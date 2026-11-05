@@ -229,11 +229,11 @@ timeout. Shared request and duration limits still apply.
 
 Load test reports each workload/pattern/level separately; a passing setting does
 not establish the behavior of untested settings or erase a failure elsewhere.
-Answer timing ends at the last answer chunk: finish/usage messages, `[DONE]` and
+Answer timing ends at the last answer-bearing client read: finish/usage messages, `[DONE]` and
 connection cleanup do not extend generation time or stream gaps. A streamed
-single-chunk answer with reported `completion_tokens <= 2` has no possible
-inter-chunk gap and is exempt from missing-gap evidence. Longer or unknown-length
-single-chunk answers still lack timing evidence (they may have been buffered).
+single-read answer with reported `completion_tokens <= 2` has no possible
+stream gap and is exempt from missing-gap evidence. Longer or unknown-length
+single-read answers still lack timing evidence (they may have been buffered).
 
 Recovery first records light probes, then refills up to its effective check
 concurrency with
@@ -304,6 +304,55 @@ then one inference verifies readiness. Poll observations and the inference probe
 are recorded separately and consume neither the shared request budget nor the
 error allowance.
 
+## Streaming generation pace
+
+Generation pace is a client-observed estimate using server-reported cumulative
+output token counts at the first and last answer-bearing client reads:
+
+```text
+(last_read_output_tokens - first_read_output_tokens)
+/ seconds between first and last answer read
+```
+
+Several tokens can arrive in one SSE event, and several events can arrive in one
+client read. Giraffe groups events received together and uses the count on the
+last content event in each group. This excludes the whole first batch. Prompt
+waiting, trailing usage/finish messages, `[DONE]` and connection cleanup do not
+extend the measured interval or add tokens to its numerator. Large batches with
+valid counts can establish an average pace, but not individual token arrival
+times or smooth streaming.
+
+For a server that supports cumulative usage on streamed events, add:
+
+```yaml
+request_options:
+  stream_options:
+    include_usage: true
+    continuous_usage_stats: true
+```
+
+This is an explicit opt-in extension, not a standard supported by every
+OpenAI-compatible endpoint. Confirm support in your server's documentation; see
+[NVIDIA's description of per-chunk usage](https://docs.nvidia.com/aiperf/reference/command-line-options#--per-chunk-usage).
+Giraffe does not enable the extension automatically.
+
+Final-only usage cannot establish earlier batch counts. Missing, invalid or
+decreasing counts leave generation pace unmeasured; Giraffe does not infer them
+from characters or SSE event counts. Counts must cover the same output scope at
+both boundaries. Reasoning needs a usable reasoning-token breakdown, and mixed
+text/tool responses cannot establish this pace. Server counts can include control
+tokens and need not equal tokenization of visible text. Network buffering also
+affects arrival times, so this is not an exact server decoding measurement.
+
+`limits.min_output_tokens_per_second` (or Load test's
+`pass_criteria.min_generation_tokens_per_second`) requires sufficient measurable
+responses; otherwise the result is inconclusive. Non-streamed, single-read and
+incomplete responses cannot establish a rate. First-answer, total-time and
+stream-pause measurements remain independent of token counts. End-to-end output
+rate uses total output usage divided by total request time and remains separate.
+Older request records without boundary counts cannot establish the corrected
+generation pace, while their saved timing and total usage remain readable.
+
 ## Workload settings and evidence
 
 | Setting | Behavior | Evidence and limitations |
@@ -331,9 +380,10 @@ sample counts. Failures, timeouts, cancellation, unknown lengths and finish reas
 appear alongside them. Aggregate
 requests/s and output tokens/s use first dispatch through last completion in that
 scenario, including error time in the window. Missing output usage leaves aggregate
-token throughput unknown. Per-request generation pace remains a client-observed
-estimate between first/last answer chunks, separate from end-to-end throughput and
-server TTFT statistics.
+token throughput unknown. Per-request generation pace uses cumulative server
+counts at the first and last answer-bearing client reads, separate from
+end-to-end throughput and server TTFT statistics. See
+[streaming generation pace](#streaming-generation-pace) for required usage reporting.
 
 Timing acceptance uses the same generator scheduling-lag qualification for core
 and additional workloads. If the generator cannot keep up, configured timing

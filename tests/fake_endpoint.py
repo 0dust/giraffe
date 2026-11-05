@@ -428,10 +428,13 @@ class FakeEndpoint:
                     self.wfile.flush()
 
                 event({"role": "assistant"})
-                for piece in pieces:
+                continuous = payload.get("stream_options", {}).get("continuous_usage_stats", False)
+                include_usage = payload.get("stream_options", {}).get("include_usage", False)
+                for index, piece in enumerate(pieces, 1):
                     if endpoint._stop.is_set():
                         return
-                    event({"content": piece})
+                    extra = {"usage": {**usage, "completion_tokens": index}} if continuous and include_usage else {}
+                    event({"content": piece}, **extra)
                     endpoint._stop.wait(endpoint.chunk_delay)
                 event({}, finish, usage=usage)
                 if mode != "truncated":

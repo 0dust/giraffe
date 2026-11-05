@@ -7,3 +7,8 @@ targets:
     model: replace-with-served-model-id
     metrics_profile: vllm-v1
     metrics_url: http://127.0.0.1:8000/metrics
+# Cumulative usage allows generation pace to account for multi-token batches.
+request_options:
+  stream_options:
+    include_usage: true
+    continuous_usage_stats: true

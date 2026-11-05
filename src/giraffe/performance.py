@@ -351,9 +351,8 @@ def _window_summary(report, target, window, records, series, observation):
     maximum_gaps = gaps + [r.max_stream_gap_ms for r in good if r.max_stream_gap_ms is not None]
     put("longest_stream_pause", max(maximum_gaps, default=None), "Longest stream pause", "ms",
         "Maximum gap between answer network reads; not token ITL", samples=len(maximum_gaps))
-    # The saved generation estimate predates versioned token-event evidence.
-    # Its existing property enforces valid, completed, unbuffered streaming
-    # evidence; only direct/token-event metrics require the newer schema.
+    # Generation pace requires cumulative usage at both answer-read boundaries.
+    # Direct/token-event metrics additionally require the newer timing schema.
     generation_rates = [r.generation_tokens_per_second for r in good]
     legacy_rates = [r.generation_tokens_per_second for r in good if getattr(r, "timing_schema", 0) < 1]
     legacy_source = "; from saved generation-rate estimate; older run" if any(rate is not None for rate in legacy_rates) else ""
@@ -365,7 +364,7 @@ def _window_summary(report, target, window, records, series, observation):
     metrics["tpot"] = {**selected_tpot, "id": "tpot", "label": "Time per output token (TPOT)"}
     metrics["tpot_direct"]["exclusion_reasons"] = dict(Counter(r.tpot_direct_reason for r in good if r.tpot_direct_reason))
     dist("generation_pace", generation_rates, "Generation pace", "tok/s",
-         "Answer streaming estimate; first-read tokens estimated by character share" + legacy_source, state="estimated")
+         "Client-observed pace from cumulative server token counts at first/last answer reads" + legacy_source, state="estimated")
     itl = [gap for r in modern for gap in (getattr(r, "itl_ms", None) or [])]
     evidence_states = Counter(r.workload.get("token_evidence", {}).get("logprobs", "not_recorded") for r in good)
     if good and not any(r.stream for r in good):

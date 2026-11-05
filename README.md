@@ -124,6 +124,14 @@ giraffe run --config giraffe.yaml \
 
 Giraffe reads the run settings from YAML; `--output` chooses where to save the results, and `--html` adds an HTML report.
 
+**Measuring generation pace:** Giraffe needs cumulative token usage alongside
+streamed answer events, not just a final token total. For a compatible server,
+enable `request_options.stream_options.include_usage: true` and
+`request_options.stream_options.continuous_usage_stats: true` in your config.
+Otherwise generation pace remains unmeasured, and a required minimum rate stays
+inconclusive; first-answer time, stream pauses and total response time still work.
+See [streaming generation pace](docs/workloads.md#streaming-generation-pace).
+
 ## CI and GitHub Actions
 
 Use `--quiet --junit junit.xml --summary-md summary.md` for CI output. Saved

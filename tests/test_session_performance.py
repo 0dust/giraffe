@@ -42,6 +42,7 @@ def test_invalid_performance_profiles_are_rejected(updates):
 async def test_mixed_live_conversations_overlap_and_keep_actual_history_isolated(retention, tmp_path):
     with FakeEndpoint(first_token_delay=.03, chunk_delay=.03) as endpoint:
         report = await run_suite(config(endpoint, checks=["sessions"], retention=retention,
+            request_options={"stream_options": {"continuous_usage_stats": True}},
             sessions={"profile": "performance", "modes": ["live"], "sessions": 4,
                       "concurrency": 2, "workloads": workloads(), "max_tokens": 64}))
         assert endpoint.peak_active == 2
@@ -105,6 +106,7 @@ def record(user, turn, rate=None, *, failed=False):
         check_ids=["sessions"], started_at="2026-10-14T00:00:00Z",
         status="failed" if failed else "completed", valid=not failed, stream=True,
         output_tokens=11, answer_chunks=2 if rate else 1, answer_reads=2 if rate else 1,
+        first_read_output_tokens=1 if rate else None, last_read_output_tokens=11 if rate else None,
         answer_chars=11, first_read_answer_chars=1, first_output_ms=100,
         last_output_ms=100 + 10000/rate if rate else 100, elapsed_ms=1200,
         dispatch_ms=turn*1500, completed_ms=turn*1500+1200,
@@ -124,13 +126,15 @@ def test_user_average_does_not_overweight_users_with_more_responses_or_invent_mi
     assert measured["users"][-1]["generation_tokens_per_second_mean"] is None
 
 
-async def test_recovery_uses_long_streamed_known_answers_for_every_phase():
+@pytest.mark.parametrize("continuous_usage", [True, False])
+async def test_recovery_uses_long_streamed_known_answers_for_every_phase(continuous_usage):
     with FakeEndpoint() as endpoint:
         settings = config(endpoint, checks=["recovery"], sustained_seconds=.75,
+            request_options={"stream_options": {"continuous_usage_stats": True}} if continuous_usage else {},
             limits={"min_output_tokens_per_second": 1, "min_samples": 2})
         report = await run_suite(settings)
     result = check(report, "recovery")
-    assert result.status == "pass"
+    assert result.status == ("pass" if continuous_usage else "inconclusive")
     completion = result.metrics["sustained_completion"]
     assert completion["reason"] == "duration elapsed"
     assert completion["requests"] >= settings.concurrency * 2
@@ -145,4 +149,7 @@ async def test_recovery_uses_long_streamed_known_answers_for_every_phase():
     assert all(row.answer_chunks > 10 and row.score is True for row in probes)
     assert len({row.fixture_id for row in probes}) == 1
     assert all(row.score is True for row in workload)
-    assert not result.metrics.get("missing_timing_metrics")
+    if continuous_usage:
+        assert not result.metrics.get("missing_timing_metrics")
+    else:
+        assert result.metrics["missing_timing_metrics"] == ["generation_tokens_per_second"]

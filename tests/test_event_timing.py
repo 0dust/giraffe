@@ -76,18 +76,21 @@ async def test_ttft_ignores_metadata_and_keeps_reasoning_separate(monkeypatch):
     assert record.reasoning_read_timestamps_ms == [300]
     assert [event["kind"] for event in record.output_events] == ["reasoning", "answer", "answer"]
     assert record.tpot_direct_ms == pytest.approx(200)
-    assert record.tpot_estimate_ms == pytest.approx(200)
+    assert record.tpot_estimate_ms is None  # Final-only usage cannot establish read boundaries.
     assert record.itl_ms == pytest.approx([200])
     assert all("thinking" not in str(event) for event in record.output_events)
 
 
-async def test_multitoken_chunk_is_read_gap_but_not_itl_or_direct_tpot(monkeypatch):
+@pytest.mark.parametrize("continuous_usage", [True, False])
+async def test_multitoken_chunk_is_read_gap_but_not_itl_or_direct_tpot(monkeypatch, continuous_usage):
     record, _ = await execute(monkeypatch, [
-        (.1, sse({"content": "AB"}, tokens=["A", "B"])),
-        (.4, sse({"content": "CD"}, tokens=["C", "D"])),
+        (.1, sse({"content": "AB"}, tokens=["A", "B"],
+            usage={"completion_tokens": 2} if continuous_usage else None)),
+        (.4, sse({"content": "CD"}, tokens=["C", "D"],
+            usage={"completion_tokens": 4} if continuous_usage else None)),
         (.5, sse(finish="stop", usage={"completion_tokens": 4})), (.6, b"data: [DONE]\n\n")])
     assert record.read_gaps_ms == pytest.approx([300])
-    assert record.tpot_estimate_ms == pytest.approx(150)
+    assert record.tpot_estimate_ms == (pytest.approx(150) if continuous_usage else None)
     assert record.tpot_direct_ms is None and "first" in record.tpot_direct_reason.lower()
     assert record.itl_ms is None and "token" in record.itl_reason.lower()
 

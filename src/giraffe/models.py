@@ -2466,10 +2466,6 @@ class EvaluationEvidence(PersistedModel):
         return _persisted_model_input(ToolExpectation, value)
 
 
-# Coarse bursts cannot establish a reliable answer-token generation rate.
-MAX_TOKENS_PER_READ = 16
-
-
 class RequestRecord(PersistedModel):
     _timing_started_monotonic: float | None = PrivateAttr(default=None)
     id: str
@@ -2510,6 +2506,8 @@ class RequestRecord(PersistedModel):
     answer_reads: int = 0
     answer_chars: int = 0
     first_read_answer_chars: int = 0
+    first_read_output_tokens: int | None = Field(default=None, strict=True, ge=0)
+    last_read_output_tokens: int | None = Field(default=None, strict=True, ge=0)
     first_reasoning_ms: float | None = None
     max_stream_gap_ms: float | None = None
     completion_tokens: int | None = None
@@ -2585,7 +2583,7 @@ class RequestRecord(PersistedModel):
 
     @property
     def tpot_estimate_ms(self) -> float | None:
-        """Reciprocal of the existing character-allocation generation estimate."""
+        """Reciprocal of client-observed pace from reported answer-read counts."""
         pace = self.generation_tokens_per_second if self.timing_schema else None
         return 1000 / pace if pace is not None and pace > 0 else None
 
@@ -2651,41 +2649,27 @@ class RequestRecord(PersistedModel):
         return not (self.stream and self.answer_reads <= 1 and self.completion_tokens in (1, 2))
 
     @property
-    def first_read_tokens(self) -> float | None:
-        chars = self.answer_chars or (self.output_chars if not self.reasoning_stripped else 0)
-        if self.output_tokens is None or chars <= 0 or self.first_read_answer_chars <= 0:
-            return None
-        return max(1.0, self.output_tokens * self.first_read_answer_chars / chars)
-
-    @property
     def measured_stream_gap(self) -> bool:
-        first = self.first_read_tokens
-        return (self.stream and self.answer_reads >= 2 and self.max_stream_gap_ms is not None
-                and first is not None and first <= MAX_TOKENS_PER_READ)
+        return self.stream and self.answer_reads >= 2 and self.max_stream_gap_ms is not None
 
     @property
     def generation_tokens_per_second(self) -> float | None:
-        """Client-observed estimate; streamed reads are not individual tokens.
+        """Client-observed pace from reported counts at answer-read boundaries.
 
-        Exclude tokens in the first answer read and time before it. Waiting for
-        usage, finish markers or stream cleanup must not slow generation.
-        Single-read, non-streamed, buffered (> MAX_TOKENS_PER_READ per read) or
-        reasoning answers without a reported reasoning token count lack this evidence.
+        Counts describe server-generated tokens, not individual token arrival times.
+        Exclude the whole first read and any tokens reported only in later trailers.
+        Legacy/final-only usage cannot reconstruct either boundary.
         """
-        reads = self.answer_reads
+        first, last = self.first_read_output_tokens, self.last_read_output_tokens
         if (not self.valid or self.status != "completed" or not self.stream
                 or self.output_tokens is None or self.output_tokens <= 1
-                or reads < 2 or self.first_output_ms is None
+                or self.answer_reads < 2 or self.first_output_ms is None
                 or self.last_output_ms is None or self.last_output_ms <= self.first_output_ms
+                or first is None or last is None or not 0 < first < last <= self.output_tokens
+                or self.tool_calls
                 or ((self.reasoning_stripped or self.reasoning.strip()) and not self.reasoning_tokens)):
             return None
-        first = self.first_read_tokens
-        if first is None or first > MAX_TOKENS_PER_READ:
-            return None
-        later = self.output_tokens - first
-        if later <= 0 or later / (reads - 1) > MAX_TOKENS_PER_READ:
-            return None
-        return later * 1000 / (self.last_output_ms - self.first_output_ms)
+        return (last - first) * 1000 / (self.last_output_ms - self.first_output_ms)
 
 
 class CheckResult(PersistedModel):
