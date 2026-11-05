@@ -12,6 +12,76 @@ def configuration():
                      checks=['multi_user'], concurrency=5, multi_user={'levels': [20]})
 
 
+def test_arrival_recovery_form_roundtrip():
+    value = browser_logic(r'''
+const markup=renderMultiUserEditor(config);
+for(const name of ['scenario_arrivals','scenario_recovery','arrivals_requests_per_second','arrivals_activations','arrivals_bursts','recovery_control_seconds','recovery_sustained_seconds','recovery_lighter_seconds','recovery_max_slowdown'])assert(markup.includes('name="multi_user_'+name+'"'));
+const form=new FormData();form.set('multi_user_rendered','1');form.set('multi_user_scenarios_rendered','1');
+form.set('multi_user_scenario_arrivals','on');form.set('multi_user_scenario_recovery','on');
+form.set('multi_user_arrivals_requests_per_second','2');form.set('multi_user_arrivals_activations','user-02@2, user-03@3');
+form.set('multi_user_arrivals_bursts','user-01@4@3@0, user-02@5@2@0.1');
+form.set('multi_user_recovery_control_seconds','4');form.set('multi_user_recovery_sustained_seconds','8');
+form.set('multi_user_recovery_lighter_seconds','4');form.set('multi_user_recovery_max_slowdown','1.5');
+assert.equal(settingPath('multi_user_arrivals_requests_per_second'),'multi_user.arrivals.requests_per_second');
+assert.equal(settingDestination('multi_user.arrivals.bursts.0.requests').name,'multi_user_arrivals_bursts');
+assert.equal(settingPath('multi_user_recovery_control_seconds'),'multi_user.recovery.control_seconds');
+console.log(JSON.stringify(configureMultiUser(config,form,bootstrap.multi_user.defaults)));
+''', configuration())
+    config = RunConfig.model_validate(value)
+    assert config.multi_user.scenarios == ['arrivals', 'recovery']
+    assert config.multi_user.arrivals.activations == {'user-02': 2, 'user-03': 3}
+    assert config.multi_user.arrivals.bursts[1].spacing_seconds == .1
+    assert config.multi_user.recovery.max_slowdown == 1.5
+
+
+def test_recovery_results_keep_user_qualification_and_phase_evidence():
+    from tests.test_multi_user_recovery import recovery_observation
+    from giraffe.multi_user_metrics import summarize
+    source, records = recovery_observation()
+    summary = summarize(source, records)
+    browser_logic('const summary='+json.dumps(summary)+r''';
+const markup=renderMultiUserResults(summary);
+for(const text of ['Scheduled and achieved traffic','Matched per-user recovery','user-03','Recovery slowdown','Control:','Sustained:','Lighter:','not server queue time'])assert(markup.includes(text));
+assert.match(markup,/data-request="2-user-03"/);
+''', configuration())
+
+
+def test_multi_user_scenarios_form_roundtrip_and_field_destinations():
+    value = browser_logic(r'''
+const markup=renderMultiUserEditor(config);
+for(const name of ['scenario_noisy_neighbors','scenario_cancellation','noisy_neighbors_heavy_user_ids','noisy_neighbors_heavy_user_count','noisy_neighbors_max_slowdown','cancellation_user_id','cancellation_cancel_after_chunks'])assert(markup.includes('name="multi_user_'+name+'"'));
+const form=new FormData();form.set('multi_user_rendered','1');form.set('multi_user_scenarios_rendered','1');
+form.set('multi_user_scenario_noisy_neighbors','on');form.set('multi_user_scenario_cancellation','on');
+form.set('multi_user_noisy_neighbors_heavy_user_ids','user-03, user-04');
+form.set('multi_user_noisy_neighbors_heavy_user_count','2');form.set('multi_user_noisy_neighbors_max_slowdown','1.5');
+form.set('multi_user_noisy_neighbors_profiles_rendered','1');form.set('multi_user_noisy_neighbors_profile_short_long','on');
+form.set('multi_user_noisy_neighbors_triggers_rendered','1');form.set('multi_user_noisy_neighbors_trigger_before_output','on');
+form.set('multi_user_cancellation_user_id','user-02');form.set('multi_user_cancellation_cancel_after_chunks','3');
+const result=configureMultiUser(config,form,bootstrap.multi_user.defaults);
+assert.equal(JSON.stringify(result.multi_user.scenarios),'["noisy_neighbors","cancellation"]');
+assert.equal(JSON.stringify(result.multi_user.noisy_neighbors.heavy_profiles),'["short_long"]');
+assert.equal(JSON.stringify(result.multi_user.noisy_neighbors.triggers),'["before_output"]');
+assert.equal(settingPath('multi_user_cancellation_user_id'),'multi_user.cancellation.user_id');
+assert.equal(settingPath('multi_user_noisy_neighbors_max_slowdown'),'multi_user.noisy_neighbors.max_slowdown');
+assert.equal(settingDestination('multi_user.noisy_neighbors.heavy_user_ids.0').name,'multi_user_noisy_neighbors_heavy_user_ids');
+console.log(JSON.stringify(result));
+''', configuration())
+    resolved = RunConfig.model_validate(value)
+    assert resolved.multi_user.noisy_neighbors.heavy_user_ids == ['user-03', 'user-04']
+    assert resolved.multi_user.cancellation.cancel_after_chunks == 3
+
+
+def test_scenario_results_show_separate_observations_and_request_links():
+    from tests.test_multi_user_reporting import scenario_report
+    summary = scenario_report().checks[0].metrics['multi_user']
+    browser_logic('const summary='+json.dumps(summary)+r''';
+const markup=renderMultiUserResults(summary);
+for(const text of ['Matched noisy-neighbor comparison','Missing heavy overlap','Selected request cancellation','Peer continuation','Same-user follow-up','Backend compute and memory release: unverified'])assert(markup.includes(text));
+assert.match(markup,/data-request="user-01-1"/);
+assert.match(markup,/data-request="user-02-1"/);
+''', configuration())
+
+
 def test_multi_user_form_and_drawer_roundtrip():
     result = browser_logic(r'''
 const original=JSON.stringify(config),check=bootstrap.checks.find(c=>c.id==='multi_user');
@@ -140,3 +210,37 @@ assert.equal(JSON.stringify(changed.multi_user.shapes),'[]');console.log(JSON.st
     from pydantic import ValidationError
     with pytest.raises(ValidationError, match='shapes'):
         RunConfig.model_validate(result)
+
+
+def test_fairness_and_conversation_settings_roundtrip():
+    result = browser_logic(r'''
+const markup=renderMultiUserEditor(config);
+for(const name of ['criteria_max_throughput_ratio','fairness_tolerance_percent','conversation_profile','conversation_modes','conversation_turns','conversation_max_tokens','conversation_sample_turn_count'])assert(markup.includes('name="multi_user_'+name+'"'));
+const values=new FormData();values.set('multi_user_rendered','1');
+values.set('multi_user_criteria_max_throughput_ratio','1.5');
+values.set('multi_user_fairness_tolerance_percent','5');
+values.set('multi_user_conversation_profile','correctness');
+values.set('multi_user_conversation_modes','live');
+values.set('multi_user_conversation_turns','Remember the name.\nRepeat the name.');
+values.set('multi_user_conversation_max_tokens','48');
+values.set('multi_user_conversation_delay_seconds','0.1');
+const changed=configureMultiUser(config,values,bootstrap.multi_user.defaults);
+assert.equal(changed.multi_user.conversations.modes[0],'live');
+assert.equal(changed.multi_user.conversations.turns.length,2);
+assert.equal(settingDestination('multi_user.conversations.max_tokens').name,'multi_user_conversation_max_tokens');
+assert.equal(settingDestination('multi_user.conversations.sampling.think_time_seconds.weights').name,'multi_user_conversation_weights_think_time_seconds');
+assert.equal(settingPath('multi_user_conversation_task_0_turn_1'),'multi_user.conversations.workloads.0.turns.1');
+console.log(JSON.stringify(changed));
+''', configuration())
+    settings = RunConfig.model_validate(result).multi_user
+    assert settings.pass_criteria.max_throughput_ratio == 1.5
+    assert settings.fairness_tolerance_percent == 5
+    assert settings.conversations.max_tokens == 48
+
+
+def test_fairness_population_and_conversation_links_render():
+    browser_logic(r'''
+const markup=renderMultiUserResults({windows:[{phase:'measurement',population:2,fairness:{status:'inconclusive',ratio:2,threshold:1.5,eligible_user_ids:['user-01'],compared_user_ids:['user-01','user-02'],reasons:['User 2 lacks overlap.']},users:[{user_id:'user-01',profile:'conversation:chat',conversations:[{id:'conversation-one',mode:'live',turns:['request-one'],planned_turns:2,stop_reason:'failed turn'}]}]}]});
+assert.match(markup,/Observed delivery fairness/);assert.match(markup,/User 2 lacks overlap/);
+assert.match(markup,/conversation-one/);assert.match(markup,/failed turn/);assert.match(markup,/data-request="request-one"/);
+''', configuration())

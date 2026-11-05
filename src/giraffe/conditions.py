@@ -119,6 +119,10 @@ def _identity(scenario: str, workload: Mapping[str, Any] | None = None) -> dict[
         level, phase = users.groups()
         return {"id": scenario, "label": f"{int(level)} users · {phase}",
                 "check": "multi_user", "population": int(level), "phase": phase}
+    if scenario.startswith("multi_user_"):
+        return {"id": scenario, "label": "Multi-user · " + scenario.removeprefix("multi_user_").replace("_", " "),
+                "check": "multi_user", "population": workload.get("population"),
+                "phase": workload.get("phase", "measurement")}
     if calibration := re.fullmatch(r"load_calibration_v45_(short|medium|long)_(short_answer|long_output)", scenario):
         return {"id": scenario, "label": f"Calibrating {calibration[1]} input tokens", "check": "load", "load_type": "calibration"}
     if comparison := re.fullmatch(r"load_(?:primary|legacy_.+?)_interference_c(\d+)\.(baseline|probe)(?:\..+)?", scenario):

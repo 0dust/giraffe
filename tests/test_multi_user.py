@@ -30,7 +30,7 @@ def test_selection_is_opt_in_and_population_does_not_clamp_to_slots():
     with pytest.raises(ValidationError):
         settings(duration_seconds=0)
     with pytest.raises(ValidationError):
-        settings(scenarios=["cancellation"])
+        settings(scenarios=["unknown"])
 
 
 def test_twenty_users_share_five_slots_and_repeat(monkeypatch):
@@ -386,3 +386,152 @@ def test_saved_question_sequence_ignores_peer_token_counts_and_population(monkey
                    for record in state.records)
 
     run_virtual(monkeypatch, scenario())
+
+
+@pytest.mark.parametrize('mode', ['fixed', 'live'])
+@pytest.mark.parametrize('terminal', [None, 'failed', 'length', 'incorrect'])
+def test_user_starts_fresh_conversations_after_completion_or_failure(monkeypatch, mode, terminal):
+    from giraffe.multi_user import execute, result
+
+    class HistoryClient(FakeClient):
+        messages = []
+
+        async def execute(self, spec, **kwargs):
+            self.messages.append((dict(spec.workload), [dict(message) for message in spec.messages]))
+            record = await super().execute(spec, **kwargs)
+            if terminal and spec.workload['conversation_sequence'] == 1:
+                if terminal == 'failed':
+                    record.status, record.valid = 'failed', False
+                elif terminal == 'incorrect':
+                    record.output = 'wrong name'
+                else:
+                    record.finish_reason = 'length'
+            return record
+
+    async def scenario():
+        cfg = settings(levels=[1], duration_seconds=.04,
+                       think_time_seconds={'values': [0]},
+                       conversations={'modes': [mode]})
+        state = runner._Run(cfg, None, None)
+        client = HistoryClient(cfg.targets[0], cfg)
+        await execute(state, cfg.targets[0], client)
+        window = state.observations['service']['multi_user']['windows'][0]
+        conversations = window['users'][0]['conversations']
+        assert len(conversations) >= 2
+        assert len({item['id'] for item in conversations}) == len(conversations)
+        assert bool(conversations[0]['stop_reason']) == bool(terminal)
+        assert len(conversations[0]['turns']) == (1 if terminal else 2)
+        for metadata, messages in client.messages:
+            assert metadata['user_id'] == 'user-01'
+            if metadata['turn_id'] == 0:
+                assert len(messages) == 1
+            else:
+                assert len(messages) == 3
+                assert messages[1]['content'] == messages[0]['content'].split('session: ')[1].split('.')[0]
+        summary = result(state, cfg.targets[0]).metrics['multi_user']['windows'][0]['users'][0]
+        assert len(summary['request_ids']) == len(state.records)
+        assert summary['conversations'] == conversations
+        if terminal in {'failed', 'incorrect'}:
+            assert summary['outcomes']['errors'] == 1
+            assert summary['status'] == 'fail'
+        assert state.slots.qsize() == 1
+
+    run_virtual(monkeypatch, scenario())
+
+
+@pytest.mark.parametrize('mode', ['fixed', 'live'])
+@pytest.mark.parametrize('retention', ['all', 'none'])
+async def test_http_conversations_keep_history_and_retained_links(mode, retention, tmp_path):
+    import json
+    from giraffe.models import Target
+    from giraffe.reporting import reproduction_export, write_report
+    from tests.fake_endpoint import FakeEndpoint
+
+    with FakeEndpoint() as endpoint:
+        cfg = settings(levels=[1], duration_seconds=2, think_time_seconds={'values': [0]},
+                       conversations={'modes': [mode]}).model_copy(update={
+                           'max_requests': 5, 'retention': retention,
+                           'targets': [Target(name='service', model='fake', url=endpoint.url)]})
+        report = await runner.run_suite(cfg)
+        payloads = [row for row in endpoint.requests if 'bakery name' in str(row)]
+        assert [len(row['messages']) for row in payloads] == [1, 3, 1, 3]
+        assert payloads[0]['messages'][0] != payloads[2]['messages'][0]
+        assert payloads[1]['messages'][1]['content'] != payloads[3]['messages'][1]['content']
+    summary = next(check.metrics['multi_user'] for check in report.checks if check.id == 'multi_user')
+    user = summary['windows'][0]['users'][0]
+    assert len(user['conversations']) == 2
+    assert len(user['request_ids']) == 4
+    for conversation in user['conversations']:
+        records = [r for r in report.requests if r.id in conversation['turns']]
+        assert len(records) == 2
+        assert {r.workload['session_id'] for r in records} == {conversation['id']}
+        assert [r.workload['turn_id'] for r in records] == [0, 1]
+    json_path, html_path = write_report(report, tmp_path, html=True)
+    exported = reproduction_export(report)['multi_user']['service']
+    assert exported['windows'][0]['users'][0]['conversations'] == user['conversations']
+    saved = json.loads(json_path.read_text())
+    assert all(r['workload']['session_id'] for r in saved['requests'] if 'multi_user' in r['check_ids'])
+    assert user['conversations'][0]['id'] in html_path.read_text()
+    if retention == 'none':
+        assert all(not r['output'] for r in saved['requests'])
+
+
+def test_conversation_samples_ignore_peer_latency_and_failures(monkeypatch):
+    from giraffe.multi_user import execute
+
+    class PeerClient(FakeClient):
+        slow_peer = False
+
+        async def execute(self, spec, **kwargs):
+            if self.slow_peer and spec.workload['user_id'] == 'user-02':
+                await asyncio.sleep(.03)
+            record = await super().execute(spec, **kwargs)
+            if self.slow_peer and spec.workload['user_id'] == 'user-02':
+                record.status, record.valid = 'failed', False
+            return record
+
+    async def scenario():
+        samples = []
+        for slow in [False, True]:
+            cfg = settings(levels=[2], duration_seconds=.12, think_time_seconds={'values': [0]},
+                conversations={'profile': 'performance', 'modes': ['live'],
+                    'workloads': [{'name': 'chat', 'turns': ['First question', 'Follow up', 'Last question']}],
+                    'sampling': {'seed': 19, 'turn_count': {'values': [2, 3]},
+                                 'think_time_seconds': {'values': [0, .001]},
+                                 'output_tokens': {'values': [8, 16]}}})
+            state = runner._Run(cfg, None, None)
+            client = PeerClient(cfg.targets[0], cfg)
+            client.slow_peer = slow
+            await execute(state, cfg.targets[0], client)
+            user = state.observations['service']['multi_user']['windows'][0]['users'][0]
+            samples.append([(item['id'], item['sampled_turns']) for item in user['conversations'][:3]])
+        assert len(samples[0]) == len(samples[1]) == 3
+        assert samples[0] == samples[1]
+
+    run_virtual(monkeypatch, scenario())
+
+
+async def test_fairness_uses_observed_http_stream_overlap():
+    from giraffe.client import LLMClient
+    from giraffe.models import Target
+    from giraffe.multi_user import execute, result
+    from tests.fake_endpoint import FakeEndpoint
+
+    prompt = 'Copy exactly, with no extra text:\n' + ' '.join(['word'] * 40)
+    with FakeEndpoint(first_token_delay=.01, chunk_delay=.005) as endpoint:
+        cfg = settings(levels=[2], duration_seconds=.5, think_time_seconds={'values': [0]},
+            conversations={'profile': 'performance', 'modes': ['live'], 'max_tokens': 8,
+                'workloads': [{'name': 'chat', 'turns': [prompt, prompt]}]},
+            pass_criteria={'max_throughput_ratio': 2, 'min_samples': 2}).model_copy(update={
+                'targets': [Target(name='service', model='fake', url=endpoint.url)], 'context_limit': 4096})
+        state = runner._Run(cfg, None, None)
+        async with LLMClient(cfg.targets[0], cfg, max_connections=2) as client:
+            await execute(state, cfg.targets[0], client)
+        fairness = result(state, cfg.targets[0]).metrics['multi_user']['windows'][0]['fairness']
+        assert endpoint.peak_active == 2
+        assert fairness['overlap_user_ids'] == ['user-01', 'user-02']
+        assert fairness['status'] == 'pass', fairness['reasons']
+        assert fairness['ratio'] <= 2
+        assert all(r.finish_reason == 'length' for r in state.records)
+        # Each capped turn ends its conversation, so none receives a fabricated continuation.
+        assert all(len(row['messages']) == 1 for row in endpoint.requests)

@@ -101,10 +101,10 @@ def window_cause(reason):
     return "run_stopped"
 
 
-def make_spec(settings, shape, scenario, point, filler_chars, *, calibration=False, request_timeout_seconds=None):
+def make_spec(settings, shape, scenario, point, filler_chars, *, calibration=False, request_timeout_seconds=None, nonce=None):
     input_size, output_size = shape.split("_")
     variant = "short_answer" if output_size == "short" else "long_output"
-    text = prompt(filler_chars, variant)
+    text = prompt(filler_chars, variant, nonce=nonce)
     cap = 1 if calibration else getattr(settings.profile, output_size).output_tokens
     condition_id = None
     if point.get("type") == "interference":

@@ -61,7 +61,7 @@ CHECK_DETAILS = {
     "tools": "Checks response protocol, configured tool names and arguments, and optional assistant text requirements separately. Parallel calls match as an unordered multiset and conversation results use matched call IDs. Empty argument text means an empty object, except an empty last call cut off by the output limit remains unverified. Only final answer text satisfies content expectations; unclosed reasoning is inconclusive. Output truncation, including partial JSON numbers, is inconclusive unless complete calls independently violate the contract. Giraffe does not execute tools.",
 }
 
-CHECK_DESCRIPTIONS["multi_user"] = "Repeated independent users sharing the request limit."
+CHECK_DESCRIPTIONS["multi_user"] = "Persistent users, arrivals, bursts and recovery sharing the request limit."
 CHECK_DESCRIPTIONS["gateway_access"] = "Do the supplied gateway identities match declared allow and deny policies?"
 CHECK_DETAILS["gateway_access"] = "Opt-in LiteLLM chat-completion probes use explicit test identity references. Valid completions and recognized gateway authentication/model-access errors qualify allow/deny observations. Transport failures, unsupported errors and incomplete matrices remain unverified. No keys or permissions are changed; these cases do not certify tenant isolation."
 CHECK_DESCRIPTIONS["gateway_policy"] = "Does an explicitly declared quota or priority reservation reject one identity while peers continue?"

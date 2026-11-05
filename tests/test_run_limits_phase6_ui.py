@@ -209,9 +209,13 @@ def test_every_native_bound_is_capability_sourced_including_first_output():
 bootstrap.limits['test_options.first_output.request_timeout_seconds'].maximum=777;
 bootstrap.limits['load_test.profile.long.output_tokens'].maximum=987;
 bootstrap.limits['sessions.concurrency'].maximum=23;
+bootstrap.limits['multi_user.pass_criteria.max_throughput_ratio'].minimum=1.25;
+bootstrap.limits['multi_user.fairness_tolerance_percent'].maximum=75;
 assert.match(renderTestCard(bootstrap.checks.find(check=>check.id==='first_output'),config),/name="test_first_output_request_timeout_seconds"[^>]*max="777"/);
 assert.match(renderLoadEditor(config),/name="load_profile_long_output_tokens"[^>]*max="987"/);
 assert.match(renderProfileEditor(bootstrap.checks.find(check=>check.id==='sessions'),config),/name="profile_sessions_concurrency"[^>]*max="23"/);
+assert.match(renderMultiUserEditor(config),/name="multi_user_criteria_max_throughput_ratio"[^>]*min="1.25"/);
+assert.match(renderMultiUserEditor(config),/name="multi_user_fairness_tolerance_percent"[^>]*max="75"/);
 """)
     source = (STATIC / 'app.js').read_text() + (STATIC / 'form-config.mjs').read_text()
     source = source.replace('{s:1,min:60,h:3600}', '')  # Time-unit conversion is not a cap.
