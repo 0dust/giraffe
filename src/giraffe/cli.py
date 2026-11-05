@@ -1166,6 +1166,13 @@ def _print_result(report: RunReport, json_path: Path, html_path: Path | None,
             line = f"Performance · {target_name} · {label}"
         print(line)
     for check in report.checks:
+        if check.id == "gateway_attribution" and check.metrics.get("state") != "not_selected":
+            data = check.metrics
+            print(f"Gateway attribution · {check.target} · {data.get('state', 'unverified')} · "
+                  f"{data.get('matched_requests', 0)} matched / {data.get('observed_requests', 0)} observed requests")
+            for row in data.get("identities", []):
+                print(f"  {row['identity']} · {row['matched_requests']} matched · "
+                      f"{row['mismatched_requests']} mismatched · {row['unverified_requests']} unverified")
         users = check.metrics.get("multi_user") if check.id == "multi_user" else None
         policy = check.metrics.get("gateway_access") if check.id == "gateway_access" else None
         if policy:
