@@ -348,6 +348,21 @@ def evaluate_scale_down(settings: ScaleDownConfig, evidence: ScaleDownEvidence,
         capacity_missing.append("Surviving topology after process termination is unconfirmed.")
     if removed_interval is None:
         capacity_missing.append("Removal lacks a bounded interval in the runner clock.")
+    # Include the cutoff's capture uncertainty: requests can fail after draining
+    # starts but before the next poll confirms it. Stop at confirmed exit.
+    draining = [by_id[i] for i in dict.fromkeys(evidence.followup_request_ids)
+                if i in by_id and drain and transition and removed_interval
+                and by_id[i].dispatch_ms is not None
+                and transition[0] <= by_id[i].dispatch_ms < removed_interval[1]]
+    drain_response_bad, drain_response_missing, drain_timing = _request_outcome(
+        draining, limits, evidence, settings.min_post_samples, strict_errors=False)
+    if drain is None or transition is None or removed_interval is None:
+        drain_response_missing.append("The drain observation window is unconfirmed.")
+    drain_window = _result("Drain-window requests", drain_response_bad, [*shared, *drain_response_missing],
+                           draining, [drain, terminated] if drain and terminated else (),
+                           start_ms=transition[0] if drain and transition else None,
+                           end_ms=removed_interval[1] if removed_interval else None,
+                           minimum_samples=settings.min_post_samples, measured_requests=len(draining), **drain_timing)
     post = [by_id[i] for i in dict.fromkeys(evidence.followup_request_ids) if i in by_id and removed_interval
             and by_id[i].dispatch_ms is not None and by_id[i].dispatch_ms >= removed_interval[1]
             and evidence.post_started_ms is not None and evidence.post_ended_ms is not None
@@ -360,14 +375,25 @@ def evaluate_scale_down(settings: ScaleDownConfig, evidence: ScaleDownEvidence,
             or evidence.post_ended_ms - evidence.post_started_ms + 1e-6 < settings.post_seconds * 1000
             or len(post) < expected or evidence.dropped_post_requests):
         capacity_missing.append("The configured post-removal offered load was not fully delivered.")
-    capacity = _result("Remaining capacity", capacity_bad, capacity_missing, post, [terminated] if terminated else (),
-                       expected_requests=expected, measured_requests=len(post), removed_interval_ms=removed_interval, **capacity_timing)
+    post_window = _result("Post-exit requests", capacity_bad, capacity_missing, post, [terminated] if terminated else (),
+                          start_ms=evidence.post_started_ms, end_ms=evidence.post_ended_ms,
+                          minimum_samples=settings.min_post_samples, expected_requests=expected,
+                          measured_requests=len(post), **capacity_timing)
+    capacity = _result("Remaining capacity",
+                       [*(f"Drain window: {value}" for value in drain_response_bad), *capacity_bad],
+                       [*(f"Drain window: {value}" for value in drain_window.limitations), *capacity_missing],
+                       draining + post, [e for e in (drain, terminated) if e],
+                       expected_requests=expected, measured_requests=len(post), removed_interval_ms=removed_interval,
+                       windows={"drain": drain_window.model_dump(mode="json"),
+                                "post_removal": post_window.model_dump(mode="json")}, **capacity_timing)
+    capacity.summary = (f"Drain-window requests: {drain_window.status}; post-exit requests: {post_window.status}. "
+                        + capacity.summary)
     results = {"continuity": continuity, "drain": backend, "capacity": capacity}
     status = "fail" if any(r.status == "fail" for r in results.values()) else "inconclusive" if any(r.status == "inconclusive" for r in results.values()) else "pass"
     return CheckResult(id="scale_down", target=settings.target, title="Scale-down continuity", status=status,
                        summary="; ".join(f"{name}: {result.status}" for name, result in results.items()),
                        metrics={"schema_version": 1, "results": {key: result.model_dump(mode="json") for key, result in results.items()}},
-                       evidence_ids=list(dict.fromkeys([*(r.id for r in cohort + post), *(e.event_id for e in selected)])))
+                       evidence_ids=list(dict.fromkeys([*(r.id for r in cohort + draining + post), *(e.event_id for e in selected)])))
 
 
 class ScaleDownController:

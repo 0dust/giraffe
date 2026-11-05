@@ -977,8 +977,8 @@ provision infrastructure or issue removal commands.
 
 The long cohort occupies `long_cohort_size` slots while one continuous arrival
 stage sends `followup_fixture` requests at `requests_per_second`. Set `concurrency`
-above the cohort size, and leave enough shared run budget for baseline and
-post-removal samples. `baseline_timeout_seconds` bounds baseline/arming;
+above the cohort size, and leave enough shared run budget for baseline, drain
+and post-removal samples. `baseline_timeout_seconds` bounds baseline/arming;
 `event_timeout_seconds` bounds the wait for an accepted marker; `grace_seconds`
 bounds removal observation; `post_seconds` measures survivor traffic;
 `completion_seconds` bounds final client cleanup. The grace policy explicitly
@@ -1010,7 +1010,19 @@ The three results have independent prerequisites:
 | --- | --- |
 | Client-visible continuity | Confirmed transition and baseline topology; enough original answer streams spanning the transition; valid stream termination, configured correctness and timing |
 | Backend drain semantics | Exact removed incarnation; active attributed work; complete all-traffic admissions/completions through termination; no admission after cutoff; successful completion before termination; declared grace respected |
-| Remaining capacity | Confirmed termination and surviving topology; full configured post-removal offered load and minimum samples; successful responses satisfying configured correctness/timing |
+| Remaining capacity | New requests during the drain observation window and after exit independently meet configured error-rate, correctness and timing limits, with at least `min_post_samples` valid responses in each; confirmed surviving topology and full configured post-removal offered load |
+
+The drain observation window starts at the earliest bounded admission-cutoff
+time and ends at confirmed process exit, using capture times in the runner
+clock. It includes the cutoff polling uncertainty so failures before the next
+collector poll cannot disappear; it is not an exact backend-only drain interval.
+The post-exit window starts when the runner observes termination and lasts
+`post_seconds`. Requests are assigned by dispatch time; responses may finish
+later. Each window is scored separately, so successful later traffic cannot
+dilute a drain-window breach. A short or unconfirmed drain with fewer than
+`min_post_samples` valid responses is inconclusive even when post-exit traffic
+passes. The capacity summary names both window verdicts; JSON reports also
+retain each window's request IDs, limitations and timing evidence.
 
 A confirmed interruption or late admission fails even when some other coverage
 is missing. Unknown attribution, absent overlap, missing lifecycle facts,

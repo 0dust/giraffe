@@ -26,7 +26,7 @@ def scenario():
     evidence = dict(schema_version=1, timing_health={"schema_version": 1, "windows": []}, timing_threshold_ms=100,
                     armed_ms=50, marker_accepted_ms=90,
                     marker=dict(event_id="operator", nonce="fresh-run", target="service", replica_id="b", source="test"),
-                    baseline_request_ids=["baseline"], long_request_ids=["long"], followup_request_ids=["post"],
+                    baseline_request_ids=["baseline"], long_request_ids=["long"], followup_request_ids=["post", "draining"],
                     snapshots=[snapshot(50, 60, 1, [], ["a", "b"]), snapshot(200, 210, 4, events[:3], ["a", "b"]), snapshot(400, 410, 6, events, ["a"])],
                     answer_started_ms={"baseline": 10, "long": 20, "post": 430},
                     post_started_ms=410, post_ended_ms=1410)
@@ -36,7 +36,8 @@ def scenario():
                              stream=True, timing_schema=1, answer_read_timestamps_ms=[10, 20], stream_terminated=True, finish_reason="stop", answer_chars=10, answer_chunks=2,
                              dispatch_ms=dispatch, timing_start_ms=dispatch, first_output_ms=10,
                              completed_ms=completed, elapsed_ms=completed-dispatch, backend_id="b" if id == "long" else "a")
-    return settings, evidence, [record("baseline", 0, 30), record("long", 10, 350), record("post", 420, 450)]
+    return settings, evidence, [record("baseline", 0, 30), record("long", 10, 350), record("post", 420, 450),
+                               record("draining", 320, 340)]
 
 
 def evaluate(settings, evidence, records):
@@ -52,6 +53,122 @@ def test_complete_graceful_evidence_passes_each_result():
     assert result.id == "scale_down" and result.status == "pass"
     assert statuses(result) == dict(continuity="pass", drain="pass", capacity="pass")
     assert "long" in result.metrics["results"]["continuity"]["request_ids"]
+
+
+@pytest.mark.parametrize("phase,dispatch", [("drain", 250), ("post_removal", 500)])
+def test_followup_errors_fail_their_window_despite_other_successes(phase, dispatch):
+    settings, evidence, records = scenario()
+    for index in range(2):
+        request_id = f"error-{index}"
+        records.append(records[2].model_copy(update=dict(
+            id=request_id, dispatch_ms=dispatch + index * 20,
+            timing_start_ms=dispatch + index * 20, completed_ms=dispatch + index * 20 + 10,
+            status="failed", http_status=503, valid=False, score=False,
+            error="controlled 503", stream_terminated=False, finish_reason=None)))
+        evidence["followup_request_ids"].append(request_id)
+    result = evaluate(settings, evidence, records)
+    assert result.status == "fail"
+    capacity = result.metrics["results"]["capacity"]
+    assert capacity["status"] == "fail"
+    windows = capacity["metrics"]["windows"]
+    assert windows[phase]["status"] == "fail"
+    assert {"error-0", "error-1"} <= set(windows[phase]["request_ids"])
+    if phase == "drain":
+        assert windows["post_removal"]["status"] == "pass"
+
+
+def test_no_drain_samples_cannot_be_hidden_by_successful_post_removal_requests():
+    settings, evidence, records = scenario()
+    evidence["followup_request_ids"] = ["post"]
+    result = evaluate(settings, evidence, records)
+    assert result.status == "inconclusive"
+    windows = result.metrics["results"]["capacity"]["metrics"]["windows"]
+    assert windows["drain"]["status"] == "inconclusive"
+    assert windows["post_removal"]["status"] == "pass"
+
+
+@pytest.mark.parametrize("index,phase", [(3, "drain"), (2, "post_removal")])
+@pytest.mark.parametrize("violation", ["correctness", "timing"])
+def test_each_followup_window_enforces_response_limits(index, phase, violation):
+    settings, evidence, records = scenario()
+    limits = Limits(latency_ms=100) if violation == "timing" else Limits()
+    updates = dict(score=False) if violation == "correctness" else dict(
+        completed_ms=records[index].dispatch_ms + 300, elapsed_ms=300)
+    records[index] = records[index].model_copy(update=updates)
+    result = evaluate_scale_down(settings, ScaleDownEvidence.model_validate(evidence), records, limits)
+    windows = result.metrics["results"]["capacity"]["metrics"]["windows"]
+    assert windows[phase]["status"] == "fail"
+    assert windows["post_removal" if phase == "drain" else "drain"]["status"] == "pass"
+
+
+@pytest.mark.parametrize("error_count,expected", [(1, "pass"), (2, "fail")])
+def test_drain_error_rate_is_not_diluted_by_post_exit_successes(error_count, expected):
+    settings, evidence, records = scenario()
+    for index in range(error_count):
+        request_id = f"drain-error-{index}"
+        records.append(records[3].model_copy(update=dict(id=request_id, status="failed", valid=False,
+                       error="503", http_status=503, stream_terminated=False)))
+        evidence["followup_request_ids"].append(request_id)
+    for index in range(10):
+        request_id = f"extra-post-{index}"
+        records.append(records[2].model_copy(update=dict(id=request_id)))
+        evidence["followup_request_ids"].append(request_id)
+    result = evaluate_scale_down(settings, ScaleDownEvidence.model_validate(evidence), records, Limits(max_error_rate=.5))
+    assert result.metrics["results"]["capacity"]["status"] == expected
+
+
+@pytest.mark.parametrize("dispatch,phase", [(49, None), (50, "drain"), (200, "drain"), (409, "drain"), (410, "post_removal"), (1410, None)])
+def test_followup_windows_use_half_open_confirmation_bounds(dispatch, phase):
+    settings, evidence, records = scenario()
+    records.append(records[2].model_copy(update=dict(id="boundary", dispatch_ms=dispatch,
+                   timing_start_ms=dispatch, completed_ms=dispatch + 20)))
+    evidence["followup_request_ids"].append("boundary")
+    windows = evaluate(settings, evidence, records).metrics["results"]["capacity"]["metrics"]["windows"]
+    for name, window in windows.items():
+        assert ("boundary" in window["request_ids"]) == (name == phase)
+
+
+def test_cancelled_drain_response_is_inconclusive_not_endpoint_failure():
+    settings, evidence, records = scenario()
+    records[3] = records[3].model_copy(update=dict(status="cancelled", valid=False, stream_terminated=False))
+    result = evaluate(settings, evidence, records)
+    assert result.status == "inconclusive"
+    assert "Giraffe cancelled" in result.metrics["results"]["capacity"]["summary"]
+
+
+def test_drain_minimum_is_independent_of_post_exit_sample_count():
+    settings, evidence, records = scenario()
+    settings = settings.model_copy(update=dict(min_post_samples=2))
+    records.append(records[2].model_copy(update=dict(id="second-post")))
+    evidence["followup_request_ids"].append("second-post")
+    result = evaluate(settings, evidence, records)
+    assert result.status == "inconclusive"
+    windows = result.metrics["results"]["capacity"]["metrics"]["windows"]
+    assert windows["drain"]["status"] == "inconclusive"
+    assert "Need 2 valid responses; observed 1" in windows["drain"]["summary"]
+    assert windows["post_removal"]["status"] == "pass"
+
+
+def test_drain_failure_outranks_incomplete_post_exit_coverage():
+    settings, evidence, records = scenario()
+    records[3] = records[3].model_copy(update=dict(status="failed", valid=False, error="503"))
+    evidence["post_started_ms"] = evidence["post_ended_ms"] = None
+    result = evaluate(settings, evidence, records)
+    assert result.status == "fail"
+    windows = result.metrics["results"]["capacity"]["metrics"]["windows"]
+    assert windows["drain"]["status"] == "fail"
+    assert windows["post_removal"]["status"] == "inconclusive"
+
+
+def test_drain_timing_is_inconclusive_when_client_delay_overlaps():
+    settings, evidence, records = scenario()
+    evidence["timing_health"] = {"schema_version": 1, "windows": [dict(start_ms=310, end_ms=350, lag_ms=150)]}
+    records[3] = records[3].model_copy(update=dict(completed_ms=620, elapsed_ms=300))
+    result = evaluate_scale_down(settings, ScaleDownEvidence.model_validate(evidence), records, Limits(latency_ms=100))
+    windows = result.metrics["results"]["capacity"]["metrics"]["windows"]
+    assert windows["drain"]["status"] == "inconclusive"
+    assert "client scheduling" in windows["drain"]["summary"]
+    assert windows["post_removal"]["status"] == "pass"
 
 
 def test_interrupted_original_is_not_erased_by_successful_retry():
@@ -196,7 +313,8 @@ def test_abrupt_termination_without_drain_cutoff_fails_original_stream(completio
         latest["coverage"][0]["end_sequence"] = 7
     records[1] = records[1].model_copy(update=dict(status="failed", valid=False, stream_terminated=False, error="connection closed"))
     result = evaluate(settings, evidence, records)
-    assert statuses(result) == dict(continuity="fail", drain="fail", capacity="pass")
+    assert statuses(result) == dict(continuity="fail", drain="fail", capacity="inconclusive")
+    assert result.metrics["results"]["capacity"]["metrics"]["windows"]["post_removal"]["status"] == "pass"
     assert "cutoff" in result.metrics["results"]["drain"]["summary"]
 
 
@@ -205,7 +323,8 @@ def test_completed_before_abrupt_removal_does_not_claim_continuity():
     for snapshot in evidence["snapshots"]:
         snapshot["export"]["events"] = [e for e in snapshot["export"]["events"] if e["kind"] != "drain_effective"]
     result = evaluate(settings, evidence, records)
-    assert statuses(result) == dict(continuity="inconclusive", drain="inconclusive", capacity="pass")
+    assert statuses(result) == dict(continuity="inconclusive", drain="inconclusive", capacity="inconclusive")
+    assert result.metrics["results"]["capacity"]["metrics"]["windows"]["post_removal"]["status"] == "pass"
 
 
 @pytest.mark.parametrize("change", ["future", "conflicting_id", "conflicting_sequence"])

@@ -1952,7 +1952,8 @@ class ScaleDownConfig(Model):
     long_cohort_size: int = Field(default=2, ge=1, le=MAX_SIMULTANEOUS_REQUESTS - 1, strict=True)
     min_baseline_samples: int = Field(default=2, ge=1, le=MAX_ARRIVAL_REQUESTS, strict=True)
     min_overlap_samples: int = Field(default=1, ge=1, le=MAX_SIMULTANEOUS_REQUESTS - 1, strict=True)
-    min_post_samples: int = Field(default=5, ge=1, le=MAX_ARRIVAL_REQUESTS, strict=True)
+    min_post_samples: int = Field(default=5, ge=1, le=MAX_ARRIVAL_REQUESTS, strict=True,
+                                  description="Minimum valid follow-up responses in each drain and post-exit window.")
     baseline_timeout_seconds: float = Field(default=30, gt=0, le=MAX_STAGE_SECONDS)
     event_timeout_seconds: float = Field(default=120, gt=0, le=MAX_STAGE_SECONDS)
     grace_seconds: float = Field(default=30, gt=0, le=MAX_STAGE_SECONDS)

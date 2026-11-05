@@ -28,6 +28,7 @@ def test_three_results_and_original_failed_request_are_visible_in_html():
     for label in ['Client-visible continuity', 'Backend drain semantics', 'Remaining capacity', 'Event timeline', 'router-boot-1', 'operator']:
         assert label in html
     assert 'peer closed' in html
+    assert 'Drain-window requests: pass; post-exit requests: pass.' in html
     assert 'retained answer' not in html
     assert report.checks[0].metrics['results']['continuity']['status'] == 'fail'
     assert report.checks[0].metrics['results']['capacity']['status'] == 'pass'
@@ -45,6 +46,9 @@ def test_reproduction_separates_executable_settings_from_historical_event():
     assert retained.requests[1].dispatch_ms == report.requests[1].dispatch_ms
     assert retained.requests[1].stream_terminated
     assert RunReport.model_validate_json(retained.model_dump_json()).observations == report.observations
+    windows = RunReport.model_validate_json(retained.model_dump_json()).checks[0].metrics['results']['capacity']['metrics']['windows']
+    assert windows['drain']['request_ids'] == ['draining']
+    assert windows['post_removal']['request_ids'] == ['post']
 
 
 def test_automatic_comparison_of_distinct_removals_is_unsupported():

@@ -86,10 +86,28 @@ async def test_graceful_http_removal_preserves_original_and_serves_survivors(tmp
 
 
 @pytest.mark.asyncio
+async def test_drain_only_http_503s_fail_capacity_even_when_post_exit_traffic_succeeds(tmp_path):
+    with FakeReplicaRouter(drain_errors=2) as router:
+        report, check, _ = await exercise(router, config_for(router, tmp_path))
+        assert router.injected_drain_errors == 2
+        assert statuses(check) == dict(continuity="pass", drain="pass", capacity="fail"), check.metrics
+        assert check.status == report.overall == "fail"
+        windows = check.metrics["results"]["capacity"]["metrics"]["windows"]
+        assert windows["drain"]["status"] == "fail"
+        assert windows["post_removal"]["status"] == "pass"
+        failures = [record for record in report.requests if record.http_status == 503]
+        assert len(failures) == 2
+        assert all(record.id in windows["drain"]["request_ids"] for record in failures)
+        assert all(record.id in check.evidence_ids for record in failures)
+        assert not set(windows["drain"]["request_ids"]) & set(windows["post_removal"]["request_ids"])
+
+
+@pytest.mark.asyncio
 async def test_abrupt_http_removal_keeps_original_failure_despite_successful_survivor(tmp_path):
     with FakeReplicaRouter() as router:
         report, check, _ = await exercise(router, config_for(router, tmp_path), mode="abrupt")
-        assert statuses(check) == dict(continuity="fail", drain="fail", capacity="pass"), check.metrics
+        assert statuses(check) == dict(continuity="fail", drain="fail", capacity="inconclusive"), check.metrics
+        assert check.metrics["results"]["capacity"]["metrics"]["windows"]["post_removal"]["status"] == "pass"
         long = next(r for r in report.requests if r.fixture_id == "long")
         assert not long.stream_terminated
         assert long.id in check.metrics["results"]["continuity"]["request_ids"]
@@ -137,7 +155,8 @@ async def test_missing_removed_replica_overlap_never_passes_drain(tmp_path, attr
     with FakeReplicaRouter(attribution=attribution, long_replica=long_replica) as router:
         _, check, _ = await exercise(router, config_for(router, tmp_path))
         assert statuses(check)["drain"] == "inconclusive", check.metrics
-        assert statuses(check)["capacity"] == "pass", check.metrics
+        assert statuses(check)["capacity"] == ("pass" if long_replica == router.b else "inconclusive"), check.metrics
+        assert check.metrics["results"]["capacity"]["metrics"]["windows"]["post_removal"]["status"] == "pass"
 
 
 @pytest.mark.asyncio
@@ -185,7 +204,8 @@ async def test_successful_survivor_attempt_cannot_erase_failed_backend_original(
         report, check, _ = await exercise(router, config_for(router, tmp_path), mode="retry_survivor")
         # The router keeps the HTTP stream valid across the backend retry, so
         # client continuity passes while the failed original means B did not drain.
-        assert statuses(check) == dict(continuity="pass", drain="fail", capacity="pass"), check.metrics
+        assert statuses(check) == dict(continuity="pass", drain="fail", capacity="inconclusive"), check.metrics
+        assert check.metrics["results"]["capacity"]["metrics"]["windows"]["post_removal"]["status"] == "pass"
         long = next(r for r in report.requests if r.fixture_id == "long")
         assert long.valid and long.stream_terminated and long.score is True
         assert long.id in check.metrics["results"]["continuity"]["request_ids"]

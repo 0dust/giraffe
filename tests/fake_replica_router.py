@@ -16,12 +16,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 class FakeReplicaRouter:
     def __init__(self, *, long_replica="replica-b-boot-1", attribution=True,
-                 terminal="stop", release_delay=.35):
+                 terminal="stop", release_delay=.8, drain_errors=0):
         self.a, self.b = "replica-a-boot-1", "replica-b-boot-1"
         self.long_replica = long_replica
         self.attribution = attribution
         self.terminal = terminal
         self.release_delay = release_delay
+        self.drain_errors = drain_errors
+        self.injected_drain_errors = 0
         self.lock = threading.RLock()
         self.stop = threading.Event()
         self.removing = threading.Event()
@@ -137,6 +139,11 @@ class FakeReplicaRouter:
                 payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 long = any(message.get("content") == "LONG" for message in payload["messages"])
                 with router.lock:
+                    if (not long and router.removing.is_set() and not router.terminated
+                            and router.injected_drain_errors < router.drain_errors):
+                        router.injected_drain_errors += 1
+                        self._json(503, {"error": {"message": "controlled drain-only failure"}})
+                        return
                     replica = router.long_replica if long else router.a
                     if (not long and router.mode == "late_admission" and not router.late_admitted
                             and not router.terminated):
