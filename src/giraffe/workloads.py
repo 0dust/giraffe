@@ -201,7 +201,7 @@ async def execute_conversation(run, target, client, config, settings, mode, inde
                                items, prepared_inputs, plan=None, session_id=None,
                                check="sessions", send=None, pause=None):
     """Execute one isolated history; its caller owns user lifetime and admission."""
-    history, previous = [], None
+    history = []
     session_id = session_id or f"{target.name}:{mode}:{index}"
     workload = plan["workload"] if plan else None
     turns = workload.turns[:len(plan["turns"])] if workload else settings.turns
@@ -317,8 +317,8 @@ async def execute_conversation(run, target, client, config, settings, mode, inde
             item["stop_reason"] = "observed context budget reached"
             run.unfinished[target.name].add(check)
             break
-        previous = final_answer(record.output)[0] if mode == "live" else value
-        history = [*messages, {"role": "assistant", "content": previous}]
+        answer = final_answer(record.output)[0] if mode == "live" else value
+        history = [*messages, {"role": "assistant", "content": answer}]
     item["completed_turns"] = len(item["turns"])
     return item
 

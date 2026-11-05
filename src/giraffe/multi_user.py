@@ -19,15 +19,17 @@ def population_plan(settings):
     values = settings.think_time_seconds.values
     weights = settings.think_time_seconds.weights
     variable = len({value for index, value in enumerate(values) if weights is None or weights[index]}) > 1
+    tasks = settings.conversations.workloads if settings.conversations else []
+    task_weights = [task.weight for task in tasks]
     for index in range(max(settings.levels)):
         user_id = f"user-{index + 1:02d}"
-        profile = random.Random(f"{settings.seed}:profile:{index}").choice(settings.shapes)
         task = None
         if settings.conversations:
-            tasks = settings.conversations.workloads
             task = (random.Random(f"{settings.seed}:conversation-task:{index}").choices(
-                range(len(tasks)), weights=[task.weight for task in tasks])[0] if tasks else None)
+                range(len(tasks)), weights=task_weights)[0] if tasks else None)
             profile = "conversation:" + (tasks[task].name if task is not None else "exact_repeat")
+        else:
+            profile = random.Random(f"{settings.seed}:profile:{index}").choice(settings.shapes)
         population.append({"user_id": user_id, "profile": profile,
             "conversation_workload": task,
             "think_time_plan": {"values": values, "weights": weights,
