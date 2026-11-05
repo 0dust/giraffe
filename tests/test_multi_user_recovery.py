@@ -51,6 +51,15 @@ def test_recovery_exposes_one_slow_user_when_median_recovers():
     assert result["worst_user"]["user_id"] == "user-03"
 
 
+@pytest.mark.parametrize("phase", [0, 1, 2])
+def test_recovery_missing_phase_end_is_inconclusive(phase):
+    source, records = recovery_observation()
+    source["windows"][phase]["end_ms"] = None
+    evidence = summarize(source, records)["windows"][-1]["recovery"]
+    assert evidence["status"] == "inconclusive"
+    assert not evidence["qualified"]
+
+
 @pytest.mark.parametrize("fault", ["missing_control", "drift", "missing_usage", "generator", "gap", "partial"])
 def test_unqualified_recovery_cannot_pass(fault):
     source, records = recovery_observation()
@@ -100,6 +109,10 @@ def test_http_same_users_continue_work_and_one_recovers_slowly():
         assert [w["offer_accounting"]["dispatched"] for w in windows] == [3, 6, 3]
         assert all(w["offer_accounting"]["not_offered"] == 0 for w in windows)
         assert endpoint.peak_active == 3
+        assert all(r.workload["ready_ms"] == r.workload["scheduled_ms"] for r in state.records)
+        for window in windows:
+            assert all(r.workload["ready_ms"] >= window["start_ms"] for r in state.records
+                       if r.workload["window_id"] == window["id"])
         for uid in ("user-01", "user-02", "user-03"):
             rows = sorted([r for r in state.records if r.workload["user_id"] == uid], key=lambda r:r.dispatch_ms)
             assert [r.workload["request_sequence"] for r in rows] == [1, 2, 3, 4]

@@ -6,9 +6,9 @@ from pathlib import Path
 
 import pytest
 
-from giraffe import concurrent_load, workloads, logprobs, logprob_workload, runner
+from giraffe import concurrent_load, workloads, logprobs, logprob_workload, runner, session_sampling
 from giraffe.deployment import fixture_hash
-from giraffe.models import RunConfig
+from giraffe.models import RunConfig, Sessions
 from giraffe.reporting import _run_limits_workload_identity, _settings_reasons, compare_baseline
 from tests.test_runner import client as client
 from tests.test_reporting import make_report
@@ -194,7 +194,7 @@ def test_presampling_generator_identity_retains_the_original_session_settings():
     assert _settings_reasons(current, old) == []
 
 
-@pytest.mark.parametrize("revision", ["legacy", "issue45", "issue95", "issue95_pauses", "issue95_pause_evidence", "gateway_policy"])
+@pytest.mark.parametrize("revision", ["legacy", "issue45", "issue95", "issue95_pauses", "issue95_pause_evidence"])
 def test_sampled_sessions_are_never_attested_as_unchanged_historical_traffic(revision):
     current, _, _, _ = reports()
     current.manifest["config"]["sessions"].update(
@@ -310,7 +310,7 @@ def test_shared_executor_preserves_exact_persistent_user_revision_for_legacy_che
     assert "Fixture pack identity differs." in _settings_reasons(current, old)
 
 
-@pytest.mark.parametrize("revision", ["persistent_users", "shared_conversations"])
+@pytest.mark.parametrize("revision", ["persistent_users", "shared_conversations", "gateway_attribution", "gateway_conversations"])
 def test_conversation_wiring_does_not_bridge_multi_user_workloads(revision):
     configured = RunConfig(targets=[{"name": "local", "url": "http://localhost", "model": "test"}],
                            checks=["multi_user"])
@@ -323,6 +323,55 @@ def test_policy_core_merge_retains_both_exact_specialist_predecessors(check, rev
     current, old, _, _ = reports(check)
     old.manifest = deepcopy(current.manifest)
     identity = _run_limits_workload_identity(old.manifest, revision=revision)
+    old.manifest["fixture_pack"]["workload_fixture_sha256"] = fixture_hash(identity)
+    assert _settings_reasons(current, old) == []
+    assert _settings_reasons(old, current) == []
+
+
+def sampled_reports(profile):
+    current, old, _, _ = reports()
+    configured = Sessions(profile=profile, **({'modes':['live'], 'workloads':[{'name':'chat', 'turns':['First','Second','Third']}]} if profile=='performance' else {}), sampling={'seed':73,'think_time_seconds':{'values':[0,.1], 'weights':[1,2]}, **({'turn_count':{'values':[2,3]}, 'output_tokens':{'values':[16,32]}} if profile=='performance' else {})})
+    current.manifest['config']['sessions'] = configured.model_dump(mode='json')
+    old.manifest = deepcopy(current.manifest)
+    for report, generator, sampler in (
+        (current, workloads.FIXTURE_SOURCE_SHA256, hashlib.sha256(Path(session_sampling.__file__).read_bytes()).hexdigest()),
+        (old, 'aee9ca71bc5ffd780d1574422b761e3177471a12f951a10b04322573ca062f76', '2fab1370faeab7ddb91a7ae9c0e49520ee9a67e305441a0663877bb12bca24c3')):
+        identity = {'generator_source_sha256':generator, 'session_sampling_source_sha256':sampler, 'settings':{'sessions':configured.model_dump(mode='json')}}
+        report.manifest['fixture_pack']['workload_fixture_sha256'] = fixture_hash(identity)
+    return current, old
+
+@pytest.mark.parametrize('profile',['correctness','performance'])
+def test_exact_predecessor_sampled_sessions_remain_comparable(profile):
+    current, old = sampled_reports(profile)
+    assert _settings_reasons(current, old) == []
+    assert _settings_reasons(old, current) == []
+
+
+@pytest.mark.parametrize("which", ["current", "baseline"])
+def test_sampled_session_bridge_rejects_unknown_sampling_sources(which):
+    current, old = sampled_reports("performance")
+    report = current if which == "current" else old
+    identity = _run_limits_workload_identity(report.manifest,
+        revision="policy_conversations" if which == "current" else "persistent_users")
+    identity["session_sampling_source_sha256"] = "unreviewed-sampler"
+    report.manifest["fixture_pack"]["workload_fixture_sha256"] = fixture_hash(identity)
+    assert "Fixture pack identity differs." in _settings_reasons(current, old)
+
+
+def test_sampled_session_bridge_rejects_changed_sampling_settings():
+    current, old = sampled_reports("performance")
+    current.manifest["config"]["sessions"]["sampling"]["seed"] += 1
+    identity = _run_limits_workload_identity(current.manifest, revision="policy_conversations")
+    current.manifest["fixture_pack"]["workload_fixture_sha256"] = fixture_hash(identity)
+    assert "Fixture pack identity differs." in _settings_reasons(current, old)
+
+
+@pytest.mark.parametrize("revision", ["gateway_policy", "gateway_conversations"])
+@pytest.mark.parametrize("profile", ["correctness", "performance"])
+def test_policy_sampled_session_bridge_preserves_exact_gateway_predecessors(profile, revision):
+    current, old = sampled_reports(profile)
+    identity = _run_limits_workload_identity(old.manifest, revision=revision)
+    assert identity is not None
     old.manifest["fixture_pack"]["workload_fixture_sha256"] = fixture_hash(identity)
     assert _settings_reasons(current, old) == []
     assert _settings_reasons(old, current) == []
