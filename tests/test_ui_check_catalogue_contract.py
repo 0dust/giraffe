@@ -17,6 +17,7 @@ NAMES = {
     'gpu': 'GPU metrics', 'prefix': 'Prefix cache',
     'sessions': 'Multi-turn sessions', 'multi_user': 'Multi-user', 'consistency': 'Answer consistency',
     'tools': 'Tool calling',
+    'gateway_attribution': 'Gateway usage attribution',
 }
 
 

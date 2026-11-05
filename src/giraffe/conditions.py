@@ -12,6 +12,7 @@ from typing import Any
 
 
 _SCENARIOS = {
+    "gateway_attribution": ("Gateway usage attribution", "gateway_attribution"),
     "initial": ("First request", "access"),
     "readiness": ("Readiness", "access"),
     "warm": ("Warm-up", "serving"),

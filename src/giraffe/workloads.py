@@ -507,7 +507,7 @@ async def execute(run, target, client, fixtures):
         ("tool_calling", tools),
     ):
         selected = WORKLOAD_CHECKS[field].intersection(run.config.checks)
-        if selected and getattr(run.config, field):
+        if selected and (getattr(run.config, field) or field == "gateway_attribution"):
             run.emit("scenario_started", target.name, field)
             if field not in {"load_test", "multi_user", "gateway_attribution"} and not run.allowed(target.name):
                 run.unfinished[target.name].update(selected)
