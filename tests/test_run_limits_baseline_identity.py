@@ -299,7 +299,7 @@ def test_shared_executor_preserves_exact_persistent_user_revision_for_legacy_che
     assert "Fixture pack identity differs." in _settings_reasons(current, old)
 
 
-@pytest.mark.parametrize("revision", ["persistent_users", "shared_conversations"])
+@pytest.mark.parametrize("revision", ["persistent_users", "shared_conversations", "gateway_attribution", "gateway_conversations"])
 def test_conversation_wiring_does_not_bridge_multi_user_workloads(revision):
     configured = RunConfig(targets=[{"name": "local", "url": "http://localhost", "model": "test"}],
                            checks=["multi_user"])
@@ -330,7 +330,7 @@ def test_sampled_session_bridge_rejects_unknown_sampling_sources(which):
     current, old = sampled_reports("performance")
     report = current if which == "current" else old
     identity = _run_limits_workload_identity(report.manifest,
-        revision="shared_conversations" if which == "current" else "persistent_users")
+        revision="gateway_conversations" if which == "current" else "persistent_users")
     identity["session_sampling_source_sha256"] = "unreviewed-sampler"
     report.manifest["fixture_pack"]["workload_fixture_sha256"] = fixture_hash(identity)
     assert "Fixture pack identity differs." in _settings_reasons(current, old)
@@ -339,6 +339,6 @@ def test_sampled_session_bridge_rejects_unknown_sampling_sources(which):
 def test_sampled_session_bridge_rejects_changed_sampling_settings():
     current, old = sampled_reports("performance")
     current.manifest["config"]["sessions"]["sampling"]["seed"] += 1
-    identity = _run_limits_workload_identity(current.manifest, revision="shared_conversations")
+    identity = _run_limits_workload_identity(current.manifest, revision="gateway_conversations")
     current.manifest["fixture_pack"]["workload_fixture_sha256"] = fixture_hash(identity)
     assert "Fixture pack identity differs." in _settings_reasons(current, old)

@@ -179,7 +179,7 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str) -> dict | No
         if not set(resolved.checks) <= unchanged_checks:
             return None  # Load generators changed; attest unchanged specialists only.
     sampled_sessions = "sessions" in resolved.checks and resolved.sessions and resolved.sessions.sampling is not None
-    if sampled_sessions and revision not in {"persistent_users", "shared_conversations"}:
+    if sampled_sessions and revision not in {"persistent_users", "shared_conversations", "gateway_attribution", "gateway_conversations"}:
         return None  # Earlier revisions have no attested sampled-traffic equivalent.
     settings = {}
     for field, checks in WORKLOAD_CHECKS.items():
@@ -215,6 +215,8 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str) -> dict | No
         identity["session_sampling_source_sha256"] = {
             "persistent_users": "2fab1370faeab7ddb91a7ae9c0e49520ee9a67e305441a0663877bb12bca24c3",
             "shared_conversations": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
+            "gateway_attribution": "2fab1370faeab7ddb91a7ae9c0e49520ee9a67e305441a0663877bb12bca24c3",
+            "gateway_conversations": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
         }[revision]
     if "concurrency" in resolved.checks:
         identity["concurrent_load_source_sha256"] = {
