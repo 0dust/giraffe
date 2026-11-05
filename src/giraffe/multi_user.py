@@ -208,6 +208,31 @@ async def execute(run, target, client):
 
 
 def result(run, target):
+    from giraffe.multi_user_metrics import summarize
+    from giraffe.overlap import scheduling_delay_windows
+
     observation = run.observations[target.name].get("multi_user", {})
-    return CheckResult(id="multi_user", target=target.name, title="Multi-user", status="inconclusive",
-                       summary="Per-user measurement windows recorded.", metrics={"multi_user": observation})
+    observation["scheduling_delay_windows"] = [
+        {"start_ms": start, "end_ms": end}
+        for start, end in scheduling_delay_windows(run).windows]
+    records = [r for r in run.records if r.target == target.name and "multi_user" in r.check_ids]
+    health = getattr(run, "timing_health", None)
+    summary = summarize(observation, records, timing_health=health.snapshot() if health else None,
+                        legacy_max_lag_ms=run.max_lag_ms)
+    observation["summary"] = summary
+    status = summary["status"]
+    if status == "measured":
+        message = "Per-user delivery measured; no acceptance criteria selected."
+    elif status == "fail":
+        worst = summary["worst_user"]
+        message = (f"{summary['failed_user_windows']} user measurements failed; "
+                   f"{worst['user_id']} at {worst['population']} users: "
+                   + " ".join(worst["reasons"]))
+    elif status == "pass":
+        message = "Every measured user met the selected criteria over the common windows."
+    else:
+        message = "Per-user acceptance is inconclusive because required evidence is incomplete."
+    return CheckResult(id="multi_user", target=target.name, title="Multi-user",
+                       status="inconclusive" if status == "measured" else status,
+                       summary=message, metrics={"multi_user": summary},
+                       evidence_ids=[r.id for r in records])

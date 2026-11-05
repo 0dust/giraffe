@@ -245,3 +245,21 @@ def test_preparation_interruption_preserves_unactivated_population(monkeypatch):
         assert not state.records
 
     run_virtual(monkeypatch, scenario())
+
+
+def test_result_uses_scheduler_windows_and_keeps_all_users(monkeypatch):
+    from giraffe.multi_user import execute, result
+
+    async def scenario():
+        cfg = settings()
+        state = runner._Run(cfg, None, None)
+        await execute(state, cfg.targets[0], FakeClient(cfg.targets[0], cfg))
+        check = result(state, cfg.targets[0])
+        summary = check.metrics["multi_user"]
+        assert len(summary["windows"][0]["users"]) == 20
+        assert summary["status"] == check.status == "pass"
+        assert sum(user["outcomes"]["attempted"] for user in summary["windows"][0]["users"]) == len(state.records)
+        assert state.observations["service"]["multi_user"]["summary"] == summary
+        assert check.evidence_ids == [r.id for r in state.records]
+
+    run_virtual(monkeypatch, scenario())

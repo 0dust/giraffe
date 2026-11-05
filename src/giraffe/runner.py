@@ -2665,8 +2665,8 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
         workload_identity["session_sampling_source_sha256"] = hashlib.sha256(
             Path(session_sampling.__file__).read_bytes()).hexdigest()
     if "multi_user" in config.checks:
-        from giraffe import multi_user, load_test, concurrent_load
-        workload_identity["multi_user_source_sha256"] = hashlib.sha256(b"".join(Path(m.__file__).read_bytes() for m in (multi_user, load_test, concurrent_load))).hexdigest()
+        from giraffe import multi_user, multi_user_metrics, load_test, concurrent_load
+        workload_identity["multi_user_source_sha256"] = hashlib.sha256(b"".join(Path(m.__file__).read_bytes() for m in (multi_user, multi_user_metrics, load_test, concurrent_load))).hexdigest()
         workload_identity["multi_user_window_policy"] = multi_user.WINDOW_POLICY
     if "load" in config.checks:
         from giraffe import load_test, concurrent_load, traffic
