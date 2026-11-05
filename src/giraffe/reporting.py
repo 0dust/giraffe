@@ -291,7 +291,8 @@ def _same_load_workload(current: dict, old: dict) -> bool:
          ("9b694c97a39d449d8ea15b09a9aeb406bf835179c0882827685c4d7888687d36",
           "df3b7bbf30cab87d2e8c1c6dab8819f9cfe592b181407caa7c32af4c5f720cd4")),
         (("d9a9e921584262148e06b636f0e8f195b7e530fd2a69c5e98f013359cf947ede",
-          "bcdc3b8411d9039e90a35bcd5b109504e7123e95ec6baebd5e654287b4774605"),
+          "bcdc3b8411d9039e90a35bcd5b109504e7123e95ec6baebd5e654287b4774605",
+          "7c1455ec2c7d65ec707e41ef1864d117fe72fe6f919ba18992e84f39b2449181"),
          ("113325dd5cffa04626cc7be7ee93bc6e9be67335531288bc329b3542a155c92a",)),
     )
     settings = []
