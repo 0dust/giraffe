@@ -15,7 +15,7 @@ from giraffe.models import Arrival, Limits, RunConfig
 from tests.test_fixtures import record
 from tests.test_gpu_reliability import snapshot
 from tests.test_runner import FakeClient, check, config
-from tests.test_review26_phase4_accuracy import run_virtual
+from tests.virtual_clock import run_virtual
 from tests.test_scoring_reliability import fixture
 from tests.test_workload_reliability import MemoryEndpoint
 from tests.test_workloads import config as workload_config

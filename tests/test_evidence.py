@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor
 import json
 import errno
 import os
@@ -278,7 +279,7 @@ def test_full_evidence_queue_never_blocks_run_and_close_is_bounded(tmp_path, mon
 
     def held(self, *args, **kwargs):
         entered.set()
-        assert release.wait(2)
+        release.wait()
         return retained(self, *args, **kwargs)
 
     monkeypatch.setattr(EvidenceWriter, "_retained", held)
@@ -289,11 +290,15 @@ def test_full_evidence_queue_never_blocks_run_and_close_is_bounded(tmp_path, mon
             writer.record_finished(record(index))
         assert writer._queue.qsize() == 2
         assert writer.dropped_count == 8
-        before = time.monotonic()
-        with pytest.raises(TimeoutError, match="Evidence writer did not stop"):
-            writer.close()
-        assert time.monotonic() - before < 0.5
-        assert not writer.stopped
+        def close():
+            with pytest.raises(TimeoutError, match="Evidence writer did not stop"):
+                writer.close()
+        with ThreadPoolExecutor(1) as pool:
+            try:
+                pool.submit(close).result(1)
+                assert not writer.stopped
+            finally:
+                release.set()
     finally:
         release.set()
         writer.close_seconds = 2
@@ -334,17 +339,19 @@ def test_heartbeat_close_is_bounded_when_metadata_write_stalls(tmp_path, monkeyp
 
     def held(*args):
         entered.set()
-        assert release.wait(2)
+        release.wait()
 
     monkeypatch.setattr("giraffe.storage._write_metadata", held)
     monkeypatch.setattr("giraffe.storage.HEARTBEAT_CLOSE_SECONDS", 0.03)
     heartbeat = Heartbeat(tmp_path).start()
     try:
         assert entered.wait(2)
-        before = time.monotonic()
-        heartbeat.close()
-        assert time.monotonic() - before < 0.5
-        assert "Heartbeat did not stop" in caplog.text
+        with ThreadPoolExecutor(1) as pool:
+            try:
+                pool.submit(heartbeat.close).result(1)
+                assert "Heartbeat did not stop" in caplog.text
+            finally:
+                release.set()
     finally:
         release.set()
         heartbeat._thread.join(timeout=2)

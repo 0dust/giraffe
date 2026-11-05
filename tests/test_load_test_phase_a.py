@@ -581,7 +581,7 @@ async def test_html_report_data_and_measure_only_has_no_accepted_capacity():
 
 
 def test_virtual_clock_run_suite_uses_unified_load_and_preserves_accounting(monkeypatch):
-    from tests.test_review26_phase4_accuracy import run_virtual
+    from tests.virtual_clock import run_virtual
     from tests.test_runner import FakeClient
     from giraffe import runner
     from giraffe.latency import latency_summary
@@ -610,7 +610,7 @@ def test_virtual_clock_run_suite_uses_unified_load_and_preserves_accounting(monk
 
 
 def test_virtual_clock_budgets_truncate_and_cancel_without_endpoint_failure(monkeypatch):
-    from tests.test_review26_phase4_accuracy import run_virtual
+    from tests.virtual_clock import run_virtual
     from tests.test_runner import FakeClient
     from giraffe import runner
 

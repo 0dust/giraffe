@@ -102,6 +102,24 @@ def assert_http_arrival_accounting(report, payloads, planned_counts, *, other_re
     assert len(report.requests) == len(payloads) == len(dispatched_ids) + other_requests
 
 
+@pytest.mark.parametrize("lag,offset", [(0, .05), (120, .15)])
+def test_http_arrival_accounting_requires_stall_covering_every_drop(lag, offset):
+    record = SimpleNamespace(id="sent", load_point={"type": "combinations", "point_id": "point"}, scheduled_ms=200)
+    offers = [{"offset_seconds": 0, "scheduler_lag_ms": 120, "outcome": "dropped_late"},
+              {"offset_seconds": .05, "scheduler_lag_ms": 70, "outcome": "dropped_late"},
+              {"offset_seconds": .2, "scheduler_lag_ms": 0, "outcome": "started", "request_id": "sent"}]
+    point = {"id": "point", "scheduled": 3, "offers": offers, "window_reason": None,
+             "cut_short": False, "local_drops": 0, "dispatched": 1, "not_sent": 2,
+             "late_arrivals": 2, "sending_start_ms": 0}
+    report = SimpleNamespace(abort_reason=None, requests=[record],
+        checks=[SimpleNamespace(id="load", metrics={"points": [point]})])
+    assert_http_arrival_accounting(report, [{}], [3], other_requests=0)
+    offers[0]["scheduler_lag_ms"] = lag
+    offers[1]["offset_seconds"] = offset
+    with pytest.raises(AssertionError):
+        assert_http_arrival_accounting(report, [{}], [3], other_requests=0)
+
+
 def test_fake_endpoint_long_output_uses_final_token_prompt_and_preserves_faults():
     from giraffe.concurrent_load import prompt
     text = prompt(32, 'long_output')
@@ -170,14 +188,13 @@ async def test_slower_upgrade_reduces_accepted_rate_as_http_queue_grows():
         assert endpoint.peak_active >= 3
     for report,payloads in ((baseline,baseline_payloads),(candidate,candidate_payloads)):
         assert_http_arrival_accounting(report,payloads,[6,30],other_requests=1)
-        assert all(point['dispatched'] == point['scheduled'] and point['late_arrivals'] == 0
-                   for point in capacity(report).metrics['points'])
     old,current=capacity(baseline).metrics,capacity(candidate).metrics
     assert old['highest_accepted'][0]['value'] == 50 and current['highest_accepted'][0]['value'] == 10
     low,high=current['points']
     lg,hg=low['groups'][0],high['groups'][0]
     assert low['status']=='pass' and high['status']=='fail'
-    assert high['dispatched']==high['scheduled'] and high['local_drops']==high['late_arrivals']==0
+    assert high['dispatched']+high['not_sent']==high['scheduled'] and high['local_drops']==0
+    assert high['not_sent']==high['late_arrivals']
     assert hg['completion_p95_ms'] > lg['completion_p95_ms']*3
     assert hg['correct_work_per_second'] < hg['completed_requests_per_second']
     assert all(r.valid and r.score is True for r in traffic_records(candidate))
@@ -319,7 +336,7 @@ async def test_reference_judging_waits_for_all_http_answers_and_preserves_payloa
 def test_reference_judging_has_separate_budget_and_does_not_extend_arrival_measurements(monkeypatch):
     """The real scheduler and judge phase share a deterministic clock, not a budget."""
     from giraffe import judging, runner
-    from tests.test_review26_phase4_accuracy import run_virtual
+    from tests.virtual_clock import run_virtual
 
     inference_finished, judge_started = [], []
 

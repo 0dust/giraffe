@@ -489,7 +489,7 @@ def test_load_budget_action_excludes_local_preparation_and_groups_visible_names(
 def test_load_dataset_controls_count_matches_real_runner_without_extra_loaded_pass(monkeypatch):
     from collections import Counter
     from giraffe import runner
-    from tests.test_review26_phase4_accuracy import run_virtual
+    from tests.virtual_clock import run_virtual
     from tests.test_runner import FakeClient
 
     async def scenario():

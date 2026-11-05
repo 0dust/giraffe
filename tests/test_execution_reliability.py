@@ -178,7 +178,7 @@ async def test_restart_readiness_deadline_bounds_backoff_and_inflight_request(mo
 
 def test_healthy_capacity_retains_all_offers_and_following_serial_overlap(monkeypatch, local_tokenizer):
     from tests.test_concurrent_load import configuration,short_windows,Client as TokenClient
-    from tests.test_review26_phase4_accuracy import run_virtual
+    from tests.virtual_clock import run_virtual
 
     class Healthy(TokenClient):
         def __init__(self,*args,max_connections=None): super().__init__()

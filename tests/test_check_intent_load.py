@@ -400,7 +400,7 @@ async def test_duration_elapsed_needs_time_weighted_occupancy(endpoint, monkeypa
 
 
 def test_unscored_sustained_completions_block_a_recovery_pass(endpoint, monkeypatch):
-    from tests.test_review26_phase4_accuracy import run_virtual
+    from tests.virtual_clock import run_virtual
 
     async def scenario():
         monkeypatch.setattr("tests.test_load_reliability.time", runner.time)
