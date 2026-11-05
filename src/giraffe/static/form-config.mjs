@@ -291,6 +291,8 @@ export function multiUserSettings(config, defaults) {
   result.profile=Object.fromEntries(loadSizes.map(size=>[size,{...defaults.profile[size],...saved.profile?.[size]}]));
   result.pass_criteria={...defaults.pass_criteria,...saved.pass_criteria};
   result.think_time_seconds={...defaults.think_time_seconds,...saved.think_time_seconds};
+  result.noisy_neighbors={...defaults.noisy_neighbors,...saved.noisy_neighbors};
+  result.cancellation={...defaults.cancellation,...saved.cancellation};
   return result;
 }
 
@@ -300,6 +302,16 @@ export function configureMultiUser(source, values, defaults, {allowInvalid=false
   const settings=multiUserSettings(source,defaults);
   const number=(name,label)=>numeric(values.get('multi_user_'+name),label,allowInvalid);
   const list=(name,label)=>String(values.get('multi_user_'+name)||'').split(',').map(value=>numeric(value.trim(),label,allowInvalid));
+  if(values.has('multi_user_scenarios_rendered'))settings.scenarios=['repeated_requests','noisy_neighbors','cancellation'].filter(name=>values.get('multi_user_scenario_'+name)==='on');
+  if(values.has('multi_user_noisy_neighbors_profiles_rendered'))settings.noisy_neighbors.heavy_profiles=['long_short','short_long','long_long'].filter(name=>values.get('multi_user_noisy_neighbors_profile_'+name)==='on');
+  if(values.has('multi_user_noisy_neighbors_triggers_rendered'))settings.noisy_neighbors.triggers=['before_output','during_stream'].filter(name=>values.get('multi_user_noisy_neighbors_trigger_'+name)==='on');
+  if(values.has('multi_user_noisy_neighbors_heavy_user_ids')){
+    const text=String(values.get('multi_user_noisy_neighbors_heavy_user_ids')||'').trim();
+    settings.noisy_neighbors.heavy_user_ids=text?text.split(',').map(value=>value.trim()):null;
+  }
+  for(const name of ['heavy_user_count','max_slowdown'])if(values.has('multi_user_noisy_neighbors_'+name))settings.noisy_neighbors[name]=number('noisy_neighbors_'+name,name);
+  if(values.has('multi_user_cancellation_user_id'))settings.cancellation.user_id=String(values.get('multi_user_cancellation_user_id')||'').trim();
+  if(values.has('multi_user_cancellation_cancel_after_chunks'))settings.cancellation.cancel_after_chunks=number('cancellation_cancel_after_chunks','Cancellation chunks');
   if(values.has('multi_user_levels'))settings.levels=list('levels','User levels');
   for(const name of ['duration_seconds','warmup_seconds','seed','fairness_tolerance_percent'])if(values.has('multi_user_'+name))settings[name]=number(name,name);
   if(values.has('multi_user_think_time_values'))settings.think_time_seconds.values=list('think_time_values','Pause values');

@@ -12,6 +12,42 @@ def configuration():
                      checks=['multi_user'], concurrency=5, multi_user={'levels': [20]})
 
 
+def test_multi_user_scenarios_form_roundtrip_and_field_destinations():
+    value = browser_logic(r'''
+const markup=renderMultiUserEditor(config);
+for(const name of ['scenario_noisy_neighbors','scenario_cancellation','noisy_neighbors_heavy_user_ids','noisy_neighbors_heavy_user_count','noisy_neighbors_max_slowdown','cancellation_user_id','cancellation_cancel_after_chunks'])assert(markup.includes('name="multi_user_'+name+'"'));
+const form=new FormData();form.set('multi_user_rendered','1');form.set('multi_user_scenarios_rendered','1');
+form.set('multi_user_scenario_noisy_neighbors','on');form.set('multi_user_scenario_cancellation','on');
+form.set('multi_user_noisy_neighbors_heavy_user_ids','user-03, user-04');
+form.set('multi_user_noisy_neighbors_heavy_user_count','2');form.set('multi_user_noisy_neighbors_max_slowdown','1.5');
+form.set('multi_user_noisy_neighbors_profiles_rendered','1');form.set('multi_user_noisy_neighbors_profile_short_long','on');
+form.set('multi_user_noisy_neighbors_triggers_rendered','1');form.set('multi_user_noisy_neighbors_trigger_before_output','on');
+form.set('multi_user_cancellation_user_id','user-02');form.set('multi_user_cancellation_cancel_after_chunks','3');
+const result=configureMultiUser(config,form,bootstrap.multi_user.defaults);
+assert.equal(JSON.stringify(result.multi_user.scenarios),'["noisy_neighbors","cancellation"]');
+assert.equal(JSON.stringify(result.multi_user.noisy_neighbors.heavy_profiles),'["short_long"]');
+assert.equal(JSON.stringify(result.multi_user.noisy_neighbors.triggers),'["before_output"]');
+assert.equal(settingPath('multi_user_cancellation_user_id'),'multi_user.cancellation.user_id');
+assert.equal(settingPath('multi_user_noisy_neighbors_max_slowdown'),'multi_user.noisy_neighbors.max_slowdown');
+assert.equal(settingDestination('multi_user.noisy_neighbors.heavy_user_ids.0').name,'multi_user_noisy_neighbors_heavy_user_ids');
+console.log(JSON.stringify(result));
+''', configuration())
+    resolved = RunConfig.model_validate(value)
+    assert resolved.multi_user.noisy_neighbors.heavy_user_ids == ['user-03', 'user-04']
+    assert resolved.multi_user.cancellation.cancel_after_chunks == 3
+
+
+def test_scenario_results_show_separate_observations_and_request_links():
+    from tests.test_multi_user_reporting import scenario_report
+    summary = scenario_report().checks[0].metrics['multi_user']
+    browser_logic('const summary='+json.dumps(summary)+r''';
+const markup=renderMultiUserResults(summary);
+for(const text of ['Matched noisy-neighbor comparison','Missing heavy overlap','Selected request cancellation','Peer continuation','Same-user follow-up','Backend compute and memory release: unverified'])assert(markup.includes(text));
+assert.match(markup,/data-request="user-01-1"/);
+assert.match(markup,/data-request="user-02-1"/);
+''', configuration())
+
+
 def test_multi_user_form_and_drawer_roundtrip():
     result = browser_logic(r'''
 const original=JSON.stringify(config),check=bootstrap.checks.find(c=>c.id==='multi_user');

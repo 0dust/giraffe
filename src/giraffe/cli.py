@@ -1177,6 +1177,31 @@ def _print_result(report: RunReport, json_path: Path, html_path: Path | None,
             if window.get("phase") != "measurement":
                 continue
             print(f"  {window['population']} users · {window.get('duration_seconds', 0):.3g} / {window['planned_duration_seconds']:g} planned seconds")
+            if window.get("role"):
+                print("    " + " · ".join(str(window[key]) for key in ("scenario", "role", "trigger", "heavy_profile") if window.get(key)))
+            if evidence := window.get("interference"):
+                print(f"    Matched noisy-neighbor comparison: {evidence['status']}")
+                for reason in evidence.get("reasons", []):
+                    print(f"      {reason}")
+                for user in evidence.get("users", []):
+                    print(f"      {user['user_id']}: {user['status']} · {user.get('matched_samples', 0)} matched samples · "
+                          f"slowdown {user.get('slowdown')} · first/completion/gap change "
+                          f"{user.get('first_answer_change_ms')} / {user.get('completion_change_ms')} / "
+                          f"{user.get('stream_gap_change_ms')} ms · output change {user.get('output_tokens_change')} tokens")
+                    print(f"        Actual input medians {user.get('control_input_median_tokens')} → {user.get('probe_input_median_tokens')}; "
+                          f"output medians {user.get('control_output_median_tokens')} → {user.get('probe_output_median_tokens')}")
+                    for reason in user.get("reasons", []):
+                        print(f"        {reason}")
+                    for name in ("control_request_ids", "probe_request_ids", "heavy_request_ids"):
+                        print(f"        {name}: {', '.join(user.get(name, [])) or 'none'}")
+            if evidence := window.get("cancellation"):
+                print(f"    Selected user: {evidence.get('selected_user_id')} · {evidence['status']}")
+                for key, label in (("cancellation", "Selected request cancellation"),
+                                   ("peer_continuation", "Peer continuation"), ("followup", "Same-user follow-up")):
+                    item = evidence.get(key, {})
+                    print(f"      {label}: {item.get('status', 'inconclusive')} · "
+                          f"{' '.join(item.get('reasons', []))} · requests: {', '.join(item.get('request_ids', [])) or 'none'}")
+                print("      Backend compute and memory release: unverified")
             fairness = window.get("fairness")
             if fairness:
                 ratio = fairness.get("ratio")

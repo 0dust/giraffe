@@ -976,7 +976,7 @@ The opt-in **Multi-user** check keeps a stable simulated user across repeated in
 giraffe run --config examples/multi-user.yaml --output runs/multi-user --html
 ```
 
-Set the endpoint and model first. All simulated users share its optional `api_key_env`; these are workload identities, not separate credentials. Interference, cancellation scenarios, arrivals and recovery remain separate follow-up work.
+Set the endpoint and model first. All simulated users share its optional `api_key_env`; these are workload identities, not separate credentials. Select repeated work, noisy neighbors or cancellation with `multi_user.scenarios`. Arrivals and recovery remain separate follow-up work.
 
 `multi_user.levels` selects populations of 1–32 users independently of the run's `concurrency` ceiling. The example runs 1, 5 and 20 users behind five shared request slots. Each user sends one request at a time, waits for completion and then pauses. Sleeping users hold no request slot. `think_time_seconds.values` and optional `weights` reuse the session distribution format; `seed` makes each user's profile and pause sequence reproducible across levels. `shapes` selects the existing short/medium/long input-output combinations; `profile` accepts the existing increasing token-size profile. Requests keep the run's request timeout and all existing global budgets.
 
@@ -1020,3 +1020,42 @@ Each user alternates the selected modes across fresh conversations. Fixed histor
 A failed, cancelled or truncated turn stops its conversation without a substitute answer. The user can then start a fresh conversation, subject to the shared budgets and stop rules. If no turn can be dispatched (for example, its first prompt exceeds the history admission ceiling), that user stops instead of repeatedly attempting the same impossible history. Every conversation has a distinct ID and request/turn links under the same user. Conversation summaries and links survive response retention. Existing Sessions counts and concurrency semantics remain unchanged.
 
 Reproduction and baseline identity include fairness criteria, comparability tolerance, conversation settings and generator sources. Changed work or window policies cannot pass a baseline comparison. Live history can vary between runs; actual shape and hash evidence remain authoritative.
+
+### Matched noisy neighbors
+
+Select `noisy_neighbors` to compare each short user's responses with its own short-only control. Every selected heavy profile and trigger gets a control window followed by a probe window of `duration_seconds` each. Short users retain their IDs, matched logical work and pause plans. The probe adds the selected heavy users, subject to the same request slots and run budgets. These scenarios use independent requests; `conversations` must be absent or `null`.
+
+For example, replace the `multi_user` block in [multi-user.yaml](../examples/multi-user.yaml) with:
+
+```yaml
+multi_user:
+  scenarios: [noisy_neighbors, cancellation]
+  levels: [3]
+  duration_seconds: 5
+  think_time_seconds: {values: [0.1]}
+  noisy_neighbors:
+    heavy_user_ids: [user-03]
+    heavy_profiles: [long_short, short_long]
+    triggers: [before_output, during_stream]
+    max_slowdown: 1.5
+  cancellation:
+    user_id: user-03
+    cancel_after_chunks: 5
+  pass_criteria:
+    min_samples: 2
+    max_error_percent: 0
+```
+
+`heavy_user_ids` selects explicit persistent IDs. Omit it to select the first `heavy_user_count` users (default 1). Every selected level must contain the heavy users and at least one short user. Each `heavy_profiles` entry selects long input (`long_short`), long output (`short_long`), or both (`long_long`); sizes come from the existing `profile` token settings. Short users use `short_short`.
+
+`before_output` dispatches heavy work while a short request has started but has not produced output. `during_stream` waits for short-user streaming progress. A requested trigger is not proof that overlap occurred: the report retains actual dispatch, output, lengths and matched request evidence. Fast short responses, early completion of heavy work, mismatched input/output lengths, missing usage, insufficient samples, client timing interference or an exhausted budget leave the comparison inconclusive. The tolerance for comparable actual lengths and exposure is `fairness_tolerance_percent`.
+
+Each short-user comparison shows the control/probe sample associations, actual median input/output lengths, completion slowdown, first-answer and stream-gap changes, and output change. `max_slowdown` optionally limits the matched completion-time ratio. Omitting it measures the difference without claiming acceptance. Per-user errors and selected latency criteria remain visible even if the interference comparison is inconclusive. These measurements describe observed interference under the tested workload; they do not identify a particular server scheduling cause.
+
+### Cancel one user while peers continue
+
+Select `cancellation` to interrupt the selected user's first long-output response after `cancel_after_chunks` output chunks and then send another request under that user's original ID. Other users continue their work. Every population level needs at least two users and must include `cancellation.user_id`.
+
+Results separately qualify the selected cancellation, peer output across cancellation, and same-user follow-up. A response that ends before the cancellation opportunity, missing peer overlap, or incomplete follow-up stays inconclusive. Successful follow-up alone does not establish that the backend released compute or memory. Run Stop still terminates the whole run; undispatched work remains distinct from HTTP attempts and partial responses follow the configured retention policy.
+
+The UI, CLI, HTML, JSON and reproduction export expose the same scenario observations and request associations. Baselines keep control/probe roles, trigger and heavy profile separate, and refuse passing comparisons when scenario configuration, work identity or window policies differ. Give the run enough time and requests for every selected window: the example above schedules eight five-second noisy-neighbor windows plus one five-second cancellation window, followed by any needed drain time. Real-engine conclusions still require runs against the intended endpoint, model and hardware.

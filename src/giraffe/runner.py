@@ -650,7 +650,7 @@ class _Run:
                     on_start()
                 self.emit("request_started", target.name, spec.scenario,
                           request_slot=request_slot, fixture_id=spec.fixture_id,
-                          **({"user": {key: spec.workload[key] for key in ("user_id", "population", "profile", "window_id", "phase", "request_sequence", "session_id", "turn_id", "conversation_sequence") if key in spec.workload}} if "multi_user" in spec.check_ids else {}),
+                          **({"user": {key: spec.workload[key] for key in ("user_id", "population", "profile", "window_id", "phase", "request_sequence", "session_id", "turn_id", "conversation_sequence", "role", "matched_work_sequence", "trigger", "heavy_profile", "cancellation_role") if key in spec.workload}} if "multi_user" in spec.check_ids else {}),
                           input_chars=request_parameters["input_chars"], requested_max_tokens=output_cap,
                           requested_input_tokens=spec.requested_input_tokens,
                           condition_id=condition_id, condition_summary=dict(condition) if condition else None)
@@ -818,7 +818,7 @@ class _Run:
                               condition_id=condition_id, condition_summary=dict(condition) if condition else None,
                               input_chars=request_parameters["input_chars"], requested_max_tokens=output_cap,
                               requested_input_tokens=spec.requested_input_tokens,
-                              **({"user": {key: spec.workload[key] for key in ("user_id", "population", "profile", "window_id", "phase", "request_sequence", "session_id", "turn_id", "conversation_sequence") if key in spec.workload}} if "multi_user" in spec.check_ids else {}),
+                              **({"user": {key: spec.workload[key] for key in ("user_id", "population", "profile", "window_id", "phase", "request_sequence", "session_id", "turn_id", "conversation_sequence", "role", "matched_work_sequence", "trigger", "heavy_profile", "cancellation_role") if key in spec.workload}} if "multi_user" in spec.check_ids else {}),
                               request_slot=request_slot, request=record.model_dump(mode="json", include={
                                   "id", "target", "fixture_id", "scenario", "condition_id", "intentional", "status", "valid", "score",
                                   "elapsed_ms", "first_output_ms", "check_ids", "http_status",
