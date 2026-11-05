@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-import os
-
+from giraffe.identities import identity_headers
 from giraffe.models import CheckResult, RequestSpec
 
 
@@ -51,10 +50,9 @@ async def execute(run, target, client):
             row["reason"] = "unsupported_profile"
         return
     for case, row in zip(settings.cases, rows):
-        identity = target.test_identities.get(case.identity)
-        refs = ([identity.api_key_env] if identity and identity.api_key_env else []) + (
-            list(identity.headers_env.values()) if identity else [])
-        if identity is None or any(not os.environ.get(ref) for ref in refs):
+        try:
+            identity_headers(target, case.identity)
+        except ValueError:
             row["reason"] = "identity_unavailable"
             continue
         if not run.allowed(target.name):

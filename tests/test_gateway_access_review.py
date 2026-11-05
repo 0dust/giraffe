@@ -81,3 +81,35 @@ async def test_missing_credentials_keep_explicit_policy_required(monkeypatch, lo
     assert len(calls) == 1
     assert all(record.identity is None for record in report.requests)
     assert all(row["reason"] == "identity_unavailable" for row in policy.metrics["gateway_access"]["cases"])
+
+
+@pytest.mark.parametrize("credential", ["api_key_env", "headers_env"])
+async def test_malformed_credentials_leave_budget_for_valid_case(monkeypatch, credential):
+    value = config(max_requests=1).model_dump()
+    identity = ({"api_key_env": "MALFORMED_KEY"} if credential == "api_key_env" else
+                {"headers_env": {"X-Test-Key": "MALFORMED_KEY"}})
+    value["targets"][0]["test_identities"] = {"invalid": identity, "anonymous": {}}
+    value["gateway_access"]["cases"] = [
+        {"name": "invalid", "identity": "invalid", "expected": "deny"},
+        {"name": "valid", "identity": "anonymous", "expected": "allow"}]
+    cfg = RunConfig.model_validate(value)
+    monkeypatch.setenv("MALFORMED_KEY", "secret\nvalue")
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(200, json={"choices": [{"message": {"content": "OK"}, "finish_reason": "stop"}]})
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
+    run = _Run(cfg, None, None)
+    async with LLMClient(cfg.targets[0], cfg) as client:
+        await execute(run, cfg.targets[0], client)
+    check = result(run, cfg.targets[0])
+    invalid, valid = check.metrics["gateway_access"]["cases"]
+    assert len(calls) == run.attempted == len(run.records) == 1
+    assert run.records[0].identity == "anonymous"
+    assert invalid["reason"] == "identity_unavailable" and invalid["request_id"] is None
+    assert valid["observed"] == "allow" and valid["request_id"] == run.records[0].id
+    assert check.status == "inconclusive" and check.required
+    assert "secret" not in check.model_dump_json()
