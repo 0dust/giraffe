@@ -43,6 +43,42 @@ def test_selected_cancellation_is_a_distinct_user_scenario():
     assert window["users"][1]["profile"] == "short_long"
 
 
+@pytest.mark.parametrize("scenario", ["cancellation", "noisy_neighbors"])
+def test_waiting_for_scenario_opportunity_is_not_pending_admission(monkeypatch, scenario):
+    from giraffe.models import LoadTestSettings
+    from giraffe.multi_user import run_window
+    from giraffe.multi_user_metrics import summarize
+    from tests.test_runner import FakeClient
+
+    async def run():
+        cfg = settings(levels=[2], duration_seconds=.12, scenarios=[scenario],
+            cancellation={"user_id": "user-02"}, noisy_neighbors={
+                "heavy_user_ids": ["user-02"], "heavy_profiles": ["long_short"],
+                "triggers": ["during_stream"]},
+            pass_criteria={"max_first_answer_ms": 70}).model_copy(update={"concurrency": 2})
+        state = runner._Run(cfg, None, None)
+        observation = _planned_observation(cfg.multi_user)
+        window = observation["windows"][-1]
+        observation["windows"] = [window]
+        monkeypatch.setattr(FakeClient, "useful_event", False)
+        calibration = {(size, mode): {"filler_chars": 100}
+                       for size in ("short", "long") for mode in ("short_answer", "long_output")}
+        await run_window(state, cfg.targets[0], FakeClient(cfg.targets[0], cfg), cfg.multi_user,
+                         LoadTestSettings(profile=cfg.multi_user.profile), calibration, window)
+        assert state.records and all(r.workload["user_id"] == "user-01" for r in state.records)
+        assert state.slots.qsize() == 2
+        selected = window["users"][1]
+        assert selected["dispatched_count"] == 0
+        summary = summarize(observation, state.records)["windows"][0]
+        user = summary["users"][1]
+        assert user["pending_wait"] is None
+        assert user["status"] == "inconclusive"
+        assert selected["ready_count"] == 0
+        assert selected["pending_ready_ms"] is None
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("retention", ["none", "failures", "all"])
 def test_http_selected_cancellation_retains_once_and_peers_continue(retention):
     from giraffe.client import LLMClient
