@@ -23,3 +23,13 @@ multi_user:
     max_completion_ms: 10000
     max_error_percent: 0
     min_samples: 2
+
+# Optional equal-work criterion (measurement only when omitted):
+# multi_user.pass_criteria.max_throughput_ratio: 1.5
+# multi_user.fairness_tolerance_percent: 10
+# To repeat isolated conversations, add under multi_user:
+# conversations:
+#   modes: [fixed, live]
+#   max_tokens: 32
+#   delay_seconds: 0.5
+# See docs/workloads.md for live tasks and sampled turns.

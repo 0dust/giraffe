@@ -1177,6 +1177,16 @@ def _print_result(report: RunReport, json_path: Path, html_path: Path | None,
             if window.get("phase") != "measurement":
                 continue
             print(f"  {window['population']} users · {window.get('duration_seconds', 0):.3g} / {window['planned_duration_seconds']:g} planned seconds")
+            fairness = window.get("fairness")
+            if fairness:
+                ratio = fairness.get("ratio")
+                print(f"    Observed delivery fairness: {fairness['status']} · "
+                      f"median / worst ratio {ratio if ratio is not None else 'undefined'} · "
+                      f"limit {fairness.get('threshold')} · "
+                      f"eligible users {', '.join(fairness.get('eligible_user_ids', [])) or 'none'} / "
+                      f"{len(fairness.get('compared_user_ids', []))} compared")
+                for reason in fairness.get("reasons", []):
+                    print(f"      {reason}")
             for user in window.get("users", []):
                 rate = user.get("output_tokens_per_second")
                 delivery = f"{rate:.3g} tok/s" if rate is not None else "unknown tok/s"
@@ -1189,6 +1199,12 @@ def _print_result(report: RunReport, json_path: Path, html_path: Path | None,
                       f"{outcome.get('completed', 0)}/{outcome.get('attempted', 0)} completed · "
                       f"{outcome.get('errors', 0)} errors · ready first/completion p95 {timing} ms · "
                       f"{user.get('coverage', {}).get('status', 'unknown')}")
+                for item in user.get("conversations", []):
+                    print(f"      Conversation {item['id']} · {item['mode']} · "
+                          f"{len(item['turns'])}/{item['planned_turns']} turns · "
+                          f"{item.get('stop_reason') or 'completed'}")
+                    for turn, request_id in enumerate(item["turns"]):
+                        print(f"        Turn {turn + 1}: {request_id}")
     unselected = []
     for check in report.checks:
         if check.status == "skipped" and check.summary.rstrip(".") in {"Not selected", "Not selected for this run"}:

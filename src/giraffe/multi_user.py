@@ -15,9 +15,24 @@ WINDOW_POLICY = "completed-output-v1"
 
 def population_plan(settings):
     """A user's assignment never depends on completion order or smaller levels."""
-    return [{"user_id": f"user-{index + 1:02d}",
-             "profile": random.Random(f"{settings.seed}:profile:{index}").choice(settings.shapes)}
-            for index in range(max(settings.levels))]
+    population = []
+    values = settings.think_time_seconds.values
+    weights = settings.think_time_seconds.weights
+    variable = len({value for index, value in enumerate(values) if weights is None or weights[index]}) > 1
+    for index in range(max(settings.levels)):
+        user_id = f"user-{index + 1:02d}"
+        profile = random.Random(f"{settings.seed}:profile:{index}").choice(settings.shapes)
+        task = None
+        if settings.conversations:
+            tasks = settings.conversations.workloads
+            task = (random.Random(f"{settings.seed}:conversation-task:{index}").choices(
+                range(len(tasks)), weights=[task.weight for task in tasks])[0] if tasks else None)
+            profile = "conversation:" + (tasks[task].name if task is not None else "exact_repeat")
+        population.append({"user_id": user_id, "profile": profile,
+            "conversation_workload": task,
+            "think_time_plan": {"values": values, "weights": weights,
+                "seed_key": f"{settings.seed}:pause:{user_id}" if variable else None}})
+    return population
 
 
 def _window(level, phase, seconds, population):
@@ -35,7 +50,8 @@ def _relative(run, now=None):
     return ((time.monotonic() if now is None else now) - run.start) * 1000
 
 
-async def run_window(run, target, client, settings, load_settings, calibration, window, *, sources_by_profile=None):
+async def run_window(run, target, client, settings, load_settings, calibration, window, *,
+                     sources_by_profile=None, prepared_inputs=None):
     """Close admission at the common cutoff; admitted work keeps its own timeout."""
     start = time.monotonic()
     intended_end = start + window["planned_duration_seconds"]
@@ -61,60 +77,99 @@ async def run_window(run, target, client, settings, load_settings, calibration, 
             if user["pending_ready_ms"] is not None:
                 user["pending_observed_ms"] = window["end_ms"]
 
+    async def pause(seconds):
+        if closed or time.monotonic() >= cutoff:
+            return False
+        if seconds == 0:
+            await asyncio.sleep(0)
+        else:
+            try:
+                async with asyncio.timeout(max(0, min(seconds, cutoff - time.monotonic()))):
+                    await admission_closed.wait()
+            except TimeoutError:
+                pass
+        return not closed and time.monotonic() < cutoff
+
     async def user_loop(user):
         user.update(activated_ms=_relative(run), stop_reason=None)
-        sequence = 0
-        while not closed and time.monotonic() < cutoff:
-            if not run.allowed(target.name):
-                close(run.stop_reason(target.name) or "target request allowance exhausted")
-                break
+        sequence, conversation_sequence = 0, 0
+        preceding_pause = 0
+
+        async def send(spec, finalize=None):
+            nonlocal sequence
+            if closed or time.monotonic() >= cutoff:
+                return None
             sequence += 1
-            ready = time.monotonic()
+            ready = _relative(run)
             user["ready_count"] += 1
-            user["pending_ready_ms"] = _relative(run, ready)
-            point = {"id": scenario, "type": "combinations", "workload": "combinations",
-                     "pattern": "concurrent", "level": window["population"], "rate": None,
-                     "bursts": False, "source": "primary", "_source_index": sequence - 1}
-            spec = build_spec(run, load_settings, point, user["profile"], calibration,
-                              frozen_sources=(sources_by_profile or {}).get(user["profile"]))
+            user["pending_ready_ms"] = ready
             spec.check_ids = ["multi_user"]
             spec.load_point = None
             spec.workload.update(user_id=user["user_id"], population=window["population"],
-                                 profile=user["profile"], scenario="repeated_requests",
-                                 phase=window["phase"], window_id=scenario,
-                                 request_sequence=sequence, ready_ms=_relative(run, ready))
+                profile=user["profile"], scenario=window["scenario"], phase=window["phase"],
+                window_id=scenario, request_sequence=sequence, ready_ms=ready,
+                think_time_seconds=preceding_pause)
+            if settings.conversations:
+                spec.scenario = scenario
+                spec.workload["conversation_sequence"] = conversation_sequence
             async with run.slot(False, cutoff) as admitted:
                 if not admitted or closed or time.monotonic() >= cutoff:
-                    break
+                    return None
                 if not run.allowed(target.name):
                     close(run.stop_reason(target.name) or "target request allowance exhausted")
-                    break
+                    return None
 
                 def dispatched():
                     user["dispatched_count"] += 1
                     user["pending_ready_ms"] = None
 
                 def finalized(record):
+                    if finalize:
+                        finalize(record)
                     user["request_ids"].append(record.id)
 
-                await run.request(target, client, spec, slot_reserved=True, admission_deadline=cutoff,
-                                  on_start=dispatched, finalize_record=finalized)
-            if closed or time.monotonic() >= cutoff:
+                return await run.request(target, client, spec, slot_reserved=True, admission_deadline=cutoff,
+                                         on_start=dispatched, finalize_record=finalized)
+
+        while not closed and time.monotonic() < cutoff:
+            if not run.allowed(target.name):
+                close(run.stop_reason(target.name) or "target request allowance exhausted")
                 break
-            pause = random.Random(f"{settings.seed}:pause:{user['user_id']}:{sequence}").choices(
-                settings.think_time_seconds.values, weights=settings.think_time_seconds.weights)[0]
-            # Even a zero-pause, immediately completing transport yields to peers.
-            if pause == 0:
-                await asyncio.sleep(0)
+            if settings.conversations:
+                from giraffe.session_sampling import conversation_turns
+                from giraffe.workloads import execute_conversation
+                conversation_sequence += 1
+                conversation = settings.conversations
+                mode = conversation.modes[(conversation_sequence - 1) % len(conversation.modes)]
+                task = user["conversation_workload"]
+                workload = conversation.workloads[task] if task is not None else None
+                seed = conversation.sampling.seed if conversation.sampling else settings.seed
+                plan = {"workload": workload, "turns": conversation_turns(conversation, workload,
+                    f"{seed}:{user['user_id']}:{conversation_sequence}:{mode}")}
+                item = await execute_conversation(run, target, client, run.config, conversation, mode,
+                    (conversation_sequence - 1) * 32 + int(user["user_id"].split("-")[1]),
+                    items=user.setdefault("conversations", []), prepared_inputs=prepared_inputs or {},
+                    plan=plan, session_id=f"{target.name}:{scenario}:{user['user_id']}:{conversation_sequence}:{mode}",
+                    check="multi_user", send=send, pause=pause)
+                if not item["turns"]:
+                    user["stop_reason"] = item["stop_reason"]
+                    break
+                pause_sequence = conversation_sequence
             else:
-                try:
-                    async with asyncio.timeout(max(0, min(pause, cutoff - time.monotonic()))):
-                        await admission_closed.wait()
-                except TimeoutError:
-                    pass
+                point = {"id": scenario, "type": "combinations", "workload": "combinations",
+                         "pattern": "concurrent", "level": window["population"], "rate": None,
+                         "bursts": False, "source": "primary", "_source_index": sequence}
+                spec = build_spec(run, load_settings, point, user["profile"], calibration,
+                                  frozen_sources=(sources_by_profile or {}).get(user["profile"]))
+                await send(spec)
+                pause_sequence = sequence
+            preceding_pause = random.Random(f"{settings.seed}:pause:{user['user_id']}:{pause_sequence}").choices(
+                settings.think_time_seconds.values, weights=settings.think_time_seconds.weights)[0]
+            if not await pause(preceding_pause):
+                break
         if user["pending_ready_ms"] is not None:
             user["pending_observed_ms"] = min(_relative(run), window["end_ms"])
-        user["stop_reason"] = window["reason"]
+        user["stop_reason"] = window["reason"] or user.get("stop_reason")
 
     order = list(window["users"])
     random.Random(f"{settings.seed}:launch:{window['population']}:{window['phase']}").shuffle(order)
@@ -150,9 +205,13 @@ async def run_window(run, target, client, settings, load_settings, calibration, 
     finally:
         window["drain_seconds"] = max(0, (_relative(run) - window["end_ms"]) / 1000)
         for user in window["users"]:
+            for item in user.get("conversations", []):
+                item["completed_turns"] = len(item["turns"])
+                if item["completed_turns"] < item["planned_turns"] and not item["stop_reason"]:
+                    item["stop_reason"] = window["reason"] or window["drain_reason"] or "conversation interrupted"
             if user["pending_ready_ms"] is not None:
                 user["pending_observed_ms"] = window["end_ms"]
-            user["stop_reason"] = window["reason"]
+            user["stop_reason"] = window["reason"] or user.get("stop_reason")
         if window["cut_short"]:
             run.mark_unfinished(target.name, ["multi_user"])
         run.finish_condition(target.name, scenario,
@@ -167,6 +226,9 @@ def _planned_observation(settings):
         if settings.warmup_seconds:
             windows.append(_window(level, "warmup", settings.warmup_seconds, population))
         windows.append(_window(level, "measurement", settings.duration_seconds, population))
+    if settings.conversations:
+        for window in windows:
+            window["scenario"] = "repeated_conversations"
     return {"version": 1, "window_policy": WINDOW_POLICY,
             "settings": settings.model_dump(mode="json"), "population": population,
             "windows": windows, "calibrations": []}
@@ -190,11 +252,23 @@ async def execute(run, target, client):
     sources = run.pack_specs or getattr(run, "load_custom_specs", [])
     # Resolve candidates once from saved inputs, never from later peer results.
     sources_by_profile = {profile: tuple(_shape_sources(load_settings, profile.split("_")[0], sources))
-                          for profile in {user["profile"] for user in population}} if sources else {}
+                          for profile in {user["profile"] for user in population}} if sources and not settings.conversations else {}
     calibration = {}
+    prepared_inputs = {}
     reason = None
     try:
-        if not (run.pack_specs or getattr(run, "load_custom_specs", [])):
+        if settings.conversations:
+            from giraffe.session_sampling import prepare_session_input
+            conversation = settings.conversations
+            distribution = conversation.sampling.input_tokens if conversation.sampling else None
+            if distribution:
+                for task in conversation.workloads:
+                    for prompt in task.turns:
+                        for tokens in distribution.values:
+                            key = prompt, tokens
+                            if key not in prepared_inputs:
+                                prepared_inputs[key] = await prepare_session_input(run, target, prompt, tokens)
+        elif not (run.pack_specs or getattr(run, "load_custom_specs", [])):
             for shape in sorted({user["profile"] for user in population}):
                 if not run.allowed(target.name):
                     reason = run.stop_reason(target.name) or "target request allowance exhausted"
@@ -216,7 +290,7 @@ async def execute(run, target, client):
                 run.mark_unfinished(target.name, ["multi_user"])
                 continue
             await run_window(run, target, client, settings, load_settings, calibration, window,
-                             sources_by_profile=sources_by_profile)
+                             sources_by_profile=sources_by_profile, prepared_inputs=prepared_inputs)
     finally:
         from giraffe.overlap import scheduling_delay_windows
         observation["scheduling_delay_windows"] = [
@@ -250,9 +324,13 @@ def result(run, target):
         message = "Per-user delivery measured; no acceptance criteria selected."
     elif status == "fail":
         worst = summary["worst_user"]
+        fairness_failures = [window["fairness"] for window in summary["windows"]
+                             if window.get("fairness", {}).get("status") == "fail"]
         message = (f"{summary['failed_user_windows']} user measurements failed; "
                    f"{worst['user_id']} at {worst['population']} users: "
-                   + " ".join(worst["reasons"]))
+                   + " ".join(worst["reasons"])) if summary["failed_user_windows"] else "Observed delivery fairness failed."
+        if fairness_failures:
+            message += " " + " ".join(reason for result in fairness_failures for reason in result["reasons"])
     elif status == "pass":
         message = "Every measured user met the selected criteria over the common windows."
     else:

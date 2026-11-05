@@ -301,7 +301,7 @@ export function configureMultiUser(source, values, defaults, {allowInvalid=false
   const number=(name,label)=>numeric(values.get('multi_user_'+name),label,allowInvalid);
   const list=(name,label)=>String(values.get('multi_user_'+name)||'').split(',').map(value=>numeric(value.trim(),label,allowInvalid));
   if(values.has('multi_user_levels'))settings.levels=list('levels','User levels');
-  for(const name of ['duration_seconds','warmup_seconds','seed'])if(values.has('multi_user_'+name))settings[name]=number(name,name);
+  for(const name of ['duration_seconds','warmup_seconds','seed','fairness_tolerance_percent'])if(values.has('multi_user_'+name))settings[name]=number(name,name);
   if(values.has('multi_user_think_time_values'))settings.think_time_seconds.values=list('think_time_values','Pause values');
   if(values.has('multi_user_think_time_weights'))settings.think_time_seconds.weights=String(values.get('multi_user_think_time_weights')).trim()?list('think_time_weights','Pause weights'):null;
   if(loadShapes.some(shape=>values.has('multi_user_shape_'+shape))){
@@ -312,6 +312,38 @@ export function configureMultiUser(source, values, defaults, {allowInvalid=false
     const name='profile_'+size+'_'+kind;if(values.has('multi_user_'+name))settings.profile[size][kind]=number(name,kind);
   }
   for(const key of Object.keys(defaults.pass_criteria))if(values.has('multi_user_criteria_'+key))settings.pass_criteria[key]=number('criteria_'+key,key);
+  if(values.has('multi_user_conversation_profile')){
+    const profile=values.get('multi_user_conversation_profile');
+    if(profile==='requests')settings.conversations=null;
+    else{
+      const conversation={...settings.conversations,profile};
+      const prefix='multi_user_conversation_';
+      for(const name of ['max_tokens','delay_seconds'])if(values.has(prefix+name))conversation[name]=number('conversation_'+name,name);
+      if(values.has(prefix+'modes'))conversation.modes=profile==='performance'?['live']:String(values.get(prefix+'modes')).split(',');
+      if(values.has(prefix+'turns'))conversation.turns=String(values.get(prefix+'turns')).split('\n');
+      if(values.has(prefix+'sampling_seed')){
+        const sampling={seed:number('conversation_sampling_seed','Sampling seed')};
+        for(const key of ['think_time_seconds','input_tokens','output_tokens','turn_count']){
+          if(profile!=='performance'&&key!=='think_time_seconds')continue;
+          const text=String(values.get(prefix+'sample_'+key)||'').trim();
+          const weights=String(values.get(prefix+'weights_'+key)||'').trim();
+          if(text||weights)sampling[key]={values:text?list('conversation_sample_'+key,key):[],weights:weights?list('conversation_weights_'+key,key):null};
+        }
+        conversation.sampling=Object.keys(sampling).length>1?sampling:null;
+      }
+      if(profile==='performance'&&values.has(prefix+'task_count')){
+        conversation.workloads=[];
+        for(let i=0;i<Number(values.get(prefix+'task_count'));i++){
+          if(values.get(prefix+`task_${i}_enabled`)!=='on')continue;
+          conversation.workloads.push({name:String(values.get(prefix+`task_${i}_name`)||'').trim(),
+            weight:number(`conversation_task_${i}_weight`,'Task weight'),
+            max_tokens:number(`conversation_task_${i}_cap`,'Task output cap'),
+            turns:Array.from({length:Number(values.get(prefix+`task_${i}_turn_count`))},(_,turn)=>String(values.get(prefix+`task_${i}_turn_${turn}`)||''))});
+        }
+      }else if(profile==='correctness')conversation.workloads=[];
+      settings.conversations=conversation;
+    }
+  }
   // An untouched hidden drawer must not activate or materialize an optional check.
   if(source.multi_user==null&&!config.checks?.includes('multi_user')&&sameConfig(settings,defaults))return config;
   config.multi_user=settings;

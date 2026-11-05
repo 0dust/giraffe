@@ -72,7 +72,8 @@ def test_single_user_regression_is_not_pooled_with_healthy_peers():
 
 
 @pytest.mark.parametrize("field,value", [("seed", 999), ("levels", [1, 5]), ("duration_seconds", 20),
-                                         ("shapes", ["long_long"])])
+                                         ("shapes", ["long_long"]), ("fairness_tolerance_percent", 5),
+                                         ("conversations", {"modes": ["live"]})])
 def test_changed_user_workload_cannot_pass_baseline(field, value):
     current, previous = user_report(), user_report()
     current.manifest["config"]["multi_user"][field] = value

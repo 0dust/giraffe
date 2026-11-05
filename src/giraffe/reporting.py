@@ -1873,9 +1873,9 @@ def _multi_user_export(data: dict[str, Any]) -> dict[str, Any]:
         "output_tokens_per_second", "late_output_tokens", "late_missing_usage_count", "late_completed",
         "partial_output_tokens", "partial_missing_usage_count", "cancelled_output_tokens",
         "cancelled_missing_usage_count", "latency", "lengths", "finish_reasons", "pending_wait",
-        "coverage", "criteria", "timing_quality", "stop_reason")
+        "coverage", "criteria", "timing_quality", "stop_reason", "conversations", "think_time_plan")
     window_fields = ("id", "scenario", "population", "phase", "start_ms", "end_ms", "planned_end_ms",
-        "duration_seconds", "planned_duration_seconds", "drain_seconds", "cut_short", "reason", "drain_reason", "status")
+        "duration_seconds", "planned_duration_seconds", "drain_seconds", "cut_short", "reason", "drain_reason", "status", "fairness")
     value = {key: data.get(key) for key in ("version", "window_policy", "settings", "population",
                                           "status", "worst_user", "interpretation")}
     value["windows"] = [{**{key: window.get(key) for key in window_fields},
@@ -1902,6 +1902,13 @@ def _multi_user_html(data: dict[str, Any], anchors: dict[str, str]) -> str:
         if window.get("phase") != "measurement":
             parts.append('<p>Warmup is excluded from per-user acceptance and delivered throughput.</p>')
             continue
+        fairness = window.get("fairness")
+        if fairness:
+            parts.append(f'<p><strong>Observed delivery fairness</strong> {_badge(fairness["status"])} · '
+                f'median / worst ratio: {_number(fairness.get("ratio"))}; limit: {_number(fairness.get("threshold"))}. '
+                f'Eligible users: {_e(", ".join(fairness.get("eligible_user_ids", [])) or "None")} / '
+                f'{len(fairness.get("compared_user_ids", []))} compared.</p>'
+                f'<p>{_e(" ".join(fairness.get("reasons", [])))}</p>')
         parts.append('<div class="table"><table><tr><th>User / profile</th><th>Outcome</th>'
                      '<th>Completed / sent / errors</th><th>Shared-window tok/s</th>'
                      '<th>Ready-to-first / completion p95 ms</th><th>Coverage / requests</th></tr>')
@@ -1909,6 +1916,12 @@ def _multi_user_html(data: dict[str, Any], anchors: dict[str, str]) -> str:
             outcome, latency = user.get("outcomes", {}), user.get("latency", {})
             links = ' '.join(f'<a href="#{anchors[rid]}">{_e(rid)}</a>'
                              for rid in user.get("request_ids", []) if rid in anchors)
+            for item in user.get("conversations", []):
+                links += (f'<p>{_e(item["id"])} · {_e(item["mode"])} · '
+                          f'{len(item["turns"])} / {item["planned_turns"]} turns. '
+                          f'{_e(item.get("stop_reason") or "Completed")}</p>' + ' '.join(
+                          f'<a href="#{anchors[rid]}">Turn {turn + 1}</a>'
+                          for turn, rid in enumerate(item["turns"]) if rid in anchors))
             pending = user.get("pending_wait")
             notes = " ".join(user.get("reasons", []) + user.get("coverage", {}).get("reasons", []))
             if pending:

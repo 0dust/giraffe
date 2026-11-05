@@ -140,3 +140,37 @@ assert.equal(JSON.stringify(changed.multi_user.shapes),'[]');console.log(JSON.st
     from pydantic import ValidationError
     with pytest.raises(ValidationError, match='shapes'):
         RunConfig.model_validate(result)
+
+
+def test_fairness_and_conversation_settings_roundtrip():
+    result = browser_logic(r'''
+const markup=renderMultiUserEditor(config);
+for(const name of ['criteria_max_throughput_ratio','fairness_tolerance_percent','conversation_profile','conversation_modes','conversation_turns','conversation_max_tokens','conversation_sample_turn_count'])assert(markup.includes('name="multi_user_'+name+'"'));
+const values=new FormData();values.set('multi_user_rendered','1');
+values.set('multi_user_criteria_max_throughput_ratio','1.5');
+values.set('multi_user_fairness_tolerance_percent','5');
+values.set('multi_user_conversation_profile','correctness');
+values.set('multi_user_conversation_modes','live');
+values.set('multi_user_conversation_turns','Remember the name.\nRepeat the name.');
+values.set('multi_user_conversation_max_tokens','48');
+values.set('multi_user_conversation_delay_seconds','0.1');
+const changed=configureMultiUser(config,values,bootstrap.multi_user.defaults);
+assert.equal(changed.multi_user.conversations.modes[0],'live');
+assert.equal(changed.multi_user.conversations.turns.length,2);
+assert.equal(settingDestination('multi_user.conversations.max_tokens').name,'multi_user_conversation_max_tokens');
+assert.equal(settingDestination('multi_user.conversations.sampling.think_time_seconds.weights').name,'multi_user_conversation_weights_think_time_seconds');
+assert.equal(settingPath('multi_user_conversation_task_0_turn_1'),'multi_user.conversations.workloads.0.turns.1');
+console.log(JSON.stringify(changed));
+''', configuration())
+    settings = RunConfig.model_validate(result).multi_user
+    assert settings.pass_criteria.max_throughput_ratio == 1.5
+    assert settings.fairness_tolerance_percent == 5
+    assert settings.conversations.max_tokens == 48
+
+
+def test_fairness_population_and_conversation_links_render():
+    browser_logic(r'''
+const markup=renderMultiUserResults({windows:[{phase:'measurement',population:2,fairness:{status:'inconclusive',ratio:2,threshold:1.5,eligible_user_ids:['user-01'],compared_user_ids:['user-01','user-02'],reasons:['User 2 lacks overlap.']},users:[{user_id:'user-01',profile:'conversation:chat',conversations:[{id:'conversation-one',mode:'live',turns:['request-one'],planned_turns:2,stop_reason:'failed turn'}]}]}]});
+assert.match(markup,/Observed delivery fairness/);assert.match(markup,/User 2 lacks overlap/);
+assert.match(markup,/conversation-one/);assert.match(markup,/failed turn/);assert.match(markup,/data-request="request-one"/);
+''', configuration())
