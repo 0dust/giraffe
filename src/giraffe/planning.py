@@ -455,6 +455,10 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
                       "multi_user.duration_seconds", count=phases,
                       timeout=config.request_timeout_seconds)
                 continue
+            if name == "gateway_policy":
+                fixed(target.name, row, config.gateway_policy.duration_seconds,
+                      "gateway_policy.duration_seconds", count=1, timeout=0)
+                continue
             if name == "capacity":
                 settings = config.effective_traffic()
                 options = effective("capacity")
@@ -1087,6 +1091,13 @@ def request_plan(config: RunConfig | ConfigDraft, *,
                 "msg":"Expected scheduled Load test requests exceed the total request budget; some tests will be truncated.",
                 "values":{"expected_scheduled_requests":load_plan["expected_scheduled_requests"]*target_count,"max_requests":config.max_requests}})
         warnings.extend(w["msg"] for w in load_warnings)
+    if "gateway_policy" in selected:
+        settings = config.gateway_policy
+        add("gateway_policy", sum(user.requests for user in settings.users),
+            "Bounded requests per declared identity; stops at policy duration or shared run limits.",
+            source="fixed identical non-streaming policy probes", kind="bounded", title="Gateway quotas & priorities")
+        rows[-1].update(users=len(settings.users), simultaneous_limit=config.concurrency,
+                        configured_seconds=settings.duration_seconds)
     if "multi_user" in selected:
         settings = config.multi_user
         for level in settings.levels:

@@ -1,4 +1,4 @@
-import {positiveBoundErrors, inferSetupPreset, configureLoadTest, loadTestIssues, loadTestSettings, loadFieldName, convertExpectedAnswer, datasetCaseFromValues, changeDatasetScorer, configureJudging, configureSessions, configureMultiUser, multiUserSettings, configureProfiles, parseLogprobSettings, parseToolFixtures, effectiveProfileDefaults, configureTests, configureRunLimits, limitValue, optionDefault, optionValue, sameConfig} from './form-config.mjs?v=20261028-results-merge-ci';
+import {positiveBoundErrors, inferSetupPreset, configureLoadTest, loadTestIssues, loadTestSettings, loadFieldName, convertExpectedAnswer, datasetCaseFromValues, changeDatasetScorer, configureJudging, configureSessions, configureMultiUser, multiUserSettings, configureGatewayPolicy, gatewayPolicySettings, configureProfiles, parseLogprobSettings, parseToolFixtures, effectiveProfileDefaults, configureTests, configureRunLimits, limitValue, optionDefault, optionValue, sameConfig} from './form-config.mjs?v=20261028-results-merge-ci';
 
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
@@ -1129,6 +1129,7 @@ function settingDestination(path) {
   if(root==='stream'){step=1;}
   else if(root==='retention'){step=3;}
   else if(root==='targets'){if(parts[1]!=='0')return {name:'config_editor',label:'advanced configuration'};name=parts[2]==='tokenizer'&&$('#new-run-form')?.elements.tokenizer?.value==='custom'?'tokenizer_custom':parts[2];step=1;}
+  else if(root==='gateway_policy'){return {name:'gateway_policy_'+(parts[1]==='users'?'users':parts[1]),check:'gateway_policy',step,label:'Gateway policy settings'};}
   else if(root==='multi_user'){
     const path=parts.slice(1);if(path[0]==='levels')name='multi_user_levels';else if(path[0]==='shapes')name='multi_user_shape_short_short';else if(path[0]==='think_time_seconds')name='multi_user_think_time_'+(path[1]==='weights'?'weights':'values');else name='multi_user_'+path.join('_').replace(/^pass_criteria_/,'criteria_');
     return {name,check:'multi_user',step,label:'Multi-user settings'};
@@ -1328,6 +1329,7 @@ function settingPath(name) {
   const check=state.bootstrap?.checks?.find(check=>name.startsWith(`test_${check.id}_`));
   if(check)return `test_options.${check.id}.${name.slice(check.id.length+6).replace(/^limit_/,'limits.')}`;
   if(name.startsWith('load_'))return loadSettingPath(name);
+  if(name.startsWith('gateway_policy_'))return 'gateway_policy.'+name.slice(15);
   if(name.startsWith('multi_user_')){const field=name.slice(11);if(field.startsWith('profile_'))return 'multi_user.profile.'+field.slice(8).replace(/^(short|medium|long)_/,'$1.');if(field.startsWith('criteria_'))return 'multi_user.pass_criteria.'+field.slice(9);if(field.startsWith('think_time_'))return 'multi_user.think_time_seconds.'+field.slice(11);if(field.startsWith('shape_'))return 'multi_user.shapes';return 'multi_user.'+field;}
   const profile=name.match(/^profile_(arrivals|prefix|sessions|consistency|tools)_(.+)$/);
   if(profile)return `${profile[1]==='tools'?'tool_checks':profile[1]}.${profile[2]}`;
@@ -1385,9 +1387,10 @@ const checkGroups=[
   {id:'answers',title:'Answers',blurb:'Is the output right?',checks:['access','serving','correctness','json','context','tools']},
   {id:'speed',title:'Speed & load',blurb:'How fast, and under how much load?',checks:['first_output','generation','load','multi_user']},
   {id:'reliability',title:'Reliability',blurb:'Does it hold up over time?',checks:['recovery','sessions','consistency']},
-  {id:'server',title:'Diagnostics',blurb:'Evidence from the server itself.',checks:['cancellation','prefix','gpu']},
+  {id:'server',title:'Diagnostics',blurb:'Evidence from the server itself.',checks:['cancellation','prefix','gpu','gateway_policy']},
 ];
 const checkGuide={
+  gateway_policy:{name:'Gateway quotas & priorities',purpose:'Exercise a declared admission policy for separate test identities.',sends:'Bounded identical requests per identity through LiteLLM; no gateway configuration changes.',shows:'Affected-user rejections, continued peer service, actual work and evidence qualifications.'},
   multi_user:{name:'Multi-user',purpose:'See which users become slow or fail while sharing one endpoint.',sends:'Repeated independent requests from persistent users; pauses release request slots.',shows:'Every user’s delivery, response timing and outcomes over a common window.'},
   load:{name:'Load test',purpose:'Workloads, request rates and bursts in one place.',sends:'Selected workloads under maintained concurrency, arrivals and bursts.',shows:'Delivery, per-response criteria and highest tested accepted load.'},
   access:{name:'Endpoint response',purpose:'Can this endpoint return an answer?',sends:'One short generated request, shared with timing checks.',shows:'Whether the endpoint, authentication and model produce a valid answer.'},
@@ -1417,6 +1420,7 @@ function renderProfileEditor(check,config) {
   const key=check.id;
   if(key==='load')return renderLoadEditor(config);
   if(key==='multi_user')return renderMultiUserEditor(config);
+  if(key==='gateway_policy')return renderGatewayPolicyEditor(config);
   if(key==='sessions')return `<input type="hidden" name="profile_edits_sessions" value="[]">${renderSessionEditor(config)}<button type="button" class="text-button reset-profile" data-action="reset-profile" data-profile="sessions">Reset this profile</button>`;
   if(key==='tools'){
     const profile=config.tool_checks || {fixtures:[],modes:null},selected=profile.modes?.join(',') || '';
@@ -1455,6 +1459,7 @@ function checkCoverageWarning(check,config) {
 }
 function checkOverrideWarning() {return '';}
 function effectiveCheckSummary(check,config) {
+  if(check.id==='gateway_policy'){const s=gatewayPolicySettings(config);return `${s.capability} · ${s.users.length} identities · ${s.users.reduce((n,u)=>n+u.requests,0)} request cap · ${s.duration_seconds}s`;}
   if(check.id==='multi_user'){const s=multiUserSettings(config,state.bootstrap.multi_user.defaults);return `${s.levels.join(' → ')} users · ${config.concurrency==null?'No shared request ceiling':`${config.concurrency} shared request slots`} · ${s.duration_seconds}s per level`; }
   const parts=[];
   const timeout=check.id==='load'?loadSettings(config).request_timeout_seconds:check.id==='gpu'?null:optionValue(config,check,'request_timeout_seconds') ?? config.request_timeout_seconds;
@@ -1858,6 +1863,17 @@ function renderConcurrentResults(metrics) {
     const cases=m.cases?Object.values(m.cases).map(item=>`<div class="check-observations"><h4>${escape(item.title)} ${badge(item.status)}</h4><p>Requested input/output: ${item.requested_input_tokens==null?'Short prompt':number(item.requested_input_tokens)} / ${number(item.requested_output_tokens)} tokens. Minimum output: ${number(item.minimum_output_tokens)}.</p><p>Observed input: ${tokenRange(item.actual_input_tokens)}; output: ${tokenRange(item.actual_output_tokens)}. ${item.calibration_requests.length} input-sizing requests.</p>${item.coverage_gaps.length?`<p class="hint">${escape(item.coverage_gaps.join(' '))}</p>`:''}<details><summary>Each concurrency level and all measurements</summary><pre>${escape(JSON.stringify(item.levels,null,2))}</pre></details></div>`).join(''):'';
     return `<section class="check-observations concurrent-result" data-concurrent-scenario="${escape(name)}"><h3>${escape(scenario.title)} ${badge(scenario.status)}</h3><p>${escape(scenario.summary)}</p><dl class="metrics-grid">${metric('Completed / sent',`${number(m.completed)} / ${number(m.attempted)}`)}${metric('Failures / timeouts',`${number(m.failed)} / ${number(m.timed_out)}`)}${metric('Correct / scored',`${number(m.correct)} / ${number(m.scored)}`)}${metric('First output p95',ms(m.first_output_p95_ms))}${metric('Response p95',ms(m.p95_ms))}${metric('Longest stream pause',ms(m.max_stream_gap_ms))}${name==='streaming_fairness'?metric('Mixed / short-only latency',m.latency_ratio==null?'Unmeasured':`${number(m.latency_ratio,2)}×`)+metric('Observed streaming overlap',`${m.overlaps ?? 0} / ${m.pairs ?? 0}`):''}</dl>${cells?`<details><summary>${name==='size_matrix'?'Request shapes and concurrency cells':'Request groups'} (${Object.keys(m.buckets).length})</summary>${cells}</details>`:''}${pairs?`<details><summary>Interference comparisons (${m.comparisons.length})</summary>${pairs}</details>`:''}${cases}<details><summary>All scenario measurements and evidence IDs</summary><pre>${escape(JSON.stringify(scenario,null,2))}</pre></details></section>`;
   }).join('');
+}
+
+function renderGatewayPolicyEditor(config) {
+  const s=gatewayPolicySettings(config),numberField=(name,label,required=true)=>field('gateway_policy_'+name,label,s[name],{type:'number',step:'any',required});
+  const modes=[['key_rpm','Per-key RPM quota'],['priority_rpm','Dynamic RPM priority reservation']];
+  if(!modes.some(([value])=>value===s.capability))modes.push([s.capability,'Saved unsupported capability']);
+  return `<div data-gateway-policy-settings><input type="hidden" name="gateway_policy_rendered" value="1"><h4>Declared gateway policy</h4><p class="hint">Use existing test identities configured on the endpoint. <button type="button" class="text-button" data-config-tab="json">Edit identity environment references in configuration JSON</button>. Environment references stay local. Giraffe never changes keys, quotas or priorities.</p><div class="fields">${field('gateway_policy_gateway','Gateway',s.gateway,{required:true})}${selectField('gateway_policy_capability','Capability',modes.map(([value,label])=>`<option value="${escape(value)}" ${s.capability===value?'selected':''}>${label}</option>`).join(''))}${field('gateway_policy_gateway_version','Gateway version',s.gateway_version||'')}${field('gateway_policy_affected_identity','Affected identity',s.affected_identity,{required:true})}</div><label class="field"><span>Identity, request cap, declared RPM, priority tier</span><textarea name="gateway_policy_users" rows="4">${escape(s.users.map(u=>[u.identity,u.requests,u.rpm,u.priority||''].join(', ')).join('\n'))}</textarea><small class="hint">One identity per line. RPM means the key quota or reserved priority share. Use 2–8 identities; tiers are needed for priority checks.</small></label><div class="fields">${numberField('duration_seconds','Traffic duration (seconds)')}${numberField('interval_seconds','Pause after each request (seconds)')}${numberField('max_output_tokens','Output token cap')}${selectField('gateway_policy_window_state','Policy window',`<option value="unknown" ${s.window_state==='unknown'?'selected':''}>Unknown — report observations only</option><option value="isolated_fresh" ${s.window_state==='isolated_fresh'?'selected':''}>Operator confirms isolated fresh window</option>`)}</div><h4>Dynamic priority reservation</h4><p class="hint">Requires LiteLLM Enterprise dynamic rate limiter v3. Declare the existing settings. A nonzero saturation cache leaves enforcement unverified. Priority is assessed from admission evidence and comparable actual work, never response speed.</p><div class="fields">${numberField('model_rpm','Model RPM',false)}${numberField('saturation_threshold','Saturation threshold (0–1)',false)}${numberField('saturation_cache_seconds','Saturation cache (seconds)',false)}</div></div>`;
+}
+
+function renderGatewayPolicyResults(data) {
+  return `<section class="multi-user-results"><h3>Gateway policy · ${escape(data.qualification)}</h3><p>${escape(data.interpretation)}</p><div class="metric-table" tabindex="0" role="region" aria-label="Gateway policy identity outcomes"><table><thead><tr><th>Identity / tier</th><th>RPM</th><th>Admitted</th><th>Rejected</th><th>Completed / cap</th><th>Actual input tokens</th><th>Actual output tokens</th></tr></thead><tbody>${data.users.map(u=>`<tr><td>${escape(u.identity)}<small>${escape(u.priority||'')}</small></td><td>${u.declared_rpm}</td><td>${u.admitted}</td><td>${u.rejected}</td><td>${u.completed} / ${u.planned}</td><td>${escape(u.input_tokens.map(v=>v??'unknown').join(', '))}</td><td>${escape(u.output_tokens.map(v=>v??'unknown').join(', '))}</td></tr>`).join('')}</tbody></table></div><p>Peer continuation: ${data.peer_continuation?'observed':'unverified'} · Overlap: ${data.overlap_observed?'observed':'unverified'} · Comparable work: ${data.comparable_actual_work?'observed':'unverified'}</p><details><summary>Policy settings and qualification</summary><pre>${escape(JSON.stringify(data,null,2))}</pre></details></section>`;
 }
 
 function renderMultiUserEditor(config) {
@@ -2808,6 +2824,7 @@ function readForm(allowEmpty=false) {
   config=configureProfiles(config,data,state.bootstrap.profile_defaults || {},{allowInvalid:allowEmpty,limits:state.bootstrap.limits});
   config=configureSessions(config,data,state.bootstrap.session_workloads.defaults,{allowInvalid:allowEmpty});
   config=configureMultiUser(config,data,state.bootstrap.multi_user?.defaults,{allowInvalid:allowEmpty});
+  config=configureGatewayPolicy(config,data,{allowInvalid:allowEmpty});
   config.restart_target=null;
   return {config,baseline_id:data.get('baseline_id') || null,mode:data.get('mode') || 'normal',restart_target:data.get('mode')==='cold-start'?data.get('restart_target'):null};
 }
@@ -3616,7 +3633,7 @@ function renderCheck(check,report) {
     metrics.push(metric('Completed responses',`${m.completed ?? 0} / ${m.attempted ?? 0}`,'Completion and correctness are distinct'));
     if(check.id==='context')metrics.push(metric('Longest measured input',m.observed_max_input_tokens==null?'Not reported':`${number(m.observed_max_input_tokens)} tokens`,`Declared context: ${number(m.declared_context_limit)} tokens`));
     else metrics.push(metric('Response time · p95',ms(m.p95_ms),`${m.completed ?? 0} valid completions`));
-  }else if(check.id!=='multi_user'){
+  }else if(!['multi_user','gateway_policy'].includes(check.id)){
     metrics.push(metric('Requests completed',`${m.completed ?? 0} / ${m.attempted ?? 0}`,`${m.failed ?? 0} failed · ${m.timed_out ?? 0} timed out`));
     if(check.id==='first_output'){metrics.push(metric('Warmed first output · p95',ms(m.first_output_p95_ms),timingLimit('first_output_ms','No acceptance limit set')));metrics.push(metric('Initial first output',ms(m.initial?.first_output_p50_ms),'Recorded separately from warmed samples'));}
     else if(check.id==='capacity'&&m.traffic_stages){metrics.push(metric(m.request_pack?.control_status==='fail'?'Highest acceptable tested loaded rate · quiet failed':'Highest acceptable tested arrival rate',m.highest_acceptable_rate_rps==null?'Unconfirmed':`${number(m.highest_acceptable_rate_rps,2)} requests/s`,m.request_pack?.control_status==='fail'?'Loaded result only; quiet checks failed. Maximum capacity unknown.':'Highest tested acceptable rate; maximum capacity unknown'));metrics.push(metric('Rate stages',number(m.traffic_stages.length),'Each stage is offered independently, then drained'));}
@@ -3635,13 +3652,14 @@ function renderCheck(check,report) {
     if(current)metrics.push(metric('Generation pace · slowest (estimate)',m.generation_tokens_per_second_min==null?'Unmeasured':`${number(m.generation_tokens_per_second_min,1)} tok/s`,limits.min_output_tokens_per_second?`Every measurable request must reach ${limits.min_output_tokens_per_second} tok/s`:'No minimum generation rate set'));
     metrics.push(metric('End-to-end output rate · median',m.output_tokens_per_second_p50==null?'Not reported':`${number(m.output_tokens_per_second_p50,1)} tok/s`,current?'Includes waiting for first output; separate from generation pace':'Older report: the output-rate limit used this end-to-end definition'));
   }
-  const extras=Object.fromEntries(Object.entries(m).filter(([k,v])=>k!=='multi_user'&&(typeof v==='object'&&v!==null || ['backend_cancellation','near_limit_coverage','tls','tls_expiry'].includes(k))));
+  const extras=Object.fromEntries(Object.entries(m).filter(([k,v])=>!['multi_user','gateway_policy'].includes(k)&&(typeof v==='object'&&v!==null || ['backend_cancellation','near_limit_coverage','tls','tls_expiry'].includes(k))));
   return `<div class="check-detail-head"><div class="check-detail-heading"><h2>${escape(checkGuide[check.id]?.name || check.title)}</h2>${badge(check.status)}</div><p>${escape(check.summary)}</p>${!check.required?'<p class="hint">Optional check</p>':''}</div>
   ${check.id==='cancellation'&&check.status!=='skipped'?renderCancellationResults(m):''}
   ${check.status==='skipped'?`<div class="empty-state" style="padding:35px 24px"><p>${unselectedCheck(check,report)?'This check was not selected. No result is inferred.':'This check was skipped. The recorded reason is shown above; no passing result is inferred.'}</p></div>`:`<dl class="metrics-grid">${metrics.join('')}</dl>`}
   ${check.id==='cancellation'?`<div class="notice" style="margin:20px 24px 0">${escape(m.backend_cancellation?.summary || 'Backend cancellation was not verified.')} Physical device memory reclamation is not measured.</div>`:''}
   ${check.id==='recovery'?`<div class="notice" style="margin:20px 24px 0">Sustained traffic was configured for ${number(config.sustained_seconds,1)} seconds. Results describe this bounded observation period.</div>`:''}
   ${m.logprobs?renderLogprobResults(m.logprobs):''}
+  ${m.gateway_policy?renderGatewayPolicyResults(m.gateway_policy):''}
   ${check.id==='multi_user'&&m.multi_user?renderMultiUserResults(m.multi_user):''}${check.id==='sessions'&&m.conversation_performance?renderSessionResults(m.conversation_performance):''}${check.id==='concurrency'?renderConcurrentResults(m):check.id==='load'?renderLoadTestResults(m):''}
   ${m.request_pack?renderPackResults(m.request_pack):''}
   ${check.id==='capacity'&&m.traffic_stages?renderTrafficStages(m.traffic_stages,m.request_pack):''}
@@ -3710,6 +3728,7 @@ function comparisonOutputs(target) {
   return rows;
 }
 function comparisonChange(row) {
+  if(row.metric==='policy_acceptance')return row.current===row.baseline?'Same qualification':'Qualification changed';
   if(row.current==null||row.baseline==null)return 'Not measured';
   const delta=row.current-row.baseline;
   if(delta===0)return 'No change';
@@ -3744,8 +3763,8 @@ function comparisonWarningSummary(row) {
 function comparisonTable(rows) {
   return `<div class="comparison-values">${rows.map(row=>{
     const warnings=comparisonWarnings(row),shortWarnings=comparisonWarningSummary(row),commonWindow=row.aggregation==='common_window';
-    const aggregation=commonWindow?'Common window':row.aggregation==='mean'?'Rate':'Median';
-    const label=commonWindow?(row.status==='fail'?'Observed decrease':warnings.length?'Warning':'Observed'):row.descriptive?'Observed':row.status==='fail'?'Regression detected':warnings.length?'Warning':'No material regression';
+    const aggregation=commonWindow?'Common window':row.aggregation==='observed'?'Policy evidence':row.aggregation==='mean'?'Rate':'Median';
+    const label=row.aggregation==='observed'?(row.status==='fail'?'Observed failure':warnings.length?'Unverified':'Observed'):commonWindow?(row.status==='fail'?'Observed decrease':warnings.length?'Warning':'Observed'):row.descriptive?'Observed':row.status==='fail'?'Regression detected':warnings.length?'Warning':'No material regression';
     return `<article class="comparison-measurement" data-metric="${escape(row.metric)}"><div class="comparison-measurement-heading"><h4>${escape(comparisonMetricLabel(row))}</h4><small>${aggregation} · ${escape(label)}</small></div><dl class="comparison-value-grid"><div><dt>Baseline</dt><dd>${comparisonValue(row,row.baseline)}</dd><small>n=${number(row.baseline_samples)}</small></div><div><dt>Current</dt><dd>${comparisonValue(row,row.current)}</dd><small>n=${number(row.current_samples)}</small></div><div><dt>Change</dt><dd>${comparisonChange(row)}</dd></div></dl>${commonWindow&&row.method?`<p class="hint">${escape(row.method)}</p>`:''}${warnings.length?`<div class="comparison-brief-warning">${shortWarnings.map(w=>`<p>${escape(w)}</p>`).join('')}<details class="comparison-support"><summary>Why this warning?</summary><ul>${warnings.map(w=>`<li>${escape(w)}</li>`).join('')}</ul></details></div>`:''}${row.worsening_interval_95?`<details class="comparison-statistics"><summary>Statistical details</summary><p>95% interval for worsening: ${row.worsening_interval_95.map(v=>number(v,1)).join(' to ')} ${row.change_unit==='percentage_points'?'percentage points':'%'}. Threshold: ${number(row.threshold,1)} ${row.change_unit==='percentage_points'?'percentage points':'%'}. Warnings still apply.</p></details>`:''}</article>`;
   }).join('')}</div>`;
 }

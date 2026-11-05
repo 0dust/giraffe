@@ -286,6 +286,35 @@ export function configureJudging(source, values, {allowInvalid=false}={}) {
   return config;
 }
 
+export function gatewayPolicySettings(config) {
+  return {gateway:'litellm',capability:'key_rpm',gateway_version:null,affected_identity:'limited',
+    users:[{identity:'limited',requests:5,rpm:2,priority:null},{identity:'peer',requests:8,rpm:8,priority:null}],
+    duration_seconds:15,interval_seconds:.1,max_output_tokens:16,window_state:'unknown',
+    model_rpm:null,saturation_threshold:null,saturation_cache_seconds:null,...structuredClone(config.gateway_policy || {})};
+}
+
+export function configureGatewayPolicy(source, values, {allowInvalid=false}={}) {
+  const config=structuredClone(source);
+  if(!values.has('gateway_policy_rendered'))return config;
+  const settings=gatewayPolicySettings(source);
+  for(const name of ['gateway','capability','affected_identity','window_state','gateway_version']){
+    if(values.has('gateway_policy_'+name))settings[name]=values.get('gateway_policy_'+name)||null;
+  }
+  for(const name of ['duration_seconds','interval_seconds','max_output_tokens','model_rpm','saturation_threshold','saturation_cache_seconds']){
+    if(values.has('gateway_policy_'+name))settings[name]=numeric(values.get('gateway_policy_'+name),name,allowInvalid);
+  }
+  if(values.has('gateway_policy_users')){
+    settings.users=String(values.get('gateway_policy_users')).split('\n').filter(row=>row.trim()).map(row=>{
+      const [identity,requests,rpm,priority,...extra]=row.split(',').map(value=>value.trim());
+      if(extra.length&&!allowInvalid)throw new Error('Each policy user needs identity, request cap, RPM and optional priority tier.');
+      return {identity,requests:numeric(requests,'Request cap',allowInvalid),rpm:numeric(rpm,'RPM',allowInvalid),priority:priority||null};
+    });
+  }
+  if(source.gateway_policy==null&&!source.checks?.includes('gateway_policy')&&sameConfig(settings,gatewayPolicySettings({})))return config;
+  config.gateway_policy=settings;
+  return config;
+}
+
 export function multiUserSettings(config, defaults) {
   const saved=config.multi_user || {}, result={...structuredClone(defaults),...structuredClone(saved)};
   result.profile=Object.fromEntries(loadSizes.map(size=>[size,{...defaults.profile[size],...saved.profile?.[size]}]));

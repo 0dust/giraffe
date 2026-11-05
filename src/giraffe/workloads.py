@@ -21,6 +21,7 @@ WORKLOAD_CHECKS = {
     "prefix": {"prefix"},
     "sessions": {"sessions"},
     "multi_user": {"multi_user"},
+    "gateway_policy": {"gateway_policy"},
     "consistency": {"consistency"}, "tool_calling": {"tools"},
     "forced_tool_diagnostic": {"tools"}, "tool_checks": {"tools"},
     "load_test": {"load"},
@@ -495,10 +496,12 @@ async def tools(run, target, client):
 async def execute(run, target, client, fixtures):
     from giraffe.load_test import execute as load_test
     from giraffe.multi_user import execute as multi_user
+    from giraffe.gateway_policy import execute as gateway_policy
     for field, callback in (
         ("prefix", prefixes),
         ("load_test", load_test),
         ("multi_user", multi_user),
+        ("gateway_policy", gateway_policy),
         ("sessions", sessions),
         ("consistency", consistency),
         ("tool_calling", tools),
@@ -524,6 +527,10 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
     result = []
     selected = set(config.checks) - set(CORE_CHECKS)
     for check in CHECK_NAMES:
+        if check == "gateway_policy" and check in selected:
+            from giraffe.gateway_policy import result as policy_result
+            result.append(policy_result(run, target))
+            continue
         if check == "multi_user" and check in selected:
             from giraffe.multi_user import result as user_result
             result_value = user_result(run, target)

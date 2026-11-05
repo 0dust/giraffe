@@ -117,6 +117,8 @@ def _context_rejection(record):
 
 
 def _serving_failure(record, scenario):
+    if scenario == "gateway_policy" and record.http_status == 429:
+        return False
     if (scenario in {"sustained", "performance_evidence_probe"} or scenario.startswith("traffic_stage_") or record.status == "cancelled"
             or _reasoning_budget(record)):
         return False

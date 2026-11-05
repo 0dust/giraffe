@@ -1166,6 +1166,13 @@ def _print_result(report: RunReport, json_path: Path, html_path: Path | None,
             line = f"Performance · {target_name} · {label}"
         print(line)
     for check in report.checks:
+        policy = check.metrics.get("gateway_policy") if check.id == "gateway_policy" else None
+        if policy:
+            print(f"Gateway policy · {check.target} · {policy['settings']['capability']} · {policy['qualification']}")
+            for user in policy["users"]:
+                print(f"  {user['identity']}: {user['admitted']} admitted, {user['rejected']} rejected, "
+                      f"{user['completed']} completed / {user['planned']} offered cap; declared {user['declared_rpm']} RPM")
+            print("  " + policy["interpretation"])
         users = check.metrics.get("multi_user") if check.id == "multi_user" else None
         if not users:
             continue

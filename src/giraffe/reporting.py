@@ -1197,6 +1197,29 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                         "comparable": not target_reasons,
                         "interpretation": "Repeatability and task correctness are separate. Different answers alone do not prove regression."})
         rows = []
+        for current_check in report.checks:
+            if current_check.id != "gateway_policy" or current_check.target != name:
+                continue
+            current_policy = current_check.metrics.get("gateway_policy", {})
+            old_policy = next((check.metrics.get("gateway_policy", {}) for check in baseline.checks
+                               if check.id == "gateway_policy" and check.target == name), {})
+            compatible = (not target_reasons and current_policy.get("version") == old_policy.get("version")
+                          and current_policy.get("settings") == old_policy.get("settings")
+                          and old_policy.get("qualification") == "observed")
+            for user in current_policy.get("users", []):
+                previous = next((item for item in old_policy.get("users", []) if item["identity"] == user["identity"]), None)
+                status = current_check.status if compatible and previous else "inconclusive"
+                rows.append({"check": "gateway_policy", "scenario": user["identity"],
+                    "user_id": user["identity"], "metric": "policy_acceptance", "aggregation": "observed",
+                    "status": status, "current": current_policy.get("qualification"),
+                    "baseline": old_policy.get("qualification"),
+                    "current_samples": user["dispatched"], "baseline_samples": previous["dispatched"] if previous else 0,
+                    "current_outcomes": user, "baseline_outcomes": previous,
+                    "qualification": current_policy.get("qualification"), "threshold": 0,
+                    "worsening": 100 if status == "fail" else 0,
+                    "reason": "Matched declared policies and observed admission; no timing inference." if compatible else
+                              "Policy settings, summary version or qualified passing baseline do not match.",
+                    "evidence_ids": user["request_ids"]})
         user_rows, user_reasons = _compare_user_delivery(report, baseline, name, target_reasons, threshold)
         rows.extend(user_rows)
         # Optional observations and checks without inference/acceptance cohorts
@@ -1228,6 +1251,8 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
         current_groups, old_groups = _groups(report.requests, name), _groups(baseline.requests, name)
         if not target_reasons:
             for check, scenario in sorted(set(current_groups) | set(old_groups)):
+                if check == "gateway_policy":
+                    continue
                 if check in non_verdict_checks:
                     continue
                 current_records = current_groups.get((check, scenario), [])
@@ -1885,6 +1910,20 @@ def _multi_user_export(data: dict[str, Any]) -> dict[str, Any]:
     return sanitize(value, bounded=False)
 
 
+def _gateway_policy_html(data):
+    rows = "".join(f'<tr><td>{_e(user["identity"])}</td><td>{_e(user["priority"] or "—")}</td>'
+        f'<td>{user["declared_rpm"]}</td><td>{user["admitted"]}</td><td>{user["rejected"]}</td>'
+        f'<td>{user["completed"]} / {user["planned"]}</td>'
+        f'<td>{_e(user["input_tokens"])}</td><td>{_e(user["output_tokens"])}</td></tr>' for user in data["users"])
+    return (f'<h3>Gateway policy · {_e(data["qualification"])}</h3><p>{_e(data["interpretation"])}</p>'
+        '<div class="table"><table><tr><th>Identity</th><th>Priority tier</th><th>Declared RPM</th>'
+        '<th>Admitted</th><th>Rejected</th><th>Completed / offered cap</th><th>Actual input tokens</th>'
+        f'<th>Actual output tokens</th></tr>{rows}</table></div>'
+        f'<p>Peer continuation: {_e(data["peer_continuation"])} · Overlap observed: {_e(data["overlap_observed"])} · '
+        f'Comparable actual work: {_e(data["comparable_actual_work"])}</p>'
+        f'<details><summary>Declared policy and qualification</summary><pre>{_json(data)}</pre></details>')
+
+
 def _multi_user_html(data: dict[str, Any], anchors: dict[str, str]) -> str:
     parts = ['<h3>Per-user shared-window delivery</h3>']
     worst = data.get("worst_user")
@@ -2525,6 +2564,8 @@ def _render(report: RunReport) -> str:
             metrics = _concurrent_load_html(check.metrics) + metrics
         if check.id == "multi_user" and check.metrics.get("multi_user"):
             metrics = _multi_user_html(check.metrics["multi_user"], anchors) + metrics
+        if check.id == "gateway_policy" and check.metrics.get("gateway_policy"):
+            metrics = _gateway_policy_html(check.metrics["gateway_policy"]) + metrics
         if check.id == "sessions" and check.metrics.get("conversation_performance"):
             metrics = _session_performance_html(check.metrics["conversation_performance"]) + metrics
         applied = ((report.manifest.get("effective_checks") or {}).get(check.id) or {}).get("limits") or {}
@@ -2874,6 +2915,9 @@ def reproduction_export(report: RunReport) -> dict:
             "invocation": safe_invocation(retained.manifest.get("invocation")),
             "config": retained.manifest.get("config", {}),
             "fixture_pack": retained.manifest.get("fixture_pack", {}),
+            **({"gateway_policy": {check.target: check.metrics["gateway_policy"] for check in retained.checks
+                                   if check.id == "gateway_policy" and check.metrics.get("gateway_policy")}}
+               if any(check.id == "gateway_policy" for check in retained.checks) else {}),
             **({"multi_user": {check.target: _multi_user_export(check.metrics["multi_user"])
                                for check in retained.checks
                                if check.id == "multi_user" and check.metrics.get("multi_user")}}
