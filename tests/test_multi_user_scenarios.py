@@ -215,6 +215,30 @@ def test_http_budget_exhausted_before_probe_preserves_partial_result():
         asyncio.run(run(endpoint))
 
 
+def test_http_partial_cancellation_cannot_pass_without_user_criteria():
+    from giraffe.client import LLMClient
+    from giraffe.models import Target
+    from tests.fake_endpoint import FakeEndpoint
+
+    async def run(endpoint):
+        cfg = settings(levels=[2], duration_seconds=10, scenarios=["cancellation"], profile=PROFILE,
+            pass_criteria={"max_error_percent": None, "min_samples": 1},
+            cancellation={"user_id": "user-02", "cancel_after_chunks": 2}).model_copy(update={
+                "max_requests": 4, "targets": [Target(name="service", model="fake-model", url=endpoint.url)]})
+        state = runner._Run(cfg, None, None)
+        async with LLMClient(cfg.targets[0], cfg, max_connections=2) as client:
+            await execute(state, cfg.targets[0], client)
+        check = result(state, cfg.targets[0])
+        window = check.metrics["multi_user"]["windows"][0]
+        evidence = window["cancellation"]
+        assert window["cut_short"]
+        assert all(evidence[key]["status"] == "pass" for key in ("cancellation", "peer_continuation", "followup"))
+        assert evidence["status"] == window["status"] == check.status == "inconclusive"
+
+    with FakeEndpoint(first_token_delay=.02, chunk_delay=.02) as endpoint:
+        asyncio.run(run(endpoint))
+
+
 def test_cancellation_followup_does_not_substitute_for_peer_overlap():
     from giraffe.multi_user_metrics import summarize
     from tests.test_multi_user_metrics import observation

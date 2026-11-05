@@ -377,7 +377,7 @@ async def execute(run, target, client):
                 turn_counts = conversation.sampling.turn_count
                 max_turns = max(value for index, value in enumerate(turn_counts.values)
                     if turn_counts.weights is None or turn_counts.weights[index] > 0) if turn_counts else None
-                assigned_tasks = sorted({user["conversation_workload"] for user in population})
+                assigned_tasks = sorted({user["conversation_workload"] for window in windows for user in window["users"]})
                 for index in assigned_tasks:
                     task = conversation.workloads[index]
                     for prompt in task.turns[:int(max_turns) if max_turns is not None else None]:
