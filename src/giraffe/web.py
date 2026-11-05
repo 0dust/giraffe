@@ -506,7 +506,7 @@ def _track_live_request(job: dict, event: dict, max_requests: int | None) -> Non
         return
     if isinstance(event.get("user"), dict):
         request["workload"] = {key: value for key, value in event["user"].items()
-                               if key in {"user_id", "population", "profile", "window_id", "phase", "request_sequence"}
+                               if key in {"user_id", "population", "profile", "window_id", "phase", "request_sequence", "session_id", "turn_id", "conversation_sequence", "role", "matched_work_sequence", "trigger", "heavy_profile", "cancellation_role", "cohort", "origin", "work_sequence", "activation_seconds"}
                                and (type(value) is int or isinstance(value, str) and len(value) <= 128)}
     request.update({key: event.get(key) for key in
                     ("input_chars", "requested_max_tokens", "requested_input_tokens")})

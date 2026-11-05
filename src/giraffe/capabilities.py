@@ -61,7 +61,7 @@ CHECK_DETAILS = {
     "tools": "Checks response protocol, configured tool names and arguments, and optional assistant text requirements separately. Parallel calls match as an unordered multiset and conversation results use matched call IDs. Empty argument text means an empty object, except an empty last call cut off by the output limit remains unverified. Only final answer text satisfies content expectations; unclosed reasoning is inconclusive. Output truncation, including partial JSON numbers, is inconclusive unless complete calls independently violate the contract. Giraffe does not execute tools.",
 }
 
-CHECK_DESCRIPTIONS["multi_user"] = "Repeated independent users sharing the request limit."
+CHECK_DESCRIPTIONS["multi_user"] = "Persistent users, arrivals, bursts and recovery sharing the request limit."
 CHECK_DETAILS["multi_user"] = "Keeps each simulated user across repeated requests and population levels. Users pause without holding request slots. All users share the run budgets; per-user results use an explicit common measurement window, with warmup and late completions shown separately."
 
 CHECK_DESCRIPTIONS["load"] = "Workloads, request rates and bursts in one place."

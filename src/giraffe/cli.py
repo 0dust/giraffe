@@ -1184,6 +1184,54 @@ def _print_result(report: RunReport, json_path: Path, html_path: Path | None,
             if window.get("phase") != "measurement":
                 continue
             print(f"  {window['population']} users · {window.get('duration_seconds', 0):.3g} / {window['planned_duration_seconds']:g} planned seconds")
+            if window.get("role"):
+                print("    " + " · ".join(str(window[key]) for key in ("scenario", "role", "trigger", "heavy_profile") if window.get(key)))
+            if counts := window.get("offer_accounting"):
+                print("    Scheduled and achieved traffic: " + " · ".join(f"{key}: {value}" for key, value in counts.items()))
+                for user in window["users"]:
+                    print(f"      {user['user_id']} / {user.get('cohort')} · scheduled/observed activation "
+                          f"{user.get('scheduled_activation_ms')} / {user.get('activated_ms')} ms · "
+                          + " · ".join(f"{key}: {value}" for key, value in user.get("offer_accounting", {}).items()))
+            if evidence := window.get("recovery"):
+                print(f"    Matched per-user recovery: {evidence['status']}")
+                for user in evidence["users"]:
+                    print(f"      {user['user_id']}: {user['status']} · {user['matched_samples']} matched samples · "
+                          f"slowdown {user['slowdown']} · {' '.join(user['reasons'])}")
+                    for label, values in user["phases"].items():
+                        print(f"        {label}: {values} · requests: {', '.join(user.get(label+'_request_ids', []))}")
+            if evidence := window.get("interference"):
+                print(f"    Matched noisy-neighbor comparison: {evidence['status']}")
+                for reason in evidence.get("reasons", []):
+                    print(f"      {reason}")
+                for user in evidence.get("users", []):
+                    print(f"      {user['user_id']}: {user['status']} · {user.get('matched_samples', 0)} matched samples · "
+                          f"slowdown {user.get('slowdown')} · first/completion/gap change "
+                          f"{user.get('first_answer_change_ms')} / {user.get('completion_change_ms')} / "
+                          f"{user.get('stream_gap_change_ms')} ms · output change {user.get('output_tokens_change')} tokens")
+                    print(f"        Actual input medians {user.get('control_input_median_tokens')} → {user.get('probe_input_median_tokens')}; "
+                          f"output medians {user.get('control_output_median_tokens')} → {user.get('probe_output_median_tokens')}")
+                    for reason in user.get("reasons", []):
+                        print(f"        {reason}")
+                    for name in ("control_request_ids", "probe_request_ids", "heavy_request_ids"):
+                        print(f"        {name}: {', '.join(user.get(name, [])) or 'none'}")
+            if evidence := window.get("cancellation"):
+                print(f"    Selected user: {evidence.get('selected_user_id')} · {evidence['status']}")
+                for key, label in (("cancellation", "Selected request cancellation"),
+                                   ("peer_continuation", "Peer continuation"), ("followup", "Same-user follow-up")):
+                    item = evidence.get(key, {})
+                    print(f"      {label}: {item.get('status', 'inconclusive')} · "
+                          f"{' '.join(item.get('reasons', []))} · requests: {', '.join(item.get('request_ids', [])) or 'none'}")
+                print("      Backend compute and memory release: unverified")
+            fairness = window.get("fairness")
+            if fairness:
+                ratio = fairness.get("ratio")
+                print(f"    Observed delivery fairness: {fairness['status']} · "
+                      f"median / worst ratio {ratio if ratio is not None else 'undefined'} · "
+                      f"limit {fairness.get('threshold')} · "
+                      f"eligible users {', '.join(fairness.get('eligible_user_ids', [])) or 'none'} / "
+                      f"{len(fairness.get('compared_user_ids', []))} compared")
+                for reason in fairness.get("reasons", []):
+                    print(f"      {reason}")
             for user in window.get("users", []):
                 rate = user.get("output_tokens_per_second")
                 delivery = f"{rate:.3g} tok/s" if rate is not None else "unknown tok/s"
@@ -1196,6 +1244,12 @@ def _print_result(report: RunReport, json_path: Path, html_path: Path | None,
                       f"{outcome.get('completed', 0)}/{outcome.get('attempted', 0)} completed · "
                       f"{outcome.get('errors', 0)} errors · ready first/completion p95 {timing} ms · "
                       f"{user.get('coverage', {}).get('status', 'unknown')}")
+                for item in user.get("conversations", []):
+                    print(f"      Conversation {item['id']} · {item['mode']} · "
+                          f"{len(item['turns'])}/{item['planned_turns']} turns · "
+                          f"{item.get('stop_reason') or 'completed'}")
+                    for turn, request_id in enumerate(item["turns"]):
+                        print(f"        Turn {turn + 1}: {request_id}")
     unselected = []
     for check in report.checks:
         if check.status == "skipped" and check.summary.rstrip(".") in {"Not selected", "Not selected for this run"}:

@@ -291,6 +291,10 @@ export function multiUserSettings(config, defaults) {
   result.profile=Object.fromEntries(loadSizes.map(size=>[size,{...defaults.profile[size],...saved.profile?.[size]}]));
   result.pass_criteria={...defaults.pass_criteria,...saved.pass_criteria};
   result.think_time_seconds={...defaults.think_time_seconds,...saved.think_time_seconds};
+  result.noisy_neighbors={...defaults.noisy_neighbors,...saved.noisy_neighbors};
+  result.cancellation={...defaults.cancellation,...saved.cancellation};
+  result.arrivals={...defaults.arrivals,...saved.arrivals};
+  result.recovery={...defaults.recovery,...saved.recovery};
   return result;
 }
 
@@ -300,8 +304,28 @@ export function configureMultiUser(source, values, defaults, {allowInvalid=false
   const settings=multiUserSettings(source,defaults);
   const number=(name,label)=>numeric(values.get('multi_user_'+name),label,allowInvalid);
   const list=(name,label)=>String(values.get('multi_user_'+name)||'').split(',').map(value=>numeric(value.trim(),label,allowInvalid));
+  if(values.has('multi_user_scenarios_rendered'))settings.scenarios=['repeated_requests','noisy_neighbors','cancellation','arrivals','recovery'].filter(name=>values.get('multi_user_scenario_'+name)==='on');
+  if(values.has('multi_user_arrivals_requests_per_second'))settings.arrivals.requests_per_second=number('arrivals_requests_per_second','Requests per second per user');
+  if(values.has('multi_user_arrivals_activations')){
+    const rows=String(values.get('multi_user_arrivals_activations')||'').trim();
+    settings.arrivals.activations=Object.fromEntries(rows?rows.split(',').map(row=>{const [id,seconds]=row.trim().split('@');return [id.trim(),numeric(seconds,'Activation seconds',allowInvalid)];}):[]);
+  }
+  if(values.has('multi_user_arrivals_bursts')){
+    const rows=String(values.get('multi_user_arrivals_bursts')||'').trim();
+    settings.arrivals.bursts=rows?rows.split(',').map(row=>{const [id,seconds,count,spacing]=row.trim().split('@');return {user_id:id.trim(),at_seconds:numeric(seconds,'Burst time',allowInvalid),requests:numeric(count,'Burst requests',allowInvalid),spacing_seconds:numeric(spacing||'0','Burst spacing',allowInvalid)};}):[];
+  }
+  for(const key of ['control_seconds','sustained_seconds','lighter_seconds','sustained_requests_per_second','lighter_requests_per_second','max_slowdown'])if(values.has('multi_user_recovery_'+key))settings.recovery[key]=number('recovery_'+key,key);
+  if(values.has('multi_user_noisy_neighbors_profiles_rendered'))settings.noisy_neighbors.heavy_profiles=['long_short','short_long','long_long'].filter(name=>values.get('multi_user_noisy_neighbors_profile_'+name)==='on');
+  if(values.has('multi_user_noisy_neighbors_triggers_rendered'))settings.noisy_neighbors.triggers=['before_output','during_stream'].filter(name=>values.get('multi_user_noisy_neighbors_trigger_'+name)==='on');
+  if(values.has('multi_user_noisy_neighbors_heavy_user_ids')){
+    const text=String(values.get('multi_user_noisy_neighbors_heavy_user_ids')||'').trim();
+    settings.noisy_neighbors.heavy_user_ids=text?text.split(',').map(value=>value.trim()):null;
+  }
+  for(const name of ['heavy_user_count','max_slowdown'])if(values.has('multi_user_noisy_neighbors_'+name))settings.noisy_neighbors[name]=number('noisy_neighbors_'+name,name);
+  if(values.has('multi_user_cancellation_user_id'))settings.cancellation.user_id=String(values.get('multi_user_cancellation_user_id')||'').trim();
+  if(values.has('multi_user_cancellation_cancel_after_chunks'))settings.cancellation.cancel_after_chunks=number('cancellation_cancel_after_chunks','Cancellation chunks');
   if(values.has('multi_user_levels'))settings.levels=list('levels','User levels');
-  for(const name of ['duration_seconds','warmup_seconds','seed'])if(values.has('multi_user_'+name))settings[name]=number(name,name);
+  for(const name of ['duration_seconds','warmup_seconds','seed','fairness_tolerance_percent'])if(values.has('multi_user_'+name))settings[name]=number(name,name);
   if(values.has('multi_user_think_time_values'))settings.think_time_seconds.values=list('think_time_values','Pause values');
   if(values.has('multi_user_think_time_weights'))settings.think_time_seconds.weights=String(values.get('multi_user_think_time_weights')).trim()?list('think_time_weights','Pause weights'):null;
   if(loadShapes.some(shape=>values.has('multi_user_shape_'+shape))){
@@ -312,6 +336,38 @@ export function configureMultiUser(source, values, defaults, {allowInvalid=false
     const name='profile_'+size+'_'+kind;if(values.has('multi_user_'+name))settings.profile[size][kind]=number(name,kind);
   }
   for(const key of Object.keys(defaults.pass_criteria))if(values.has('multi_user_criteria_'+key))settings.pass_criteria[key]=number('criteria_'+key,key);
+  if(values.has('multi_user_conversation_profile')){
+    const profile=values.get('multi_user_conversation_profile');
+    if(profile==='requests')settings.conversations=null;
+    else{
+      const conversation={...settings.conversations,profile};
+      const prefix='multi_user_conversation_';
+      for(const name of ['max_tokens','delay_seconds'])if(values.has(prefix+name))conversation[name]=number('conversation_'+name,name);
+      if(values.has(prefix+'modes'))conversation.modes=profile==='performance'?['live']:String(values.get(prefix+'modes')).split(',');
+      if(values.has(prefix+'turns'))conversation.turns=String(values.get(prefix+'turns')).split('\n');
+      if(values.has(prefix+'sampling_seed')){
+        const sampling={seed:number('conversation_sampling_seed','Sampling seed')};
+        for(const key of ['think_time_seconds','input_tokens','output_tokens','turn_count']){
+          if(profile!=='performance'&&key!=='think_time_seconds')continue;
+          const text=String(values.get(prefix+'sample_'+key)||'').trim();
+          const weights=String(values.get(prefix+'weights_'+key)||'').trim();
+          if(text||weights)sampling[key]={values:text?list('conversation_sample_'+key,key):[],weights:weights?list('conversation_weights_'+key,key):null};
+        }
+        conversation.sampling=Object.keys(sampling).length>1?sampling:null;
+      }
+      if(profile==='performance'&&values.has(prefix+'task_count')){
+        conversation.workloads=[];
+        for(let i=0;i<Number(values.get(prefix+'task_count'));i++){
+          if(values.get(prefix+`task_${i}_enabled`)!=='on')continue;
+          conversation.workloads.push({name:String(values.get(prefix+`task_${i}_name`)||'').trim(),
+            weight:number(`conversation_task_${i}_weight`,'Task weight'),
+            max_tokens:number(`conversation_task_${i}_cap`,'Task output cap'),
+            turns:Array.from({length:Number(values.get(prefix+`task_${i}_turn_count`))},(_,turn)=>String(values.get(prefix+`task_${i}_turn_${turn}`)||''))});
+        }
+      }else if(profile==='correctness')conversation.workloads=[];
+      settings.conversations=conversation;
+    }
+  }
   // An untouched hidden drawer must not activate or materialize an optional check.
   if(source.multi_user==null&&!config.checks?.includes('multi_user')&&sameConfig(settings,defaults))return config;
   config.multi_user=settings;

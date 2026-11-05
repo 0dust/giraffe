@@ -26,8 +26,10 @@ class FakeEndpoint:
         fault_contains: str | None = None,
         service_slots: int | None = None,
         cached_tokens: int | None = None,
+        response_delay=None,
     ):
         self.cached_tokens = cached_tokens
+        self.response_delay = response_delay
         self.mode = mode
         self.first_token_delay = first_token_delay
         self.chunk_delay = chunk_delay
@@ -349,6 +351,8 @@ class FakeEndpoint:
                     self.wfile.flush()
 
             def _completion(self, payload: dict[str, Any]) -> None:
+                if endpoint.response_delay:
+                    endpoint._stop.wait(endpoint.response_delay(payload))
                 prompt = "\n".join(message.get("content") or "" for message in payload["messages"])
                 applies = endpoint.fault_contains is None or endpoint.fault_contains in prompt
                 mode = endpoint.mode if applies else "healthy"
