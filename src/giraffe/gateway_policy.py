@@ -180,10 +180,25 @@ def summarize(settings, observation, records):
     if admitted > allowance:
         return outcome("observed_failure", "Admitted requests exceeded the declared RPM allowance in the isolated window.", "fail")
     first_rejection = min((record.completed_ms for record in recognized if record.completed_ms is not None), default=None)
-    prior_admissions = sum(record.http_status is not None and 200 <= record.http_status < 300
-                           and record.completed_ms is not None and first_rejection is not None
-                           and record.completed_ms < first_rejection for record in affected)
-    if prior_admissions < declared.rpm:
+    if first_rejection is None:
+        return outcome("unverified", "Attributed rejection timing is unavailable.")
+    if settings.capability == "priority_rpm" and any(
+        record.http_status is not None and 200 <= record.http_status < 300
+        and record.dispatch_ms is not None and record.dispatch_ms > first_rejection
+        and record.completed_ms is not None and record.completed_ms <= observation.get("end_ms", 0)
+        for record in affected
+    ):
+        return outcome("observed_failure", "A request dispatched after strict priority pool exhaustion was admitted in the same window.", "fail")
+    prior_admissions = [record for record in affected
+                        if record.http_status is not None and 200 <= record.http_status < 300
+                        and record.completed_ms is not None and record.completed_ms < first_rejection]
+    if len(prior_admissions) < declared.rpm:
+        # RPM can be charged before a downstream failure; its admission is unknown.
+        uncertain_prior = sum(record not in prior_admissions and record not in recognized
+                              and (record.dispatch_ms is None or record.dispatch_ms < first_rejection)
+                              for record in affected)
+        if len(prior_admissions) + uncertain_prior >= declared.rpm:
+            return outcome("unverified", "Prior requests with unknown admission could have consumed the declared RPM allowance.")
         return outcome("observed_failure", "Attributed rejection occurred before the declared RPM allowance was served.", "fail")
     if not summary["complete"] or any(user["cancelled"] or user["other_failures"] for user in users):
         return outcome("unverified", "Traffic was interrupted or non-policy failures left incomplete evidence.")
