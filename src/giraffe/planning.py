@@ -1027,6 +1027,11 @@ def request_plan(config: RunConfig | ConfigDraft, *,
                 kind="bounded", title="Sustained load")
     if "gpu" in selected:
         add("gpu", 0, "Observes metrics without adding inference requests.", source="configured metrics endpoint")
+    if "gateway_attribution" in selected and config.gateway_attribution:
+        settings = config.gateway_attribution
+        add("gateway_attribution", len(settings.identities) * settings.samples,
+            "Marked identity probes plus bounded read-only gateway spend-log collection.",
+            source="configured test identity references")
 
     if "arrivals" in selected:
         add("arrivals", config.arrivals.requests,

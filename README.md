@@ -240,6 +240,7 @@ In the UI, open a completed run and choose **Save baseline** (fully passing runs
 | Multi-turn sessions · `sessions` | Recall and timing across concurrent conversations |
 | Multi-user · `multi_user` | Persistent users sharing request slots, with individual delivery and timing outcomes |
 | Gateway quotas & priorities · `gateway_policy` | [Opt-in LiteLLM policy observations](docs/gateway-policy.md) with separate identities, bounded traffic and continued peer service |
+| Gateway usage attribution · `gateway_attribution` | Marked requests and final token counts matched to existing LiteLLM spend logs |
 | Answer consistency · `consistency` | Answer agreement across repeated requests |
 | Tool calling · `tools` | Tool-call structure, names and expected arguments |
 
@@ -248,6 +249,44 @@ The catalog includes verdict checks and two server observations: **GPU metrics**
 Missing GPU telemetry and missing or inactive prefix caching do not change the
 verdict. GPU hardware faults and an exceeded configured temperature limit can
 still fail the run. Prefix cache never fails the run.
+
+Gateway attribution is optional and independent of simulated users. The bounded
+[LiteLLM example](examples/litellm-attribution.yaml) sends four requests using two
+existing virtual keys and reads `/spend/logs/v2`; run it with
+`giraffe run --config examples/litellm-attribution.yaml` after setting the three
+named environment variables and the served model. It needs an existing LiteLLM
+database with spend logging and an observer credential authorized to read both
+identities. Giraffe makes only GET requests to the evidence endpoint and does not
+create keys, change gateway settings, or reset counters. LiteLLM's available
+reader permissions depend on the deployment; a supplied admin credential remains
+privileged even though this check only reads.
+
+`targets[].test_identities` contains labels and `api_key_env`/`headers_env`
+references. A selected probe identity replaces all target authentication and
+custom headers and ignores ambient cookies; `{}` explicitly means anonymous.
+Missing references never fall back to the shared key. Identity probes retain
+numeric response evidence, not answer text or arbitrary server identifiers.
+Ordinary requests continue to use the target's shared credentials.
+
+The LiteLLM adapter requires generated request metadata, the matching session
+marker, a gateway API-key hash, and complete final prompt/completion token counts.
+The hash is compared in memory and discarded. Repeated log rows and cumulative
+streaming usage count once. Header-only or anonymous identities without a bearer
+key cannot prove key attribution. Missing rows, log lag beyond the bounded wait,
+changed or ambiguous rows, incomplete pagination, and missing token usage leave
+the result **unverified**. Shared counters cannot isolate this test's traffic and
+are not used, so counter resets cannot produce a pass. Results separately name
+**not selected**, **unavailable**, **unsupported**, **unverified**, and observed
+**mismatch**; a verified result covers only the marked requests observed.
+Identity references and check settings survive report exports and baseline
+configuration; changing either prevents a like-for-like comparison. References
+cannot establish that an operator kept the same underlying credential values.
+
+The adapter follows LiteLLM's documented
+[spend-log API](https://docs.litellm.ai/docs/proxy/cost_tracking) and
+[request headers](https://docs.litellm.ai/docs/proxy/request_headers). Controlled
+fixtures test that contract; a successful run against your actual gateway is
+needed to establish deployment compatibility and attribution.
 
 When selected, generation uses a **5,000 ms stream-gap limit** if no generation
 limit is supplied; this catches stalls without imposing a token speed. Set

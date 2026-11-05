@@ -1,5 +1,6 @@
 """Persistent users share request admission without sharing their lifetime."""
 import asyncio
+import threading
 
 import pytest
 from pydantic import ValidationError
@@ -156,25 +157,57 @@ def test_run_selection_planning_and_live_identity(monkeypatch):
     run_virtual(monkeypatch, scenario())
 
 
-def test_actual_http_requests_share_slots_and_persist_user_identity():
+@pytest.mark.parametrize("first_token_delay", [.005, .15])
+def test_actual_http_requests_share_slots_and_persist_user_identity(monkeypatch, first_token_delay):
     from giraffe.client import LLMClient
     from giraffe.multi_user import execute
     from giraffe.models import Target
     from tests.fake_endpoint import FakeEndpoint
 
     async def scenario(endpoint):
-        cfg = settings(duration_seconds=.4).model_copy(update={
+        # Finish on request count, not an assumption about loopback throughput.
+        # Each user thinks longer than the watchdog after its first response, so
+        # only twenty distinct users can consume the twenty-request budget.
+        cfg = settings(duration_seconds=60, think_time_seconds={"values": [60]}).model_copy(update={
+            "max_requests": 20, "max_duration_seconds": 60,
             "targets": [Target(name="service", model="fake-model", url=endpoint.url)]})
         state = runner._Run(cfg, None, None)
+        persisted = []
+        state.record_sink = persisted.append
         async with LLMClient(cfg.targets[0], cfg, max_connections=20) as client:
-            await execute(state, cfg.targets[0], client)
-        assert 2 <= endpoint.peak_active <= 5
-        assert len({r.workload["user_id"] for r in state.records}) == 20
-        assert len({r.id for r in state.records}) == len(endpoint.requests)
+            await asyncio.wait_for(execute(state, cfg.targets[0], client), timeout=10)
+        window = state.observations["service"]["multi_user"]["windows"][0]
+        assert endpoint.peak_active == 5
+        assert len(window["users"]) == 20
+        for user in window["users"]:
+            records = [r for r in persisted if r.workload["user_id"] == user["user_id"]]
+            assert [r.workload["request_sequence"] for r in records] == [1]
+            assert user["request_ids"] == [r.id for r in records]
+        assert len(state.records) == len(persisted) == len({r.id for r in persisted}) == 20
+        assert len(endpoint.requests) == 20
+        assert all(r.status == "completed" for r in persisted)
+        assert all(r.dispatch_ms < window["end_ms"] for r in persisted)
+        assert window["cut_short"]
+        assert window["reason"] == "maximum request budget reached"
+        assert window["drain_reason"] is None
         assert state.slots.qsize() == 5
 
-    with FakeEndpoint() as endpoint:
-        asyncio.run(scenario(endpoint))
+    with FakeEndpoint(first_token_delay=first_token_delay) as endpoint:
+        # Hold each wave until five requests reach the real HTTP server. A pool
+        # of twenty cannot supply the runner's five-slot limit accidentally.
+        barrier = threading.Barrier(5, timeout=5)
+        handler = endpoint._server.RequestHandlerClass
+        completion = handler._completion
+
+        def synchronized_completion(self, payload):
+            barrier.wait()
+            completion(self, payload)
+
+        monkeypatch.setattr(handler, "_completion", synchronized_completion)
+        try:
+            asyncio.run(scenario(endpoint))
+        finally:
+            barrier.abort()
 
 
 def test_stop_during_drain_preserves_closed_window_and_terminal_records(monkeypatch):

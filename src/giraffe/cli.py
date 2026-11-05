@@ -1173,6 +1173,13 @@ def _print_result(report: RunReport, json_path: Path, html_path: Path | None,
                 print(f"  {user['identity']}: {user['admitted']} admitted, {user['rejected']} rejected, "
                       f"{user['completed']} completed / {user['planned']} offered cap; declared {user['declared_rpm']} RPM")
             print("  " + policy["interpretation"])
+        if check.id == "gateway_attribution" and check.metrics.get("state") != "not_selected":
+            data = check.metrics
+            print(f"Gateway attribution · {check.target} · {data.get('state', 'unverified')} · "
+                  f"{data.get('matched_requests', 0)} matched / {data.get('observed_requests', 0)} observed requests")
+            for row in data.get("identities", []):
+                print(f"  {row['identity']} · {row['matched_requests']} matched · "
+                      f"{row['mismatched_requests']} mismatched · {row['unverified_requests']} unverified")
         users = check.metrics.get("multi_user") if check.id == "multi_user" else None
         if not users:
             continue

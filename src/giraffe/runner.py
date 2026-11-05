@@ -1112,7 +1112,13 @@ async def _target(run: _Run, target: Target, fixtures: dict):
         if enabled == {"gpu"} and config.restart_target != target.name:
             await _metrics(run, target, "start")
             return
-        async with LLMClient(target, config, max_connections=run.connection_limits[target.name]) as client:
+        gateway_only = bool(enabled) and all(check.startswith("gateway_") for check in enabled)
+        client_target = target
+        if gateway_only:
+            # Explicit identity probes never require or inherit shared credentials.
+            client_target = target.model_copy(update={"api_key_env": None, "headers_env": {}})
+            client_target._api_key = None
+        async with LLMClient(client_target, config, max_connections=run.connection_limits[target.name]) as client:
             client.logprob_budget = run.logprob_budget
             client.on_response = lambda: run.endpoint_response(target.name)
             data = run.observations[target.name]["serving_telemetry"]
@@ -1163,7 +1169,7 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                 else:
                     await run.group(target, client, initial_specs, "initial", count=1)
             run.finish_checks(target.name, {"access"})
-            if config.stream and hasattr(client, "token_evidence_probe"):
+            if config.stream and not gateway_only and hasattr(client, "token_evidence_probe"):
                 # A one-token inference can still have a slow first response.
                 # Share one configured timeout across compatibility retries.
                 probe_end = min(run.deadline, time.monotonic() + config.request_timeout_seconds)

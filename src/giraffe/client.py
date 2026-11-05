@@ -418,6 +418,14 @@ class LLMClient:
             except ValueError:
                 record.error = "Test identity credentials are unavailable."
                 return record
+            if "gateway_attribution" in spec.check_ids:
+                selected_headers = dict(httpx.Headers(selected_headers))
+                authorization = httpx.Headers(selected_headers).get("authorization", "")
+                if authorization.startswith("Bearer "):
+                    record._gateway_key_hash = hashlib.sha256(authorization[7:].encode()).hexdigest()
+                selected_headers["x-litellm-trace-id"] = spec.workload["gateway_run"]
+                selected_headers["x-litellm-spend-logs-metadata"] = json.dumps({
+                    "giraffe_run": spec.workload["gateway_run"], "giraffe_request": record.id})
         payload = {
             key: value for key, value in (self.config.request_options | spec.options).items()
             if key not in _RESERVED_OPTIONS and value is not None

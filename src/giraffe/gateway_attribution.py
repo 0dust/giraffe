@@ -1,0 +1,244 @@
+"""Bounded, read-only LiteLLM spend-log attribution for marked test traffic."""
+from __future__ import annotations
+
+import asyncio
+from collections import defaultdict
+import json
+import ssl
+import time
+import uuid
+
+import httpx
+
+from .identities import identity_headers, identity_scope
+from .models import CheckResult, RequestSpec
+
+
+CHECK = "gateway_attribution"
+MAX_BODY_BYTES = 4 * 1024 * 1024
+MAX_PAGES = 8
+PAGE_SIZE = 128
+
+
+def _state(state, reason, **details):
+    return {"state": state, "reason": reason, "matched_requests": 0,
+            "mismatched_requests": 0, "unverified_requests": 0,
+            "prompt_tokens": 0, "completion_tokens": 0, "identities": [], **details}
+
+
+def _number(value):
+    return type(value) is int and 0 <= value <= 10**12
+
+
+def _normalize(rows, marker, expected):
+    """Drop all raw data before returning; hashes are compared only in memory."""
+    matched = defaultdict(dict)
+    unrelated = invalid = 0
+    for row in rows:
+        if not isinstance(row, dict):
+            invalid += 1
+            continue
+        metadata = row.get("metadata")
+        if isinstance(metadata, str):
+            try:
+                metadata = json.loads(metadata)
+            except (ValueError, UnicodeError, RecursionError):
+                metadata = None
+        tags = metadata.get("spend_logs_metadata") if isinstance(metadata, dict) else None
+        if not isinstance(tags, dict) or tags.get("giraffe_run") != marker:
+            unrelated += 1
+            continue
+        local_id = tags.get("giraffe_request")
+        gateway_id = row.get("request_id")
+        if (not isinstance(local_id, str) or local_id not in expected
+                or row.get("session_id") != marker
+                or not isinstance(gateway_id, str) or not 0 < len(gateway_id) <= 256):
+            invalid += 1
+            continue
+        prompt, completion, total = (row.get(key) for key in ("prompt_tokens", "completion_tokens", "total_tokens"))
+        actual_key = row.get("api_key")
+        complete = (all(_number(n) for n in (prompt, completion, total))
+                    and prompt + completion == total and row.get("status") == "success"
+                    and isinstance(actual_key, str) and len(actual_key) == 64
+                    and all(char in "0123456789abcdef" for char in actual_key))
+        value = {"complete": complete,
+                 "identity_matches": bool(expected[local_id]._gateway_key_hash)
+                    and actual_key == expected[local_id]._gateway_key_hash,
+                 "prompt_tokens": prompt if _number(prompt) else None,
+                 "completion_tokens": completion if _number(completion) else None}
+        previous = matched[local_id].get(gateway_id)
+        # Repeated pages/scrapes of one row are not additional requests. A row
+        # that changes its final usage or owner is unstable evidence.
+        if previous is not None and previous != value:
+            value["complete"] = False
+        matched[local_id][gateway_id] = value
+    return matched, unrelated, invalid
+
+
+def _assess(records, matched, planned, *, complete, unstable=False):
+    identities = {}
+    totals = _state("unverified", "Some marked requests lack complete attribution evidence.",
+                    planned_requests=planned, observed_requests=len(records))
+    for record in records:
+        alias = record.identity
+        row = identities.setdefault(alias, {"identity": alias, "observed_requests": 0,
+            "matched_requests": 0, "mismatched_requests": 0, "unverified_requests": 0,
+            "prompt_tokens": 0, "completion_tokens": 0, "request_ids": []})
+        row["observed_requests"] += 1
+        row["request_ids"].append(record.id)
+        observations = list(matched.get(record.id, {}).values())
+        good = (complete and not unstable and record.status == "completed" and record.valid
+                and record._gateway_key_hash and _number(record.input_tokens) and _number(record.completion_tokens)
+                and len(observations) == 1 and observations[0]["complete"])
+        if not good:
+            field = "unverified_requests"
+        else:
+            observation = observations[0]
+            field = "matched_requests" if (observation["identity_matches"]
+                and observation["prompt_tokens"] == record.input_tokens
+                and observation["completion_tokens"] == record.completion_tokens) else "mismatched_requests"
+            if field == "matched_requests":
+                for metric in ("prompt_tokens", "completion_tokens"):
+                    row[metric] += observation[metric]
+                    totals[metric] += observation[metric]
+        row[field] += 1
+        totals[field] += 1
+    totals["identities"] = list(identities.values())
+    if totals["mismatched_requests"]:
+        totals.update(state="mismatch", reason="Marked requests have different gateway identity or token attribution.")
+    elif records and len(records) == planned and totals["matched_requests"] == planned:
+        totals.update(state="verified", reason="Every marked request matches its gateway identity and final token counts.")
+    return totals
+
+
+def _client(config, gateway, headers, timeout):
+    verify = ssl.create_default_context(cafile=config.ca_bundle) if config.ca_bundle else True
+    return httpx.AsyncClient(headers=headers, verify=verify, proxy=config.proxy,
+                             timeout=timeout, follow_redirects=False)
+
+
+async def _pages(client, url, marker, *, max_rows, stop):
+    rows = []
+    for page in range(1, MAX_PAGES + 1):
+        if stop.is_set():
+            return rows, False
+        async with client.stream("GET", url, params={"session_id": marker, "page": page,
+                                                     "page_size": min(PAGE_SIZE, max_rows)}) as response:
+            if response.status_code in {404, 405, 501}:
+                return "unsupported", False
+            if response.status_code != 200:
+                return "unavailable", False
+            body = bytearray()
+            async for chunk in response.aiter_bytes():
+                body.extend(chunk)
+                if len(body) > MAX_BODY_BYTES:
+                    return rows, False
+            try:
+                payload = json.loads(body)
+            except (ValueError, UnicodeError, RecursionError):
+                return rows, False
+            if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+                return rows, False
+            data = payload["data"]
+            if len(rows) + len(data) > max_rows:
+                return rows, False
+            rows.extend(data)
+            if not data:
+                return rows, True
+            pages = payload.get("total_pages")
+            if type(pages) is not int or pages < 0:
+                return rows, False
+            if payload.get("total_is_capped") is not True and type(pages) is int and pages >= 0 and page >= pages:
+                return rows, True
+    return rows, False
+
+
+async def execute(run, target, client):
+    settings, gateway = run.config.gateway_attribution, target.gateway
+    observation = _state("unavailable", "Gateway evidence endpoint and credentials are not configured.")
+    run.observations[target.name][CHECK] = observation
+    if gateway is None:
+        return
+    if gateway.profile != "litellm":
+        observation.update(state="unsupported", reason="No supported attribution adapter selected for this gateway profile.")
+        return
+    # The same credential-reference validation/resolution applies to the reader,
+    # but its credential is never taken from an inference identity.
+    from types import SimpleNamespace
+    try:
+        headers = identity_headers(SimpleNamespace(test_identities={"reader": gateway}), "reader")
+        for alias in settings.identities:
+            identity_headers(target, alias)
+    except ValueError:
+        observation.update(reason="Gateway reader or selected identity credentials are unavailable.")
+        return
+    marker = "giraffe-" + uuid.uuid4().hex
+    records = []
+    planned = settings.samples * len(settings.identities)
+    run.plan_condition(target.name, CHECK, planned=planned)
+    try:
+        for _ in range(settings.samples):
+            for alias in settings.identities:
+                if not run.allowed(target.name):
+                    break
+                spec = RequestSpec(fixture_id="gateway_attribution.v1", scenario=CHECK, check_ids=[CHECK],
+                    identity=alias, messages=[{"role": "user", "content": "Reply with OK."}],
+                    max_tokens=min(16, run.config.max_output_tokens),
+                    options={"stream_options": {"include_usage": True}} if run.config.stream else {},
+                    workload={"gateway_run": marker})
+                record = await run.request(target, client, spec)
+                if record is not None:
+                    records.append(record)
+    finally:
+        run.finish_condition(target.name, CHECK)
+    if not records:
+        observation.update(state="unverified", reason="No identified requests were admitted within the run budget.", planned_requests=planned)
+        return
+    deadline = min(run.deadline, time.monotonic() + settings.settle_seconds)
+    attempts, previous, unstable = 0, {}, False
+    assessment = _assess(records, {}, planned, complete=False)
+    # Poll only this finite post-request window. No background monitoring is kept.
+    try:
+        with identity_scope(True):
+            remaining = max(.001, min(run.config.metrics_timeout_seconds, deadline - time.monotonic()))
+            reader = await asyncio.to_thread(_client, run.config, gateway, headers, remaining)
+            async with reader:
+                while attempts < 3 and time.monotonic() < deadline and not run.stop.is_set():
+                    attempts += 1
+                    async with asyncio.timeout_at(deadline):
+                        rows, complete = await _pages(reader, gateway.url, marker,
+                            max_rows=run.config.metrics_max_series, stop=run.stop)
+                    if isinstance(rows, str):
+                        assessment = _state(rows, "Read-only gateway spend logs are unavailable or unsupported.")
+                        break
+                    matched, unrelated, invalid = _normalize(rows, marker, {r.id: r for r in records})
+                    current = {(local_id, gateway_id): value for local_id, entries in matched.items()
+                               for gateway_id, value in entries.items()}
+                    unstable |= any(key not in current or (value["complete"] and current[key] != value)
+                                    for key, value in previous.items())
+                    previous = current
+                    assessment = _assess(records, matched, planned, complete=complete, unstable=unstable)
+                    assessment.update(unrelated_rows=unrelated, invalid_rows=invalid,
+                                      collection_complete=complete, evidence_changed=unstable)
+                    if assessment["state"] in {"verified", "mismatch"}:
+                        break
+                    await asyncio.sleep(min(settings.settle_seconds / 4, max(0, deadline - time.monotonic())))
+    except (httpx.HTTPError, OSError, TimeoutError, ValueError):
+        assessment.update(state="unverified", reason="Gateway evidence collection did not complete within its bounded window.")
+    finally:
+        # Secret-derived fingerprints are transient and never included in reports.
+        for record in records:
+            record._gateway_key_hash = None
+    assessment.update(collection_attempts=attempts, source="litellm_spend_logs_v2",
+        evidence_scope="Exact generated request markers; aggregate counters and counter resets are not used.")
+    run.observations[target.name][CHECK] = assessment
+
+
+def result(run, target):
+    selected = CHECK in run.config.checks
+    data = (run.observations[target.name].get(CHECK)
+            or _state("unverified", "Gateway attribution was not exercised.")) if selected else _state("not_selected", "Not selected.")
+    status = {"not_selected": "skipped", "verified": "pass", "mismatch": "fail"}.get(data["state"], "inconclusive")
+    return CheckResult(id=CHECK, target=target.name, title="Gateway usage attribution", required=selected,
+                       status=status, summary=data["reason"], metrics=data,
+                       evidence_ids=[r.id for r in run.records if r.target == target.name and CHECK in r.check_ids])

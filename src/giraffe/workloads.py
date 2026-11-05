@@ -22,6 +22,7 @@ WORKLOAD_CHECKS = {
     "sessions": {"sessions"},
     "multi_user": {"multi_user"},
     "gateway_policy": {"gateway_policy"},
+    "gateway_attribution": {"gateway_attribution"},
     "consistency": {"consistency"}, "tool_calling": {"tools"},
     "forced_tool_diagnostic": {"tools"}, "tool_checks": {"tools"},
     "load_test": {"load"},
@@ -497,11 +498,13 @@ async def execute(run, target, client, fixtures):
     from giraffe.load_test import execute as load_test
     from giraffe.multi_user import execute as multi_user
     from giraffe.gateway_policy import execute as gateway_policy
+    from giraffe.gateway_attribution import execute as gateway_attribution
     for field, callback in (
         ("prefix", prefixes),
         ("load_test", load_test),
         ("multi_user", multi_user),
         ("gateway_policy", gateway_policy),
+        ("gateway_attribution", gateway_attribution),
         ("sessions", sessions),
         ("consistency", consistency),
         ("tool_calling", tools),
@@ -509,7 +512,7 @@ async def execute(run, target, client, fixtures):
         selected = WORKLOAD_CHECKS[field].intersection(run.config.checks)
         if selected and getattr(run.config, field):
             run.emit("scenario_started", target.name, field)
-            if field not in {"load_test", "multi_user"} and not run.allowed(target.name):
+            if field not in {"load_test", "multi_user", "gateway_attribution"} and not run.allowed(target.name):
                 run.unfinished[target.name].update(selected)
                 continue
             if field in {"arrivals", "consistency"}:
@@ -530,6 +533,11 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
         if check == "gateway_policy" and check in selected:
             from giraffe.gateway_policy import result as policy_result
             result.append(policy_result(run, target))
+            continue
+        if check == "gateway_attribution":
+            if check in selected or config.gateway_attribution is not None or target.gateway is not None:
+                from giraffe.gateway_attribution import result as gateway_result
+                result.append(gateway_result(run, target))
             continue
         if check == "multi_user" and check in selected:
             from giraffe.multi_user import result as user_result
