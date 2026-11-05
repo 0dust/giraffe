@@ -149,9 +149,6 @@ async def run_window(run, target, client, settings, load_settings, calibration, 
                     spec.cancel_after_chunks = settings.cancellation.cancel_after_chunks
             progress = OutputProgress(changed)
             if selected and sequence == 1:
-                # Let an actual peer stream begin before submitting the selected
-                # request. Admission can still remove that opportunity; the
-                # saved stream intervals decide whether cancellation overlapped.
                 while not closed and time.monotonic() < cutoff:
                     changed.clear()
                     if any(peer.first for peer in active.values()):

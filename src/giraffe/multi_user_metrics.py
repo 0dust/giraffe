@@ -392,16 +392,14 @@ def _cancellation(window, records, criteria, health, lag, timing_threshold, dela
             "peer_continuation": peers, "followup": followup, "backend_release": "unverified"}
 
 
-def _interference(observation, window, control, records, criteria, health, lag, timing_threshold):
+def _interference(observation, window, control, user_records, criteria, health, lag, timing_threshold, delays):
     """Compare the same logical short work, retaining the exposure that exercised it."""
     settings = observation.get("settings", {})
     tolerance = settings.get("fairness_tolerance_percent", 10) / 100
     limit = settings.get("noisy_neighbors", {}).get("max_slowdown")
     load_settings = LoadTestSettings(profile=settings.get("profile", {}),
                                     pass_criteria={"min_valid_responses": criteria.min_samples})
-    delays = _delays(observation.get("scheduling_delay_windows", []))
-    heavy = [r for r in records if r.workload.get("window_id") == window["id"]
-             and r.workload.get("user_id") in window["heavy_user_ids"]]
+    heavy = [r for uid in window["heavy_user_ids"] for r in user_records.get((window["id"], uid), [])]
     reasons = []
     for phase in (control, window):
         if not phase or phase.get("cut_short") or phase.get("drain_reason"):
@@ -420,9 +418,9 @@ def _interference(observation, window, control, records, criteria, health, lag, 
         if uid in window["heavy_user_ids"]:
             continue
         notes = list(reasons)
-        controls = {r.workload.get("matched_work_sequence"): r for r in records
-                    if control and r.workload.get("window_id") == control["id"] and r.workload.get("user_id") == uid}
-        probes = [r for r in records if r.workload.get("window_id") == window["id"] and r.workload.get("user_id") == uid]
+        controls = {r.workload.get("matched_work_sequence"): r
+                    for r in user_records.get((control["id"], uid), [])} if control else {}
+        probes = user_records.get((window["id"], uid), [])
         pairs, exposed = [], set()
         for probe in probes:
             baseline = controls.get(probe.workload.get("matched_work_sequence"))
@@ -495,24 +493,25 @@ def _interference(observation, window, control, records, criteria, health, lag, 
                     for phase, u in ((control or {}, control_user), (window, user))]
         if not min(exposure) or max(exposure) > min(exposure)*(1+tolerance):
             notes.append("Short-user active exposure is not comparable.")
-        a, b = median([user_latency(r, False) for r in before]), median([user_latency(r, False) for r in after])
-        slowdown = b/a if a and b is not None else None
+        control_completion = median([user_latency(r, False) for r in before])
+        probe_completion = median([user_latency(r, False) for r in after])
+        slowdown = probe_completion/control_completion if control_completion and probe_completion is not None else None
         if slowdown is None:
             notes.append("Matched completion slowdown is undefined.")
         qualified = not notes
         status = "inconclusive" if not qualified else "measured" if limit is None else "fail" if slowdown > limit else "pass"
         if status == "fail":
             notes.append(f"Observed slowdown {slowdown:g} exceeds {limit:g}.")
-        def difference(get):
-            a, b = median([get(r) for r in before]), median([get(r) for r in after])
+        def difference(a, b):
             return b-a if a is not None and b is not None else None
         measured.append({"user_id": uid, "status": status, "qualified": qualified, "reasons": list(dict.fromkeys(notes)),
             "matched_samples": len(pairs), "control_request_ids": [r.id for r in before],
             "probe_request_ids": [r.id for r in after], "heavy_request_ids": sorted(exposed),
-            "slowdown": slowdown, "first_answer_change_ms": difference(lambda r: user_latency(r, True)),
-            "completion_change_ms": difference(lambda r: user_latency(r, False)),
-            "stream_gap_change_ms": difference(lambda r: r.max_stream_gap_ms),
-            "output_tokens_change": difference(lambda r: r.output_tokens), **values})
+            "slowdown": slowdown, "first_answer_change_ms": difference(
+                median([user_latency(r, True) for r in before]), median([user_latency(r, True) for r in after])),
+            "completion_change_ms": difference(control_completion, probe_completion),
+            "stream_gap_change_ms": difference(median([r.max_stream_gap_ms for r in before]), median([r.max_stream_gap_ms for r in after])),
+            "output_tokens_change": difference(values["control_output_median_tokens"], values["probe_output_median_tokens"]), **values})
     statuses = [item["status"] for item in measured]
     return {"status": _status(statuses, measured=all(s == "measured" for s in statuses)),
             "qualified": bool(measured) and all(item["qualified"] for item in measured),
@@ -549,19 +548,21 @@ def summarize(observation: dict[str, Any], records: list[RequestRecord], *,
         windows.append({**window, "users": users, "status": window_status, "fairness": fairness})
         all_users.extend({**user, "window_id": window["id"], "population": window["population"],
                           "scenario": window["scenario"]} for user in users)
+    scenario_delays = (_delays(observation.get("scheduling_delay_windows", []))
+                       if any(window.get("role") in {"probe", "cancellation"} for window in windows) else None)
     for window in windows:
         if window["phase"] != "measurement":
             continue
         evidence = None
         if window.get("role") == "probe":
             control = next((item for item in windows if item["id"] == window["control_window_id"]), None)
-            evidence = window["interference"] = _interference(observation, window, control, records, criteria,
-                                                               timing_health, legacy_max_lag_ms, timing_threshold)
+            evidence = window["interference"] = _interference(observation, window, control, user_records, criteria,
+                                                               timing_health, legacy_max_lag_ms, timing_threshold, scenario_delays)
         elif window.get("scenario") == "cancellation":
             evidence = window["cancellation"] = _cancellation(window,
                 [r for r in records if r.workload.get("window_id") == window["id"]], criteria,
                 timing_health, legacy_max_lag_ms, timing_threshold,
-                _delays(observation.get("scheduling_delay_windows", [])))
+                scenario_delays)
         if evidence:
             window["status"] = _status([window["status"], evidence["status"]],
                                       measured=window["status"] == evidence["status"] == "measured")
