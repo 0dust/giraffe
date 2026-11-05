@@ -198,13 +198,15 @@ async def test_reader_pages_individually_and_never_follows_redirects():
         return httpx.Response(200, json={"data": [{"page": page}], "total_pages": 2})
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler), follow_redirects=False) as client:
-        rows, complete = await _pages(client, "http://proxy/spend/logs/v2", "marker", max_rows=4, stop=asyncio.Event())
+        rows, complete = await _pages(client, "http://proxy/spend/logs/v2", "marker", max_rows=4, stop=asyncio.Event(),
+                                     start_date="2026-11-06 00:00:00", end_date="2026-11-06 00:00:10")
     assert rows == [{"page": 1}, {"page": 2}] and complete
     assert [req.url.params["page"] for req in seen] == ["1", "2"]
     assert all(req.url.params["session_id"] == "marker" and req.method == "GET" for req in seen)
     async with httpx.AsyncClient(transport=httpx.MockTransport(lambda req: httpx.Response(302,
         headers={"location": "http://elsewhere/secret"})), follow_redirects=False) as client:
-        rows, complete = await _pages(client, "http://proxy/spend/logs/v2", "marker", max_rows=4, stop=asyncio.Event())
+        rows, complete = await _pages(client, "http://proxy/spend/logs/v2", "marker", max_rows=4, stop=asyncio.Event(),
+                                     start_date="2026-11-06 00:00:00", end_date="2026-11-06 00:00:10")
     assert rows == "unavailable" and not complete
 
 
@@ -216,7 +218,8 @@ async def test_reader_pages_individually_and_never_follows_redirects():
 async def test_reader_limits_and_malformed_pages_are_incomplete(reply, max_rows):
     from giraffe.gateway_attribution import _pages
     async with httpx.AsyncClient(transport=httpx.MockTransport(lambda req: httpx.Response(200, json=reply))) as client:
-        _, complete = await _pages(client, "http://proxy/spend/logs/v2", "marker", max_rows=max_rows, stop=asyncio.Event())
+        _, complete = await _pages(client, "http://proxy/spend/logs/v2", "marker", max_rows=max_rows, stop=asyncio.Event(),
+                                  start_date="2026-11-06 00:00:00", end_date="2026-11-06 00:00:10")
     assert not complete
 
 

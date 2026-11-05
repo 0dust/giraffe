@@ -117,9 +117,7 @@ def _context_rejection(record):
 
 
 def _serving_failure(record, scenario):
-    if scenario == "gateway_policy" and record.http_status == 429:
-        return False
-    if (scenario in {"sustained", "performance_evidence_probe", "gateway_access"} or scenario.startswith("traffic_stage_") or record.status == "cancelled"
+    if (record.identity is not None or scenario in {"sustained", "performance_evidence_probe"} or scenario.startswith("traffic_stage_") or record.status == "cancelled"
             or _reasoning_budget(record)):
         return False
     if (scenario.startswith("load_calibration_") and record.input_tokens is not None
@@ -583,7 +581,7 @@ class _Run:
         spec = spec.model_copy(update={"check_ids": check_ids})
         readiness = spec.scenario == "readiness" or (
             spec.scenario == "initial" and self.config.restart_target == target.name)
-        evidence_probe = spec.scenario in {"performance_evidence_probe", "gateway_access"}
+        evidence_probe = spec.scenario == "performance_evidence_probe" or spec.identity is not None
         slot_deadline = min(self.deadline, deadline_override if deadline_override is not None else self.deadline)
         if admission_deadline is not None:
             slot_deadline = min(slot_deadline, admission_deadline)
@@ -711,6 +709,7 @@ class _Run:
             if time.monotonic() >= self.deadline and record.status == "cancelled":
                 record.error = "maximum run duration reached"
             record.completed_at = _now()
+            record.identity = spec.identity
             record.request_timeout_seconds = spec.request_timeout_seconds or self.config.request_timeout_seconds
             if record.status in {"timeout", "cancelled"}:
                 try:
@@ -1527,8 +1526,8 @@ def _pack_results(run: _Run, target: Target) -> dict:
 def _checks(run: _Run, target: Target) -> list[CheckResult]:
     config = run.config
     all_records = [r for r in run.records if r.target == target.name]
-    ordinary = [r for r in all_records if r.scenario not in {"client_cancel", "client_deadline", "backend_cancel"}
-                or _serving_failure(r, r.scenario)]
+    ordinary = [r for r in all_records if r.identity is None and (r.scenario not in {"client_cancel", "client_deadline", "backend_cancel"}
+                or _serving_failure(r, r.scenario))]
     observations = run.observations[target.name]
     result = []
     warm = [r for r in ordinary if r.scenario == "warm"]

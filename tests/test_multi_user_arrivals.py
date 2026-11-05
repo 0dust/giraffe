@@ -19,6 +19,146 @@ def arrival_settings(**changes):
                   "bursts": [{"user_id": "user-01", "at_seconds": .05, "requests": 3}]}, **changes)
 
 
+def test_preview_counts_offers_without_materializing_request_ledger(monkeypatch):
+    from giraffe import multi_user
+    from giraffe.planning import request_plan
+
+    def unexpected(*args):
+        pytest.fail("Setup preview must not allocate the execution offer ledger")
+    monkeypatch.setattr(multi_user, "_offer_plan", unexpected)
+    row = next(row for row in request_plan(arrival_settings())["rows"] if row["id"] == "multi_user_2")
+    assert row["scheduled_offers"] == 9
+
+
+def test_aggregate_offer_bound_rejects_large_plan_before_allocation(monkeypatch):
+    from giraffe import multi_user
+    from giraffe.models import RunConfig
+    from pydantic import ValidationError
+
+    monkeypatch.setattr(multi_user, "_offer_plan", lambda *args: pytest.fail("Validation allocated an offer ledger"))
+    with pytest.raises(ValidationError, match="total scheduled offers"):
+        RunConfig(targets=[{"name": "local", "url": "http://localhost/v1", "model": "test"}],
+            checks=["multi_user"], max_requests=1, concurrency=32, multi_user={
+                "scenarios": ["arrivals", "recovery"], "levels": list(range(2, 33)), "duration_seconds": 3.125,
+                "arrivals": {"requests_per_second": 1000}, "recovery": {
+                    "control_seconds": 6.25, "lighter_seconds": 6.25, "sustained_seconds": 3.125,
+                    "lighter_requests_per_second": 500, "sustained_requests_per_second": 1000}})
+
+
+def test_aggregate_offer_bound_counts_targets_and_accepts_exact_limit(monkeypatch):
+    from giraffe import multi_user
+    from giraffe.models import RunConfig
+    from pydantic import ValidationError
+
+    monkeypatch.setattr(multi_user, "_offer_plan", lambda *args: pytest.fail("Validation allocated an offer ledger"))
+    target = {"url": "http://localhost/v1", "model": "test"}
+    values = {"targets": [{**target, "name": str(i)} for i in range(2)], "checks": ["multi_user"],
+        "max_requests": 1, "multi_user": {"scenarios": ["arrivals"], "levels": [2], "duration_seconds": 25,
+                                         "warmup_seconds": 1, "arrivals": {"requests_per_second": 1000}}}
+    cfg = RunConfig.model_validate(values)
+    windows = multi_user._planned_observation(cfg.multi_user, include_offers=False)["windows"]
+    assert sum(window.get("scheduled_offers", 0) for window in windows)*len(cfg.targets) == 100000
+    values["targets"].append({**target, "name": "third"})
+    with pytest.raises(ValidationError, match="total scheduled offers"):
+        RunConfig.model_validate(values)
+
+
+@pytest.mark.parametrize("case,expected", [
+    ("equal", "pass"), ("slow", "fail"), ("newcomer", "inconclusive"), ("burst", "inconclusive"),
+    ("measure_only", "measured"),
+])
+def test_selected_arrival_fairness_controls_window_and_overall_verdict(case, expected):
+    from giraffe.multi_user import _planned_observation, _offer_counts
+    from giraffe.multi_user_metrics import summarize
+    from tests.test_multi_user_metrics import record
+
+    arrivals = {"requests_per_second": .4}
+    if case == "newcomer":
+        arrivals["activations"] = {"user-02": 1}
+    elif case == "burst":
+        arrivals["bursts"] = [{"user_id": "user-01", "at_seconds": 1, "requests": 1}]
+    criteria = {"min_samples": 1, "max_throughput_ratio": 1.2}
+    if case == "measure_only":
+        criteria.update(max_throughput_ratio=None, max_error_percent=None)
+    cfg = settings(levels=[2], scenarios=["arrivals"], duration_seconds=10, profile=PROFILE,
+                   arrivals=arrivals, pass_criteria=criteria)
+    source = _planned_observation(cfg.multi_user)
+    window, = source["windows"]
+    window.update(start_ms=0, end_ms=10000, planned_end_ms=10000, duration_seconds=10,
+                  cut_short=False, reason=None)
+    records = []
+    for offer in window["offers"]:
+        uid, start = offer["user_id"], offer["offset_seconds"]*1000
+        end = 11000 if case != "equal" and uid == "user-02" and start > 0 else start+1000
+        request = record(uid, identity=f'request-{offer["index"]}', dispatch=start, end=end,
+            tokens=16, input_tokens=64, requested_input_tokens=64, requested_output_tokens=16,
+            requested_max_tokens=16, stream=True, answer_chunks=3, answer_reads=3,
+            last_output_ms=end-start-100, stream_end_ms=end-start)
+        request.workload.update(window_id=window["id"], scenario="arrivals", role="arrivals",
+                                cohort=offer["cohort"])
+        records.append(request)
+        offer.update(offered=True, dispatched=True, outcome="dispatched", request_id=request.id)
+    window["offer_accounting"] = _offer_counts(window["offers"])
+    for user in window["users"]:
+        own = [offer for offer in window["offers"] if offer["user_id"] == user["user_id"]]
+        user.update(activated_ms=user["activation_seconds"]*1000, ready_count=len(own),
+                    dispatched_count=len(own), offer_accounting=_offer_counts(own))
+    summary = summarize(source, records)
+    measured = summary["windows"][0]["fairness"]
+    assert measured["status"] == expected
+    assert measured["qualified"] == (case in {"equal", "slow", "measure_only"})
+    if case == "slow":
+        assert measured["ratio"] == 2.5
+    if case in {"newcomer", "burst"}:
+        assert any("arrival exposure or burst work differs" in reason for reason in measured["reasons"])
+    assert summary["windows"][0]["status"] == summary["status"] == expected
+
+
+@pytest.mark.parametrize("scenario", ["arrivals", "recovery"])
+@pytest.mark.parametrize("default_slots", [4, 7])
+def test_scheduled_users_run_with_omitted_global_concurrency(monkeypatch, scenario, default_slots):
+    from giraffe.models import RunConfig, required_concurrency
+
+    async def run():
+        raw = settings(levels=[2], scenarios=[scenario], duration_seconds=.2, profile=PROFILE,
+            arrivals={"requests_per_second": 10}, recovery={"control_seconds": .2,
+                "sustained_seconds": .2, "lighter_seconds": .2,
+                "sustained_requests_per_second": 10, "lighter_requests_per_second": 5}).model_dump()
+        raw.pop("concurrency")
+        raw["default_concurrency"] = default_slots
+        cfg = RunConfig.model_validate(raw)
+        assert cfg.concurrency is None
+        assert required_concurrency(cfg)["by_check"]["multi_user"] == default_slots
+        state = runner._Run(cfg, None, None)
+        await execute(state, cfg.targets[0], FakeClient(cfg.targets[0], cfg))
+        windows = state.observations["service"]["multi_user"]["windows"]
+        assert all(w["offer_accounting"]["dispatched"] == len(w["offers"]) for w in windows)
+        assert state.records and state.slots.qsize() == default_slots
+    run_virtual(monkeypatch, run())
+
+
+def test_other_check_transport_pool_does_not_raise_user_admission_limit(monkeypatch):
+    from giraffe.models import RunConfig
+
+    async def run():
+        raw = settings(levels=[1], scenarios=["arrivals"], duration_seconds=.2, profile=PROFILE,
+            arrivals={"requests_per_second": 1, "bursts": [
+                {"user_id": "user-01", "at_seconds": 0, "requests": 8}]}).model_dump()
+        raw.pop("concurrency")
+        raw.update(default_concurrency=4, checks=["multi_user", "sessions"],
+                   sessions={"sessions": 16, "concurrency": 16})
+        cfg = RunConfig.model_validate(raw)
+        state = runner._Run(cfg, None, None)
+        assert state.max_connections == 16
+        await execute(state, cfg.targets[0], FakeClient(cfg.targets[0], cfg))
+        window, = state.observations["service"]["multi_user"]["windows"]
+        assert window["peak_in_flight"] == 4
+        assert window["offer_accounting"]["dispatched"] == 4
+        assert window["offer_accounting"]["dropped_local"] == 5
+        assert state.slots.qsize() == 16
+    run_virtual(monkeypatch, run())
+
+
 @pytest.mark.parametrize("budget", [None, 3])
 def test_user_offers_reconcile_busy_slots_and_budget(monkeypatch, budget):
     async def run():
@@ -65,6 +205,8 @@ def test_http_single_user_burst_overlaps_under_global_cap():
                    ("dispatched", "dropped_local", "dropped_late", "unissued", "not_offered")) == 4
         assert {r.workload["user_id"] for r in state.records} == {"user-01"}
         assert len({r.workload["request_sequence"] for r in state.records}) == len(state.records)
+        assert all(r.workload["ready_ms"] == r.workload["scheduled_ms"] for r in state.records)
+        assert all(r.workload["ready_ms"] >= window["start_ms"] for r in state.records)
         assert any(a.dispatch_ms < b.dispatch_ms < a.completed_ms for a in state.records for b in state.records)
     with FakeEndpoint(first_token_delay=.05, chunk_delay=.03) as endpoint:
         asyncio.run(run(endpoint))

@@ -139,6 +139,32 @@ def test_recovery_report_export_cli_and_baseline_keep_all_phase_users(tmp_path, 
     assert 'Matched per-user recovery: fail' in output and 'user-03: fail' in output
 
 
+def test_loaded_recovery_sample_count_is_escaped_in_html():
+    from html.parser import HTMLParser
+    from giraffe.models import RunReport
+    from giraffe.reporting import _render
+    from tests.test_multi_user_recovery import recovery_observation
+
+    source, records = recovery_observation()
+    summary = summarize(source, records)
+    payload = '<img src=x onerror="alert(document.domain)">'
+    summary["windows"][-1]["recovery"]["users"][0]["matched_samples"] = payload
+    report = make_report()
+    report.checks = [CheckResult(id="multi_user", target="local", title="Multi-user", status="inconclusive",
+                                summary="Imported recovery", metrics={"multi_user": summary})]
+    loaded = RunReport.model_validate_json(report.model_dump_json())
+    html = _render(loaded)
+    tags = []
+
+    class Tags(HTMLParser):
+        def handle_starttag(self, tag, attrs):
+            tags.append((tag, dict(attrs)))
+
+    Tags().feed(html)
+    assert not any("onerror" in attrs for _, attrs in tags)
+    assert '&lt;img src=x onerror=&quot;alert(document.domain)&quot;&gt;' in html
+
+
 def test_finite_user_request_comparisons_keep_phase_and_cohort():
     from tests.test_multi_user_recovery import recovery_observation
     from giraffe.reporting import _groups
@@ -259,7 +285,8 @@ def scenario_report():
             "first_answer_change_ms": 20, "completion_change_ms": 30, "stream_gap_change_ms": 10,
             "output_tokens_change": -5, "control_input_median_tokens": 100,
             "probe_input_median_tokens": 100, "control_output_median_tokens": 100,
-            "probe_output_median_tokens": 95, "private_prompt": "do not export"}]}
+            "probe_output_median_tokens": 95, "heavy_input_median_tokens": 640,
+            "heavy_output_median_tokens": 32, "private_prompt": "do not export"}]}
     cancellation = deepcopy(window)
     cancellation.update(id="cancellation", scenario="cancellation", role="cancellation", selected_user_id="user-02")
     cancellation.pop("interference")
@@ -277,6 +304,7 @@ def test_scenario_html_and_compact_export_keep_qualified_user_evidence(tmp_path)
     _, html_path = write_report(report, tmp_path, html=True)
     html = html_path.read_text()
     assert "Matched noisy-neighbor comparison" in html
+    assert "Heavy input / output medians: 640.0 / 32.0 tokens" in html
     assert "Missing heavy overlap" in html
     assert "Selected request cancellation" in html
     assert "Peer continuation" in html and "Same-user follow-up" in html
@@ -285,6 +313,8 @@ def test_scenario_html_and_compact_export_keep_qualified_user_evidence(tmp_path)
     windows = reproduction_export(report)["multi_user"]["local"]["windows"]
     assert windows[0]["role"] == "probe"
     assert windows[0]["interference"]["users"][0]["matched_samples"] == 2
+    assert windows[0]["interference"]["users"][0]["heavy_input_median_tokens"] == 640
+    assert windows[0]["interference"]["users"][0]["heavy_output_median_tokens"] == 32
     assert windows[1]["cancellation"]["followup"]["request_ids"] == ["user-02-1"]
     assert "do not export" not in json.dumps(windows)
 
@@ -316,6 +346,7 @@ def test_changed_scenario_work_cannot_pass_baseline(field, value):
 def test_cli_preserves_scenario_qualification_and_separate_cancellation_observations(tmp_path, capsys):
     _print_result(scenario_report(), tmp_path / "report.json", None, tmp_path, {})
     output = capsys.readouterr().out
+    assert "Heavy input / output medians: 640 / 32 tokens" in output
     for text in ("Matched noisy-neighbor comparison", "Missing heavy overlap", "Peer continuation",
                  "Same-user follow-up", "Backend compute and memory release: unverified"):
         assert text in output

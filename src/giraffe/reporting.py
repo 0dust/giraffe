@@ -178,8 +178,9 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str) -> dict | No
             unchanged_checks.add("prefix")
         if not set(resolved.checks) <= unchanged_checks:
             return None  # Load generators changed; attest unchanged specialists only.
-    if "sessions" in resolved.checks and resolved.sessions and resolved.sessions.sampling is not None:
-        return None  # Sampled traffic has no historical equivalent.
+    sampled_sessions = "sessions" in resolved.checks and resolved.sessions and resolved.sessions.sampling is not None
+    if sampled_sessions and revision not in {"persistent_users", "shared_conversations", "gateway_attribution", "gateway_conversations", "gateway_policy", "policy_conversations", "gateway_access", "gateway_access_policy", "access_conversations"}:
+        return None  # Earlier revisions have no attested sampled-traffic equivalent.
     settings = {}
     for field, checks in WORKLOAD_CHECKS.items():
         if not checks.intersection(resolved.checks):
@@ -217,6 +218,18 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str) -> dict | No
         }[revision] if any(settings.values()) else None,
         "settings": settings,
     }
+    if sampled_sessions:
+        identity["session_sampling_source_sha256"] = {
+            "persistent_users": "2fab1370faeab7ddb91a7ae9c0e49520ee9a67e305441a0663877bb12bca24c3",
+            "shared_conversations": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
+            "gateway_attribution": "2fab1370faeab7ddb91a7ae9c0e49520ee9a67e305441a0663877bb12bca24c3",
+            "gateway_conversations": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
+            "gateway_policy": "2fab1370faeab7ddb91a7ae9c0e49520ee9a67e305441a0663877bb12bca24c3",
+            "policy_conversations": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
+            "gateway_access": "2fab1370faeab7ddb91a7ae9c0e49520ee9a67e305441a0663877bb12bca24c3",
+            "gateway_access_policy": "2fab1370faeab7ddb91a7ae9c0e49520ee9a67e305441a0663877bb12bca24c3",
+            "access_conversations": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
+        }[revision]
     if "concurrency" in resolved.checks:
         identity["concurrent_load_source_sha256"] = {
             "legacy": "33b66f3784ad9613db082fa1f00a2f3292fc910b9f842bd3fe018340a0fe7aa7",
@@ -276,6 +289,28 @@ def _same_run_limits_workload(current: dict, old: dict) -> bool:
     selected = set(current_config.get("checks", [])) | set(old_config.get("checks", []))
     return all(current_config.get(field) == old_config.get(field)
                for field, checks in WORKLOAD_CHECKS.items() if checks & selected)
+
+
+def _same_load_workload(current: dict, old: dict) -> bool:
+    """Attest the optional nonce argument only for unchanged ordinary Load runs."""
+    settings = []
+    for manifest in (current, old):
+        raw = manifest.get("config", {})
+        if raw.get("config_version") != 2 or set(raw.get("checks", [])) != {"load"} or "load_test" not in raw:
+            return False
+        try:
+            resolved = RunConfig.model_validate(raw).load_test.model_dump(mode="json")
+        except ValidationError:
+            return False
+        identity = {"generator_source_sha256": "d9a9e921584262148e06b636f0e8f195b7e530fd2a69c5e98f013359cf947ede",
+                    "settings": {"load_test": resolved}}
+        if not any(fixture_hash({**identity, "load_test_source_sha256": source}) ==
+                   manifest.get("fixture_pack", {}).get("workload_fixture_sha256") for source in (
+                       "9b694c97a39d449d8ea15b09a9aeb406bf835179c0882827685c4d7888687d36",
+                       "df3b7bbf30cab87d2e8c1c6dab8819f9cfe592b181407caa7c32af4c5f720cd4")):
+            return False
+        settings.append(resolved)
+    return settings[0] == settings[1]
 
 
 def _limits_reached(report: RunReport) -> set[str]:
@@ -473,7 +508,8 @@ def _settings_reasons(report: RunReport, baseline: RunReport, *, details: dict[s
         reasons.append("Fixture pack identity is missing or unknown.")
     else:
         inactive = {"custom"}
-        if _same_run_limits_workload(report.manifest, baseline.manifest):
+        if (_same_run_limits_workload(report.manifest, baseline.manifest)
+                or _same_load_workload(report.manifest, baseline.manifest)):
             inactive.add("workload_fixture_sha256")
         if ({key: value for key, value in current_pack.items() if key not in inactive}
                 != {key: value for key, value in old_pack.items() if key not in inactive}):
@@ -1586,6 +1622,14 @@ def _retained(report: RunReport) -> RunReport:
             or (record.status == "completed" and not record.valid) or record.score is False
             or record.evaluation_error is not None or record.id in failed_evidence
         ))
+        if (policy != "all" and "multi_user" in record.check_ids
+                and record.workload.get("session_id") and record.workload.get("mode") == "live"
+                and record.evaluation and any(message.get("role") == "assistant"
+                    for message in record.evaluation.messages)):
+            # Prior replies are response bodies even when copied into later inputs.
+            record = record.model_copy(update={"evaluation": record.evaluation.model_copy(update={
+                "messages": [{**message, "content": ""} if message.get("role") == "assistant" else message
+                             for message in record.evaluation.messages]})})
         result.requests.append(record if keep else _without_response(record))
     from .performance import refresh_performance
     return refresh_performance(result)
@@ -1975,7 +2019,8 @@ def _multi_user_scenario_export(window: dict[str, Any]) -> dict[str, Any]:
         user_fields = ("user_id", "status", "qualified", "reasons", "matched_samples", "control_request_ids",
             "probe_request_ids", "heavy_request_ids", "slowdown", "first_answer_change_ms", "completion_change_ms",
             "stream_gap_change_ms", "output_tokens_change", "control_input_median_tokens", "probe_input_median_tokens",
-            "control_output_median_tokens", "probe_output_median_tokens")
+            "control_output_median_tokens", "probe_output_median_tokens",
+            "heavy_input_median_tokens", "heavy_output_median_tokens")
         result["interference"] = {key: evidence[key] for key in fields if key in evidence}
         result["interference"]["users"] = [{key: user[key] for key in user_fields if key in user}
                                              for user in evidence.get("users", [])]
@@ -2047,7 +2092,7 @@ def _multi_user_scenario_html(window: dict[str, Any], anchors: dict[str, str]) -
         parts.append(f'<h5>Matched per-user recovery {_badge(evidence["status"])}</h5>')
         for user in evidence["users"]:
             parts.append(f'<p><strong>{_e(user["user_id"])}</strong> {_badge(user["status"])} · '
-                f'{user["matched_samples"]} matched samples · slowdown {_number(user["slowdown"])}×. '
+                f'{_e(user["matched_samples"])} matched samples · slowdown {_number(user["slowdown"])}×. '
                 f'{_e(" ".join(user["reasons"]))}</p><details><summary>Actual work and request evidence</summary>'
                 f'<pre>{_json(user["phases"])}</pre><p>Control: {links(user["control_request_ids"])}</p>'
                 f'<p>Sustained: {links(user["sustained_request_ids"])}</p><p>Lighter: {links(user["lighter_request_ids"])}</p></details>')
@@ -2065,7 +2110,9 @@ def _multi_user_scenario_html(window: dict[str, Any], anchors: dict[str, str]) -
                 f'{_number(user.get("slowdown"))}×</td><td>{_number(user.get("first_answer_change_ms"))} / '
                 f'{_number(user.get("completion_change_ms"))} / {_number(user.get("stream_gap_change_ms"))}</td>'
                 f'<td>{_number(user.get("control_input_median_tokens"))} → {_number(user.get("probe_input_median_tokens"))} / '
-                f'{_number(user.get("control_output_median_tokens"))} → {_number(user.get("probe_output_median_tokens"))}</td>'
+                f'{_number(user.get("control_output_median_tokens"))} → {_number(user.get("probe_output_median_tokens"))}'
+                f'<br>Heavy input / output medians: {_number(user.get("heavy_input_median_tokens"))} / '
+                f'{_number(user.get("heavy_output_median_tokens"))} tokens</td>'
                 f'<td>{_number(user.get("output_tokens_change"))} tokens<br>Control: {links(user.get("control_request_ids", []))}'
                 f'<br>Probe: {links(user.get("probe_request_ids", []))}<br>Heavy: {links(user.get("heavy_request_ids", []))}</td></tr>')
         parts.append('</table></div>')

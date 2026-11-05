@@ -34,6 +34,17 @@ console.log(JSON.stringify(configureMultiUser(config,form,bootstrap.multi_user.d
     assert config.multi_user.recovery.max_slowdown == 1.5
 
 
+def test_arrival_recovery_form_preserves_imported_scenario_order():
+    config = configuration()
+    config.multi_user.scenarios = ['recovery', 'arrivals']
+    value = browser_logic(r'''
+const form=new FormData();form.set('multi_user_rendered','1');form.set('multi_user_scenarios_rendered','1');
+form.set('multi_user_scenario_arrivals','on');form.set('multi_user_scenario_recovery','on');
+console.log(JSON.stringify(configureMultiUser(config,form,bootstrap.multi_user.defaults)));
+''', config)
+    assert value['multi_user']['scenarios'] == config.multi_user.scenarios
+
+
 def test_recovery_results_keep_user_qualification_and_phase_evidence():
     from tests.test_multi_user_recovery import recovery_observation
     from giraffe.multi_user_metrics import summarize
@@ -77,8 +88,28 @@ def test_scenario_results_show_separate_observations_and_request_links():
     browser_logic('const summary='+json.dumps(summary)+r''';
 const markup=renderMultiUserResults(summary);
 for(const text of ['Matched noisy-neighbor comparison','Missing heavy overlap','Selected request cancellation','Peer continuation','Same-user follow-up','Backend compute and memory release: unverified'])assert(markup.includes(text));
+assert.match(markup,/Heavy input \/ output medians: 640 \/ 32 tokens/);
 assert.match(markup,/data-request="user-01-1"/);
 assert.match(markup,/data-request="user-02-1"/);
+''', configuration())
+
+
+def test_imported_probe_order_survives_form_edits():
+    browser_logic(r'''
+config.multi_user.noisy_neighbors.heavy_profiles=['short_long','long_short'];
+config.multi_user.noisy_neighbors.triggers=['during_stream','before_output'];
+const form=new FormData();form.set('multi_user_rendered','1');
+form.set('multi_user_noisy_neighbors_profiles_rendered','1');
+form.set('multi_user_noisy_neighbors_triggers_rendered','1');
+for(const name of config.multi_user.noisy_neighbors.heavy_profiles)form.set('multi_user_noisy_neighbors_profile_'+name,'on');
+for(const name of config.multi_user.noisy_neighbors.triggers)form.set('multi_user_noisy_neighbors_trigger_'+name,'on');
+let changed=configureMultiUser(config,form,bootstrap.multi_user.defaults);
+assert.equal(JSON.stringify(changed.multi_user.noisy_neighbors),JSON.stringify(config.multi_user.noisy_neighbors));
+form.set('multi_user_noisy_neighbors_profile_long_long','on');
+form.delete('multi_user_noisy_neighbors_profile_long_short');
+changed=configureMultiUser(config,form,bootstrap.multi_user.defaults);
+assert.equal(JSON.stringify(changed.multi_user.noisy_neighbors.heavy_profiles),'["short_long","long_long"]');
+assert.equal(JSON.stringify(changed.multi_user.noisy_neighbors.triggers),'["during_stream","before_output"]');
 ''', configuration())
 
 
@@ -129,7 +160,8 @@ def test_live_user_identity_survives_started_and_completed_events():
     job = {'requests': OrderedDict(), 'live_request_count': 0, 'evicted_running': set(),
            'live_request_summary': {'evicted': 0, 'through_slot': None, 'statuses': {}}}
     identity = {'user_id': 'user-01', 'population': 20, 'profile': 'short_short',
-                'window_id': 'multi_user_20_measurement', 'phase': 'measurement', 'request_sequence': 2}
+                'window_id': 'multi_user_20_measurement', 'phase': 'measurement', 'request_sequence': 2,
+                'activation_seconds': .5}
     for kind in ['request_started', 'request_completed']:
         event = {'event': kind, 'request_slot': 0, 'target': 'local', 'scenario': 'multi_user_20_measurement',
                  'user': {**identity, 'prompt': 'must not reach live identity'}}
