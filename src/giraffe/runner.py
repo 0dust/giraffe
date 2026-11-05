@@ -2218,7 +2218,6 @@ def _verdict_summary(check, config, records, budget):
     if check.status == "blocked" and summary.startswith("Internal error in Giraffe ("):
         return summary
     if check.id == "gateway_access":
-        # Expected HTTP denials are policy evidence, not serving failures.
         return summary
     if check.id == "concurrency":
         from .concurrent_load import remedies

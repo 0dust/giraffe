@@ -1,4 +1,3 @@
-"""Bounded observations of declared LiteLLM access policies."""
 from __future__ import annotations
 
 import os
@@ -16,7 +15,6 @@ def configured_cases(config):
 
 
 def observation(record):
-    """Only a complete answer or recognized gateway denial establishes a decision."""
     if record is None:
         return "unverified", "not_run"
     if record.status == "completed" and record.http_status == 200 and record.valid:
@@ -70,7 +68,7 @@ async def execute(run, target, client):
 def result(run, target):
     settings = run.config.gateway_access
     data = run.observations[target.name].get("gateway_access", {})
-    rows = data.get("cases", [_row(case) for case in configured_cases(run.config)])
+    rows = data["cases"] if "cases" in data else [_row(case) for case in configured_cases(run.config)]
     matrix = {row["expected"] for row in rows} == {"allow", "deny"}
     complete = bool(rows) and matrix and all(row["observed"] != "unverified" for row in rows)
     status = ("fail" if any(row["status"] == "fail" for row in rows) else
