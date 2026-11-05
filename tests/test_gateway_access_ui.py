@@ -57,3 +57,11 @@ def test_expected_denial_is_not_appended_as_a_policy_failure():
         status='failed', http_status=401, error='HTTP 401')
     summary = _verdict_summary(check, config(), [record], '')
     assert summary == check.summary
+
+
+def test_gateway_access_phase_fallback_matches_canonical_label():
+    import json
+    from giraffe.conditions import _SCENARIOS
+
+    browser_logic("assert.equal(phaseName('gateway_access'), " +
+                  json.dumps(_SCENARIOS['gateway_access'][0]) + ");", config())
