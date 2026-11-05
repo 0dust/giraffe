@@ -49,14 +49,16 @@ def preview_script(path: str) -> dict:
             "size": len(data), "machine": socket.gethostname(), "contents": contents}
 
 
-def script_environment(targets):
+def script_environment(config):
     """Inherit ordinary environment values while retaining credentials for redaction."""
     environment = os.environ.copy()
     secrets = set()
-    for target in targets:
-        if target._api_key is not None:
-            secrets.add(target._api_key.get_secret_value())
-        for name in [target.api_key_env, *target.headers_env.values()]:
+    for target in [*config.targets, *config.judging.judges]:
+        if key := getattr(target, "_api_key", None):
+            secrets.add(key.get_secret_value())
+        for name in [target.api_key_env, *target.headers_env.values(),
+                     getattr(target, "metrics_api_key_env", None),
+                     *getattr(target, "metrics_headers_env", {}).values()]:
             if name is not None:
                 value = environment.pop(name, None)
                 if value:

@@ -2275,7 +2275,9 @@ def _cold_start_html(report: RunReport) -> str:
                 ("Service answered after", duration(cold.get("service_answered_ms"))),
                 ("First answer after", duration(cold.get("readiness_ms"))),
                 ("Model loaded before first request", cold.get("model_loaded_before_first_request", "Unknown"))]
-        comparisons = [("First request", cold.get("first_request") or {})]
+        first = cold.get("first_request") or {}
+        label = "First request (retry, not cold)" if first.get("cold") is False else "First request"
+        comparisons = [(label, first)]
         comparisons.extend((f"Warm request {index}", item)
                            for index, item in enumerate(cold.get("warm_requests", []), 1))
         sections.append(f'<section><h2>Cold start</h2><h3>{_e(name)}</h3><dl>')
@@ -2295,6 +2297,8 @@ def _cold_start_html(report: RunReport) -> str:
                             f'{note_html}{reason_html}</td>'
                             f'<td>{_e(duration(item.get("elapsed_ms")))}</td></tr>')
         sections.append('</table></div>')
+        if first.get("cold") is False and first.get("not_cold_reason"):
+            sections.append(f'<p>{_e(first["not_cold_reason"])}</p>')
         if cold.get("reason"):
             sections.append(f'<p>{_e(cold["reason"])}</p>')
         if cold.get("output_tail"):

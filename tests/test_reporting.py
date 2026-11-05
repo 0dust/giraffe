@@ -68,6 +68,23 @@ def test_cold_start_model_load_value_has_one_label_and_preserves_json(value):
     assert report.model_dump_json() == original
 
 
+@pytest.mark.parametrize("cold", [None, True, False])
+def test_cold_start_retry_label_and_note(cold):
+    from giraffe.reporting import _cold_start_html
+
+    note = "An earlier request reached the server before this one, so this is not a cold measurement."
+    report = make_report()
+    report.observations["targets"] = {"local": {"restart": {
+        "first_request": {"first_output_ms": 5, "elapsed_ms": 10,
+            **({"cold": cold, "not_cold_reason": note} if cold is not None else {})}}}}
+    html = _cold_start_html(report)
+    label = "First request (retry, not cold)" if cold is False else "First request"
+    assert f"<td>{label}</td>" in html
+    assert (note in html) == (cold is False)
+    if cold is False:
+        assert f"</table></div><p>{note}</p>" in html
+
+
 def test_comparison_setting_reasons_include_structured_values_without_changing_text():
     current, previous = make_report(), make_report("baseline")
     current.manifest["config"]["request_timeout_seconds"] = 300

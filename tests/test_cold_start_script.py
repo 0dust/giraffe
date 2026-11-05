@@ -41,6 +41,25 @@ def test_preview_identifies_exact_executable_text(tmp_path):
     assert len(result["sha256"]) == 64 and result["machine"]
 
 
+def test_script_environment_removes_telemetry_and_judge_credentials(monkeypatch):
+    from pydantic import SecretStr
+    from giraffe.restart_script import script_environment
+
+    names = ["COLD_METRICS_API", "COLD_METRICS_HEADER", "COLD_JUDGE_API", "COLD_JUDGE_HEADER"]
+    for name in names:
+        monkeypatch.setenv(name, name.lower())
+    monkeypatch.setenv("COLD_ORDINARY", "kept")
+    config = RunConfig(targets=[Target(name="local", url="http://localhost", model="tiny",
+        metrics_api_key_env=names[0], metrics_headers_env={"X-Metrics": names[1]})],
+        judging={"judges": [{"api_key_env": names[2], "headers_env": {"X-Judge": names[3]}}]})
+    config.targets[0]._api_key = SecretStr("resolved-key")
+    environment, secrets = script_environment(config)
+    assert all(name not in environment for name in names)
+    assert secrets == {name.lower().encode() for name in names} | {b"resolved-key"}
+    assert environment["COLD_ORDINARY"] == "kept"
+    assert all(os.environ[name] == name.lower() for name in names)
+
+
 @pytest.mark.parametrize("kind,match", [("missing", "exist"), ("directory", "regular"),
     ("permission", "executable"), ("size", "64 KiB"), ("binary", "UTF-8")])
 def test_preview_field_errors(tmp_path, kind, match):

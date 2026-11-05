@@ -46,6 +46,15 @@ def reasoning_output_note(measurement):
     return "First output was reasoning."
 
 
+def reached_server(record):
+    """Only a failed connection establishes that no request reached the server."""
+    return record.http_status is not None or record.error not in {
+        f"{prefix} ({kind})"
+        for prefix in ("request failed", "client failure")
+        for kind in ("ConnectError", "ConnectTimeout", "ConnectionRefusedError")
+    }
+
+
 def retry_readiness(record):
     """Only startup/transport failures warrant another cold request."""
     if record.status in {"timeout", "cancelled"} or record.http_status == 429:

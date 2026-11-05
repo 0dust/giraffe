@@ -24,7 +24,7 @@ function updateAPIKeySummary() {
   const key=apiKeyFor(form.elements.url.value),ref=form.elements.api_key_env?.value.trim();
   $('.row-value',summary).textContent=key?'Set for this tab':ref||'Not set';
 }
-const state = {bootstrap:null, runs:[], storage:null, storageUnavailable:false, cleanup:null, cleanupResult:null, baselines:[], detail:null, mosaicFollow:true, config:null, active:null, diskActive:null, routeVersion:0, poll:null, tab:'checks', selectedCheck:null, checkNavigatorOpen:false, filter:'all', historySearch:'', comparisonFilter:null, comparisonCheck:'all', submitting:false, openTest:null, configView:'form', jsonDraft:null, jsonBase:null, configRevision:0, configBusy:false, showAvailableTests:false, restartPreview:null, restartPreviewSequence:0, restartConfirmedHash:null, requestPreview:null, previewSequence:0, planTimer:null, setupPreset:null, catalogueFilter:'all', catalogueCategory:'all', catalogueSearch:'', setupStep:1, returnToReview:false, modelDiscovery:null, modelDiscoverySequence:0, autoModel:null, datasetSelection:[], datasetImportSequence:0, judgeEditorOpen:null, datasetImport:null, datasetEditor:null, datasetTry:null, migrationNotes:[], dismissedMigrationNotes:[], loadPanels:{}, limitValues:{}, jsonValidation:null};
+const state = {bootstrap:null, runs:[], storage:null, storageUnavailable:false, cleanup:null, cleanupResult:null, baselines:[], detail:null, mosaicFollow:true, config:null, active:null, diskActive:null, routeVersion:0, poll:null, tab:'checks', selectedCheck:null, checkNavigatorOpen:false, filter:'all', historySearch:'', comparisonFilter:null, comparisonCheck:'all', submitting:false, openTest:null, configView:'form', jsonDraft:null, jsonBase:null, configRevision:0, configBusy:false, showAvailableTests:false, restartPreview:null, restartPreviewSequence:0, restartConfirmedHash:null, restartTarget:null, requestPreview:null, previewSequence:0, planTimer:null, setupPreset:null, catalogueFilter:'all', catalogueCategory:'all', catalogueSearch:'', setupStep:1, returnToReview:false, modelDiscovery:null, modelDiscoverySequence:0, autoModel:null, datasetSelection:[], datasetImportSequence:0, judgeEditorOpen:null, datasetImport:null, datasetEditor:null, datasetTry:null, migrationNotes:[], dismissedMigrationNotes:[], loadPanels:{}, limitValues:{}, jsonValidation:null};
 const statusLabels = {pass:'Passed',fail:'Failed',failed:'Failed',timeout:'Timed out',inconclusive:'Inconclusive',skipped:'Not run',idle:'Unused',blocked:'Blocked',running:'Running',queued:'Queued',reserved:'Reserved',stopping:'Stopping',error:'Runner error',completed:'Finished',stopped:'Stopped',cancelled:'Cancelled',interrupted:'Interrupted'};
 const statusIcons = {pass:'✓',fail:'×',failed:'×',timeout:'◷',inconclusive:'?',skipped:'–',idle:'○',blocked:'!',running:'·',queued:'○',reserved:'○',stopping:'·',error:'×',completed:'✓',stopped:'⊘',cancelled:'⊘',interrupted:'!'};
 const order = {fail:0,blocked:1,inconclusive:2,pass:3,skipped:4};
@@ -2788,7 +2788,7 @@ function readForm(allowEmpty=false) {
   config=configureSessions(config,data,state.bootstrap.session_workloads.defaults,{allowInvalid:allowEmpty});
   config.restart_target=null;
   const confirmed=restartConfirmed(config);
-  return {config,baseline_id:data.get('baseline_id') || null,mode:confirmed?'cold-start':'normal',restart_target:confirmed?first.name:null,...(confirmed?{restart_script_sha256:state.restartConfirmedHash}:{})};
+  return {config,baseline_id:data.get('baseline_id') || null,mode:confirmed?'cold-start':'normal',restart_target:confirmed?restartTarget(config).name:null,...(confirmed?{restart_script_sha256:state.restartConfirmedHash}:{})};
 }
 const retentionLabels={failures:'Failed answers only',all:'All answers',none:'None'};
 function savedRunSummary(name,retention) {
@@ -2834,12 +2834,14 @@ function configureEvaluator() {
   if(!state.config.judging?.judges?.length)changeJudge('add');
   else $('[name="judge_0_url"]')?.focus();
 }
-function restartScriptPath(config=state.config) {
-  return $('#new-run-form')?.elements.restart_script?.value.trim() ?? config?.targets?.[0]?.restart_script ?? '';
+function restartScriptPath(config=state.config,target=config?.targets?.[0]) {
+  return ((!target||target===config?.targets?.[0]?$('#new-run-form')?.elements.restart_script?.value.trim():undefined) ?? target?.restart_script ?? '').trim();
 }
-function currentRestartPreview(config=state.config) {
+function restartCandidates(config=state.config) {return (config?.targets || []).filter(target=>target.restart_script?.trim());}
+function restartTarget(config=state.config) {const candidates=restartCandidates(config),target=candidates.find(target=>target.name===state.restartTarget) || candidates[0];state.restartTarget=target?.name ?? null;return target;}
+function currentRestartPreview(config=state.config,target=restartTarget(config)) {
   const preview=state.restartPreview;
-  return preview?.status==='current'&&preview.route===state.routeVersion&&preview.requestedPath===restartScriptPath(config)?preview:null;
+  return preview?.status==='current'&&preview.route===state.routeVersion&&preview.requestedPath===restartScriptPath(config,target)?preview:null;
 }
 function restartConfirmed(config=state.config) {
   const preview=currentRestartPreview(config);
@@ -2872,7 +2874,7 @@ function watchRestartScriptRow() {
 }
 function renderRestartPreview() {
   const element=$('#restart-script-preview');if(!element)return;
-  const preview=currentRestartPreview(),saved=state.restartPreview;
+  const preview=currentRestartPreview(state.config,state.config?.targets?.[0]),saved=state.restartPreview;
   element.innerHTML=preview?renderScriptContents(preview):saved?.status==='pending'?'<p class="hint">Reviewing script…</p>':'';
   const error=$('#field-restart_script-error'),input=$('#field-restart_script');
   if(error){error.textContent=saved?.status==='error'?saved.error:'';error.hidden=!error.textContent;}
@@ -2880,21 +2882,22 @@ function renderRestartPreview() {
   const summary=$('#restart-script-row > summary .row-value');if(summary)summary.textContent=restartScriptPath()||'Not set';
 }
 function renderRestartConfirmation(config) {
-  if(!state.bootstrap.restart_allowed||!config.targets?.[0]?.restart_script)return '';
-  const preview=currentRestartPreview(config);
-  return `<section class="review-section" id="review-restart"><label class="test-selection"><input type="checkbox" id="confirm-restart-script" name="confirm_restart_script" ${restartConfirmed(config)?'checked':''} ${preview?'':'disabled'}><span>Restart the server with this script before testing</span></label>${preview?renderScriptContents(preview):'<button type="button" class="text-button" data-action="preview-restart-script">Review script</button>'}</section>`;
+  if(!state.bootstrap.restart_allowed||!restartCandidates(config).length)return '';
+  const target=restartTarget(config),candidates=restartCandidates(config),preview=currentRestartPreview(config);
+  const selector=candidates.length>1?selectField('restart_target','Endpoint to restart',candidates.map(item=>`<option value="${escape(item.name)}" ${item.name===target.name?'selected':''}>${escape(item.name)}</option>`).join(''),{hint:''}):'';
+  return `<section class="review-section" id="review-restart"><label class="test-selection"><input type="checkbox" id="confirm-restart-script" name="confirm_restart_script" ${restartConfirmed(config)?'checked':''} ${preview?'':'disabled'}><span>Restart the server with this script before testing</span></label>${selector}${preview?renderScriptContents(preview):'<button type="button" class="text-button" data-action="preview-restart-script">Review script</button>'}</section>`;
 }
-async function previewRestartScript() {
+async function previewRestartScript(target=restartTarget()) {
   invalidateRestartConfirmation();
-  const path=restartScriptPath(),route=state.routeVersion,sequence=++state.restartPreviewSequence;
+  const path=restartScriptPath(state.config,target),route=state.routeVersion,sequence=++state.restartPreviewSequence;
   if(!path){state.restartPreview=null;renderRestartPreview();updateBounds();return;}
   state.restartPreview={status:'pending',requestedPath:path,route};renderRestartPreview();updateBounds();
   try{
     const preview=await api('/api/targets/restart-script/preview',{method:'POST',body:JSON.stringify({path})});
-    if(route!==state.routeVersion||sequence!==state.restartPreviewSequence||path!==restartScriptPath())return;
+    if(route!==state.routeVersion||sequence!==state.restartPreviewSequence||path!==restartScriptPath(state.config,target))return;
     state.restartPreview={...preview,status:'current',requestedPath:path,route};
   }catch(error){
-    if(route!==state.routeVersion||sequence!==state.restartPreviewSequence||path!==restartScriptPath())return;
+    if(route!==state.routeVersion||sequence!==state.restartPreviewSequence||path!==restartScriptPath(state.config,target))return;
     state.restartPreview={status:'error',requestedPath:path,route,error:error.message};
     const input=$('#new-run-form')?.elements.restart_script;if(input)input.setAttribute('aria-invalid','true');
   }
@@ -2918,7 +2921,7 @@ async function startRun(event) {
     const payload=await validatedSnapshot();
     await refreshRequestPreview(payload.config);
     if(currentResourceErrors().length)throw new Error(currentResourceErrors()[0].msg);
-    if(payload.mode==='cold-start'&&(!restartConfirmed(payload.config)||payload.restart_script_sha256!==state.restartConfirmedHash))throw new Error('The script changed. Review it again.');
+    if(payload.mode==='cold-start'&&(!restartConfirmed(payload.config)||payload.restart_target!==restartTarget(payload.config)?.name||payload.restart_script_sha256!==state.restartConfirmedHash))throw new Error('The script changed. Review it again.');
     if(version!==state.routeVersion)return;
     $('#start-run').textContent='Checking input preparation…';
     const result=await api('/api/runs',{method:'POST',body:JSON.stringify({...payload,migration_notes:[...(state.migrationNotes || [])],api_keys:sessionAPIKeys(payload.config)})});state.config=clone(payload.config);state.config.targets[0].tokenizer=draft.targets[0].tokenizer;
@@ -3493,7 +3496,7 @@ function renderColdStart(report=state.detail?.report) {
   return `<section id="results-cold-start" class="panel report-result-section"><h2>Cold start</h2>${targets.map(([name,item],index)=>{
     const restart=item.restart,first=restart.first_request || {},warm=restart.warm_requests || [];
     const rows=[['Script time',ms(restart.script_ms)],['Service answered after',ms(restart.service_answered_ms)],['First answer after',ms(restart.readiness_ms)],['Model load',(restart.model_load || 'Not reported by this server').replace(/^Model load: /,'')],['Model loaded before first request',restart.model_loaded_before_first_request || 'Unknown']];
-    return `${targets.length>1?`<h3>${escape(name)}</h3>`:''}<dl class="bound-list">${rows.map(([label,value])=>`<div><dt>${escape(label)}${label==='Model load'?infoHelp(`cold_model_load_${index}`,'Model load','Some servers load weights at startup, in which case it\'s part of "Service answered after".'):''}</dt><dd>${escape(value)}</dd></div>`).join('')}</dl>${restart.measurement_api?`<p class="hint">${escape(restart.measurement_api)}</p>`:''}<div class="metric-table"><table><thead><tr><th>Request</th><th>First-answer time</th><th>Latency</th></tr></thead><tbody>${[first,...warm].map((request,index)=>`<tr><th scope="row">${index?`Follow-up ${index}`:'First request'}</th><td>${request.first_output_ms==null?'Not measured':ms(request.first_output_ms)}${request.first_output_kind==='reasoning'?`<p class="hint">${request.answer_present===false&&request.output_cap_exhausted===true?'First output was reasoning; no answer within the output cap.':'First output was reasoning.'}</p>`:''}${request.reason?`<p class="hint">${escape(request.reason)}</p>`:''}</td><td>${request.elapsed_ms==null?'Not measured':ms(request.elapsed_ms)}</td></tr>`).join('')}</tbody></table></div>${restart.reason?`<p>${escape(restart.reason)}</p>`:''}${restart.output_tail?`<details class="check-observations"><summary>Restart script output</summary><pre>${escape(restart.output_tail)}</pre></details>`:''}`;
+    return `${targets.length>1?`<h3>${escape(name)}</h3>`:''}<dl class="bound-list">${rows.map(([label,value])=>`<div><dt>${escape(label)}${label==='Model load'?infoHelp(`cold_model_load_${index}`,'Model load','Some servers load weights at startup, in which case it\'s part of "Service answered after".'):''}</dt><dd>${escape(value)}</dd></div>`).join('')}</dl>${restart.measurement_api?`<p class="hint">${escape(restart.measurement_api)}</p>`:''}<div class="metric-table"><table><thead><tr><th>Request</th><th>First-answer time</th><th>Latency</th></tr></thead><tbody>${[first,...warm].map((request,requestIndex)=>`<tr><th scope="row">${requestIndex?`Follow-up ${requestIndex}`:first.cold===false?`First request (retry, not cold)${infoHelp(`cold_not_cold_${index}`,'First request',first.not_cold_reason)}`:'First request'}</th><td>${request.first_output_ms==null?'Not measured':ms(request.first_output_ms)}${request.first_output_kind==='reasoning'?`<p class="hint">${request.answer_present===false&&request.output_cap_exhausted===true?'First output was reasoning; no answer within the output cap.':'First output was reasoning.'}</p>`:''}${request.reason?`<p class="hint">${escape(request.reason)}</p>`:''}</td><td>${request.elapsed_ms==null?'Not measured':ms(request.elapsed_ms)}</td></tr>`).join('')}</tbody></table></div>${restart.reason?`<p>${escape(restart.reason)}</p>`:''}${restart.output_tail?`<details class="check-observations"><summary>Restart script output</summary><pre>${escape(restart.output_tail)}</pre></details>`:''}`;
   }).join('')}</section>`;
 }
 function renderDiagnostics(report,detail) {
@@ -4098,7 +4101,7 @@ async function rerun(){
     try{const result=await api('/api/config/draft',{method:'POST',body:JSON.stringify(source)});if(version!==state.routeVersion)return;source=result.config;notes=result.migration_notes;}
     catch(error){toast(error.message);return;}
   }
-  replaceMigrationNotes(notes);state.config=clone(source);state.autoModel=null;state.setupStep=1;invalidateModelDiscovery();state.datasetSelection=[];state.config.restart_target=null;invalidateRestartPreview();state.jsonDraft=null;state.jsonBase=null;state.configView='form';configChanged();state.prefillBaseline=state.detail.baseline_id || '';location.hash='#new';
+  replaceMigrationNotes(notes);state.config=clone(source);state.autoModel=null;state.setupStep=1;invalidateModelDiscovery();state.datasetSelection=[];state.config.restart_target=null;state.restartTarget=null;invalidateRestartPreview();state.jsonDraft=null;state.jsonBase=null;state.configView='form';configChanged();state.prefillBaseline=state.detail.baseline_id || '';location.hash='#new';
 }
 function portableConfig(payload) {return {...payload.config,restart_target:payload.mode==='cold-start'?payload.restart_target:null};}
 function hasJsonChanges() {return state.jsonDraft!==null&&state.jsonDraft!==state.jsonBase;}
@@ -4109,7 +4112,7 @@ function captureFormDraft() {
   try{state.config=readForm(true).config;}catch{}
 }
 async function restoreDraft() {
-  invalidateRestartPreview();
+  state.restartTarget=null;invalidateRestartPreview();
   try{
     const draft=JSON.parse(sessionStorage.getItem('giraffe-draft-v1'));
     const legacy=draft?.config?.config_version==null;
@@ -4174,7 +4177,7 @@ async function applyConfig(text=state.jsonDraft,{importing=false}={}) {
     captureFormDraft();
     replaceMigrationNotes(result.migration_notes);
     state.config=result.config;state.autoModel=null;invalidateModelDiscovery();state.datasetSelection=[];
-    invalidateRestartPreview();
+    state.restartTarget=null;invalidateRestartPreview();
     state.config.restart_target=null;
     state.jsonDraft=null;state.jsonBase=null;configChanged();
     renderNew();toast(importing?'Configuration imported.':'Configuration applied.');
@@ -4284,7 +4287,7 @@ document.addEventListener('click',async(event)=>{
   if(action==='setup-next'){navigateSetup(state.configView==='json'?state.setupStep:state.returnToReview?3:state.setupStep+1);return;}
   if(action==='setup-back'){navigateSetup(state.setupStep-1);return;}
   if(action==='test-connection'){await testConnection();return;}
-  if(action==='preview-restart-script'){await previewRestartScript();return;}
+  if(action==='preview-restart-script'){await previewRestartScript(event.target.closest('#restart-script-row')?state.config.targets[0]:restartTarget());return;}
   if(action==='clear-api-key'){clearAPIKey();invalidateModelDiscovery();captureFormDraft();configChanged();renderNew();$('#connection-auth').open=true;$('#new-run-form').elements.api_key.focus();return;}
   const configure=event.target.closest('[data-configure-test]')?.dataset.configureTest;
   if(configure){toggleTestEditor(configure);return;}
@@ -4430,7 +4433,7 @@ document.addEventListener('input',event=>{
   if(event.target.id==='run-search'){state.historySearch=event.target.value;renderRuns();return;}
   if(event.target.id==='check-search'){state.catalogueSearch=event.target.value;syncTestControls();return;}
   if(!event.target.closest('#new-run-form')||event.target.matches('[data-dataset-select], #dataset-select-all, #dataset-bulk-scorer'))return;
-  if(event.target.name==='confirm_restart_script')return;
+  if(['confirm_restart_script','restart_target'].includes(event.target.name))return;
   if(['name','retention'].includes(event.target.name))updateSavedRunSummary();
   if(event.target.name==='restart_script'){invalidateRestartPreview();event.target.removeAttribute?.('aria-invalid');}
   event.target.removeAttribute?.('data-setting-highlight');
@@ -4461,7 +4464,8 @@ document.addEventListener('input',event=>{
 document.addEventListener('change',event=>{
   if(['name','retention'].includes(event.target.name)&&event.target.closest('#new-run-form'))updateSavedRunSummary();
   if(event.target.name==='confirm_restart_script'){const preview=currentRestartPreview();state.restartConfirmedHash=event.target.checked&&preview?preview.sha256:null;state.configRevision++;state.requestPreview&&(state.requestPreview.status='stale');updateBounds();return;}
-  if(event.target.name==='restart_script'){configChanged();previewRestartScript();return;}
+  if(event.target.name==='restart_target'){state.restartTarget=event.target.value;configChanged();previewRestartScript();return;}
+  if(event.target.name==='restart_script'){configChanged();previewRestartScript(state.config.targets[0]);return;}
   if(event.target.name==='session_pause_mode'){syncTestControls();updateBounds();}
   const comparisonFilter=event.target.dataset?.comparisonFilter;
   if(['outcome','check'].includes(comparisonFilter)){

@@ -92,17 +92,19 @@ def test_decline_clears_inherited_confirmation(config, monkeypatch):
 
 
 def test_stdin_handoff_uses_controlling_terminal(config, monkeypatch):
-    terminal = io.StringIO("yes\n")
+    terminal = io.StringIO("y\n")
     monkeypatch.setattr("sys.stdin", io.StringIO("configuration already consumed"))
     opened = []
 
-    def open_terminal(path, *args, **kwargs):
-        opened.append(path)
+    def open_terminal(path, mode, *, encoding):
+        opened.append((path, mode, encoding))
+        if mode != "r":
+            raise io.UnsupportedOperation("File or stream is not seekable.")
         return terminal
 
     monkeypatch.setattr("giraffe.cli.open", open_terminal, raising=False)
     _confirm_restart_script(config)
-    assert opened == ["/dev/tty"]
+    assert opened == [("/dev/tty", "r", "utf-8")]
     assert terminal.closed
     assert config.restart_script_sha256
 
@@ -188,6 +190,23 @@ def test_text_missing_model_load_evidence_has_a_label(tmp_path, capsys):
             "model_load": "Not reported by this server"}}}})
     _print_result(report, tmp_path / "report.json", None, tmp_path, {})
     assert "Model load: Not reported by this server" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("cold", [None, True, False])
+def test_text_cold_start_retry_label_and_note(tmp_path, capsys, cold):
+    note = "An earlier request reached the server before this one, so this is not a cold measurement."
+    report = RunReport(run_id="cold", started_at="now", finished_at="now", overall="pass",
+        manifest={}, observations={"targets": {"local": {"restart": {
+            "first_request": {"first_output_ms": 5, "elapsed_ms": 10,
+                **({"cold": cold, "not_cold_reason": note} if cold is not None else {})},
+            "warm_requests": [{"first_output_ms": 2, "elapsed_ms": 3}]}}}})
+    _print_result(report, tmp_path / "report.json", None, tmp_path, {})
+    output = capsys.readouterr().out
+    label = "First request (retry, not cold)" if cold is False else "First request"
+    assert f"  {label}: first answer 5 ms; latency 10 ms" in output
+    assert (note in output) == (cold is False)
+    if cold is False:
+        assert f"  Warm request 1: first answer 2 ms; latency 3 ms\n  {note}\n" in output
 
 
 @pytest.mark.parametrize("contents,message", [

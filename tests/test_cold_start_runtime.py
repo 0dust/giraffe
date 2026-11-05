@@ -6,6 +6,7 @@ import os
 import signal
 import sys
 import time
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -43,6 +44,18 @@ def script_file(tmp_path, body):
 
 def observation(report):
     return report.observations["targets"]["service"]["restart"]
+
+
+@pytest.mark.parametrize("prefix", ["request failed", "client failure"])
+@pytest.mark.parametrize("kind", ["ConnectError", "ConnectTimeout", "ConnectionRefusedError",
+    "ReadTimeout", "ReadError", "WriteError", "CloseError", "ConnectionResetError",
+    "NetworkError", "ConnectionError"])
+def test_only_failed_connections_did_not_reach_server(prefix, kind):
+    record = SimpleNamespace(error=f"{prefix} ({kind})", http_status=None)
+    assert cold_start.reached_server(record) is (kind not in {
+        "ConnectError", "ConnectTimeout", "ConnectionRefusedError"})
+    record.http_status = 503
+    assert cold_start.reached_server(record) is True
 
 
 def mocked_http(monkeypatch, *, native=True, resident=False, duration=903_000_000,
@@ -156,6 +169,9 @@ async def test_native_three_measurements_then_unchanged_normal_checks(monkeypatc
     report = await runner.run_suite(settings(tmp_path, script_file(tmp_path, "print('issued')")))
     restart = observation(report)
     assert restart["status"] == "ready"
+    assert restart["first_request"]["cold"] is True
+    assert restart["first_request"]["attempt"] == 1
+    assert restart["earlier_attempts"] == []
     assert restart["measurement_api"] == cold_start.NATIVE_API_LABEL
     from giraffe.reporting import _cold_start_html
     assert "Measured through Ollama&#x27;s native API" in _cold_start_html(report)
@@ -193,6 +209,9 @@ async def test_unusable_native_cold_request_falls_back_for_cold_and_warm(monkeyp
     assert restart["model_loaded_before_first_request"] == "Unknown"
     assert "measurement_api" not in restart and "model_load_ms" not in restart
     assert restart["first_request"]["first_output_ms"] is not None
+    assert restart["first_request"]["cold"] is False
+    assert restart["first_request"]["attempt"] == 2
+    assert restart["earlier_attempts"][0]["reached_server"] is True
     assert all(item["first_output_ms"] is not None for item in restart["warm_requests"])
     paths = [path for method, path, _ in calls if method == "POST"]
     assert paths == ["/api/chat"] + ["/v1/chat/completions"] * 6
@@ -340,6 +359,28 @@ async def test_only_transient_errors_retry_then_measure_output(monkeypatch, tmp_
     assert observation(report)["status"] == "ready"
     assert len([r for r in report.requests if r.scenario == "readiness"]) == 2
     assert observation(report)["first_request"]["first_output_kind"] == "answer"
+
+
+@pytest.mark.parametrize("failure,cold", [("timeout", False), ("connect", True)])
+async def test_cold_retry_preserves_attempt_and_model_load_evidence(monkeypatch, tmp_path, failure, cold):
+    mocked_http(monkeypatch, cold_failure=failure)
+    report = await runner.run_suite(settings(tmp_path, script_file(tmp_path, "pass"),
+                                             readiness_timeout_seconds=2))
+    restart = observation(report)
+    first = restart["first_request"]
+    assert first["cold"] is cold
+    assert first["attempt"] == 2
+    record = next(r for r in report.requests if r.scenario == "readiness")
+    assert restart["earlier_attempts"] == [{"status": record.status, "http_status": record.http_status,
+        "error": record.error, "elapsed_ms": record.elapsed_ms, "reached_server": not cold}]
+    if cold:
+        assert restart["model_load_ms"] == 903
+        assert "not_cold_reason" not in first
+    else:
+        assert "model_load_ms" not in restart
+        assert first["not_cold_reason"] == (
+            "An earlier request reached the server before this one, so this is not a cold measurement.")
+    assert type(report).model_validate_json(report.model_dump_json()).observations == report.observations
 
 
 @pytest.mark.parametrize("native", [True, False])

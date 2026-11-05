@@ -929,7 +929,7 @@ async def _restart(run: _Run, target: Target) -> bool:
     waiter = stopper = None
     started = None
     log_path = None
-    environment, script_secrets = script_environment(run.config.targets)
+    environment, script_secrets = script_environment(run.config)
     run.preparation(target.name, "restart_script", "Running restart script", "running")
     try:
         # File output matters: a background server can inherit these descriptors.
@@ -1175,21 +1175,25 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                 if restart and restart["status"] == "hook_completed":
                     from .cold_start import (NATIVE_API_LABEL, OllamaColdClient, cold_spec,
                                              detect_ollama, model_load_evidence, native_fallback, output_measurement,
-                                             residency, retry_readiness)
+                                             reached_server, residency, retry_readiness)
                     started = restart["started_monotonic"]
                     ready_deadline = min(run.deadline, time.monotonic() + config.readiness_timeout_seconds)
                     initial = []
                     restart["health_polls"] = []
+                    restart["earlier_attempts"] = []
                     measured_client = client
                     native = False
                     before = "unknown"
-                    readiness_attempts = 0
 
                     async def measure_restart(probe, *, deadline_override=None):
                         nonlocal measured_client, native
                         record = await run.request(target, measured_client, probe,
                                                    deadline_override=deadline_override, budget_exempt=True)
                         if native and not initial and record is not None and native_fallback(record):
+                            restart["earlier_attempts"].append({
+                                "status": record.status, "http_status": record.http_status,
+                                "error": record.error, "elapsed_ms": record.elapsed_ms,
+                                "reached_server": reached_server(record)})
                             native = False
                             measured_client = client
                             restart.pop("measurement_api", None)
@@ -1221,13 +1225,16 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                                     measured_client = OllamaColdClient(client)
                                     before = await residency(target, config, deadline=ready_deadline, stop=run.stop)
                             probe = cold_spec(initial_specs[0])
-                            readiness_attempts += 1
                             record = await measure_restart(probe, deadline_override=ready_deadline)
                             if record is None:
                                 break
                             measurement = output_measurement(record)
                             restart["first_request"] = measurement
                             if "first_output_kind" in measurement:
+                                measurement["attempt"] = len(restart["earlier_attempts"]) + 1
+                                measurement["cold"] = not any(a["reached_server"] for a in restart["earlier_attempts"])
+                                if not measurement["cold"]:
+                                    measurement["not_cold_reason"] = "An earlier request reached the server before this one, so this is not a cold measurement."
                                 restart["readiness_ms"] = round(
                                     (run.start-started)*1000 + record.timing_start_ms
                                     + measurement["first_output_ms"], 3) if measurement["first_output_ms"] is not None else None
@@ -1239,12 +1246,16 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                                     # the model; its retry's duration cannot time that load.
                                     restart.update(model_load_evidence(before, after,
                                         record.workload.get("reported_load_duration_ns")
-                                        if readiness_attempts == 1 else None))
+                                        if measurement["cold"] else None))
                                 initial = [record]
                                 break
                             if not retry_readiness(record):
                                 restart["reason"] = measurement["reason"]
                                 break
+                            restart["earlier_attempts"].append({
+                                "status": record.status, "http_status": record.http_status,
+                                "error": record.error, "elapsed_ms": record.elapsed_ms,
+                                "reached_server": reached_server(record)})
                         await asyncio.sleep(min(.25, max(0, ready_deadline-time.monotonic())))
                     restart["status"] = "ready" if initial else "blocked"
                     restart.pop("started_monotonic", None)

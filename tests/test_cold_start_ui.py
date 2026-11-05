@@ -47,6 +47,122 @@ for(const value of ['Model load: 1.38 s, reported by Ollama','Not reported by th
 ''')
 
 
+def test_retried_first_request_explains_why_it_is_not_cold_and_old_runs_are_unchanged():
+    run_browser_logic(r'''
+const report={observations:{targets:{local:{restart:{first_request:{first_output_ms:5,elapsed_ms:20},warm_requests:[{first_output_ms:2,elapsed_ms:12}]}}}}};
+const first=report.observations.targets.local.restart.first_request,original=renderColdStart(report);
+assert.match(original,/<th scope="row">First request<\/th>/);
+assert.doesNotMatch(original,/cold_not_cold|retry, not cold/);
+first.cold=true;first.attempt=1;assert.equal(renderColdStart(report),original);
+first.cold=false;first.attempt=2;first.not_cold_reason='Retried after HTTP 503 <busy>.';
+const help=infoHelp('cold_not_cold_0','First request',first.not_cold_reason),html=renderColdStart(report);
+assert(html.includes('<th scope="row">First request (retry, not cold)'+help+'</th>'));
+assert.match(html,/Retried after HTTP 503 &lt;busy&gt;\./);assert.doesNotMatch(html,/<busy>/);
+assert.equal(html.replace('First request (retry, not cold)'+help,'First request'),original);
+''')
+
+
+def test_restart_target_selection_controls_preview_confirmation_and_payload():
+    run_browser_logic(r'''
+state.bootstrap.restart_allowed=true;
+state.config={targets:[{name:'first',model:'m',url:'http://first/v1',restart_script:'/tmp/first.sh'},
+ {name:'second <server>',model:'m',url:'http://second/v1',restart_script:'/tmp/second.sh'},
+ {name:'no-script',model:'m',url:'http://third/v1'}],checks:[]};
+state.bootstrap.config=state.config;
+const values={name:'first',model:'m',url:'http://first/v1',restart_script:'/tmp/first.sh'};
+const elements=Object.fromEntries(Object.entries(values).map(([name,value])=>[name,element({value})]));
+nodes['#new-run-form']={elements,querySelectorAll:()=>[]};
+nodes['#confirm-restart-script']=element();
+FormData=class {constructor(){this.values={...values};}has(name){return Object.hasOwn(this.values,name);}get(name){return this.values[name]??null;}set(name,value){this.values[name]=value;}};
+tokenizerChoice=()=>null;
+configureRunLimits=configureTests=configureLoadTest=configureJudging=configureProfiles=configureSessions=config=>config;
+loadFormDefaults=()=>({});renderRequestPreview=()=>{};
+let rendered;updateBounds=()=>{rendered=renderRestartConfirmation(readForm(true).config);};
+const paths=[];api=async(url,options)=>{const path=JSON.parse(options.body).path;paths.push(path);return {path,machine:'local',sha256:path,contents:'script '+path};};
+let html=renderRestartConfirmation(state.config);
+assert.match(html,/<label[^>]*>Endpoint to restart/);assert.match(html,/<select[^>]*name="restart_target"/);
+assert.match(html,/<option value="first" selected>first<\/option>/);
+assert.match(html,/<option value="second &lt;server&gt;" >second &lt;server&gt;<\/option>/);
+assert.doesNotMatch(html,/no-script/);
+await previewRestartScript();listeners.change({target:{name:'confirm_restart_script',checked:true}});
+assert.equal(readForm(true).restart_target,'first');assert.equal(restartConfirmed(),true);
+const selection={name:'restart_target',value:'second <server>',closest:()=>true,matches:()=>false};
+listeners.input({target:selection});
+listeners.change({target:selection});
+assert.equal(state.restartConfirmedHash,null);assert.equal(nodes['#confirm-restart-script'].checked,false);
+assert.equal(readForm(true).mode,'normal');
+await Promise.resolve();
+assert.equal(state.restartTarget,'second <server>');assert.equal(paths.at(-1),'/tmp/second.sh');
+assert.equal(currentRestartPreview().path,'/tmp/second.sh');assert.match(rendered,/script \/tmp\/second.sh/);
+assert.equal(restartScriptPath(),'/tmp/first.sh');assert.equal(elements.restart_script.value,'/tmp/first.sh');
+listeners.change({target:{name:'confirm_restart_script',checked:true}});
+const payload=readForm(true);
+assert.equal(payload.mode,'cold-start');assert.equal(payload.restart_target,'second <server>');
+assert.equal(payload.restart_script_sha256,'/tmp/second.sh');
+assert.match(renderRestartConfirmation(structuredClone(state.config)),/<option value="second &lt;server&gt;" selected>/);
+listeners.change({target:{name:'restart_script'}});await Promise.resolve();
+assert.equal(paths.at(-1),'/tmp/first.sh');assert.equal(currentRestartPreview(),null);
+assert.equal(state.restartTarget,'second <server>');assert.equal(state.restartConfirmedHash,null);
+let resolveFirst,resolveSecond;
+api=(url,options)=>new Promise(done=>{if(JSON.parse(options.body).path==='/tmp/first.sh')resolveFirst=done;else resolveSecond=done;});
+listeners.change({target:{name:'restart_target',value:'first'}});
+listeners.change({target:selection});
+resolveSecond({path:'/tmp/second.sh',sha256:'second',contents:'second script'});await Promise.resolve();
+resolveFirst({path:'/tmp/first.sh',sha256:'first',contents:'first script'});await Promise.resolve();
+assert.equal(currentRestartPreview().sha256,'second');assert.match(rendered,/second script/);
+listeners.change({target:{name:'confirm_restart_script',checked:true}});
+state.config.targets[1].restart_script=null;
+assert.doesNotMatch(renderRestartConfirmation(state.config),/<select/);assert.equal(state.restartTarget,'first');
+assert.equal(restartConfirmed(),false);
+''')
+
+
+def test_only_restart_candidate_on_second_endpoint_needs_no_selector():
+    run_browser_logic(r'''
+state.bootstrap.restart_allowed=true;
+state.config={targets:[{name:'first',model:'m',url:'http://first/v1'},
+ {name:'second',model:'m',url:'http://second/v1',restart_script:'/tmp/second.sh'}],checks:[]};
+state.bootstrap.config=state.config;
+const values={name:'first',model:'m',url:'http://first/v1',restart_script:''};
+const elements=Object.fromEntries(Object.entries(values).map(([name,value])=>[name,element({value})]));
+nodes['#new-run-form']={elements,querySelectorAll:()=>[]};
+FormData=class {constructor(){this.values={...values};}has(name){return Object.hasOwn(this.values,name);}get(name){return this.values[name]??null;}set(name,value){this.values[name]=value;}};
+tokenizerChoice=()=>null;
+configureRunLimits=configureTests=configureLoadTest=configureJudging=configureProfiles=configureSessions=config=>config;
+loadFormDefaults=()=>({});updateBounds=()=>{};
+const html=renderRestartConfirmation(state.config);
+assert.match(html,/id="review-restart"/);assert.doesNotMatch(html,/<select|Endpoint to restart/);
+api=async(url,options)=>{assert.equal(JSON.parse(options.body).path,'/tmp/second.sh');return {sha256:'second',contents:'second script'};};
+await previewRestartScript();
+assert.equal(currentRestartPreview().sha256,'second');
+listeners.change({target:{name:'confirm_restart_script',checked:true}});
+const payload=readForm(true);
+assert.equal(payload.mode,'cold-start');assert.equal(payload.restart_target,'second');
+assert.equal(payload.restart_script_sha256,'second');assert.equal(payload.config.targets[0].restart_script,null);
+''')
+
+
+def test_applying_or_importing_config_resets_restart_target_and_confirmation():
+    run_browser_logic(r'''
+state.bootstrap.restart_allowed=true;
+const config={targets:[{name:'first',restart_script:'/tmp/first.sh'},
+ {name:'second',restart_script:'/tmp/second.sh'}],checks:[]};
+state.config=structuredClone(config);
+captureFormDraft=invalidateModelDiscovery=renderRequestPreview=toast=()=>{};
+configError=error=>{if(error)throw error;};
+let rendered;renderNew=()=>{assert.equal(state.restartTarget,null);rendered=renderRestartConfirmation(state.config);};
+api=async()=>({config:structuredClone(config)});
+for(const importing of [false,true]){
+ state.restartTarget='second';state.restartConfirmedHash='previous';
+ state.restartPreview={status:'current',requestedPath:'/tmp/second.sh',route:state.routeVersion,sha256:'previous'};
+ await applyConfig(JSON.stringify(config),{importing});
+ assert.equal(state.restartTarget,'first');assert.equal(state.restartConfirmedHash,null);
+ assert.equal(state.restartPreview,null);assert.equal(state.config.restart_target,null);
+ assert.match(rendered,/<option value="first" selected>/);assert.doesNotMatch(rendered,/ checked/);
+}
+''')
+
+
 def test_script_row_reuses_connection_pattern_and_hides_when_disallowed():
     run_browser_logic(r"""
 const config={restart_script_timeout_seconds:600},target={restart_script:'/tmp/restart.sh'};
@@ -199,7 +315,6 @@ assert.match(html,/class="preparation-elapsed"/);
 """)
     source=APP.read_text()
     assert "selectField('mode','Server startup'" not in source
-    assert "selectField('restart_target'" not in source
     assert "restart_command" not in source
     assert "updateRestart" not in source
     assert source.index("${renderRestartScriptRow(target,c)}") < source.index('id="setup-panel-2"')
@@ -210,11 +325,13 @@ def test_run_again_clears_confirmation_but_keeps_script_configuration():
 state.config={config_version:2,targets:[{name:'local',restart_script:'/tmp/restart.sh'}],checks:[]};
 state.detail={report:{manifest:{config:state.config}}};
 state.restartConfirmedHash='previous';
+state.restartTarget='local';
 state.restartPreview={status:'current',requestedPath:'/tmp/restart.sh',route:state.routeVersion,sha256:'previous'};
 invalidateModelDiscovery=renderRequestPreview=()=>{};
 await rerun();
 assert.equal(state.config.targets[0].restart_script,'/tmp/restart.sh');
 assert.equal(state.config.restart_target,null);assert.equal(state.restartConfirmedHash,null);
+assert.equal(state.restartTarget,null);
 assert.equal(state.restartPreview,null);assert.equal(restartConfirmed(),false);
 """)
 

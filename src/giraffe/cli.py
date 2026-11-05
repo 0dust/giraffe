@@ -514,7 +514,7 @@ def _confirm_restart_script(config: RunConfig, *, yes: bool = False) -> None:
                 terminal = sys.stdin
             else:
                 try:
-                    terminal = open("/dev/tty", "r+", encoding="utf-8")
+                    terminal = open("/dev/tty", "r", encoding="utf-8")
                 except OSError:
                     raise ValueError("Restart script requires an interactive terminal or --yes") from None
             print("Restart the server with this script before testing? [y/N] ",
@@ -1255,7 +1255,8 @@ def _print_result(report: RunReport, json_path: Path, html_path: Path | None,
                 value = restart.get(field)
                 print(f"  {label}: {value:g} ms" if isinstance(value, (float, int)) else f"  {label}: Not measured")
             first = restart.get("first_request") or {}
-            for label, request in [("First request", first), *[
+            label = "First request (retry, not cold)" if first.get("cold") is False else "First request"
+            for label, request in [(label, first), *[
                     (f"Warm request {index}", request)
                     for index, request in enumerate(restart.get("warm_requests", []), 1)]]:
                 def timing(field):
@@ -1267,6 +1268,8 @@ def _print_result(report: RunReport, json_path: Path, html_path: Path | None,
                     print(f"    {note}")
                 if request.get("reason"):
                     print(f"    {request['reason']}")
+            if first.get("cold") is False and first.get("not_cold_reason"):
+                print(f"  {first['not_cold_reason']}")
             model_load = restart.get("model_load", "Not reported by this server")
             print(f"  {'Model load: ' if model_load == 'Not reported by this server' else ''}{model_load}")
             print(f"  Model loaded before first request: {restart.get('model_loaded_before_first_request', 'Unknown')}")
