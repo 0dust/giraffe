@@ -74,10 +74,12 @@ async def test_missing_identity_sends_nothing_and_cannot_pass(monkeypatch):
     assert result(state, cfg.targets[0]).status == "inconclusive"
 
 
-async def test_full_runner_keeps_policy_separate_and_preserves_exports(monkeypatch, tmp_path, local_tokenizer):
+async def test_full_runner_keeps_policy_separate_and_preserves_exports(monkeypatch, tmp_path, local_tokenizer, capsys):
     from giraffe.runner import run_suite
     from giraffe.planning import request_plan
-    from giraffe.reporting import reproduction_export, write_report
+    from giraffe.reporting import reproduction_export, write_report, compare_baseline
+    from giraffe.cli import _print_result
+    from giraffe.performance import build_performance
 
     monkeypatch.setenv("ALLOW_KEY", "sensitive-allow-value")
     monkeypatch.setenv("DENY_KEY", "sensitive-deny-value")
@@ -91,21 +93,45 @@ async def test_full_runner_keeps_policy_separate_and_preserves_exports(monkeypat
         return httpx.Response(200, json={"choices": [{"message": {"content": "sensitive-allow-value"}, "finish_reason": "stop"}]})
     original = httpx.AsyncClient
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
-    cfg = config()
+    cfg = config(retention="all")
+    cfg.targets[0].api_key_env = "UNUSED_SHARED_KEY"
+    monkeypatch.delenv("UNUSED_SHARED_KEY", raising=False)
+    cfg.stream = True  # Policy probes still use complete responses and skip shared-key setup.
     plan = request_plan(cfg)
     assert next(row for row in plan["rows"] if row["id"] == "gateway_access")["requests_per_target"] == 2
     report = await run_suite(cfg)
     check = next(check for check in report.checks if check.id == "gateway_access")
     assert check.status == "pass"
     assert len(calls) == 2
+    assert all(row["condition"]["check"] == "gateway_access"
+               for row in report.observations["targets"]["proxy"]["conditions"]
+               if row["condition"]["id"] == "gateway_access")
+    assert not build_performance(report)["targets"][0]["request_series"]
     exported = reproduction_export(report)
     assert exported["config"]["gateway_access"]["cases"] == cfg.gateway_access.model_dump()["cases"]
     assert exported["config"]["targets"][0]["test_identities"]["allowed"]["api_key_env"] == "ALLOW_KEY"
-    write_report(report, tmp_path)
+    assert exported["gateway_access"]["proxy"]["cases"][1]["observed"] == "deny"
+    assert RunConfig.model_validate(exported["config"]).gateway_access == cfg.gateway_access
+    json_path, html_path = write_report(report, tmp_path, html=True)
+    _print_result(report, json_path, html_path, tmp_path, {})
+    cli = capsys.readouterr().out
+    assert "expected deny, observed deny" in cli
+    assert "Declared access cases" in html_path.read_text()
+    assert "sensitive-allow-value" not in cli and "sensitive-deny-value" not in cli
     for path in tmp_path.rglob("*"):
         if path.is_file():
             assert "sensitive-allow-value" not in path.read_text()
             assert "sensitive-deny-value" not in path.read_text()
+    altered = report.model_copy(deep=True)
+    altered.manifest["config"]["gateway_access"]["cases"][0]["expected"] = "deny"
+    comparison = compare_baseline(altered, report)
+    assert comparison.baseline["status"] == "inconclusive"
+    assert any("gateway_access" in reason for reason in comparison.baseline["targets"][0]["reasons"])
+    assert next(c for c in comparison.checks if c.id == "gateway_access").metrics == check.metrics
+    altered = report.model_copy(deep=True)
+    altered.manifest["config"]["targets"][0]["test_identities"]["allowed"]["api_key_env"] = "DIFFERENT_KEY"
+    comparison = compare_baseline(altered, report)
+    assert any("identity references" in reason for reason in comparison.baseline["targets"][0]["reasons"])
 
 
 @pytest.mark.parametrize("change", [{"max_requests": 1}, {"gateway_access": None},
@@ -124,3 +150,53 @@ async def test_incomplete_matrix_never_passes(monkeypatch, change):
     async with LLMClient(cfg.targets[0], cfg) as client:
         await execute(state, cfg.targets[0], client)
     assert result(state, cfg.targets[0]).status == "inconclusive"
+
+
+@pytest.mark.parametrize("configured", [True, False])
+async def test_policy_denials_and_missing_configuration_do_not_fail_shared_key_access(monkeypatch, local_tokenizer, configured):
+    from giraffe.runner import run_suite
+    monkeypatch.setenv("ALLOW_KEY", "allow-secret")
+    monkeypatch.setenv("DENY_KEY", "deny-secret")
+    cfg = RunConfig.model_validate({**config().model_dump(), "checks": ["access", "gateway_access"],
+        "stop_after_errors": 1, "gateway_access": config().gateway_access.model_dump() if configured else None})
+    original = httpx.AsyncClient
+    def handler(req):
+        if req.method != "POST":
+            return httpx.Response(404)
+        if req.headers.get("authorization") == "Bearer deny-secret":
+            return httpx.Response(401, json={"error": {"type": "token_not_found_in_db"}})
+        return httpx.Response(200, json={"choices": [{"message": {"content": "OK"}, "finish_reason": "stop"}]})
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
+    report = await run_suite(cfg)
+    assert report.overall == "pass" and report.abort_reason is None
+    assert next(c for c in report.checks if c.id == "access").status == "pass"
+    assert next(c for c in report.checks if c.id == "gateway_access").status == ("pass" if configured else "inconclusive")
+    assert all("access" not in r.check_ids for r in report.requests if r.identity)
+
+
+async def test_expected_allow_but_recognized_denial_fails(monkeypatch):
+    from giraffe.gateway_access import execute, result, observation
+    monkeypatch.setenv("ALLOW_KEY", "allow-secret")
+    monkeypatch.setenv("DENY_KEY", "deny-secret")
+    cfg = config()
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(
+        lambda req: httpx.Response(401, json={"error": {"type": "token_not_found_in_db"}})), **kw))
+    state = _Run(cfg, None, None)
+    async with LLMClient(cfg.targets[0], cfg) as client:
+        await execute(state, cfg.targets[0], client)
+    assert result(state, cfg.targets[0]).status == "fail"
+    assert observation(state.records[0].model_copy(update={"status": "timeout"}))[0] == "unverified"
+
+
+def test_limits_and_example_are_valid():
+    from pathlib import Path
+    import yaml
+    from pydantic import ValidationError
+    from giraffe.models import GatewayAccess
+    for changes in ({"request_timeout_seconds": 61}, {"max_output_tokens": 129},
+                    {"cases": [{"name": "same", "identity": "allowed", "expected": "allow"}] * 17}):
+        with pytest.raises(ValidationError):
+            GatewayAccess.model_validate(changes)
+    values = yaml.safe_load((Path(__file__).parents[1] / "examples/gateway-access.yaml").read_text())
+    assert RunConfig.model_validate(values).checks == ["gateway_access"]

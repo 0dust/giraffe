@@ -2696,6 +2696,10 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
         from giraffe import multi_user, multi_user_metrics, load_test, concurrent_load
         workload_identity["multi_user_source_sha256"] = hashlib.sha256(b"".join(Path(m.__file__).read_bytes() for m in (multi_user, multi_user_metrics, load_test, concurrent_load))).hexdigest()
         workload_identity["multi_user_window_policy"] = multi_user.WINDOW_POLICY
+    if "gateway_access" in config.checks:
+        from giraffe import gateway_access
+        workload_identity["gateway_access_source_sha256"] = hashlib.sha256(
+            Path(gateway_access.__file__).read_bytes()).hexdigest()
     if "load" in config.checks:
         from giraffe import load_test, concurrent_load, traffic
         workload_identity["load_test_source_sha256"] = hashlib.sha256(b"".join(Path(m.__file__).read_bytes() for m in (load_test, concurrent_load, traffic))).hexdigest()

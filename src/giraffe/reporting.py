@@ -1170,6 +1170,9 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
         saturated_runs = [label for label, run in (("Current", report), ("Baseline", baseline))
                           if _generator_saturated(run, name)]
         old_target = old_targets.get(name)
+        if (old_target is not None and "gateway_access" in config.get("checks", [])
+                and target.get("test_identities") != old_target.get("test_identities")):
+            target_reasons.append("Gateway test identity references differ; access-policy cases are not comparable.")
         if (old_target is not None and "gateway_attribution" in report.manifest.get("config", {}).get("checks", [])
                 and any(target.get(key) != old_target.get(key) for key in ("test_identities", "gateway"))):
             target_reasons.append("Gateway identity references or evidence configuration differs; attribution runs are not comparable.")
@@ -2890,6 +2893,10 @@ def reproduction_export(report: RunReport) -> dict:
             "invocation": safe_invocation(retained.manifest.get("invocation")),
             "config": retained.manifest.get("config", {}),
             "fixture_pack": retained.manifest.get("fixture_pack", {}),
+            **({"gateway_access": {check.target: check.metrics["gateway_access"]
+                                   for check in retained.checks
+                                   if check.id == "gateway_access" and check.metrics.get("gateway_access")}}
+               if any(check.id == "gateway_access" and check.metrics.get("gateway_access") for check in retained.checks) else {}),
             **({"gateway_attribution": {check.target: check.metrics for check in retained.checks
                                          if check.id == "gateway_attribution"}}
                if any(check.id == "gateway_attribution" for check in retained.checks) else {}),
