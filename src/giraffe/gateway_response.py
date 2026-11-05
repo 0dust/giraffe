@@ -11,7 +11,7 @@ def response_evidence(status, body=b"", headers=None, *, declared_priority=None)
     if status in {401, 403}:
         try:
             data = json.loads(body)
-        except (ValueError, UnicodeError):
+        except (ValueError, UnicodeError, RecursionError):
             data = None
         error = data.get("error") if isinstance(data, dict) else None
         if isinstance(error, dict):
@@ -45,7 +45,7 @@ def response_evidence(status, body=b"", headers=None, *, declared_priority=None)
     evidence.policy_rejection = "unknown"
     try:
         data = json.loads(body)
-    except (ValueError, UnicodeError):
+    except (ValueError, UnicodeError, RecursionError):
         return evidence
     error = data.get("error") if isinstance(data, dict) else None
     if not isinstance(error, dict) or error.get("type") != "throttling_error" or error.get("code") not in (429, "429"):

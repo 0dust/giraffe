@@ -1161,7 +1161,8 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                   "Rates use percentage points; timing and output rate use relative percent. "
                   "Output token rate is end-to-end server-reported output tokens / elapsed seconds. "
                   "Intervals describe within-run variation, not cross-run environmental stability. "
-                  "Per-user shared-window delivery compares observed common-window rates without a confidence interval.",
+                  "Per-user shared-window delivery compares observed common-window rates without a confidence interval. "
+                  "Gateway policy acceptance compares qualified observations under matching declarations without timing inference.",
     }
     for target in targets or [{"name": "unknown"}]:
         name = target["name"]
@@ -1170,6 +1171,9 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
         saturated_runs = [label for label, run in (("Current", report), ("Baseline", baseline))
                           if _generator_saturated(run, name)]
         old_target = old_targets.get(name)
+        if (old_target is not None and "gateway_policy" in config.get("checks", [])
+                and target.get("test_identities") != old_target.get("test_identities")):
+            target_reasons.append("Gateway policy identity references differ; runs are not comparable.")
         if (old_target is not None and "gateway_attribution" in report.manifest.get("config", {}).get("checks", [])
                 and any(target.get(key) != old_target.get(key) for key in ("test_identities", "gateway"))):
             target_reasons.append("Gateway identity references or evidence configuration differs; attribution runs are not comparable.")

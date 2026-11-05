@@ -24,13 +24,17 @@ def configuration(mode="key_rpm", **changes):
         max_duration_seconds=5, request_timeout_seconds=1)
 
 
-async def exercise(monkeypatch, mode="key_rpm", *, behavior="enforce", **settings):
+async def exercise(monkeypatch, mode="key_rpm", *, behavior="enforce", full=False, **settings):
     monkeypatch.setenv("LIMITED", "limited-secret")
     monkeypatch.setenv("PEER", "peer-secret")
+    if behavior == "duplicate_credentials":
+        monkeypatch.setenv("PEER", "limited-secret")
     seen = []
     counts = {"limited": 0, "peer": 0}
 
     async def handle(request):
+        if request.method != "POST":
+            return httpx.Response(404)
         who = "limited" if request.headers["authorization"] == "Bearer limited-secret" else "peer"
         counts[who] += 1
         seen.append(who)
@@ -57,10 +61,28 @@ async def exercise(monkeypatch, mode="key_rpm", *, behavior="enforce", **setting
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handle), **kw))
     from giraffe.gateway_policy import execute, result
     cfg = configuration(mode, **settings)
+    if full:
+        cfg.targets[0].api_key_env = "UNUSED_SHARED_CREDENTIAL"
+        monkeypatch.delenv("UNUSED_SHARED_CREDENTIAL", raising=False)
+        report = await runner.run_suite(cfg)
+        return next(check for check in report.checks if check.id == "gateway_policy"), report, seen
     state = runner._Run(cfg, None, None)
     async with LLMClient(cfg.targets[0], cfg, max_connections=2) as client:
         await execute(state, cfg.targets[0], client)
     return result(state, cfg.targets[0]), state, seen
+
+
+@pytest.mark.usefixtures("local_tokenizer")
+@pytest.mark.parametrize("mode", ["key_rpm", "priority_rpm"])
+@pytest.mark.parametrize("behavior,expected", [("enforce", "pass"), ("overadmit", "fail"), ("unknown", "inconclusive")])
+async def test_full_runner_keeps_policy_verdict_and_does_not_send_shared_setup(monkeypatch, mode, behavior, expected):
+    check, report, seen = await exercise(monkeypatch, mode, behavior=behavior, full=True)
+    assert check.status == expected, check.summary
+    assert len(seen) == 13
+    assert all(record.identity in {"limited", "peer"} for record in report.requests)
+    assert len(report.requests) == 13
+    assert "limited-secret" not in report.model_dump_json()
+    assert "private-hash" not in report.model_dump_json()
 
 
 @pytest.mark.parametrize("mode", ["key_rpm", "priority_rpm"])
@@ -88,6 +110,28 @@ async def test_unknown_429_is_not_policy_enforcement_or_failure(monkeypatch, mod
 async def test_unknown_window_cannot_certify_priority(monkeypatch):
     check, _, _ = await exercise(monkeypatch, "priority_rpm", window_state="unknown")
     assert check.status == "inconclusive"
+
+
+async def test_two_aliases_with_one_credential_are_unverified(monkeypatch):
+    check, _, _ = await exercise(monkeypatch, behavior="duplicate_credentials")
+    assert check.status == "inconclusive"
+    assert check.metrics["gateway_policy"]["qualification"] == "unverified"
+    assert not check.metrics["gateway_policy"]["identities_distinct"]
+
+
+async def test_priority_cached_saturation_is_unverified(monkeypatch):
+    check, _, _ = await exercise(monkeypatch, "priority_rpm", saturation_cache_seconds=5)
+    assert check.status == "inconclusive"
+
+
+async def test_priority_without_actual_overlap_is_unverified(monkeypatch):
+    from giraffe.gateway_policy import summarize
+    check, state, _ = await exercise(monkeypatch, "priority_rpm")
+    for index, record in enumerate(state.records):
+        record.dispatch_ms, record.completed_ms = index*100, index*100+10
+    summary = summarize(state.config.gateway_policy, state.observations["proxy"]["gateway_policy"], state.records)
+    assert summary["status"] == "inconclusive"
+    assert not summary["overlap_observed"]
 
 
 async def test_priority_missing_actual_work_is_unverified(monkeypatch):
@@ -159,6 +203,9 @@ def test_policy_reports_exports_ui_and_baseline(tmp_path, capsys, monkeypatch):
     different = report.model_copy(deep=True)
     different.manifest["config"]["gateway_policy"]["duration_seconds"] = 1
     assert compare_baseline(report, different).baseline["status"] == "inconclusive"
+    different = report.model_copy(deep=True)
+    different.manifest["config"]["targets"][0]["test_identities"]["peer"]["api_key_env"] = "OTHER_PEER"
+    assert compare_baseline(report, different).baseline["status"] == "inconclusive"
     browser_logic('const policy='+json.dumps(check.metrics["gateway_policy"])+r''';
 const check=bootstrap.checks.find(c=>c.id==='gateway_policy');
 const markup=renderTestCard(check,config);
@@ -171,6 +218,8 @@ assert.equal(changed.gateway_policy.model_rpm,10);
 const result=renderGatewayPolicyResults(policy);
 assert.match(result,/limited/);assert.match(result,/observed/);
 assert.match(result,/Actual input tokens/);assert.doesNotMatch(result,/limited-secret/);
+const comparison=comparisonTable([{metric:'policy_acceptance',aggregation:'observed',status:'pass',current:'observed',baseline:'observed',current_samples:5,baseline_samples:5}]);
+assert.match(comparison,/Policy evidence/);assert.doesNotMatch(comparison,/Median|No material regression/);
 ''', state.config)
 
 
@@ -182,3 +231,9 @@ def test_parser_never_persists_raw_rate_limit_identity():
     assert evidence.policy_rejection == "key_rpm"
     assert evidence.request_limit == 2
     assert "secret-hash" not in evidence.model_dump_json()
+
+
+@pytest.mark.parametrize("body", [b'[]', b'{"error":[]}', b'{"error":{"type":[],"code":[]}}', b'['*1200+b']'*1200])
+def test_malformed_policy_evidence_is_unknown(body):
+    from giraffe.gateway_response import response_evidence
+    assert response_evidence(429, body).policy_rejection == "unknown"

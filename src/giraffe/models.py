@@ -2476,6 +2476,8 @@ class RunConfig(Model):
             result.pop("default_concurrency", None)
         if self.gateway_attribution is None:
             result.pop("gateway_attribution", None)
+        if self.gateway_policy is None:
+            result.pop("gateway_policy", None)
         return result
 
     @field_serializer("limits")

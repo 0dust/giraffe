@@ -28,6 +28,15 @@ async def execute(run, target, client):
     if not _supported(settings):
         observation["stop_reason"] = "Selected gateway capability is unsupported."
         return
+    from .identities import identity_headers
+    try:
+        credentials = [next((value for name, value in identity_headers(target, user.identity).items()
+                             if name.lower() == "authorization"), None) for user in settings.users]
+        observation["identities_distinct"] = (all(value and value.startswith("Bearer ") for value in credentials)
+                                               and len(set(credentials)) == len(credentials))
+        del credentials
+    except ValueError:
+        observation["identities_distinct"] = False
     run.plan_condition(target.name, "gateway_policy", {},
                        planned=sum(user.requests for user in settings.users))
 
@@ -95,6 +104,7 @@ def summarize(settings, observation, records):
     summary = {"version": VERSION, "settings": settings.model_dump(mode="json"), "users": users,
         "start_ms": observation.get("start_ms"), "end_ms": observation.get("end_ms"),
         "complete": observation.get("complete", False), "stop_reason": observation.get("stop_reason"),
+        "identities_distinct": observation.get("identities_distinct", False),
         "qualification": "unverified", "status": "inconclusive", "reasons": [],
         "peer_continuation": False, "overlap_observed": False, "comparable_actual_work": False,
         "interpretation": "Observed admission under declared policy and window assumptions; no queue-order, latency-causality or production-wide guarantee."}
@@ -126,7 +136,8 @@ def summarize(settings, observation, records):
             for record in peers) for user in settings.users if user.identity != settings.affected_identity)
         if summary["peer_continuation"]:
             break
-    summary["overlap_observed"] = any(a.dispatch_ms is not None and a.completed_ms is not None
+    summary["overlap_observed"] = any(a.status == "completed" and a.valid and b.status == "completed" and b.valid
+        and a.dispatch_ms is not None and a.completed_ms is not None
         and b.dispatch_ms is not None and b.completed_ms is not None
         and max(a.dispatch_ms, b.dispatch_ms) < min(a.completed_ms, b.completed_ms)
         for a in affected for b in peers)
@@ -137,6 +148,8 @@ def summarize(settings, observation, records):
         and len(set(inputs)) == 1 and max(outputs or [0]) <= 2*min(outputs or [0]))
     if settings.window_state != "isolated_fresh" or not settings.gateway_version or not observation.get("isolated_run"):
         return outcome("unverified", "Gateway version or isolated fresh policy window is unknown.")
+    if not observation.get("identities_distinct"):
+        return outcome("unverified", "Distinct authenticated test credentials could not be established locally.")
     if not recognized:
         if any(record.http_status == 429 for record in affected):
             return outcome("unverified", "Rejection does not identify the declared gateway policy.")
@@ -153,7 +166,7 @@ def summarize(settings, observation, records):
             return outcome("unverified", "Comparable actual token work and overlapping requests are required for priority observations.")
         if any(record.gateway_evidence is None or record.gateway_evidence.priority_matches is not True for record in successes):
             return outcome("unverified", "Successful responses do not confirm each declared priority tier.")
-    elif any(record.gateway_evidence.request_limit != declared.rpm for record in recognized):
+    elif any(record.gateway_evidence.request_limit != declared.rpm or record.gateway_evidence.request_remaining != 0 for record in recognized):
         return outcome("unverified", "Gateway key limit differs from the declared RPM.")
     # A proven violation survives incomplete peer coverage. No inference from latency is used.
     admitted = sum(record.http_status is not None and 200 <= record.http_status < 300 for record in affected)
@@ -163,7 +176,7 @@ def summarize(settings, observation, records):
         import math
         allowance = max(allowance, math.ceil(settings.saturation_threshold*settings.model_rpm))
     if admitted > allowance:
-        return outcome("observed_failure", "Completed requests exceeded the declared RPM allowance in the isolated window.", "fail")
+        return outcome("observed_failure", "Admitted requests exceeded the declared RPM allowance in the isolated window.", "fail")
     first_rejection = min((record.completed_ms for record in recognized if record.completed_ms is not None), default=None)
     prior_admissions = sum(record.http_status is not None and 200 <= record.http_status < 300
                            and record.completed_ms is not None and first_rejection is not None
