@@ -152,17 +152,22 @@ async def run_window(run, target, client, settings, load_settings, calibration, 
                              reason=window["reason"])
 
 
-async def execute(run, target, client):
-    settings = run.config.multi_user
+def _planned_observation(settings):
     population = population_plan(settings)
     windows = []
     for level in settings.levels:
         if settings.warmup_seconds:
             windows.append(_window(level, "warmup", settings.warmup_seconds, population))
         windows.append(_window(level, "measurement", settings.duration_seconds, population))
-    observation = {"version": 1, "window_policy": WINDOW_POLICY,
-                   "settings": settings.model_dump(mode="json"), "population": population,
-                   "windows": windows, "calibrations": []}
+    return {"version": 1, "window_policy": WINDOW_POLICY,
+            "settings": settings.model_dump(mode="json"), "population": population,
+            "windows": windows, "calibrations": []}
+
+
+async def execute(run, target, client):
+    settings = run.config.multi_user
+    observation = _planned_observation(settings)
+    population, windows = observation["population"], observation["windows"]
     run.observations[target.name]["multi_user"] = observation
     for window in windows:
         run.plan_condition(target.name, window["id"],
@@ -211,7 +216,15 @@ def result(run, target):
     from giraffe.multi_user_metrics import summarize
     from giraffe.overlap import scheduling_delay_windows
 
-    observation = run.observations[target.name].get("multi_user", {})
+    observation = run.observations[target.name].get("multi_user")
+    if observation is None:
+        observation = _planned_observation(run.config.multi_user)
+        reason = run.stop_reason(target.name) or "Target execution did not start."
+        for window in observation["windows"]:
+            window["reason"] = reason
+            for user in window["users"]:
+                user["stop_reason"] = reason
+        run.observations[target.name]["multi_user"] = observation
     observation["scheduling_delay_windows"] = [
         {"start_ms": start, "end_ms": end}
         for start, end in scheduling_delay_windows(run).windows]

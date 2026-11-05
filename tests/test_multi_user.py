@@ -263,3 +263,19 @@ def test_result_uses_scheduler_windows_and_keeps_all_users(monkeypatch):
         assert check.evidence_ids == [r.id for r in state.records]
 
     run_virtual(monkeypatch, scenario())
+
+
+def test_stop_before_target_execution_still_reports_planned_users():
+    async def scenario():
+        stop = asyncio.Event()
+        stop.set()
+        report = await runner.run_suite(settings(), stop_event=stop)
+        summary = next(check.metrics['multi_user'] for check in report.checks
+                       if check.id == 'multi_user')
+        assert len(summary['population']) == 20
+        assert len(summary['windows'][0]['users']) == 20
+        assert all(user['coverage']['status'] == 'unexercised'
+                   for user in summary['windows'][0]['users'])
+        assert not report.requests
+        assert summary['status'] == 'inconclusive'
+    asyncio.run(scenario())
