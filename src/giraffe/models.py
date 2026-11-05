@@ -2508,6 +2508,7 @@ class RequestRecord(PersistedModel):
     first_read_answer_chars: int = 0
     first_read_output_tokens: int | None = Field(default=None, strict=True, ge=0)
     last_read_output_tokens: int | None = Field(default=None, strict=True, ge=0)
+    read_output_tokens_source: Literal["usage", "logprobs"] | None = None
     first_reasoning_ms: float | None = None
     max_stream_gap_ms: float | None = None
     completion_tokens: int | None = None
@@ -2588,6 +2589,16 @@ class RequestRecord(PersistedModel):
         return 1000 / pace if pace is not None and pace > 0 else None
 
     @property
+    def streamed_answer_tokens(self) -> int | None:
+        events = [event for event in self.output_events if event["kind"] == "answer"]
+        if self.output_tokens is None or any(event.get("token_count") is None for event in events):
+            return None
+        tokens = sum(event["token_count"] for event in events)
+        if tokens == self.output_tokens or (self.finish_reason == "stop" and tokens == self.output_tokens - 1):
+            return tokens
+        return None
+
+    @property
     def tpot_direct_reason(self) -> str | None:
         if not self.timing_schema:
             return "Timing schema predates client content-event collection."
@@ -2597,7 +2608,7 @@ class RequestRecord(PersistedModel):
             return "A valid completed answer and matching usage are required."
         if self.output_tokens is None:
             return "Answer-token usage is missing or includes unseparated reasoning."
-        if self.output_tokens <= 1:
+        if self.output_tokens <= 1 or self.streamed_answer_tokens == 1:
             return "Single-token answers have no subsequent-token interval."
         if self.output_events_truncated or self.read_timestamps_truncated:
             return "Receipt-event evidence was truncated; collect a shorter response."
@@ -2606,8 +2617,7 @@ class RequestRecord(PersistedModel):
         events = [event for event in self.output_events if event["kind"] == "answer"]
         if not events or events[0].get("token_count") != 1:
             return "The first answer event is not proven to contain exactly one token; collect aligned streamed logprobs."
-        if (any(event.get("token_count") is None for event in events)
-                or sum(event["token_count"] for event in events) != self.output_tokens):
+        if self.streamed_answer_tokens is None:
             return "Streamed token-boundary evidence does not match answer usage."
         if (len(events) < 2 or len({event["read_id"] for event in events}) != len(events)
                 or events[-1]["at_ms"] <= events[0]["at_ms"]):
@@ -2624,7 +2634,7 @@ class RequestRecord(PersistedModel):
         if self.tpot_direct_reason is not None:
             return None
         events = [event for event in self.output_events if event["kind"] == "answer"]
-        return (events[-1]["at_ms"] - events[0]["at_ms"]) / (self.output_tokens - 1)
+        return (events[-1]["at_ms"] - events[0]["at_ms"]) / (self.streamed_answer_tokens - 1)
 
     @property
     def itl_reason(self) -> str | None:

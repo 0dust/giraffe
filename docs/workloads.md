@@ -306,8 +306,8 @@ error allowance.
 
 ## Streaming generation pace
 
-Generation pace is a client-observed estimate using server-reported cumulative
-output token counts at the first and last answer-bearing client reads:
+Generation pace is a client-observed estimate using output token counts at the
+first and last answer-bearing client reads:
 
 ```text
 (last_read_output_tokens - first_read_output_tokens)
@@ -321,6 +321,23 @@ waiting, trailing usage/finish messages, `[DONE]` and connection cleanup do not
 extend the measured interval or add tokens to its numerator. Large batches with
 valid counts can establish an average pace, but not individual token arrival
 times or smooth streaming.
+
+### Token-count sources
+
+Giraffe uses the first source available for a response and records it as
+`read_output_tokens_source`:
+
+1. `usage`: cumulative server usage on streamed events (opt-in, below).
+2. `logprobs`: streamed logprob entries. Giraffe probes logprob support and,
+   on plain-text requests, sends `logprobs: true` and `top_logprobs: 0`
+   automatically. Each entry is one generated token, so the count at a read is
+   the number of answer logprob entries received up to it. Setting `logprobs`
+   explicitly in `request_options` disables the automatic request.
+
+Some servers, including Ollama, count the end-of-sequence token in
+`completion_tokens` without streaming it. When a response finished with `stop`
+and usage is exactly one more than the streamed logprob tokens, Giraffe treats
+that token as unstreamed and uses the streamed count for per-token timing.
 
 For a server that supports cumulative usage on streamed events, add:
 
@@ -336,13 +353,14 @@ OpenAI-compatible endpoint. Confirm support in your server's documentation; see
 [NVIDIA's description of per-chunk usage](https://docs.nvidia.com/aiperf/reference/command-line-options#--per-chunk-usage).
 Giraffe does not enable the extension automatically.
 
-Final-only usage cannot establish earlier batch counts. Missing, invalid or
-decreasing counts leave generation pace unmeasured; Giraffe does not infer them
-from characters or SSE event counts. Counts must cover the same output scope at
-both boundaries. Reasoning needs a usable reasoning-token breakdown, and mixed
-text/tool responses cannot establish this pace. Server counts can include control
-tokens and need not equal tokenization of visible text. Network buffering also
-affects arrival times, so this is not an exact server decoding measurement.
+Final-only usage without streamed logprobs cannot establish earlier batch counts.
+Missing, invalid or decreasing counts leave generation pace unmeasured; Giraffe
+does not infer them from characters or SSE event counts. Counts must cover the
+same output scope at both boundaries. Reasoning needs a usable reasoning-token
+breakdown, and mixed text/tool responses cannot establish this pace. Server
+counts can include control tokens and need not equal tokenization of visible text.
+Network buffering also affects arrival times, so this is not an exact server
+decoding measurement.
 
 `limits.min_output_tokens_per_second` (or Load test's
 `pass_criteria.min_generation_tokens_per_second`) requires sufficient measurable
@@ -383,7 +401,7 @@ scenario, including error time in the window. Missing output usage leaves aggreg
 token throughput unknown. Per-request generation pace uses cumulative server
 counts at the first and last answer-bearing client reads, separate from
 end-to-end throughput and server TTFT statistics. See
-[streaming generation pace](#streaming-generation-pace) for required usage reporting.
+[streaming generation pace](#streaming-generation-pace) for required token counts.
 
 Timing acceptance uses the same generator scheduling-lag qualification for core
 and additional workloads. If the generator cannot keep up, configured timing

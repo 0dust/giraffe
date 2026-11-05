@@ -364,7 +364,7 @@ def _window_summary(report, target, window, records, series, observation):
     metrics["tpot"] = {**selected_tpot, "id": "tpot", "label": "Time per output token (TPOT)"}
     metrics["tpot_direct"]["exclusion_reasons"] = dict(Counter(r.tpot_direct_reason for r in good if r.tpot_direct_reason))
     dist("generation_pace", generation_rates, "Generation pace", "tok/s",
-         "Client-observed pace from cumulative server token counts at first/last answer reads" + legacy_source, state="estimated")
+         "Client-observed pace from server token counts (cumulative usage or streamed logprobs) at first/last answer reads" + legacy_source, state="estimated")
     itl = [gap for r in modern for gap in (getattr(r, "itl_ms", None) or [])]
     evidence_states = Counter(r.workload.get("token_evidence", {}).get("logprobs", "not_recorded") for r in good)
     if good and not any(r.stream for r in good):

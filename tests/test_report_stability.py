@@ -49,7 +49,7 @@ def test_main_schema_three_fixture_preserves_checks_outcome_and_conditions():
             summary["sections"]["server"] = summary["sections"]["server"][:original_server_rows]
             summary["metrics"] = {key: value for key, value in summary["metrics"].items() if key not in added}
             sources = {
-                "generation_pace": "Client-observed pace from cumulative server token counts at first/last answer reads",
+                "generation_pace": "Client-observed pace from server token counts (cumulative usage or streamed logprobs) at first/last answer reads",
                 "tpot_estimate": "1000 / generation_tokens_per_second",
                 "tpot": "1000 / generation_tokens_per_second",
             }

@@ -76,7 +76,8 @@ async def test_ttft_ignores_metadata_and_keeps_reasoning_separate(monkeypatch):
     assert record.reasoning_read_timestamps_ms == [300]
     assert [event["kind"] for event in record.output_events] == ["reasoning", "answer", "answer"]
     assert record.tpot_direct_ms == pytest.approx(200)
-    assert record.tpot_estimate_ms is None  # Final-only usage cannot establish read boundaries.
+    assert record.tpot_estimate_ms == pytest.approx(200)
+    assert record.read_output_tokens_source == "logprobs"
     assert record.itl_ms == pytest.approx([200])
     assert all("thinking" not in str(event) for event in record.output_events)
 
@@ -90,7 +91,8 @@ async def test_multitoken_chunk_is_read_gap_but_not_itl_or_direct_tpot(monkeypat
             usage={"completion_tokens": 4} if continuous_usage else None)),
         (.5, sse(finish="stop", usage={"completion_tokens": 4})), (.6, b"data: [DONE]\n\n")])
     assert record.read_gaps_ms == pytest.approx([300])
-    assert record.tpot_estimate_ms == (pytest.approx(150) if continuous_usage else None)
+    assert record.tpot_estimate_ms == pytest.approx(150)
+    assert record.read_output_tokens_source == ("usage" if continuous_usage else "logprobs")
     assert record.tpot_direct_ms is None and "first" in record.tpot_direct_reason.lower()
     assert record.itl_ms is None and "token" in record.itl_reason.lower()
 
@@ -193,12 +195,37 @@ async def test_later_multitoken_event_supports_mean_tpot_but_not_itl(monkeypatch
     assert record.itl_ms is None and "Multi-token" in record.itl_reason
 
 
-async def test_usage_must_match_proven_token_events(monkeypatch):
+@pytest.mark.parametrize("finish,count", [("length", 3), ("stop", 4), ("stop", 1)])
+async def test_usage_must_match_proven_token_events(monkeypatch, finish, count):
     record, _ = await execute(monkeypatch, [(.1, sse({"content": "A"}, tokens=["A"])),
         (.5, sse({"content": "B"}, tokens=["B"])),
-        (.6, sse(finish="stop", usage={"completion_tokens": 3})), (.7, b"data: [DONE]\n\n")])
-    assert record.tpot_direct_ms is None and "usage" in record.tpot_direct_reason
+        (.6, sse(finish=finish, usage={"completion_tokens": count})), (.7, b"data: [DONE]\n\n")])
+    assert record.streamed_answer_tokens is None
+    assert record.tpot_direct_ms is None
+    if count > 1:
+        assert record.tpot_direct_reason == "Streamed token-boundary evidence does not match answer usage."
     assert record.itl_ms is None
+
+
+@pytest.mark.parametrize("stop_tokens", [None, [""]])
+async def test_one_unstreamed_stop_token_keeps_direct_timing_and_pace(monkeypatch, stop_tokens):
+    record, _ = await execute(monkeypatch, [(.1, sse({"content": "A"}, tokens=["A"])),
+        (.3, sse({"content": "B"}, tokens=["B"])), (.5, sse({"content": "C"}, tokens=["C"])),
+        (.6, sse({"content": ""}, finish="stop", usage={"completion_tokens": 4}, tokens=stop_tokens)),
+        (.7, b"data: [DONE]\n\n")])
+    assert record.tpot_direct_ms == pytest.approx(400 / (3 - 1))
+    assert record.output_tokens == 4 and record.streamed_answer_tokens == 3
+    assert record.itl_ms == pytest.approx([200, 200])
+    assert record.generation_tokens_per_second == pytest.approx(5)
+    assert record.read_output_tokens_source == "logprobs"
+
+
+async def test_one_streamed_token_and_unstreamed_stop_have_no_interval(monkeypatch):
+    record, _ = await execute(monkeypatch, [(.1, sse({"content": "A"}, tokens=["A"])),
+        (.2, sse(finish="stop", usage={"completion_tokens": 2})), (.3, b"data: [DONE]\n\n")])
+    assert record.streamed_answer_tokens == 1
+    assert record.tpot_direct_reason == "Single-token answers have no subsequent-token interval."
+    assert record.tpot_direct_ms is None and record.itl_ms is None
 
 
 async def test_whitespace_generated_content_precedes_useful_output(monkeypatch):
@@ -223,4 +250,5 @@ async def test_saved_record_roundtrip_keeps_token_arrival_evidence(monkeypatch):
     saved = RequestRecord.model_validate_json(record.model_dump_json())
     assert saved.first_token_ms == 100
     assert saved.itl_ms == [400] and saved.tpot_direct_ms == 400
+    assert saved.read_output_tokens_source == "logprobs"
     assert saved.output_events[0]["token_count_source"] == "choice.logprobs.content"

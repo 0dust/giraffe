@@ -899,6 +899,7 @@ class LLMClient:
                                      "answer" if has_answer else "reasoning")
                     event["token_count"] = event["token_count_source"] = None
             first_read = last_read = None
+            first_read_id = last_read_id = None
             gap = None
             first_counts = last_counts = None
             for index, (offset, at, content_read_id, completion_count, reasoning_count) in enumerate(content_reads):
@@ -923,10 +924,12 @@ class LLMClient:
                 record.answer_reads += 1
                 if first_read is None:
                     first_read, record.first_read_answer_chars = at, len(text)
+                    first_read_id = content_read_id
                     first_counts = (completion_count, reasoning_count)
                 else:
                     gap = max(gap or 0, (at - last_read) * 1000)
                 last_read = at
+                last_read_id = content_read_id
                 last_counts = (completion_count, reasoning_count)
             if usage_consistent and not reads_truncated and not tool_parts:
                 needs_reasoning = bool(record.reasoning.strip() or stripped or previous_reasoning)
@@ -936,6 +939,19 @@ class LLMClient:
                     return counts[0] - (counts[1] or 0)
                 record.first_read_output_tokens = answer_count(first_counts)
                 record.last_read_output_tokens = answer_count(last_counts)
+            if record.first_read_output_tokens is not None and record.last_read_output_tokens is not None:
+                record.read_output_tokens_source = "usage"
+            else:
+                record.first_read_output_tokens = record.last_read_output_tokens = None
+                events = [event for event in record.output_events if event["kind"] == "answer"]
+                if (not reads_truncated and not record.output_events_truncated and not tool_parts
+                        and first_read_id is not None and last_read_id is not None and events
+                        and all(event.get("token_count") is not None for event in events)):
+                    record.first_read_output_tokens = sum(event["token_count"] for event in events
+                        if event["read_id"] <= first_read_id)
+                    record.last_read_output_tokens = sum(event["token_count"] for event in events
+                        if event["read_id"] <= last_read_id)
+                    record.read_output_tokens_source = "logprobs"
             if reads_truncated:
                 record.read_timestamps_truncated = True
                 record.answer_reads = 0

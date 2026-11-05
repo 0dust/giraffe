@@ -1734,6 +1734,7 @@ async def test_live_request_events_keep_identity_and_exclude_response_bodies(cli
                 "completed_ms", "timing_start_ms", "timing_schema", "first_token_ms", "first_reasoning_ms",
                 "last_output_ms", "stream", "stream_end_ms", "answer_reads", "answer_chunks", "answer_chars",
                 "first_read_answer_chars", "first_read_output_tokens", "last_read_output_tokens",
+                "read_output_tokens_source",
                                   "max_stream_gap_ms", "input_tokens", "output_tokens",
                 "completion_tokens", "reasoning_tokens", "cached_prompt_tokens", "finish_reason"}
         assert not {"output", "reasoning", "tool_calls", "assistant_message", "evaluation",

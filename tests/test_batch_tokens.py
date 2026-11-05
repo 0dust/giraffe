@@ -15,13 +15,15 @@ _UNSET = object()
 
 
 def chunk(text=None, count=_UNSET, *, reasoning=None, reasoning_tokens=_UNSET,
-          finish=None, usage_only=False):
+          finish=None, usage_only=False, tokens=None):
     delta = {}
     if text is not None:
         delta["content"] = text
     if reasoning is not None:
         delta["reasoning_content"] = reasoning
     data = {"choices": [] if usage_only else [{"delta": delta, "finish_reason": finish}]}
+    if tokens is not None:
+        data["choices"][0]["logprobs"] = {"content": [{"token": token} for token in tokens]}
     if count is not _UNSET:
         data["usage"] = {"completion_tokens": count}
         if reasoning_tokens is not _UNSET:
@@ -205,3 +207,79 @@ async def test_distinct_reads_with_same_timestamp_keep_distinct_boundaries(monke
     assert result.valid and result.answer_reads == 3
     assert result.first_read_output_tokens == 2 and result.last_read_output_tokens == 10
     assert result.generation_tokens_per_second == 8
+
+
+@pytest.mark.parametrize("coalesced", [False, True])
+async def test_logprob_counts_establish_pace_with_final_only_usage(monkeypatch, coalesced):
+    first = (chunk("abc", tokens=["a", "b", "c"]) if not coalesced else
+        chunk("a", tokens=["a"]) + chunk("b", tokens=["b"]) + chunk("c", tokens=["c"]))
+    result, _ = await execute(monkeypatch, [first, chunk("d", tokens=["d"]),
+        chunk("e", tokens=["e"]), chunk(count=6, finish="stop"), DONE])
+    assert result.first_read_output_tokens == 3 and result.last_read_output_tokens == 5
+    assert result.read_output_tokens_source == "logprobs"
+    assert result.generation_tokens_per_second == (5 - 3) * 1000 / 2000
+
+
+async def test_continuous_usage_is_preferred_to_logprob_counts(monkeypatch):
+    result, _ = await execute(monkeypatch, [chunk("a", 10, tokens=["a"]),
+        chunk("b", 20, tokens=["b"]), chunk(count=20, finish="stop"), DONE])
+    assert result.first_read_output_tokens == 10 and result.last_read_output_tokens == 20
+    assert result.read_output_tokens_source == "usage"
+    assert result.generation_tokens_per_second == 10
+
+
+@pytest.mark.parametrize("first,last", [(2, _UNSET), (_UNSET, 10)])
+async def test_partial_usage_uses_logprobs_for_both_boundaries(monkeypatch, first, last):
+    result, _ = await execute(monkeypatch, [chunk("abc", first, tokens=["a", "b", "c"]),
+        chunk("d", last, tokens=["d"]), chunk(count=10, finish="stop"), DONE])
+    assert result.first_read_output_tokens == 3 and result.last_read_output_tokens == 4
+    assert result.read_output_tokens_source == "logprobs"
+    assert result.generation_tokens_per_second == 1
+
+
+@pytest.mark.parametrize("missing", [0, 1, 2])
+async def test_missing_answer_logprobs_leave_both_boundaries_unmeasured(monkeypatch, missing):
+    reads = [chunk(text, 1 if index == 0 else _UNSET,
+        tokens=None if index == missing else [text]) for index, text in enumerate("abc")]
+    result, _ = await execute(monkeypatch, [*reads, chunk(count=3, finish="stop"), DONE])
+    assert result.first_read_output_tokens is None and result.last_read_output_tokens is None
+    assert result.read_output_tokens_source is None and result.generation_tokens_per_second is None
+
+
+async def test_tool_calls_exclude_logprob_pace(monkeypatch):
+    tool = b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c","type":"function","function":{"name":"f","arguments":"{}"}}]}}]}\n\n'
+    result, _ = await execute(monkeypatch, [tool, chunk("a", tokens=["a"]),
+        chunk("b", tokens=["b"]), chunk(count=3, finish="stop"), DONE])
+    assert result.tool_calls and result.generation_tokens_per_second is None
+    assert result.read_output_tokens_source is None
+
+
+async def test_logprob_boundaries_include_leading_but_not_trailing_whitespace(monkeypatch):
+    result, _ = await execute(monkeypatch, [chunk(" ", tokens=[" "]),
+        chunk("a", tokens=["a"]), chunk("b", tokens=["b"]), chunk(" ", tokens=[" "]),
+        chunk(count=5, finish="stop"), DONE])
+    assert result.first_read_output_tokens == 2 and result.last_read_output_tokens == 3
+    assert result.generation_tokens_per_second == 1
+
+
+@pytest.mark.parametrize("cap", ["_MAX_CONTENT_READS", "_MAX_OUTPUT_EVENTS"])
+async def test_truncated_evidence_cannot_supply_logprob_boundaries(monkeypatch, cap):
+    monkeypatch.setattr("giraffe.client." + cap, 2)
+    result, _ = await execute(monkeypatch, [chunk(text, tokens=[text]) for text in "abc"] +
+        [chunk(count=4, finish="stop"), DONE])
+    assert result.first_read_output_tokens is None and result.last_read_output_tokens is None
+    assert result.read_output_tokens_source is None and result.generation_tokens_per_second is None
+
+
+async def test_inline_reasoning_reclassification_cannot_supply_logprob_boundaries(monkeypatch):
+    result, _ = await execute(monkeypatch, [chunk("<think>x</think>a", tokens=["x", "a"]),
+        chunk("b", tokens=["b"]), chunk(count=3, reasoning_tokens=1, finish="stop"), DONE])
+    assert result.reasoning_stripped and result.generation_tokens_per_second is None
+    assert result.read_output_tokens_source is None
+
+
+def test_saved_record_without_read_token_source_loads():
+    sample = RequestRecord(id="old", target="t", fixture_id="f", scenario="generation",
+        check_ids=["generation"], started_at="now", status="completed")
+    saved = RequestRecord.model_validate(sample.model_dump(exclude={"read_output_tokens_source"}))
+    assert saved.read_output_tokens_source is None
