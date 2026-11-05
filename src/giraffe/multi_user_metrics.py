@@ -22,11 +22,13 @@ def _status(statuses: list[str], *, measured: bool = False) -> str:
 
 
 def _valid(record: RequestRecord) -> bool:
-    return record.status == "completed" and record.valid and record.score is not False
+    return record.status == "completed" and not _error(record)
 
 
 def _error(record: RequestRecord) -> bool:
-    return record.status in {"failed", "timeout"} or record.status == "completed" and (not record.valid or record.score is False)
+    return record.status in {"failed", "timeout"} or record.status == "completed" and (
+        not record.valid or record.score is False
+        or bool(record.workload.get("session_id")) and record.finish_reason == "length")
 
 
 def _tokens(records: list[RequestRecord]) -> tuple[int, int]:
@@ -187,7 +189,7 @@ def _user_summary(user: dict[str, Any], window: dict[str, Any], records: list[Re
             "outcomes": {"attempted": len(rows)+missing_terminal, "completed": len(completed),
                          "valid_completed": len(valid), "errors": len(errors),
                          "failed": sum(r.status == "failed" for r in attempts),
-                         "invalid": sum(r.status == "completed" and (not r.valid or r.score is False) for r in attempts),
+                         "invalid": sum(r.status == "completed" and _error(r) for r in attempts),
                          "timeouts": sum(r.status == "timeout" for r in attempts),
                          "cancelled": len(cancelled),
                          "intentional_cancelled": sum(r.status == "cancelled" for r in intentional),

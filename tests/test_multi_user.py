@@ -511,9 +511,10 @@ def test_conversation_samples_ignore_peer_latency_and_failures(monkeypatch):
     run_virtual(monkeypatch, scenario())
 
 
-async def test_fairness_uses_observed_http_stream_overlap():
+@pytest.mark.parametrize('conversations', [False, True])
+async def test_fairness_uses_observed_http_stream_overlap(conversations):
     from giraffe.client import LLMClient
-    from giraffe.models import Target
+    from giraffe.models import Target, RequestSpec
     from giraffe.multi_user import execute, result
     from tests.fake_endpoint import FakeEndpoint
 
@@ -521,17 +522,148 @@ async def test_fairness_uses_observed_http_stream_overlap():
     with FakeEndpoint(first_token_delay=.01, chunk_delay=.005) as endpoint:
         cfg = settings(levels=[2], duration_seconds=.5, think_time_seconds={'values': [0]},
             conversations={'profile': 'performance', 'modes': ['live'], 'max_tokens': 8,
-                'workloads': [{'name': 'chat', 'turns': [prompt, prompt]}]},
+                'workloads': [{'name': 'chat', 'turns': [prompt, prompt]}]} if conversations else None,
             pass_criteria={'max_throughput_ratio': 2, 'min_samples': 2}).model_copy(update={
                 'targets': [Target(name='service', model='fake', url=endpoint.url)], 'context_limit': 4096})
         state = runner._Run(cfg, None, None)
+        if not conversations:
+            state.load_custom_specs = [RequestSpec(fixture_id='copy', scenario='saved', check_ids=['load'],
+                messages=[{'role': 'user', 'content': prompt}], input_chars=len(prompt), max_tokens=8)]
         async with LLMClient(cfg.targets[0], cfg, max_connections=2) as client:
             await execute(state, cfg.targets[0], client)
         fairness = result(state, cfg.targets[0]).metrics['multi_user']['windows'][0]['fairness']
         assert endpoint.peak_active == 2
-        assert fairness['overlap_user_ids'] == ['user-01', 'user-02']
-        assert fairness['status'] == 'pass', fairness['reasons']
-        assert fairness['ratio'] <= 2
+        if conversations:
+            assert fairness['status'] == 'inconclusive'
+            assert not fairness['eligible_user_ids']
+            assert fairness['ratio'] is None
+        else:
+            assert fairness['overlap_user_ids'] == ['user-01', 'user-02']
+            assert fairness['status'] == 'pass', fairness['reasons']
+            assert fairness['ratio'] <= 2
         assert all(r.finish_reason == 'length' for r in state.records)
         # Each capped turn ends its conversation, so none receives a fabricated continuation.
         assert all(len(row['messages']) == 1 for row in endpoint.requests)
+
+
+@pytest.mark.parametrize('mode', ['fixed', 'live'])
+def test_correctness_conversations_ignore_dormant_performance_tasks(monkeypatch, mode):
+    from giraffe.multi_user import execute, result
+
+    class WrongAnswerClient(FakeClient):
+        seen = []
+        async def execute(self, spec, **kwargs):
+            self.seen.append(spec)
+            record = await super().execute(spec, **kwargs)
+            record.output = 'wrong answer'
+            return record
+
+    async def scenario():
+        cfg = settings(levels=[1], duration_seconds=.04,
+            think_time_seconds={'values': [0]},
+            conversations={'profile': 'correctness', 'modes': [mode],
+                'workloads': [{'name': 'chat', 'turns': ['Give advice', 'Expand the advice']}]})
+        state = runner._Run(cfg, None, None)
+        client = WrongAnswerClient(cfg.targets[0], cfg)
+        await execute(state, cfg.targets[0], client)
+        assert len(client.seen) >= 2
+        assert all(spec.scorer == 'exact' and spec.expected for spec in client.seen)
+        assert all(record.score is False for record in state.records)
+        conversations = state.observations['service']['multi_user']['windows'][0]['users'][0]['conversations']
+        assert len(conversations) >= 2
+        assert all(len(item['turns']) == 1 and item['stop_reason'] for item in conversations)
+        assert all(len(spec.messages) == 1 for spec in client.seen)
+        summary = result(state, cfg.targets[0]).metrics['multi_user']['windows'][0]['users'][0]
+        assert summary['outcomes']['errors'] == len(state.records)
+        assert summary['status'] == 'fail'
+
+    run_virtual(monkeypatch, scenario())
+
+
+def test_cancelled_final_turn_keeps_conversation_interrupted(monkeypatch):
+    from giraffe.multi_user import execute  # noqa: F401
+    class FinalTurnClient(FakeClient):
+        async def execute(self, spec, **kwargs):
+            if spec.workload.get('turn_id') == 1:
+                await asyncio.sleep(1)
+            return await super().execute(spec, **kwargs)
+
+    async def scenario():
+        cfg = settings(levels=[1], duration_seconds=.2,
+            think_time_seconds={'values': [0]}, conversations={'modes': ['live']})
+        stop = asyncio.Event()
+        started = 0
+        def progress(event):
+            nonlocal started
+            if event['event'] == 'request_started':
+                started += 1
+                if started == 2:
+                    asyncio.get_running_loop().call_later(.01, stop.set)
+        monkeypatch.setattr(runner, 'LLMClient', FinalTurnClient)
+        report = await runner.run_suite(cfg, stop_event=stop, progress=progress)
+        window = report.observations['targets']['service']['multi_user']['windows'][0]
+        conversation = window['users'][0]['conversations'][0]
+        assert len(report.requests) == 2
+        assert report.requests[-1].status == 'cancelled'
+        assert conversation['turns'] == [record.id for record in report.requests]
+        assert conversation['completed_turns'] == conversation['planned_turns'] == 2
+        assert conversation['stop_reason']
+    run_virtual(monkeypatch, scenario())
+
+
+@pytest.mark.parametrize('retention', ['none', 'failures', 'all'])
+def test_live_response_history_obeys_retention(monkeypatch, tmp_path, retention):
+    import json
+    from giraffe.reporting import write_report
+    marker = 'PRIVATE_MODEL_RESPONSE_NOT_IN_PROMPTS'
+    class HistoryClient(FakeClient):
+        seen = []
+        async def execute(self, spec, **kwargs):
+            self.seen.append(spec.messages)
+            record = await super().execute(spec, **kwargs)
+            record.output = marker
+            return record
+    async def scenario():
+        cfg = settings(levels=[1], duration_seconds=.2, think_time_seconds={'values': [0]},
+            conversations={'profile':'performance','modes':['live'],
+                'workloads':[{'name':'chat','turns':['First question','Follow-up question']}]}).model_copy(
+                    update={'max_requests':2, 'retention':retention})
+        monkeypatch.setattr(runner, 'LLMClient', HistoryClient)
+        report = await runner.run_suite(cfg)
+        assert marker in str(HistoryClient.seen[1])
+        json_path, html_path = write_report(report, tmp_path, html=True)
+        saved = json.loads(json_path.read_text())
+        assert len(saved['requests']) == 2
+        assert all(row['workload']['session_id'] for row in saved['requests'])
+        if retention == 'all':
+            assert marker in json_path.read_text()
+        else:
+            assert marker not in json_path.read_text()
+            assert marker not in html_path.read_text()
+    run_virtual(monkeypatch, scenario())
+
+
+def test_unreachable_conversation_inputs_cannot_spend_preparation_budget(monkeypatch):
+    from giraffe import session_sampling
+    from giraffe.multi_user import execute, population_plan
+    async def scenario():
+        cfg = settings(levels=[1], duration_seconds=.04, think_time_seconds={'values':[0]},
+            conversations={'profile':'performance','modes':['live'],
+                'workloads':[{'name':'a','turns':['A1','A2','A3']},{'name':'b','turns':['B1','B2','B3']}],
+                'sampling':{'input_tokens':{'values':[32,64],'weights':[1,0]},
+                    'turn_count':{'values':[2,3],'weights':[1,0]}}})
+        chosen = population_plan(cfg.multi_user)[0]['conversation_workload']
+        prompts = cfg.multi_user.conversations.workloads[chosen].turns[:2]
+        calls = []
+        async def prepare(run, target, prompt, tokens):
+            calls.append((prompt,tokens))
+            if prompt not in prompts or tokens != 32:
+                await asyncio.sleep(20)
+                return {'status':'inconclusive','reason':'unused input consumed preparation budget'}
+            return {'status':'calibrated','messages':[{'role':'user','content':prompt}]}
+        monkeypatch.setattr(session_sampling,'prepare_session_input',prepare)
+        state = runner._Run(cfg,None,None)
+        await execute(state,cfg.targets[0],FakeClient(cfg.targets[0],cfg))
+        assert len(state.records) >= 2
+        assert calls == [(prompt,32) for prompt in prompts]
+    run_virtual(monkeypatch, scenario())
