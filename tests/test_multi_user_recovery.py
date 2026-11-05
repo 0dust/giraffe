@@ -109,6 +109,10 @@ def test_http_same_users_continue_work_and_one_recovers_slowly():
         assert [w["offer_accounting"]["dispatched"] for w in windows] == [3, 6, 3]
         assert all(w["offer_accounting"]["not_offered"] == 0 for w in windows)
         assert endpoint.peak_active == 3
+        assert all(r.workload["ready_ms"] == r.workload["scheduled_ms"] for r in state.records)
+        for window in windows:
+            assert all(r.workload["ready_ms"] >= window["start_ms"] for r in state.records
+                       if r.workload["window_id"] == window["id"])
         for uid in ("user-01", "user-02", "user-03"):
             rows = sorted([r for r in state.records if r.workload["user_id"] == uid], key=lambda r:r.dispatch_ms)
             assert [r.workload["request_sequence"] for r in rows] == [1, 2, 3, 4]

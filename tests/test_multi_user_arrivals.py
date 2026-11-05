@@ -76,6 +76,8 @@ def test_http_single_user_burst_overlaps_under_global_cap():
                    ("dispatched", "dropped_local", "dropped_late", "unissued", "not_offered")) == 4
         assert {r.workload["user_id"] for r in state.records} == {"user-01"}
         assert len({r.workload["request_sequence"] for r in state.records}) == len(state.records)
+        assert all(r.workload["ready_ms"] == r.workload["scheduled_ms"] for r in state.records)
+        assert all(r.workload["ready_ms"] >= window["start_ms"] for r in state.records)
         assert any(a.dispatch_ms < b.dispatch_ms < a.completed_ms for a in state.records for b in state.records)
     with FakeEndpoint(first_token_delay=.05, chunk_delay=.03) as endpoint:
         asyncio.run(run(endpoint))
