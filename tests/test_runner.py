@@ -75,6 +75,7 @@ class FakeClient:
             started_at=datetime.now(timezone.utc).isoformat(), status=status,
             http_status=200, valid=status == "completed", output=output,
             output_chars=len(output), output_tokens=2,
+            first_read_output_tokens=1, last_read_output_tokens=2,
             input_tokens=max(1, spec.input_chars//4) if cls.input_usage else None,
             input_chars=spec.input_chars, elapsed_ms=elapsed, stream_end_ms=elapsed if status == "completed" else None,
             first_output_ms=first_output, last_output_ms=first_output + 2,
@@ -1747,7 +1748,9 @@ async def test_live_request_events_keep_identity_and_exclude_response_bodies(cli
                 "elapsed_ms", "first_output_ms", "check_ids", "http_status", "started_at", "dispatch_ms",
                 "completed_ms", "timing_start_ms", "timing_schema", "first_token_ms", "first_reasoning_ms",
                 "last_output_ms", "stream", "stream_end_ms", "answer_reads", "answer_chunks", "answer_chars",
-                "first_read_answer_chars", "max_stream_gap_ms", "input_tokens", "output_tokens",
+                "first_read_answer_chars", "first_read_output_tokens", "last_read_output_tokens",
+                "read_output_tokens_source",
+                                  "max_stream_gap_ms", "input_tokens", "output_tokens",
                 "completion_tokens", "reasoning_tokens", "cached_prompt_tokens", "finish_reason"}
         assert not {"output", "reasoning", "tool_calls", "assistant_message", "evaluation",
                     "logprob_evidence", "content_reads", "reasoning_reads", "output_events"} & record.keys()

@@ -56,7 +56,7 @@ def test_missing_first_answer_timing_is_inconclusive_with_enough_completed_answe
 
 
 def test_single_token_answer_does_not_supply_generation_pace_sample():
-    records = [answer("measured", "generation"),
+    records = [answer("measured", "generation", first_read_output_tokens=1, last_read_output_tokens=4),
                answer("single-token", "generation", output="a", output_chars=1,
                       answer_chars=1, output_tokens=1, completion_tokens=1,
                       answer_reads=1, answer_chunks=1, first_read_answer_chars=1)]
