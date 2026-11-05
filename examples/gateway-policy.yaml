@@ -1,0 +1,28 @@
+# Existing LiteLLM test keys only. Giraffe never provisions keys or changes limits.
+config_version: 2
+targets:
+  - name: test-gateway
+    url: http://localhost:4000/v1
+    model: YOUR_EXISTING_TEST_MODEL
+    test_identities:
+      limited:
+        api_key_env: GIRAFFE_LIMITED_TEST_KEY
+      peer:
+        api_key_env: GIRAFFE_PEER_TEST_KEY
+checks: [gateway_policy]
+concurrency: 2
+max_requests: 13
+max_duration_seconds: 20
+request_timeout_seconds: 5
+gateway_policy:
+  gateway: litellm
+  capability: key_rpm
+  gateway_version: null # Set the version actually deployed.
+  affected_identity: limited
+  users:
+    - {identity: limited, requests: 5, rpm: 2}
+    - {identity: peer, requests: 8, rpm: 8}
+  duration_seconds: 15
+  interval_seconds: 0.1
+  max_output_tokens: 16
+  window_state: unknown # Change only after confirming an isolated fresh window.

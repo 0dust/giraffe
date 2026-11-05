@@ -10,7 +10,7 @@ import uuid
 
 import httpx
 
-from .identities import identity_headers, identity_scope
+from .identities import credential_headers, identity_headers, identity_scope
 from .models import CheckResult, RequestSpec
 
 
@@ -111,7 +111,7 @@ def _assess(records, matched, planned, *, complete, unstable=False):
     return totals
 
 
-def _client(config, gateway, headers, timeout):
+def _client(config, headers, timeout):
     verify = ssl.create_default_context(cafile=config.ca_bundle) if config.ca_bundle else True
     return httpx.AsyncClient(headers=headers, verify=verify, proxy=config.proxy,
                              timeout=timeout, follow_redirects=False)
@@ -148,7 +148,7 @@ async def _pages(client, url, marker, *, max_rows, stop):
             pages = payload.get("total_pages")
             if type(pages) is not int or pages < 0:
                 return rows, False
-            if payload.get("total_is_capped") is not True and type(pages) is int and pages >= 0 and page >= pages:
+            if payload.get("total_is_capped") is not True and page >= pages:
                 return rows, True
     return rows, False
 
@@ -164,9 +164,8 @@ async def execute(run, target, client):
         return
     # The same credential-reference validation/resolution applies to the reader,
     # but its credential is never taken from an inference identity.
-    from types import SimpleNamespace
     try:
-        headers = identity_headers(SimpleNamespace(test_identities={"reader": gateway}), "reader")
+        headers = credential_headers(gateway)
         for alias in settings.identities:
             identity_headers(target, alias)
     except ValueError:
@@ -197,11 +196,11 @@ async def execute(run, target, client):
     deadline = min(run.deadline, time.monotonic() + settings.settle_seconds)
     attempts, previous, unstable = 0, {}, False
     assessment = _assess(records, {}, planned, complete=False)
-    # Poll only this finite post-request window. No background monitoring is kept.
+    expected = {record.id: record for record in records}
     try:
         with identity_scope(True):
             remaining = max(.001, min(run.config.metrics_timeout_seconds, deadline - time.monotonic()))
-            reader = await asyncio.to_thread(_client, run.config, gateway, headers, remaining)
+            reader = await asyncio.to_thread(_client, run.config, headers, remaining)
             async with reader:
                 while attempts < 3 and time.monotonic() < deadline and not run.stop.is_set():
                     attempts += 1
@@ -211,7 +210,7 @@ async def execute(run, target, client):
                     if isinstance(rows, str):
                         assessment = _state(rows, "Read-only gateway spend logs are unavailable or unsupported.")
                         break
-                    matched, unrelated, invalid = _normalize(rows, marker, {r.id: r for r in records})
+                    matched, unrelated, invalid = _normalize(rows, marker, expected)
                     current = {(local_id, gateway_id): value for local_id, entries in matched.items()
                                for gateway_id, value in entries.items()}
                     unstable |= any(key not in current or (value["complete"] and current[key] != value)

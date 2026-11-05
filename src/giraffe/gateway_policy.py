@@ -1,0 +1,199 @@
+"""Bounded observations of explicitly declared LiteLLM admission policies."""
+from __future__ import annotations
+
+import asyncio
+import time
+
+from .models import CheckResult, RequestSpec
+
+
+VERSION = 1
+PROMPT = "Reply with exactly the word OK."
+SUPPORTED = {"key_rpm", "priority_rpm"}
+
+
+def _supported(settings):
+    return settings.gateway == "litellm" and settings.capability in SUPPORTED
+
+
+async def execute(run, target, client):
+    settings = run.config.gateway_policy
+    start = time.monotonic()
+    end = min(start + settings.duration_seconds, run.deadline)
+    observation = {"version": VERSION, "settings": settings.model_dump(mode="json"),
+        "start_ms": (start-run.start)*1000, "end_ms": (end-run.start)*1000,
+        "complete": False, "stop_reason": None, "offered": {user.identity: 0 for user in settings.users}}
+    observation["isolated_run"] = set(run.config.checks) == {"gateway_policy"}
+    run.observations[target.name]["gateway_policy"] = observation
+    if not _supported(settings):
+        observation["stop_reason"] = "Selected gateway capability is unsupported."
+        return
+    from .identities import identity_headers
+    try:
+        credentials = [next((value for name, value in identity_headers(target, user.identity).items()
+                             if name.lower() == "authorization"), None) for user in settings.users]
+        observation["identities_distinct"] = (all(value and value.startswith("Bearer ") for value in credentials)
+                                               and len(set(credentials)) == len(credentials))
+        del credentials
+    except ValueError:
+        observation["identities_distinct"] = False
+    run.plan_condition(target.name, "gateway_policy", {},
+                       planned=sum(user.requests for user in settings.users))
+
+    async def user_loop(user):
+        for sequence in range(user.requests):
+            if time.monotonic() >= end or not run.allowed(target.name):
+                return
+            ready_ms = (time.monotonic()-run.start)*1000
+            spec = RequestSpec(fixture_id="gateway-policy-v1", scenario="gateway_policy",
+                check_ids=["gateway_policy"], identity=user.identity,
+                messages=[{"role": "user", "content": PROMPT}], stream=False,
+                max_tokens=settings.max_output_tokens, options={"temperature": 0},
+                workload={"user_id": user.identity, "request_sequence": sequence+1,
+                          "ready_ms": ready_ms, "declared_priority": user.priority})
+
+            def dispatched():
+                observation["offered"][user.identity] += 1
+
+            record = await run.request(target, client, spec, admission_deadline=end,
+                                       on_start=dispatched)
+            if record is None:
+                return
+            if sequence+1 < user.requests:
+                await asyncio.sleep(min(settings.interval_seconds, max(0, end-time.monotonic())))
+
+    tasks = [asyncio.create_task(user_loop(user)) for user in settings.users]
+    try:
+        async with asyncio.timeout_at(end):
+            await asyncio.gather(*tasks)
+        observation["complete"] = all(observation["offered"][u.identity] == u.requests for u in settings.users)
+    except TimeoutError:
+        observation["stop_reason"] = "Policy traffic duration reached."
+    except BaseException:
+        observation["stop_reason"] = "Policy traffic interrupted."
+        raise
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        observation["end_ms"] = min((time.monotonic()-run.start)*1000, observation["end_ms"])
+        observation["stop_reason"] = observation["stop_reason"] or run.stop_reason(target.name)
+        if not observation["complete"]:
+            run.mark_unfinished(target.name, ["gateway_policy"])
+        run.finish_condition(target.name, "gateway_policy", reason=observation["stop_reason"])
+
+
+def summarize(settings, observation, records):
+    users = []
+    for user in settings.users:
+        own = [record for record in records if record.identity == user.identity]
+        completed = [record for record in own if record.status == "completed" and record.valid]
+        users.append({"identity": user.identity, "declared_rpm": user.rpm, "priority": user.priority,
+            "planned": user.requests, "dispatched": len(own), "completed": len(completed),
+            "admitted": sum(record.http_status is not None and 200 <= record.http_status < 300 for record in own),
+            "rejected": sum(record.http_status == 429 for record in own),
+            "other_failures": sum((record.status in {"failed", "timeout"} or record.status == "completed" and not record.valid) and record.http_status != 429 for record in own),
+            "cancelled": sum(record.status == "cancelled" for record in own),
+            "input_tokens": [record.input_tokens for record in completed],
+            "output_tokens": [record.output_tokens for record in completed],
+            "request_ids": [record.id for record in own],
+            "evidence": [{"request_id": record.id, "http_status": record.http_status,
+                          "policy": record.gateway_evidence.model_dump(mode="json") if record.gateway_evidence else None}
+                         for record in own]})
+    summary = {"version": VERSION, "settings": settings.model_dump(mode="json"), "users": users,
+        "start_ms": observation.get("start_ms"), "end_ms": observation.get("end_ms"),
+        "complete": observation.get("complete", False), "stop_reason": observation.get("stop_reason"),
+        "identities_distinct": observation.get("identities_distinct", False),
+        "qualification": "unverified", "status": "inconclusive", "reasons": [],
+        "peer_continuation": False, "overlap_observed": False, "comparable_actual_work": False,
+        "interpretation": "Observed admission under declared policy and window assumptions; no queue-order, latency-causality or production-wide guarantee."}
+
+    def outcome(qualification, reason, status="inconclusive"):
+        summary.update(qualification=qualification, status=status)
+        summary["reasons"].append(reason)
+        return summary
+
+    if not _supported(settings):
+        return outcome("unavailable", "Selected gateway capability is unsupported.")
+    if not records:
+        return outcome("unexercised", "No policy traffic was dispatched.")
+    affected = [record for record in records if record.identity == settings.affected_identity]
+    peers = [record for record in records if record.identity != settings.affected_identity]
+    successes = [record for record in records if record.status == "completed" and record.valid]
+    declared = next(user for user in settings.users if user.identity == settings.affected_identity)
+    rejection_kind = "key_rpm" if settings.capability == "key_rpm" else "priority_pool"
+    recognized = [record for record in affected if record.http_status == 429 and record.gateway_evidence
+                  and record.gateway_evidence.policy_rejection == rejection_kind
+                  and record.gateway_evidence.rate_limit_unit == "requests"]
+    for rejection in recognized:
+        summary["peer_continuation"] = all(any(record.identity == user.identity
+            and record.status == "completed" and record.valid
+            and record.dispatch_ms is not None and rejection.completed_ms is not None
+            and record.dispatch_ms > rejection.completed_ms and record.completed_ms is not None
+            and record.completed_ms <= observation.get("end_ms", 0)
+            for record in peers) for user in settings.users if user.identity != settings.affected_identity)
+        if summary["peer_continuation"]:
+            break
+    summary["overlap_observed"] = any(a.status == "completed" and a.valid and b.status == "completed" and b.valid
+        and a.dispatch_ms is not None and a.completed_ms is not None
+        and b.dispatch_ms is not None and b.completed_ms is not None
+        and max(a.dispatch_ms, b.dispatch_ms) < min(a.completed_ms, b.completed_ms)
+        for a in affected for b in peers)
+    inputs = [record.input_tokens for record in successes]
+    outputs = [record.output_tokens for record in successes]
+    summary["comparable_actual_work"] = bool(successes and all(row["completed"] for row in users)
+        and all(value is not None and value > 0 for value in inputs+outputs)
+        and len(set(inputs)) == 1 and max(outputs) <= 2*min(outputs))
+    if settings.window_state != "isolated_fresh" or not settings.gateway_version or not observation.get("isolated_run"):
+        return outcome("unverified", "Gateway version or isolated fresh policy window is unknown.")
+    if not observation.get("identities_distinct"):
+        return outcome("unverified", "Distinct authenticated test credentials could not be established locally.")
+    if not recognized:
+        if any(record.http_status == 429 for record in affected):
+            return outcome("unverified", "Rejection does not identify the declared gateway policy.")
+        return outcome("unexercised", "No attributed policy rejection was observed within offered work.")
+    if settings.capability == "priority_rpm":
+        if settings.saturation_cache_seconds != 0:
+            return outcome("unverified", "Cached saturation can differ between gateway nodes; this check requires zero cache delay.")
+        evidence = [record.gateway_evidence for record in recognized]
+        if any(item.model_rpm != settings.model_rpm or item.priority_matches is not True
+               or item.saturation_percent is None or item.saturation_percent < settings.saturation_threshold*100
+               for item in evidence):
+            return outcome("unverified", "Priority tier, model RPM or strict-mode evidence does not match the declaration.")
+        if not summary["overlap_observed"] or not summary["comparable_actual_work"]:
+            return outcome("unverified", "Comparable actual token work and overlapping requests are required for priority observations.")
+        if any(record.gateway_evidence is None or record.gateway_evidence.priority_matches is not True for record in successes):
+            return outcome("unverified", "Successful responses do not confirm each declared priority tier.")
+    elif any(record.gateway_evidence.request_limit != declared.rpm or record.gateway_evidence.request_remaining != 0 for record in recognized):
+        return outcome("unverified", "Gateway key limit differs from the declared RPM.")
+    admitted = sum(record.http_status is not None and 200 <= record.http_status < 300 for record in affected)
+    allowance = declared.rpm
+    if settings.capability == "priority_rpm":
+        # Before saturation idle capacity may be borrowed; integer crossing admits one request.
+        import math
+        allowance = max(allowance, math.ceil(settings.saturation_threshold*settings.model_rpm))
+    if admitted > allowance:
+        return outcome("observed_failure", "Admitted requests exceeded the declared RPM allowance in the isolated window.", "fail")
+    first_rejection = min((record.completed_ms for record in recognized if record.completed_ms is not None), default=None)
+    prior_admissions = sum(record.http_status is not None and 200 <= record.http_status < 300
+                           and record.completed_ms is not None and first_rejection is not None
+                           and record.completed_ms < first_rejection for record in affected)
+    if prior_admissions < declared.rpm:
+        return outcome("observed_failure", "Attributed rejection occurred before the declared RPM allowance was served.", "fail")
+    if not summary["complete"] or any(user["cancelled"] or user["other_failures"] for user in users):
+        return outcome("unverified", "Traffic was interrupted or non-policy failures left incomplete evidence.")
+    if not summary["peer_continuation"]:
+        return outcome("unexercised", "Peer service after policy rejection was not observed within the same window.")
+    if any(user["rejected"] for user in users if user["identity"] != settings.affected_identity):
+        return outcome("unverified", "Peer rejections prevent establishing continued service within declared limits.")
+    return outcome("observed", "Attributed policy rejection and continued peer service were observed.", "pass")
+
+
+def result(run, target):
+    observation = run.observations[target.name].get("gateway_policy", {})
+    records = [record for record in run.records if record.target == target.name and "gateway_policy" in record.check_ids]
+    summary = summarize(run.config.gateway_policy, observation, records)
+    return CheckResult(id="gateway_policy", title="Gateway quotas & priorities", target=target.name,
+        status=summary["status"], summary=" ".join(summary["reasons"]), metrics={"gateway_policy": summary},
+        evidence_ids=[record.id for record in records])

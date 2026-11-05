@@ -165,9 +165,9 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str) -> dict | No
         resolved = RunConfig.model_validate({**config, "max_requests": None, "max_duration_seconds": None})
     except ValidationError:
         return None
-    if revision in {"issue45", "issue95", "issue95_pauses", "issue95_pause_evidence", "persistent_users", "gateway_attribution", "gateway_access"}:
+    if revision in {"issue45", "issue95", "issue95_pauses", "issue95_pause_evidence", "persistent_users", "gateway_attribution", "gateway_policy", "gateway_access", "gateway_access_policy"}:
         unchanged_checks = {"sessions", "consistency"}
-        if revision in {"issue95_pause_evidence", "persistent_users", "gateway_attribution", "gateway_access"}:
+        if revision in {"issue95_pause_evidence", "persistent_users", "gateway_attribution", "gateway_policy", "gateway_access", "gateway_access_policy"}:
             # Optional user/gateway dispatch changed the shared file; these
             # specialist requests are unchanged at these exact revisions.
             unchanged_checks.add("prefix")
@@ -201,6 +201,8 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str) -> dict | No
             "persistent_users": "aee9ca71bc5ffd780d1574422b761e3177471a12f951a10b04322573ca062f76",
             "gateway_attribution": "e29f47df17e250a0fc0133ce3ead964ef97539f8066ac76c374308c9ee552c88",
             "gateway_access": "9c18e53a9181a3bcf7c4470365ecba67a2c3e4f7f2f5c15a0d444bd8d7d6f5ac",
+            "gateway_policy": "8630615d4b6321fe111f312cff35ad9b1c4864f15f19ed5bd7be9e4649291791",
+            "gateway_access_policy": "4a2232070b9effa22e7fa01ca91f015c035d4b26c1d74794fca33c4114fb548f",
         }[revision] if any(settings.values()) else None,
         "settings": settings,
     }
@@ -227,6 +229,8 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str) -> dict | No
             "persistent_users": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
             "gateway_attribution": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
             "gateway_access": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
+            "gateway_policy": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
+            "gateway_access_policy": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
         }[revision]
     if "tools" in resolved.checks:
         from .tool_checks import resolved_tool_fixtures, resolved_tool_modes
@@ -245,7 +249,7 @@ def _same_run_limits_workload(current: dict, old: dict) -> bool:
     if current.get("config", {}).get("config_version") != 2 or old.get("config", {}).get("config_version", 2) != 2:
         return False
     for manifest in (current, old):
-        revisions = ("phase2", "phase3", "review26", "caps26", "issue45", "issue95", "issue95_pauses", "issue95_pause_evidence", "persistent_users", "gateway_attribution", "gateway_access") if "config_version" in manifest.get("config", {}) else ("legacy",)
+        revisions = ("phase2", "phase3", "review26", "caps26", "issue45", "issue95", "issue95_pauses", "issue95_pause_evidence", "persistent_users", "gateway_attribution", "gateway_policy", "gateway_access", "gateway_access_policy") if "config_version" in manifest.get("config", {}) else ("legacy",)
         identities = [_run_limits_workload_identity(manifest, revision=revision) for revision in revisions]
         if not any(identity is not None and fixture_hash(identity) == manifest.get("fixture_pack", {}).get("workload_fixture_sha256")
                    for identity in identities):
@@ -1165,7 +1169,8 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                   "Rates use percentage points; timing and output rate use relative percent. "
                   "Output token rate is end-to-end server-reported output tokens / elapsed seconds. "
                   "Intervals describe within-run variation, not cross-run environmental stability. "
-                  "Per-user shared-window delivery compares observed common-window rates without a confidence interval.",
+                  "Per-user shared-window delivery compares observed common-window rates without a confidence interval. "
+                  "Gateway policy acceptance compares qualified observations under matching declarations without timing inference.",
     }
     for target in targets or [{"name": "unknown"}]:
         name = target["name"]
@@ -1177,6 +1182,9 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
         if (old_target is not None and "gateway_access" in config.get("checks", [])
                 and target.get("test_identities") != old_target.get("test_identities")):
             target_reasons.append("Gateway test identity references differ; access-policy cases are not comparable.")
+        if (old_target is not None and "gateway_policy" in config.get("checks", [])
+                and target.get("test_identities") != old_target.get("test_identities")):
+            target_reasons.append("Gateway policy identity references differ; runs are not comparable.")
         if (old_target is not None and "gateway_attribution" in report.manifest.get("config", {}).get("checks", [])
                 and any(target.get(key) != old_target.get(key) for key in ("test_identities", "gateway"))):
             target_reasons.append("Gateway identity references or evidence configuration differs; attribution runs are not comparable.")
@@ -1209,6 +1217,29 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                         "comparable": not target_reasons,
                         "interpretation": "Repeatability and task correctness are separate. Different answers alone do not prove regression."})
         rows = []
+        for current_check in report.checks:
+            if current_check.id != "gateway_policy" or current_check.target != name:
+                continue
+            current_policy = current_check.metrics.get("gateway_policy", {})
+            old_policy = next((check.metrics.get("gateway_policy", {}) for check in baseline.checks
+                               if check.id == "gateway_policy" and check.target == name), {})
+            compatible = (not target_reasons and current_policy.get("version") == old_policy.get("version")
+                          and current_policy.get("settings") == old_policy.get("settings")
+                          and old_policy.get("qualification") == "observed")
+            for user in current_policy.get("users", []):
+                previous = next((item for item in old_policy.get("users", []) if item["identity"] == user["identity"]), None)
+                status = current_check.status if compatible and previous else "inconclusive"
+                rows.append({"check": "gateway_policy", "scenario": user["identity"],
+                    "user_id": user["identity"], "metric": "policy_acceptance", "aggregation": "observed",
+                    "status": status, "current": current_policy.get("qualification"),
+                    "baseline": old_policy.get("qualification"),
+                    "current_samples": user["dispatched"], "baseline_samples": previous["dispatched"] if previous else 0,
+                    "current_outcomes": user, "baseline_outcomes": previous,
+                    "qualification": current_policy.get("qualification"), "threshold": 0,
+                    "worsening": 100 if status == "fail" else 0,
+                    "reason": "Matched declared policies and observed admission; no timing inference." if compatible else
+                              "Policy settings, summary version or qualified passing baseline do not match.",
+                    "evidence_ids": user["request_ids"]})
         user_rows, user_reasons = _compare_user_delivery(report, baseline, name, target_reasons, threshold)
         rows.extend(user_rows)
         # Optional observations and checks without inference/acceptance cohorts
@@ -1240,6 +1271,8 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
         current_groups, old_groups = _groups(report.requests, name), _groups(baseline.requests, name)
         if not target_reasons:
             for check, scenario in sorted(set(current_groups) | set(old_groups)):
+                if check == "gateway_policy":
+                    continue
                 if check in non_verdict_checks:
                     continue
                 current_records = current_groups.get((check, scenario), [])
@@ -1906,6 +1939,20 @@ def _multi_user_export(data: dict[str, Any]) -> dict[str, Any]:
     return sanitize(value, bounded=False)
 
 
+def _gateway_policy_html(data):
+    rows = "".join(f'<tr><td>{_e(user["identity"])}</td><td>{_e(user["priority"] or "—")}</td>'
+        f'<td>{user["declared_rpm"]}</td><td>{user["admitted"]}</td><td>{user["rejected"]}</td>'
+        f'<td>{user["completed"]} / {user["planned"]}</td>'
+        f'<td>{_e(user["input_tokens"])}</td><td>{_e(user["output_tokens"])}</td></tr>' for user in data["users"])
+    return (f'<h3>Gateway policy · {_e(data["qualification"])}</h3><p>{_e(data["interpretation"])}</p>'
+        '<div class="table"><table><tr><th>Identity</th><th>Priority tier</th><th>Declared RPM</th>'
+        '<th>Admitted</th><th>Rejected</th><th>Completed / offered cap</th><th>Actual input tokens</th>'
+        f'<th>Actual output tokens</th></tr>{rows}</table></div>'
+        f'<p>Peer continuation: {_e(data["peer_continuation"])} · Overlap observed: {_e(data["overlap_observed"])} · '
+        f'Comparable actual work: {_e(data["comparable_actual_work"])}</p>'
+        f'<details><summary>Declared policy and qualification</summary><pre>{_json(data)}</pre></details>')
+
+
 def _multi_user_html(data: dict[str, Any], anchors: dict[str, str]) -> str:
     parts = ['<h3>Per-user shared-window delivery</h3>']
     worst = data.get("worst_user")
@@ -2548,6 +2595,8 @@ def _render(report: RunReport) -> str:
             metrics = _multi_user_html(check.metrics["multi_user"], anchors) + metrics
         if check.id == "gateway_access" and check.metrics.get("gateway_access"):
             metrics = _gateway_access_html(check.metrics["gateway_access"]) + metrics
+        if check.id == "gateway_policy" and check.metrics.get("gateway_policy"):
+            metrics = _gateway_policy_html(check.metrics["gateway_policy"]) + metrics
         if check.id == "sessions" and check.metrics.get("conversation_performance"):
             metrics = _session_performance_html(check.metrics["conversation_performance"]) + metrics
         applied = ((report.manifest.get("effective_checks") or {}).get(check.id) or {}).get("limits") or {}
@@ -2901,6 +2950,9 @@ def reproduction_export(report: RunReport) -> dict:
                                    for check in retained.checks
                                    if check.id == "gateway_access" and check.metrics.get("gateway_access")}}
                if any(check.id == "gateway_access" and check.metrics.get("gateway_access") for check in retained.checks) else {}),
+            **({"gateway_policy": {check.target: check.metrics["gateway_policy"] for check in retained.checks
+                                   if check.id == "gateway_policy" and check.metrics.get("gateway_policy")}}
+               if any(check.id == "gateway_policy" for check in retained.checks) else {}),
             **({"gateway_attribution": {check.target: check.metrics for check in retained.checks
                                          if check.id == "gateway_attribution"}}
                if any(check.id == "gateway_attribution" for check in retained.checks) else {}),

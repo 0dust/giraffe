@@ -117,6 +117,8 @@ def _context_rejection(record):
 
 
 def _serving_failure(record, scenario):
+    if scenario == "gateway_policy" and record.http_status == 429:
+        return False
     if (scenario in {"sustained", "performance_evidence_probe", "gateway_access"} or scenario.startswith("traffic_stage_") or record.status == "cancelled"
             or _reasoning_budget(record)):
         return False
@@ -2703,6 +2705,10 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
         from giraffe import gateway_access
         workload_identity["gateway_access_source_sha256"] = hashlib.sha256(
             Path(gateway_access.__file__).read_bytes()).hexdigest()
+    if "gateway_policy" in config.checks:
+        from giraffe import gateway_policy, gateway_response
+        workload_identity["gateway_policy_source_sha256"] = hashlib.sha256(
+            Path(gateway_policy.__file__).read_bytes() + Path(gateway_response.__file__).read_bytes()).hexdigest()
     if "load" in config.checks:
         from giraffe import load_test, concurrent_load, traffic
         workload_identity["load_test_source_sha256"] = hashlib.sha256(b"".join(Path(m.__file__).read_bytes() for m in (load_test, concurrent_load, traffic))).hexdigest()

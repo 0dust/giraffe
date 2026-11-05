@@ -461,6 +461,10 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
                       "multi_user.duration_seconds", count=phases,
                       timeout=config.request_timeout_seconds)
                 continue
+            if name == "gateway_policy":
+                fixed(target.name, row, config.gateway_policy.duration_seconds,
+                      "gateway_policy.duration_seconds", count=1, timeout=0)
+                continue
             if name == "capacity":
                 settings = config.effective_traffic()
                 options = effective("capacity")
@@ -1106,6 +1110,13 @@ def request_plan(config: RunConfig | ConfigDraft, *,
             "One serial request per declared access case; missing identities and unsupported profiles send no traffic. "
             "Both allow and deny evidence are required for a complete policy observation.",
             source="declared LiteLLM access cases", kind="bounded")
+    if "gateway_policy" in selected:
+        settings = config.gateway_policy
+        add("gateway_policy", sum(user.requests for user in settings.users),
+            "Bounded requests per declared identity; stops at policy duration or shared run limits.",
+            source="fixed identical non-streaming policy probes", kind="bounded")
+        rows[-1].update(users=len(settings.users), simultaneous_limit=config.concurrency,
+                        configured_seconds=settings.duration_seconds)
     if "multi_user" in selected:
         settings = config.multi_user
         for level in settings.levels:

@@ -154,7 +154,7 @@ def test_source_bridge_requires_an_explicitly_attested_generator_revision(monkey
 def test_unchanged_text_generator_has_reviewed_identity_table_entry():
     configured = RunConfig(targets=[{"name": "local", "url": "http://localhost", "model": "test"}],
                            checks=["consistency"])
-    identity = _run_limits_workload_identity({"config": configured.model_dump(mode="json")}, revision="gateway_access")
+    identity = _run_limits_workload_identity({"config": configured.model_dump(mode="json")}, revision="gateway_access_policy")
     actual = {
         "generator_source_sha256": hashlib.sha256(Path(workloads.__file__).read_bytes()).hexdigest(),
     }
@@ -181,7 +181,7 @@ def test_presampling_generator_identity_retains_the_original_session_settings():
     assert _settings_reasons(current, old) == []
 
 
-@pytest.mark.parametrize("revision", ["legacy", "issue45", "issue95", "issue95_pauses", "issue95_pause_evidence"])
+@pytest.mark.parametrize("revision", ["legacy", "issue45", "issue95", "issue95_pauses", "issue95_pause_evidence", "gateway_policy"])
 def test_sampled_sessions_are_never_attested_as_unchanged_historical_traffic(revision):
     current, _, _, _ = reports()
     current.manifest["config"]["sessions"].update(
@@ -272,3 +272,13 @@ def test_prefix_bridge_requires_matching_saved_settings(change):
 def test_prefix_bridge_does_not_attest_earlier_unreviewed_prefix_revisions(revision):
     current, _, _ = prefix_reports()
     assert _run_limits_workload_identity(current.manifest, revision=revision) is None
+
+
+@pytest.mark.parametrize("check", ["gateway_policy", "gateway_attribution", "multi_user", "load"])
+def test_policy_dispatch_bridge_does_not_attest_new_or_changed_workloads(check):
+    from tests.test_gateway_policy import configuration
+
+    config = configuration().model_dump(mode="json")
+    config["checks"] = [check]
+    RunConfig.model_validate(config)
+    assert _run_limits_workload_identity({"config": config}, revision="gateway_policy") is None

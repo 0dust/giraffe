@@ -221,7 +221,7 @@ In the UI, open a completed run and choose **Save baseline** (fully passing runs
 
 ## Tests
 
-16 built-in checks. The four defaults are `access, serving, correctness, first_output`; select additional checks for your endpoint.
+The four defaults are `access, serving, correctness, first_output`; select additional checks for your endpoint.
 
 | Check · CLI ID | What it checks |
 | --- | --- |
@@ -239,6 +239,7 @@ In the UI, open a completed run and choose **Save baseline** (fully passing runs
 | Prefix cache · `prefix` | Reported cache reuse against independent controls |
 | Multi-turn sessions · `sessions` | Recall and timing across concurrent conversations |
 | Multi-user · `multi_user` | Persistent users sharing request slots, with individual delivery and timing outcomes |
+| Gateway quotas & priorities · `gateway_policy` | [Opt-in LiteLLM policy observations](docs/gateway-policy.md) with separate identities, bounded traffic and continued peer service |
 | Gateway usage attribution · `gateway_attribution` | Marked requests and final token counts matched to existing LiteLLM spend logs |
 | Gateway access policy · `gateway_access` | Declared allow/deny cases using existing test identity references |
 | Answer consistency · `consistency` | Answer agreement across repeated requests |
