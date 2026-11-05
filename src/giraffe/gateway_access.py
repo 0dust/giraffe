@@ -17,6 +17,8 @@ def configured_cases(config):
 def observation(record):
     if record is None:
         return "unverified", "not_run"
+    if record.status == "cancelled":
+        return "unverified", "request_cancelled"
     if record.status == "completed" and record.http_status == 200 and record.valid:
         return "allow", "valid_completion"
     evidence = record.gateway_evidence
@@ -30,6 +32,14 @@ def observation(record):
 def _row(case):
     return {**case.model_dump(), "observed": "unverified", "status": "inconclusive",
             "reason": "not_run", "http_status": None, "request_id": None}
+
+
+def _record_case(row, record):
+    observed, reason = observation(record)
+    row.update(observed=observed, reason=reason,
+               status="inconclusive" if observed == "unverified" else
+                      "pass" if observed == row["expected"] else "fail",
+               http_status=record.http_status, request_id=record.id)
 
 
 async def execute(run, target, client):
@@ -56,13 +66,7 @@ async def execute(run, target, client):
             max_tokens=settings.max_output_tokens,
             request_timeout_seconds=settings.request_timeout_seconds,
             workload={"case": case.name, "expected": case.expected})
-        record = await run.request(target, client, spec)
-        observed, reason = observation(record)
-        row.update(observed=observed, reason=reason,
-                   status="inconclusive" if observed == "unverified" else
-                          "pass" if observed == case.expected else "fail",
-                   http_status=record.http_status if record else None,
-                   request_id=record.id if record else None)
+        await run.request(target, client, spec, finalize_record=lambda record: _record_case(row, record))
 
 
 def result(run, target):
@@ -81,5 +85,6 @@ def result(run, target):
                "qualification": QUALIFICATION}
     return CheckResult(id="gateway_access", title="Gateway access policy", target=target.name,
                        status=status, summary=summary, metrics={"gateway_access": metrics},
-                       required=any(row["request_id"] for row in rows) or run.config.checks == ["gateway_access"],
+                       required=bool(settings and settings.profile == "litellm" and settings.cases)
+                                or any(row["request_id"] for row in rows) or run.config.checks == ["gateway_access"],
                        evidence_ids=[row["request_id"] for row in rows if row["request_id"]])
