@@ -393,6 +393,8 @@ async def run_arrival_window(run, target, client, settings, load_settings, calib
             matched_work_sha256=_matched_work_sha256(spec))
         return spec
 
+    lag_tolerance_ms = 100
+
     async def send(spec, annotate):
         offer = offers[spec.workload["offer_index"]]
         user = users[offer["user_id"]]
@@ -407,9 +409,13 @@ async def run_arrival_window(run, target, client, settings, load_settings, calib
             offer["request_id"] = record.id
             user["request_ids"].append(record.id)
 
+        scheduled = run.start + spec.workload["scheduled_ms"]/1000
+        window_end = scheduled-offer["offset_seconds"]+window["planned_duration_seconds"]
+        # The runner checks this again after condition setup. Exactly the
+        # tolerated lag remains eligible; only greater lag closes admission.
+        lag_deadline = math.nextafter(scheduled+lag_tolerance_ms/1000, math.inf)
         return await run.request(target, client, spec, slot_reserved=True, budget_reserved=True,
-                                 admission_deadline=run.start+spec.workload["scheduled_ms"]/1000
-                                     -offer["offset_seconds"]+window["planned_duration_seconds"],
+                                 admission_deadline=min(window_end, lag_deadline),
                                  on_start=started, finalize_record=finished)
 
     def stop():
@@ -421,7 +427,7 @@ async def run_arrival_window(run, target, client, settings, load_settings, calib
                   planned_end_ms=_relative(run)+window["planned_duration_seconds"]*1000, reason=None)
     evidence = await run_stage(traffic=TrafficConfig(duration_seconds=window["planned_duration_seconds"],
         rates=[window["requests_per_second"]], max_in_flight=required_concurrency(run.config)["by_check"]["multi_user"],
-        scheduler_lag_tolerance_ms=100, drain_timeout_seconds=None), rate_rps=window["requests_per_second"]*window["population"],
+        scheduler_lag_tolerance_ms=lag_tolerance_ms, drain_timeout_seconds=None), rate_rps=window["requests_per_second"]*window["population"],
         stage_index=0, fixtures={}, execute=send, reserve_offer=reserve, try_acquire=run.try_acquire_slot,
         release=run.release_slot, stop_reason=stop, deadline=run.deadline, limits=Limits(),
         schedule_override=[(o["offset_seconds"], o["profile"]) for o in offers], spec_factory=build,
