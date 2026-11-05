@@ -125,14 +125,11 @@ async def run_window(run, target, client, settings, load_settings, calibration, 
             if closed or time.monotonic() >= cutoff:
                 return None
             sequence += 1
-            ready = _relative(run)
-            user["ready_count"] += 1
-            user["pending_ready_ms"] = ready
             spec.check_ids = ["multi_user"]
             spec.load_point = None
             spec.workload.update(user_id=user["user_id"], population=window["population"],
                 profile=user["profile"], scenario=window["scenario"], phase=window["phase"],
-                window_id=scenario, request_sequence=sequence, ready_ms=ready,
+                window_id=scenario, request_sequence=sequence,
                 think_time_seconds=preceding_pause)
             if window.get("role"):
                 spec.workload.update(role=window["role"], matched_work_sequence=sequence,
@@ -164,6 +161,13 @@ async def run_window(run, target, client, settings, load_settings, calibration, 
             if settings.conversations:
                 spec.scenario = scenario
                 spec.workload["conversation_sequence"] = conversation_sequence
+            if closed or time.monotonic() >= cutoff:
+                return None
+            # Scenario coordination precedes eligibility for shared admission.
+            ready = _relative(run)
+            user["ready_count"] += 1
+            user["pending_ready_ms"] = ready
+            spec.workload["ready_ms"] = ready
             async with run.slot(False, cutoff) as admitted:
                 if not admitted or closed or time.monotonic() >= cutoff:
                     return None
