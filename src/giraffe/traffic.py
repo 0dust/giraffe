@@ -301,7 +301,7 @@ async def run_stage(
             if on_drop:
                 on_drop()
 
-    def annotate(kind: str, offset: float, lag_ms: float, record: RequestRecord):
+    def annotate(index: int, kind: str, offset: float, lag_ms: float, record: RequestRecord):
         record.traffic_stage = stage_index
         record.traffic_rate_rps = rate_rps
         record.traffic_class = kind
@@ -310,6 +310,7 @@ async def run_stage(
             clock_start = record.timing_start_ms if record.timing_start_ms is not None else record.dispatch_ms
             if clock_start is not None:
                 lag_ms = max(lag_ms, clock_start-record.scheduled_ms)
+        offer_lags_ms[index] = lag_ms
         record.dispatch_lag_ms = lag_ms
         record.arrival_first_output_ms = (lag_ms + record.first_output_ms
                                            if record.first_output_ms is not None else None)
@@ -343,9 +344,15 @@ async def run_stage(
             if missed_arrival(offset, ready):
                 drop(index, "dropped_late")
                 return
-            record = await execute(spec, lambda record: annotate(kind, offset, lag_ms, record))
+            record = await execute(spec, lambda record: annotate(index, kind, offset, lag_ms, record))
             if record is None:
-                drop(index, "not_offered")
+                refused = time.monotonic()
+                offer_lags_ms[index] = max(0.0, (refused-started_at-offset)*1000)
+                # A final admission check may reject setup that crossed the lag
+                # limit. Earlier window expiry or an explicit stop stays unissued.
+                late = (started_at+offset+traffic.scheduler_lag_tolerance_ms/1000 < min(stage_end, deadline)
+                        and interruption() is None and missed_arrival(offset, refused))
+                drop(index, "dropped_late" if late else "not_offered")
                 return
             records.append((index, record))
         except asyncio.CancelledError as exc:
