@@ -283,8 +283,19 @@ def _same_run_limits_workload(current: dict, old: dict) -> bool:
 
 
 def _same_load_workload(current: dict, old: dict) -> bool:
-    """Attest the optional nonce argument only for unchanged ordinary Load runs."""
+    """Attest unchanged Load dispatch within exact source-equivalence groups."""
+    # Keep the historical nonce-only change separate from current admission
+    # semantics. Optional gateway dispatch changes the generator file, not Load.
+    revisions = (
+        (("d9a9e921584262148e06b636f0e8f195b7e530fd2a69c5e98f013359cf947ede",),
+         ("9b694c97a39d449d8ea15b09a9aeb406bf835179c0882827685c4d7888687d36",
+          "df3b7bbf30cab87d2e8c1c6dab8819f9cfe592b181407caa7c32af4c5f720cd4")),
+        (("d9a9e921584262148e06b636f0e8f195b7e530fd2a69c5e98f013359cf947ede",
+          "bcdc3b8411d9039e90a35bcd5b109504e7123e95ec6baebd5e654287b4774605"),
+         ("113325dd5cffa04626cc7be7ee93bc6e9be67335531288bc329b3542a155c92a",)),
+    )
     settings = []
+    matched_groups = []
     for manifest in (current, old):
         raw = manifest.get("config", {})
         if raw.get("config_version") != 2 or set(raw.get("checks", [])) != {"load"} or "load_test" not in raw:
@@ -293,15 +304,17 @@ def _same_load_workload(current: dict, old: dict) -> bool:
             resolved = RunConfig.model_validate(raw).load_test.model_dump(mode="json")
         except ValidationError:
             return False
-        identity = {"generator_source_sha256": "d9a9e921584262148e06b636f0e8f195b7e530fd2a69c5e98f013359cf947ede",
-                    "settings": {"load_test": resolved}}
-        if not any(fixture_hash({**identity, "load_test_source_sha256": source}) ==
-                   manifest.get("fixture_pack", {}).get("workload_fixture_sha256") for source in (
-                       "9b694c97a39d449d8ea15b09a9aeb406bf835179c0882827685c4d7888687d36",
-                       "df3b7bbf30cab87d2e8c1c6dab8819f9cfe592b181407caa7c32af4c5f720cd4")):
+        groups = {index for index, (generators, sources) in enumerate(revisions)
+                  if any(fixture_hash({"generator_source_sha256": generator,
+                                       "settings": {"load_test": resolved},
+                                       "load_test_source_sha256": source}) ==
+                         manifest.get("fixture_pack", {}).get("workload_fixture_sha256")
+                         for generator in generators for source in sources)}
+        if not groups:
             return False
         settings.append(resolved)
-    return settings[0] == settings[1]
+        matched_groups.append(groups)
+    return settings[0] == settings[1] and bool(matched_groups[0] & matched_groups[1])
 
 
 def _limits_reached(report: RunReport) -> set[str]:

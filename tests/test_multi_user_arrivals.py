@@ -288,3 +288,72 @@ def test_invalid_user_or_out_of_window_schedule_rejected(changes):
     from pydantic import ValidationError
     with pytest.raises(ValidationError):
         settings(levels=[2], scenarios=["arrivals"], duration_seconds=.2, arrivals=changes)
+
+
+@pytest.mark.parametrize("delay,duration,stop,expected", [
+    (.01, .5, None, "dispatched"), (.1, .5, None, "dispatched"),
+    (.2, .5, None, "dropped_late"), (.6, .5, None, "dropped_late"),
+    (.06, .05, None, "unissued"), (.2, .05, None, "unissued"),
+    (.2, .5, "deadline", "unissued"),
+])
+def test_final_admission_rechecks_condition_setup_delay(monkeypatch, delay, duration, stop, expected):
+    async def run():
+        cfg = settings(levels=[1], scenarios=["arrivals"], duration_seconds=duration,
+                       profile=PROFILE, arrivals={"requests_per_second": 1})
+        state = runner._Run(cfg, None, None)
+        if stop == "deadline":
+            state.deadline = state.start + .15
+        condition = state._condition
+        calls = []
+
+        class SpyClient(FakeClient):
+            async def execute(self, spec, **kwargs):
+                calls.append(spec.workload["offer_index"])
+                return await super().execute(spec, **kwargs)
+
+        def delayed(*args, **kwargs):
+            value = condition(*args, **kwargs)
+            if kwargs.get("request_parameters") is not None:
+                asyncio.get_running_loop().now += delay
+            return value
+
+        monkeypatch.setattr(state, "_condition", delayed)
+        await execute(state, cfg.targets[0], SpyClient(cfg.targets[0], cfg))
+        await asyncio.sleep(0)  # Run the scheduler's queued slot-release callback.
+        window, = state.observations["service"]["multi_user"]["windows"]
+        offer, = window["offers"]
+        assert offer["outcome"] == expected
+        assert offer["scheduler_lag_ms"] == pytest.approx(delay*1000)
+        assert len(calls) == len(state.records) == state.attempted == int(expected == "dispatched")
+        assert window["offer_accounting"][expected] == 1
+        assert state.slots.qsize() == state.max_connections
+    run_virtual(monkeypatch, run())
+
+
+def test_final_admission_stall_discards_backlog_without_catchup(monkeypatch):
+    async def run():
+        cfg = settings(levels=[1], scenarios=["arrivals"], duration_seconds=.5,
+                       profile=PROFILE, arrivals={"requests_per_second": 20})
+        state = runner._Run(cfg, None, None)
+        condition = state._condition
+        stalled = False
+
+        def delayed(*args, **kwargs):
+            nonlocal stalled
+            value = condition(*args, **kwargs)
+            if kwargs.get("request_parameters") is not None and not stalled:
+                stalled = True
+                asyncio.get_running_loop().now += .2
+            return value
+
+        monkeypatch.setattr(state, "_condition", delayed)
+        await execute(state, cfg.targets[0], FakeClient(cfg.targets[0], cfg))
+        window, = state.observations["service"]["multi_user"]["windows"]
+        assert window["offer_accounting"] == {"planned": 10, "offered": 10, "dispatched": 5,
+            "dropped_local": 0, "dropped_late": 5, "unissued": 0, "not_offered": 0}
+        assert all(offer["outcome"] == "dropped_late" for offer in window["offers"][:5])
+        assert all(record.dispatch_ms > 200 for record in state.records)
+        assert window["offers"][0]["scheduler_lag_ms"] == pytest.approx(200)
+        assert window["scheduler_stalls"] == [
+            {"start_ms": 0, "end_ms": 200}, {"start_ms": 50, "end_ms": 200}]
+    run_virtual(monkeypatch, run())

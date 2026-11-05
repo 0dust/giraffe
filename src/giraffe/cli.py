@@ -889,7 +889,10 @@ def _main(argv: list[str] | None = None) -> int:
             if json_output:
                 emit("blocked", 3, message=str(error))
             return 3
-        if args.command == "run" and not args.skip_preflight:
+        # Explicit identity probes must not spend or require shared credentials
+        # before measuring their own gateway policy and attribution evidence.
+        gateway_only = bool(config.checks) and all(check.startswith("gateway_") for check in config.checks)
+        if args.command == "run" and not args.skip_preflight and not gateway_only:
             from giraffe.deployment import preparation_residency
             config._preparation_residency = asyncio.run(preparation_residency(config))
             async def preflight():
