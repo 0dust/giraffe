@@ -30,7 +30,8 @@ def population_plan(settings):
     values = settings.think_time_seconds.values
     weights = settings.think_time_seconds.weights
     variable = len({value for index, value in enumerate(values) if weights is None or weights[index]}) > 1
-    tasks = settings.conversations.workloads if settings.conversations else []
+    tasks = (settings.conversations.workloads
+             if settings.conversations and settings.conversations.profile == "performance" else [])
     task_weights = [task.weight for task in tasks]
     for index in range(max(settings.levels)):
         user_id = f"user-{index + 1:02d}"
@@ -214,11 +215,15 @@ async def run_window(run, target, client, settings, load_settings, calibration, 
                 seed = conversation.sampling.seed if conversation.sampling else settings.seed
                 plan = {"workload": workload, "turns": conversation_turns(conversation, workload,
                     f"{seed}:{user['user_id']}:{conversation_sequence}:{mode}")}
-                item = await execute_conversation(run, target, client, run.config, conversation, mode,
-                    (conversation_sequence - 1) * 32 + int(user["user_id"].split("-")[1]),
-                    items=user.setdefault("conversations", []), prepared_inputs=prepared_inputs or {},
-                    plan=plan, session_id=f"{target.name}:{scenario}:{user['user_id']}:{conversation_sequence}:{mode}",
-                    check="multi_user", send=send, pause=pause)
+                try:
+                    item = await execute_conversation(run, target, client, run.config, conversation, mode,
+                        (conversation_sequence - 1) * 32 + int(user["user_id"].split("-")[1]),
+                        items=user.setdefault("conversations", []), prepared_inputs=prepared_inputs or {},
+                        plan=plan, session_id=f"{target.name}:{scenario}:{user['user_id']}:{conversation_sequence}:{mode}",
+                        check="multi_user", send=send, pause=pause)
+                except asyncio.CancelledError:
+                    user["conversations"][-1]["stop_reason"] = "conversation interrupted"
+                    raise
                 if not item["turns"]:
                     user["stop_reason"] = item["stop_reason"]
                     break
@@ -566,9 +571,18 @@ async def execute(run, target, client):
             conversation = settings.conversations
             distribution = conversation.sampling.input_tokens if conversation.sampling else None
             if distribution:
-                for task in conversation.workloads:
-                    for prompt in task.turns:
-                        for tokens in distribution.values:
+                tokens_to_prepare = [value for index, value in enumerate(distribution.values)
+                                     if distribution.weights is None or distribution.weights[index] > 0]
+                turn_counts = conversation.sampling.turn_count
+                max_turns = max(value for index, value in enumerate(turn_counts.values)
+                    if turn_counts.weights is None or turn_counts.weights[index] > 0) if turn_counts else None
+                assigned_tasks = sorted({user["conversation_workload"] for window in windows for user in window["users"]})
+                for index in assigned_tasks:
+                    task = conversation.workloads[index]
+                    for prompt in task.turns[:int(max_turns) if max_turns is not None else None]:
+                        for tokens in tokens_to_prepare:
+                            if not run.allowed(target.name):
+                                break
                             key = prompt, tokens
                             if key not in prepared_inputs:
                                 prepared_inputs[key] = await prepare_session_input(run, target, prompt, tokens)

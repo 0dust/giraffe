@@ -22,11 +22,13 @@ def _status(statuses: list[str], *, measured: bool = False) -> str:
 
 
 def _valid(record: RequestRecord) -> bool:
-    return record.status == "completed" and record.valid and record.score is not False
+    return record.status == "completed" and not _error(record)
 
 
 def _error(record: RequestRecord) -> bool:
-    return record.status in {"failed", "timeout"} or record.status == "completed" and (not record.valid or record.score is False)
+    return record.status in {"failed", "timeout"} or record.status == "completed" and (
+        not record.valid or record.score is False
+        or bool(record.workload.get("session_id")) and record.finish_reason == "length")
 
 
 def _tokens(records: list[RequestRecord]) -> tuple[int, int]:
@@ -187,7 +189,7 @@ def _user_summary(user: dict[str, Any], window: dict[str, Any], records: list[Re
             "outcomes": {"attempted": len(rows)+missing_terminal, "completed": len(completed),
                          "valid_completed": len(valid), "errors": len(errors),
                          "failed": sum(r.status == "failed" for r in attempts),
-                         "invalid": sum(r.status == "completed" and (not r.valid or r.score is False) for r in attempts),
+                         "invalid": sum(r.status == "completed" and _error(r) for r in attempts),
                          "timeouts": sum(r.status == "timeout" for r in attempts),
                          "cancelled": len(cancelled),
                          "intentional_cancelled": sum(r.status == "cancelled" for r in intentional),
@@ -390,7 +392,8 @@ def _cancellation(window, records, criteria, health, lag, timing_threshold, dela
     followup = observation(sum(_valid(r) for r in followups) >= criteria.min_samples,
                            [r.id for r in followups], "Same-user follow-up is missing, failed or insufficiently sampled.",
                            failed=any(_error(r) for r in followups))
-    return {"status": _status([cancellation["status"], peers["status"], followup["status"]]),
+    coverage = "inconclusive" if window.get("cut_short") or window.get("drain_reason") else "pass"
+    return {"status": _status([cancellation["status"], peers["status"], followup["status"], coverage]),
             "selected_user_id": window["selected_user_id"], "cancellation": cancellation,
             "peer_continuation": peers, "followup": followup, "backend_release": "unverified"}
 
@@ -434,7 +437,7 @@ def _interference(observation, window, control, user_records, criteria, health, 
                     or baseline.workload.get("think_time_seconds") != probe.workload.get("think_time_seconds")):
                 notes.append("Matched logical work or pause plan differs.")
                 continue
-            if any(r.completed_ms is None or r.completed_ms > phase.get("end_ms", -1)
+            if any(r.completed_ms is None or phase.get("end_ms") is None or r.completed_ms > phase["end_ms"]
                    for r, phase in ((baseline, control), (probe, window))):
                 continue
             matches = []
@@ -492,9 +495,11 @@ def _interference(observation, window, control, user_records, criteria, health, 
             if a is None or b is None or max(a, b) > min(a, b)*(1+tolerance):
                 notes.append("Actual short-user token lengths are not comparable.")
         control_user = next((u for u in (control or {}).get("users", []) if u["user_id"] == uid), {})
-        exposure = [max(0, phase.get("end_ms", 0)-max(phase.get("start_ms", 0), u.get("activated_ms") or 0))
-                    for phase, u in ((control or {}, control_user), (window, user))]
-        if not min(exposure) or max(exposure) > min(exposure)*(1+tolerance):
+        bounds = [(phase.get("start_ms"), phase.get("end_ms"), u.get("activated_ms"))
+                  for phase, u in ((control or {}, control_user), (window, user))]
+        exposure = [max(0, end-max(start, activated)) if all(value is not None for value in (start, end, activated)) else None
+                    for start, end, activated in bounds]
+        if any(value is None or value <= 0 for value in exposure) or max(exposure) > min(exposure)*(1+tolerance):
             notes.append("Short-user active exposure is not comparable.")
         control_completion = median([user_latency(r, False) for r in before])
         probe_completion = median([user_latency(r, False) for r in after])
