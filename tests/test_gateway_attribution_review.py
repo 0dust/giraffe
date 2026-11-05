@@ -225,3 +225,21 @@ async def test_runner_fallback_records_keep_selected_identity_and_health_isolati
     assert record.identity == "alice" and run.attempted == 1 and len(run.records) == 1
     assert run.errors == 0 and run.allowed("proxy")
     assert not run.endpoint_health["proxy"]["abort_reason"]
+
+
+@pytest.mark.usefixtures("local_tokenizer")
+async def test_mixed_full_run_keeps_shared_checks_passing_with_expired_identity(monkeypatch):
+    from giraffe.runner import run_suite
+    async def observer(request, rows):
+        return httpx.Response(200, json={"data": rows, "total_pages": 1})
+    cfg, _, _ = setup(monkeypatch, observer, rejected="expired")
+    cfg.checks = ["access", "serving", "gateway_attribution"]
+    cfg.stop_after_errors = 1
+    cfg.limits.min_samples = 2
+    cfg.targets[0].api_key_env = "SHARED"
+    report = await run_suite(cfg)
+    checks = {check.id: check for check in report.checks}
+    assert checks["access"].status == checks["serving"].status == "pass"
+    assert checks["gateway_attribution"].status == "inconclusive"
+    assert len([record for record in report.requests if record.identity is not None]) == 2
+    assert all(record.http_status == 200 for record in report.requests if record.identity is None)
