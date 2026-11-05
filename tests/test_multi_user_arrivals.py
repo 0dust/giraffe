@@ -19,6 +19,17 @@ def arrival_settings(**changes):
                   "bursts": [{"user_id": "user-01", "at_seconds": .05, "requests": 3}]}, **changes)
 
 
+def test_preview_counts_offers_without_materializing_request_ledger(monkeypatch):
+    from giraffe import multi_user
+    from giraffe.planning import request_plan
+
+    def unexpected(*args):
+        pytest.fail("Setup preview must not allocate the execution offer ledger")
+    monkeypatch.setattr(multi_user, "_offer_plan", unexpected)
+    row = next(row for row in request_plan(arrival_settings())["rows"] if row["id"] == "multi_user_2")
+    assert row["scheduled_offers"] == 9
+
+
 @pytest.mark.parametrize("budget", [None, 3])
 def test_user_offers_reconcile_busy_slots_and_budget(monkeypatch, budget):
     async def run():
@@ -65,6 +76,8 @@ def test_http_single_user_burst_overlaps_under_global_cap():
                    ("dispatched", "dropped_local", "dropped_late", "unissued", "not_offered")) == 4
         assert {r.workload["user_id"] for r in state.records} == {"user-01"}
         assert len({r.workload["request_sequence"] for r in state.records}) == len(state.records)
+        assert all(r.workload["ready_ms"] == r.workload["scheduled_ms"] for r in state.records)
+        assert all(r.workload["ready_ms"] >= window["start_ms"] for r in state.records)
         assert any(a.dispatch_ms < b.dispatch_ms < a.completed_ms for a in state.records for b in state.records)
     with FakeEndpoint(first_token_delay=.05, chunk_delay=.03) as endpoint:
         asyncio.run(run(endpoint))
