@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio.selector_events
 import copy
 import hashlib
+import io
 import json
+from pathlib import Path
 import socket
 import sys
 import time
@@ -106,6 +108,100 @@ async def test_observer_tracks_request_through_identity_scope_wrapper(monkeypatc
         row["kind"] for row in rows}
     assert {row["metadata"]["record_id"] for row in rows} == {record.id}
     assert all(row["lower_ns"] <= row["upper_ns"] for row in rows)
+
+
+async def test_observer_rejects_selected_identity_before_transport(monkeypatch, tmp_path):
+    from giraffe.models import RunConfig, Target
+    from tests.test_client import spec
+
+    secret = "observer-identity-echo-secret"
+    monkeypatch.setenv("OBSERVER_TEST_IDENTITY", secret)
+    sent = []
+
+    def handler(request):
+        sent.append(request)
+        content = secret if request.headers.get("authorization") else "42"
+        return httpx.Response(200, text='data: ' + json.dumps({
+            "id": content, "choices": [{"delta": {"content": content}, "finish_reason": "stop"}]})
+            + '\n\ndata: [DONE]\n\n')
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: original(
+        transport=httpx.MockTransport(handler), **kwargs))
+    target = Target(name="local", url="http://synthetic/v1", model="test",
+                    test_identities={"alice": {"api_key_env": "OBSERVER_TEST_IDENTITY"}})
+    log = TimingLog(tmp_path / "events.jsonl", tmp_path / "health.json", {})
+    observer = Observer(product_client, log)
+    async with product_client.LLMClient(target, RunConfig(targets=[target])) as client:
+        try:
+            observer.install()
+            with pytest.raises(RuntimeError, match="does not support test identities"):
+                await client.execute(spec(identity="alice"))
+            assert not sent
+            from giraffe.identities import identity_request
+            assert not identity_request.get()
+            ordinary = await client.execute(spec())
+        finally:
+            observer.uninstall()
+    health = log.close({})
+    assert len(sent) == 1 and ordinary.valid and ordinary.output == "42"
+    assert not health["complete"]
+    assert health["unsupported_identity_requests"] == 1 and not health["callback_errors"]
+    rows = read_rows(log.events)
+    assert {"client_timer_start", "client_timer_end", "client_semantic_ready"} <= {row["kind"] for row in rows}
+    assert {row["metadata"]["record_id"] for row in rows} == {ordinary.id}
+    assert secret not in log.events.read_text() + log.health.read_text()
+
+
+@pytest.mark.parametrize("mode", ["identities", "evidence", "selection"])
+def test_observer_cli_rejects_gateway_config_before_capture(monkeypatch, tmp_path, mode):
+    from validation_suite import timing_observer
+
+    target = {"name": "local", "url": "http://synthetic/v1", "model": "test"}
+    values = {"targets": [target], "checks": ["access"]}
+    if mode == "identities":
+        target["test_identities"] = {"alice": {"api_key_env": "OBSERVER_TEST_IDENTITY"}}
+    elif mode == "evidence":
+        target["gateway"] = {"url": "http://synthetic/logs", "api_key_env": "OBSERVER_ADMIN"}
+    else:
+        values["checks"] = ["gateway_attribution"]
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(values))
+    events, health = tmp_path / "events.jsonl", tmp_path / "health.json"
+    monkeypatch.setattr(sys, "argv", ["timing-observer", "--baseline", str(Path(product_client.__file__).parents[2]),
+        "--events", str(events), "--health", str(health), "--", "run", "--config", str(path)])
+    monkeypatch.setattr(timing_observer.runpy, "run_module", lambda *a, **k: pytest.fail("Unsupported CLI reached execution"))
+    with pytest.raises(RuntimeError, match="does not support test identities"):
+        timing_observer.main()
+    assert not events.exists() and not health.exists()
+
+
+@pytest.mark.parametrize("stdin", [False, True])
+def test_observer_cli_preserves_ordinary_stream_capture(monkeypatch, tmp_path, stdin):
+    from validation_suite import timing_observer
+
+    values = {"targets": [{"name": "local", "url": "http://synthetic/v1", "model": "test"}],
+              "checks": ["access"], "max_memory_mb": 0}
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(values))
+    if stdin:
+        monkeypatch.setattr(sys, "stdin", io.StringIO(path.read_text()))
+    original = httpx.AsyncClient
+    def handler(request):
+        if request.method != "POST":
+            return httpx.Response(404)
+        return httpx.Response(200, text='data: {"choices":[{"delta":{"content":"42"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: original(
+        transport=httpx.MockTransport(handler), **kwargs))
+    events, health = tmp_path / "events.jsonl", tmp_path / "health.json"
+    monkeypatch.setattr(sys, "argv", ["timing-observer", "--baseline", str(Path(product_client.__file__).parents[2]),
+        "--events", str(events), "--health", str(health), "--", "run", "--config", "-" if stdin else str(path),
+        "--skip-preflight", "--output", str(tmp_path / "run"), "--output-format", "json"])
+    with pytest.raises(SystemExit) as stopped:
+        timing_observer.main()
+    assert stopped.value.code == 0
+    assert json.loads(health.read_text())["complete"]
+    assert "client_semantic_ready" in {row["kind"] for row in read_rows(events)}
 
 
 @pytest.mark.parametrize("mode", ["bundled", "fragmented_utf8", "reasoning", "error"])

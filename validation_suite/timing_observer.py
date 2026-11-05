@@ -2,6 +2,8 @@
 
 This is an explicitly instrumented diagnostic. Socket recv return, HTTP body
 yield and semantic parse are distinct boundaries; none is packet arrival.
+Gateway identity probes are unsupported: this diagnostic retains raw response
+evidence. Its CLI rejects configured gateway observations before capture.
 """
 
 from __future__ import annotations
@@ -12,6 +14,7 @@ import base64
 import hashlib
 import http.client
 import importlib
+import io
 import json
 import math
 import os
@@ -115,7 +118,8 @@ class TimingLog:
                       "queue_high_water_rows": 0, "queue_bound_rows": queue_rows,
                       "queue_bound_bytes": queue_bytes, "callback_count": 0,
                       "callback_work_ns": 0, "callback_max_work_ns": 0,
-                      "state_overflow_count": 0, "state_unresolved_at_uninstall": 0}
+                      "state_overflow_count": 0, "state_unresolved_at_uninstall": 0,
+                      "unsupported_identity_requests": 0}
         self.thread = threading.Thread(target=self._write, daemon=True, name="timing-observer-writer")
         self.thread.start()
 
@@ -176,7 +180,8 @@ class TimingLog:
         self.thread.join(timeout=5)
         complete = (not self.thread.is_alive() and self.stats["attempted"] == self.stats["written"]
                     and not any(self.stats[key] for key in ["overflow_count", "write_errors", "callback_errors",
-                                                           "state_overflow_count", "state_unresolved_at_uninstall"]))
+                                                           "state_overflow_count", "state_unresolved_at_uninstall",
+                                                           "unsupported_identity_requests"]))
         digest = hashlib.sha256()
         if self.events.exists():
             with self.events.open("rb") as stream:
@@ -346,6 +351,11 @@ class Observer:
         site = self.sites.get((code, line))
         if site is None:
             return sys.monitoring.DISABLE
+        # Reject unsupported direct API use before any request can be sent.
+        # This deliberate refusal must escape the callback-error handlers.
+        if site == "request_clock_before" and getattr(self._frame(code).f_locals.get("spec"), "identity", None) is not None:
+            self.log.stats["unsupported_identity_requests"] += 1
+            raise RuntimeError("Timing observation does not support test identities.")
         if site.endswith("_before"):
             key = None
             try:
@@ -777,6 +787,28 @@ def main() -> None:
     source = Path(client.__file__).resolve()
     if not source.is_relative_to(baseline / "src"):
         raise RuntimeError("Observed product import escaped the pinned baseline")
+    cli_argv = args.cli[1:] if args.cli[:1] == ["--"] else args.cli
+    cli = importlib.import_module("giraffe.cli")
+    cli_args = cli.parser().parse_args(cli_argv)
+    config_path = getattr(cli_args, "config", None)
+    stdin_config = None
+    if config_path == Path("-"):
+        stdin_config = sys.stdin.read()
+        values = cli.yaml.safe_load(stdin_config)
+        if not isinstance(values, dict):
+            raise ValueError("Configuration must be a YAML/JSON object")
+    else:
+        values = cli.load_configuration(config_path) if config_path else {}
+    if getattr(cli_args, "manifest", None):
+        values = cli.load_report(cli_args.manifest).manifest.get("config", {})
+    selected = getattr(cli_args, "checks", None) or values.get("checks", [])
+    if isinstance(selected, str):
+        selected = selected.split(",")
+    if (any(str(check).strip().startswith("gateway_") for check in selected)
+            or any(values.get(key) is not None for key in values if key.startswith("gateway_"))
+            or any(target.get("test_identities") or target.get("gateway")
+                   for target in values.get("targets", []) if isinstance(target, dict))):
+        raise RuntimeError("Timing observation does not support test identities or gateway evidence.")
     before = hashlib.sha256(source.read_bytes()).hexdigest()
     context = json.loads(args.context.read_text()) if args.context else {}
     log = TimingLog(args.events, args.health, context)
@@ -785,15 +817,19 @@ def main() -> None:
                   "observer_source_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                   "clock_calibration_before": clock_calibration(),
                   "entrypoint": "runpy.run_module('giraffe.cli',run_name='__main__')",
-                  "cli_argv": args.cli[1:] if args.cli[:1] == ["--"] else args.cli}
+                  "cli_argv": cli_argv}
     if args.reference_url:
         provenance["endpoint_clock_probe_before"] = endpoint_clock_probe(
             args.reference_url, expected_pid=args.reference_pid)
     sys.argv = ["giraffe", *provenance["cli_argv"]]
+    original_stdin = sys.stdin
     try:
+        if stdin_config is not None:
+            sys.stdin = io.StringIO(stdin_config)
         observer.install()
         runpy.run_module("giraffe.cli", run_name="__main__")
     finally:
+        sys.stdin = original_stdin
         observer.uninstall()
         provenance["clock_calibration_after"] = clock_calibration()
         if args.reference_url:
