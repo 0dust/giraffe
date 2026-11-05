@@ -1866,6 +1866,15 @@ def _traffic_table(check: CheckResult) -> str:
     return "".join(parts)
 
 
+def _gateway_access_html(data: dict[str, Any]) -> str:
+    rows = ''.join('<tr>' + ''.join(f'<td>{_e(row.get(key) if row.get(key) is not None else "—")}</td>'
+                   for key in ("name", "identity", "expected", "observed", "http_status", "status", "reason"))
+                   + '</tr>' for row in data.get("cases", []))
+    return ('<h3>Declared access cases</h3><div class="table-wrap"><table><thead><tr>'
+            '<th>Case</th><th>Identity</th><th>Expected</th><th>Observed</th><th>HTTP</th><th>Outcome</th><th>Evidence</th>'
+            '</tr></thead><tbody>' + rows + '</tbody></table></div><p>' + _e(data.get("qualification", "")) + '</p>')
+
+
 def _multi_user_export(data: dict[str, Any]) -> dict[str, Any]:
     """Export user plans and compact outcomes, never prompts or response bodies."""
     user_fields = ("user_id", "profile", "status", "reasons", "activated_ms", "ready_count",
@@ -2525,6 +2534,8 @@ def _render(report: RunReport) -> str:
             metrics = _concurrent_load_html(check.metrics) + metrics
         if check.id == "multi_user" and check.metrics.get("multi_user"):
             metrics = _multi_user_html(check.metrics["multi_user"], anchors) + metrics
+        if check.id == "gateway_access" and check.metrics.get("gateway_access"):
+            metrics = _gateway_access_html(check.metrics["gateway_access"]) + metrics
         if check.id == "sessions" and check.metrics.get("conversation_performance"):
             metrics = _session_performance_html(check.metrics["conversation_performance"]) + metrics
         applied = ((report.manifest.get("effective_checks") or {}).get(check.id) or {}).get("limits") or {}

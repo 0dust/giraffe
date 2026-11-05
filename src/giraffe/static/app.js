@@ -1,4 +1,4 @@
-import {positiveBoundErrors, inferSetupPreset, configureLoadTest, loadTestIssues, loadTestSettings, loadFieldName, convertExpectedAnswer, datasetCaseFromValues, changeDatasetScorer, configureJudging, configureSessions, configureMultiUser, multiUserSettings, configureProfiles, parseLogprobSettings, parseToolFixtures, effectiveProfileDefaults, configureTests, configureRunLimits, limitValue, optionDefault, optionValue, sameConfig} from './form-config.mjs?v=20261028-results-merge-ci';
+import {configureGatewayAccess, positiveBoundErrors, inferSetupPreset, configureLoadTest, loadTestIssues, loadTestSettings, loadFieldName, convertExpectedAnswer, datasetCaseFromValues, changeDatasetScorer, configureJudging, configureSessions, configureMultiUser, multiUserSettings, configureProfiles, parseLogprobSettings, parseToolFixtures, effectiveProfileDefaults, configureTests, configureRunLimits, limitValue, optionDefault, optionValue, sameConfig} from './form-config.mjs?v=20261028-results-merge-ci';
 
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
@@ -1119,6 +1119,7 @@ function infoHelp(name,label,help,details='') {
   return `<button type="button" class="field-info" id="${escape(id)}-info" popovertarget="${escape(id)}-help" aria-label="About ${escape(label)}" aria-describedby="${escape(id)}-help-text"><span aria-hidden="true">i</span></button><div id="${escape(id)}-help" class="field-help" popover="auto" data-help-for="${escape(id)}-info" role="note"><strong>${escape(label)}</strong><p id="${escape(id)}-help-text">${escape(help)}</p>${details}</div>`;
 }
 function settingDestination(path) {
+  if(path.startsWith('gateway_access.'))return {step:'checks',check:'gateway_access',name:'gateway_access_'+(path.startsWith('gateway_access.cases')?'cases':path.slice(15)),label:'Gateway access policy'};
   const parts=String(path).split('.'),root=parts[0];
   if(parts[1]==='levels')parts.splice(2);
   let name=path,check=null,step=2;
@@ -1325,6 +1326,7 @@ function loadSettingPath(name) {
   const path=paths.find(path=>loadFieldName(path)===name);return path?'load_test.'+path:name;
 }
 function settingPath(name) {
+  if(name.startsWith('gateway_access_'))return 'gateway_access.'+name.slice(15);
   const check=state.bootstrap?.checks?.find(check=>name.startsWith(`test_${check.id}_`));
   if(check)return `test_options.${check.id}.${name.slice(check.id.length+6).replace(/^limit_/,'limits.')}`;
   if(name.startsWith('load_'))return loadSettingPath(name);
@@ -1385,9 +1387,10 @@ const checkGroups=[
   {id:'answers',title:'Answers',blurb:'Is the output right?',checks:['access','serving','correctness','json','context','tools']},
   {id:'speed',title:'Speed & load',blurb:'How fast, and under how much load?',checks:['first_output','generation','load','multi_user']},
   {id:'reliability',title:'Reliability',blurb:'Does it hold up over time?',checks:['recovery','sessions','consistency']},
-  {id:'server',title:'Diagnostics',blurb:'Evidence from the server itself.',checks:['cancellation','prefix','gpu']},
+  {id:'server',title:'Diagnostics',blurb:'Evidence from the server itself.',checks:['cancellation','prefix','gpu','gateway_access']},
 ];
 const checkGuide={
+  gateway_access:{name:'Gateway access policy',purpose:'Check declared allow and deny behavior for existing test identities.',sends:'One bounded chat-completion request per case, using environment references.',shows:'Expected and observed decisions; incomplete or unsupported evidence remains unverified.',needs:'LiteLLM endpoint and existing test identities'},
   multi_user:{name:'Multi-user',purpose:'See which users become slow or fail while sharing one endpoint.',sends:'Repeated independent requests from persistent users; pauses release request slots.',shows:'Every user’s delivery, response timing and outcomes over a common window.'},
   load:{name:'Load test',purpose:'Workloads, request rates and bursts in one place.',sends:'Selected workloads under maintained concurrency, arrivals and bursts.',shows:'Delivery, per-response criteria and highest tested accepted load.'},
   access:{name:'Endpoint response',purpose:'Can this endpoint return an answer?',sends:'One short generated request, shared with timing checks.',shows:'Whether the endpoint, authentication and model produce a valid answer.'},
@@ -1417,6 +1420,7 @@ function renderProfileEditor(check,config) {
   const key=check.id;
   if(key==='load')return renderLoadEditor(config);
   if(key==='multi_user')return renderMultiUserEditor(config);
+  if(key==='gateway_access')return renderGatewayAccessEditor(config);
   if(key==='sessions')return `<input type="hidden" name="profile_edits_sessions" value="[]">${renderSessionEditor(config)}<button type="button" class="text-button reset-profile" data-action="reset-profile" data-profile="sessions">Reset this profile</button>`;
   if(key==='tools'){
     const profile=config.tool_checks || {fixtures:[],modes:null},selected=profile.modes?.join(',') || '';
@@ -1860,6 +1864,14 @@ function renderConcurrentResults(metrics) {
   }).join('');
 }
 
+function renderGatewayAccessEditor(config) {
+  const s=config.gateway_access||{profile:'unknown',cases:[],request_timeout_seconds:10,max_output_tokens:16};
+  const cases=typeof s.cases==='string'?s.cases:(s.cases||[]).map(row=>`${row.name} ${row.identity} ${row.expected}`).join('\n');
+  return `<div data-gateway-access-settings><input type="hidden" name="gateway_access_rendered" value="1"><p>Uses each configured endpoint and model. Supply both an allowed and a denied case; only these declared cases are verified.</p>${selectField('gateway_access_profile','Gateway profile',['unknown','litellm'].map(value=>`<option value="${value}" ${s.profile===value?'selected':''}>${value==='litellm'?'LiteLLM':'Not configured'}</option>`).join(''))}${textField('gateway_access_cases','Declared cases',cases,{hint:'One line: case name, identity alias, allow or deny. Example: valid allowed allow. Maximum 16 cases.'})}<div class="fields">${field('gateway_access_request_timeout_seconds','Timeout per case (seconds)',s.request_timeout_seconds,{type:'number',step:'any',required:true})}${field('gateway_access_max_output_tokens','Output cap per case (tokens)',s.max_output_tokens,{type:'number',step:1,required:true})}</div>${config.targets.map((target,index)=>textField('gateway_access_identities_'+index,'Environment references · '+target.name,typeof target.test_identities==='string'?target.test_identities:JSON.stringify(target.test_identities||{},null,2),{hint:'Existing test identities only. Example: {"allowed":{"api_key_env":"ALLOW_KEY"},"denied":{"api_key_env":"DENY_KEY"}}. Optional headers_env maps header names to environment variable names. Never paste key values. An empty identity object explicitly sends no authentication.'})).join('')}<p class="hint">No keys or permissions are changed. Network failures and unsupported gateway responses cannot confirm a denial. These fixtures do not certify tenant isolation.</p></div>`;
+}
+function renderGatewayAccessResults(value) {
+  return `<section class="gateway-access-results"><h3>Declared access cases</h3><div class="metric-table"><table><thead><tr><th>Case / identity</th><th>Expected</th><th>Observed</th><th>HTTP</th><th>Outcome</th></tr></thead><tbody>${(value.cases||[]).map(row=>`<tr><td>${escape(row.name)}<small>${escape(row.identity)}</small></td><td>${escape(row.expected)}</td><td>${escape(row.observed)}</td><td>${escape(row.http_status??'—')}</td><td>${badge(row.status)}<small>${escape(human(row.reason))}</small></td></tr>`).join('')}</tbody></table></div><p class="hint">${escape(value.qualification)}</p></section>`;
+}
 function renderMultiUserEditor(config) {
   const s=multiUserSettings(config,state.bootstrap.multi_user.defaults);
   const numeric=(name,label,value,extra={})=>field('multi_user_'+name,label,value,{type:'number',step:'any',required:true,...extra});
@@ -2808,6 +2820,7 @@ function readForm(allowEmpty=false) {
   config=configureProfiles(config,data,state.bootstrap.profile_defaults || {},{allowInvalid:allowEmpty,limits:state.bootstrap.limits});
   config=configureSessions(config,data,state.bootstrap.session_workloads.defaults,{allowInvalid:allowEmpty});
   config=configureMultiUser(config,data,state.bootstrap.multi_user?.defaults,{allowInvalid:allowEmpty});
+  config=configureGatewayAccess(config,data,{allowInvalid:allowEmpty});
   config.restart_target=null;
   return {config,baseline_id:data.get('baseline_id') || null,mode:data.get('mode') || 'normal',restart_target:data.get('mode')==='cold-start'?data.get('restart_target'):null};
 }
@@ -3642,7 +3655,7 @@ function renderCheck(check,report) {
   ${check.id==='cancellation'?`<div class="notice" style="margin:20px 24px 0">${escape(m.backend_cancellation?.summary || 'Backend cancellation was not verified.')} Physical device memory reclamation is not measured.</div>`:''}
   ${check.id==='recovery'?`<div class="notice" style="margin:20px 24px 0">Sustained traffic was configured for ${number(config.sustained_seconds,1)} seconds. Results describe this bounded observation period.</div>`:''}
   ${m.logprobs?renderLogprobResults(m.logprobs):''}
-  ${check.id==='multi_user'&&m.multi_user?renderMultiUserResults(m.multi_user):''}${check.id==='sessions'&&m.conversation_performance?renderSessionResults(m.conversation_performance):''}${check.id==='concurrency'?renderConcurrentResults(m):check.id==='load'?renderLoadTestResults(m):''}
+  ${check.id==='gateway_access'&&m.gateway_access?renderGatewayAccessResults(m.gateway_access):''}${check.id==='multi_user'&&m.multi_user?renderMultiUserResults(m.multi_user):''}${check.id==='sessions'&&m.conversation_performance?renderSessionResults(m.conversation_performance):''}${check.id==='concurrency'?renderConcurrentResults(m):check.id==='load'?renderLoadTestResults(m):''}
   ${m.request_pack?renderPackResults(m.request_pack):''}
   ${check.id==='capacity'&&m.traffic_stages?renderTrafficStages(m.traffic_stages,m.request_pack):''}
   ${check.id==='capacity'&&m.levels?`<div class="metric-table"><table><thead><tr><th>Load</th><th>Achieved</th><th>Correct</th><th>p95</th></tr></thead><tbody>${Object.entries(m.levels).map(([k,v])=>`<tr><td class="mono">${escape(k)}</td><td>${number(v.achieved_concurrency)}</td><td>${v.correct ?? 0} / ${v.scored ?? 0}</td><td class="mono">${ms(v.p95_ms)}</td></tr>`).join('')}</tbody></table></div>`:''}

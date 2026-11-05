@@ -532,6 +532,30 @@ export function configureProfiles(source, values, defaults, {allowInvalid=false,
 
 // HTML has no exclusive min attribute. Apply the same schema rule to positive
 // numeric fields and array entries before preview/validation makes an API call.
+export function configureGatewayAccess(source, values, {allowInvalid=false}={}) {
+  if(!values.has('gateway_access_rendered'))return source;
+  const config=structuredClone(source),raw=String(values.get('gateway_access_cases')||'');
+  let cases;
+  try {
+    cases=raw.split('\n').map(line=>line.trim()).filter(Boolean).map(line=>{
+      const parts=line.split(/\s+/);
+      if(parts.length!==3||!['allow','deny'].includes(parts[2]))throw new Error('Enter a case name, identity alias and allow or deny on each line.');
+      return {name:parts[0],identity:parts[1],expected:parts[2]};
+    });
+  } catch(error) {if(!allowInvalid)throw error;cases=raw;}
+  config.gateway_access={profile:values.get('gateway_access_profile')||'unknown',cases,
+    request_timeout_seconds:Number(values.get('gateway_access_request_timeout_seconds')),
+    max_output_tokens:Number(values.get('gateway_access_max_output_tokens'))};
+  config.targets.forEach((target,index)=>{
+    const key='gateway_access_identities_'+index;
+    if(!values.has(key))return;
+    const text=String(values.get(key)||'{}');
+    try{const value=JSON.parse(text);if(!value||Array.isArray(value)||typeof value!=='object')throw new Error();target.test_identities=value;}
+    catch{if(!allowInvalid)throw new Error('Environment references must be an object mapping identity aliases to api_key_env and headers_env.');target.test_identities=text;}
+  });
+  return config;
+}
+
 export function positiveBoundErrors(config, limits={}, explanations={}) {
   const errors=[];
   function walk(value,path,parent=null) {

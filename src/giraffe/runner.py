@@ -117,7 +117,7 @@ def _context_rejection(record):
 
 
 def _serving_failure(record, scenario):
-    if (scenario in {"sustained", "performance_evidence_probe"} or scenario.startswith("traffic_stage_") or record.status == "cancelled"
+    if (scenario in {"sustained", "performance_evidence_probe", "gateway_access"} or scenario.startswith("traffic_stage_") or record.status == "cancelled"
             or _reasoning_budget(record)):
         return False
     if (scenario.startswith("load_calibration_") and record.input_tokens is not None
@@ -581,7 +581,7 @@ class _Run:
         spec = spec.model_copy(update={"check_ids": check_ids})
         readiness = spec.scenario == "readiness" or (
             spec.scenario == "initial" and self.config.restart_target == target.name)
-        evidence_probe = spec.scenario == "performance_evidence_probe"
+        evidence_probe = spec.scenario in {"performance_evidence_probe", "gateway_access"}
         slot_deadline = min(self.deadline, deadline_override if deadline_override is not None else self.deadline)
         if admission_deadline is not None:
             slot_deadline = min(slot_deadline, admission_deadline)

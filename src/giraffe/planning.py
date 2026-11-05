@@ -448,6 +448,12 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
                         # timeout after sending stops, even without timing samples.
                         item["coverage_high_seconds"] = item["high_seconds"]
                 continue
+            if name == "gateway_access":
+                settings = config.gateway_access
+                timeout = settings.request_timeout_seconds if settings else 0
+                count = row["requests_per_target"] or 0
+                unknown(target.name, row, count, timeout, count * timeout)
+                continue
             if name.startswith("multi_user_"):
                 settings = config.multi_user
                 phases = 1 + bool(settings.warmup_seconds)
@@ -1087,6 +1093,13 @@ def request_plan(config: RunConfig | ConfigDraft, *,
                 "msg":"Expected scheduled Load test requests exceed the total request budget; some tests will be truncated.",
                 "values":{"expected_scheduled_requests":load_plan["expected_scheduled_requests"]*target_count,"max_requests":config.max_requests}})
         warnings.extend(w["msg"] for w in load_warnings)
+    if "gateway_access" in selected:
+        settings = config.gateway_access
+        count = len(settings.cases) if settings and settings.profile == "litellm" else 0
+        add("gateway_access", count,
+            "One serial request per declared access case; missing identities and unsupported profiles send no traffic. "
+            "Both allow and deny evidence are required for a complete policy observation.",
+            source="declared LiteLLM access cases", kind="bounded")
     if "multi_user" in selected:
         settings = config.multi_user
         for level in settings.levels:

@@ -60,6 +60,8 @@ CHECK_DETAILS = {
 }
 
 CHECK_DESCRIPTIONS["multi_user"] = "Repeated independent users sharing the request limit."
+CHECK_DESCRIPTIONS["gateway_access"] = "Do the supplied gateway identities match declared allow and deny policies?"
+CHECK_DETAILS["gateway_access"] = "Opt-in LiteLLM chat-completion probes use explicit test identity references. Valid completions and recognized gateway authentication/model-access errors qualify allow/deny observations. Transport failures, unsupported errors and incomplete matrices remain unverified. No keys or permissions are changed; these cases do not certify tenant isolation."
 CHECK_DETAILS["multi_user"] = "Keeps each simulated user across repeated requests and population levels. Users pause without holding request slots. All users share the run budgets; per-user results use an explicit common measurement window, with warmup and late completions shown separately."
 
 CHECK_DESCRIPTIONS["load"] = "Workloads, request rates and bursts in one place."

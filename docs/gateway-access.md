@@ -1,0 +1,55 @@
+# Check declared gateway access
+
+Select **Gateway access policy** in the local UI, choose the LiteLLM profile, and
+enter the expected cases plus environment variable references for existing test
+identities. The endpoint and model come from Connection settings. The same check
+is available from the CLI:
+
+```sh
+giraffe run --config examples/gateway-access.yaml
+```
+
+First edit the example's URL and model and supply `GIRAFFE_ALLOWED_KEY` and
+`GIRAFFE_DENIED_KEY` in the environment where Giraffe runs. Use existing test
+credentials whose intended policy you know: the first identity should be allowed
+to call that model; the second should be invalid or denied that model. Giraffe
+does not create keys, revoke keys, change privileges, or call administrative
+gateway endpoints. Each case makes one ordinary inference request and may incur
+the endpoint's normal inference cost.
+
+Identities may include `headers_env`, mapping header names to environment variable
+names. They replace the endpoint's credentials completely. An explicit empty
+identity sends no authentication. A missing alias or environment value sends no
+request for that case. Never put resolved credentials in a configuration file.
+
+The check supports up to 16 cases, a maximum 60-second deadline per request, and
+an output cap of at most 128 tokens. Shared run limits also apply. A complete
+matrix needs at least one expected allow and one expected deny. Every case must
+produce qualified evidence before the matrix can pass.
+
+| Response | Observation |
+| --- | --- |
+| HTTP 200 with a complete, valid chat answer | Allow |
+| HTTP 401 with a recognized LiteLLM authentication error | Deny |
+| HTTP 403 with a recognized LiteLLM model-access error | Deny |
+| Timeout, network error, 429, 5xx, redirect, unknown authentication error, malformed or incomplete response | Unverified |
+
+Recognized 401 types are `token_not_found_in_db`, `expired_key`, and `auth_error`.
+Recognized 403 types are `key_model_access_denied`, `team_model_access_denied`,
+`user_model_access_denied`, `org_model_access_denied`, and
+`project_model_access_denied`. Types must match their HTTP status; provider
+exception markers leave the response unverified. Other versions or gateway error
+formats may remain unverified. See LiteLLM's
+[error reference](https://docs.litellm.ai/docs/proxy/error_reference) and
+[chat-completion client setup](https://docs.litellm.ai/docs/proxy/user_keys).
+
+The report shows expected versus observed decisions for every declared case,
+including cases that could not run. A valid completion for an expected-deny case
+fails the check. Policy observations remain separate from ordinary Endpoint
+access and performance measurements. Unconfigured checks do not stop ordinary
+shared-key tests. Safe configuration references and qualified outcomes survive
+report export and baseline comparison; secrets and raw gateway responses do not.
+
+These cases check only the supplied identities, endpoint and model. They do not
+certify tenant isolation or comprehensive gateway security. Automated fixtures
+exercise the supported protocol; this example has not qualified a live gateway.

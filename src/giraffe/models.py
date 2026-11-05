@@ -40,6 +40,7 @@ CHECK_NAMES = {
     "prefix": "Prefix cache",
     "sessions": "Multi-turn sessions",
     "multi_user": "Multi-user",
+    "gateway_access": "Gateway access policy",
     "consistency": "Answer consistency",
     "tools": "Tool calling",
 }
@@ -1268,6 +1269,25 @@ class Consistency(Model):
         return self
 
 
+class GatewayAccessCase(Model):
+    name: str = Field(pattern=r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
+    identity: str = Field(pattern=r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
+    expected: Literal["allow", "deny"]
+
+
+class GatewayAccess(Model):
+    profile: str = Field(default="unknown", pattern=r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
+    cases: list[GatewayAccessCase] = Field(default_factory=list, max_length=16)
+    request_timeout_seconds: float = Field(default=10, gt=0, le=60)
+    max_output_tokens: int = Field(default=16, ge=1, le=128)
+
+    @model_validator(mode="after")
+    def unique_cases(self):
+        if len({case.name for case in self.cases}) != len(self.cases):
+            raise ValueError("gateway access case names must be unique")
+        return self
+
+
 class TestIdentity(Model):
     """Explicit credential references; an empty identity is anonymous."""
 
@@ -2046,6 +2066,7 @@ class RunConfig(Model):
     _concurrency_warnings: list[dict[str, Any]] = PrivateAttr(default_factory=list)
     sessions: Sessions | None = None
     multi_user: MultiUser | None = None
+    gateway_access: GatewayAccess | None = None
     consistency: Consistency | None = None
     tool_calling: bool = False
     forced_tool_diagnostic: bool = False
