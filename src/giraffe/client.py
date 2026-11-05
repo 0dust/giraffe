@@ -302,7 +302,11 @@ class LLMClient:
         verify = (ssl.create_default_context(cafile=self.config.ca_bundle)
                   if self.config.ca_bundle else
                   httpx.create_ssl_context(verify=True, trust_env=True))
-        cookies = CookieJar()
+        if self.target.test_identities:
+            from .identities import IdentityCookieJar
+            cookies = IdentityCookieJar()
+        else:
+            cookies = CookieJar()
 
         def factory():
             return httpx.AsyncClient(
@@ -390,6 +394,7 @@ class LLMClient:
         stream = spec.stream if spec.workload.get("logprobs") else self.config.stream and spec.stream
         budget = spec.max_tokens if spec.max_tokens is not None else self.config.max_output_tokens
         record = RequestRecord(
+            identity=spec.identity,
             id=uuid.uuid4().hex, target=self.target.name, fixture_id=spec.fixture_id,
             scenario=spec.scenario, check_ids=spec.check_ids,
             started_at=datetime.now(timezone.utc).isoformat(), status="failed",
@@ -398,6 +403,14 @@ class LLMClient:
                 "No qualifying streamed generated-content event was observed." if stream else
                 "Non-streamed replies do not provide first-token arrival timing."),
         )
+        selected_headers = None
+        if spec.identity is not None:
+            from .identities import identity_headers
+            try:
+                selected_headers = identity_headers(self.target, spec.identity)
+            except ValueError:
+                record.error = "Test identity credentials are unavailable."
+                return record
         payload = {
             key: value for key, value in (self.config.request_options | spec.options).items()
             if key not in _RESERVED_OPTIONS and value is not None
@@ -682,17 +695,33 @@ class LLMClient:
                       spec.cancel_after_ms / 1000 if spec.cancel_after_ms else float("inf"))
         try:
             async with asyncio.timeout(timeout):
-                response = await self._client.send(self._client.build_request(
+                request = self._client.build_request(
                     "POST", completion_url(self.target.url), json=payload,
-                    timeout=httpx.Timeout(None, connect=min(request_timeout * .9, 10))), stream=True)
+                    timeout=httpx.Timeout(None, connect=min(request_timeout * .9, 10)))
+                if selected_headers is not None:
+                    # Building through HTTPX merges default headers and cookies.
+                    # Rebuild the complete headers from this identity instead.
+                    request.headers = httpx.Request("POST", request.url, json=payload,
+                                                    headers=selected_headers).headers
+                from .identities import identity_request
+                identity_token = identity_request.set(spec.identity is not None)
+                try:
+                    response = await self._client.send(request, stream=True)
+                finally:
+                    identity_request.reset(identity_token)
                 events = None
                 try:
                     record.http_status = response.status_code
+                    if spec.identity is not None:
+                        from .gateway_response import response_evidence
+                        record.gateway_evidence = response_evidence(response.status_code, headers=response.headers)
                     record.backend_id = response.headers.get("x-backend-id") or response.headers.get(
                         "x-replica-id",
                     )
                     if not 200 <= response.status_code < 300:
                         error_body = await _limited_body(response, on_body=body_received)
+                        if spec.identity is not None:
+                            record.gateway_evidence = response_evidence(response.status_code, error_body, response.headers)
                         if spec.scenario == "connection" and response.status_code in {400, 404, 422}:
                             # Keep only the classification, never arbitrary server error text.
                             body = error_body.decode("utf-8", errors="replace").lower()
@@ -828,7 +857,8 @@ class LLMClient:
         except UnicodeDecodeError:
             record.error = "response contains invalid UTF-8"
         except (httpx.HTTPError, OSError, ValueError) as exc:
-            logger.debug("Endpoint request failed", exc_info=True)
+            if spec.identity is None:
+                logger.debug("Endpoint request failed", exc_info=True)
             record.error = f"request failed ({type(exc).__name__})"
         finally:
             if logprob_collector is not None and record.logprob_evidence is None:
@@ -909,4 +939,7 @@ class LLMClient:
                 if record.workload.get("equality") == "whitespace":
                     answer = " ".join(answer.split())
                 record.answer_hash = hashlib.sha256(answer.encode()).hexdigest()
+            if spec.identity is not None:
+                from .identities import discard_identity_response
+                discard_identity_response(record)
         return record

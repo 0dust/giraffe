@@ -1268,6 +1268,28 @@ class Consistency(Model):
         return self
 
 
+class TestIdentity(Model):
+    """Explicit credential references; an empty identity is anonymous."""
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+    api_key_env: str | None = Field(default=None, max_length=128)
+    headers_env: dict[str, str] = Field(default_factory=dict, max_length=16)
+
+    @model_validator(mode="after")
+    def validate_references(self):
+        refs = [*self.headers_env.values(), *([self.api_key_env] if self.api_key_env else [])]
+        if any(not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,127}", ref) for ref in refs):
+            raise ValueError("identity credentials must name environment variables")
+        names = [name.lower() for name in self.headers_env]
+        reserved = {"host", "content-length", "content-type", "transfer-encoding", "connection",
+                    "accept", "accept-encoding", "expect", "upgrade"}
+        if (len(set(names)) != len(names) or reserved.intersection(names)
+                or (self.api_key_env and "authorization" in names)
+                or any(not re.fullmatch(r"[A-Za-z][A-Za-z0-9-]{0,63}", name) for name in self.headers_env)):
+            raise ValueError("identity headers must be unique credential headers, not protocol headers")
+        return self
+
+
 class Target(Model):
     tokenizer: str | None = Field(default=None, min_length=1,
         description="Prompt sizing tokenizer: null or auto resolves the served model name and falls back to builtin; builtin uses tiktoken o200k_base. A model ID or local directory remains an optional CLI override. Tokenizer assets download and cache locally; no inference is used for sizing.")
@@ -1279,6 +1301,7 @@ class Target(Model):
     model: str = Field(min_length=1)
     api_key_env: str | None = None
     headers_env: dict[str, str] = Field(default_factory=dict)
+    test_identities: dict[str, TestIdentity] = Field(default_factory=dict, max_length=32)
     route: Literal["direct", "gateway", "replica"] = "direct"
     parent: str | None = None
     identity: dict[str, str] = Field(default_factory=dict)
@@ -1292,6 +1315,13 @@ class Target(Model):
     deployment: Deployment = Field(default_factory=Deployment)
     restart_command: list[str] | None = None
 
+    @model_serializer(mode="wrap")
+    def serialize_optional_identity_settings(self, handler):
+        result = handler(self)
+        if not self.test_identities:
+            result.pop("test_identities", None)
+        return result
+
     @field_validator("tokenizer", mode="before")
     @classmethod
     def trim_tokenizer(cls, value):
@@ -1300,6 +1330,9 @@ class Target(Model):
     @model_validator(mode="after")
     def validate_target(self) -> Target:
         from urllib.parse import urlsplit
+
+        if any(not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", name) for name in self.test_identities):
+            raise ValueError("test identity names must be short labels using letters, numbers, underscores or hyphens")
 
         parsed = urlsplit(self.url)
         if parsed.scheme not in {"http", "https"} or not parsed.hostname:
@@ -2425,6 +2458,8 @@ class ConfigDraft(RunConfig):
 
 
 class RequestSpec(Model):
+    identity: str | None = Field(default=None, pattern=r"^[A-Za-z][A-Za-z0-9_-]{0,63}$",
+        description="Explicit gateway probe identity. Probes retain numeric response evidence, not response text.")
     condition_id: str | None = None
     fixture_id: str
     scenario: str
@@ -2448,6 +2483,13 @@ class RequestSpec(Model):
     requested_input_tokens: int | None = None
     requested_output_tokens: int | None = None
     workload: dict[str, Any] = Field(default_factory=dict)
+
+    @model_serializer(mode="wrap")
+    def serialize_optional_identity(self, handler):
+        result = handler(self)
+        if self.identity is None:
+            result.pop("identity", None)
+        return result
 
     @model_validator(mode="after")
     def validate_tool_expectation(self):
@@ -2504,7 +2546,22 @@ class EvaluationEvidence(PersistedModel):
 MAX_TOKENS_PER_READ = 16
 
 
+class GatewayResponseEvidence(PersistedModel):
+    error_kind: Literal["authentication", "model_access", "rate_limit", "unknown"] | None = None
+
+
 class RequestRecord(PersistedModel):
+    identity: str | None = None
+    gateway_evidence: GatewayResponseEvidence | None = None
+
+    @model_serializer(mode="wrap")
+    def serialize_optional_identity(self, handler):
+        result = handler(self)
+        if self.identity is None:
+            result.pop("identity", None)
+        if self.gateway_evidence is None:
+            result.pop("gateway_evidence", None)
+        return result
     _timing_started_monotonic: float | None = PrivateAttr(default=None)
     id: str
     target: str
