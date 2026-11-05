@@ -139,6 +139,32 @@ def test_recovery_report_export_cli_and_baseline_keep_all_phase_users(tmp_path, 
     assert 'Matched per-user recovery: fail' in output and 'user-03: fail' in output
 
 
+def test_loaded_recovery_sample_count_is_escaped_in_html():
+    from html.parser import HTMLParser
+    from giraffe.models import RunReport
+    from giraffe.reporting import _render
+    from tests.test_multi_user_recovery import recovery_observation
+
+    source, records = recovery_observation()
+    summary = summarize(source, records)
+    payload = '<img src=x onerror="alert(document.domain)">'
+    summary["windows"][-1]["recovery"]["users"][0]["matched_samples"] = payload
+    report = make_report()
+    report.checks = [CheckResult(id="multi_user", target="local", title="Multi-user", status="inconclusive",
+                                summary="Imported recovery", metrics={"multi_user": summary})]
+    loaded = RunReport.model_validate_json(report.model_dump_json())
+    html = _render(loaded)
+    tags = []
+
+    class Tags(HTMLParser):
+        def handle_starttag(self, tag, attrs):
+            tags.append((tag, dict(attrs)))
+
+    Tags().feed(html)
+    assert not any("onerror" in attrs for _, attrs in tags)
+    assert '&lt;img src=x onerror=&quot;alert(document.domain)&quot;&gt;' in html
+
+
 def test_finite_user_request_comparisons_keep_phase_and_cohort():
     from tests.test_multi_user_recovery import recovery_observation
     from giraffe.reporting import _groups

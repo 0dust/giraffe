@@ -550,6 +550,14 @@ def _recovery(observation, window, control, sustained, user_records, criteria, h
             shared.append("Client scheduling delay affects recovery timing.")
     sustained_records = [r for user in (sustained or {}).get("users", [])
                          for r in user_records.get((sustained["id"], user["user_id"]), [])]
+    sustained_end = (sustained or {}).get("end_ms")
+    sustained_streams = [r.model_copy(update={"stream_end_ms": r.last_output_ms}) for r in sustained_records
+                         if _valid(r) and r.stream and r.answer_reads >= 2 and r.answer_chunks >= 2
+                         and r.max_stream_gap_ms is not None and r.completed_ms is not None
+                         and sustained_end is not None and r.completed_ms <= sustained_end
+                         and qualify([r], health, timing_threshold,
+                             ("latency_ms", "first_output_ms", "max_stream_gap_ms"),
+                             legacy_max_lag_ms=lag)["status"] == "qualified"]
     measured = []
     for user in window["users"]:
         uid = user["user_id"]
@@ -569,8 +577,9 @@ def _recovery(observation, window, control, sustained, user_records, criteria, h
         stress = [r for r in sustained_records if r.workload.get("user_id") == uid and _valid(r)
                   and r.completed_ms is not None and (sustained or {}).get("end_ms") is not None
                   and r.completed_ms <= sustained["end_ms"]]
-        if len(stress) < criteria.min_samples or max_evidenced_overlap(stress,
-                [r for r in sustained_records if r.workload.get("user_id") != uid and _valid(r)], delays) < 2:
+        if len(stress) < criteria.min_samples or max_evidenced_overlap(
+                [r for r in sustained_streams if r.workload.get("user_id") == uid],
+                [r for r in sustained_streams if r.workload.get("user_id") != uid], delays) < 2:
             notes.append("This user lacks sustained samples with qualified peer streaming overlap.")
         values = {}
         for label, rows in (("control", [a for a, _ in pairs]), ("lighter", [b for _, b in pairs]), ("sustained", stress)):

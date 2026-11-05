@@ -2009,7 +2009,7 @@ def _multi_user_scenario_html(window: dict[str, Any], anchors: dict[str, str]) -
         parts.append(f'<h5>Matched per-user recovery {_badge(evidence["status"])}</h5>')
         for user in evidence["users"]:
             parts.append(f'<p><strong>{_e(user["user_id"])}</strong> {_badge(user["status"])} · '
-                f'{user["matched_samples"]} matched samples · slowdown {_number(user["slowdown"])}×. '
+                f'{_e(user["matched_samples"])} matched samples · slowdown {_number(user["slowdown"])}×. '
                 f'{_e(" ".join(user["reasons"]))}</p><details><summary>Actual work and request evidence</summary>'
                 f'<pre>{_json(user["phases"])}</pre><p>Control: {links(user["control_request_ids"])}</p>'
                 f'<p>Sustained: {links(user["sustained_request_ids"])}</p><p>Lighter: {links(user["lighter_request_ids"])}</p></details>')

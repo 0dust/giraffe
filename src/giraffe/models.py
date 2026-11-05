@@ -2206,6 +2206,17 @@ class RunConfig(Model):
             raise ValueError("Unknown check name(s): " + ", ".join(sorted(set(self.checks) - set(CHECK_NAMES)))
                              + ". Valid names: " + ", ".join(CHECK_NAMES))
         self.resolve_concurrency()
+        if "multi_user" in self.checks and set(self.multi_user.scenarios) & {"arrivals", "recovery"}:
+            from giraffe.multi_user import _planned_observation
+            windows = _planned_observation(self.multi_user, include_offers=False)["windows"]
+            offers = sum(window.get("scheduled_offers", 0) for window in windows)*len(self.targets)
+            if offers > MAX_PLANNED_ARRIVALS:
+                raise PydanticCustomError("multi_user_offers",
+                    "Multi-user has {planned} total scheduled offers across population levels, phases and targets; "
+                    "the maximum is {maximum}. Reduce rates, durations, population levels or targets.",
+                    {"planned": offers, "maximum": MAX_PLANNED_ARRIVALS,
+                     "fields": ["multi_user.levels", "multi_user.arrivals.requests_per_second",
+                                "multi_user.recovery.sustained_requests_per_second", "targets"]})
         for check_id, options in self.test_options.items():
             if check_id not in CHECK_OPTION_FIELDS:
                 raise PydanticCustomError("check_options", f"unsupported test_options check: {check_id}",
