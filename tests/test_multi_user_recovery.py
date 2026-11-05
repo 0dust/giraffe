@@ -51,6 +51,15 @@ def test_recovery_exposes_one_slow_user_when_median_recovers():
     assert result["worst_user"]["user_id"] == "user-03"
 
 
+@pytest.mark.parametrize("phase", [0, 1, 2])
+def test_recovery_missing_phase_end_is_inconclusive(phase):
+    source, records = recovery_observation()
+    source["windows"][phase]["end_ms"] = None
+    evidence = summarize(source, records)["windows"][-1]["recovery"]
+    assert evidence["status"] == "inconclusive"
+    assert not evidence["qualified"]
+
+
 @pytest.mark.parametrize("fault", ["missing_control", "drift", "missing_usage", "generator", "gap", "partial"])
 def test_unqualified_recovery_cannot_pass(fault):
     source, records = recovery_observation()

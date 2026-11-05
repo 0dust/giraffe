@@ -1090,7 +1090,7 @@ def request_plan(config: RunConfig | ConfigDraft, *,
     if "multi_user" in selected:
         from giraffe.multi_user import _planned_observation
         settings = config.multi_user
-        windows = _planned_observation(settings)["windows"]
+        windows = _planned_observation(settings, include_offers=False)["windows"]
         for level in settings.levels:
             phases = [window for window in windows if window["population"] == level]
             seconds = sum(window["planned_duration_seconds"] for window in phases)
@@ -1101,7 +1101,7 @@ def request_plan(config: RunConfig | ConfigDraft, *,
                 kind="duration", title=f"Multi-user · {level} users")
             rows[-1].update(users=level, simultaneous_limit=config.concurrency,
                             configured_seconds=seconds, window_count=len(phases), scenarios=settings.scenarios,
-                            scheduled_offers=sum(len(window.get("offers", [])) for window in phases))
+                            scheduled_offers=sum(window.get("scheduled_offers", 0) for window in phases))
     if "sessions" in selected:
         settings = config.sessions
         if settings.profile == "performance":

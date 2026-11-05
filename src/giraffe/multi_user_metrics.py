@@ -524,7 +524,6 @@ def _interference(observation, window, control, user_records, criteria, health, 
 
 
 def _recovery(observation, window, control, sustained, user_records, criteria, health, lag, timing_threshold, delays):
-    """Compare matched per-user work after a qualified sustained exposure."""
     settings = observation["settings"]
     tolerance = settings.get("fairness_tolerance_percent", 10)/100
     limit = settings.get("recovery", {}).get("max_slowdown")
@@ -532,7 +531,7 @@ def _recovery(observation, window, control, sustained, user_records, criteria, h
                                     pass_criteria={"min_valid_responses": criteria.min_samples})
     shared = []
     for phase in (control, sustained, window):
-        if not phase or phase.get("cut_short") or phase.get("drain_reason") or phase.get("start_ms") is None:
+        if not phase or phase.get("cut_short") or phase.get("drain_reason") or phase.get("start_ms") is None or phase.get("end_ms") is None:
             shared.append("Control, sustained or lighter window has incomplete coverage.")
             continue
         counts = phase.get("offer_accounting", {})
@@ -555,6 +554,7 @@ def _recovery(observation, window, control, sustained, user_records, criteria, h
         controls = {r.workload.get("matched_work_sequence"): r for r in before if _valid(r)}
         pairs = [(controls.get(r.workload.get("matched_work_sequence")), r) for r in after if _valid(r)]
         pairs = [(a, b) for a, b in pairs if a is not None and a.completed_ms is not None and b.completed_ms is not None
+                 and (control or {}).get("end_ms") is not None and window.get("end_ms") is not None
                  and a.completed_ms <= control["end_ms"] and b.completed_ms <= window["end_ms"]]
         if len({a.id for a, _ in pairs}) < criteria.min_samples or len(pairs) != len(after):
             notes.append("Recovery lacks sufficient matched completed control samples.")
@@ -562,7 +562,8 @@ def _recovery(observation, window, control, sustained, user_records, criteria, h
                or a.workload.get("matched_work_sha256") != b.workload["matched_work_sha256"] for a, b in pairs):
             notes.append("Matched control and recovery work differs.")
         stress = [r for r in sustained_records if r.workload.get("user_id") == uid and _valid(r)
-                  and r.completed_ms is not None and r.completed_ms <= sustained["end_ms"]]
+                  and r.completed_ms is not None and (sustained or {}).get("end_ms") is not None
+                  and r.completed_ms <= sustained["end_ms"]]
         if len(stress) < criteria.min_samples or max_evidenced_overlap(stress,
                 [r for r in sustained_records if r.workload.get("user_id") != uid and _valid(r)], delays) < 2:
             notes.append("This user lacks sustained samples with qualified peer streaming overlap.")
@@ -620,7 +621,6 @@ def summarize(observation: dict[str, Any], records: list[RequestRecord], *,
         if isinstance(window_id, str) and isinstance(user_id, str):
             user_records[window_id, user_id].append(record)
     windows = []
-    all_users = []
     for window in observation.get("windows", []):
         if window["phase"] != "measurement":
             windows.append({**window, "status": "warmup"})
@@ -635,8 +635,6 @@ def summarize(observation: dict[str, Any], records: list[RequestRecord], *,
             statuses.append(fairness["status"])
         window_status = _status(statuses, measured=all(status == "measured" for status in statuses))
         windows.append({**window, "users": users, "status": window_status, "fairness": fairness})
-        all_users.extend({**user, "window_id": window["id"], "population": window["population"],
-                          "scenario": window["scenario"]} for user in users)
     scenario_delays = _delays(observation.get("scheduling_delay_windows", []))
     for window in windows:
         if window["phase"] != "measurement":
@@ -674,12 +672,12 @@ def summarize(observation: dict[str, Any], records: list[RequestRecord], *,
                     user["reasons"] = list(dict.fromkeys(user["reasons"] + comparison["reasons"]))
             window["status"] = _status([window["status"], evidence["status"]],
                                       measured=window["status"] == evidence["status"] == "measured")
-    status = _status([window["status"] for window in windows if window["phase"] == "measurement"],
-                     measured=bool(all_users) and all(window["status"] == "measured" for window in windows
-                                                   if window["phase"] == "measurement"))
     all_users = [{**user, "window_id": window["id"], "population": window["population"],
                   "scenario": window["scenario"]} for window in windows if window["phase"] == "measurement"
                  for user in window["users"]]
+    status = _status([window["status"] for window in windows if window["phase"] == "measurement"],
+                     measured=bool(all_users) and all(window["status"] == "measured" for window in windows
+                                                   if window["phase"] == "measurement"))
     ranked = sorted(all_users, key=lambda user: (
         {"fail": 0, "inconclusive": 1, "measured": 2, "pass": 2}[user["status"]],
         user["output_tokens_per_second"] if user["output_tokens_per_second"] is not None else -1,

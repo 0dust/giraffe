@@ -296,8 +296,12 @@ async def run_window(run, target, client, settings, load_settings, calibration, 
                              reason=window["reason"])
 
 
+def _steady_offer_count(duration, activation, rate):
+    count = math.ceil((duration-activation)*rate)
+    return count - int(count > 0 and activation+(count-1)/rate >= duration)
+
+
 def _offer_plan(window, settings):
-    """Bounded stateless work keeps identity even when admission never occurs."""
     offers = []
     recovery = window["scenario"] == "recovery"
     rate = window["requests_per_second"]
@@ -306,7 +310,7 @@ def _offer_plan(window, settings):
         activation = 0 if recovery else settings.arrivals.activations.get(uid, 0)
         cohort = "shared" if recovery else "newcomer" if activation else "incumbent"
         user.update(cohort=cohort, activation_seconds=activation)
-        for index in range(math.ceil((window["planned_duration_seconds"]-activation)*rate)):
+        for index in range(_steady_offer_count(window["planned_duration_seconds"], activation, rate)):
             offset = activation + index/rate
             if offset < window["planned_duration_seconds"]:
                 offers.append({"user_id": uid, "profile": user["profile"], "cohort": cohort,
@@ -335,7 +339,6 @@ def _offer_counts(offers):
 
 async def run_arrival_window(run, target, client, settings, load_settings, calibration, window, *,
                              sources_by_profile, sequences):
-    """Use the existing immediate-admission scheduler; never queue or replay offers."""
     offers = window["offers"]
     users = {u["user_id"]: u for u in window["users"]}
     offered = 0
@@ -434,8 +437,11 @@ async def run_arrival_window(run, target, client, settings, load_settings, calib
         dispatched_requests_per_second=sum(o["dispatched"] for o in offers)/evidence.sending_seconds
             if evidence.sending_seconds else None,
         scheduler_stalls=[{"start_ms": start+a*1000, "end_ms": start+b*1000} for a, b in evidence.stalls])
+    offers_by_user = {user["user_id"]: [] for user in window["users"]}
+    for offer in offers:
+        offers_by_user[offer["user_id"]].append(offer)
     for user in window["users"]:
-        own = [o for o in offers if o["user_id"] == user["user_id"]]
+        own = offers_by_user[user["user_id"]]
         user.update(offer_accounting=_offer_counts(own), scheduled_activation_ms=start+user["activation_seconds"]*1000,
                     stop_reason=window["reason"], active_duration_seconds=max(0, (end-user["activated_ms"])/1000)
                         if user["activated_ms"] is not None else 0)
@@ -446,7 +452,7 @@ async def run_arrival_window(run, target, client, settings, load_settings, calib
         raise asyncio.CancelledError
 
 
-def _planned_observation(settings):
+def _planned_observation(settings, *, include_offers=True):
     population = population_plan(settings)
     windows = []
     for level in settings.levels:
@@ -512,10 +518,20 @@ def _planned_observation(settings):
         windows = expanded
     for window in windows:
         if window["scenario"] in {"arrivals", "recovery"} and window["phase"] == "measurement":
-            window["offers"] = _offer_plan(window, settings)
-            window["offer_accounting"] = _offer_counts(window["offers"])
-            for user in window["users"]:
-                user["offer_accounting"] = _offer_counts([o for o in window["offers"] if o["user_id"] == user["user_id"]])
+            arrivals = window["scenario"] == "arrivals"
+            window["scheduled_offers"] = sum(_steady_offer_count(window["planned_duration_seconds"],
+                settings.arrivals.activations.get(user["user_id"], 0) if arrivals else 0,
+                window["requests_per_second"]) for user in window["users"])
+            if arrivals:
+                window["scheduled_offers"] += sum(burst.requests for burst in settings.arrivals.bursts)
+            if include_offers:
+                window["offers"] = _offer_plan(window, settings)
+                window["offer_accounting"] = _offer_counts(window["offers"])
+                offers_by_user = {user["user_id"]: [] for user in window["users"]}
+                for offer in window["offers"]:
+                    offers_by_user[offer["user_id"]].append(offer)
+                for user in window["users"]:
+                    user["offer_accounting"] = _offer_counts(offers_by_user[user["user_id"]])
     return {"version": 1, "window_policy": WINDOW_POLICY,
             "settings": settings.model_dump(mode="json"), "population": population,
             "windows": windows, "calibrations": []}
