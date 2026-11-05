@@ -56,7 +56,7 @@ def _rate(record: RequestRecord) -> float | None:
 def _groups(records: list[RequestRecord], target: str) -> dict[tuple[str, str], list[RequestRecord]]:
     groups: dict[tuple[str, str], list[RequestRecord]] = defaultdict(list)
     for record in records:
-        if (record.target == target and getattr(record, "traffic_stage", None) is None
+        if (record.target == target and (getattr(record, "traffic_stage", None) is None or "multi_user" in record.check_ids)
                 and record.scenario not in {"client_cancel", "client_deadline", "sglang_cancel", "backend_cancel"}):
             for check in record.check_ids:
                 if check == "load" and not (record.load_point or {}).get("point_id"):
@@ -70,6 +70,8 @@ def _groups(records: list[RequestRecord], target: str) -> dict[tuple[str, str], 
                     if record.workload.get("role"):
                         scenario += " / " + " / ".join(str(record.workload.get(key) or "")
                             for key in ("role", "trigger", "heavy_profile"))
+                    if record.workload.get("cohort"):
+                        scenario += " / " + record.workload["cohort"]
                 if check == "load" and record.load_point:
                     # A mixed test has one sending window but distinct shape cohorts.
                     scenario += "." + str(record.load_point.get("shape", "unknown"))
@@ -1071,12 +1073,16 @@ def _user_measurements(report: RunReport, target: str) -> dict[tuple, tuple[dict
     summary = next((check.metrics.get("multi_user", {}) for check in report.checks
                     if check.id == "multi_user" and check.target == target), {})
     return {(window["scenario"], window["population"], user["profile"], user["user_id"],
-             window.get("role") or "", window.get("trigger") or "", window.get("heavy_profile") or ""): (window, user)
+             window.get("role") or "", window.get("trigger") or "", window.get("heavy_profile") or "",
+             user.get("cohort") or ""): (window, user)
             for window in summary.get("windows", []) if window.get("phase") == "measurement"
             for user in window.get("users", [])}
 
 
 def _user_scenario_evidence(window: dict, user_id: str) -> dict:
+    if window.get("scenario") == "recovery" and window.get("role") == "lighter":
+        evidence = window.get("recovery") or {"status": "inconclusive", "qualified": False}
+        return next((user for user in evidence.get("users", []) if user.get("user_id") == user_id), evidence)
     if window.get("scenario") == "noisy_neighbors" and window.get("role") == "probe":
         evidence = window.get("interference") or {"status": "inconclusive", "qualified": False}
         return next((user for user in evidence.get("users", []) if user.get("user_id") == user_id), evidence)
@@ -1094,7 +1100,7 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold):
     current_records = {record.id: record for record in report.requests if record.target == target}
     old_records = {record.id: record for record in baseline.requests if record.target == target}
     for key in sorted(current.keys() | previous.keys()):
-        scenario, population, profile, user_id, role, trigger, heavy_profile = key
+        scenario, population, profile, user_id, role, trigger, heavy_profile, cohort = key
         c_window, c = current.get(key, ({}, {}))
         b_window, b = previous.get(key, ({}, {}))
         c_rate, b_rate = c.get("output_tokens_per_second"), b.get("output_tokens_per_second")
@@ -1110,7 +1116,7 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold):
                    or c_rate is None or b_rate is None or work_reason or mix_changed or scenario_reason)
         row = {"check": "multi_user", "scenario": " / ".join(map(str, key if role else key[:4])),
                "user_id": user_id, "population": population, "profile": profile,
-               "role": role, "trigger": trigger, "heavy_profile": heavy_profile,
+               "role": role, "trigger": trigger, "heavy_profile": heavy_profile, "cohort": cohort,
                "window_id": c_window.get("id", b_window.get("id")),
                "metric": "shared_window_output_tokens_per_second", "aggregation": "common_window",
                "current": c_rate, "baseline": b_rate, "status": "inconclusive",
@@ -1895,6 +1901,13 @@ def _traffic_table(check: CheckResult) -> str:
 
 def _multi_user_scenario_export(window: dict[str, Any]) -> dict[str, Any]:
     result = {}
+    if evidence := window.get("recovery"):
+        result["recovery"] = {key: evidence[key] for key in
+            ("status", "qualified", "control_window_id", "sustained_window_id", "reasons") if key in evidence}
+        result["recovery"]["users"] = [{key: user[key] for key in
+            ("user_id", "profile", "status", "qualified", "slowdown", "matched_samples", "reasons", "phases",
+             "control_request_ids", "lighter_request_ids", "sustained_request_ids") if key in user}
+            for user in evidence.get("users", [])]
     if evidence := window.get("interference"):
         fields = ("status", "qualified", "control_window_id", "trigger", "heavy_profile", "heavy_user_ids", "reasons")
         user_fields = ("user_id", "status", "qualified", "reasons", "matched_samples", "control_request_ids",
@@ -1919,13 +1932,20 @@ def _multi_user_export(data: dict[str, Any]) -> dict[str, Any]:
         "output_tokens_per_second", "late_output_tokens", "late_missing_usage_count", "late_completed",
         "partial_output_tokens", "partial_missing_usage_count", "cancelled_output_tokens",
         "cancelled_missing_usage_count", "latency", "lengths", "finish_reasons", "pending_wait",
-        "coverage", "criteria", "timing_quality", "stop_reason", "conversations", "think_time_plan")
+        "coverage", "criteria", "timing_quality", "stop_reason", "conversations", "think_time_plan",
+        "cohort", "activation_seconds", "scheduled_activation_ms", "active_duration_seconds", "offer_accounting")
     window_fields = ("id", "scenario", "population", "phase", "start_ms", "end_ms", "planned_end_ms",
         "duration_seconds", "planned_duration_seconds", "drain_seconds", "cut_short", "reason", "drain_reason", "status", "fairness",
-        "role", "trigger", "heavy_profile", "heavy_user_ids", "control_window_id", "selected_user_id")
+        "role", "trigger", "heavy_profile", "heavy_user_ids", "control_window_id", "selected_user_id",
+        "sustained_window_id", "requests_per_second", "planned_requests_per_second", "dispatched_requests_per_second",
+        "offer_accounting", "peak_in_flight", "scheduler_stalls")
     value = {key: data.get(key) for key in ("version", "window_policy", "settings", "population",
                                           "status", "worst_user", "interpretation")}
     value["windows"] = [{**{key: window.get(key) for key in window_fields}, **_multi_user_scenario_export(window),
+                         **({"offers": [{key: offer[key] for key in ("index", "user_id", "profile", "cohort", "origin",
+                             "offset_seconds", "scheduled_ms", "scheduler_lag_ms", "request_sequence", "work_sequence",
+                             "matched_work_sequence", "outcome", "offered", "dispatched", "request_id", "burst_index") if key in offer}
+                             for offer in window["offers"]]} if "offers" in window else {}),
                          "users": [{key: user[key] for key in user_fields if key in user}
                                    for user in window.get("users", [])]}
                         for window in data.get("windows", [])]
@@ -1937,6 +1957,24 @@ def _multi_user_scenario_html(window: dict[str, Any], anchors: dict[str, str]) -
         return ' '.join(f'<a href="#{anchors[rid]}">{_e(rid)}</a>' for rid in ids if rid in anchors)
 
     parts = []
+    if counts := window.get("offer_accounting"):
+        parts.append('<h5>Scheduled and achieved traffic</h5><p>' + _e(' · '.join(f'{key}: {value}' for key, value in counts.items()))
+            + '</p><p>Planned = offered + not offered. Offered = dispatched + local drops + late drops + unissued. '
+              'Client admission is not server queue time.</p><div class="table"><table><tr><th>User / cohort</th>'
+              '<th>Scheduled / observed activation (ms)</th><th>Offer accounting</th></tr>')
+        for user in window["users"]:
+            parts.append(f'<tr><td>{_e(user["user_id"])} / {_e(user.get("cohort"))}</td><td>'
+                f'{_number(user.get("scheduled_activation_ms"))} / {_number(user.get("activated_ms"))}</td><td>'
+                + _e(' · '.join(f'{key}: {value}' for key, value in user.get("offer_accounting", {}).items())) + '</td></tr>')
+        parts.append('</table></div>')
+    if evidence := window.get("recovery"):
+        parts.append(f'<h5>Matched per-user recovery {_badge(evidence["status"])}</h5>')
+        for user in evidence["users"]:
+            parts.append(f'<p><strong>{_e(user["user_id"])}</strong> {_badge(user["status"])} · '
+                f'{user["matched_samples"]} matched samples · slowdown {_number(user["slowdown"])}×. '
+                f'{_e(" ".join(user["reasons"]))}</p><details><summary>Actual work and request evidence</summary>'
+                f'<pre>{_json(user["phases"])}</pre><p>Control: {links(user["control_request_ids"])}</p>'
+                f'<p>Sustained: {links(user["sustained_request_ids"])}</p><p>Lighter: {links(user["lighter_request_ids"])}</p></details>')
     if evidence := window.get("interference"):
         parts.append(f'<h5>Matched noisy-neighbor comparison {_badge(evidence["status"])}</h5>'
             f'<p>{_e(evidence.get("trigger"))} · {_e(evidence.get("heavy_profile"))} · '

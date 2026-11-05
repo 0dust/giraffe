@@ -4,16 +4,24 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import random
 import time
 from copy import deepcopy
 
 from giraffe.concurrent_load import OutputProgress, calibrate
 from giraffe.load_test import _shape_sources, build_spec
-from giraffe.models import CheckResult, LoadTestSettings
+from giraffe.models import CheckResult, LoadTestSettings, Limits, TrafficConfig
+from giraffe.traffic import run_stage
 
 
 WINDOW_POLICY = "completed-output-v1"
+
+
+def _matched_work_sha256(spec):
+    return hashlib.sha256(json.dumps({"messages": spec.messages, "options": spec.options,
+        "max_tokens": spec.max_tokens, "requested_input_tokens": spec.requested_input_tokens,
+        "scorer": spec.scorer, "expected": spec.expected}, sort_keys=True).encode()).hexdigest()
 
 
 def population_plan(settings):
@@ -136,10 +144,7 @@ async def run_window(run, target, client, settings, load_settings, calibration, 
             if window.get("role"):
                 spec.workload.update(role=window["role"], matched_work_sequence=sequence,
                     trigger=window.get("trigger"), heavy_profile=window.get("heavy_profile"),
-                    matched_work_sha256=hashlib.sha256(json.dumps({"messages": spec.messages,
-                        "options": spec.options, "max_tokens": spec.max_tokens,
-                        "requested_input_tokens": spec.requested_input_tokens,
-                        "scorer": spec.scorer, "expected": spec.expected}, sort_keys=True).encode()).hexdigest())
+                    matched_work_sha256=_matched_work_sha256(spec))
                 sequences[user["user_id"]] = sequences.get(user["user_id"], 0) + 1
                 spec.workload["request_sequence"] = sequences[user["user_id"]]
             selected = window.get("selected_user_id") == user["user_id"] and window["phase"] == "measurement"
@@ -291,10 +296,178 @@ async def run_window(run, target, client, settings, load_settings, calibration, 
                              reason=window["reason"])
 
 
+def _offer_plan(window, settings):
+    """Bounded stateless work keeps identity even when admission never occurs."""
+    offers = []
+    recovery = window["scenario"] == "recovery"
+    rate = window["requests_per_second"]
+    for user in window["users"]:
+        uid = user["user_id"]
+        activation = 0 if recovery else settings.arrivals.activations.get(uid, 0)
+        cohort = "shared" if recovery else "newcomer" if activation else "incumbent"
+        user.update(cohort=cohort, activation_seconds=activation)
+        for index in range(math.ceil((window["planned_duration_seconds"]-activation)*rate)):
+            offset = activation + index/rate
+            if offset < window["planned_duration_seconds"]:
+                offers.append({"user_id": uid, "profile": user["profile"], "cohort": cohort,
+                               "offset_seconds": offset, "origin": "steady"})
+    if not recovery:
+        users = {u["user_id"]: u for u in window["users"]}
+        for burst_index, burst in enumerate(settings.arrivals.bursts):
+            for index in range(burst.requests):
+                user = users[burst.user_id]
+                offers.append({"user_id": burst.user_id, "profile": user["profile"], "cohort": user["cohort"],
+                    "offset_seconds": burst.at_seconds + index*burst.spacing_seconds,
+                    "origin": "burst", "burst_index": burst_index})
+    priority = {user["user_id"]: random.Random(f"{settings.seed}:offer:{user['user_id']}").random()
+                for user in window["users"]}
+    offers.sort(key=lambda offer: (offer["offset_seconds"], priority[offer["user_id"]]))
+    for index, offer in enumerate(offers):
+        offer.update(index=index, outcome="not_offered", offered=False, dispatched=False, request_id=None)
+    return offers
+
+
+def _offer_counts(offers):
+    return {"planned": len(offers), "offered": sum(o["offered"] for o in offers),
+            **{name: sum(o["outcome"] == name for o in offers) for name in
+               ("dispatched", "dropped_local", "dropped_late", "unissued", "not_offered")}}
+
+
+async def run_arrival_window(run, target, client, settings, load_settings, calibration, window, *,
+                             sources_by_profile, sequences):
+    """Use the existing immediate-admission scheduler; never queue or replay offers."""
+    offers = window["offers"]
+    users = {u["user_id"]: u for u in window["users"]}
+    offered = 0
+    work_counts = {}
+    for offer in offers:
+        uid = offer["user_id"]
+        work_counts[uid] = work_counts.get(uid, 0) + 1
+        sequences[uid] = sequences.get(uid, 0) + 1
+        offer["request_sequence"] = sequences[uid]
+        work_index = work_counts[uid] + window.get("work_sequence_start", 0)
+        offer["work_sequence"] = work_index
+        offer["matched_work_sequence"] = ((work_index-1) % window["control_work_count"] + 1
+                                           if window.get("control_work_count") else work_index)
+
+    def reserve():
+        nonlocal offered
+        if not run.reserve_offer(target.name):
+            return False
+        offer = offers[offered]
+        offer["offered"] = True
+        user = users[offer["user_id"]]
+        user["ready_count"] += 1
+        if user["activated_ms"] is None:
+            user["activated_ms"] = _relative(run)
+        offered += 1
+        return True
+
+    def build(index):
+        offer = offers[index]
+        point = {"id": window["id"], "type": "combinations", "workload": "combinations",
+                 "pattern": "constant", "level": window["population"], "rate": window["requests_per_second"],
+                 "bursts": offer["origin"] == "burst", "source": "primary",
+                 "_source_index": offer["matched_work_sequence"]-1}
+        nonce = hashlib.sha256(f"{settings.seed}:{window['population']}:{offer['user_id']}:{offer['matched_work_sequence']}".encode()).hexdigest()[:32]
+        spec = build_spec(run, load_settings, point, offer["profile"], calibration,
+                          frozen_sources=sources_by_profile.get(offer["profile"]), nonce=nonce)
+        spec.load_point = None
+        spec.workload.update({key: offer[key] for key in ("user_id", "profile", "cohort", "origin",
+            "request_sequence", "work_sequence", "matched_work_sequence")})
+        spec.workload.update(offer_index=index, population=window["population"], scenario=window["scenario"],
+            phase=window["phase"], role=window["role"], window_id=window["id"],
+            activation_seconds=users[offer["user_id"]]["activation_seconds"],
+            matched_work_sha256=_matched_work_sha256(spec))
+        return spec
+
+    async def send(spec, annotate):
+        offer = offers[spec.workload["offer_index"]]
+        user = users[offer["user_id"]]
+        spec.workload["ready_ms"] = spec.workload["scheduled_ms"]
+
+        def started():
+            offer["dispatched"] = True
+            user["dispatched_count"] += 1
+
+        def finished(record):
+            annotate(record)
+            offer["request_id"] = record.id
+            user["request_ids"].append(record.id)
+
+        return await run.request(target, client, spec, slot_reserved=True, budget_reserved=True,
+                                 admission_deadline=run.start+spec.workload["scheduled_ms"]/1000
+                                     -offer["offset_seconds"]+window["planned_duration_seconds"],
+                                 on_start=started, finalize_record=finished)
+
+    def stop():
+        reason = run.stop_reason(target.name)
+        return None if reason == "maximum request budget reached" else reason
+
+    run.start_condition(target.name, window["id"], planned=len(offers))
+    window.update(start_ms=_relative(run), end_ms=_relative(run)+window["planned_duration_seconds"]*1000,
+                  planned_end_ms=_relative(run)+window["planned_duration_seconds"]*1000, reason=None)
+    evidence = await run_stage(traffic=TrafficConfig(duration_seconds=window["planned_duration_seconds"],
+        rates=[window["requests_per_second"]], max_in_flight=run.config.concurrency,
+        scheduler_lag_tolerance_ms=100, drain_timeout_seconds=None), rate_rps=window["requests_per_second"]*window["population"],
+        stage_index=0, fixtures={}, execute=send, reserve_offer=reserve, try_acquire=run.try_acquire_slot,
+        release=run.release_slot, stop_reason=stop, deadline=run.deadline, limits=Limits(),
+        schedule_override=[(o["offset_seconds"], o["profile"]) for o in offers], spec_factory=build,
+        check_id="multi_user", scenario=window["id"], run_start=run.start, return_evidence=True,
+        on_drop=lambda: run.drop_offer(target.name, window["id"]),
+        schedule_observations=run.observations[target.name].setdefault("schedule_transitions", []),
+        schedule_stage_id=window["id"], schedule_label=window["role"], schedule_pattern="constant")
+    start = _relative(run, evidence.started_monotonic)
+    end = start + evidence.sending_seconds*1000
+    for index, offer in enumerate(offers):
+        raw = evidence.outcomes[index]
+        offer["outcome"] = ("dispatched" if offer["dispatched"] else raw if raw in {"dropped_local", "dropped_late"}
+                            else "unissued" if offer["offered"] else "not_offered")
+        offer["scheduled_ms"] = start + offer["offset_seconds"]*1000
+        offer["scheduler_lag_ms"] = evidence.offer_lags_ms[index]
+    window.update(start_ms=start, end_ms=end, planned_end_ms=start+window["planned_duration_seconds"]*1000,
+        duration_seconds=evidence.sending_seconds, drain_seconds=max(0, evidence.observation_seconds-evidence.sending_seconds),
+        cut_short=evidence.interrupted, reason="; ".join(evidence.reasons) or None,
+        drain_reason="Drain interrupted" if evidence.drain_expired else None,
+        offer_accounting=_offer_counts(offers), peak_in_flight=evidence.peak,
+        planned_requests_per_second=len(offers)/window["planned_duration_seconds"],
+        dispatched_requests_per_second=sum(o["dispatched"] for o in offers)/evidence.sending_seconds
+            if evidence.sending_seconds else None,
+        scheduler_stalls=[{"start_ms": start+a*1000, "end_ms": start+b*1000} for a, b in evidence.stalls])
+    for user in window["users"]:
+        own = [o for o in offers if o["user_id"] == user["user_id"]]
+        user.update(offer_accounting=_offer_counts(own), scheduled_activation_ms=start+user["activation_seconds"]*1000,
+                    stop_reason=window["reason"], active_duration_seconds=max(0, (end-user["activated_ms"])/1000)
+                        if user["activated_ms"] is not None else 0)
+    run.finish_condition(target.name, window["id"], reason=window["reason"])
+    if evidence.interrupted:
+        run.mark_unfinished(target.name, ["multi_user"])
+    if asyncio.current_task().cancelling():
+        raise asyncio.CancelledError
+
+
 def _planned_observation(settings):
     population = population_plan(settings)
     windows = []
     for level in settings.levels:
+        if "arrivals" in settings.scenarios:
+            window = _window(level, "measurement", settings.duration_seconds, population)
+            window.update(id=f"multi_user_{level}_arrivals", scenario="arrivals", role="arrivals",
+                          requests_per_second=settings.arrivals.requests_per_second)
+            windows.append(window)
+        if "recovery" in settings.scenarios:
+            recovery = settings.recovery
+            for role, seconds, rate in (("control", recovery.control_seconds, recovery.lighter_requests_per_second),
+                    ("sustained", recovery.sustained_seconds, recovery.sustained_requests_per_second),
+                    ("lighter", recovery.lighter_seconds, recovery.lighter_requests_per_second)):
+                window = _window(level, "measurement", seconds, population)
+                window.update(id=f"multi_user_{level}_recovery_{role}", scenario="recovery", role=role,
+                    requests_per_second=rate, control_window_id=f"multi_user_{level}_recovery_control",
+                    sustained_window_id=f"multi_user_{level}_recovery_sustained",
+                    control_work_count=math.ceil(recovery.control_seconds*recovery.lighter_requests_per_second),
+                    work_sequence_start=math.ceil(recovery.sustained_seconds*recovery.sustained_requests_per_second)
+                        if role == "lighter" else 0)
+                windows.append(window)
         if "repeated_requests" in settings.scenarios:
             if settings.warmup_seconds:
                 windows.append(_window(level, "warmup", settings.warmup_seconds, population))
@@ -326,13 +499,23 @@ def _planned_observation(settings):
     if settings.warmup_seconds:
         expanded = []
         for window in windows:
-            if window.get("role"):
+            if window["scenario"] in {"arrivals", "recovery"} and window["role"] in {"arrivals", "control"}:
+                warmup = _window(window["population"], "warmup", settings.warmup_seconds, population)
+                warmup.update(id=window["id"]+"_warmup", scenario=window["scenario"], role="warmup")
+                expanded.append(warmup)
+            elif window.get("role") and window["scenario"] not in {"arrivals", "recovery"}:
                 warmup = deepcopy(window)
                 warmup.update(id=window["id"] + "_warmup", phase="warmup",
                               planned_duration_seconds=settings.warmup_seconds)
                 expanded.append(warmup)
             expanded.append(window)
         windows = expanded
+    for window in windows:
+        if window["scenario"] in {"arrivals", "recovery"} and window["phase"] == "measurement":
+            window["offers"] = _offer_plan(window, settings)
+            window["offer_accounting"] = _offer_counts(window["offers"])
+            for user in window["users"]:
+                user["offer_accounting"] = _offer_counts([o for o in window["offers"] if o["user_id"] == user["user_id"]])
     return {"version": 1, "window_policy": WINDOW_POLICY,
             "settings": settings.model_dump(mode="json"), "population": population,
             "windows": windows, "calibrations": []}
@@ -395,8 +578,12 @@ async def execute(run, target, client):
                     user["stop_reason"] = reason
                 run.mark_unfinished(target.name, ["multi_user"])
                 continue
-            await run_window(run, target, client, settings, load_settings, calibration, window,
-                             sources_by_profile=sources_by_profile, prepared_inputs=prepared_inputs, sequences=sequences)
+            if "offers" in window:
+                await run_arrival_window(run, target, client, settings, load_settings, calibration, window,
+                                         sources_by_profile=sources_by_profile, sequences=sequences)
+            else:
+                await run_window(run, target, client, settings, load_settings, calibration, window,
+                                 sources_by_profile=sources_by_profile, prepared_inputs=prepared_inputs, sequences=sequences)
     finally:
         from giraffe.overlap import scheduling_delay_windows
         observation["scheduling_delay_windows"] = [
@@ -442,6 +629,11 @@ def result(run, target):
         if interference_failures:
             detail = " ".join(f"{user['user_id']}: {' '.join(user['reasons'])}" for user in interference_failures)
             message = (message + " " if summary["failed_user_windows"] else "Observed noisy-neighbor interference failed. ") + detail
+        recovery_failures = [user for window in summary["windows"]
+                             for user in window.get("recovery", {}).get("users", []) if user["status"] == "fail"]
+        if recovery_failures:
+            message = "Observed per-user recovery failed. " + " ".join(
+                f"{user['user_id']}: {' '.join(user['reasons'])}" for user in recovery_failures)
     elif status == "pass":
         message = "Every measured user met the selected criteria over the common windows."
     else:

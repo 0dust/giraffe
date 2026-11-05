@@ -293,6 +293,8 @@ export function multiUserSettings(config, defaults) {
   result.think_time_seconds={...defaults.think_time_seconds,...saved.think_time_seconds};
   result.noisy_neighbors={...defaults.noisy_neighbors,...saved.noisy_neighbors};
   result.cancellation={...defaults.cancellation,...saved.cancellation};
+  result.arrivals={...defaults.arrivals,...saved.arrivals};
+  result.recovery={...defaults.recovery,...saved.recovery};
   return result;
 }
 
@@ -302,7 +304,17 @@ export function configureMultiUser(source, values, defaults, {allowInvalid=false
   const settings=multiUserSettings(source,defaults);
   const number=(name,label)=>numeric(values.get('multi_user_'+name),label,allowInvalid);
   const list=(name,label)=>String(values.get('multi_user_'+name)||'').split(',').map(value=>numeric(value.trim(),label,allowInvalid));
-  if(values.has('multi_user_scenarios_rendered'))settings.scenarios=['repeated_requests','noisy_neighbors','cancellation'].filter(name=>values.get('multi_user_scenario_'+name)==='on');
+  if(values.has('multi_user_scenarios_rendered'))settings.scenarios=['repeated_requests','noisy_neighbors','cancellation','arrivals','recovery'].filter(name=>values.get('multi_user_scenario_'+name)==='on');
+  if(values.has('multi_user_arrivals_requests_per_second'))settings.arrivals.requests_per_second=number('arrivals_requests_per_second','Requests per second per user');
+  if(values.has('multi_user_arrivals_activations')){
+    const rows=String(values.get('multi_user_arrivals_activations')||'').trim();
+    settings.arrivals.activations=Object.fromEntries(rows?rows.split(',').map(row=>{const [id,seconds]=row.trim().split('@');return [id.trim(),numeric(seconds,'Activation seconds',allowInvalid)];}):[]);
+  }
+  if(values.has('multi_user_arrivals_bursts')){
+    const rows=String(values.get('multi_user_arrivals_bursts')||'').trim();
+    settings.arrivals.bursts=rows?rows.split(',').map(row=>{const [id,seconds,count,spacing]=row.trim().split('@');return {user_id:id.trim(),at_seconds:numeric(seconds,'Burst time',allowInvalid),requests:numeric(count,'Burst requests',allowInvalid),spacing_seconds:numeric(spacing||'0','Burst spacing',allowInvalid)};}):[];
+  }
+  for(const key of ['control_seconds','sustained_seconds','lighter_seconds','sustained_requests_per_second','lighter_requests_per_second','max_slowdown'])if(values.has('multi_user_recovery_'+key))settings.recovery[key]=number('recovery_'+key,key);
   if(values.has('multi_user_noisy_neighbors_profiles_rendered'))settings.noisy_neighbors.heavy_profiles=['long_short','short_long','long_long'].filter(name=>values.get('multi_user_noisy_neighbors_profile_'+name)==='on');
   if(values.has('multi_user_noisy_neighbors_triggers_rendered'))settings.noisy_neighbors.triggers=['before_output','during_stream'].filter(name=>values.get('multi_user_noisy_neighbors_trigger_'+name)==='on');
   if(values.has('multi_user_noisy_neighbors_heavy_user_ids')){

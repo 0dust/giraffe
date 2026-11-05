@@ -74,7 +74,9 @@ def test_single_user_regression_is_not_pooled_with_healthy_peers():
 
 @pytest.mark.parametrize("field,value", [("seed", 999), ("levels", [1, 5]), ("duration_seconds", 20),
                                          ("shapes", ["long_long"]), ("fairness_tolerance_percent", 5),
-                                         ("conversations", {"modes": ["live"]})])
+                                         ("conversations", {"modes": ["live"]}),
+                                         ("arrivals", {"requests_per_second": 2}),
+                                         ("recovery", {"lighter_seconds": 9})])
 def test_changed_user_workload_cannot_pass_baseline(field, value):
     current, previous = user_report(), user_report()
     current.manifest["config"]["multi_user"][field] = value
@@ -110,6 +112,45 @@ def test_legacy_reports_do_not_gain_persistent_users(tmp_path):
     _, html_path = write_report(report, tmp_path, html=True)
     assert "Per-user shared-window delivery" not in html_path.read_text()
     assert "multi_user" not in reproduction_export(report)
+
+
+def test_recovery_report_export_cli_and_baseline_keep_all_phase_users(tmp_path, capsys):
+    from tests.test_multi_user_recovery import recovery_observation
+    from giraffe.reporting import _user_measurements
+    source, records = recovery_observation()
+    report = make_report()
+    for r in records:
+        r.target = "local"
+    report.requests = records
+    report.manifest['config'].update(checks=['multi_user'], multi_user=source['settings'])
+    summary = summarize(source, records)
+    report.checks = [CheckResult(id='multi_user', target='local', title='Multi-user', status=summary['status'],
+                                summary='Per-user recovery', metrics={'multi_user': summary})]
+    _, path = write_report(report, tmp_path, html=True)
+    html = path.read_text()
+    assert 'Matched per-user recovery' in html and 'user-03' in html and 'Recovery slowdown' in html
+    assert 'Scheduled and achieved traffic' in html and 'not server queue time' in html
+    exported = reproduction_export(report)['multi_user']['local']
+    assert [w['role'] for w in exported['windows']] == ['control', 'sustained', 'lighter']
+    assert exported['windows'][2]['recovery']['users'][2]['slowdown'] == 3
+    assert len(_user_measurements(report, 'local')) == 9
+    _print_result(report, tmp_path/'report.json', path, tmp_path, {})
+    output = capsys.readouterr().out
+    assert 'Matched per-user recovery: fail' in output and 'user-03: fail' in output
+
+
+def test_finite_user_request_comparisons_keep_phase_and_cohort():
+    from tests.test_multi_user_recovery import recovery_observation
+    from giraffe.reporting import _groups
+    source, records = recovery_observation()
+    for r in records:
+        r.traffic_stage = 0
+        r.workload['cohort'] = 'shared'
+    groups = _groups(records, 'service')
+    assert len(groups) == 9
+    assert all(len(rows) == 1 for rows in groups.values())
+    assert all('shared' in scenario for check, scenario in groups)
+    assert {r.workload['role'] for rows in groups.values() for r in rows} == {'control', 'sustained', 'lighter'}
 
 
 def test_matching_user_baseline_preserves_per_user_delivery_rows():

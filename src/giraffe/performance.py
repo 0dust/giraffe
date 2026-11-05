@@ -163,6 +163,8 @@ def _cohort_label(group, observation):
     point = first.load_point or {}
     check = next((name for name in first.check_ids if name in _PERFORMANCE_CHECKS), first.check_ids[0] if first.check_ids else "serving")
     check_label = CHECK_NAMES.get(check, check.replace("_", " ").capitalize())
+    if check == "multi_user" and first.workload.get("role"):
+        return check, " · ".join((check_label, first.workload.get("scenario", ""), first.workload["role"]))
     if point:
         shape = point.get("shape") or point.get("workload")
         name = {

@@ -650,7 +650,7 @@ class _Run:
                     on_start()
                 self.emit("request_started", target.name, spec.scenario,
                           request_slot=request_slot, fixture_id=spec.fixture_id,
-                          **({"user": {key: spec.workload[key] for key in ("user_id", "population", "profile", "window_id", "phase", "request_sequence", "session_id", "turn_id", "conversation_sequence", "role", "matched_work_sequence", "trigger", "heavy_profile", "cancellation_role") if key in spec.workload}} if "multi_user" in spec.check_ids else {}),
+                          **({"user": {key: spec.workload[key] for key in ("user_id", "population", "profile", "window_id", "phase", "request_sequence", "session_id", "turn_id", "conversation_sequence", "role", "matched_work_sequence", "trigger", "heavy_profile", "cancellation_role", "cohort", "origin", "work_sequence", "activation_seconds") if key in spec.workload}} if "multi_user" in spec.check_ids else {}),
                           input_chars=request_parameters["input_chars"], requested_max_tokens=output_cap,
                           requested_input_tokens=spec.requested_input_tokens,
                           condition_id=condition_id, condition_summary=dict(condition) if condition else None)
@@ -818,7 +818,7 @@ class _Run:
                               condition_id=condition_id, condition_summary=dict(condition) if condition else None,
                               input_chars=request_parameters["input_chars"], requested_max_tokens=output_cap,
                               requested_input_tokens=spec.requested_input_tokens,
-                              **({"user": {key: spec.workload[key] for key in ("user_id", "population", "profile", "window_id", "phase", "request_sequence", "session_id", "turn_id", "conversation_sequence", "role", "matched_work_sequence", "trigger", "heavy_profile", "cancellation_role") if key in spec.workload}} if "multi_user" in spec.check_ids else {}),
+                              **({"user": {key: spec.workload[key] for key in ("user_id", "population", "profile", "window_id", "phase", "request_sequence", "session_id", "turn_id", "conversation_sequence", "role", "matched_work_sequence", "trigger", "heavy_profile", "cancellation_role", "cohort", "origin", "work_sequence", "activation_seconds") if key in spec.workload}} if "multi_user" in spec.check_ids else {}),
                               request_slot=request_slot, request=record.model_dump(mode="json", include={
                                   "id", "target", "fixture_id", "scenario", "condition_id", "intentional", "status", "valid", "score",
                                   "elapsed_ms", "first_output_ms", "check_ids", "http_status",
@@ -2687,8 +2687,8 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
         workload_identity["session_sampling_source_sha256"] = hashlib.sha256(
             Path(session_sampling.__file__).read_bytes()).hexdigest()
     if "multi_user" in config.checks:
-        from giraffe import multi_user, multi_user_metrics, load_test, concurrent_load, session_sampling
-        workload_identity["multi_user_source_sha256"] = hashlib.sha256(b"".join(Path(m.__file__).read_bytes() for m in (multi_user, multi_user_metrics, load_test, concurrent_load, session_sampling))).hexdigest()
+        from giraffe import multi_user, multi_user_metrics, load_test, concurrent_load, session_sampling, traffic
+        workload_identity["multi_user_source_sha256"] = hashlib.sha256(b"".join(Path(m.__file__).read_bytes() for m in (multi_user, multi_user_metrics, load_test, concurrent_load, session_sampling, traffic))).hexdigest()
         workload_identity["multi_user_window_policy"] = multi_user.WINDOW_POLICY
     if "load" in config.checks:
         from giraffe import load_test, concurrent_load, traffic

@@ -1179,6 +1179,19 @@ def _print_result(report: RunReport, json_path: Path, html_path: Path | None,
             print(f"  {window['population']} users · {window.get('duration_seconds', 0):.3g} / {window['planned_duration_seconds']:g} planned seconds")
             if window.get("role"):
                 print("    " + " · ".join(str(window[key]) for key in ("scenario", "role", "trigger", "heavy_profile") if window.get(key)))
+            if counts := window.get("offer_accounting"):
+                print("    Scheduled and achieved traffic: " + " · ".join(f"{key}: {value}" for key, value in counts.items()))
+                for user in window["users"]:
+                    print(f"      {user['user_id']} / {user.get('cohort')} · scheduled/observed activation "
+                          f"{user.get('scheduled_activation_ms')} / {user.get('activated_ms')} ms · "
+                          + " · ".join(f"{key}: {value}" for key, value in user.get("offer_accounting", {}).items()))
+            if evidence := window.get("recovery"):
+                print(f"    Matched per-user recovery: {evidence['status']}")
+                for user in evidence["users"]:
+                    print(f"      {user['user_id']}: {user['status']} · {user['matched_samples']} matched samples · "
+                          f"slowdown {user['slowdown']} · {' '.join(user['reasons'])}")
+                    for label, values in user["phases"].items():
+                        print(f"        {label}: {values} · requests: {', '.join(user.get(label+'_request_ids', []))}")
             if evidence := window.get("interference"):
                 print(f"    Matched noisy-neighbor comparison: {evidence['status']}")
                 for reason in evidence.get("reasons", []):

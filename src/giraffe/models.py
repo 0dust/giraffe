@@ -868,7 +868,8 @@ def required_concurrency(config) -> dict[str, Any]:
             arrival = config.effective_arrivals()
             peak = arrival.max_in_flight if arrival else config.inherited_concurrency(config.default_concurrency)
         elif check == "multi_user":
-            peak = max(config.multi_user.levels)
+            peak = (config.concurrency if set(config.multi_user.scenarios) & {"arrivals", "recovery"}
+                    else max(config.multi_user.levels))
         elif check == "sessions":
             peak = min(config.sessions.concurrency, config.sessions.sessions)
         elif check == "consistency":
@@ -1208,9 +1209,33 @@ class MultiUserCancellation(Model):
     cancel_after_chunks: StrictInt = Field(default=5, ge=1, le=1000)
 
 
+class MultiUserBurst(Model):
+    user_id: str = "user-01"
+    at_seconds: float = Field(default=1, ge=0, le=MAX_STAGE_SECONDS)
+    requests: StrictInt = Field(default=5, ge=1, le=MAX_BURST_SIZE)
+    spacing_seconds: float = Field(default=0, ge=0, le=MAX_STAGE_SECONDS)
+
+
+class MultiUserArrivals(Model):
+    requests_per_second: float = Field(default=1, gt=0, le=1000)
+    activations: dict[str, Annotated[float, Field(ge=0, le=MAX_STAGE_SECONDS)]] = Field(default_factory=dict, max_length=32)
+    bursts: list[MultiUserBurst] = Field(default_factory=list, max_length=32)
+
+
+class MultiUserRecovery(Model):
+    control_seconds: float = Field(default=5, gt=0, le=MAX_STAGE_SECONDS)
+    sustained_seconds: float = Field(default=15, gt=0, le=MAX_STAGE_SECONDS)
+    lighter_seconds: float = Field(default=5, gt=0, le=MAX_STAGE_SECONDS)
+    sustained_requests_per_second: float = Field(default=2, gt=0, le=1000)
+    lighter_requests_per_second: float = Field(default=.5, gt=0, le=1000)
+    max_slowdown: float | None = Field(default=None, ge=1)
+
+
 class MultiUser(Model):
-    scenarios: list[Literal["repeated_requests", "noisy_neighbors", "cancellation"]] = Field(
-        default_factory=lambda: ["repeated_requests"], min_length=1, max_length=3)
+    scenarios: list[Literal["repeated_requests", "noisy_neighbors", "cancellation", "arrivals", "recovery"]] = Field(
+        default_factory=lambda: ["repeated_requests"], min_length=1, max_length=5)
+    arrivals: MultiUserArrivals = Field(default_factory=MultiUserArrivals)
+    recovery: MultiUserRecovery = Field(default_factory=MultiUserRecovery)
     noisy_neighbors: MultiUserNeighbors = Field(default_factory=MultiUserNeighbors)
     cancellation: MultiUserCancellation = Field(default_factory=MultiUserCancellation)
     levels: list[Annotated[StrictInt, Field(ge=1, le=MAX_SIMULATED_USERS)]] = Field(
@@ -1231,9 +1256,29 @@ class MultiUser(Model):
             raise ValueError("multi-user scenarios must be distinct")
         if self.conversations and self.scenarios != ["repeated_requests"]:
             raise ValueError("conversation users support the repeated_requests scenario")
-        if any(s != "repeated_requests" for s in self.scenarios) and min(self.levels) < 2:
-            raise ValueError("noisy neighbors and cancellation require at least two users at every level")
+        if set(self.scenarios) & {"noisy_neighbors", "cancellation", "recovery"} and min(self.levels) < 2:
+            raise ValueError("noisy neighbors, cancellation and recovery require at least two users at every level")
         ids = {f"user-{index + 1:02d}" for index in range(min(self.levels))}
+        if "arrivals" in self.scenarios:
+            arrivals = self.arrivals
+            if not set(arrivals.activations) <= ids or any(b.user_id not in ids for b in arrivals.bursts):
+                raise ValueError("arrival and burst user IDs must exist at every population level")
+            if any(at >= self.duration_seconds for at in arrivals.activations.values()):
+                raise ValueError("user activations must precede the arrival window end")
+            if any(b.at_seconds < arrivals.activations.get(b.user_id, 0)
+                   or b.at_seconds + (b.requests-1)*b.spacing_seconds >= self.duration_seconds for b in arrivals.bursts):
+                raise ValueError("every burst must fall after its user activation and before the window end")
+            if math.ceil(self.duration_seconds * arrivals.requests_per_second) * max(self.levels) + sum(b.requests for b in arrivals.bursts) > MAX_PLANNED_ARRIVALS:
+                raise ValueError("multi-user arrival schedule exceeds the finite offer bound")
+        if "recovery" in self.scenarios:
+            recovery = self.recovery
+            if recovery.lighter_requests_per_second >= recovery.sustained_requests_per_second:
+                raise ValueError("recovery traffic must be lighter than sustained traffic")
+            if any(math.ceil(seconds*rate)*max(self.levels) > MAX_PLANNED_ARRIVALS for seconds, rate in (
+                    (recovery.control_seconds, recovery.lighter_requests_per_second),
+                    (recovery.sustained_seconds, recovery.sustained_requests_per_second),
+                    (recovery.lighter_seconds, recovery.lighter_requests_per_second))):
+                raise ValueError("multi-user recovery schedule exceeds the finite offer bound")
         if "cancellation" in self.scenarios and self.cancellation.user_id not in ids:
             raise ValueError("the cancellation user must exist at every population level")
         if "noisy_neighbors" in self.scenarios:

@@ -1095,13 +1095,13 @@ def request_plan(config: RunConfig | ConfigDraft, *,
             phases = [window for window in windows if window["population"] == level]
             seconds = sum(window["planned_duration_seconds"] for window in phases)
             add(f"multi_user_{level}", None,
-                f"{level} persistent users share the run request slots for {settings.duration_seconds:g} s"
-                f" after {settings.warmup_seconds:g} s warmup per window; {len(phases)} windows total "
-                f"({seconds:g} s). Each request drains within its ordinary timeout.",
+                f"{level} persistent users share the run request slots across {len(phases)} explicit windows "
+                f"({seconds:g} s including warmup). Each request drains within its ordinary timeout.",
                 source="isolated conversations" if settings.conversations else "generated token-target prompts",
                 kind="duration", title=f"Multi-user · {level} users")
             rows[-1].update(users=level, simultaneous_limit=config.concurrency,
-                            configured_seconds=seconds, window_count=len(phases), scenarios=settings.scenarios)
+                            configured_seconds=seconds, window_count=len(phases), scenarios=settings.scenarios,
+                            scheduled_offers=sum(len(window.get("offers", [])) for window in phases))
     if "sessions" in selected:
         settings = config.sessions
         if settings.profile == "performance":
