@@ -76,6 +76,161 @@ assert.equal(JSON.stringify(config),original);
 """)
 
 
+def test_session_description_matches_initial_mode_and_updates_on_switch():
+    browser_logic(r"""
+const correct=renderSessionEditor({...config,sessions:{profile:'correctness'}});
+const performance=renderSessionEditor({...config,sessions:{profile:'performance'}});
+assert(correct.includes('data-session-description>Giraffe assigns a unique name'));
+assert.equal((correct.match(/Giraffe assigns a unique name/g)||[]).length,1);
+assert(performance.includes('data-session-description>Measure conversation performance'));
+const editor=renderProfileEditor({id:'sessions'},config);
+assert.equal((editor.match(/name="profile_sessions_modes"/g)||[]).length,1);
+assert.match(editor,/data-session-description>[^<]+<\/p>\s*<div data-session-legacy[^>]*><div[^>]*>[\s\S]*?Conversation history/);
+assert(editor.indexOf('name="profile_sessions_modes"')<editor.indexOf('name="profile_sessions_concurrency"'));
+for(const label of ['Prewritten replies','Replies from this run','Test both'])assert(editor.includes('>'+label+'</option>'));
+assert.doesNotMatch(editor,/Uses the saved fixed\/live exact-repeat/);
+assert(editor.indexOf('Conversation tasks')<editor.indexOf('Traffic and timing'));
+assert(editor.indexOf('Add custom task')<editor.indexOf('Traffic and timing'));
+assert(editor.indexOf('Traffic and timing')<editor.indexOf('name="session_pause_mode"'));
+assert(editor.indexOf('Recall prompts')<editor.indexOf('Traffic and timing'));
+assert(editor.includes('Recall prompts (one line per turn)'));
+assert.doesNotMatch(editor,/<summary>Recall prompts<\/summary>/);
+assert.doesNotMatch(editor,/Giraffe adds a name-recall instruction|expected replies are generated automatically/);
+assert(correct.includes('<legend>Pause between turns</legend>'));
+assert(correct.includes('type="radio" name="session_pause_mode" value="fixed" checked'));
+assert(correct.includes('type="radio" name="session_pause_mode" value="dynamic"'));
+assert.doesNotMatch(editor,/Sample pauses|name="sessions_delay"|<select name="session_pause_mode"/);
+assert(performance.includes('<summary>Vary message lengths and turns</summary>'));
+assert.doesNotMatch(editor,/name="profile_sessions_saved_answers"|Conversation questions|Prepared answers/);
+const selector={value:'correctness'},description={textContent:''};
+const controls={'[data-session-description]':description,'[data-session-mix]':{},'[data-session-legacy]':{},'[data-session-fixed]':{},'[data-session-correctness-traffic]':{},'[data-session-performance-traffic]':{}};
+nodes['#new-run-form']={elements:{sessions_profile:selector},querySelector:key=>controls[key]};
+state.bootstrap.checks=[];syncPackControls=()=>{};
+for(const mode of ['correctness','performance','correctness']){
+  selector.value=mode;syncTestControls();
+  assert.equal(description.textContent,sessionProfileDescription(mode));
+  assert.equal(controls['[data-session-mix]'].hidden,mode!=='performance');
+  if(mode==='correctness')assert.match(description.textContent,/every reply repeats it exactly/);
+  else assert.match(description.textContent,/without scoring answer quality/);
+  assert.equal(controls['[data-session-legacy]'].hidden,mode==='performance');
+  assert.equal(controls['[data-session-correctness-traffic]'].hidden,mode==='performance');
+  assert.equal(controls['[data-session-performance-traffic]'].hidden,mode!=='performance');
+}
+const historySelector={value:'live'},historyHint={textContent:''};
+nodes['#new-run-form'].elements.profile_sessions_modes=historySelector;
+controls['#field-profile_sessions_modes-hint']=historyHint;
+const historyDescriptions={
+  fixed:'Use prewritten earlier replies to test each answer against a controlled conversation.',
+  live:'Keep the model’s actual replies in the conversation to test it like a normal chat.',
+  'fixed,live':'Test each conversation twice: once with prewritten replies and once with the model’s actual replies.',
+};
+for(const [mode,expected] of Object.entries(historyDescriptions)){
+  const initial=renderSessionEditor({...config,sessions:{profile:'correctness',modes:mode.split(',')}});
+  assert(initial.includes(escape(expected)));
+  historySelector.value=mode;syncTestControls();assert.equal(historyHint.textContent,expected);
+}
+const legacy={...config,sessions:{...clone(bootstrap.profile_defaults.sessions),saved_answers:['Old reply','Old reply']}};
+const edits=new FormData();edits.set('profile_edits_sessions','["turns","delay_seconds"]');
+edits.set('profile_sessions_turns','Remember the assigned name.\nRepeat the assigned name.');edits.set('profile_sessions_delay_seconds','2');
+const edited=configureProfiles(legacy,edits,bootstrap.profile_defaults);
+assert.equal(edited.sessions.turns.length,2);assert.equal(edited.sessions.delay_seconds,2);
+assert.equal(JSON.stringify(edited.sessions.saved_answers),JSON.stringify(legacy.sessions.saved_answers));
+""")
+
+
+def test_pause_radio_change_shows_only_selected_fields_without_erasing_values():
+    browser_logic(r"""
+const controls={'[data-session-mix]':{},'[data-session-legacy]':{},'[data-session-fixed-pause]':{},'[data-session-dynamic-pause]':{},'[data-session-seed]':{}};
+const mode={value:'fixed'},lengths={value:''},pauses={value:'0, 1, 5'};
+const form={elements:{sessions_profile:{value:'correctness'},session_pause_mode:mode,session_sample_input_tokens:lengths,session_sample_think_time_seconds:pauses},querySelector:key=>controls[key]};
+nodes['#new-run-form']=form;state.bootstrap.checks=[];syncPackControls=()=>{};updateBounds=()=>{};
+const input={name:'session_pause_mode',dataset:{},matches:()=>false,closest:()=>null};
+for(const profile of ['correctness','performance']){
+  form.elements.sessions_profile.value=profile;
+  for(const value of ['dynamic','fixed','dynamic']){
+    mode.value=value;listeners.change({target:input});
+    assert.equal(controls['[data-session-fixed-pause]'].hidden,value==='dynamic');
+    assert.equal(controls['[data-session-dynamic-pause]'].hidden,value!=='dynamic');
+    assert.equal(controls['[data-session-seed]'].hidden,value!=='dynamic');
+    assert.equal(pauses.value,'0, 1, 5');
+  }
+}
+mode.value='fixed';lengths.value='128, 512';syncTestControls();
+assert.equal(controls['[data-session-seed]'].hidden,false);
+form.elements.sessions_profile.value='correctness';syncTestControls();
+assert.equal(controls['[data-session-seed]'].hidden,true);
+""")
+
+
+def test_history_select_change_event_refreshes_hint_and_records_profile_edit():
+    browser_logic(r"""
+const hint={textContent:'stale'},marker={value:'[]'},profile={dataset:{profileSettings:'sessions'}};
+const controls={'#field-profile_sessions_modes-hint':hint,'[data-session-mix]':{},'[data-session-legacy]':{}};
+const form={elements:{sessions_profile:{value:'correctness'},profile_edits_sessions:marker},querySelector:key=>controls[key]};
+const selector={name:'profile_sessions_modes',id:'field-profile_sessions_modes',tagName:'SELECT',dataset:{},value:'fixed',
+  matches:()=>false,closest:key=>({'[data-profile-settings]':profile,'[data-test-editor]':{},'#new-run-form':form})[key]||null};
+form.elements.profile_sessions_modes=selector;nodes['#new-run-form']=form;
+state.bootstrap.checks=[];syncPackControls=()=>{};configChanged=()=>{};scheduleRequestPlan=()=>{};updateBounds=()=>{};handlePerformanceChange=()=>false;
+for(const mode of ['fixed','live','fixed,live','fixed']){
+  selector.value=mode;listeners.change({target:selector});
+  assert.equal(hint.textContent,sessionHistoryDescription(mode));
+  assert.equal(marker.value,'["modes"]');
+}
+""")
+
+
+def test_session_task_edits_keep_settings_visible_and_reveal_the_edited_task():
+    browser_logic(r"""
+state.config.sessions={...clone(bootstrap.session_workloads.defaults),profile:'performance',
+  workloads:clone(bootstrap.session_workloads.presets)};
+const advanced={open:true},taskNodes={};
+let renders=0,focused=null,scrolled=null;
+nodes['#setup-advanced']=advanced;
+nodes['[data-action="add-session-workload"]']={closest:()=>advanced,focus:()=>{focused='add';},scrollIntoView:()=>{scrolled='add';}};
+function taskForm(){
+  const elements={};
+  state.config.sessions.workloads.forEach((item,index)=>{
+    const details={open:false};
+    const input={value:item.name,closest:()=>details,
+      focus:()=>{focused=item.name;},scrollIntoView:()=>{scrolled=item.name;}};
+    elements['session_name_'+index]=input;elements['session_enabled_'+index]={checked:true};
+    nodes['#field-session_name_'+index]=input;taskNodes[item.name]=details;
+  });
+  nodes['#new-run-form']={elements};
+}
+taskForm();captureFormDraft=()=>{};configChanged=()=>{};
+renderNew=()=>{renders++;advanced.open=false;taskForm();};syncTestControls=()=>{};
+const original=JSON.stringify(state.config.sessions.workloads);
+editSessionWorkload('add-session-workload');
+assert.equal(renders,1);assert.equal(advanced.open,true);
+assert.equal(taskNodes['custom-1'].open,true);assert.equal(focused,'custom-1');assert.equal(scrolled,'custom-1');
+assert.equal(JSON.stringify(state.config.sessions.workloads.slice(0,-1)),original);
+editSessionWorkload('add-session-workload');assert.equal(taskNodes['custom-2'].open,true);
+const index=state.config.sessions.workloads.findIndex(item=>item.name==='custom-1');
+editSessionWorkload('add-session-turn',index);
+assert.equal(state.config.sessions.workloads[index].turns.length,3);
+assert.equal(advanced.open,true);assert.equal(taskNodes['custom-1'].open,true);
+editSessionWorkload('remove-session-turn',index);
+assert.equal(state.config.sessions.workloads[index].turns.length,2);
+assert.equal(advanced.open,true);assert.equal(taskNodes['custom-1'].open,true);
+assert.equal((renderSessionEditor(state.config).match(/>Delete task<\/button>/g)||[]).length,2);
+const remaining=JSON.stringify(state.config.sessions.workloads.filter(item=>item.name!=='custom-1'));
+nodes['#new-run-form'].elements['session_enabled_'+index].checked=false;
+editSessionWorkload('remove-session-workload',index);
+assert.equal(JSON.stringify(state.config.sessions.workloads),remaining);
+assert.equal(advanced.open,true);assert.equal(focused,'add');assert.equal(scrolled,'add');
+assert(!renderSessionEditor(state.config).includes('Custom-1 ·'));
+state.config.sessions.workloads=state.config.sessions.workloads.filter(item=>item.name==='custom-2');taskForm();
+editSessionWorkload('remove-session-workload',0);
+assert.equal(state.config.sessions.workloads.length,0);
+const empty=renderSessionEditor(state.config);
+assert(!empty.includes('Custom-2 ·'));assert.doesNotMatch(empty,/name="session_enabled_\d+" checked/);
+assert.doesNotMatch(empty,/>Delete task<\/button>/);
+editSessionWorkload('add-session-workload');
+assert.equal(state.config.sessions.workloads[0].name,'custom-1');
+""")
+
+
 def test_saved_questions_summary_does_not_claim_inactive_sample_settings():
     browser_logic(r"""
 const check=bootstrap.checks.find(x=>x.id==='correctness');

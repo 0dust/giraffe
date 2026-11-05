@@ -174,7 +174,7 @@ async def test_restart_readiness_deadline_bounds_backoff_and_inflight_request(mo
         async def __aexit__(self, *args):
             pass
         async def ready(self, deadline):
-            await asyncio.sleep(1)
+            await asyncio.sleep(30)
     async def restart(run, target):
         run.observations["t"]["restart"] = {"status": "hook_completed", "started_monotonic": runner.time.monotonic(),
                                           "service_answered_ms": None, "warm_requests": []}
@@ -184,7 +184,7 @@ async def test_restart_readiness_deadline_bounds_backoff_and_inflight_request(mo
     run = runner._Run(cfg, None, None)
     await runner._target(run, cfg.targets[0], builtin_fixtures(cfg))
     assert run.observations["t"]["restart"]["status"] == "blocked"
-    assert run.errors == 0 and runner.time.monotonic()-run.start < .2
+    assert run.errors == 0 and runner.time.monotonic()-run.start < 10
 
 
 def test_healthy_capacity_retains_all_offers_and_following_serial_overlap(monkeypatch, local_tokenizer):

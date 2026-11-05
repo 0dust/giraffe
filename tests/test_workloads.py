@@ -74,7 +74,7 @@ async def test_concurrent_session_history_exact_marker_and_no_cross_contaminatio
                                  "Repeat exactly the bakery name you just suggested, with no extra text."]
         report = await run_suite(config(endpoint, sessions=settings, retention="none"))
         session_calls = [p for p in endpoint.requests
-                         if p["messages"][0]["content"].startswith("Suggest a name for a bakery")]
+                         if "Use this exact bakery name for this session:" in p["messages"][0]["content"]]
     followups = [p for p in session_calls if p["messages"][-1]["content"].startswith("Repeat")]
     assert len(followups) == 2
     assert all("Use this exact bakery name for this session:" in p["messages"][0]["content"]
@@ -144,7 +144,7 @@ async def test_failed_semantic_turn_stops_session_before_next_user_turn(repeat_p
             )
         )
         calls = [p for p in endpoint.requests
-                 if p["messages"][0]["content"].startswith("Suggest a name for a bakery")]
+                 if "Use this exact bakery name for this session:" in p["messages"][0]["content"]]
     assert len(calls) == 2
     assert check(report, "sessions").status == "fail"
     assert (

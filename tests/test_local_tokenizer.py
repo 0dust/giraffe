@@ -124,7 +124,8 @@ async def test_stop_during_preparation_kills_worker_and_finishes_progress(monkey
     assert run._tokenizer_preparation_seconds[target.name] > 0
 
 
-async def test_worker_forces_offline_matching_tokenizer_and_counts_chat_template(tmp_path, monkeypatch):
+@pytest.mark.parametrize("content_only", [False, True])
+async def test_worker_forces_offline_matching_tokenizer_and_counts_chat_template(tmp_path, monkeypatch, content_only):
     # Exercise the actual import/worker entry point without a model download.
     # The stub rejects incorrect options and includes role/template token costs.
     (tmp_path / "transformers.py").write_text('''
@@ -140,14 +141,18 @@ class AutoTokenizer:
     def apply_chat_template(self, messages, *, tokenize, add_generation_prompt, return_dict):
         assert tokenize and add_generation_prompt and not return_dict
         return [0] * (7 + sum(len(m["content"]) for m in messages))
+    def encode(self, content, *, add_special_tokens):
+        assert not add_special_tokens
+        return [0] * len(content)
 ''')
     from pathlib import Path
     monkeypatch.setenv("PYTHONPATH", f"{tmp_path}:{Path(sizing.__file__).parents[1]}")
     run, target, _ = run_and_target()
-    result = await sizing.prepare_messages(run, target, "load", lambda n: [{"role": "user", "content": "x" * n}], 100, tolerance=0)
+    result = await sizing.prepare_messages(run, target, "load", lambda n: [{"role": "user", "content": "x" * n}], 100, tolerance=0, content_only=content_only)
     assert result["status"] == "calibrated"
     assert result["input_tokens"] in {99, 100, 101}
-    assert result["input_tokens"] == 7 + result["filler_chars"]
+    assert result["input_tokens"] == (0 if content_only else 7) + result["filler_chars"]
+    assert result["token_count_scope"] == ("message_content" if content_only else "chat_template")
 
 
 @pytest.mark.parametrize("budget", ["run", "target"])

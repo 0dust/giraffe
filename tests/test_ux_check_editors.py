@@ -199,8 +199,9 @@ def test_profile_controls_explain_the_experiment_and_keep_uncommon_values():
 config.sessions={...bootstrap.profile_defaults.sessions,modes:['live','fixed']};
 const markup=renderProfileEditor(bootstrap.checks.find(x=>x.id==='sessions'),config);
 assert.match(markup,/<option value="live,fixed" selected>Saved selection/);
-const advanced=markup.match(/<details class="check-advanced">([\s\S]*?)<\/details>/)[1];
+const advanced=markup.match(/<details[^>]*data-session-length-sampling[^>]*>([\s\S]*?)<\/details>/)[1];
 assert.doesNotMatch(advanced,/name="profile_sessions_max_tokens"/);
+assert.match(advanced,/name="session_sample_input_tokens"/);
 assert.match(markup,/data-profile-settings="sessions" class="fields">[\s\S]*name="profile_sessions_max_tokens"/);
 assert.equal((markup.match(/name="profile_sessions_max_tokens"/g)||[]).length,1);
 assert.match(markup,/Conversations to run for each chosen history type/);
