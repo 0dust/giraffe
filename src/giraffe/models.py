@@ -40,6 +40,7 @@ CHECK_NAMES = {
     "prefix": "Prefix cache",
     "sessions": "Multi-turn sessions",
     "multi_user": "Multi-user",
+    "gateway_attribution": "Gateway usage attribution",
     "consistency": "Answer consistency",
     "tools": "Tool calling",
 }
@@ -1290,6 +1291,35 @@ class TestIdentity(Model):
         return self
 
 
+class GatewayEvidence(TestIdentity):
+    profile: str = Field(default="litellm", min_length=1, max_length=64)
+    url: str
+
+    @field_validator("url")
+    @classmethod
+    def validate_url(cls, value):
+        from urllib.parse import urlsplit
+        parsed = urlsplit(value)
+        if (parsed.scheme not in {"http", "https"} or not parsed.hostname
+                or any((parsed.username, parsed.password, parsed.query, parsed.fragment))
+                or any(char.isspace() for char in value)):
+            raise ValueError("gateway evidence URL must be http(s) without credentials, query or fragment")
+        return value
+
+
+class GatewayAttribution(Model):
+    identities: list[str] = Field(min_length=1, max_length=32)
+    samples: int = Field(default=2, ge=1, le=16)
+    settle_seconds: float = Field(default=2, gt=0, le=30)
+
+    @field_validator("identities")
+    @classmethod
+    def validate_identities(cls, value):
+        if len(set(value)) != len(value) or any(not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", x) for x in value):
+            raise ValueError("attribution identities must be unique configured identity labels")
+        return value
+
+
 class Target(Model):
     tokenizer: str | None = Field(default=None, min_length=1,
         description="Prompt sizing tokenizer: null or auto resolves the served model name and falls back to builtin; builtin uses tiktoken o200k_base. A model ID or local directory remains an optional CLI override. Tokenizer assets download and cache locally; no inference is used for sizing.")
@@ -1302,6 +1332,7 @@ class Target(Model):
     api_key_env: str | None = None
     headers_env: dict[str, str] = Field(default_factory=dict)
     test_identities: dict[str, TestIdentity] = Field(default_factory=dict, max_length=32)
+    gateway: GatewayEvidence | None = None
     route: Literal["direct", "gateway", "replica"] = "direct"
     parent: str | None = None
     identity: dict[str, str] = Field(default_factory=dict)
@@ -1320,6 +1351,8 @@ class Target(Model):
         result = handler(self)
         if not self.test_identities:
             result.pop("test_identities", None)
+        if self.gateway is None:
+            result.pop("gateway", None)
         return result
 
     @field_validator("tokenizer", mode="before")
@@ -2046,6 +2079,7 @@ class RunConfig(Model):
     _concurrency_warnings: list[dict[str, Any]] = PrivateAttr(default_factory=list)
     sessions: Sessions | None = None
     multi_user: MultiUser | None = None
+    gateway_attribution: GatewayAttribution | None = None
     consistency: Consistency | None = None
     tool_calling: bool = False
     forced_tool_diagnostic: bool = False
@@ -2125,6 +2159,8 @@ class RunConfig(Model):
                     self.checks.append(check)
         self.validate_active_judges()
         self.checks = list(dict.fromkeys(self.checks))
+        if "gateway_attribution" in self.checks and self.gateway_attribution is None:
+            raise ValueError("gateway_attribution requires explicit identity selection and settings")
         self.structured_json, self.metrics = "json" in self.checks, "gpu" in self.checks
         self.tool_calling = "tools" in self.checks
         if (self.tool_calling and self.tool_checks and self.tool_checks.modes
@@ -2389,6 +2425,8 @@ class RunConfig(Model):
         result = handler(self)
         if "default_concurrency" not in self.model_fields_set:
             result.pop("default_concurrency", None)
+        if self.gateway_attribution is None:
+            result.pop("gateway_attribution", None)
         return result
 
     @field_serializer("limits")
@@ -2563,6 +2601,7 @@ class RequestRecord(PersistedModel):
             result.pop("gateway_evidence", None)
         return result
     _timing_started_monotonic: float | None = PrivateAttr(default=None)
+    _gateway_key_hash: str | None = PrivateAttr(default=None)
     id: str
     target: str
     fixture_id: str

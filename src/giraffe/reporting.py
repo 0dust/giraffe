@@ -56,6 +56,8 @@ def _rate(record: RequestRecord) -> float | None:
 def _groups(records: list[RequestRecord], target: str) -> dict[tuple[str, str], list[RequestRecord]]:
     groups: dict[tuple[str, str], list[RequestRecord]] = defaultdict(list)
     for record in records:
+        if record.identity is not None:
+            continue  # Credential probes are not throughput/latency workloads.
         if (record.target == target and getattr(record, "traffic_stage", None) is None
                 and record.scenario not in {"client_cancel", "client_deadline", "sglang_cancel", "backend_cancel"}):
             for check in record.check_ids:
@@ -1168,6 +1170,9 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
         saturated_runs = [label for label, run in (("Current", report), ("Baseline", baseline))
                           if _generator_saturated(run, name)]
         old_target = old_targets.get(name)
+        if (old_target is not None and "gateway_attribution" in report.manifest.get("config", {}).get("checks", [])
+                and any(target.get(key) != old_target.get(key) for key in ("test_identities", "gateway"))):
+            target_reasons.append("Gateway identity references or evidence configuration differs; attribution runs are not comparable.")
         identity_changes = {}
         if old_target is None:
             target_reasons.append("Target is absent from the baseline.")
@@ -2874,6 +2879,9 @@ def reproduction_export(report: RunReport) -> dict:
             "invocation": safe_invocation(retained.manifest.get("invocation")),
             "config": retained.manifest.get("config", {}),
             "fixture_pack": retained.manifest.get("fixture_pack", {}),
+            **({"gateway_attribution": {check.target: check.metrics for check in retained.checks
+                                         if check.id == "gateway_attribution"}}
+               if any(check.id == "gateway_attribution" for check in retained.checks) else {}),
             **({"multi_user": {check.target: _multi_user_export(check.metrics["multi_user"])
                                for check in retained.checks
                                if check.id == "multi_user" and check.metrics.get("multi_user")}}
