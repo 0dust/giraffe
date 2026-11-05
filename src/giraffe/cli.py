@@ -1190,6 +1190,8 @@ def _print_result(report: RunReport, json_path: Path, html_path: Path | None,
                           f"{user.get('stream_gap_change_ms')} ms · output change {user.get('output_tokens_change')} tokens")
                     print(f"        Actual input medians {user.get('control_input_median_tokens')} → {user.get('probe_input_median_tokens')}; "
                           f"output medians {user.get('control_output_median_tokens')} → {user.get('probe_output_median_tokens')}")
+                    print(f"        Heavy input / output medians: {user.get('heavy_input_median_tokens')} / "
+                          f"{user.get('heavy_output_median_tokens')} tokens")
                     for reason in user.get("reasons", []):
                         print(f"        {reason}")
                     for name in ("control_request_ids", "probe_request_ids", "heavy_request_ids"):

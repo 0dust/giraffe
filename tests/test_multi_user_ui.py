@@ -43,8 +43,28 @@ def test_scenario_results_show_separate_observations_and_request_links():
     browser_logic('const summary='+json.dumps(summary)+r''';
 const markup=renderMultiUserResults(summary);
 for(const text of ['Matched noisy-neighbor comparison','Missing heavy overlap','Selected request cancellation','Peer continuation','Same-user follow-up','Backend compute and memory release: unverified'])assert(markup.includes(text));
+assert.match(markup,/Heavy input \/ output medians: 640 \/ 32 tokens/);
 assert.match(markup,/data-request="user-01-1"/);
 assert.match(markup,/data-request="user-02-1"/);
+''', configuration())
+
+
+def test_imported_probe_order_survives_form_edits():
+    browser_logic(r'''
+config.multi_user.noisy_neighbors.heavy_profiles=['short_long','long_short'];
+config.multi_user.noisy_neighbors.triggers=['during_stream','before_output'];
+const form=new FormData();form.set('multi_user_rendered','1');
+form.set('multi_user_noisy_neighbors_profiles_rendered','1');
+form.set('multi_user_noisy_neighbors_triggers_rendered','1');
+for(const name of config.multi_user.noisy_neighbors.heavy_profiles)form.set('multi_user_noisy_neighbors_profile_'+name,'on');
+for(const name of config.multi_user.noisy_neighbors.triggers)form.set('multi_user_noisy_neighbors_trigger_'+name,'on');
+let changed=configureMultiUser(config,form,bootstrap.multi_user.defaults);
+assert.equal(JSON.stringify(changed.multi_user.noisy_neighbors),JSON.stringify(config.multi_user.noisy_neighbors));
+form.set('multi_user_noisy_neighbors_profile_long_long','on');
+form.delete('multi_user_noisy_neighbors_profile_long_short');
+changed=configureMultiUser(config,form,bootstrap.multi_user.defaults);
+assert.equal(JSON.stringify(changed.multi_user.noisy_neighbors.heavy_profiles),'["short_long","long_long"]');
+assert.equal(JSON.stringify(changed.multi_user.noisy_neighbors.triggers),'["during_stream","before_output"]');
 ''', configuration())
 
 
