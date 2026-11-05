@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from giraffe.models import CheckResult, RequestRecord, RunConfig, RunReport, Target
-from giraffe.reporting import compare_baseline, write_report
+from giraffe.reporting import _compare_metric, compare_baseline, write_report
 
 
 def make_report(run_id: str = "current", *, latency: float = 100, count: int = 8) -> RunReport:
@@ -32,6 +32,18 @@ def make_report(run_id: str = "current", *, latency: float = 100, count: int = 8
 
 def baseline_check(report: RunReport) -> CheckResult:
     return next(check for check in report.checks if check.id == "baseline")
+
+
+def test_rate_baseline_uses_percentage_point_threshold():
+    error = _compare_metric("error_rate", [0.1125] * 200, [0.0] * 200, 2, 20,
+                            rate_threshold=5)
+    correctness = _compare_metric("correctness_rate", [0.88] * 200, [1.0] * 200, 2, 20,
+                                  rate_threshold=5)
+    timing = _compare_metric("latency_ms", [120.0] * 200, [100.0] * 200, 2, 20,
+                             rate_threshold=5)
+    assert error["threshold"] == correctness["threshold"] == 5
+    assert error["status"] == correctness["status"] == "fail"
+    assert timing["threshold"] == 20
 
 
 def test_comparison_setting_reasons_include_structured_values_without_changing_text():
