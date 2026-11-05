@@ -12,7 +12,7 @@ from giraffe.local_tokenizer import SETUP_TIMEOUT_SECONDS
 from giraffe.fixtures import SUITE_VERSION, builtin_fixtures
 from giraffe.models import (
     CHECK_LIMIT_FIELDS, CHECK_NAMES, CHECK_OPTION_FIELDS, DEFAULT_CHECKS, CheckOptions, CleanupCriteria, Limits,
-    RunConfig, TrafficConfig, Arrival, Prefix, Sessions, Consistency, ConcurrentLoad, LoadTest, JudgingConfig, JUDGE_PROMPT_VERSION, JUDGE_VOTING_RULE,
+    RunConfig, TrafficConfig, Arrival, Prefix, Sessions, MultiUser, Consistency, ConcurrentLoad, LoadTest, JudgingConfig, JUDGE_PROMPT_VERSION, JUDGE_VOTING_RULE,
     DEFAULT_CONSISTENCY_OUTPUT_TOKENS, SHAPES, RequestPack, session_workload_presets,
 )
 from giraffe.caps import (MAX_PLANNED_ARRIVALS, MAX_REQUEST_PACK_BYTES, MAX_REQUEST_PACK_CASES,
@@ -209,6 +209,7 @@ def capabilities(config: RunConfig | None = None, *, restart_allowed: bool = Fal
         "load_test": {"defaults": LoadTest().model_dump(mode="json"), "schema": LoadTest.model_json_schema()},
         "concurrent_load": {"defaults": ConcurrentLoad().model_dump(mode="json"),
                                  "schema": ConcurrentLoad.model_json_schema()},
+        "multi_user": {"defaults": MultiUser().model_dump(mode="json"), "schema": MultiUser.model_json_schema()},
         "session_workloads": {"defaults": Sessions().model_dump(mode="json"),
                               "presets": [item.model_dump(mode="json") for item in session_workload_presets()]},
         "judging": {"schema": JudgingConfig.model_json_schema(),

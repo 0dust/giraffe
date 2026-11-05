@@ -2,7 +2,7 @@
 
 [Documentation index](README.md) · [Running and baselines](running.md)
 
-The public catalog has 15 checks. **Load test** combines the former concurrency,
+The public catalog has 16 checks. **Load test** combines the former concurrency,
 capacity and arrival checks. Workloads share configured run-wide request, duration
 and concurrency ceilings; Load test has its own token profile and request timeout.
 The [expanded example](../examples/workloads.yaml) includes legacy load settings
@@ -966,3 +966,26 @@ discovery is `unknown`. These observations do not prove a cold start or explain 
 slow first response. A separately requested UI connection test may already have
 loaded the model before the run starts. A deliberate restart may also change state
 between observations. This is one endpoint’s inventory, not proof about every replica.
+
+
+## Persistent multi-user requests
+
+The opt-in **Multi-user** check keeps a stable simulated user across repeated independent requests. Start with [multi-user.yaml](../examples/multi-user.yaml):
+
+```sh
+giraffe run --config examples/multi-user.yaml --output runs/multi-user --html
+```
+
+Set the endpoint and model first. All simulated users share its optional `api_key_env`; these are workload identities, not separate credentials. This first slice tests repeated independent requests only. Conversations, fairness verdicts, interference, cancellation scenarios, arrivals and recovery remain separate follow-up work.
+
+`multi_user.levels` selects populations of 1–32 users independently of the run's `concurrency` ceiling. The example runs 1, 5 and 20 users behind five shared request slots. Each user sends one request at a time, waits for completion and then pauses. Sleeping users hold no request slot. `think_time_seconds.values` and optional `weights` reuse the session distribution format; `seed` makes each user's profile and pause sequence reproducible across levels. `shapes` selects the existing short/medium/long input-output combinations; `profile` accepts the existing increasing token-size profile. Requests keep the run's request timeout and all existing global budgets.
+
+Each population has a common measurement window. Optional `warmup_seconds` traffic uses the same budgets and fully drains before measurement begins. New requests stop at the measurement cutoff; admitted requests can drain within their ordinary timeout and the global deadline. A request ready before cutoff but still waiting for a slot is retained as undispatched work.
+
+Per-user delivered throughput is **known valid output tokens completed inside the common measurement window divided by that window's actual seconds**. Equal delivered tokens therefore produce equal rates even when users had different active times. Late completions, partial output and missing usage are shown separately. Missing usage on an eligible completion makes exact throughput unknown; a user that never dispatched has known zero delivery and unexercised acceptance. This rate includes thinking and waiting; it is separate from generation pace.
+
+Optional `max_first_answer_ms` and `max_completion_ms` apply from the time a user is ready, including local admission wait. Dispatch-to-answer timings remain available in JSON and inspection. Every nonintentional admitted attempt enters timing attainment, including errors and requests that fail during drain. One user's failure is not hidden by healthy peers. A pending admission wait that already exceeds a selected timing limit is a client-admission breach when timing evidence is qualified; shorter waits at cutoff remain censored. Interrupted windows cannot pass, and incomplete throughput evidence is not an established throughput shortfall.
+
+`max_error_percent` defaults to zero; set it to `null` to omit that criterion. `min_output_tokens_per_second` is optional and measures shared-window delivery, not generation speed. `min_samples` requires that many valid responses for each user. With all acceptance thresholds set to `null`, results are measurements and the check remains inconclusive rather than claiming acceptance.
+
+CLI output, the UI, HTML, JSON and reproduction exports retain every planned user, including those with no requests. Results identify the worst served user and link user rows to their request evidence. Response retention still controls bodies and reasoning. Baselines compare each user at the same population and profile; changing population, shapes, seed, duration or window policy prevents a passing comparison. Shared-window rate changes are observed changes without a cross-run confidence interval. Reproduction exports include user settings, plans and compact outcomes, but do not recreate inaccessible server state.

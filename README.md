@@ -221,7 +221,7 @@ In the UI, open a completed run and choose **Save baseline** (fully passing runs
 
 ## Tests
 
-15 built-in checks. The four defaults are `access, serving, correctness, first_output`; select additional checks for your endpoint.
+16 built-in checks. The four defaults are `access, serving, correctness, first_output`; select additional checks for your endpoint.
 
 | Check · CLI ID | What it checks |
 | --- | --- |
@@ -238,10 +238,11 @@ In the UI, open a completed run and choose **Save baseline** (fully passing runs
 | GPU metrics · `gpu` | Available GPU telemetry |
 | Prefix cache · `prefix` | Reported cache reuse against independent controls |
 | Multi-turn sessions · `sessions` | Recall and timing across concurrent conversations |
+| Multi-user · `multi_user` | Persistent users sharing request slots, with individual delivery and timing outcomes |
 | Answer consistency · `consistency` | Answer agreement across repeated requests |
 | Tool calling · `tools` | Tool-call structure, names and expected arguments |
 
-The catalog has 13 verdict checks and two server observations: **GPU metrics** and
+The catalog has 14 verdict checks and two server observations: **GPU metrics** and
 **Prefix cache**. Both remain in the selected checks and baseline configuration.
 Missing GPU telemetry and missing or inactive prefix caching do not change the
 verdict. GPU hardware faults and an exceeded configured temperature limit can

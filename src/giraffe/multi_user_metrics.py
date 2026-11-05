@@ -1,7 +1,7 @@
 """Per-user delivery over explicit common windows, separate from generation pace."""
 from __future__ import annotations
 
-from collections import Counter
+from collections import Counter, defaultdict
 from typing import Any
 
 from .models import MultiUserCriteria, RequestRecord
@@ -38,7 +38,7 @@ def _first(record: RequestRecord) -> float | None:
     return start + record.first_output_ms if start is not None and record.first_output_ms is not None else None
 
 
-def _latency(record: RequestRecord, first: bool, *, ready: bool = True) -> float | None:
+def user_latency(record: RequestRecord, first: bool, *, ready: bool = True) -> float | None:
     start = record.workload.get("ready_ms") if ready else record.dispatch_ms
     end = _first(record) if first else record.completed_ms
     return max(0, end - start) if start is not None and end is not None else None
@@ -49,8 +49,6 @@ def _user_summary(user: dict[str, Any], window: dict[str, Any], records: list[Re
                   timing_threshold: float) -> dict[str, Any]:
     start, end = window.get("start_ms"), window.get("end_ms")
     duration = max(0, (end-start)/1000) if start is not None and end is not None else 0
-    # The scheduler's dispatch ledger retains cancelled and late attempts. Never
-    # infer a request from a ready user that did not get a slot.
     rows = [r for r in records if r.workload.get("user_id") == user["user_id"]
             and r.workload.get("window_id") == window["id"]
             and r.dispatch_ms is not None and start is not None and end is not None
@@ -73,13 +71,9 @@ def _user_summary(user: dict[str, Any], window: dict[str, Any], records: list[Re
     cancelled_tokens, cancelled_missing = _tokens([r for r in rows if r.status == "cancelled"])
     known_rate = known/duration if duration > 0 else None
     rate = known_rate if not missing and not unclassified and not missing_terminal else None
-    # A never-started user delivered no tokens, including when there was no
-    # measurement interval. Its acceptance remains unexercised, not passing.
     if not rows and not user.get("dispatched_count"):
         rate = known_rate = 0.0
 
-    # Existing timing qualification can include the ready-to-dispatch interval
-    # using its scheduled timestamp contract; source records stay unchanged.
     timing_rows = [r.model_copy(update={"scheduled_ms": r.workload.get("ready_ms")}) for r in valid]
     quality = qualify(timing_rows, health, timing_threshold,
                       ("latency_ms", "first_output_ms"), legacy_max_lag_ms=lag)
@@ -117,7 +111,7 @@ def _user_summary(user: dict[str, Any], window: dict[str, Any], records: list[Re
             elif record.status == "cancelled":
                 unknown += 1
             else:
-                value = _latency(record, first)
+                value = user_latency(record, first)
                 if value is None or record.id in affected:
                     unknown += 1
                 elif value > limit:
@@ -159,8 +153,6 @@ def _user_summary(user: dict[str, Any], window: dict[str, Any], records: list[Re
         if failed:
             reasons.append(f"Observed request error rate exceeds {criteria.max_error_percent:g}%.")
     if criteria.min_output_tokens_per_second is not None:
-        # An interrupted window cannot establish the delivery its remaining
-        # requests would have achieved. Keep the actual rate as a measurement.
         interrupted = bool(window.get("cut_short") or window.get("drain_reason")
                            or cancelled or missing_terminal)
         failed = (bool(attempts) and not interrupted and rate is not None
@@ -174,10 +166,10 @@ def _user_summary(user: dict[str, Any], window: dict[str, Any], records: list[Re
     status = _status([item["status"] for item in selected.values()]) if selected else "measured"
     if status == "inconclusive":
         reasons.extend(incomplete)
-    ready_first = [_latency(r, True) for r in valid]
-    ready_completion = [_latency(r, False) for r in valid]
-    dispatch_first = [_latency(r, True, ready=False) for r in valid]
-    dispatch_completion = [_latency(r, False, ready=False) for r in valid]
+    ready_first = [user_latency(r, True) for r in valid]
+    ready_completion = [user_latency(r, False) for r in valid]
+    dispatch_first = [user_latency(r, True, ready=False) for r in valid]
+    dispatch_completion = [user_latency(r, False, ready=False) for r in valid]
     coverage_reasons = list(incomplete)
     if missing:
         coverage_reasons.append("Some eligible completions have no reported output token count.")
@@ -240,15 +232,21 @@ def summarize(observation: dict[str, Any], records: list[RequestRecord], *,
               timing_health: dict | None = None, legacy_max_lag_ms: float = 0) -> dict[str, Any]:
     """Summarize the planned population without mutating its ledger or requests."""
     criteria = MultiUserCriteria.model_validate(observation.get("settings", {}).get("pass_criteria", {}))
+    timing_threshold = threshold(records)
+    user_records = defaultdict(list)
+    for record in records:
+        window_id, user_id = record.workload.get("window_id"), record.workload.get("user_id")
+        if isinstance(window_id, str) and isinstance(user_id, str):
+            user_records[window_id, user_id].append(record)
     windows = []
     all_users = []
     for window in observation.get("windows", []):
         if window["phase"] != "measurement":
-            # Warmup remains available for inspection but never enters acceptance.
             windows.append({**window, "status": "warmup"})
             continue
-        users = [_user_summary(user, window, records, criteria, timing_health,
-                               legacy_max_lag_ms, threshold(records)) for user in window["users"]]
+        users = [_user_summary(user, window, user_records.get((window["id"], user["user_id"]), []),
+                               criteria, timing_health, legacy_max_lag_ms, timing_threshold)
+                 for user in window["users"]]
         window_status = _status([user["status"] for user in users],
                                 measured=all(user["status"] == "measured" for user in users))
         windows.append({**window, "users": users, "status": window_status})
@@ -256,7 +254,6 @@ def summarize(observation: dict[str, Any], records: list[RequestRecord], *,
                           "scenario": window["scenario"]} for user in users)
     status = _status([window["status"] for window in windows if window["phase"] == "measurement"],
                      measured=bool(all_users) and all(user["status"] == "measured" for user in all_users))
-    # A failure leads, followed by incomplete evidence, then lowest known delivery.
     ranked = sorted(all_users, key=lambda user: (
         {"fail": 0, "inconclusive": 1, "measured": 2, "pass": 2}[user["status"]],
         user["output_tokens_per_second"] if user["output_tokens_per_second"] is not None else -1,

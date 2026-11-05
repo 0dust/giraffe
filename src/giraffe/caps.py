@@ -85,6 +85,8 @@ def cap_policy(path):
     path = path.removesuffix("[]")
     name = path.rsplit(".", 1)[-1]
     label = _CAP_LABELS.get(name, name.replace("_", " ").capitalize())
+    if path == "multi_user.levels":
+        return "User population levels", "implementation constraint", "the supported population of 1–32 users, independently of shared request slots"
     if path.startswith("load_test."):
         label = {"rates": "Rates (requests/second)", "size": "Burst size (requests)",
                  "first_seconds": "First burst after (seconds)", "gap_seconds": "Time between bursts (seconds)",
@@ -169,5 +171,4 @@ def cap_explanations(limits):
         explanations[prefix] = {"label": "Probability evidence", "help": help_text}
     return explanations
 
-# User lifetime is independent of the simultaneous HTTP request limit.
 MAX_SIMULATED_USERS = 32

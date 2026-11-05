@@ -312,8 +312,9 @@ def test_every_check_has_an_explained_row_and_planning_has_no_execution_side_eff
     configuration = config(checks=list(CHECK_NAMES))
     result = plan(configuration)
     rows = {row["id"]: row for row in result["rows"]}
-    assert set(CHECK_NAMES) - {"load"} <= rows.keys()
+    assert set(CHECK_NAMES) - {"load", "multi_user"} <= rows.keys()
     assert {"load_combinations", "load_calibration"} <= rows.keys()
+    assert {f"multi_user_{level}" for level in configuration.multi_user.levels} <= rows.keys()
     assert all(row["source"] and row["summary"] for row in rows.values())
     assert result["count_kind"] == "bounded"
 

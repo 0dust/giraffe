@@ -124,8 +124,6 @@ async def run_window(run, target, client, settings, load_settings, calibration, 
             for task in done:
                 task.result()
         close(run.stop_reason(target.name))
-        # A user Stop/error/duration ends in-flight work. A full request budget
-        # closes admission only: requests already admitted still finish normally.
         reason = run.stop_reason(target.name)
         if reason and reason != "maximum request budget reached":
             for task in tasks:
@@ -205,7 +203,6 @@ async def execute(run, target, client):
                 continue
             await run_window(run, target, client, settings, load_settings, calibration, window)
     finally:
-        # Preserve pending waiting intervals with the run's existing lag evidence.
         from giraffe.overlap import scheduling_delay_windows
         observation["scheduling_delay_windows"] = [
             {"start_ms": start, "end_ms": end}

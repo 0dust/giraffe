@@ -116,7 +116,7 @@ def completion_buckets(records, start_ms, end_ms):
             "partial_bucket_disclosure": "Final bucket uses its actual duration; counts are not requests/s."}
 
 
-_PERFORMANCE_CHECKS = {"load", "concurrency", "capacity", "arrivals", "sessions", "buckets"}
+_PERFORMANCE_CHECKS = {"load", "concurrency", "capacity", "arrivals", "sessions", "multi_user", "buckets"}
 
 
 def _cohort(record):
@@ -127,6 +127,8 @@ def _cohort(record):
     """
     from .conditions import condition_for
 
+    if "multi_user" in record.check_ids and record.workload.get("window_id"):
+        return str(record.workload["window_id"])
     point = record.load_point or {}
     identity = str(point.get("point_id") or record.condition_id
                    or condition_for(record.scenario, record.workload)["id"])
@@ -661,6 +663,15 @@ def _bind_existing(report, target, window, records, observation, put):
         "Conversation completion rate", "ratio", "Completed / planned conversations from session lifecycle", samples=sessions.get("started_conversations", 0), state="measured" if planned else "not_applicable")
     put("user_fairness", sessions.get("users") or None, "Per-user generation pace / fairness", "tok/s", "Existing per-user estimates and equal-user weighting; missing coverage retained",
         samples=sessions.get("users_with_measured_generation", 0), state="estimated" if sessions.get("users") else "not_applicable")
+    user_summary = by_id.get("multi_user", {}).get("multi_user", observation.get("multi_user", {}).get("summary", {}))
+    user_windows = [value for value in user_summary.get("windows", [])
+                    if value.get("phase") == "measurement" and value.get("id") == cohort]
+    if user_windows:
+        users = user_windows[0].get("users", [])
+        put("persistent_user_delivery", users, "Persistent user delivery", "tok/s",
+            "Completed valid output tokens inside the common user window / its actual duration; all planned users retained",
+            samples=len(users), eligible=user_windows[0].get("population", len(users)),
+            state="measured", window_policy=user_summary.get("window_policy"))
     matched = [p for p in points if p.get("interference")]
     legacy = by_id.get("concurrency", {}).get("load_types", {}).get("interference", {}).get("points", [])
     interference = [p.get("interference") for p in matched] or [p.get("interference", p) for p in legacy if ids.intersection(p.get("request_ids", []))]
