@@ -60,6 +60,24 @@ def test_recovery_missing_phase_end_is_inconclusive(phase):
     assert not evidence["qualified"]
 
 
+@pytest.mark.parametrize("fault", [None, "single_read", "missing_gap"])
+def test_recovery_requires_qualified_peer_streams(fault):
+    source, records = recovery_observation()
+    for request, shift in zip(records[3:6], [0, 120, 60], strict=True):
+        request.dispatch_ms += shift
+        request.timing_start_ms += shift
+        request.completed_ms += shift
+    peer = records[5]
+    if fault == "single_read":
+        peer.answer_reads = peer.answer_chunks = 1
+    elif fault == "missing_gap":
+        peer.max_stream_gap_ms = None
+    evidence = summarize(source, records)["windows"][-1]["recovery"]
+    for user in evidence["users"][:2]:
+        assert user["status"] == ("inconclusive" if fault else "pass")
+        assert any("qualified peer streaming overlap" in reason for reason in user["reasons"]) == bool(fault)
+
+
 @pytest.mark.usefixtures("local_tokenizer")
 def test_fractional_phase_boundaries_replay_only_scheduled_control_work(monkeypatch):
     from giraffe import runner

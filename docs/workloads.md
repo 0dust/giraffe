@@ -1066,6 +1066,8 @@ Select `arrivals` and set `arrivals.requests_per_second` per user. Users normall
 
 The finite offer ledger preserves identity, cohort, intended time and outcome even when a request is never sent. Planned work equals offered plus not offered; offered work equals dispatched plus local drops, late drops and unissued work. Local drops consume offer budget without inventing HTTP attempts. Generator stalls discard already-due offers instead of creating catch-up bursts. A reserved offer that never dispatches is unissued; work beyond the budget/stop boundary is not offered. Scheduled-to-answer latency includes client delay and is separate from dispatch-to-answer latency. Neither measures the server's internal queue.
 
+The combined schedule is limited to 100,000 offers across all selected population levels, arrival and recovery phases, and targets. The request budget can stop execution earlier; it does not increase this planning limit.
+
 Results show scheduled and observed activation, achieved traffic, per-user accounting and overlap evidence. Newcomer exposure and selected-user bursts cannot establish equal-work fairness against incumbents. Independent user acceptance failures remain visible. Warmup drains before the scheduled measurement begins and does not contribute output to it.
 
 ### Sustained shared use and lighter recovery

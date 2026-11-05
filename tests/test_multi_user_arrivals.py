@@ -30,6 +30,39 @@ def test_preview_counts_offers_without_materializing_request_ledger(monkeypatch)
     assert row["scheduled_offers"] == 9
 
 
+def test_aggregate_offer_bound_rejects_large_plan_before_allocation(monkeypatch):
+    from giraffe import multi_user
+    from giraffe.models import RunConfig
+    from pydantic import ValidationError
+
+    monkeypatch.setattr(multi_user, "_offer_plan", lambda *args: pytest.fail("Validation allocated an offer ledger"))
+    with pytest.raises(ValidationError, match="total scheduled offers"):
+        RunConfig(targets=[{"name": "local", "url": "http://localhost/v1", "model": "test"}],
+            checks=["multi_user"], max_requests=1, concurrency=32, multi_user={
+                "scenarios": ["arrivals", "recovery"], "levels": list(range(2, 33)), "duration_seconds": 3.125,
+                "arrivals": {"requests_per_second": 1000}, "recovery": {
+                    "control_seconds": 6.25, "lighter_seconds": 6.25, "sustained_seconds": 3.125,
+                    "lighter_requests_per_second": 500, "sustained_requests_per_second": 1000}})
+
+
+def test_aggregate_offer_bound_counts_targets_and_accepts_exact_limit(monkeypatch):
+    from giraffe import multi_user
+    from giraffe.models import RunConfig
+    from pydantic import ValidationError
+
+    monkeypatch.setattr(multi_user, "_offer_plan", lambda *args: pytest.fail("Validation allocated an offer ledger"))
+    target = {"url": "http://localhost/v1", "model": "test"}
+    values = {"targets": [{**target, "name": str(i)} for i in range(2)], "checks": ["multi_user"],
+        "max_requests": 1, "multi_user": {"scenarios": ["arrivals"], "levels": [2], "duration_seconds": 25,
+                                         "warmup_seconds": 1, "arrivals": {"requests_per_second": 1000}}}
+    cfg = RunConfig.model_validate(values)
+    windows = multi_user._planned_observation(cfg.multi_user, include_offers=False)["windows"]
+    assert sum(window.get("scheduled_offers", 0) for window in windows)*len(cfg.targets) == 100000
+    values["targets"].append({**target, "name": "third"})
+    with pytest.raises(ValidationError, match="total scheduled offers"):
+        RunConfig.model_validate(values)
+
+
 @pytest.mark.parametrize("case,expected", [
     ("equal", "pass"), ("slow", "fail"), ("newcomer", "inconclusive"), ("burst", "inconclusive"),
     ("measure_only", "measured"),
