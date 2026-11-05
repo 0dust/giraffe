@@ -304,7 +304,10 @@ export function configureMultiUser(source, values, defaults, {allowInvalid=false
   const settings=multiUserSettings(source,defaults);
   const number=(name,label)=>numeric(values.get('multi_user_'+name),label,allowInvalid);
   const list=(name,label)=>String(values.get('multi_user_'+name)||'').split(',').map(value=>numeric(value.trim(),label,allowInvalid));
-  if(values.has('multi_user_scenarios_rendered'))settings.scenarios=['repeated_requests','noisy_neighbors','cancellation','arrivals','recovery'].filter(name=>values.get('multi_user_scenario_'+name)==='on');
+  if(values.has('multi_user_scenarios_rendered')){
+    const selected=['repeated_requests','noisy_neighbors','cancellation','arrivals','recovery'].filter(name=>values.get('multi_user_scenario_'+name)==='on');
+    settings.scenarios=[...settings.scenarios.filter(name=>selected.includes(name)),...selected.filter(name=>!settings.scenarios.includes(name))];
+  }
   if(values.has('multi_user_arrivals_requests_per_second'))settings.arrivals.requests_per_second=number('arrivals_requests_per_second','Requests per second per user');
   if(values.has('multi_user_arrivals_activations')){
     const rows=String(values.get('multi_user_arrivals_activations')||'').trim();
@@ -315,8 +318,12 @@ export function configureMultiUser(source, values, defaults, {allowInvalid=false
     settings.arrivals.bursts=rows?rows.split(',').map(row=>{const [id,seconds,count,spacing]=row.trim().split('@');return {user_id:id.trim(),at_seconds:numeric(seconds,'Burst time',allowInvalid),requests:numeric(count,'Burst requests',allowInvalid),spacing_seconds:numeric(spacing||'0','Burst spacing',allowInvalid)};}):[];
   }
   for(const key of ['control_seconds','sustained_seconds','lighter_seconds','sustained_requests_per_second','lighter_requests_per_second','max_slowdown'])if(values.has('multi_user_recovery_'+key))settings.recovery[key]=number('recovery_'+key,key);
-  if(values.has('multi_user_noisy_neighbors_profiles_rendered'))settings.noisy_neighbors.heavy_profiles=['long_short','short_long','long_long'].filter(name=>values.get('multi_user_noisy_neighbors_profile_'+name)==='on');
-  if(values.has('multi_user_noisy_neighbors_triggers_rendered'))settings.noisy_neighbors.triggers=['before_output','during_stream'].filter(name=>values.get('multi_user_noisy_neighbors_trigger_'+name)==='on');
+  for(const [field,group,options] of [['heavy_profiles','profile',['long_short','short_long','long_long']],['triggers','trigger',['before_output','during_stream']]]){
+    if(!values.has('multi_user_noisy_neighbors_'+group+'s_rendered'))continue;
+    const selected=options.filter(name=>values.get('multi_user_noisy_neighbors_'+group+'_'+name)==='on');
+    const previous=settings.noisy_neighbors[field];
+    settings.noisy_neighbors[field]=[...previous.filter(name=>selected.includes(name)),...selected.filter(name=>!previous.includes(name))];
+  }
   if(values.has('multi_user_noisy_neighbors_heavy_user_ids')){
     const text=String(values.get('multi_user_noisy_neighbors_heavy_user_ids')||'').trim();
     settings.noisy_neighbors.heavy_user_ids=text?text.split(',').map(value=>value.trim()):null;

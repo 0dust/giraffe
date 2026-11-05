@@ -636,7 +636,7 @@ def summarize(observation: dict[str, Any], records: list[RequestRecord], *,
         fairness = _fairness(observation, window, users, user_records, criteria, timing_health,
                              legacy_max_lag_ms, timing_threshold)
         statuses = [user["status"] for user in users]
-        if criteria.max_throughput_ratio is not None and not window.get("role"):
+        if criteria.max_throughput_ratio is not None and (not window.get("role") or window.get("scenario") == "arrivals"):
             statuses.append(fairness["status"])
         window_status = _status(statuses, measured=all(status == "measured" for status in statuses))
         windows.append({**window, "users": users, "status": window_status, "fairness": fairness})

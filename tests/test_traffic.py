@@ -112,6 +112,32 @@ def test_arrivals_start_while_earlier_request_is_still_running(monkeypatch):
     run_virtual(monkeypatch, scenario())
 
 
+@pytest.mark.parametrize("build_seconds,late", [(.01, 0), (.2, 5), (.6, 10)])
+def test_spec_build_delay_is_rechecked_before_dispatch(monkeypatch, build_seconds, late):
+    async def scenario():
+        monkeypatch.setattr("tests.test_traffic.time", runner.time)
+        harness = Harness()
+        evidence = []
+
+        def build(index):
+            if index == 0:
+                asyncio.get_running_loop().now += build_seconds
+            return RequestSpec(fixture_id="short", scenario="traffic", check_ids=["capacity"],
+                               messages=[], scorer="exact", expected="ok")
+
+        result = await harness.run(profile(rates=[20], duration_seconds=.5),
+            spec_factory=build, capture_evidence=evidence.append)
+        assert result["dropped_late"] == late
+        assert result["started"] == 10-late
+        assert evidence[0].offer_lags_ms[0] == pytest.approx(build_seconds*1000)
+        assert all(start < .5 for start in harness.starts)
+        if late:
+            assert evidence[0].outcomes[0] == "dropped_late"
+            assert evidence[0].stalls[0] == (0, build_seconds)
+            assert all(start > build_seconds for start in harness.starts)
+    run_virtual(monkeypatch, scenario())
+
+
 def test_nearly_coincident_arrivals_within_tolerance_are_not_missed_ticks(monkeypatch):
     async def scenario():
         monkeypatch.setattr("tests.test_traffic.time", runner.time)

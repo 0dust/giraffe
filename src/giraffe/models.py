@@ -869,7 +869,8 @@ def required_concurrency(config) -> dict[str, Any]:
             arrival = config.effective_arrivals()
             peak = arrival.max_in_flight if arrival else config.inherited_concurrency(config.default_concurrency)
         elif check == "multi_user":
-            peak = (config.concurrency if set(config.multi_user.scenarios) & {"arrivals", "recovery"}
+            peak = ((config.concurrency or config.inherited_concurrency(config.default_concurrency))
+                    if set(config.multi_user.scenarios) & {"arrivals", "recovery"}
                     else max(config.multi_user.levels))
         elif check == "sessions":
             peak = min(config.sessions.concurrency, config.sessions.sessions)

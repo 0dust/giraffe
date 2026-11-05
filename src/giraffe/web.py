@@ -7,6 +7,7 @@ import gc
 import hashlib
 import json
 import logging
+import math
 import os
 import queue
 import re
@@ -507,7 +508,9 @@ def _track_live_request(job: dict, event: dict, max_requests: int | None) -> Non
     if isinstance(event.get("user"), dict):
         request["workload"] = {key: value for key, value in event["user"].items()
                                if key in {"user_id", "population", "profile", "window_id", "phase", "request_sequence", "session_id", "turn_id", "conversation_sequence", "role", "matched_work_sequence", "trigger", "heavy_profile", "cancellation_role", "cohort", "origin", "work_sequence", "activation_seconds"}
-                               and (type(value) is int or isinstance(value, str) and len(value) <= 128)}
+                               and (type(value) is int or isinstance(value, str) and len(value) <= 128
+                                    or key == "activation_seconds" and type(value) is float
+                                    and math.isfinite(value) and value >= 0)}
     request.update({key: event.get(key) for key in
                     ("input_chars", "requested_max_tokens", "requested_input_tokens")})
     if summary["through_slot"] is not None and slot <= summary["through_slot"]:
