@@ -165,9 +165,9 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str) -> dict | No
         resolved = RunConfig.model_validate({**config, "max_requests": None, "max_duration_seconds": None})
     except ValidationError:
         return None
-    if revision in {"issue45", "issue95", "issue95_pauses", "issue95_pause_evidence", "persistent_users", "gateway_attribution"}:
+    if revision in {"issue45", "issue95", "issue95_pauses", "issue95_pause_evidence", "persistent_users", "gateway_attribution", "gateway_policy"}:
         unchanged_checks = {"sessions", "consistency"}
-        if revision in {"issue95_pause_evidence", "persistent_users", "gateway_attribution"}:
+        if revision in {"issue95_pause_evidence", "persistent_users", "gateway_attribution", "gateway_policy"}:
             # Optional user/gateway dispatch changed the shared file; these
             # specialist requests are unchanged at these exact revisions.
             unchanged_checks.add("prefix")
@@ -200,6 +200,7 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str) -> dict | No
             "issue95_pause_evidence": "ab5875f7c635f8f454429a88aac87d52ce3a141a84bcf7b936fa737ffa41fe83",
             "persistent_users": "aee9ca71bc5ffd780d1574422b761e3177471a12f951a10b04322573ca062f76",
             "gateway_attribution": "e29f47df17e250a0fc0133ce3ead964ef97539f8066ac76c374308c9ee552c88",
+            "gateway_policy": "8630615d4b6321fe111f312cff35ad9b1c4864f15f19ed5bd7be9e4649291791",
         }[revision] if any(settings.values()) else None,
         "settings": settings,
     }
@@ -225,6 +226,7 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str) -> dict | No
             "issue95_pause_evidence": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
             "persistent_users": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
             "gateway_attribution": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
+            "gateway_policy": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
         }[revision]
     if "tools" in resolved.checks:
         from .tool_checks import resolved_tool_fixtures, resolved_tool_modes
@@ -243,7 +245,7 @@ def _same_run_limits_workload(current: dict, old: dict) -> bool:
     if current.get("config", {}).get("config_version") != 2 or old.get("config", {}).get("config_version", 2) != 2:
         return False
     for manifest in (current, old):
-        revisions = ("phase2", "phase3", "review26", "caps26", "issue45", "issue95", "issue95_pauses", "issue95_pause_evidence", "persistent_users", "gateway_attribution") if "config_version" in manifest.get("config", {}) else ("legacy",)
+        revisions = ("phase2", "phase3", "review26", "caps26", "issue45", "issue95", "issue95_pauses", "issue95_pause_evidence", "persistent_users", "gateway_attribution", "gateway_policy") if "config_version" in manifest.get("config", {}) else ("legacy",)
         identities = [_run_limits_workload_identity(manifest, revision=revision) for revision in revisions]
         if not any(identity is not None and fixture_hash(identity) == manifest.get("fixture_pack", {}).get("workload_fixture_sha256")
                    for identity in identities):
