@@ -292,8 +292,20 @@ def _same_run_limits_workload(current: dict, old: dict) -> bool:
 
 
 def _same_load_workload(current: dict, old: dict) -> bool:
-    """Attest the optional nonce argument only for unchanged ordinary Load runs."""
+    """Attest unchanged Load dispatch within exact source-equivalence groups."""
+    # Keep the historical nonce-only change separate from current admission
+    # semantics. Optional gateway dispatch changes the generator file, not Load.
+    revisions = (
+        (("d9a9e921584262148e06b636f0e8f195b7e530fd2a69c5e98f013359cf947ede",),
+         ("9b694c97a39d449d8ea15b09a9aeb406bf835179c0882827685c4d7888687d36",
+          "df3b7bbf30cab87d2e8c1c6dab8819f9cfe592b181407caa7c32af4c5f720cd4")),
+        (("d9a9e921584262148e06b636f0e8f195b7e530fd2a69c5e98f013359cf947ede",
+          "bcdc3b8411d9039e90a35bcd5b109504e7123e95ec6baebd5e654287b4774605",
+          "7c1455ec2c7d65ec707e41ef1864d117fe72fe6f919ba18992e84f39b2449181"),
+         ("113325dd5cffa04626cc7be7ee93bc6e9be67335531288bc329b3542a155c92a",)),
+    )
     settings = []
+    matched_groups = []
     for manifest in (current, old):
         raw = manifest.get("config", {})
         if raw.get("config_version") != 2 or set(raw.get("checks", [])) != {"load"} or "load_test" not in raw:
@@ -302,15 +314,17 @@ def _same_load_workload(current: dict, old: dict) -> bool:
             resolved = RunConfig.model_validate(raw).load_test.model_dump(mode="json")
         except ValidationError:
             return False
-        identity = {"generator_source_sha256": "d9a9e921584262148e06b636f0e8f195b7e530fd2a69c5e98f013359cf947ede",
-                    "settings": {"load_test": resolved}}
-        if not any(fixture_hash({**identity, "load_test_source_sha256": source}) ==
-                   manifest.get("fixture_pack", {}).get("workload_fixture_sha256") for source in (
-                       "9b694c97a39d449d8ea15b09a9aeb406bf835179c0882827685c4d7888687d36",
-                       "df3b7bbf30cab87d2e8c1c6dab8819f9cfe592b181407caa7c32af4c5f720cd4")):
+        groups = {index for index, (generators, sources) in enumerate(revisions)
+                  if any(fixture_hash({"generator_source_sha256": generator,
+                                       "settings": {"load_test": resolved},
+                                       "load_test_source_sha256": source}) ==
+                         manifest.get("fixture_pack", {}).get("workload_fixture_sha256")
+                         for generator in generators for source in sources)}
+        if not groups:
             return False
         settings.append(resolved)
-    return settings[0] == settings[1]
+        matched_groups.append(groups)
+    return settings[0] == settings[1] and bool(matched_groups[0] & matched_groups[1])
 
 
 def _limits_reached(report: RunReport) -> set[str]:
@@ -1316,7 +1330,7 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                     "current_outcomes": user, "baseline_outcomes": previous,
                     "qualification": current_policy.get("qualification"), "threshold": 0,
                     "worsening": 100 if status == "fail" else 0,
-                    "reason": "Matched declared policies and observed admission; no timing inference." if compatible else
+                    "reason": current_check.summary if compatible and previous else
                               "Policy settings, summary version or qualified passing baseline do not match.",
                     "evidence_ids": user["request_ids"]})
         user_rows, user_reasons = _compare_user_delivery(report, baseline, name, target_reasons, threshold)
@@ -2061,13 +2075,13 @@ def _multi_user_export(data: dict[str, Any]) -> dict[str, Any]:
 
 def _gateway_policy_html(data):
     rows = "".join(f'<tr><td>{_e(user["identity"])}</td><td>{_e(user["priority"] or "—")}</td>'
-        f'<td>{user["declared_rpm"]}</td><td>{user["admitted"]}</td><td>{user["rejected"]}</td>'
-        f'<td>{user["completed"]} / {user["planned"]}</td>'
-        f'<td>{_e(user["input_tokens"])}</td><td>{_e(user["output_tokens"])}</td></tr>' for user in data["users"])
+        f'<td>{_e(user["declared_rpm"])}</td><td>{_e(user["admitted"])}</td><td>{_e(user["rejected"])}</td>'
+        f'<td>{_e(user["completed"])} / {_e(user["planned"])}</td>'
+        f'<td>{_e(user["input_tokens"])}</td><td>{_e(user.get("completion_tokens", user["output_tokens"]))}</td></tr>' for user in data["users"])
     return (f'<h3>Gateway policy · {_e(data["qualification"])}</h3><p>{_e(data["interpretation"])}</p>'
         '<div class="table"><table><tr><th>Identity</th><th>Priority tier</th><th>Declared RPM</th>'
         '<th>Admitted</th><th>Rejected</th><th>Completed / offered cap</th><th>Actual input tokens</th>'
-        f'<th>Actual output tokens</th></tr>{rows}</table></div>'
+        f'<th>Actual output tokens (including reasoning)</th></tr>{rows}</table></div>'
         f'<p>Peer continuation: {_e(data["peer_continuation"])} · Overlap observed: {_e(data["overlap_observed"])} · '
         f'Comparable actual work: {_e(data["comparable_actual_work"])}</p>'
         f'<details><summary>Declared policy and qualification</summary><pre>{_json(data)}</pre></details>')

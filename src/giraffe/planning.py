@@ -462,7 +462,7 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
                       timeout=config.request_timeout_seconds)
                 continue
             if name == "gateway_policy":
-                fixed(target.name, row, config.gateway_policy.duration_seconds if config.gateway_policy else 0,
+                fixed(target.name, row, row.get("configured_seconds", 0),
                       "gateway_policy.duration_seconds", count=1, timeout=0)
                 continue
             if name == "capacity":
@@ -1115,6 +1115,9 @@ def request_plan(config: RunConfig | ConfigDraft, *,
         if settings is None:
             add("gateway_policy", 0, "Gateway policy unavailable: declare identities, policy and offered work.",
                 source="not configured", kind="exact")
+        elif not settings.supported:
+            add("gateway_policy", 0, "Gateway policy unavailable: selected gateway or capability is unsupported.",
+                source="unsupported capability", kind="exact")
         else:
             add("gateway_policy", sum(user.requests for user in settings.users),
                 "Bounded requests per declared identity; stops at policy duration or shared run limits.",

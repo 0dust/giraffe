@@ -24,8 +24,8 @@ async def test_strict_priority_rejection_precludes_later_borrowing(monkeypatch):
                dict(identity="peer", requests=5, rpm=8, priority="high")])
     last = [record for record in run.records if record.identity == "limited"][-1]
     last.status, last.http_status, last.valid = "completed", 200, True
-    last.input_tokens, last.output_tokens = 8, 2
-    last.gateway_evidence = GatewayResponseEvidence(priority_matches=True)
+    last.input_tokens, last.output_tokens, last.completion_tokens = 8, 2, 2
+    last.gateway_evidence = GatewayResponseEvidence(priority_matches=True, limiter_version="v3", priority_request_limit=2)
     result = summarize(run.config.gateway_policy, run.observations["proxy"]["gateway_policy"], run.records)
     assert result["qualification"] == "observed_failure", result
     assert result["status"] == "fail"

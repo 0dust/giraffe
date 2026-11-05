@@ -7,13 +7,8 @@ import time
 from .models import CheckResult, RequestSpec
 
 
-VERSION = 1
+VERSION = 2
 PROMPT = "Reply with exactly the word OK."
-SUPPORTED = {"key_rpm", "priority_rpm"}
-
-
-def _supported(settings):
-    return settings.gateway == "litellm" and settings.capability in SUPPORTED
 
 
 async def execute(run, target, client):
@@ -25,16 +20,18 @@ async def execute(run, target, client):
     observation = {"version": VERSION, "settings": settings.model_dump(mode="json"),
         "start_ms": (start-run.start)*1000, "end_ms": (end-run.start)*1000,
         "complete": False, "stop_reason": None, "offered": {user.identity: 0 for user in settings.users}}
-    observation["isolated_run"] = set(run.config.checks) == {"gateway_policy"}
+    observation["isolated_run"] = set(run.config.checks) == {"gateway_policy"} and len(run.config.targets) == 1
     run.observations[target.name]["gateway_policy"] = observation
-    if not _supported(settings):
+    if not settings.supported:
         observation["stop_reason"] = "Selected gateway capability is unsupported."
         return
     from .identities import identity_headers
     try:
         credentials = [next((value for name, value in identity_headers(target, user.identity).items()
-                             if name.lower() == "authorization"), None) for user in settings.users]
-        observation["identities_distinct"] = (all(value and value.startswith("Bearer ") for value in credentials)
+                             if name.lower() == settings.auth_header.lower()), None) for user in settings.users]
+        credentials = [value[7:].strip()
+                       if value and value.lower().startswith("bearer ") else value.strip() if value else None for value in credentials]
+        observation["identities_distinct"] = (all(credentials)
                                                and len(set(credentials)) == len(credentials))
         del credentials
     except ValueError:
@@ -99,6 +96,8 @@ def summarize(settings, observation, records):
             "cancelled": sum(record.status == "cancelled" for record in own),
             "input_tokens": [record.input_tokens for record in completed],
             "output_tokens": [record.output_tokens for record in completed],
+            "completion_tokens": [record.completion_tokens for record in completed],
+            "reasoning_tokens": [record.reasoning_tokens for record in completed],
             "request_ids": [record.id for record in own],
             "evidence": [{"request_id": record.id, "http_status": record.http_status,
                           "policy": record.gateway_evidence.model_dump(mode="json") if record.gateway_evidence else None}
@@ -118,7 +117,7 @@ def summarize(settings, observation, records):
 
     if settings is None:
         return outcome("unavailable", "Gateway policy is not configured; declare identities, policy and offered work.")
-    if not _supported(settings):
+    if not settings.supported:
         return outcome("unavailable", "Selected gateway capability is unsupported.")
     if not records:
         return outcome("unexercised", "No policy traffic was dispatched.")
@@ -145,18 +144,24 @@ def summarize(settings, observation, records):
         and max(a.dispatch_ms, b.dispatch_ms) < min(a.completed_ms, b.completed_ms)
         for a in affected for b in peers)
     inputs = [record.input_tokens for record in successes]
-    outputs = [record.output_tokens for record in successes]
+    outputs = [record.completion_tokens for record in successes]
     summary["comparable_actual_work"] = bool(successes and all(row["completed"] for row in users)
         and all(value is not None and value > 0 for value in inputs+outputs)
         and len(set(inputs)) == 1 and max(outputs) <= 2*min(outputs))
     if settings.window_state != "isolated_fresh" or not settings.gateway_version or not observation.get("isolated_run"):
-        return outcome("unverified", "Gateway version or isolated fresh policy window is unknown.")
+        return outcome("unverified", "Gateway version or isolated fresh single-target policy window is unknown.")
     if not observation.get("identities_distinct"):
         return outcome("unverified", "Distinct authenticated test credentials could not be established locally.")
     if not recognized:
         if any(record.http_status == 429 for record in affected):
             return outcome("unverified", "Rejection does not identify the declared gateway policy.")
         return outcome("unexercised", "No attributed policy rejection was observed within offered work.")
+    windows = [record.gateway_evidence.retry_after_seconds for record in recognized]
+    start, end = observation.get("start_ms"), observation.get("end_ms")
+    if (any(window is None or window <= 0 for window in windows) or len(set(windows)) != 1
+            or start is None or end is None or end < start or end - start >= windows[0]*1000):
+        return outcome("unverified", "Effective policy window is missing, conflicting or crossed by this observation.")
+    summary["effective_window_seconds"] = windows[0]
     if settings.capability == "priority_rpm":
         if settings.saturation_cache_seconds != 0:
             return outcome("unverified", "Cached saturation can differ between gateway nodes; this check requires zero cache delay.")
@@ -169,6 +174,11 @@ def summarize(settings, observation, records):
             return outcome("unverified", "Comparable actual token work and overlapping requests are required for priority observations.")
         if any(record.gateway_evidence is None or record.gateway_evidence.priority_matches is not True for record in successes):
             return outcome("unverified", "Successful responses do not confirm each declared priority tier.")
+        reservations = {user.identity: user.rpm for user in settings.users}
+        if any(record.gateway_evidence.limiter_version != "v3"
+               or record.gateway_evidence.priority_request_limit != reservations[record.identity]
+               for record in successes):
+            return outcome("unverified", "Scoped v3 priority RPM limits are missing or differ from the declared reservations.")
     elif any(record.gateway_evidence.request_limit != declared.rpm or record.gateway_evidence.request_remaining != 0 for record in recognized):
         return outcome("unverified", "Gateway key limit differs from the declared RPM.")
     admitted = sum(record.http_status is not None and 200 <= record.http_status < 300 for record in affected)

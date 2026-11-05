@@ -287,7 +287,7 @@ export function configureJudging(source, values, {allowInvalid=false}={}) {
 }
 
 export function gatewayPolicySettings(config) {
-  return {gateway:'litellm',capability:'key_rpm',gateway_version:null,affected_identity:'limited',
+  return {auth_header:'Authorization',gateway:'litellm',capability:'key_rpm',gateway_version:null,affected_identity:'limited',
     users:[{identity:'limited',requests:5,rpm:2,priority:null},{identity:'peer',requests:8,rpm:8,priority:null}],
     duration_seconds:15,interval_seconds:.1,max_output_tokens:16,window_state:'unknown',
     model_rpm:null,saturation_threshold:null,saturation_cache_seconds:null,...structuredClone(config.gateway_policy || {})};
@@ -297,7 +297,7 @@ export function configureGatewayPolicy(source, values, {allowInvalid=false}={}) 
   const config=structuredClone(source);
   if(!values.has('gateway_policy_rendered'))return config;
   const settings=gatewayPolicySettings(source);
-  for(const name of ['gateway','capability','affected_identity','window_state','gateway_version']){
+  for(const name of ['gateway','capability','affected_identity','window_state','gateway_version','auth_header']){
     if(values.has('gateway_policy_'+name))settings[name]=values.get('gateway_policy_'+name)||null;
   }
   for(const name of ['duration_seconds','interval_seconds','max_output_tokens','model_rpm','saturation_threshold','saturation_cache_seconds']){

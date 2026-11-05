@@ -875,7 +875,7 @@ def required_concurrency(config) -> dict[str, Any]:
                     if set(config.multi_user.scenarios) & {"arrivals", "recovery"}
                     else max(config.multi_user.levels))
         elif check == "gateway_policy":
-            peak = len(config.gateway_policy.users) if config.gateway_policy else 0
+            peak = len(config.gateway_policy.users) if config.gateway_policy and config.gateway_policy.supported else 0
         elif check == "sessions":
             peak = min(config.sessions.concurrency, config.sessions.sessions)
         elif check == "consistency":
@@ -1110,6 +1110,7 @@ class GatewayPolicyUser(Model):
 
 
 class GatewayPolicy(Model):
+    auth_header: str = Field(default="Authorization", pattern=r"^[A-Za-z][A-Za-z0-9-]{0,63}$")
     gateway: str = Field(default="litellm", min_length=1, max_length=64)
     capability: str = Field(default="key_rpm", min_length=1, max_length=64)
     gateway_version: str | None = Field(default=None, max_length=64)
@@ -1122,6 +1123,10 @@ class GatewayPolicy(Model):
     model_rpm: StrictInt | None = Field(default=None, ge=1, le=1000000)
     saturation_threshold: float | None = Field(default=None, ge=0, le=1)
     saturation_cache_seconds: float | None = Field(default=None, ge=0, le=60)
+
+    @property
+    def supported(self) -> bool:
+        return self.gateway == "litellm" and self.capability in {"key_rpm", "priority_rpm"}
 
     @model_validator(mode="after")
     def valid_policy(self):
@@ -2762,6 +2767,8 @@ class GatewayResponseEvidence(PersistedModel):
     retry_after_seconds: float | None = Field(default=None, ge=0)
     rate_limit_unit: Literal["requests", "tokens", "unknown"] | None = None
     priority_matches: bool | None = None
+    limiter_version: Literal["v3"] | None = None
+    priority_request_limit: int | None = Field(default=None, ge=0)
     model_rpm: int | None = Field(default=None, ge=0)
     saturation_percent: float | None = Field(default=None, ge=0, le=100)
 

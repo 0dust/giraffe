@@ -1,0 +1,165 @@
+"""LiteLLM qualification requires the effective window and reserved RPM evidence."""
+import pytest
+
+from giraffe.gateway_policy import summarize
+from giraffe.gateway_response import response_evidence
+from tests.test_gateway_policy import exercise
+
+
+def observed(run):
+    return summarize(run.config.gateway_policy, run.observations["proxy"]["gateway_policy"], run.records)
+
+
+@pytest.mark.parametrize("window", [None, 0, 0.01])
+async def test_unknown_or_crossed_effective_window_stays_unverified(monkeypatch, window):
+    _, run, _ = await exercise(monkeypatch)
+    for record in run.records:
+        if record.http_status == 429:
+            record.gateway_evidence.retry_after_seconds = window
+    assert observed(run)["qualification"] == "unverified"
+
+
+async def test_conflicting_effective_windows_stay_unverified(monkeypatch):
+    _, run, _ = await exercise(monkeypatch)
+    rejected = [record for record in run.records if record.http_status == 429]
+    for record in rejected:
+        record.gateway_evidence.retry_after_seconds = 60
+    rejected[-1].gateway_evidence.retry_after_seconds = 30
+    assert observed(run)["qualification"] == "unverified"
+
+
+async def test_legitimate_admission_after_short_bucket_reset_is_not_policy_failure(monkeypatch):
+    _, run, _ = await exercise(monkeypatch)
+    for record in run.records:
+        if record.http_status == 429:
+            record.gateway_evidence.retry_after_seconds = 5
+    last = [record for record in run.records if record.identity == "limited"][-1]
+    last.status, last.http_status, last.valid = "completed", 200, True
+    last.dispatch_ms, last.completed_ms = 6100, 6150
+    run.observations["proxy"]["gateway_policy"].update(start_ms=0, end_ms=7000)
+    assert observed(run)["qualification"] == "unverified"
+
+
+@pytest.mark.parametrize("limit,version", [(None, "v3"), (1, "v3"), (3, None), (3, "v2")])
+async def test_priority_pool_requires_matching_scoped_v3_limit(monkeypatch, limit, version):
+    _, run, _ = await exercise(monkeypatch, "priority_rpm", behavior="overadmit", saturation_threshold=.5,
+        users=[dict(identity="limited", requests=5, rpm=3, priority="low"),
+               dict(identity="peer", requests=5, rpm=7, priority="high")])
+    for record in run.records:
+        if record.http_status == 200:
+            headers = {"x-litellm-priority": "low" if record.identity == "limited" else "high"}
+            if version:
+                headers["x-litellm-rate-limiter-version"] = version
+            if limit is not None:
+                headers["x-ratelimit-priority_model-limit-requests"] = str(limit if record.identity == "limited" else 7)
+            record.gateway_evidence = response_evidence(200, headers=headers,
+                declared_priority="low" if record.identity == "limited" else "high")
+    assert observed(run)["qualification"] == "unverified"
+
+
+def test_allowlisted_priority_limit_has_version_provenance():
+    evidence = response_evidence(200, headers={"x-litellm-rate-limiter-version": "v3",
+        "x-ratelimit-priority_model-limit-requests": "3"})
+    assert getattr(evidence, "limiter_version", None) == "v3"
+    assert getattr(evidence, "priority_request_limit", None) == 3
+
+
+@pytest.mark.parametrize("duplicate", [False, True])
+async def test_declared_custom_auth_header_qualifies_only_distinct_keys(monkeypatch, duplicate):
+    import httpx
+    from giraffe import runner
+    from giraffe.client import LLMClient
+    from giraffe.gateway_policy import execute, result
+    from giraffe.models import RunConfig
+    from tests.test_gateway_policy import configuration
+
+    raw = configuration().model_dump(mode="json")
+    raw["gateway_policy"]["auth_header"] = "X-Litellm-Key"
+    raw["targets"][0]["test_identities"] = {
+        "limited": {"headers_env": {"x-litellm-key": "CUSTOM_LIMITED"}},
+        "peer": {"headers_env": {"X-Litellm-Key": "CUSTOM_PEER"}}}
+    cfg = RunConfig.model_validate(raw)
+    monkeypatch.setenv("CUSTOM_LIMITED", "Bearer limited-secret")
+    monkeypatch.setenv("CUSTOM_PEER", "bearer limited-secret" if duplicate else "Bearer peer-secret")
+    counts = {"limited": 0, "peer": 0}
+
+    async def handler(request):
+        import asyncio
+        assert "authorization" not in request.headers
+        identity = {"bearer limited-secret": "limited", "bearer peer-secret": "peer"}[request.headers["x-litellm-key"].lower()]
+        counts[identity] += 1
+        await asyncio.sleep(.01)
+        if identity == "limited" and counts[identity] > 2:
+            return httpx.Response(429, headers={"retry-after": "60"}, json={"error": {
+                "type": "throttling_error", "code": "429", "message":
+                "Rate limit exceeded for api_key: private-hash. Limit type: requests. Current limit: 2, Remaining: 0. Limit resets at: now"}})
+        return httpx.Response(200, json={"choices": [{"message": {"content": "OK"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 8, "completion_tokens": 2}})
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
+    run = runner._Run(cfg, None, None)
+    async with LLMClient(cfg.targets[0], cfg, max_connections=2) as client:
+        await execute(run, cfg.targets[0], client)
+    check = result(run, cfg.targets[0])
+    assert check.metrics["gateway_policy"]["qualification"] == ("unverified" if duplicate else "observed")
+    assert sum(counts.values()) == 13
+    assert "limited-secret" not in check.model_dump_json()
+
+
+@pytest.mark.usefixtures("local_tokenizer")
+async def test_multiple_targets_cannot_assume_independent_key_windows(monkeypatch):
+    from tests import test_gateway_policy as fixture
+
+    original = fixture.configuration
+    def multiple_targets(*args, **kwargs):
+        config = original(*args, **kwargs)
+        config.targets.append(config.targets[0].model_copy(update={"name": "other-model", "model": "other"}))
+        return config
+    monkeypatch.setattr(fixture, "configuration", multiple_targets)
+    _, report, seen = await fixture.exercise(monkeypatch, full=True)
+    checks = [check for check in report.checks if check.id == "gateway_policy"]
+    assert len(checks) == 2 and len(seen) == 26
+    assert all(check.metrics["gateway_policy"]["qualification"] == "unverified" for check in checks)
+    assert len(report.requests) == 26
+
+
+async def test_actual_priority_work_includes_reasoning_completion_tokens(monkeypatch):
+    check, run, _ = await exercise(monkeypatch, "priority_rpm", behavior="reasoning_work")
+    affected = [record for record in run.records if record.identity == "limited" and record.http_status == 200]
+    assert all(record.output_tokens == 2 and record.completion_tokens == 128 for record in affected)
+    assert check.metrics["gateway_policy"]["qualification"] == "unverified"
+    assert not check.metrics["gateway_policy"]["comparable_actual_work"]
+
+
+def test_custom_auth_field_round_trips_in_policy_ui():
+    from tests.test_gateway_policy import configuration
+    from tests.test_ux_catalogue import browser_logic
+
+    browser_logic("""
+const markup=renderGatewayPolicyEditor(config);
+assert.match(markup,/Gateway authentication header/);
+const values=new FormData();values.set('gateway_policy_rendered','1');
+values.set('gateway_policy_auth_header','X-Litellm-Key');
+assert.equal(configureGatewayPolicy(config,values).gateway_policy.auth_header,'X-Litellm-Key');
+const rendered=renderGatewayPolicyResults({qualification:'unverified',interpretation:'fixture',users:[{
+identity:'limited',priority:'low',declared_rpm:2,admitted:1,rejected:1,completed:1,planned:2,
+input_tokens:[8],output_tokens:[2],completion_tokens:[128]}]});
+assert.match(rendered,/including reasoning/);assert.match(rendered,/128/);
+""", configuration())
+
+
+async def test_peer_dispatched_before_rejection_is_not_continued_service(monkeypatch):
+    _, run, _ = await exercise(monkeypatch)
+    rejected = [record for record in run.records if record.http_status == 429]
+    for record in rejected:
+        record.dispatch_ms, record.completed_ms = 20, 30
+    for record in run.records:
+        if record.identity == "peer":
+            record.dispatch_ms, record.completed_ms = 10, 40
+        elif record.http_status == 200:
+            record.dispatch_ms, record.completed_ms = 0, 5
+    run.observations["proxy"]["gateway_policy"].update(start_ms=0, end_ms=50)
+    summary = observed(run)
+    assert summary["qualification"] == "unexercised"
+    assert summary["peer_continuation"] is False
