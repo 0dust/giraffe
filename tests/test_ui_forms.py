@@ -302,8 +302,8 @@ def test_field_help_preserves_labels_and_escapes_details():
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
-import {{optionDefault,optionValue,limitValue,sameConfig,effectiveProfileDefaults,loadTestSettings,loadFieldName,multiUserSettings}} from {json.dumps((static / 'form-config.mjs').as_uri())};
-const context={{structuredClone,optionDefault,optionValue,limitValue,sameConfig,effectiveProfileDefaults,loadTestSettings,loadFieldName,multiUserSettings,
+import {{optionDefault,optionValue,limitValue,sameConfig,effectiveProfileDefaults,loadTestSettings,loadFieldName,multiUserSettings,gatewayPolicySettings}} from {json.dumps((static / 'form-config.mjs').as_uri())};
+const context={{structuredClone,optionDefault,optionValue,limitValue,sameConfig,effectiveProfileDefaults,loadTestSettings,loadFieldName,multiUserSettings,gatewayPolicySettings,
   document:{{addEventListener(){{}}}},window:{{addEventListener(){{}}}}}};
 const source=fs.readFileSync({json.dumps(str(static / 'app.js'))},'utf8')
   .replace(/^import .*?;\\n/,'').replace(/\\ninit\\(\\);\\s*$/,'');

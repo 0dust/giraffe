@@ -44,6 +44,20 @@ def test_supported_policy_keeps_declared_plan(mode):
     plan = request_plan(config)
     row = next(row for row in plan["rows"] if row["id"] == "gateway_policy")
     assert row["requests_per_target"] == 13
-    assert row["kind"] == "bounded"
+    assert row["kind"] == "exact"
     assert plan["minimum_seconds"] == 2
     assert required_concurrency(config)["by_check"]["gateway_policy"] == 2
+
+
+@pytest.mark.parametrize("mode", ["key_rpm", "priority_rpm"])
+def test_finite_policy_plan_requires_only_its_declared_request_cap(mode):
+    from tests.test_gateway_policy import configuration
+
+    config = configuration(mode).model_copy(update={"max_requests": 13})
+    plan = request_plan(config)
+    assert plan["planned_total"] == plan["known_total"] == plan["required_request_limit"] == 13
+    assert plan["count_kind"] == "exact"
+    assert plan["request_warnings"] == []
+    truncated = request_plan(config.model_copy(update={"max_requests": 12}))
+    assert [warning["kind"] for warning in truncated["request_warnings"]] == ["incomplete_coverage"]
+    assert truncated["request_warnings"][0]["values"]["required_request_limit"] == 13
