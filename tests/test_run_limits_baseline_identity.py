@@ -16,6 +16,7 @@ from tests.test_reporting import make_report
 
 LEGACY_GENERATOR = "4aa7fb48fa4be4a51b3341f34d86755dcfcca5c1043d1d362205d006115eccb0"
 LEGACY_LOAD = "33b66f3784ad9613db082fa1f00a2f3292fc910b9f842bd3fe018340a0fe7aa7"
+PRE_MULTI_USER_GENERATOR = "ab5875f7c635f8f454429a88aac87d52ce3a141a84bcf7b936fa737ffa41fe83"
 
 
 @pytest.mark.asyncio
@@ -223,3 +224,51 @@ def test_streaming_logprob_generator_is_not_bridged_to_historical_evidence(respo
     before = old.model_dump_json()
     assert "Fixture pack identity differs." in _settings_reasons(current, old)
     assert old.model_dump_json() == before
+
+
+def prefix_reports():
+    current, old, settings, _ = reports("prefix")
+    old.manifest["config"] = deepcopy(current.manifest["config"])
+    old.manifest["fixture_pack"]["workload_fixture_sha256"] = fixture_hash({
+        "generator_source_sha256": PRE_MULTI_USER_GENERATOR, "settings": settings,
+    })
+    return current, old, settings
+
+
+def test_unchanged_versioned_prefix_baseline_survives_multi_user_wiring():
+    current, old, _ = prefix_reports()
+    before = old.model_dump_json()
+    assert current.manifest["fixture_pack"] != old.manifest["fixture_pack"]
+    assert _settings_reasons(current, old) == []
+    assert _settings_reasons(old, current) == []
+    assert old.model_dump_json() == before
+
+
+@pytest.mark.parametrize("which", ["current", "baseline"])
+def test_prefix_bridge_rejects_unknown_generator_revisions(which):
+    current, old, settings = prefix_reports()
+    report = current if which == "current" else old
+    report.manifest["fixture_pack"]["workload_fixture_sha256"] = fixture_hash({
+        "generator_source_sha256": "unknown-prefix-revision", "settings": settings,
+    })
+    assert "Fixture pack identity differs." in _settings_reasons(current, old)
+
+
+@pytest.mark.parametrize("change", ["changed", "missing"])
+def test_prefix_bridge_requires_matching_saved_settings(change):
+    current, old, settings = prefix_reports()
+    if change == "changed":
+        current.manifest["config"]["prefix"]["repeats"] += 1
+        settings["prefix"]["repeats"] += 1
+        current.manifest["fixture_pack"]["workload_fixture_sha256"] = fixture_hash({
+            "generator_source_sha256": workloads.FIXTURE_SOURCE_SHA256, "settings": settings,
+        })
+    else:
+        old.manifest["config"].pop("prefix")
+    assert "Fixture pack identity differs." in _settings_reasons(current, old)
+
+
+@pytest.mark.parametrize("revision", ["issue45", "issue95", "issue95_pauses"])
+def test_prefix_bridge_does_not_attest_earlier_unreviewed_prefix_revisions(revision):
+    current, _, _ = prefix_reports()
+    assert _run_limits_workload_identity(current.manifest, revision=revision) is None

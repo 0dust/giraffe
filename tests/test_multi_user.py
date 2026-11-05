@@ -166,7 +166,7 @@ def test_actual_http_requests_share_slots_and_persist_user_identity():
         cfg = settings(duration_seconds=.4).model_copy(update={
             "targets": [Target(name="service", model="fake-model", url=endpoint.url)]})
         state = runner._Run(cfg, None, None)
-        async with LLMClient(cfg.targets[0], cfg, max_connections=5) as client:
+        async with LLMClient(cfg.targets[0], cfg, max_connections=20) as client:
             await execute(state, cfg.targets[0], client)
         assert 2 <= endpoint.peak_active <= 5
         assert len({r.workload["user_id"] for r in state.records}) == 20
@@ -279,3 +279,77 @@ def test_stop_before_target_execution_still_reports_planned_users():
         assert not report.requests
         assert summary['status'] == 'inconclusive'
     asyncio.run(scenario())
+
+
+def test_request_setup_crossing_cutoff_does_not_send_or_consume_budget(monkeypatch):
+    from giraffe.multi_user import execute, result
+
+    async def scenario():
+        cfg = settings(levels=[1], duration_seconds=.05)
+        state = runner._Run(cfg, None, None)
+        original = state._condition
+        def slow_request_setup(*args, **kwargs):
+            condition = original(*args, **kwargs)
+            if kwargs.get("request_parameters") is not None:
+                asyncio.get_running_loop().now += .06
+            return condition
+        monkeypatch.setattr(state, "_condition", slow_request_setup)
+        await execute(state, cfg.targets[0], FakeClient(cfg.targets[0], cfg))
+        assert not state.records
+        assert state.attempted == state.budget_used == 0
+        assert state.counts["service"] == 0
+        user = state.observations["service"]["multi_user"]["windows"][0]["users"][0]
+        assert user["dispatched_count"] == 0
+        assert user["pending_ready_ms"] is not None
+        summary = result(state, cfg.targets[0]).metrics["multi_user"]["windows"][0]["users"][0]
+        assert summary["outcomes"]["missing_terminal"] == 0
+        assert state.slots.qsize() == 1
+
+    run_virtual(monkeypatch, scenario())
+
+
+def test_budget_closure_wakes_thinking_users_without_idle_drain(monkeypatch):
+    from giraffe.multi_user import execute
+
+    async def scenario():
+        cfg = settings(levels=[2], duration_seconds=90, seed=42,
+                       think_time_seconds={"values": [0, 60]}).model_copy(
+                           update={"max_requests": 3, "max_duration_seconds": 100})
+        state = runner._Run(cfg, None, None)
+        await execute(state, cfg.targets[0], FakeClient(cfg.targets[0], cfg))
+        window = state.observations["service"]["multi_user"]["windows"][0]
+        assert len(state.records) == 3
+        assert all(record.status == "completed" for record in state.records)
+        assert asyncio.get_running_loop().time() - state.start < .05
+        assert window["drain_seconds"] < .01
+        assert state.slots.qsize() == 2
+
+    run_virtual(monkeypatch, scenario())
+
+
+def test_saved_question_sequence_ignores_peer_token_counts_and_population(monkeypatch):
+    from giraffe.multi_user import execute
+    from giraffe.models import RequestSpec
+
+    class MeasuredClient(FakeClient):
+        async def execute(self, spec, **kwargs):
+            record = await super().execute(spec, **kwargs)
+            # First candidate initially fits Short by its character estimate,
+            # but actual usage is outside Short. This must not rewrite the plan.
+            record.input_tokens = 281 if spec.fixture_id == "a" else 25
+            return record
+
+    async def scenario():
+        cfg = settings(levels=[1, 2], duration_seconds=.015,
+                       think_time_seconds={"values": [0]})
+        state = runner._Run(cfg, None, None)
+        state.load_custom_specs = [RequestSpec(fixture_id=name, scenario="saved", check_ids=["load"],
+            messages=[{"role": "user", "content": "a" * count}], input_chars=count)
+            for name, count in (("a", 921), ("b", 100))]
+        await execute(state, cfg.targets[0], MeasuredClient(cfg.targets[0], cfg))
+        assert {record.workload["population"] for record in state.records} == {1, 2}
+        assert {record.workload["user_id"] for record in state.records} == {"user-01", "user-02"}
+        assert all(record.fixture_id == ("a" if record.workload["request_sequence"] % 2 else "b")
+                   for record in state.records)
+
+    run_virtual(monkeypatch, scenario())

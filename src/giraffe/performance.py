@@ -668,10 +668,15 @@ def _bind_existing(report, target, window, records, observation, put):
                     if value.get("phase") == "measurement" and value.get("id") == cohort]
     if user_windows:
         users = user_windows[0].get("users", [])
+        eligible = user_windows[0].get("population", len(users))
+        samples = sum(_number(user.get("output_tokens_per_second")) for user in users)
+        complete = eligible > 0 and samples == eligible
         put("persistent_user_delivery", users, "Persistent user delivery", "tok/s",
             "Completed valid output tokens inside the common user window / its actual duration; all planned users retained",
-            samples=len(users), eligible=user_windows[0].get("population", len(users)),
-            state="measured", window_policy=user_summary.get("window_policy"))
+            samples=samples, eligible=eligible,
+            state="measured" if complete else "insufficient_evidence",
+            reason=None if complete else "Not every planned user has a known shared-window output rate.",
+            window_policy=user_summary.get("window_policy"))
     matched = [p for p in points if p.get("interference")]
     legacy = by_id.get("concurrency", {}).get("load_types", {}).get("interference", {}).get("points", [])
     interference = [p.get("interference") for p in matched] or [p.get("interference", p) for p in legacy if ids.intersection(p.get("request_ids", []))]

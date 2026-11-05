@@ -163,8 +163,14 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str) -> dict | No
         resolved = RunConfig.model_validate({**config, "max_requests": None, "max_duration_seconds": None})
     except ValidationError:
         return None
-    if revision in {"issue45", "issue95", "issue95_pauses", "issue95_pause_evidence", "persistent_users"} and not set(resolved.checks) <= {"sessions", "consistency"}:
-        return None  # Load generators changed; this attestation covers unchanged specialists only.
+    if revision in {"issue45", "issue95", "issue95_pauses", "issue95_pause_evidence", "persistent_users"}:
+        unchanged_checks = {"sessions", "consistency"}
+        if revision in {"issue95_pause_evidence", "persistent_users"}:
+            # Multi-user wiring changed the shared file, but prefix requests are
+            # unchanged between these two exact generator revisions.
+            unchanged_checks.add("prefix")
+        if not set(resolved.checks) <= unchanged_checks:
+            return None  # Load generators changed; attest unchanged specialists only.
     if "sessions" in resolved.checks and resolved.sessions and resolved.sessions.sampling is not None:
         return None  # Sampled traffic has no historical equivalent.
     settings = {}

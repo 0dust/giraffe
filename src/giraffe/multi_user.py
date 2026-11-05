@@ -6,7 +6,7 @@ import random
 import time
 
 from giraffe.concurrent_load import calibrate
-from giraffe.load_test import build_spec
+from giraffe.load_test import _shape_sources, build_spec
 from giraffe.models import CheckResult, LoadTestSettings
 
 
@@ -35,7 +35,7 @@ def _relative(run, now=None):
     return ((time.monotonic() if now is None else now) - run.start) * 1000
 
 
-async def run_window(run, target, client, settings, load_settings, calibration, window):
+async def run_window(run, target, client, settings, load_settings, calibration, window, *, sources_by_profile=None):
     """Close admission at the common cutoff; admitted work keeps its own timeout."""
     start = time.monotonic()
     intended_end = start + window["planned_duration_seconds"]
@@ -46,12 +46,14 @@ async def run_window(run, target, client, settings, load_settings, calibration, 
     run.start_condition(target.name, scenario, {"population": window["population"],
                         "phase": window["phase"]}, planned=None, planned_kind="duration")
     closed = False
+    admission_closed = asyncio.Event()
 
     def close(reason=None):
         nonlocal closed
         if closed:
             return
         closed = True
+        admission_closed.set()
         end = min(time.monotonic(), cutoff)
         window.update(end_ms=_relative(run, end), duration_seconds=max(0, end - start),
                       cut_short=end < intended_end, reason=reason)
@@ -73,7 +75,8 @@ async def run_window(run, target, client, settings, load_settings, calibration, 
             point = {"id": scenario, "type": "combinations", "workload": "combinations",
                      "pattern": "concurrent", "level": window["population"], "rate": None,
                      "bursts": False, "source": "primary", "_source_index": sequence - 1}
-            spec = build_spec(run, load_settings, point, user["profile"], calibration)
+            spec = build_spec(run, load_settings, point, user["profile"], calibration,
+                              frozen_sources=(sources_by_profile or {}).get(user["profile"]))
             spec.check_ids = ["multi_user"]
             spec.load_point = None
             spec.workload.update(user_id=user["user_id"], population=window["population"],
@@ -94,14 +97,21 @@ async def run_window(run, target, client, settings, load_settings, calibration, 
                 def finalized(record):
                     user["request_ids"].append(record.id)
 
-                await run.request(target, client, spec, slot_reserved=True,
+                await run.request(target, client, spec, slot_reserved=True, admission_deadline=cutoff,
                                   on_start=dispatched, finalize_record=finalized)
             if closed or time.monotonic() >= cutoff:
                 break
             pause = random.Random(f"{settings.seed}:pause:{user['user_id']}:{sequence}").choices(
                 settings.think_time_seconds.values, weights=settings.think_time_seconds.weights)[0]
             # Even a zero-pause, immediately completing transport yields to peers.
-            await asyncio.sleep(min(pause, max(0, cutoff - time.monotonic())))
+            if pause == 0:
+                await asyncio.sleep(0)
+            else:
+                try:
+                    async with asyncio.timeout(max(0, min(pause, cutoff - time.monotonic()))):
+                        await admission_closed.wait()
+                except TimeoutError:
+                    pass
         if user["pending_ready_ms"] is not None:
             user["pending_observed_ms"] = min(_relative(run), window["end_ms"])
         user["stop_reason"] = window["reason"]
@@ -177,6 +187,10 @@ async def execute(run, target, client):
         from giraffe.fixtures import load_custom_fixtures
         run.load_custom_specs = load_custom_fixtures(run.config.custom_fixtures,
             legacy_max_output_tokens=run.config.legacy_custom_fixture_max_output_tokens)
+    sources = run.pack_specs or getattr(run, "load_custom_specs", [])
+    # Resolve candidates once from saved inputs, never from later peer results.
+    sources_by_profile = {profile: tuple(_shape_sources(load_settings, profile.split("_")[0], sources))
+                          for profile in {user["profile"] for user in population}} if sources else {}
     calibration = {}
     reason = None
     try:
@@ -201,7 +215,8 @@ async def execute(run, target, client):
                     user["stop_reason"] = reason
                 run.mark_unfinished(target.name, ["multi_user"])
                 continue
-            await run_window(run, target, client, settings, load_settings, calibration, window)
+            await run_window(run, target, client, settings, load_settings, calibration, window,
+                             sources_by_profile=sources_by_profile)
     finally:
         from giraffe.overlap import scheduling_delay_windows
         observation["scheduling_delay_windows"] = [

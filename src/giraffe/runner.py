@@ -566,11 +566,13 @@ class _Run:
                 self.release_slot()
 
     async def request(self, target, client, spec, event=None, on_start=None, timeout_override=None,
-                      *, slot_reserved=False, budget_reserved=False, deadline_override=None, budget_exempt=False, evaluate_record=None, finalize_record=None, request_parameters=None):
+                      *, slot_reserved=False, budget_reserved=False, deadline_override=None, admission_deadline=None, budget_exempt=False, evaluate_record=None, finalize_record=None, request_parameters=None):
         """Complete a request and persist its terminal evidence once.
 
         ``finalize_record`` synchronously adds scheduler-owned measurements before
         the evidence snapshot, including cancellation and postprocessing failures.
+        ``admission_deadline`` closes dispatch only; admitted requests retain
+        their ordinary timeout, unlike ``deadline_override``.
         """
         check_ids = [name for name in spec.check_ids if name in self.config.checks
                      and (not _stress(spec.scenario) or name not in {"access", "serving", "first_output", "generation"})
@@ -581,16 +583,21 @@ class _Run:
             spec.scenario == "initial" and self.config.restart_target == target.name)
         evidence_probe = spec.scenario == "performance_evidence_probe"
         slot_deadline = min(self.deadline, deadline_override if deadline_override is not None else self.deadline)
+        if admission_deadline is not None:
+            slot_deadline = min(slot_deadline, admission_deadline)
         async with self.slot(slot_reserved, slot_deadline) as admitted:
             # An offered arrival owns its budget even if a later arrival exhausts
             # the ceiling. Only a real stop condition can prevent its dispatch.
             reason = self.stop_reason(target.name)
             stopped = not admitted or time.monotonic() >= slot_deadline or (
                 reason is not None and reason != "maximum request budget reached")
-            if stopped or (not budget_reserved and not budget_exempt and not self.reserve_offer(target.name)):
-                self.mark_unfinished(target.name, _scenario_checks(spec))
+            if stopped or (admission_deadline is None and not budget_reserved and not budget_exempt
+                           and not self.reserve_offer(target.name)):
+                if admission_deadline is None or time.monotonic() >= self.deadline or reason:
+                    self.mark_unfinished(target.name, _scenario_checks(spec))
                 return None
-            self.attempted += 1
+            if admission_deadline is None:
+                self.attempted += 1
             output_cap = spec.max_tokens if spec.max_tokens is not None else self.config.max_output_tokens
             request_parameters = {**(request_parameters or {}),
                 "input_chars": spec.input_chars or sum(len(str(message.get("content") or "")) for message in spec.messages),
@@ -602,6 +609,20 @@ class _Run:
                             condition_for(condition_scenario, spec.workload, self.config)["id"])
             if condition is None or condition["status"] != "running":
                 condition = self.start_condition(target.name, condition_scenario, spec.workload, request_parameters=request_parameters)
+            if admission_deadline is not None:
+                # Condition construction/progress may take time. Sample the
+                # dispatch boundary after that setup, before taking any budget
+                # or recording an HTTP attempt that may never be sent.
+                started_at = _now()
+                started = time.monotonic()
+                if started >= slot_deadline:
+                    if started >= self.deadline:
+                        self.mark_unfinished(target.name, _scenario_checks(spec))
+                    return None
+                if not budget_reserved and not budget_exempt and not self.reserve_offer(target.name):
+                    self.mark_unfinished(target.name, _scenario_checks(spec))
+                    return None
+                self.attempted += 1
             if condition is not None:
                 condition["sent"] += 1
                 condition["started"] += 1
@@ -618,7 +639,8 @@ class _Run:
             global_deadline = False
             deadline = None
             intentional_deadline_applies = False
-            started, started_at = time.monotonic(), _now()
+            if admission_deadline is None:
+                started, started_at = time.monotonic(), _now()
             token = self.inflight.start(target.name)
             failure = None
             task = asyncio.current_task()
