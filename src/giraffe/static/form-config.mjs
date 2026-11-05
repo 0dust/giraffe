@@ -310,7 +310,7 @@ export function configureGatewayPolicy(source, values, {allowInvalid=false}={}) 
       return {identity,requests:numeric(requests,'Request cap',allowInvalid),rpm:numeric(rpm,'RPM',allowInvalid),priority:priority||null};
     });
   }
-  if(source.gateway_policy==null&&!source.checks?.includes('gateway_policy')&&sameConfig(settings,gatewayPolicySettings({})))return config;
+  if(source.gateway_policy==null&&sameConfig(settings,gatewayPolicySettings({})))return config;
   config.gateway_policy=settings;
   return config;
 }

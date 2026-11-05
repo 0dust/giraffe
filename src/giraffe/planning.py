@@ -462,7 +462,7 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
                       timeout=config.request_timeout_seconds)
                 continue
             if name == "gateway_policy":
-                fixed(target.name, row, config.gateway_policy.duration_seconds,
+                fixed(target.name, row, config.gateway_policy.duration_seconds if config.gateway_policy else 0,
                       "gateway_policy.duration_seconds", count=1, timeout=0)
                 continue
             if name == "capacity":
@@ -1112,11 +1112,15 @@ def request_plan(config: RunConfig | ConfigDraft, *,
             source="declared LiteLLM access cases", kind="bounded")
     if "gateway_policy" in selected:
         settings = config.gateway_policy
-        add("gateway_policy", sum(user.requests for user in settings.users),
-            "Bounded requests per declared identity; stops at policy duration or shared run limits.",
-            source="fixed identical non-streaming policy probes", kind="bounded")
-        rows[-1].update(users=len(settings.users), simultaneous_limit=config.concurrency,
-                        configured_seconds=settings.duration_seconds)
+        if settings is None:
+            add("gateway_policy", 0, "Gateway policy unavailable: declare identities, policy and offered work.",
+                source="not configured", kind="exact")
+        else:
+            add("gateway_policy", sum(user.requests for user in settings.users),
+                "Bounded requests per declared identity; stops at policy duration or shared run limits.",
+                source="fixed identical non-streaming policy probes", kind="bounded")
+            rows[-1].update(users=len(settings.users), simultaneous_limit=config.concurrency,
+                            configured_seconds=settings.duration_seconds)
     if "multi_user" in selected:
         settings = config.multi_user
         for level in settings.levels:

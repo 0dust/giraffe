@@ -18,6 +18,8 @@ def _supported(settings):
 
 async def execute(run, target, client):
     settings = run.config.gateway_policy
+    if settings is None:
+        return
     start = time.monotonic()
     end = min(start + settings.duration_seconds, run.deadline)
     observation = {"version": VERSION, "settings": settings.model_dump(mode="json"),
@@ -86,7 +88,7 @@ async def execute(run, target, client):
 
 def summarize(settings, observation, records):
     users = []
-    for user in settings.users:
+    for user in settings.users if settings else []:
         own = [record for record in records if record.identity == user.identity]
         completed = [record for record in own if record.status == "completed" and record.valid]
         users.append({"identity": user.identity, "declared_rpm": user.rpm, "priority": user.priority,
@@ -101,7 +103,7 @@ def summarize(settings, observation, records):
             "evidence": [{"request_id": record.id, "http_status": record.http_status,
                           "policy": record.gateway_evidence.model_dump(mode="json") if record.gateway_evidence else None}
                          for record in own]})
-    summary = {"version": VERSION, "settings": settings.model_dump(mode="json"), "users": users,
+    summary = {"version": VERSION, "settings": settings.model_dump(mode="json") if settings else {}, "users": users,
         "start_ms": observation.get("start_ms"), "end_ms": observation.get("end_ms"),
         "complete": observation.get("complete", False), "stop_reason": observation.get("stop_reason"),
         "identities_distinct": observation.get("identities_distinct", False),
@@ -114,6 +116,8 @@ def summarize(settings, observation, records):
         summary["reasons"].append(reason)
         return summary
 
+    if settings is None:
+        return outcome("unavailable", "Gateway policy is not configured; declare identities, policy and offered work.")
     if not _supported(settings):
         return outcome("unavailable", "Selected gateway capability is unsupported.")
     if not records:

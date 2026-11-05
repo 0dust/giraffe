@@ -873,7 +873,7 @@ def required_concurrency(config) -> dict[str, Any]:
         elif check == "multi_user":
             peak = max(config.multi_user.levels)
         elif check == "gateway_policy":
-            peak = len(config.gateway_policy.users)
+            peak = len(config.gateway_policy.users) if config.gateway_policy else 0
         elif check == "sessions":
             peak = min(config.sessions.concurrency, config.sessions.sessions)
         elif check == "consistency":
@@ -2199,9 +2199,7 @@ class RunConfig(Model):
 
     @model_validator(mode="after")
     def validate_run(self) -> RunConfig:
-        if "gateway_policy" in self.checks:
-            if self.gateway_policy is None:
-                raise ValueError("Gateway policy checks require explicit identities, policy and offered work")
+        if "gateway_policy" in self.checks and self.gateway_policy is not None:
             for target in self.targets:
                 if any(user.identity not in target.test_identities for user in self.gateway_policy.users):
                     raise ValueError("Every policy identity must be configured in each target's test_identities")
