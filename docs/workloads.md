@@ -968,15 +968,15 @@ loaded the model before the run starts. A deliberate restart may also change sta
 between observations. This is one endpoint’s inventory, not proof about every replica.
 
 
-## Persistent multi-user requests
+## Persistent multi-user work
 
-The opt-in **Multi-user** check keeps a stable simulated user across repeated independent requests. Start with [multi-user.yaml](../examples/multi-user.yaml):
+The opt-in **Multi-user** check keeps a stable simulated user across repeated independent requests or fresh conversations. Start with [multi-user.yaml](../examples/multi-user.yaml):
 
 ```sh
 giraffe run --config examples/multi-user.yaml --output runs/multi-user --html
 ```
 
-Set the endpoint and model first. All simulated users share its optional `api_key_env`; these are workload identities, not separate credentials. This first slice tests repeated independent requests only. Conversations, fairness verdicts, interference, cancellation scenarios, arrivals and recovery remain separate follow-up work.
+Set the endpoint and model first. All simulated users share its optional `api_key_env`; these are workload identities, not separate credentials. Select repeated work, noisy neighbors, cancellation, arrivals or recovery with `multi_user.scenarios`.
 
 `multi_user.levels` selects populations of 1–32 users independently of the run's `concurrency` ceiling. The example runs 1, 5 and 20 users behind five shared request slots. Each user sends one request at a time, waits for completion and then pauses. Sleeping users hold no request slot. `think_time_seconds.values` and optional `weights` reuse the session distribution format; `seed` makes each user's profile and pause sequence reproducible across levels. `shapes` selects the existing short/medium/long input-output combinations; `profile` accepts the existing increasing token-size profile. Requests keep the run's request timeout and all existing global budgets.
 
@@ -989,3 +989,89 @@ Optional `max_first_answer_ms` and `max_completion_ms` apply from the time a use
 `max_error_percent` defaults to zero; set it to `null` to omit that criterion. `min_output_tokens_per_second` is optional and measures shared-window delivery, not generation speed. `min_samples` requires that many valid responses for each user. With all acceptance thresholds set to `null`, results are measurements and the check remains inconclusive rather than claiming acceptance.
 
 CLI output, the UI, HTML, JSON and reproduction exports retain every planned user, including those with no requests. Results identify the worst served user and link user rows to their request evidence. Response retention still controls bodies and reasoning. Baselines compare each user at the same population and profile; changing population, shapes, seed, duration or window policy prevents a passing comparison. Shared-window rate changes are observed changes without a cross-run confidence interval. Reproduction exports include user settings, plans and compact outcomes, but do not recreate inaccessible server state.
+
+### Qualified delivery fairness
+
+Set `multi_user.pass_criteria.max_throughput_ratio` to compare **median user throughput / worst user throughput** against a maximum (at least 1). Without a threshold, fairness remains a measurement. A zero or unknown worst throughput leaves the ratio undefined. Other selected per-user criteria retain their own failures even when fairness evidence is inconclusive.
+
+Every compared user needs sufficient valid in-window samples, known input/output usage, equivalent active exposure, the same work and pause plans, and qualified streamed overlap with another user. Users need not all overlap at once: twenty users can be compared behind five request slots. The eligible population and concrete qualification reasons appear beside the ratio in CLI, UI, HTML, JSON and exports. `fairness_tolerance_percent` defaults to 10 and applies to differences in actual median input/output token lengths and active exposure. An unserved user, early EOS before the requested output shape, incomplete work or client scheduling delay prevents a fairness verdict. Independently sampled variable pauses or conversation lengths do not establish equal work. The result describes observed delivery fairness; it does not establish a server scheduling defect.
+
+### Repeated conversations
+
+Set `multi_user.conversations` to use the existing conversation settings. Omit it or set it to `null` for independent requests. The Multi-user editor exposes both choices. For example:
+
+```yaml
+multi_user:
+  levels: [2, 5]
+  duration_seconds: 30
+  think_time_seconds: {values: [1]}
+  conversations:
+    profile: correctness
+    modes: [fixed, live]
+    max_tokens: 32
+    delay_seconds: 0.5
+    turns:
+      - Remember the conversation name.
+      - Repeat the original name.
+```
+
+Each user alternates the selected modes across fresh conversations. Fixed histories use the conversation's seeded answer; live histories use actual preceding answers. The outer `think_time_seconds` pauses between conversations, while `delay_seconds` or `sampling.think_time_seconds` pauses between turns. None holds a request slot while sleeping. The optional conversation `sampling` uses the same seed, weighted pause/input/output/turn-count distributions as Sessions; input/output/turn-count sampling requires `profile: performance` with `modes: [live]` and selected `workloads`. Task weights assign each persistent user a stable task independently of population and peer completion order. Performance replies are unscored.
+
+A failed, cancelled or truncated turn stops its conversation without a substitute answer. The user can then start a fresh conversation, subject to the shared budgets and stop rules. If no turn can be dispatched (for example, its first prompt exceeds the history admission ceiling), that user stops instead of repeatedly attempting the same impossible history. Every conversation has a distinct ID and request/turn links under the same user. Conversation summaries and links survive response retention. Existing Sessions counts and concurrency semantics remain unchanged.
+
+Reproduction and baseline identity include fairness criteria, comparability tolerance, conversation settings and generator sources. Changed work or window policies cannot pass a baseline comparison. Live history can vary between runs; actual shape and hash evidence remain authoritative.
+
+### Matched noisy neighbors
+
+Select `noisy_neighbors` to compare each short user's responses with its own short-only control. Every selected heavy profile and trigger gets a control window followed by a probe window of `duration_seconds` each. Short users retain their IDs, matched logical work and pause plans. The probe adds the selected heavy users, subject to the same request slots and run budgets. These scenarios use independent requests; `conversations` must be absent or `null`.
+
+For example, replace the `multi_user` block in [multi-user.yaml](../examples/multi-user.yaml) with:
+
+```yaml
+multi_user:
+  scenarios: [noisy_neighbors, cancellation]
+  levels: [3]
+  duration_seconds: 5
+  think_time_seconds: {values: [0.1]}
+  noisy_neighbors:
+    heavy_user_ids: [user-03]
+    heavy_profiles: [long_short, short_long]
+    triggers: [before_output, during_stream]
+    max_slowdown: 1.5
+  cancellation:
+    user_id: user-03
+    cancel_after_chunks: 5
+  pass_criteria:
+    min_samples: 2
+    max_error_percent: 0
+```
+
+`heavy_user_ids` selects explicit persistent IDs. Omit it to select the first `heavy_user_count` users (default 1). Every selected level must contain the heavy users and at least one short user. Each `heavy_profiles` entry selects long input (`long_short`), long output (`short_long`), or both (`long_long`); sizes come from the existing `profile` token settings. Short users use `short_short`.
+
+`before_output` dispatches heavy work while a short request has started but has not produced output. `during_stream` waits for short-user streaming progress. A requested trigger is not proof that overlap occurred: the report retains actual dispatch, output, lengths and matched request evidence. Fast short responses, early completion of heavy work, mismatched input/output lengths, missing usage, insufficient samples, client timing interference or an exhausted budget leave the comparison inconclusive. The tolerance for comparable actual lengths and exposure is `fairness_tolerance_percent`.
+
+Each short-user comparison shows the control/probe sample associations, actual median input/output lengths, completion slowdown, first-answer and stream-gap changes, and output change. `max_slowdown` optionally limits the matched completion-time ratio. Omitting it measures the difference without claiming acceptance. Per-user errors and selected latency criteria remain visible even if the interference comparison is inconclusive. These measurements describe observed interference under the tested workload; they do not identify a particular server scheduling cause.
+
+### Cancel one user while peers continue
+
+Select `cancellation` to interrupt the selected user's first long-output response after `cancel_after_chunks` output chunks and then send another request under that user's original ID. Other users continue their work. Every population level needs at least two users and must include `cancellation.user_id`.
+
+Results separately qualify the selected cancellation, peer output across cancellation, and same-user follow-up. A response that ends before the cancellation opportunity, missing peer overlap, or incomplete follow-up stays inconclusive. Successful follow-up alone does not establish that the backend released compute or memory. Run Stop still terminates the whole run; undispatched work remains distinct from HTTP attempts and partial responses follow the configured retention policy.
+
+The UI, CLI, HTML, JSON and reproduction export expose the same scenario observations and request associations. Baselines keep control/probe roles, trigger and heavy profile separate, and refuse passing comparisons when scenario configuration, work identity or window policies differ. Give the run enough time and requests for every selected window: the example above schedules eight five-second noisy-neighbor windows plus one five-second cancellation window, followed by any needed drain time. Real-engine conclusions still require runs against the intended endpoint, model and hardware.
+
+### Newcomers and selected-user bursts
+
+Select `arrivals` and set `arrivals.requests_per_second` per user. Users normally activate at zero; `activations: {user-03: 5}` starts that user's finite independent-request schedule five seconds into the window. Existing user sequences continue. Add `bursts: [{user_id: user-01, at_seconds: 8, requests: 3, spacing_seconds: 0}]` to offer three independent requests together. They may overlap under the shared cap, including when the population has only one user. Conversations retain their sequential execution and cannot use scheduled arrivals.
+
+The finite offer ledger preserves identity, cohort, intended time and outcome even when a request is never sent. Planned work equals offered plus not offered; offered work equals dispatched plus local drops, late drops and unissued work. Local drops consume offer budget without inventing HTTP attempts. Generator stalls discard already-due offers instead of creating catch-up bursts. A reserved offer that never dispatches is unissued; work beyond the budget/stop boundary is not offered. Scheduled-to-answer latency includes client delay and is separate from dispatch-to-answer latency. Neither measures the server's internal queue.
+
+Results show scheduled and observed activation, achieved traffic, per-user accounting and overlap evidence. Newcomer exposure and selected-user bursts cannot establish equal-work fairness against incumbents. Independent user acceptance failures remain visible. Warmup drains before the scheduled measurement begins and does not contribute output to it.
+
+### Sustained shared use and lighter recovery
+
+Select `recovery` with at least two users. `control_seconds`, `sustained_seconds` and `lighter_seconds` define explicit common windows; `lighter_requests_per_second` drives both control and lighter traffic, and must be below `sustained_requests_per_second`. User profiles stay unchanged. Lifetime request sequences continue, while a separate work sequence advances from sustained into lighter traffic. Work replays a finite seeded control corpus, so request hashes can prove which controls match. Repeated work may benefit caches; these are observed recovery comparisons, not proof of a particular server cause.
+
+Each user reports its lighter/control median completion slowdown, actual input/output lengths, first-answer and stream-gap measurements, matched sample counts and request links. `recovery.max_slowdown` is optional; omitted means measured only. A single user's qualified regression fails the recovery criterion even when aggregates recover. Missing controls, different actual work, insufficient samples, unqualified stream gaps, missing sustained peer overlap, generator saturation and partial phases prevent a passing recovery conclusion. Single-chunk responses cannot qualify stream-gap recovery; select a suitable output profile when testing it. Configured endpoint errors still fail independently of comparison uncertainty.
+
+The runnable replacement block in [multi-user.yaml](../examples/multi-user.yaml) combines newcomers, a burst and recovery. Setup, CLI inspection, HTML/JSON reports and reproduction exports preserve each phase and user; baseline comparison rejects changed schedules. An interrupted run retains completed, partial and unexercised windows and their finite offer totals.

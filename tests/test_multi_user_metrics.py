@@ -289,3 +289,207 @@ def test_user_window_counts_do_not_claim_distinct_population_totals():
     result = summarize(source, records)
     assert result["failed_user_windows"] == 2
     assert "failed_users" not in result
+
+
+def fairness_records(counts=(2, 2)):
+    return [record(f'user-{index + 1:02d}', identity=f'user-{index + 1:02d}-{turn}',
+                   dispatch=turn * 2000, end=turn * 2000 + 1000,
+                   stream=True, answer_chunks=3, answer_reads=3, last_output_ms=900)
+            for index, count in enumerate(counts) for turn in range(count)]
+
+
+def fairness_observation(records, *, users=('user-01', 'user-02'), limit=1.2):
+    source = observation(records, users=users, criteria={'max_error_percent': None})
+    source['settings']['pass_criteria']['max_throughput_ratio'] = limit
+    source['settings']['fairness_tolerance_percent'] = 10
+    source['settings']['think_time_seconds'] = {'values': [0], 'weights': None}
+    for user in source['windows'][0]['users']:
+        user['think_time_plan'] = {'values': [0], 'weights': None, 'seed_key': None}
+    return source
+
+
+def fairness(result):
+    return result['windows'][0]['fairness']
+
+
+@pytest.mark.parametrize('counts,expected,ratio', [((2, 2), 'pass', 1), ((4, 1), 'fail', 2.5)])
+def test_equal_work_fairness_counts_the_slowest_user(counts, expected, ratio):
+    records = fairness_records(counts)
+    source = fairness_observation(records)
+    before = deepcopy(source)
+    result = summarize(source, records)
+    measured = fairness(result)
+    assert measured['status'] == result['status'] == expected
+    assert measured['qualified']
+    assert measured['ratio'] == ratio
+    assert measured['eligible_user_ids'] == ['user-01', 'user-02']
+    assert measured['compared_user_ids'] == ['user-01', 'user-02']
+    assert measured['overlap_user_ids'] == ['user-01', 'user-02']
+    assert source == before
+
+
+@pytest.mark.parametrize('change,reason', [
+    ('think_plan', 'think'), ('actual_input', 'input'), ('actual_output', 'output'),
+    ('early_eos', 'ended'), ('missing_input', 'usage'), ('missing_output', 'usage'),
+    ('unserved', 'samples'), ('missing_overlap', 'overlap'), ('missing_stream', 'overlap'),
+    ('buffered', 'overlap'), ('late_activation', 'exposure'), ('profile', 'profile'),
+    ('short_window', 'window'), ('short_samples', 'samples'), ('client_lag', 'scheduling'),
+])
+def test_incomparable_work_cannot_pass_or_fail_fairness(change, reason):
+    records = fairness_records((4, 1))
+    source = fairness_observation(records)
+    window = source['windows'][0]
+    second = records[-1]
+    health = None
+    if change == 'think_plan':
+        window['users'][1]['think_time_plan']['values'] = [1]
+    elif change == 'actual_input':
+        second.input_tokens = 200
+    elif change == 'actual_output':
+        second.output_tokens = 50
+    elif change == 'early_eos':
+        second.finish_reason, second.output_tokens = 'stop', 95
+    elif change == 'missing_input':
+        second.input_tokens = None
+    elif change == 'missing_output':
+        second.output_tokens = None
+    elif change == 'unserved':
+        records.pop()
+        window['users'][1]['dispatched_count'] = 0
+    elif change == 'missing_overlap':
+        second.dispatch_ms = second.timing_start_ms = 8500
+        second.completed_ms = 9500
+    elif change == 'missing_stream':
+        second.stream = False
+    elif change == 'buffered':
+        second.answer_reads = second.answer_chunks = 1
+    elif change == 'late_activation':
+        window['users'][1]['activated_ms'] = 5000
+    elif change == 'profile':
+        window['users'][1]['profile'] = 'medium_short'
+    elif change == 'short_window':
+        window['cut_short'] = True
+    elif change == 'short_samples':
+        source['settings']['pass_criteria']['min_samples'] = 2
+    elif change == 'client_lag':
+        health = {'schema_version': 1, 'windows': [{'start_ms': 100, 'end_ms': 700, 'lag_ms': 550}]}
+    measured = fairness(summarize(source, records, timing_health=health))
+    assert measured['status'] == 'inconclusive'
+    assert not measured['qualified']
+    assert any(reason in message.lower() for message in measured['reasons'])
+
+
+def test_each_user_needs_a_peer_overlap_not_a_population_wide_overlap():
+    users = tuple(f'user-{index + 1:02d}' for index in range(20))
+    records = [record(user, dispatch=(index // 5) * 2000, end=(index // 5) * 2000 + 1000,
+                      stream=True, answer_chunks=3, answer_reads=3, last_output_ms=900)
+               for index, user in enumerate(users)]
+    result = summarize(fairness_observation(records, users=users), records)
+    assert fairness(result)['status'] == 'pass'
+    assert fairness(result)['overlap_user_ids'] == list(users)
+
+
+def test_unserved_third_user_cannot_be_dropped_from_fairness_population():
+    records = fairness_records()
+    users = ('user-01', 'user-02', 'user-03')
+    result = summarize(fairness_observation(records, users=users), records)
+    assert fairness(result)['status'] == 'inconclusive'
+    assert fairness(result)['compared_user_ids'] == list(users)
+    assert fairness(result)['eligible_user_ids'] == list(users[:2])
+    assert fairness(result)['ratio'] is None
+
+
+def test_unselected_fairness_is_measurement_only_even_with_unequal_delivery():
+    records = fairness_records((4, 1))
+    result = summarize(fairness_observation(records, limit=None), records)
+    assert fairness(result)['status'] == result['status'] == 'measured'
+    assert fairness(result)['ratio'] == 2.5
+
+
+@pytest.mark.parametrize('tokens', [0, None])
+def test_missing_or_zero_worst_throughput_never_invents_a_ratio(tokens):
+    records = fairness_records()
+    for item in records:
+        if item.workload['user_id'] == 'user-02':
+            item.output_tokens = tokens
+    measured = fairness(summarize(fairness_observation(records), records))
+    assert measured['ratio'] is None
+    assert measured['status'] == 'inconclusive'
+
+
+def test_fairness_inconclusive_does_not_erase_an_independent_error_failure():
+    records = fairness_records()
+    records[-1].status, records[-1].valid = 'failed', False
+    source = fairness_observation(records)
+    source['settings']['pass_criteria']['max_error_percent'] = 0
+    result = summarize(source, records)
+    assert result['status'] == 'fail'
+    assert fairness(result)['status'] == 'inconclusive'
+    assert row(result, 'user-02')['status'] == 'fail'
+
+
+def test_actual_length_tolerance_is_configurable_and_input_shape_still_required():
+    records = fairness_records()
+    for item in records:
+        if item.workload['user_id'] == 'user-02':
+            item.input_tokens = 115
+    source = fairness_observation(records)
+    assert fairness(summarize(source, records))['status'] == 'inconclusive'
+    source['settings']['fairness_tolerance_percent'] = 20
+    assert fairness(summarize(source, records))['status'] == 'pass'
+    for item in records:
+        item.input_tokens = 512
+    assert fairness(summarize(source, records))['status'] == 'inconclusive'
+
+
+def test_variable_independent_pause_and_conversation_plans_are_not_equal_work():
+    records = fairness_records()
+    source = fairness_observation(records)
+    for user in source['windows'][0]['users']:
+        user['think_time_plan'] = {'values': [0, 1], 'weights': None, 'seed_key': user['user_id']}
+    assert fairness(summarize(source, records))['status'] == 'inconclusive'
+    for user in source['windows'][0]['users']:
+        user['think_time_plan'] = {'values': [0], 'weights': None, 'seed_key': None}
+    source['settings']['conversations'] = {'sampling': {'turn_count': {'values': [2, 3]}}}
+    assert fairness(summarize(source, records))['status'] == 'inconclusive'
+
+
+def test_missing_usage_on_late_work_keeps_delivery_known_but_fairness_unqualified():
+    records = fairness_records()
+    records.append(record('user-02', identity='late', dispatch=9500, end=11000,
+                          input_tokens=None, tokens=None, stream=True, answer_reads=3,
+                          answer_chunks=3, last_output_ms=1400))
+    source = fairness_observation(records)
+    result = summarize(source, records)
+    assert row(result, 'user-02')['output_tokens_per_second'] == 20
+    assert fairness(result)['status'] == 'inconclusive'
+    assert any('usage' in reason for reason in fairness(result)['reasons'])
+
+
+def test_overlap_of_a_users_own_requests_does_not_prove_peer_overlap():
+    records = fairness_records((2, 1))
+    records[1].dispatch_ms = records[1].timing_start_ms = 0
+    records[1].completed_ms = 1000
+    records[-1].dispatch_ms = records[-1].timing_start_ms = 5000
+    records[-1].completed_ms = 6000
+    result = summarize(fairness_observation(records), records)
+    assert fairness(result)['status'] == 'inconclusive'
+    assert fairness(result)['overlap_user_ids'] == []
+
+
+def test_lag_while_users_are_thinking_still_qualifies_the_shared_duration():
+    records = fairness_records((1, 1))
+    health = {'schema_version': 1, 'windows': [{'start_ms': 2000, 'end_ms': 2900, 'lag_ms': 850}]}
+    result = summarize(fairness_observation(records), records, timing_health=health)
+    assert all(user['timing_quality']['status'] == 'qualified' for user in result['windows'][0]['users'])
+    assert fairness(result)['status'] == 'inconclusive'
+    assert fairness(result)['timing_quality']['phase_affected']
+
+
+def test_saved_scheduling_windows_cannot_be_ignored_when_recomputing_fairness():
+    records = fairness_records((1, 1))
+    source = fairness_observation(records)
+    source['scheduling_delay_windows'] = [{'start_ms': 2000, 'end_ms': 2900}]
+    result = summarize(source, records)
+    assert fairness(result)['status'] == 'inconclusive'
+    assert any('scheduling' in reason for reason in fairness(result)['reasons'])

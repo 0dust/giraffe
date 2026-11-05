@@ -450,8 +450,8 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
                 continue
             if name.startswith("multi_user_"):
                 settings = config.multi_user
-                phases = 1 + bool(settings.warmup_seconds)
-                fixed(target.name, row, settings.duration_seconds + settings.warmup_seconds,
+                phases = row.get("window_count", 1 + bool(settings.warmup_seconds))
+                fixed(target.name, row, row.get("configured_seconds", settings.duration_seconds + settings.warmup_seconds),
                       "multi_user.duration_seconds", count=phases,
                       timeout=config.request_timeout_seconds)
                 continue
@@ -1109,14 +1109,20 @@ def request_plan(config: RunConfig | ConfigDraft, *,
             rows[-1].update(users=len(settings.users), simultaneous_limit=config.concurrency,
                             configured_seconds=settings.duration_seconds)
     if "multi_user" in selected:
+        from giraffe.multi_user import _planned_observation
         settings = config.multi_user
+        windows = _planned_observation(settings)["windows"]
         for level in settings.levels:
+            phases = [window for window in windows if window["population"] == level]
+            seconds = sum(window["planned_duration_seconds"] for window in phases)
             add(f"multi_user_{level}", None,
-                f"{level} persistent users share the run request slots for {settings.duration_seconds:g} s"
-                f" after {settings.warmup_seconds:g} s warmup; each request drains within its ordinary timeout.",
-                source="generated token-target prompts", kind="duration", title=f"Multi-user · {level} users")
+                f"{level} persistent users share the run request slots across {len(phases)} explicit windows "
+                f"({seconds:g} s including warmup). Each request drains within its ordinary timeout.",
+                source="isolated conversations" if settings.conversations else "generated token-target prompts",
+                kind="duration", title=f"Multi-user · {level} users")
             rows[-1].update(users=level, simultaneous_limit=config.concurrency,
-                            configured_seconds=settings.duration_seconds + settings.warmup_seconds)
+                            configured_seconds=seconds, window_count=len(phases), scenarios=settings.scenarios,
+                            scheduled_offers=sum(len(window.get("offers", [])) for window in phases))
     if "sessions" in selected:
         settings = config.sessions
         if settings.profile == "performance":

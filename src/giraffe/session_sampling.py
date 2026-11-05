@@ -14,23 +14,32 @@ def session_plan(settings):
                      [(mode, index, None) for mode in settings.modes for index in range(settings.sessions)])
     for mode, index, workload in conversations:
         seed = sampling.seed if sampling else 42
-        rng = random.Random(f"{seed}:{index}" if mixed else f"{seed}:{mode}:{index}")
-
-        def sample(field, default):
-            distribution = getattr(sampling, field) if sampling else None
-            return (rng.choices(distribution.values, weights=distribution.weights, k=1)[0]
-                    if distribution else default)
-
-        count = int(sample("turn_count", len(workload.turns))) if mixed else len(settings.turns)
-        turns = []
-        for turn in range(count):
-            turns.append({
-                "think_time_seconds": sample("think_time_seconds", settings.delay_seconds) if turn else 0,
-                "input_tokens": sample("input_tokens", None),
-                "output_tokens": int(sample("output_tokens", (workload.max_tokens if workload else None) or settings.max_tokens)),
-            })
+        turns = conversation_turns(settings, workload,
+            f"{seed}:{index}" if mixed else f"{seed}:{mode}:{index}")
         plans.append({"workload": workload, "turns": turns, **({"mode": mode, "index": index} if not mixed else {})})
     return plans
+
+
+def conversation_turns(settings, workload, seed):
+    """Sample one history using only its logical identity, never peer progress."""
+    sampling = settings.sampling
+    mixed = settings.profile == "performance"
+    rng = random.Random(seed)
+
+    def sample(field, default):
+        distribution = getattr(sampling, field) if sampling else None
+        return (rng.choices(distribution.values, weights=distribution.weights, k=1)[0]
+                if distribution else default)
+
+    count = int(sample("turn_count", len(workload.turns))) if mixed else len(settings.turns)
+    turns = []
+    for turn in range(count):
+        turns.append({
+            "think_time_seconds": sample("think_time_seconds", settings.delay_seconds) if turn else 0,
+            "input_tokens": sample("input_tokens", None),
+            "output_tokens": int(sample("output_tokens", (workload.max_tokens if workload else None) or settings.max_tokens)),
+        })
+    return turns
 
 
 async def prepare_session_input(run, target, prompt, tokens):

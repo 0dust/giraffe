@@ -4,8 +4,9 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from typing import Any
 
-from .models import MultiUserCriteria, RequestRecord
-from .stats import distribution
+from .models import LoadTestSettings, MultiUserCriteria, RequestRecord
+from .overlap import _delays, _overlap, answer_window, max_evidenced_overlap
+from .stats import distribution, median
 from .timing import qualify, threshold
 
 
@@ -21,11 +22,11 @@ def _status(statuses: list[str], *, measured: bool = False) -> str:
 
 
 def _valid(record: RequestRecord) -> bool:
-    return record.status == "completed" and record.valid
+    return record.status == "completed" and record.valid and record.score is not False
 
 
 def _error(record: RequestRecord) -> bool:
-    return record.status in {"failed", "timeout"} or record.status == "completed" and not record.valid
+    return record.status in {"failed", "timeout"} or record.status == "completed" and (not record.valid or record.score is False)
 
 
 def _tokens(records: list[RequestRecord]) -> tuple[int, int]:
@@ -186,7 +187,7 @@ def _user_summary(user: dict[str, Any], window: dict[str, Any], records: list[Re
             "outcomes": {"attempted": len(rows)+missing_terminal, "completed": len(completed),
                          "valid_completed": len(valid), "errors": len(errors),
                          "failed": sum(r.status == "failed" for r in attempts),
-                         "invalid": sum(r.status == "completed" and not r.valid for r in attempts),
+                         "invalid": sum(r.status == "completed" and (not r.valid or r.score is False) for r in attempts),
                          "timeouts": sum(r.status == "timeout" for r in attempts),
                          "cancelled": len(cancelled),
                          "intentional_cancelled": sum(r.status == "cancelled" for r in intentional),
@@ -228,6 +229,386 @@ def _user_summary(user: dict[str, Any], window: dict[str, Any], records: list[Re
                                                             for r, value in zip(valid, ready_completion))}}
 
 
+def _variable(distribution: dict | None) -> bool:
+    if not distribution:
+        return False
+    values = distribution.get("values", [])
+    weights = distribution.get("weights") or [1] * len(values)
+    return len({value for value, weight in zip(values, weights) if weight > 0}) > 1
+
+
+def _input_shape(observation, settings, profile, records):
+    from .load_test import input_qualification
+    size, output = profile.split("_")
+    variant = "short_answer" if output == "short" else "long_output"
+    floors = {item["size"]: item["input_tokens"] for item in observation.get("calibrations", [])
+              if item.get("variant") == variant and item.get("status") == "calibrated"
+              and item.get("reason_code") == "minimum_prompt_length"
+              and item.get("token_count_scope") != "builtin_reference" and item.get("input_tokens") is not None}
+    return input_qualification(settings, size, records, floors=floors)
+
+
+def _fairness(observation, window, users, records, criteria, health, lag, timing_threshold):
+    """Qualify observed delivery, never attribute a difference to server scheduling."""
+    settings = observation.get("settings", {})
+    tolerance = settings.get("fairness_tolerance_percent", 10)
+    limit = criteria.max_throughput_ratio
+    start, end = window.get("start_ms"), window.get("end_ms")
+    reasons = []
+    if window.get("scenario") == "arrivals" and (len({u.get("activation_seconds", 0) for u in users}) > 1
+            or any(o.get("origin") == "burst" for o in window.get("offers", []))):
+        reasons.append("Work not comparable: arrival exposure or burst work differs between users.")
+    if len(users) < 2:
+        reasons.append("Fairness requires at least two compared users.")
+    if window.get("cut_short") or start is None or end is None or end <= start:
+        reasons.append("The common measurement window was not completed.")
+    if window.get("drain_reason"):
+        reasons.append("The measurement has incomplete drain coverage.")
+    if len({user["profile"] for user in users}) > 1:
+        reasons.append("Work not comparable: assigned profiles differ.")
+    plans = [user.get("think_time_plan", settings.get("think_time_seconds", {"values": [0]}))
+             for user in users]
+    if plans and (any(plan != plans[0] for plan in plans[1:])
+                  or any(_variable(plan) and not plan.get("seed_key") for plan in plans)):
+        reasons.append("Work not comparable: users have different or unverified think-time plans.")
+    conversation = settings.get("conversations") or {}
+    if any(_variable(value) for key, value in (conversation.get("sampling") or {}).items()
+           if key != "seed"):
+        reasons.append("Work not comparable: independently sampled conversation plans differ.")
+    phase_quality = qualify([], health, timing_threshold, ("latency_ms",), legacy_max_lag_ms=lag,
+                            phase_intervals=((start, end),) if start is not None and end is not None else ())
+    saved_delay = start is not None and end is not None and any(
+        start < delay["end_ms"] and delay["start_ms"] < end
+        for delay in observation.get("scheduling_delay_windows", []))
+    if phase_quality["status"] != "qualified" or saved_delay:
+        reasons.append("Client scheduling delay overlaps the common measurement window.")
+    load_settings = LoadTestSettings(profile=settings.get("profile", {}),
+                                    pass_criteria={"min_valid_responses": criteria.min_samples})
+    measurements, streams = [], {}
+    for user in users:
+        uid = user["user_id"]
+        rows = records.get((window["id"], uid), [])
+        work = [r for r in rows if _valid(r) and not r.intentional
+                and start is not None and end is not None and r.dispatch_ms is not None
+                and start <= r.dispatch_ms < end]
+        samples = [r for r in work if r.completed_ms is not None and r.completed_ms <= end]
+        notes = []
+        if len(samples) < criteria.min_samples:
+            notes.append(f"Only {len(samples)} valid in-window samples; {criteria.min_samples} required.")
+        if user["outcomes"]["errors"] or user["outcomes"]["cancelled"] or user["outcomes"]["missing_terminal"]:
+            notes.append("Failed or incomplete requests prevent an equal-work comparison.")
+        if any(r.input_tokens is None or r.output_tokens is None for r in work):
+            notes.append("Input or output usage is missing.")
+        if any(r.finish_reason == "stop" and r.output_tokens is not None
+               and (cap := r.requested_output_tokens if r.requested_output_tokens is not None
+                    else r.requested_max_tokens) is not None and r.output_tokens < cap
+               for r in work):
+            notes.append("An answer ended before its requested output shape was exercised.")
+        qualification = None
+        if "_" in user["profile"] and not user["profile"].startswith("conversation:"):
+            qualification = _input_shape(observation, load_settings, user["profile"], work)
+            if not qualification["qualified"]:
+                notes.append("Input shape not qualified: " + qualification["reason"])
+        activated = user.get("activated_ms")
+        exposure = max(0, end - max(start, activated)) if all(value is not None for value in (start, end, activated)) else None
+        if exposure is None or exposure <= 0:
+            notes.append("Active exposure is missing or unexercised.")
+        if user["timing_quality"]["status"] != "qualified":
+            notes.append("Client scheduling delay affects user timing.")
+        streams[uid] = [r.model_copy(update={"stream_end_ms": r.last_output_ms}) for r in samples
+                        if r.stream and r.answer_reads >= 2 and r.answer_chunks >= 2]
+        measurements.append({"user_id": uid, "reasons": notes, "valid_samples": len(samples),
+                             "input_median_tokens": median([r.input_tokens for r in work]),
+                             "output_median_tokens": median([r.output_tokens for r in work]),
+                             "active_exposure_ms": exposure, "input_qualification": qualification})
+    overlap_users = []
+    for measured in measurements:
+        uid = measured["user_id"]
+        peers = [record for other, values in streams.items() if other != uid for record in values]
+        if max_evidenced_overlap(streams[uid], peers, observation.get("scheduling_delay_windows", [])) >= 2:
+            overlap_users.append(uid)
+        else:
+            measured["reasons"].append("No qualified streamed answer overlap with another compared user.")
+    for field, label in (("input_median_tokens", "actual median input lengths"),
+                         ("output_median_tokens", "actual median output lengths"),
+                         ("active_exposure_ms", "active exposure")):
+        values = [item[field] for item in measurements if item[field] is not None]
+        if values and max(values) > min(values) * (1 + tolerance / 100):
+            reasons.append(f"Work not comparable: {label} differ by more than {tolerance:g}%.")
+    rates = [user["output_tokens_per_second"] for user in users]
+    ratio = median(rates) / min(rates) if rates and all(value is not None and value > 0 for value in rates) else None
+    for measured in measurements:
+        measured["eligible"] = not measured["reasons"] and not reasons
+    eligible = [item["user_id"] for item in measurements if item["eligible"]]
+    if ratio is None:
+        reasons.append("The median-to-worst throughput ratio is undefined because a user has zero or missing throughput.")
+    reasons.extend(f"{item['user_id']}: {reason}" for item in measurements for reason in item["reasons"])
+    qualified = not reasons
+    status = ("measured" if limit is None else "inconclusive" if not qualified else
+              "fail" if ratio > limit else "pass")
+    if status == "fail":
+        reasons.append(f"Observed delivery ratio {ratio:g} exceeds the selected maximum {limit:g}.")
+    return {"status": status, "qualified": qualified, "threshold": limit, "tolerance_percent": tolerance,
+            "ratio": ratio, "compared_user_ids": [user["user_id"] for user in users],
+            "eligible_user_ids": eligible, "overlap_user_ids": overlap_users, "reasons": reasons,
+            "users": measurements, "timing_quality": phase_quality,
+            "interpretation": "Median user throughput divided by worst user throughput over the common window. "
+                "Comparability tolerance applies to actual median token lengths and active exposure. "
+                "This measures observed delivery fairness, not a server scheduling defect."}
+
+
+def _cancellation(window, records, criteria, health, lag, timing_threshold, delays):
+    selected = [r for r in records if r.workload.get("cancellation_role") == "selected"]
+    cancelled = [r for r in selected if r.status == "cancelled" and r.intentional
+                 and r.client_cancelled_ms is not None and r.client_cancelled_at_ns is not None
+                 and r.timing_start_ms is not None and r.finish_reason is None and r.answer_chunks > 0
+                 and r.first_output_ms is not None and r.first_output_ms <= r.client_cancelled_ms <= r.elapsed_ms
+                 and qualify([r], health, timing_threshold, ("latency_ms",), legacy_max_lag_ms=lag)["status"] == "qualified"]
+    peer_ids, followups = set(), []
+    for record in cancelled:
+        at = record.timing_start_ms + record.client_cancelled_ms
+        for peer in records:
+            span = answer_window(peer)
+            if (peer.workload.get("user_id") != window["selected_user_id"] and span
+                    and peer.stream and peer.answer_reads >= 2 and peer.answer_chunks >= 2
+                    and _overlap(span, (span[0], at), delays) and _overlap(span, (at, span[1]), delays)
+                    and qualify([peer], health, timing_threshold, ("latency_ms", "max_stream_gap_ms"),
+                                legacy_max_lag_ms=lag)["status"] == "qualified"):
+                peer_ids.add(peer.id)
+        followups.extend(r for r in records if r.workload.get("cancellation_role") == "followup"
+                         and r.workload.get("user_id") == window["selected_user_id"]
+                         and record.completed_ms is not None and r.dispatch_ms is not None
+                         and r.dispatch_ms >= record.completed_ms)
+
+    def observation(ok, ids, reason, *, failed=False):
+        return {"status": "fail" if failed else "pass" if ok else "inconclusive",
+                "request_ids": sorted(ids), "reasons": [] if ok and not failed else [reason]}
+
+    cancellation = observation(bool(cancelled), [r.id for r in cancelled],
+                               "The selected request did not reach an observed streaming cancellation.")
+    peers = observation(bool(peer_ids), peer_ids, "No qualified peer answer output spans the cancellation.")
+    followup = observation(sum(_valid(r) for r in followups) >= criteria.min_samples,
+                           [r.id for r in followups], "Same-user follow-up is missing, failed or insufficiently sampled.",
+                           failed=any(_error(r) for r in followups))
+    return {"status": _status([cancellation["status"], peers["status"], followup["status"]]),
+            "selected_user_id": window["selected_user_id"], "cancellation": cancellation,
+            "peer_continuation": peers, "followup": followup, "backend_release": "unverified"}
+
+
+def _interference(observation, window, control, user_records, criteria, health, lag, timing_threshold, delays):
+    """Compare the same logical short work, retaining the exposure that exercised it."""
+    settings = observation.get("settings", {})
+    tolerance = settings.get("fairness_tolerance_percent", 10) / 100
+    limit = settings.get("noisy_neighbors", {}).get("max_slowdown")
+    load_settings = LoadTestSettings(profile=settings.get("profile", {}),
+                                    pass_criteria={"min_valid_responses": criteria.min_samples})
+    heavy = [r for uid in window["heavy_user_ids"] for r in user_records.get((window["id"], uid), [])]
+    reasons = []
+    for phase in (control, window):
+        if not phase or phase.get("cut_short") or phase.get("drain_reason"):
+            reasons.append("Control or competing window has incomplete coverage.")
+            continue
+        a, b = phase.get("start_ms"), phase.get("end_ms")
+        if a is None or b is None or b <= a:
+            reasons.append("Control or competing window was not exercised.")
+        elif (qualify([], health, timing_threshold, ("latency_ms", "max_stream_gap_ms"),
+                      legacy_max_lag_ms=lag, phase_intervals=((a, b),))["status"] != "qualified"
+              or any(a < end and start < b for start, end in delays.windows)):
+            reasons.append("Client scheduling delay affects the comparison window.")
+    measured = []
+    for user in window["users"]:
+        uid = user["user_id"]
+        if uid in window["heavy_user_ids"]:
+            continue
+        notes = list(reasons)
+        controls = {r.workload.get("matched_work_sequence"): r
+                    for r in user_records.get((control["id"], uid), [])} if control else {}
+        probes = user_records.get((window["id"], uid), [])
+        pairs, exposed = [], set()
+        for probe in probes:
+            baseline = controls.get(probe.workload.get("matched_work_sequence"))
+            if not baseline or not _valid(baseline) or not _valid(probe):
+                continue
+            if (not probe.workload.get("matched_work_sha256")
+                    or baseline.workload.get("matched_work_sha256") != probe.workload["matched_work_sha256"]
+                    or baseline.workload.get("think_time_seconds") != probe.workload.get("think_time_seconds")):
+                notes.append("Matched logical work or pause plan differs.")
+                continue
+            if any(r.completed_ms is None or r.completed_ms > phase.get("end_ms", -1)
+                   for r, phase in ((baseline, control), (probe, window))):
+                continue
+            matches = []
+            for competitor in heavy:
+                at = competitor.workload.get("trigger_ms")
+                if (not _valid(competitor) or at is None or uid not in competitor.workload.get("trigger_peer_ids", [])
+                        or not probe.stream or probe.answer_reads < 2 or probe.answer_chunks < 2):
+                    continue
+                first = _first(probe)
+                span = answer_window(probe)
+                if window["trigger"] == "before_output":
+                    short_span = (probe.dispatch_ms, first) if probe.dispatch_ms is not None and first is not None else None
+                else:
+                    short_span = span
+                if short_span is None or not short_span[0] <= at < short_span[1]:
+                    continue
+                if window["heavy_profile"].endswith("_short"):
+                    last = _first(competitor)
+                    heavy_span = (competitor.timing_start_ms, last) if competitor.timing_start_ms is not None and last is not None else None
+                else:
+                    heavy_span = answer_window(competitor) if competitor.answer_reads >= 2 and competitor.answer_chunks >= 2 else None
+                overlap_span = span if window["heavy_profile"].endswith("_long") else short_span
+                if _overlap(overlap_span, heavy_span, delays):
+                    matches.append(competitor)
+            if matches:
+                pairs.append((baseline, probe))
+                exposed.update(r.id for r in matches)
+        before, after = [pair[0] for pair in pairs], [pair[1] for pair in pairs]
+        competitors = [r for r in heavy if r.id in exposed]
+        if len(pairs) < criteria.min_samples:
+            notes.append(f"Only {len(pairs)} matched samples with the selected trigger and heavy overlap; {criteria.min_samples} required.")
+        if {r.workload.get("user_id") for r in competitors} != set(window["heavy_user_ids"]):
+            notes.append("Not every selected heavy user has qualified overlap.")
+        values = {}
+        for label, rows, shape in (("control", before, "short_short"), ("probe", after, "short_short"),
+                                   ("heavy", competitors, window["heavy_profile"])):
+            if not _input_shape(observation, load_settings, shape, rows)["qualified"]:
+                notes.append(f"Actual {label} input shape is unqualified.")
+            if any(r.input_tokens is None or r.output_tokens is None for r in rows):
+                notes.append(f"Actual {label} token usage is missing.")
+            if shape.endswith("_long") and any(r.output_tokens is None
+                    or r.output_tokens < max(r.requested_output_tokens or 0, load_settings.profile.long.output_tokens) * (1-tolerance)
+                    for r in rows):
+                notes.append("Heavy output ended before the requested long shape was exercised.")
+            if shape.endswith("_short") and any(r.output_tokens is not None
+                    and r.output_tokens > load_settings.profile.short.output_tokens * (1+tolerance) for r in rows):
+                notes.append(f"Actual {label} output exceeds the short-output shape.")
+            values[f"{label}_input_median_tokens"] = median([r.input_tokens for r in rows])
+            values[f"{label}_output_median_tokens"] = median([r.output_tokens for r in rows])
+            if qualify(rows, health, timing_threshold, ("latency_ms", "first_output_ms", "max_stream_gap_ms"),
+                       legacy_max_lag_ms=lag)["status"] != "qualified":
+                notes.append(f"Actual {label} timing is unqualified.")
+        for suffix in ("input_median_tokens", "output_median_tokens"):
+            a, b = values["control_"+suffix], values["probe_"+suffix]
+            if a is None or b is None or max(a, b) > min(a, b)*(1+tolerance):
+                notes.append("Actual short-user token lengths are not comparable.")
+        control_user = next((u for u in (control or {}).get("users", []) if u["user_id"] == uid), {})
+        exposure = [max(0, phase.get("end_ms", 0)-max(phase.get("start_ms", 0), u.get("activated_ms") or 0))
+                    for phase, u in ((control or {}, control_user), (window, user))]
+        if not min(exposure) or max(exposure) > min(exposure)*(1+tolerance):
+            notes.append("Short-user active exposure is not comparable.")
+        control_completion = median([user_latency(r, False) for r in before])
+        probe_completion = median([user_latency(r, False) for r in after])
+        slowdown = probe_completion/control_completion if control_completion and probe_completion is not None else None
+        if slowdown is None:
+            notes.append("Matched completion slowdown is undefined.")
+        qualified = not notes
+        status = "inconclusive" if not qualified else "measured" if limit is None else "fail" if slowdown > limit else "pass"
+        if status == "fail":
+            notes.append(f"Observed slowdown {slowdown:g} exceeds {limit:g}.")
+        def difference(a, b):
+            return b-a if a is not None and b is not None else None
+        measured.append({"user_id": uid, "status": status, "qualified": qualified, "reasons": list(dict.fromkeys(notes)),
+            "matched_samples": len(pairs), "control_request_ids": [r.id for r in before],
+            "probe_request_ids": [r.id for r in after], "heavy_request_ids": sorted(exposed),
+            "slowdown": slowdown, "first_answer_change_ms": difference(
+                median([user_latency(r, True) for r in before]), median([user_latency(r, True) for r in after])),
+            "completion_change_ms": difference(control_completion, probe_completion),
+            "stream_gap_change_ms": difference(median([r.max_stream_gap_ms for r in before]), median([r.max_stream_gap_ms for r in after])),
+            "output_tokens_change": difference(values["control_output_median_tokens"], values["probe_output_median_tokens"]), **values})
+    statuses = [item["status"] for item in measured]
+    return {"status": _status(statuses, measured=all(s == "measured" for s in statuses)),
+            "qualified": bool(measured) and all(item["qualified"] for item in measured),
+            "control_window_id": window["control_window_id"], "trigger": window["trigger"],
+            "heavy_profile": window["heavy_profile"], "heavy_user_ids": window["heavy_user_ids"],
+            "reasons": list(dict.fromkeys(reasons)), "users": measured}
+
+
+def _recovery(observation, window, control, sustained, user_records, criteria, health, lag, timing_threshold, delays):
+    """Compare matched per-user work after a qualified sustained exposure."""
+    settings = observation["settings"]
+    tolerance = settings.get("fairness_tolerance_percent", 10)/100
+    limit = settings.get("recovery", {}).get("max_slowdown")
+    load_settings = LoadTestSettings(profile=settings.get("profile", {}),
+                                    pass_criteria={"min_valid_responses": criteria.min_samples})
+    shared = []
+    for phase in (control, sustained, window):
+        if not phase or phase.get("cut_short") or phase.get("drain_reason") or phase.get("start_ms") is None:
+            shared.append("Control, sustained or lighter window has incomplete coverage.")
+            continue
+        counts = phase.get("offer_accounting", {})
+        if not counts or any(counts.get(key, 0) for key in ("dropped_local", "dropped_late", "unissued", "not_offered")):
+            shared.append("The generator did not deliver the configured phase schedule.")
+        start, end = phase["start_ms"], phase["end_ms"]
+        if (qualify([], health, timing_threshold, ("latency_ms", "max_stream_gap_ms"),
+                legacy_max_lag_ms=lag, phase_intervals=((start, end),))["status"] != "qualified"
+                or any(start < high and low < end for low, high in delays.windows)
+                or phase.get("scheduler_stalls")):
+            shared.append("Client scheduling delay affects recovery timing.")
+    sustained_records = [r for user in (sustained or {}).get("users", [])
+                         for r in user_records.get((sustained["id"], user["user_id"]), [])]
+    measured = []
+    for user in window["users"]:
+        uid = user["user_id"]
+        notes = list(shared)
+        before = user_records.get(((control or {}).get("id"), uid), [])
+        after = user_records.get((window["id"], uid), [])
+        controls = {r.workload.get("matched_work_sequence"): r for r in before if _valid(r)}
+        pairs = [(controls.get(r.workload.get("matched_work_sequence")), r) for r in after if _valid(r)]
+        pairs = [(a, b) for a, b in pairs if a is not None and a.completed_ms is not None and b.completed_ms is not None
+                 and a.completed_ms <= control["end_ms"] and b.completed_ms <= window["end_ms"]]
+        if len({a.id for a, _ in pairs}) < criteria.min_samples or len(pairs) != len(after):
+            notes.append("Recovery lacks sufficient matched completed control samples.")
+        if any(not b.workload.get("matched_work_sha256")
+               or a.workload.get("matched_work_sha256") != b.workload["matched_work_sha256"] for a, b in pairs):
+            notes.append("Matched control and recovery work differs.")
+        stress = [r for r in sustained_records if r.workload.get("user_id") == uid and _valid(r)
+                  and r.completed_ms is not None and r.completed_ms <= sustained["end_ms"]]
+        if len(stress) < criteria.min_samples or max_evidenced_overlap(stress,
+                [r for r in sustained_records if r.workload.get("user_id") != uid and _valid(r)], delays) < 2:
+            notes.append("This user lacks sustained samples with qualified peer streaming overlap.")
+        values = {}
+        for label, rows in (("control", [a for a, _ in pairs]), ("lighter", [b for _, b in pairs]), ("sustained", stress)):
+            if not _input_shape(observation, load_settings, user["profile"], rows)["qualified"]:
+                notes.append(f"Actual {label} input shape is unqualified.")
+            if any(r.input_tokens is None or r.output_tokens is None for r in rows):
+                notes.append(f"Actual {label} token usage is missing.")
+            if user["profile"].endswith("_long") and any(r.output_tokens is None or
+                    r.output_tokens < (r.requested_output_tokens or 0)*(1-tolerance) for r in rows):
+                notes.append(f"Actual {label} output did not exercise the requested shape.")
+            if any(not r.stream or r.answer_reads < 2 or r.max_stream_gap_ms is None for r in rows):
+                notes.append(f"Actual {label} stream gaps are unqualified.")
+            if qualify(rows, health, timing_threshold, ("latency_ms", "first_output_ms", "max_stream_gap_ms"),
+                       legacy_max_lag_ms=lag)["status"] != "qualified":
+                notes.append(f"Actual {label} timing is unqualified.")
+            values[label] = {"input_tokens": median([r.input_tokens for r in rows]),
+                "output_tokens": median([r.output_tokens for r in rows]),
+                "completion_ms": median([user_latency(r, False) for r in rows]),
+                "first_answer_ms": median([user_latency(r, True) for r in rows]),
+                "stream_gap_ms": median([r.max_stream_gap_ms for r in rows])}
+        for phase in ("lighter", "sustained"):
+            for metric in ("input_tokens", "output_tokens"):
+                a, b = values["control"][metric], values[phase][metric]
+                if a is None or b is None or max(a, b) > min(a, b)*(1+tolerance):
+                    notes.append("Actual per-user token lengths drifted between phases.")
+        base, current = values["control"]["completion_ms"], values["lighter"]["completion_ms"]
+        slowdown = current/base if base and current is not None else None
+        if slowdown is None:
+            notes.append("Matched recovery slowdown is undefined.")
+        qualified = not notes
+        status = "inconclusive" if notes else "measured" if limit is None else "fail" if slowdown > limit else "pass"
+        if status == "fail":
+            notes.append(f"Recovery slowdown {slowdown:g} exceeds {limit:g}.")
+        measured.append({"user_id": uid, "profile": user["profile"], "status": status, "qualified": qualified,
+            "slowdown": slowdown, "matched_samples": len(pairs), "reasons": list(dict.fromkeys(notes)),
+            "control_request_ids": [a.id for a, _ in pairs], "lighter_request_ids": [b.id for _, b in pairs],
+            "sustained_request_ids": [r.id for r in stress], "phases": values})
+    statuses = [user["status"] for user in measured]
+    return {"status": _status(statuses, measured=all(s == "measured" for s in statuses)),
+            "qualified": bool(measured) and all(user["qualified"] for user in measured),
+            "control_window_id": window["control_window_id"], "sustained_window_id": window["sustained_window_id"],
+            "users": measured, "reasons": list(dict.fromkeys(shared))}
+
+
 def summarize(observation: dict[str, Any], records: list[RequestRecord], *,
               timing_health: dict | None = None, legacy_max_lag_ms: float = 0) -> dict[str, Any]:
     """Summarize the planned population without mutating its ledger or requests."""
@@ -247,13 +628,58 @@ def summarize(observation: dict[str, Any], records: list[RequestRecord], *,
         users = [_user_summary(user, window, user_records.get((window["id"], user["user_id"]), []),
                                criteria, timing_health, legacy_max_lag_ms, timing_threshold)
                  for user in window["users"]]
-        window_status = _status([user["status"] for user in users],
-                                measured=all(user["status"] == "measured" for user in users))
-        windows.append({**window, "users": users, "status": window_status})
+        fairness = _fairness(observation, window, users, user_records, criteria, timing_health,
+                             legacy_max_lag_ms, timing_threshold)
+        statuses = [user["status"] for user in users]
+        if criteria.max_throughput_ratio is not None and not window.get("role"):
+            statuses.append(fairness["status"])
+        window_status = _status(statuses, measured=all(status == "measured" for status in statuses))
+        windows.append({**window, "users": users, "status": window_status, "fairness": fairness})
         all_users.extend({**user, "window_id": window["id"], "population": window["population"],
                           "scenario": window["scenario"]} for user in users)
+    scenario_delays = _delays(observation.get("scheduling_delay_windows", []))
+    for window in windows:
+        if window["phase"] != "measurement":
+            continue
+        evidence = None
+        if window.get("role") == "probe":
+            control = next((item for item in windows if item["id"] == window["control_window_id"]), None)
+            evidence = window["interference"] = _interference(observation, window, control, user_records, criteria,
+                                                               timing_health, legacy_max_lag_ms, timing_threshold, scenario_delays)
+        elif window.get("scenario") == "cancellation":
+            evidence = window["cancellation"] = _cancellation(window,
+                [r for r in records if r.workload.get("window_id") == window["id"]], criteria,
+                timing_health, legacy_max_lag_ms, timing_threshold,
+                scenario_delays)
+        elif window.get("scenario") == "recovery" and window.get("role") == "lighter":
+            control = next((item for item in windows if item["id"] == window["control_window_id"]), None)
+            sustained = next((item for item in windows if item["id"] == window["sustained_window_id"]), None)
+            evidence = window["recovery"] = _recovery(observation, window, control, sustained, user_records,
+                criteria, timing_health, legacy_max_lag_ms, timing_threshold, scenario_delays)
+        if window.get("offers") is not None:
+            for user in window["users"]:
+                if any(user.get("offer_accounting", {}).get(key, 0) for key in
+                       ("dropped_local", "dropped_late", "unissued", "not_offered")):
+                    user["coverage"]["status"] = "partial" if user["outcomes"]["attempted"] else "unexercised"
+                    user["reasons"].append("The configured user offer schedule was not delivered.")
+                    if user["status"] != "fail":
+                        user["status"] = "inconclusive"
+            if any(user["status"] == "inconclusive" for user in window["users"]) and window["status"] != "fail":
+                window["status"] = "inconclusive"
+        if evidence:
+            if "recovery" in window:
+                for user, comparison in zip(window["users"], evidence["users"], strict=True):
+                    user["status"] = _status([user["status"], comparison["status"]],
+                                              measured=user["status"] == comparison["status"] == "measured")
+                    user["reasons"] = list(dict.fromkeys(user["reasons"] + comparison["reasons"]))
+            window["status"] = _status([window["status"], evidence["status"]],
+                                      measured=window["status"] == evidence["status"] == "measured")
     status = _status([window["status"] for window in windows if window["phase"] == "measurement"],
-                     measured=bool(all_users) and all(user["status"] == "measured" for user in all_users))
+                     measured=bool(all_users) and all(window["status"] == "measured" for window in windows
+                                                   if window["phase"] == "measurement"))
+    all_users = [{**user, "window_id": window["id"], "population": window["population"],
+                  "scenario": window["scenario"]} for window in windows if window["phase"] == "measurement"
+                 for user in window["users"]]
     ranked = sorted(all_users, key=lambda user: (
         {"fail": 0, "inconclusive": 1, "measured": 2, "pass": 2}[user["status"]],
         user["output_tokens_per_second"] if user["output_tokens_per_second"] is not None else -1,
@@ -269,4 +695,5 @@ def summarize(observation: dict[str, Any], records: list[RequestRecord], *,
             "interpretation": "Completed valid output tokens delivered inside each common measurement window, "
                 "divided by that window's actual duration. Late and partial output are separate. "
                 "Latency distributions contain successful responses; timing attainment retains failed attempts. "
-                "Ready-to-answer latency includes client admission wait. This is closed-loop delivery, not fixed-rate capacity."}
+                "Ready-to-answer latency includes client admission wait. Scheduled traffic reports finite offers and local drops; "
+                "closed-loop delivery alone does not establish fixed-rate capacity."}

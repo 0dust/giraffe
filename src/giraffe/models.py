@@ -870,7 +870,8 @@ def required_concurrency(config) -> dict[str, Any]:
             arrival = config.effective_arrivals()
             peak = arrival.max_in_flight if arrival else config.inherited_concurrency(config.default_concurrency)
         elif check == "multi_user":
-            peak = max(config.multi_user.levels)
+            peak = (config.concurrency if set(config.multi_user.scenarios) & {"arrivals", "recovery"}
+                    else max(config.multi_user.levels))
         elif check == "gateway_policy":
             peak = len(config.gateway_policy.users) if config.gateway_policy else 0
         elif check == "sessions":
@@ -1095,27 +1096,8 @@ class MultiUserCriteria(Model):
     max_completion_ms: float | None = Field(default=None, gt=0)
     max_error_percent: float | None = Field(default=0, ge=0, le=100)
     min_output_tokens_per_second: float | None = Field(default=None, gt=0)
+    max_throughput_ratio: float | None = Field(default=None, ge=1)
     min_samples: StrictInt = Field(default=1, ge=1)
-
-
-class MultiUser(Model):
-    levels: list[Annotated[StrictInt, Field(ge=1, le=MAX_SIMULATED_USERS)]] = Field(
-        default_factory=lambda: [1, 5, 20], min_length=1, max_length=MAX_SIMULATED_USERS)
-    profile: LoadTestProfile = Field(default_factory=LoadTestProfile)
-    shapes: list[Literal[*SHAPES]] = Field(default_factory=lambda: ["short_short"], min_length=1, max_length=9)
-    seed: StrictInt = Field(default=42, ge=0, le=2**32 - 1)
-    think_time_seconds: SessionDistribution = Field(default_factory=lambda: SessionDistribution(values=[0]))
-    warmup_seconds: float = Field(default=0, ge=0, le=MAX_STAGE_SECONDS)
-    duration_seconds: float = Field(default=15, gt=0, le=MAX_STAGE_SECONDS)
-    pass_criteria: MultiUserCriteria = Field(default_factory=MultiUserCriteria)
-
-    @model_validator(mode="after")
-    def valid_population(self):
-        if len(set(self.levels)) != len(self.levels) or len(set(self.shapes)) != len(self.shapes):
-            raise ValueError("multi-user levels and shapes must be distinct")
-        if any(value > 60 for value in self.think_time_seconds.values):
-            raise ValueError("multi-user think times must be between 0 and 60 seconds")
-        return self
 
 
 class GatewayPolicyUser(Model):
@@ -1210,11 +1192,9 @@ def session_workload_presets() -> list[SessionWorkload]:
     ]
 
 
-class Sessions(Model):
+class ConversationSettings(Model):
     profile: Literal["correctness", "performance"] = "correctness"
     modes: list[Literal["fixed", "live"]] = Field(default_factory=lambda: ["fixed", "live"])
-    sessions: int = Field(default=5, ge=1, le=MAX_SESSIONS)
-    concurrency: int = Field(default=2, ge=1, le=MAX_SIMULTANEOUS_REQUESTS)
     turns: list[Annotated[str, Field(min_length=1, max_length=MAX_SESSION_TURN_CHARS)]] = Field(min_length=2, max_length=MAX_SESSION_TURNS, default_factory=lambda: [
         "Remember the name assigned to this conversation and reply with that name only.",
         SESSION_REPEAT_PROMPT])
@@ -1249,6 +1229,114 @@ class Sessions(Model):
             raise ValueError("select distinct fixed/live session modes")
         if not 2 <= len(self.turns) <= MAX_SESSION_TURNS or any(not t.strip() or len(t) > MAX_SESSION_TURN_CHARS for t in self.turns):
             raise ValueError(f"sessions need 2..{MAX_SESSION_TURNS} non-empty bounded user turns")
+        return self
+
+
+class Sessions(ConversationSettings):
+    sessions: int = Field(default=5, ge=1, le=MAX_SESSIONS)
+    concurrency: int = Field(default=2, ge=1, le=MAX_SIMULTANEOUS_REQUESTS)
+
+
+class MultiUserNeighbors(Model):
+    heavy_user_ids: list[str] | None = Field(default=None, min_length=1, max_length=31)
+    heavy_user_count: StrictInt = Field(default=1, ge=1, le=31)
+    heavy_profiles: list[Literal["long_short", "short_long", "long_long"]] = Field(
+        default_factory=lambda: ["long_short", "short_long"], min_length=1, max_length=3)
+    triggers: list[Literal["before_output", "during_stream"]] = Field(
+        default_factory=lambda: ["before_output", "during_stream"], min_length=1, max_length=2)
+    max_slowdown: float | None = Field(default=None, ge=1)
+
+
+class MultiUserCancellation(Model):
+    user_id: str = "user-01"
+    cancel_after_chunks: StrictInt = Field(default=5, ge=1, le=1000)
+
+
+class MultiUserBurst(Model):
+    user_id: str = "user-01"
+    at_seconds: float = Field(default=1, ge=0, le=MAX_STAGE_SECONDS)
+    requests: StrictInt = Field(default=5, ge=1, le=MAX_BURST_SIZE)
+    spacing_seconds: float = Field(default=0, ge=0, le=MAX_STAGE_SECONDS)
+
+
+class MultiUserArrivals(Model):
+    requests_per_second: float = Field(default=1, gt=0, le=1000)
+    activations: dict[str, Annotated[float, Field(ge=0, le=MAX_STAGE_SECONDS)]] = Field(default_factory=dict, max_length=32)
+    bursts: list[MultiUserBurst] = Field(default_factory=list, max_length=32)
+
+
+class MultiUserRecovery(Model):
+    control_seconds: float = Field(default=5, gt=0, le=MAX_STAGE_SECONDS)
+    sustained_seconds: float = Field(default=15, gt=0, le=MAX_STAGE_SECONDS)
+    lighter_seconds: float = Field(default=5, gt=0, le=MAX_STAGE_SECONDS)
+    sustained_requests_per_second: float = Field(default=2, gt=0, le=1000)
+    lighter_requests_per_second: float = Field(default=.5, gt=0, le=1000)
+    max_slowdown: float | None = Field(default=None, ge=1)
+
+
+class MultiUser(Model):
+    scenarios: list[Literal["repeated_requests", "noisy_neighbors", "cancellation", "arrivals", "recovery"]] = Field(
+        default_factory=lambda: ["repeated_requests"], min_length=1, max_length=5)
+    arrivals: MultiUserArrivals = Field(default_factory=MultiUserArrivals)
+    recovery: MultiUserRecovery = Field(default_factory=MultiUserRecovery)
+    noisy_neighbors: MultiUserNeighbors = Field(default_factory=MultiUserNeighbors)
+    cancellation: MultiUserCancellation = Field(default_factory=MultiUserCancellation)
+    levels: list[Annotated[StrictInt, Field(ge=1, le=MAX_SIMULATED_USERS)]] = Field(
+        default_factory=lambda: [1, 5, 20], min_length=1, max_length=MAX_SIMULATED_USERS)
+    profile: LoadTestProfile = Field(default_factory=LoadTestProfile)
+    shapes: list[Literal[*SHAPES]] = Field(default_factory=lambda: ["short_short"], min_length=1, max_length=9)
+    seed: StrictInt = Field(default=42, ge=0, le=2**32 - 1)
+    think_time_seconds: SessionDistribution = Field(default_factory=lambda: SessionDistribution(values=[0]))
+    warmup_seconds: float = Field(default=0, ge=0, le=MAX_STAGE_SECONDS)
+    duration_seconds: float = Field(default=15, gt=0, le=MAX_STAGE_SECONDS)
+    conversations: ConversationSettings | None = None
+    fairness_tolerance_percent: float = Field(default=10, ge=0, le=100)
+    pass_criteria: MultiUserCriteria = Field(default_factory=MultiUserCriteria)
+
+    @model_validator(mode="after")
+    def valid_population(self):
+        if len(set(self.scenarios)) != len(self.scenarios):
+            raise ValueError("multi-user scenarios must be distinct")
+        if self.conversations and self.scenarios != ["repeated_requests"]:
+            raise ValueError("conversation users support the repeated_requests scenario")
+        if set(self.scenarios) & {"noisy_neighbors", "cancellation", "recovery"} and min(self.levels) < 2:
+            raise ValueError("noisy neighbors, cancellation and recovery require at least two users at every level")
+        ids = {f"user-{index + 1:02d}" for index in range(min(self.levels))}
+        if "arrivals" in self.scenarios:
+            arrivals = self.arrivals
+            if not set(arrivals.activations) <= ids or any(b.user_id not in ids for b in arrivals.bursts):
+                raise ValueError("arrival and burst user IDs must exist at every population level")
+            if any(at >= self.duration_seconds for at in arrivals.activations.values()):
+                raise ValueError("user activations must precede the arrival window end")
+            if any(b.at_seconds < arrivals.activations.get(b.user_id, 0)
+                   or b.at_seconds + (b.requests-1)*b.spacing_seconds >= self.duration_seconds for b in arrivals.bursts):
+                raise ValueError("every burst must fall after its user activation and before the window end")
+            if math.ceil(self.duration_seconds * arrivals.requests_per_second) * max(self.levels) + sum(b.requests for b in arrivals.bursts) > MAX_PLANNED_ARRIVALS:
+                raise ValueError("multi-user arrival schedule exceeds the finite offer bound")
+        if "recovery" in self.scenarios:
+            recovery = self.recovery
+            if recovery.lighter_requests_per_second >= recovery.sustained_requests_per_second:
+                raise ValueError("recovery traffic must be lighter than sustained traffic")
+            if any(math.ceil(seconds*rate)*max(self.levels) > MAX_PLANNED_ARRIVALS for seconds, rate in (
+                    (recovery.control_seconds, recovery.lighter_requests_per_second),
+                    (recovery.sustained_seconds, recovery.sustained_requests_per_second),
+                    (recovery.lighter_seconds, recovery.lighter_requests_per_second))):
+                raise ValueError("multi-user recovery schedule exceeds the finite offer bound")
+        if "cancellation" in self.scenarios and self.cancellation.user_id not in ids:
+            raise ValueError("the cancellation user must exist at every population level")
+        if "noisy_neighbors" in self.scenarios:
+            heavy = self.noisy_neighbors
+            if heavy.heavy_user_ids is not None:
+                if len(set(heavy.heavy_user_ids)) != len(heavy.heavy_user_ids) or not set(heavy.heavy_user_ids) < ids:
+                    raise ValueError("heavy user IDs must be distinct, exist at every level and leave a short user")
+            elif heavy.heavy_user_count >= min(self.levels):
+                raise ValueError("heavy user count must leave at least one short user")
+            if len(set(heavy.heavy_profiles)) != len(heavy.heavy_profiles) or len(set(heavy.triggers)) != len(heavy.triggers):
+                raise ValueError("heavy profiles and interference triggers must be distinct")
+        if len(set(self.levels)) != len(self.levels) or len(set(self.shapes)) != len(self.shapes):
+            raise ValueError("multi-user levels and shapes must be distinct")
+        if any(value > 60 for value in self.think_time_seconds.values):
+            raise ValueError("multi-user think times must be between 0 and 60 seconds")
         return self
 
 
