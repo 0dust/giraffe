@@ -431,7 +431,7 @@ def _interference(observation, window, control, user_records, criteria, health, 
                     or baseline.workload.get("think_time_seconds") != probe.workload.get("think_time_seconds")):
                 notes.append("Matched logical work or pause plan differs.")
                 continue
-            if any(r.completed_ms is None or r.completed_ms > phase.get("end_ms", -1)
+            if any(r.completed_ms is None or phase.get("end_ms") is None or r.completed_ms > phase["end_ms"]
                    for r, phase in ((baseline, control), (probe, window))):
                 continue
             matches = []
@@ -489,9 +489,11 @@ def _interference(observation, window, control, user_records, criteria, health, 
             if a is None or b is None or max(a, b) > min(a, b)*(1+tolerance):
                 notes.append("Actual short-user token lengths are not comparable.")
         control_user = next((u for u in (control or {}).get("users", []) if u["user_id"] == uid), {})
-        exposure = [max(0, phase.get("end_ms", 0)-max(phase.get("start_ms", 0), u.get("activated_ms") or 0))
-                    for phase, u in ((control or {}, control_user), (window, user))]
-        if not min(exposure) or max(exposure) > min(exposure)*(1+tolerance):
+        bounds = [(phase.get("start_ms"), phase.get("end_ms"), u.get("activated_ms"))
+                  for phase, u in ((control or {}, control_user), (window, user))]
+        exposure = [max(0, end-max(start, activated)) if all(value is not None for value in (start, end, activated)) else None
+                    for start, end, activated in bounds]
+        if any(value is None or value <= 0 for value in exposure) or max(exposure) > min(exposure)*(1+tolerance):
             notes.append("Short-user active exposure is not comparable.")
         control_completion = median([user_latency(r, False) for r in before])
         probe_completion = median([user_latency(r, False) for r in after])

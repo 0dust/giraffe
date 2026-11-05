@@ -171,6 +171,50 @@ def test_short_user_failure_survives_unqualified_comparison():
     assert summary["windows"][1]["interference"]["status"] == "inconclusive"
 
 
+def test_unstarted_noisy_neighbor_plan_is_inconclusive():
+    from giraffe.multi_user_metrics import summarize
+    cfg = settings(levels=[2], scenarios=["noisy_neighbors"])
+    summary = summarize(_planned_observation(cfg.multi_user), [])
+    assert summary["status"] == "inconclusive"
+    comparisons = [window["interference"] for window in summary["windows"] if "interference" in window]
+    assert comparisons and all(item["status"] == "inconclusive" and not item["qualified"] for item in comparisons)
+
+
+@pytest.mark.parametrize("missing", ["start_ms", "end_ms", "activated_ms"])
+def test_matched_interference_with_missing_exposure_is_inconclusive(missing):
+    from giraffe.multi_user_metrics import summarize
+    source, records = matched_observation()
+    probe = source["windows"][1]
+    (probe["users"][0] if missing == "activated_ms" else probe)[missing] = None
+    evidence = summarize(source, records)["windows"][1]["interference"]
+    assert evidence["status"] == "inconclusive"
+    assert not evidence["qualified"]
+
+
+def test_http_budget_exhausted_before_probe_preserves_partial_result():
+    from giraffe.client import LLMClient
+    from giraffe.models import Target
+    from tests.fake_endpoint import FakeEndpoint
+
+    async def run(endpoint):
+        cfg = settings(levels=[2], duration_seconds=.3, scenarios=["noisy_neighbors"], profile=PROFILE,
+            noisy_neighbors={"triggers": ["during_stream"], "heavy_profiles": ["long_short"]}).model_copy(update={
+                "max_requests": 1, "targets": [Target(name="service", model="fake-model", url=endpoint.url)]})
+        state = runner._Run(cfg, None, None)
+        async with LLMClient(cfg.targets[0], cfg, max_connections=2) as client:
+            await execute(state, cfg.targets[0], client)
+        check = result(state, cfg.targets[0])
+        assert check.status == "inconclusive"
+        probe = check.metrics["multi_user"]["windows"][1]
+        assert probe["start_ms"] is None
+        assert probe["interference"]["status"] == "inconclusive"
+        assert len(state.records) == 1 and check.evidence_ids == [state.records[0].id]
+        assert state.slots.qsize() == 2
+
+    with FakeEndpoint(first_token_delay=.005, chunk_delay=.001) as endpoint:
+        asyncio.run(run(endpoint))
+
+
 def test_cancellation_followup_does_not_substitute_for_peer_overlap():
     from giraffe.multi_user_metrics import summarize
     from tests.test_multi_user_metrics import observation
