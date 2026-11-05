@@ -1109,7 +1109,7 @@ def request_plan(config: RunConfig | ConfigDraft, *,
         add("gateway_access", count,
             "One serial request per declared access case; missing identities and unsupported profiles send no traffic. "
             "Both allow and deny evidence are required for a complete policy observation.",
-            source="declared LiteLLM access cases", kind="bounded")
+            source="declared LiteLLM access cases", kind="exact")
     if "gateway_policy" in selected:
         settings = config.gateway_policy
         if settings is None:

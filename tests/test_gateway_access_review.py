@@ -113,3 +113,12 @@ async def test_malformed_credentials_leave_budget_for_valid_case(monkeypatch, cr
     assert valid["observed"] == "allow" and valid["request_id"] == run.records[0].id
     assert check.status == "inconclusive" and check.required
     assert "secret" not in check.model_dump_json()
+
+
+def test_finite_access_matrix_has_exact_request_plan():
+    from giraffe.planning import request_plan
+
+    plan = request_plan(config(max_requests=2))
+    row = next(row for row in plan["rows"] if row["id"] == "gateway_access")
+    assert row["kind"] == "exact" and row["requests_per_target"] == 2
+    assert not any("adaptive traffic" in warning for warning in plan["warnings"])
