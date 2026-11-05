@@ -126,7 +126,6 @@ def summarize(settings, observation, records):
     recognized = [record for record in affected if record.http_status == 429 and record.gateway_evidence
                   and record.gateway_evidence.policy_rejection == rejection_kind
                   and record.gateway_evidence.rate_limit_unit == "requests"]
-    # Both peer admission and service must follow the attributed rejection within this window.
     for rejection in recognized:
         summary["peer_continuation"] = all(any(record.identity == user.identity
             and record.status == "completed" and record.valid
@@ -145,7 +144,7 @@ def summarize(settings, observation, records):
     outputs = [record.output_tokens for record in successes]
     summary["comparable_actual_work"] = bool(successes and all(row["completed"] for row in users)
         and all(value is not None and value > 0 for value in inputs+outputs)
-        and len(set(inputs)) == 1 and max(outputs or [0]) <= 2*min(outputs or [0]))
+        and len(set(inputs)) == 1 and max(outputs) <= 2*min(outputs))
     if settings.window_state != "isolated_fresh" or not settings.gateway_version or not observation.get("isolated_run"):
         return outcome("unverified", "Gateway version or isolated fresh policy window is unknown.")
     if not observation.get("identities_distinct"):
@@ -168,7 +167,6 @@ def summarize(settings, observation, records):
             return outcome("unverified", "Successful responses do not confirm each declared priority tier.")
     elif any(record.gateway_evidence.request_limit != declared.rpm or record.gateway_evidence.request_remaining != 0 for record in recognized):
         return outcome("unverified", "Gateway key limit differs from the declared RPM.")
-    # A proven violation survives incomplete peer coverage. No inference from latency is used.
     admitted = sum(record.http_status is not None and 200 <= record.http_status < 300 for record in affected)
     allowance = declared.rpm
     if settings.capability == "priority_rpm":

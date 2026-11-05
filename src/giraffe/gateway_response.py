@@ -1,7 +1,6 @@
 """Allowlisted LiteLLM response evidence; raw errors never leave this parser."""
 import json
 import re
-import math
 
 from .models import GatewayResponseEvidence
 
@@ -72,6 +71,8 @@ def response_evidence(status, body=b"", headers=None, *, declared_priority=None)
                 matches = tier_match[1] == declared_priority
                 evidence.priority_matches = matches if evidence.priority_matches is None else matches and evidence.priority_matches
         saturation = re.search(r", Model saturation: ([0-9]{1,3}(?:\.[0-9]{1,6})?)%$", message)
-        if saturation and math.isfinite(float(saturation[1])) and float(saturation[1]) <= 100:
-            evidence.saturation_percent = float(saturation[1])
+        if saturation:
+            value = float(saturation[1])
+            if value <= 100:
+                evidence.saturation_percent = value
     return evidence

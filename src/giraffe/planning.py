@@ -1100,7 +1100,7 @@ def request_plan(config: RunConfig | ConfigDraft, *,
         settings = config.gateway_policy
         add("gateway_policy", sum(user.requests for user in settings.users),
             "Bounded requests per declared identity; stops at policy duration or shared run limits.",
-            source="fixed identical non-streaming policy probes", kind="bounded", title="Gateway quotas & priorities")
+            source="fixed identical non-streaming policy probes", kind="bounded")
         rows[-1].update(users=len(settings.users), simultaneous_limit=config.concurrency,
                         configured_seconds=settings.duration_seconds)
     if "multi_user" in selected:
