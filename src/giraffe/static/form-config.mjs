@@ -304,7 +304,10 @@ export function configureMultiUser(source, values, defaults, {allowInvalid=false
   const settings=multiUserSettings(source,defaults);
   const number=(name,label)=>numeric(values.get('multi_user_'+name),label,allowInvalid);
   const list=(name,label)=>String(values.get('multi_user_'+name)||'').split(',').map(value=>numeric(value.trim(),label,allowInvalid));
-  if(values.has('multi_user_scenarios_rendered'))settings.scenarios=['repeated_requests','noisy_neighbors','cancellation','arrivals','recovery'].filter(name=>values.get('multi_user_scenario_'+name)==='on');
+  if(values.has('multi_user_scenarios_rendered')){
+    const selected=['repeated_requests','noisy_neighbors','cancellation','arrivals','recovery'].filter(name=>values.get('multi_user_scenario_'+name)==='on');
+    settings.scenarios=[...settings.scenarios.filter(name=>selected.includes(name)),...selected.filter(name=>!settings.scenarios.includes(name))];
+  }
   if(values.has('multi_user_arrivals_requests_per_second'))settings.arrivals.requests_per_second=number('arrivals_requests_per_second','Requests per second per user');
   if(values.has('multi_user_arrivals_activations')){
     const rows=String(values.get('multi_user_arrivals_activations')||'').trim();
