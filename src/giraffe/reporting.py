@@ -28,7 +28,7 @@ from .deployment import deployment_diff, fixture_hash, safe_config, sanitize
 from .report_inputs import input_ref as _input_ref
 from .multi_user_metrics import (_length_mix_differs, _total_generated_tokens, _uncached_input_tokens, truncated_conversation_turn,
                                  user_delivery_completions, user_latency)
-from .models import (CHECK_NAMES, SHAPES, CheckResult, RequestRecord, RunConfig, RunReport, overall_status, load_shape_label,
+from .models import (CHECK_NAMES, CORE_CHECKS, SHAPES, CheckResult, RequestRecord, RunConfig, RunReport, overall_status, load_shape_label,
                      migrate_concurrent_load, migrate_run_limits, is_supported_schema, CURRENT_SCHEMA)
 from .stats import median, percentile
 from .storage import DEFAULT_LIMITS, format_size, fsync_directory, update_metadata, write_metadata
@@ -154,6 +154,10 @@ def _comparison_manifest(manifest: dict) -> dict:
     return value
 
 
+_CONVERSATION_REVISIONS = {"persistent_users", "shared_conversations"}
+_CONVERSATION_BRIDGE_CHECKS = {"prefix", "sessions", "consistency"}
+
+
 def _run_limits_workload_identity(manifest: dict, *, revision: str) -> dict | None:
     """Reconstruct only identities whose generator revision is known exactly."""
     raw = manifest.get("config", {})
@@ -170,6 +174,10 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str) -> dict | No
             # User and conversation wiring changed the shared file, but prefix
             # requests are unchanged across these exact generator revisions.
             unchanged_checks.add("prefix")
+        if revision in _CONVERSATION_REVISIONS:
+            # Ordinary core dispatch and the separate Load sources are the
+            # same on both sides of the shared conversation refactor.
+            unchanged_checks.update(CORE_CHECKS)
         if not set(resolved.checks) <= unchanged_checks:
             return None  # Load generators changed; attest unchanged specialists only.
     sampled_sessions = "sessions" in resolved.checks and resolved.sessions and resolved.sessions.sampling is not None
@@ -203,6 +211,8 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str) -> dict | No
         }[revision] if any(settings.values()) else None,
         "settings": settings,
     }
+    if "load" in resolved.checks and revision in _CONVERSATION_REVISIONS:
+        identity["load_test_source_sha256"] = "9b694c97a39d449d8ea15b09a9aeb406bf835179c0882827685c4d7888687d36"
     if sampled_sessions:
         identity["session_sampling_source_sha256"] = {
             "persistent_users": "2fab1370faeab7ddb91a7ae9c0e49520ee9a67e305441a0663877bb12bca24c3",
@@ -247,15 +257,25 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str) -> dict | No
 def _same_run_limits_workload(current: dict, old: dict) -> bool:
     if current.get("config", {}).get("config_version") != 2 or old.get("config", {}).get("config_version", 2) != 2:
         return False
+    matched_revisions = []
     for manifest in (current, old):
         revisions = ("phase2", "phase3", "review26", "caps26", "issue45", "issue95", "issue95_pauses", "issue95_pause_evidence", "persistent_users", "shared_conversations") if "config_version" in manifest.get("config", {}) else ("legacy",)
-        identities = [_run_limits_workload_identity(manifest, revision=revision) for revision in revisions]
-        if not any(identity is not None and fixture_hash(identity) == manifest.get("fixture_pack", {}).get("workload_fixture_sha256")
-                   for identity in identities):
+        fingerprint = manifest.get("fixture_pack", {}).get("workload_fixture_sha256")
+        matched = {revision for revision in revisions
+                   if (identity := _run_limits_workload_identity(manifest, revision=revision)) is not None
+                   and fixture_hash(identity) == fingerprint}
+        if not matched:
             return False
+        matched_revisions.append(matched)
     current_config = _comparison_manifest(current)["config"]
     old_config = _comparison_manifest(old)["config"]
     selected = set(current_config.get("checks", [])) | set(old_config.get("checks", []))
+    if not selected <= _CONVERSATION_BRIDGE_CHECKS:
+        # Newly attested companion checks must match the exact conversation
+        # revisions on both reports. Earlier bridges keep their existing scope.
+        if not (all(matches & _CONVERSATION_REVISIONS for matches in matched_revisions)
+                or all(matches - _CONVERSATION_REVISIONS for matches in matched_revisions)):
+            return False
     return all(current_config.get(field) == old_config.get(field)
                for field, checks in WORKLOAD_CHECKS.items() if checks & selected)
 

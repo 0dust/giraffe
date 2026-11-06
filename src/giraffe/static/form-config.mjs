@@ -345,6 +345,7 @@ export function configureMultiUser(source, values, defaults, {allowInvalid=false
             max_tokens:number(`conversation_task_${i}_cap`,'Task output cap'),
             turns:Array.from({length:Number(values.get(prefix+`task_${i}_turn_count`))},(_,turn)=>String(values.get(prefix+`task_${i}_turn_${turn}`)||''))});
         }
+        if(!conversation.workloads.length&&!allowInvalid)throw new Error('Select at least one conversation task.');
       }
       settings.conversations=conversation;
     }
