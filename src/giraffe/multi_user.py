@@ -20,9 +20,18 @@ WINDOW_POLICY = "completed-output-v1"
 class _UserOutputProgress(OutputProgress):
     first_token = False
 
+    def __init__(self, changed, expire_trigger_admissions):
+        super().__init__(changed)
+        self.expire_trigger_admissions = expire_trigger_admissions
+
     def on_first_token(self):
         self.first_token = True
+        self.expire_trigger_admissions()
         self.changed.set()
+
+    def set(self):
+        super().set()
+        self.expire_trigger_admissions()
 
 
 def _matched_work_sha256(spec, *, nonce=None):
@@ -94,6 +103,7 @@ async def run_window(run, target, client, settings, load_settings, calibration, 
     admission_closed = asyncio.Event()
     changed = asyncio.Event()
     active = {}
+    trigger_waiters = {}
     sequences = sequences if sequences is not None else {}
 
     def trigger_peers():
@@ -103,6 +113,14 @@ async def run_window(run, target, client, settings, load_settings, calibration, 
 
     def cancellation_peers():
         return [uid for uid, progress in active.items() if progress.first]
+
+    def expire_trigger_admissions():
+        if not trigger_waiters or closed or time.monotonic() >= cutoff:
+            return
+        peers = trigger_peers() if window["role"] == "probe" else cancellation_peers()
+        if not peers:
+            for user in trigger_waiters.values():
+                user["pending_ready_ms"] = None
 
     async def wait_for_trigger(eligible_peers):
         while not closed and time.monotonic() < cutoff:
@@ -170,7 +188,7 @@ async def run_window(run, target, client, settings, load_settings, calibration, 
                 spec.workload["cancellation_role"] = "selected" if cancel_first else "followup"
                 if cancel_first:
                     spec.cancel_after_chunks = settings.cancellation.cancel_after_chunks
-            progress = _UserOutputProgress(changed)
+            progress = _UserOutputProgress(changed, expire_trigger_admissions)
             heavy = window.get("role") == "probe" and user["user_id"] in window.get("heavy_user_ids", [])
             eligible_peers = cancellation_peers if cancel_first else trigger_peers if heavy else None
             if settings.conversations:
@@ -180,6 +198,7 @@ async def run_window(run, target, client, settings, load_settings, calibration, 
             def dispatched():
                 user["dispatched_count"] += 1
                 user["pending_ready_ms"] = None
+                trigger_waiters.pop(user["user_id"], None)
                 active[user["user_id"]] = progress
                 if heavy:
                     spec.workload.update(trigger=window["trigger"], trigger_ms=_relative(run),
@@ -201,24 +220,29 @@ async def run_window(run, target, client, settings, load_settings, calibration, 
                 user["ready_count"] += 1
                 user["pending_ready_ms"] = ready
                 spec.workload["ready_ms"] = ready
-                async with run.slot(False, cutoff) as admitted:
-                    if not admitted or closed or time.monotonic() >= cutoff:
-                        return None
-                    if not run.allowed(target.name):
-                        close(run.stop_reason(target.name) or "target request allowance exhausted")
-                        return None
-                    peers = eligible_peers() if eligible_peers else []
-                    if eligible_peers and not peers:
-                        # Eligibility expired while queued. Release the slot and
-                        # wait for a new peer without carrying over admission delay.
-                        user["pending_ready_ms"] = None
-                        continue
-                    try:
-                        return await run.request(target, client, spec, slot_reserved=True, admission_deadline=cutoff,
-                                                 event=progress, on_start=dispatched, finalize_record=finalized)
-                    finally:
-                        active.pop(user["user_id"], None)
-                        changed.set()
+                if eligible_peers:
+                    trigger_waiters[user["user_id"]] = user
+                try:
+                    async with run.slot(False, cutoff) as admitted:
+                        if not admitted or closed or time.monotonic() >= cutoff:
+                            return None
+                        if not run.allowed(target.name):
+                            close(run.stop_reason(target.name) or "target request allowance exhausted")
+                            return None
+                        peers = eligible_peers() if eligible_peers else []
+                        if eligible_peers and (not peers or user["pending_ready_ms"] is None):
+                            # An expired trigger cannot carry admission wait into a new opportunity.
+                            user["pending_ready_ms"] = None
+                            continue
+                        try:
+                            return await run.request(target, client, spec, slot_reserved=True, admission_deadline=cutoff,
+                                                     event=progress, on_start=dispatched, finalize_record=finalized)
+                        finally:
+                            active.pop(user["user_id"], None)
+                            expire_trigger_admissions()
+                            changed.set()
+                finally:
+                    trigger_waiters.pop(user["user_id"], None)
 
         while not closed and time.monotonic() < cutoff:
             if not run.allowed(target.name):
@@ -470,19 +494,27 @@ def result(run, target):
     if status == "measured":
         message = "Per-user delivery measured; no acceptance criteria selected."
     elif status == "fail":
-        worst = summary["worst_user"]
+        messages = []
+        if summary["failed_user_windows"]:
+            worst = summary["worst_user"]
+            messages.append(f"{summary['failed_user_windows']} user measurements failed; "
+                            f"{worst['user_id']} at {worst['population']} users: " + " ".join(worst["reasons"]))
         fairness_failures = [window["fairness"] for window in summary["windows"]
-                             if window.get("fairness", {}).get("status") == "fail"]
-        message = (f"{summary['failed_user_windows']} user measurements failed; "
-                   f"{worst['user_id']} at {worst['population']} users: "
-                   + " ".join(worst["reasons"])) if summary["failed_user_windows"] else "Observed delivery fairness failed."
+                             if not window.get("role") and window.get("fairness", {}).get("status") == "fail"]
         if fairness_failures:
-            message += " " + " ".join(reason for result in fairness_failures for reason in result["reasons"])
+            messages.append("Observed delivery fairness failed. " + " ".join(
+                reason for evidence in fairness_failures for reason in evidence["reasons"]))
         interference_failures = [user for window in summary["windows"]
                                  for user in window.get("interference", {}).get("users", []) if user["status"] == "fail"]
         if interference_failures:
-            detail = " ".join(f"{user['user_id']}: {' '.join(user['reasons'])}" for user in interference_failures)
-            message = (message + " " if summary["failed_user_windows"] else "Observed noisy-neighbor interference failed. ") + detail
+            messages.append("Observed noisy-neighbor interference failed. " + " ".join(
+                f"{user['user_id']}: {' '.join(user['reasons'])}" for user in interference_failures))
+        for window in summary["windows"]:
+            followup = window.get("cancellation", {}).get("followup", {})
+            if followup.get("status") == "fail":
+                messages.append("Same-user cancellation follow-up failed for "
+                                + window["cancellation"]["selected_user_id"] + ".")
+        message = " ".join(messages)
     elif status == "pass":
         message = "Every measured user met the selected criteria over the common windows."
     else:

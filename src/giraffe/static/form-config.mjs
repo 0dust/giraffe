@@ -302,7 +302,10 @@ export function configureMultiUser(source, values, defaults, {allowInvalid=false
   const settings=multiUserSettings(source,defaults);
   const number=(name,label)=>numeric(values.get('multi_user_'+name),label,allowInvalid);
   const list=(name,label)=>String(values.get('multi_user_'+name)||'').split(',').map(value=>numeric(value.trim(),label,allowInvalid));
-  if(values.has('multi_user_scenarios_rendered'))settings.scenarios=['repeated_requests','noisy_neighbors','cancellation'].filter(name=>values.get('multi_user_scenario_'+name)==='on');
+  if(values.has('multi_user_scenarios_rendered')){
+    const selected=['repeated_requests','noisy_neighbors','cancellation'].filter(name=>values.get('multi_user_scenario_'+name)==='on');
+    settings.scenarios=[...settings.scenarios.filter(name=>selected.includes(name)),...selected.filter(name=>!settings.scenarios.includes(name))];
+  }
   for(const [field,group,options] of [['heavy_profiles','profile',['long_short','short_long','long_long']],['triggers','trigger',['before_output','during_stream']]]){
     if(!values.has('multi_user_noisy_neighbors_'+group+'s_rendered'))continue;
     const selected=options.filter(name=>values.get('multi_user_noisy_neighbors_'+group+'_'+name)==='on');

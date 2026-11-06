@@ -37,6 +37,17 @@ console.log(JSON.stringify(result));
     assert resolved.multi_user.cancellation.cancel_after_chunks == 3
 
 
+def test_unchanged_form_preserves_imported_scenario_order():
+    config = configuration()
+    config.multi_user.scenarios = ['cancellation', 'noisy_neighbors']
+    saved = browser_logic(r'''
+const form=new FormData();form.set('multi_user_rendered','1');form.set('multi_user_scenarios_rendered','1');
+form.set('multi_user_scenario_noisy_neighbors','on');form.set('multi_user_scenario_cancellation','on');
+console.log(JSON.stringify(configureMultiUser(config,form,bootstrap.multi_user.defaults)));
+''', config)
+    assert RunConfig.model_validate(saved).multi_user.scenarios == config.multi_user.scenarios
+
+
 def test_scenario_results_show_separate_observations_and_request_links():
     from tests.test_multi_user_reporting import scenario_report
     summary = scenario_report().checks[0].metrics['multi_user']

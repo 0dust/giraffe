@@ -685,7 +685,7 @@ def summarize(observation: dict[str, Any], records: list[RequestRecord], *,
     measurement_windows = [window for window in windows if window["phase"] == "measurement"]
     statuses = [window["status"] for window in measurement_windows]
     fairness_windows = [window for window in measurement_windows if not window.get("role")]
-    if criteria.max_throughput_ratio is not None and fairness_windows and all(
+    if criteria.max_throughput_ratio is not None and all(
             window["fairness"]["status"] == "not_applicable" for window in fairness_windows):
         statuses.append("inconclusive")
     status = _status(statuses, measured=bool(all_users) and all(value == "measured" for value in statuses))
