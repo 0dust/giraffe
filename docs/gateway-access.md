@@ -15,7 +15,7 @@ credentials whose intended policy you know: the first identity should be allowed
 to call that model; the second should be invalid or denied that model. Giraffe
 does not create keys, revoke keys, change privileges, or call administrative
 gateway endpoints. Each case makes one ordinary inference request and may incur
-the endpoint's normal inference cost.
+the endpoint's normal inference cost. Access probes omit suite-level tool options.
 
 Identities may include `headers_env`, mapping header names to environment variable
 names. They replace the endpoint's credentials completely. An explicit empty
@@ -43,7 +43,7 @@ the matrix can pass.
 | HTTP 200 with a `length` finish and assistant reasoning metered at the full requested output cap | Allow |
 | HTTP 401 with a recognized LiteLLM authentication error | Deny |
 | HTTP 403 with a recognized LiteLLM model-access error | Deny |
-| Timeout, network error, 429, 5xx, redirect, unknown authentication error, malformed or incomplete response | Unverified |
+| Timeout, network error, 429, 5xx, redirect, unknown authentication error, tool call, malformed or incomplete response | Unverified |
 
 Recognized 401 types are `token_not_found_in_db` and `expired_key`. Generic
 `auth_error` responses remain unverified because they can indicate an

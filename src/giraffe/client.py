@@ -590,9 +590,6 @@ class LLMClient:
             content = choice.get("delta" if streaming else "message")
             if not isinstance(content, dict):
                 raise _ProtocolError("response is missing assistant content")
-            if access_probe and (content.get("role") != "assistant"
-                                 or choice.get("finish_reason") not in ("stop", "length")):
-                raise _ProtocolError("gateway access probe requires a completed assistant answer")
             if conversation:
                 if content.get("role", "assistant") != "assistant":
                     raise _ProtocolError("conversation response must have assistant role")
@@ -610,19 +607,18 @@ class LLMClient:
             if policy_probe and (content.get("role") != "assistant"
                                  or choice.get("finish_reason") not in ("stop", "length")):
                 raise _ProtocolError("gateway policy probe requires a completed assistant answer")
-            answer = _text(content.get("content"))
+            if access_probe:
+                from .gateway_access import assistant_reply
+
+                answer, reasoning, record._gateway_access_refusal = assistant_reply(content, choice.get("finish_reason"))
+            else:
+                answer = _text(content.get("content"))
             if logprob_collector is not None:
                 logprob_collector.add(choice.get("logprobs"))
             if spec.workload.get("logprobs") and not streaming:
                 record.logprob_evidence = self.logprob_budget.collect(choice.get("logprobs"), answer,
                                                           spec.workload["top_logprobs"])
-            if access_probe:
-                reasoning = _text(content.get("reasoning_content"))
-                alternate_reasoning = _text(content.get("reasoning"))
-                reasoning = reasoning or alternate_reasoning
-                refusal = _text(content.get("refusal"))
-                record._gateway_access_refusal = bool(refusal.strip()) and choice.get("finish_reason") == "stop"
-            else:
+            if not access_probe:
                 reasoning = _text(content.get("reasoning_content") or content.get("reasoning"))
             now = observed_at
             if streaming:

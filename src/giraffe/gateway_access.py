@@ -3,12 +3,13 @@ from __future__ import annotations
 import json
 import re
 
-from giraffe.client import REASONING_BUDGET_ERROR
+from giraffe.client import REASONING_BUDGET_ERROR, _ProtocolError, _text
 from giraffe.identities import LITELLM_NATIVE_KEY_HEADERS, identity_headers, litellm_key_fingerprint
 from giraffe.models import CheckResult, RequestSpec
 
 
 EVIDENCE_VERSION = 2
+_TOOL_OPTIONS = ("tools", "tool_choice", "parallel_tool_calls", "functions", "function_call")
 QUALIFICATION = ("Only the declared identities and endpoint/model were exercised. "
                  "These fixtures do not certify tenant isolation or comprehensive gateway security.")
 
@@ -16,6 +17,19 @@ QUALIFICATION = ("Only the declared identities and endpoint/model were exercised
 def configured_cases(config):
     settings = config.gateway_access
     return settings.cases if settings else []
+
+
+def assistant_reply(message, finish_reason):
+    """Validate the fields used to qualify a plain assistant completion."""
+    if message.get("role") != "assistant" or finish_reason not in ("stop", "length"):
+        raise _ProtocolError("gateway access probe requires a completed assistant answer")
+    if message.get("tool_calls") not in (None, []) or message.get("function_call") is not None:
+        raise _ProtocolError("gateway access probe received an unexpected tool call")
+    answer = _text(message.get("content"))
+    reasoning = _text(message.get("reasoning_content"))
+    alternate_reasoning = _text(message.get("reasoning"))
+    refusal = _text(message.get("refusal"))
+    return answer, reasoning or alternate_reasoning, finish_reason == "stop" and bool(refusal.strip())
 
 
 def denial_kind(status, body):
@@ -119,6 +133,7 @@ async def execute(run, target, client):
         spec = RequestSpec(fixture_id="gateway-access-" + case.name,
             scenario="gateway_access", check_ids=["gateway_access"], identity=case.identity,
             messages=[{"role": "user", "content": "Reply with OK."}], stream=False,
+            options=dict.fromkeys(_TOOL_OPTIONS),
             max_tokens=settings.max_output_tokens,
             request_timeout_seconds=settings.request_timeout_seconds,
             workload={"case": case.name, "expected": case.expected})

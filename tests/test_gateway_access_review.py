@@ -235,6 +235,64 @@ async def test_access_requires_valid_assistant_text_fields(monkeypatch, message,
     assert "deny-secret" not in report.model_dump_json()
 
 
+@pytest.mark.parametrize("message,finish,usage,observed", [
+    ({"content": "OK", "tool_calls": None, "function_call": None}, "stop", {}, "allow"),
+    ({"content": "OK", "tool_calls": []}, "stop", {}, "allow"),
+    ({"content": "OK", "tool_calls": [{}]}, "stop", {}, "unverified"),
+    ({"refusal": "deny-secret", "tool_calls": [{}]}, "stop", {}, "unverified"),
+    ({"content": None, "tool_calls": [{}]}, "length", {"completion_tokens": 16,
+        "completion_tokens_details": {"reasoning_tokens": 16}}, "unverified"),
+    ({"content": "OK", "tool_calls": {}}, "stop", {}, "unverified"),
+    ({"content": "OK", "function_call": {}}, "stop", {}, "unverified"),
+    ({"content": "OK", "function_call": {"name": "unexpected", "arguments": "{}"}}, "stop", {}, "unverified"),
+])
+async def test_access_requires_tool_free_completions(monkeypatch, message, finish, usage, observed):
+    monkeypatch.setenv("ALLOW_KEY", "allow-secret")
+    monkeypatch.setenv("DENY_KEY", "deny-secret")
+
+    def handler(request):
+        if request.method != "POST":
+            return httpx.Response(404)
+        if request.headers["authorization"] == "Bearer allow-secret":
+            return httpx.Response(200, json={"choices": [{"message": {
+                "role": "assistant", "content": "OK"}, "finish_reason": "stop"}]})
+        return httpx.Response(200, json={"choices": [{"message": {
+            "role": "assistant", **message}, "finish_reason": finish}], "usage": usage})
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
+    report = await run_suite(config(retention="all"))
+    check = next(check for check in report.checks if check.id == "gateway_access")
+    assert check.metrics["gateway_access"]["cases"][1]["observed"] == observed
+    assert report.overall == check.status == ("fail" if observed == "allow" else "inconclusive")
+    assert "deny-secret" not in report.model_dump_json()
+
+
+async def test_access_does_not_send_inherited_tool_options(monkeypatch):
+    monkeypatch.setenv("ALLOW_KEY", "allow-secret")
+    monkeypatch.setenv("DENY_KEY", "deny-secret")
+    inherited = {"tools": [{"type": "function", "function": {"name": "unexpected"}}],
+                 "tool_choice": "required", "parallel_tool_calls": True,
+                 "functions": [{"name": "legacy"}], "function_call": "auto"}
+    payloads = []
+
+    def handler(request):
+        if request.method != "POST":
+            return httpx.Response(404)
+        payloads.append(json.loads(request.content))
+        if request.headers["authorization"] == "Bearer deny-secret":
+            return httpx.Response(401, json={"error": {"type": "token_not_found_in_db"}})
+        return httpx.Response(200, json={"choices": [{"message": {
+            "role": "assistant", "content": "OK"}, "finish_reason": "stop"}]})
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
+    report = await run_suite(config(request_options={**inherited, "temperature": 0.4}))
+    assert report.overall == "pass"
+    assert len(payloads) == 2
+    assert all(payload["temperature"] == 0.4 and not inherited.keys() & payload.keys() for payload in payloads)
+
+
 async def test_access_denial_rules_do_not_change_policy_evidence(monkeypatch, local_tokenizer):
     from tests.test_gateway_policy import exercise
 
