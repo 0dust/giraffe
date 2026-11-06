@@ -29,7 +29,8 @@ from .report_inputs import input_ref as _input_ref
 from .multi_user_metrics import (_length_mix_differs, _total_generated_tokens, _uncached_input_tokens, truncated_conversation_turn,
                                  user_delivery_completions, user_latency)
 from .models import (CHECK_NAMES, CORE_CHECKS, SHAPES, SHARED_BASELINE_EXCLUDED_WORKLOADS, CheckResult, GatewayAccess,
-                     GatewayAttribution, GatewayPolicy, RequestRecord, RunConfig, RunReport, overall_status, load_shape_label,
+                     GatewayAttribution, GatewayEvidence, GatewayPolicy, RequestRecord, RunConfig, RunReport,
+                     overall_status, load_shape_label,
                      migrate_concurrent_load, migrate_run_limits, is_supported_schema, CURRENT_SCHEMA)
 from .stats import median, percentile
 from .storage import DEFAULT_LIMITS, format_size, fsync_directory, update_metadata, write_metadata
@@ -86,6 +87,27 @@ def _groups(records: list[RequestRecord], target: str) -> dict[tuple[str, str], 
     return groups
 
 
+def _uses_shared_tool_options(config: dict, check: str) -> bool:
+    if check in ("gateway_access", "gpu"):
+        return False
+    if check not in ("gateway_attribution", "gateway_policy"):
+        return True
+    settings = config.get(check)
+    if settings is None:
+        return False
+    try:
+        if check == "gateway_policy":
+            return GatewayPolicy.model_validate(settings).supported
+        GatewayAttribution.model_validate(settings)
+        targets = config.get("targets")
+        if not isinstance(targets, list) or not targets:
+            return True
+        return any(not isinstance(target, dict) or (target.get("gateway") is not None
+                   and GatewayEvidence.model_validate(target["gateway"]).profile == "litellm") for target in targets)
+    except ValidationError:
+        return True
+
+
 def _comparison_config(value: dict) -> dict:
     """Normalize saved config I/O without changing the recorded workload identity."""
     config, _ = migrate_run_limits(deepcopy(value))
@@ -93,13 +115,11 @@ def _comparison_config(value: dict) -> dict:
     checks = config.get("checks")
     options = config.get("request_options")
     if (isinstance(checks, list) and "gateway_access" in checks
-            and all(check in ("gateway_access", "gpu")
-                    or (check in ("gateway_attribution", "gateway_policy") and config.get(check) is None)
-                    for check in checks)
-            and not config.get("restart_target") and isinstance(options, dict)):
+            and not config.get("restart_target") and isinstance(options, dict)
+            and not any(_uses_shared_tool_options(config, check) for check in checks)):
         from .gateway_access import _TOOL_OPTIONS
 
-        # Access discards these options. Telemetry and unconfigured probes send no inference.
+        # Access discards these options. Telemetry and unavailable probes send no inference.
         config["request_options"] = {key: value for key, value in options.items() if key not in _TOOL_OPTIONS}
     if isinstance(config.get("limits"), dict):
         config["limits"].pop("regression_percent", None)

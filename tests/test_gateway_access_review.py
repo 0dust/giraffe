@@ -268,8 +268,17 @@ async def test_access_requires_tool_free_completions(monkeypatch, message, finis
     assert "deny-secret" not in report.model_dump_json()
 
 
-@pytest.mark.parametrize("other_check", [None, "gateway_attribution", "gateway_policy", "serving"])
-async def test_access_baseline_matches_transmitted_request_options(monkeypatch, other_check):
+@pytest.mark.parametrize("other_check,setup,uses_tool_options", [
+    (None, None, False),
+    ("gateway_attribution", None, False),
+    ("gateway_attribution", "no_reader", False),
+    ("gateway_attribution", "unsupported_reader", False),
+    ("gateway_attribution", "potentially_active", True),
+    ("gateway_policy", None, False),
+    ("gateway_policy", "unsupported", False),
+    ("serving", None, True),
+])
+async def test_access_baseline_matches_transmitted_request_options(monkeypatch, other_check, setup, uses_tool_options):
     monkeypatch.setenv("ALLOW_KEY", "allow-secret")
     monkeypatch.setenv("DENY_KEY", "deny-secret")
     inherited = {"tools": [{"type": "function", "function": {"name": "unexpected"}}],
@@ -295,6 +304,15 @@ async def test_access_baseline_matches_transmitted_request_options(monkeypatch, 
         raw = config(request_options=options).model_dump()
         if other_check:
             raw["checks"].append(other_check)
+        if other_check == "gateway_attribution" and setup is not None:
+            raw["gateway_attribution"] = {"identities": ["allowed"], "samples": 1}
+            if setup != "no_reader":
+                raw["targets"][0]["gateway"] = {"url": "http://reader", "api_key_env": "ALLOW_KEY",
+                    "profile": "litellm" if setup == "potentially_active" else "unsupported"}
+                raw["max_requests"] = 8  # The mocked reader's 404 preflight sends no inference.
+        if other_check == "gateway_policy" and setup is not None:
+            raw["gateway_policy"] = {"capability": "unsupported", "affected_identity": "allowed", "users": [
+                {"identity": alias, "requests": 1, "rpm": 1} for alias in ("allowed", "denied")]}
         report = await run_suite(RunConfig.model_validate(raw))
         assert report.overall == "pass"
         probes = {auth: body for auth, body in payloads if auth is not None}
@@ -312,7 +330,7 @@ async def test_access_baseline_matches_transmitted_request_options(monkeypatch, 
     current, probes = await run_with({"temperature": 0.4})
     assert probes == original_probes
     comparison = compare_baseline(current, baseline).baseline["targets"][0]
-    if other_check == "serving":
+    if uses_tool_options:
         assert comparison["status"] == "inconclusive"
         assert "Run setting request_options differs." in comparison["reasons"]
     else:
@@ -372,16 +390,19 @@ async def test_access_denial_rules_do_not_change_policy_evidence(monkeypatch, lo
     assert compare_baseline(report, baseline).baseline["status"] == "pass"
 
 
-@pytest.mark.parametrize("completion,reasoning,reasoning_text,observed,status", [
-    (16, 16, "deny-secret", "allow", "fail"),
-    (16, 16, None, "allow", "fail"),
-    (16, None, "deny-secret", "unverified", "inconclusive"),
-    (16, 17, None, "unverified", "inconclusive"),
-    (15, 15, None, "unverified", "inconclusive"),
-    (17, 17, None, "unverified", "inconclusive"),
+@pytest.mark.parametrize("completion,reasoning,reasoning_text,extra_usage,extra_details,observed", [
+    (16, 16, "deny-secret", {}, {}, "allow"),
+    (16, 16, None, {}, {}, "allow"),
+    (16, 16, None, {"total_tokens": 24}, {"accepted_prediction_tokens": 0, "audio_tokens": None}, "allow"),
+    (16, 16, None, {"total_tokens": 8}, {}, "unverified"),
+    (16, 16, None, {"total_tokens": 24}, {"accepted_prediction_tokens": 2}, "unverified"),
+    (16, None, "deny-secret", {}, {}, "unverified"),
+    (16, 17, None, {}, {}, "unverified"),
+    (15, 15, None, {}, {}, "unverified"),
+    (17, 17, None, {}, {}, "unverified"),
 ])
 async def test_reasoning_only_access_requires_metered_cap_exhaustion(
-        monkeypatch, completion, reasoning, reasoning_text, observed, status):
+        monkeypatch, completion, reasoning, reasoning_text, extra_usage, extra_details, observed):
     monkeypatch.setenv("ALLOW_KEY", "allow-secret")
     monkeypatch.setenv("DENY_KEY", "deny-secret")
 
@@ -390,20 +411,23 @@ async def test_reasoning_only_access_requires_metered_cap_exhaustion(
             return httpx.Response(404)
         if request.headers["authorization"] == "Bearer allow-secret":
             return httpx.Response(200, json={"choices": [{"message": {
-                "role": "assistant", "content": "OK"}, "finish_reason": "stop"}]})
+                "role": "assistant", "content": "OK"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 8, "completion_tokens": 1, "total_tokens": 8}})
         assert json.loads(request.content)["max_tokens"] == 16
         return httpx.Response(200, json={"choices": [{"message": {
             "role": "assistant", "content": None, "reasoning_content": reasoning_text},
             "finish_reason": "length"}], "usage": {"prompt_tokens": 8,
-            "completion_tokens": completion, "completion_tokens_details": {"reasoning_tokens": reasoning}}})
+            "completion_tokens": completion, **extra_usage,
+            "completion_tokens_details": {"reasoning_tokens": reasoning, **extra_details}}})
 
     original = httpx.AsyncClient
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
     report = await run_suite(config(retention="all"))
     check = next(check for check in report.checks if check.id == "gateway_access")
-    denied_case = check.metrics["gateway_access"]["cases"][1]
+    allowed_case, denied_case = check.metrics["gateway_access"]["cases"]
     record = next(record for record in report.requests if record.id == denied_case["request_id"])
-    assert report.overall == check.status == denied_case["status"] == status
+    assert allowed_case["observed"] == "allow" and allowed_case["reason"] == "valid_completion"
+    assert report.overall == check.status == denied_case["status"] == ("fail" if observed == "allow" else "inconclusive")
     assert denied_case["observed"] == observed
     assert not record.valid and record.answer_chars == 0
     assert "deny-secret" not in report.model_dump_json()

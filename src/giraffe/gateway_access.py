@@ -4,7 +4,7 @@ import hashlib
 import json
 import re
 
-from giraffe.client import REASONING_BUDGET_ERROR, _ProtocolError, _text
+from giraffe.client import REASONING_BUDGET_ERROR, _ProtocolError, _text, _token_count
 from giraffe.identities import LITELLM_NATIVE_KEY_HEADERS, identity_headers, litellm_key_fingerprint
 from giraffe.models import CheckResult, RequestSpec
 
@@ -37,6 +37,23 @@ def assistant_reply(message, finish_reason):
     alternate_reasoning = _text(message.get("reasoning"))
     refusal = _text(message.get("refusal"))
     return answer, reasoning or alternate_reasoning, finish_reason == "stop" and bool(refusal.strip())
+
+
+def metered_reasoning_usage(usage, record):
+    """Require the output cap to be accounted for entirely by reasoning."""
+    completion = record.completion_tokens
+    if not isinstance(usage, dict) or not (record.reasoning_tokens == completion == record.requested_max_tokens > 0):
+        return False
+    if "total_tokens" in usage:
+        total = _token_count(usage["total_tokens"])
+        prompt = record.input_tokens
+        if (total is None or total < completion or ("prompt_tokens" in usage and prompt is None)
+                or (prompt is not None and total != prompt + completion)):
+            return False
+    details = usage["completion_tokens_details"]
+    return all(details.get(field) is None or _token_count(details[field]) == 0 for field in (
+        "accepted_prediction_tokens", "rejected_prediction_tokens", "audio_tokens", "text_tokens",
+    ))
 
 
 def denial_kind(status, body):
@@ -76,8 +93,7 @@ def observation(record):
             return "allow", "valid_completion"
         if record._gateway_access_refusal:
             return "allow", "assistant_refusal"
-        if (record.error == REASONING_BUDGET_ERROR
-                and record.reasoning_tokens == record.completion_tokens == record.requested_max_tokens > 0):
+        if record.error == REASONING_BUDGET_ERROR and record._gateway_access_metered_reasoning:
             return "allow", "metered_reasoning_completion"
     evidence = record.gateway_evidence
     if (record.status == "failed" and record.error == f"HTTP {record.http_status}" and evidence
