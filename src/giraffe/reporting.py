@@ -371,6 +371,30 @@ def _same_load_workload(current: dict, old: dict, *, fingerprint_key: str = "wor
     return bool(matches[0] & matches[1])
 
 
+def _gateway_limited_mixed_run(report: RunReport) -> bool:
+    checks = report.manifest.get("config", {}).get("checks")
+    if report.observations.get("request_limit_scopes") != ["gateway"] or not isinstance(checks, list):
+        return False
+    selected = {check for check in checks if isinstance(check, str)}
+    return (bool(selected & SHARED_BASELINE_EXCLUDED_WORKLOADS)
+            and any(check in CHECK_NAMES for check in selected - SHARED_BASELINE_EXCLUDED_WORKLOADS - {"gpu"}))
+
+
+def _shared_budget_cutoff(check: CheckResult) -> bool:
+    if check.id in SHARED_BASELINE_EXCLUDED_WORKLOADS:
+        return False
+    metrics = check.metrics
+    if metrics.get("reason_code") == "budget_limited":
+        return True
+    if check.id == "load":
+        points = metrics.get("points")
+        return isinstance(points, list) and any(isinstance(point, dict) and point.get("reason_code") == "budget_limited"
+                                                for point in points)
+    completion = metrics.get("sustained_completion")
+    return (check.id == "recovery" and isinstance(completion, dict)
+            and completion.get("reason") == "allowance consumed with sustained concurrency")
+
+
 def _limits_reached(report: RunReport) -> set[str]:
     reached = set(report.limits_reached)
     if any("Global request budget exhausted" in warning for warning in report.warnings):
@@ -385,6 +409,10 @@ def _limits_reached(report: RunReport) -> set[str]:
            for group in metrics.get("load_types", {}).values()
            for point in group.get("points", [])):
         reached.add("max_requests")
+    elif _gateway_limited_mixed_run(report):
+        # Shared schedulers can also report a local reservation cutoff.
+        if not any(_shared_budget_cutoff(check) for check in report.checks):
+            reached.discard("max_requests")
     return reached
 
 
@@ -400,9 +428,17 @@ def _settings_reasons(report: RunReport, baseline: RunReport, *, details: dict[s
         reasons.append("Report schema versions differ.")
     if report.manifest.get("timing_measurement_version", 1) != baseline.manifest.get("timing_measurement_version", 1):
         reasons.append("Client timing measurement methods differ; rerun the baseline.")
-    if report.abort_reason or report.observations.get("target_abort_reasons"):
+    current_limits, baseline_limits = _limits_reached(report), _limits_reached(baseline)
+
+    def shared_abort(run, limits):
+        gateway_budget = (run.abort_reason == "maximum request budget reached"
+                          and _gateway_limited_mixed_run(run)
+                          and "max_requests" not in limits)
+        return run.observations.get("target_abort_reasons") or (run.abort_reason and not gateway_budget)
+
+    if shared_abort(report, current_limits):
         reasons.append("Current run was aborted; incomplete traffic cannot establish a regression.")
-    if baseline.abort_reason or baseline.observations.get("target_abort_reasons"):
+    if shared_abort(baseline, baseline_limits):
         reasons.append("Baseline run was aborted; it cannot establish a complete reference.")
     for label, run in (("Current", report), ("Baseline", baseline)):
         if any(record.evaluation_error for record in run.requests):
@@ -430,7 +466,7 @@ def _settings_reasons(report: RunReport, baseline: RunReport, *, details: dict[s
     excluded_checks = [SHARED_BASELINE_EXCLUDED_WORKLOADS.intersection(config.get("checks", []))
                        for config in (current_config, old_config)]
     shared_selection_changed = excluded_checks[0] != excluded_checks[1]
-    reached = _limits_reached(report) | _limits_reached(baseline)
+    reached = current_limits | baseline_limits
     for key in ("concurrency", "max_requests", "max_duration_seconds"):
         if key in reached and current_config.get(key) != old_config.get(key):
             setting_reason(f"Run setting {key} differs and its limit stopped work or constrained concurrency.",

@@ -350,7 +350,7 @@ async def execute(run, target, client, *, deferred=False):
     try:
         for _ in range(settings.samples):
             for alias in settings.identities:
-                if not run.allowed(target.name):
+                if not run.allowed(target.name, gateway_probe=True):
                     break
                 spec = RequestSpec(fixture_id="gateway_attribution.v1", scenario=CHECK, check_ids=[CHECK],
                     identity=alias, messages=[{"role": "user", "content": "Reply with OK."}],
@@ -458,6 +458,9 @@ async def execute(run, target, client, *, deferred=False):
         # Secret-derived fingerprints are transient and never included in reports.
         for record in records:
             record._gateway_key_hash = None
+        if time.monotonic() >= run.deadline:
+            # The reader's own timeout can finish before the run monitor wakes.
+            run.stop_reason(target.name)
         if (assessment["state"] == "unverified" and len(records) == planned
                 and deadline < settle_deadline and not run.stop.is_set()
                 and (not cancelled or run.reason == "maximum run duration reached")):
