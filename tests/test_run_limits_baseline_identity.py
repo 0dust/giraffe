@@ -381,7 +381,7 @@ def test_shared_executor_preserves_exact_persistent_user_revision_for_legacy_che
     assert "Fixture pack identity differs." in _settings_reasons(current, old)
 
 
-def exact_conversation_reports(checks, **options):
+def exact_conversation_reports(checks, *, access_companion=False, **options):
     config = RunConfig(targets=[{"name": "local", "url": "http://localhost", "model": "test"}],
                        checks=checks, sessions={"sampling": {"think_time_seconds": {"values": [0, .1]}}},
                        **options)
@@ -391,12 +391,15 @@ def exact_conversation_reports(checks, **options):
         if active_checks.intersection(checks):
             value = getattr(config, field)
             settings[field] = value.model_dump(mode="json") if hasattr(value, "model_dump") else value
-    for report, generator, sampler in (
-        (current, "d9a9e921584262148e06b636f0e8f195b7e530fd2a69c5e98f013359cf947ede",
-         "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4"),
-        (old, "aee9ca71bc5ffd780d1574422b761e3177471a12f951a10b04322573ca062f76",
-         "2fab1370faeab7ddb91a7ae9c0e49520ee9a67e305441a0663877bb12bca24c3"),
-    ):
+    shared_sampler = "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4"
+    if access_companion:
+        sources = ((workloads.FIXTURE_SOURCE_SHA256, shared_sampler),
+                   ("9ff9179300b4012552a7bd6fd6ef0ae60c016b9023dba33ffabc9ca03783ac2d", shared_sampler))
+    else:
+        sources = (("d9a9e921584262148e06b636f0e8f195b7e530fd2a69c5e98f013359cf947ede", shared_sampler),
+                   ("aee9ca71bc5ffd780d1574422b761e3177471a12f951a10b04322573ca062f76",
+                    "2fab1370faeab7ddb91a7ae9c0e49520ee9a67e305441a0663877bb12bca24c3"))
+    for report, (generator, sampler) in zip((current, old), sources):
         identity = {"generator_source_sha256": generator if any(settings.values()) else None,
                     "settings": deepcopy(settings)}
         if "load" in checks:
@@ -429,6 +432,17 @@ def test_exact_conversation_predecessor_keeps_ordinary_load_and_core_companions_
 @pytest.mark.parametrize("checks", [["tools"], ["tools", "access"], ["tools", "sessions"]])
 def test_exact_conversation_predecessor_keeps_tool_workloads_comparable(checks):
     current, old = exact_conversation_reports(checks)
+    assert _settings_reasons(current, old) == []
+    assert _settings_reasons(old, current) == []
+
+
+def test_exact_access_companion_predecessor_keeps_tool_workloads_comparable():
+    from giraffe.tool_checks import default_tool_fixture
+    from tests.test_tool_conversations import fixture
+
+    tool_checks = {"fixtures": [default_tool_fixture()], "conversations": [fixture()], "modes": ["complete"]}
+    current, old = exact_conversation_reports(["access", "tools"], access_companion=True, tool_checks=tool_checks)
+    assert current.manifest["fixture_pack"] != old.manifest["fixture_pack"]
     assert _settings_reasons(current, old) == []
     assert _settings_reasons(old, current) == []
 
@@ -527,7 +541,7 @@ def test_exact_predecessor_sampled_sessions_remain_comparable(profile):
     assert _settings_reasons(old, current) == []
 
 
-@pytest.mark.parametrize("check", ["gateway_access", "gateway_policy", "gateway_attribution", "multi_user", "load", "tools"])
+@pytest.mark.parametrize("check", ["gateway_access", "gateway_policy", "gateway_attribution", "multi_user", "load"])
 def test_access_core_bridge_does_not_attest_changed_workloads(check):
     config = RunConfig(targets=[{"name": "local", "url": "http://localhost", "model": "test"}], checks=[check])
     assert _run_limits_workload_identity({"config": config.model_dump(mode="json")}, revision="access_conversations") is None
