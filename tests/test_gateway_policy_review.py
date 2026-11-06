@@ -24,7 +24,7 @@ async def test_unknown_prior_admission_cannot_prove_early_exhaustion(monkeypatch
 
 
 async def test_strict_priority_rejection_precludes_later_borrowing(monkeypatch):
-    _, run, _ = await exercise(monkeypatch, "priority_rpm", saturation_threshold=.5,
+    _, run, _ = await exercise(monkeypatch, "priority_rpm", saturation_threshold=.29,
         users=[dict(identity="limited", requests=5, rpm=2, priority="low"),
                dict(identity="peer", requests=5, rpm=8, priority="high")])
     last = [record for record in run.records if record.identity == "limited"][-1]
@@ -41,7 +41,8 @@ async def test_strict_priority_rejection_precludes_later_borrowing(monkeypatch):
 @pytest.mark.usefixtures("local_tokenizer")
 @pytest.mark.parametrize("peer_requests,expected", [(7, "pass"), (8, "fail")])
 async def test_priority_borrowing_cannot_exceed_aggregate_model_rpm(monkeypatch, peer_requests, expected):
-    check, _, _ = await exercise(monkeypatch, "priority_rpm", behavior="overadmit", saturation_threshold=.5, full=True, peer_delay=.04,
+    check, _, _ = await exercise(monkeypatch, "priority_rpm", behavior="overadmit", saturation_threshold=.39, full=True,
+        peer_delay=.075, early_peer_admissions=1,
         users=[dict(identity="limited", requests=5, rpm=2, priority="low"),
                dict(identity="peer", requests=peer_requests, rpm=8, priority="high")])
     policy = check.metrics["gateway_policy"]
@@ -146,50 +147,62 @@ async def test_default_pool_label_cannot_establish_distinct_priority_reservation
 
 
 @pytest.mark.usefixtures("local_tokenizer")
-@pytest.mark.parametrize("reported,expected", [(55.0, "pass"), (54.9, "inconclusive")])
-async def test_priority_compares_reported_saturation_at_the_exact_threshold(monkeypatch, reported, expected):
-    check, _, _ = await exercise(monkeypatch, "priority_rpm", full=True, model_rpm=20,
-        saturation_threshold=.55, rejection_saturation=reported,
-        users=[dict(identity="limited", requests=5, rpm=2, priority="low"),
-               dict(identity="peer", requests=10, rpm=18, priority="high")])
+@pytest.mark.parametrize("early_peers,reported,expected,reason", [
+    (9, 55.0, "pass", "continued peer service"),
+    (9, 54.9, "inconclusive", "Strict-mode evidence"),
+    (10, 57.0, "inconclusive", "Reported saturation contradicts completed admissions"),
+])
+async def test_priority_compares_reported_saturation_to_completed_admissions(monkeypatch, early_peers, reported, expected, reason):
+    check, report, _ = await exercise(monkeypatch, "priority_rpm", full=True, model_rpm=20,
+        saturation_threshold=.55, rejection_saturation=reported, early_peer_admissions=early_peers,
+        users=[dict(identity="limited", requests=3, rpm=2, priority="low"),
+               dict(identity="peer", requests=16, rpm=18, priority="high")])
+    rejection = next(record for record in report.requests if record.http_status == 429)
+    assert sum(record.http_status == 200 and record.completed_ms < rejection.dispatch_ms
+               for record in report.requests) == early_peers + 2
     assert check.status == expected, check.summary
-    if expected == "inconclusive":
-        assert "strict-mode evidence" in check.summary
+    assert reason in check.summary
 
 
 @pytest.mark.usefixtures("local_tokenizer")
 @pytest.mark.parametrize("admitted,expected", [(51, "pass"), (56, "fail")])
 async def test_priority_borrowing_stops_at_the_gateway_ratio_boundary(monkeypatch, admitted, expected):
     check, _, _ = await exercise(monkeypatch, "priority_rpm", full=True, model_rpm=100, duration_seconds=3,
-        saturation_threshold=.55, rejection_saturation=56.0, admitted_affected=admitted, peer_delay=.5,
+        saturation_threshold=.55, admitted_affected=admitted, peer_delay=.25, early_peer_admissions=4,
         users=[dict(identity="limited", requests=57, rpm=2, priority="low"),
-               dict(identity="peer", requests=4, rpm=4, priority="high")])
+               dict(identity="peer", requests=6, rpm=6, priority="high")])
     policy = check.metrics["gateway_policy"]
-    assert [user["admitted"] for user in policy["users"]] == [admitted, 4]
+    assert [user["admitted"] for user in policy["users"]] == [admitted, 6]
     assert check.status == expected, check.summary
     if expected == "fail":
         assert "exceeded the declared RPM allowance" in check.summary
 
 
 @pytest.mark.usefixtures("local_tokenizer")
-@pytest.mark.parametrize("header,expected", [
-    ("61.54%", "pass"), (None, "inconclusive"), ("61.50%", "inconclusive"),
-    ("62.00%", "inconclusive"), ("61.54%, 90.00%", "inconclusive"),
+@pytest.mark.parametrize("header,threshold,expected", [
+    ("61.54%", .6152, "pass"), ("61.54%", .61539, "inconclusive"),
+    (None, .6152, "inconclusive"), ("61.50%", .6152, "inconclusive"),
+    ("62.00%", .6152, "inconclusive"), ("61.54%, 90.00%", .6152, "inconclusive"),
 ])
-async def test_priority_uses_consistent_finer_saturation_evidence(monkeypatch, header, expected):
+async def test_priority_uses_consistent_finer_saturation_evidence(monkeypatch, header, threshold, expected):
     check, _, _ = await exercise(monkeypatch, "priority_rpm", full=True, model_rpm=13,
-        saturation_threshold=.6152, rejection_saturation=61.5, saturation_header=header,
+        saturation_threshold=threshold, rejection_saturation=61.5, saturation_header=header,
         users=[dict(identity="limited", requests=5, rpm=2, priority="low"),
                dict(identity="peer", requests=8, rpm=8, priority="high")])
     assert check.status == expected, check.summary
     if expected == "inconclusive":
-        assert "strict-mode evidence" in check.summary
+        assert "Strict-mode evidence" in check.summary
 
 
 @pytest.mark.usefixtures("local_tokenizer")
-@pytest.mark.parametrize("early_peers,expected", [(1, "pass"), (2, "inconclusive"), (3, "fail")])
-async def test_priority_borrowing_accounts_for_peer_admission_order(monkeypatch, early_peers, expected):
-    config = configuration("priority_rpm", saturation_threshold=.5,
+@pytest.mark.parametrize("early_peers,model_tpm,expected", [
+    (1, "not configured", "pass"), (2, "not configured", "inconclusive"),
+    (3, "not configured", "fail"), (1, "60", "inconclusive"),
+    (1, None, "inconclusive"), (1, "not configured, Model TPM: 60", "inconclusive"),
+    (3, "60", "fail"),
+])
+async def test_priority_borrowing_accounts_for_peer_admission_order(monkeypatch, early_peers, model_tpm, expected):
+    config = configuration("priority_rpm", saturation_threshold=.49,
         users=[dict(identity="limited", requests=5, rpm=2, priority="low"),
                dict(identity="peer", requests=early_peers + 3, rpm=8, priority="high")])
     monkeypatch.setenv("LIMITED", "limited-secret")
@@ -232,8 +245,9 @@ async def test_priority_borrowing_accounts_for_peer_admission_order(monkeypatch,
                 rejection_observed.set()
             saturation = admitted / 10
             headers["x-litellm-saturation"] = f"{saturation:.2%}"
+            model_tpm_field = f"Model TPM: {model_tpm}, " if model_tpm is not None else ""
             message = (f"Priority-based rate limit exceeded. Model: {MODEL_POOL}, Priority: low, Rate limit type: requests, "
-                       f"Model TPM: not configured, Model RPM: 10, Remaining: 0, Model saturation: {saturation:.1%}")
+                       f"{model_tpm_field}Model RPM: 10, Remaining: 0, Model saturation: {saturation:.1%}")
             return httpx.Response(429, headers=headers, json={"error": {"type": "throttling_error", "code": "429", "message": message}})
         admitted += 1
         return httpx.Response(200, headers=headers, json={"choices": [{"message": {"role": "assistant", "content": "OK"},
@@ -248,4 +262,5 @@ async def test_priority_borrowing_accounts_for_peer_admission_order(monkeypatch,
     if expected == "fail":
         assert "completed admissions reached model saturation" in check.summary
     if expected == "inconclusive":
-        assert "Overlapping admissions leave saturation uncertain" in check.summary
+        reason = "Overlapping admissions leave saturation uncertain" if model_tpm == "not configured" else "Model TPM is configured or unknown"
+        assert reason in check.summary

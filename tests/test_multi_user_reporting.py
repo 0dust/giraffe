@@ -278,10 +278,18 @@ def test_selected_fairness_baseline_tracks_threshold_crossings_with_comparable_w
         assert result.baseline["acceptance"]["current"] == ("fail" if new_overlap else "inconclusive")
 
 
-def test_fairness_baseline_rejects_median_token_drift_even_when_mixes_overlap():
+@pytest.mark.parametrize(("drop_request", "changed_work", "expected"), [
+    (True, True, "inconclusive"),
+    (False, True, "inconclusive"),
+    (False, False, "pass"),
+])
+def test_fairness_baseline_qualifies_work_even_when_both_runs_pass(drop_request, changed_work, expected):
     current, previous = user_report(), user_report()
-    current.requests = [request for request in current.requests if request.id != "user-05-0"]
-    for report, lengths in ((previous, [100]*5 + [120]*2 + [200]), (current, [100]*3 + [120]*4 + [200])):
+    if drop_request:
+        current.requests = [request for request in current.requests if request.id != "user-05-0"]
+    old_lengths = [100]*5 + [120]*2 + [200]
+    new_lengths = [100]*3 + [120]*4 + [200] if changed_work else old_lengths
+    for report, lengths in ((previous, old_lengths), (current, new_lengths)):
         settings = report.manifest["config"]["multi_user"]
         settings["pass_criteria"]["max_throughput_ratio"] = 1.1
         for request in report.requests:
@@ -291,7 +299,7 @@ def test_fairness_baseline_rejects_median_token_drift_even_when_mixes_overlap():
             request.input_tokens = lengths[int(request.id.rsplit("-", 1)[1])]
         source = report.observations["targets"]["local"]["multi_user"]
         source["settings"] = settings
-        if report is current:
+        if report is current and drop_request:
             source["windows"][0]["users"][-1]["dispatched_count"] = 7
         summary = summarize(source, report.requests)
         report.checks[0].metrics["multi_user"] = summary
@@ -302,8 +310,8 @@ def test_fairness_baseline_rejects_median_token_drift_even_when_mixes_overlap():
 
     result = compare_baseline(current, previous)
     row = next(row for row in result.baseline["targets"][0]["comparisons"] if row["metric"] == "fairness_acceptance")
-    assert row["status"] == result.baseline["status"] == "inconclusive"
-    assert result.baseline["acceptance"] == {"baseline": "pass", "current": "fail"}
+    assert row["status"] == result.baseline["status"] == expected
+    assert result.baseline["acceptance"] == {"baseline": "pass", "current": "fail" if drop_request else "pass"}
 
 
 def live_user_report():
@@ -763,6 +771,61 @@ def test_new_interference_failure_survives_incomplete_peer_cancellation_baseline
     assert compared.baseline["status"] == "fail"
     assert any(row["metric"] == "scenario_acceptance" and row["status"] == "fail"
                for row in compared.baseline["targets"][0]["comparisons"])
+
+
+def test_interference_baseline_attributes_matched_slowdown_only_to_short_user():
+    from tests.test_multi_user_scenarios import matched_observation
+
+    current, baseline = user_report(), user_report()
+    for report in (current, baseline):
+        source, requests = matched_observation()
+        for item in requests:
+            item.target = "local"
+            window = next(window for window in source["windows"] if window["id"] == item.workload["window_id"])
+            item.workload.update(scenario=window["scenario"], trigger=window["trigger"],
+                                 heavy_profile=window["heavy_profile"], population=window["population"])
+        if report is current:
+            requests[1].completed_ms = requests[1].workload["ready_ms"] + 810
+            requests[1].elapsed_ms = requests[1].completed_ms - requests[1].dispatch_ms
+        summary = summarize(source, requests)
+        interference = summary["windows"][1]["interference"]
+        short, = interference["users"]
+        assert short["slowdown"] == pytest.approx(4.05 if report is current else 1.5)
+        assert interference["status"] == ("fail" if report is current else "pass")
+        report.requests = requests
+        report.checks[0].metrics["multi_user"] = summary
+
+    compared = compare_baseline(current, baseline).baseline
+    acceptance, = [row for row in compared["targets"][0]["comparisons"] if row["metric"] == "scenario_acceptance"]
+    assert acceptance["user_id"] == "user-01" and acceptance["status"] == "fail"
+    assert acceptance["current_samples"] == acceptance["baseline_samples"] == 1
+    assert acceptance["evidence_ids"] == [item.id for item in current.requests]
+
+
+def test_intentional_user_cancellation_is_not_an_ordinary_baseline_sample():
+    report = scenario_report()
+    window = report.checks[0].metrics["multi_user"]["windows"][-1]
+    report.checks[0].metrics["multi_user"]["windows"] = [window]
+    window["users"] = [window["users"][1]]
+    report.requests = [item for item in report.requests if item.workload["user_id"] == "user-02"][:5]
+    for item in report.requests:
+        item.workload.update(scenario="cancellation", role="cancellation", window_id=window["id"],
+                             population=window["population"], cancellation_role="followup")
+    cancelled = report.requests[0]
+    cancelled.status, cancelled.valid, cancelled.intentional = "cancelled", False, True
+    cancelled.termination_reason = "generation_chunk_limit"
+    cancelled.workload["cancellation_role"] = "selected"
+    window["users"][0].update(request_ids=[item.id for item in report.requests], output_tokens_per_second=40)
+
+    compared = compare_baseline(report, report).baseline
+    rows = {row["metric"]: row for row in compared["targets"][0]["comparisons"] if row.get("user_id") == "user-02"}
+    for metric, value in (("valid_completion_rate", 1), ("error_rate", 0)):
+        assert rows[metric]["current"] == rows[metric]["baseline"] == value
+        assert rows[metric]["current_samples"] == rows[metric]["baseline_samples"] == 4
+        assert rows[metric]["status"] == "inconclusive"
+        assert cancelled.id not in rows[metric]["evidence_ids"]
+    exported_window, = reproduction_export(report)["multi_user"]["local"]["windows"]
+    assert exported_window["cancellation"]["cancellation"]["request_ids"] == [cancelled.id]
 
 
 @pytest.mark.parametrize("qualified", [True, False])
