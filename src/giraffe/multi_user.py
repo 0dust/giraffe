@@ -22,6 +22,14 @@ from giraffe.traffic import run_stage
 WINDOW_POLICY = "completed-output-v1"
 
 
+class _UserOutputProgress(OutputProgress):
+    first_token = False
+
+    def on_first_token(self):
+        self.first_token = True
+        self.changed.set()
+
+
 def _matched_work_sha256(spec, *, nonce=None):
     messages = spec.messages
     if nonce and messages:
@@ -95,7 +103,8 @@ async def run_window(run, target, client, settings, load_settings, calibration, 
 
     def trigger_peers():
         return [uid for uid, progress in active.items() if uid not in window.get("heavy_user_ids", [])
-                and (not progress.first if window.get("trigger") == "before_output" else progress.chunks >= 2)]
+                and (not (progress.first_token or progress.first)
+                     if window.get("trigger") == "before_output" else progress.chunks >= 2)]
 
     def cancellation_peers():
         return [uid for uid, progress in active.items() if progress.first]
@@ -166,7 +175,7 @@ async def run_window(run, target, client, settings, load_settings, calibration, 
                 spec.workload["cancellation_role"] = "selected" if cancel_first else "followup"
                 if cancel_first:
                     spec.cancel_after_chunks = settings.cancellation.cancel_after_chunks
-            progress = OutputProgress(changed)
+            progress = _UserOutputProgress(changed)
             heavy = window.get("role") == "probe" and user["user_id"] in window.get("heavy_user_ids", [])
             eligible_peers = cancellation_peers if cancel_first else trigger_peers if heavy else None
             if settings.conversations:

@@ -239,6 +239,69 @@ def test_reasoning_chunks_trigger_selected_cancellation_and_preserve_observation
     run_virtual(monkeypatch, run())
 
 
+@pytest.mark.parametrize("reasoning_delay", [.01, .09])
+def test_before_output_rechecks_generation_when_a_slot_opens(monkeypatch, reasoning_delay):
+    import httpx
+    from giraffe.client import LLMClient
+    from giraffe.models import LoadTestSettings
+    from giraffe.multi_user import run_window
+    from tests.test_review26_phase4_accuracy import run_virtual
+
+    class Stream(httpx.AsyncByteStream):
+        def __init__(self, reasoning):
+            self.reasoning = reasoning
+
+        async def __aiter__(self):
+            if self.reasoning:
+                await asyncio.sleep(reasoning_delay)
+                yield b'data: {"choices":[{"delta":{"reasoning_content":"thinking"}}]}\n\n'
+                await asyncio.sleep(.05)
+            else:
+                await asyncio.sleep(.03)
+            yield b'data: {"choices":[{"delta":{"content":"K7P4"}}]}\n\n'
+            await asyncio.sleep(.01)
+            yield b'data: {"choices":[{"delta":{"content":" 42"},"finish_reason":"length"}]}\n\n'
+            yield b'data: [DONE]\n\n'
+
+    async def run():
+        cfg = settings(levels=[3], duration_seconds=.25, think_time_seconds={"values": [1]},
+            profile=PROFILE, scenarios=["noisy_neighbors"], noisy_neighbors={
+                "heavy_user_ids": ["user-03"], "heavy_profiles": ["long_short"],
+                "triggers": ["before_output"]}).model_copy(update={"concurrency": 2})
+        target = cfg.targets[0]
+        state = runner._Run(cfg, None, None)
+        client = LLMClient(target, cfg, max_connections=2)
+        requests = 0
+
+        async def respond(request):
+            nonlocal requests
+            requests += 1
+            return httpx.Response(200, stream=Stream(reasoning=requests == 2))
+
+        window = _planned_observation(cfg.multi_user)["windows"][-1]
+        calibration = {(size, "short_answer"): {"filler_chars": 100} for size in ("short", "long")}
+        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as transport:
+            client._client = transport
+            await run_window(state, target, client, cfg.multi_user, LoadTestSettings(profile=cfg.multi_user.profile),
+                             calibration, window)
+        records = {r.workload["user_id"]: r for r in state.records
+                   if r.workload["request_sequence"] == 1}
+        reasoning = records["user-02"]
+        assert reasoning.first_reasoning_ms is not None
+        first_generation = reasoning.timing_start_ms + reasoning.first_reasoning_ms
+        first_answer = reasoning.timing_start_ms + reasoning.first_output_ms
+        first_slot_open = records["user-01"].completed_ms
+        if reasoning_delay == .01:
+            assert first_generation < first_slot_open <= first_answer
+            assert "user-03" not in records
+        else:
+            heavy = records["user-03"]
+            assert heavy.workload["trigger_peer_ids"] == ["user-02"]
+            assert first_slot_open <= heavy.workload["trigger_ms"] < first_generation
+
+    run_virtual(monkeypatch, run())
+
+
 def matched_observation(trigger="during_stream", heavy_profile="long_short"):
     cfg = settings(levels=[2], duration_seconds=1, scenarios=["noisy_neighbors"], profile=PROFILE,
         noisy_neighbors={"heavy_user_ids": ["user-02"], "heavy_profiles": [heavy_profile],
@@ -288,6 +351,62 @@ def test_matched_interference_requires_actual_trigger_and_lengths(trigger, profi
     assert user["control_request_ids"] == [records[0].id]
     assert user["probe_request_ids"] == [records[1].id]
     assert user["heavy_request_ids"] == [records[2].id]
+
+
+@pytest.mark.parametrize("field", ["first_token_ms", "first_reasoning_ms"])
+def test_before_output_cannot_match_after_generation_started(field):
+    from giraffe.multi_user_metrics import summarize
+
+    source, records = matched_observation("before_output")
+    setattr(records[1], field, 10)
+    user, = summarize(source, records)["windows"][1]["interference"]["users"]
+    assert user["status"] == "inconclusive"
+    assert user["matched_samples"] == 0
+
+
+def test_interference_requires_heavy_prefill_overlap_before_reasoning_starts():
+    from giraffe.multi_user_metrics import summarize
+
+    source, records = matched_observation("before_output")
+    # The competitor starts reasoning in less than the minimum overlap time.
+    # Waiting until its first answer would count reasoning as prefill.
+    records[2].first_reasoning_ms = .5
+    user, = summarize(source, records)["windows"][1]["interference"]["users"]
+    assert user["status"] == "inconclusive"
+    assert user["matched_samples"] == 0
+
+
+@pytest.mark.parametrize(("completion_counts", "status"), [
+    ((16, 16), "pass"), ((16, 32), "inconclusive"), ((16, None), "inconclusive"),
+])
+def test_interference_qualifies_total_generation_with_equal_answer_lengths(completion_counts, status):
+    from giraffe.multi_user_metrics import summarize
+
+    source, records = matched_observation()
+    for request, total in zip(records[:2], completion_counts):
+        request.completion_tokens = total
+    user, = summarize(source, records)["windows"][1]["interference"]["users"]
+    assert user["status"] == status
+    assert user["matched_samples"] == (1 if status == "pass" else 0)
+
+
+def test_interference_only_matches_selected_peer_and_half_open_trigger_interval():
+    from giraffe.multi_user_metrics import summarize
+
+    source, records = matched_observation("before_output")
+    control, probe, heavy = records
+    # The probe is eligible from dispatch at 1100 until first output at 1200.
+    def competitor(identity, at, peer="user-01"):
+        result = heavy.model_copy(deep=True, update={"id": identity})
+        result.workload.update(trigger_ms=at, trigger_peer_ids=[peer])
+        return result
+
+    candidates = [competitor("too-late", 1200), competitor("different-peer", 1140, "user-99"),
+                  heavy, competitor("at-dispatch", 1100), competitor("too-early", 1099)]
+    user, = summarize(source, [control, probe, *candidates])["windows"][1]["interference"]["users"]
+    assert user["status"] == "pass"
+    assert user["matched_samples"] == 1
+    assert user["heavy_request_ids"] == sorted([heavy.id, "at-dispatch"])
 
 
 @pytest.mark.parametrize("missing", ["overlap", "trigger", "work", "length", "usage", "samples", "budget", "timing"])
