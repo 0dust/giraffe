@@ -273,6 +273,24 @@ async def execute(run, target, client, *, deferred=False):
     start_date = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     records = []
     planned = settings.samples * len(settings.identities)
+
+    def report_probe_stop(reason, *, cancelled=False):
+        time_limited = not run.stop.is_set() and (
+            reason == "maximum run duration reached"
+            or any(record.termination_reason == "run_duration_limit" for record in records))
+        if not time_limited and not cancelled:
+            return False
+        assessment = _assess(records, {}, planned, complete=False)
+        if time_limited:
+            assessment.update(reason_code="time_limited", collection_attempts=0, collection_complete=False,
+                              reason="The run deadline interrupted the configured attribution probes.")
+        else:
+            assessment.update(reason="Gateway identity probes were interrupted before attribution completed.")
+        run.observations[target.name][CHECK] = assessment
+        for record in records:
+            record._gateway_key_hash = None
+        return True
+
     run.plan_condition(target.name, CHECK, planned=planned)
     try:
         for _ in range(settings.samples):
@@ -290,16 +308,15 @@ async def execute(run, target, client, *, deferred=False):
     except asyncio.CancelledError:
         records = [record for record in run.records if record.target == target.name
                    and record.workload.get("gateway_run") == marker]
-        observation = _assess(records, {}, planned, complete=False)
-        observation.update(reason="Gateway identity probes were interrupted before attribution completed.")
-        run.observations[target.name][CHECK] = observation
-        for record in records:
-            record._gateway_key_hash = None
+        report_probe_stop(run.reason, cancelled=True)
         raise
     finally:
         run.finish_condition(target.name, CHECK)
+    probe_stop = run.stop_reason(target.name) if len(records) < planned else None
+    if report_probe_stop(probe_stop):
+        return
     budget_limited = (len(records) < planned and run.remaining(target.name) == 0
-                      and run.stop_reason(target.name) in {None, "maximum request budget reached"})
+                      and probe_stop in {None, "maximum request budget reached"})
     budget_reason = "The request limit left too few slots for the configured attribution probes."
     if not records:
         observation.update(state="unverified", reason="No identified requests were admitted within the run budget.", planned_requests=planned)

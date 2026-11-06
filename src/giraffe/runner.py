@@ -2164,7 +2164,8 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
             check.summary = check.finding_summary + " " + budget
             continue
         if interrupted and run.reason == "maximum run duration reached" and check.id not in {"load", "recovery"}:
-            check.finding_summary = "Run deadline reached before this check finished."
+            if check.id != "gateway_attribution" or check.metrics.get("reason_code") != "time_limited":
+                check.finding_summary = "Run deadline reached before this check finished."
             check.remediation = _deadline_remediation(run.config)
             check.summary = check.finding_summary + " " + _deadline_guidance(run.config)
             continue
