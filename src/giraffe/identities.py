@@ -55,7 +55,7 @@ def credential_headers(identity):
         refs["Authorization"] = identity.api_key_env
     for header, ref in refs.items():
         value = os.environ.get(ref)
-        if not value or any(ord(char) < 32 or ord(char) > 126 for char in value):
+        if not value or value != value.strip() or any(ord(char) < 32 or ord(char) > 126 for char in value):
             raise ValueError("Test identity credentials are unavailable.")
         headers[header] = "Bearer " + value if header == "Authorization" and identity.api_key_env else value
     return headers

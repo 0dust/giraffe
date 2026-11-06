@@ -19,8 +19,15 @@ the endpoint's normal inference cost.
 
 Identities may include `headers_env`, mapping header names to environment variable
 names. They replace the endpoint's credentials completely. An explicit empty
-identity sends no authentication. A missing alias or environment value sends no
-request for that case. Never put resolved credentials in a configuration file.
+identity sends no authentication. A missing alias or invalid environment value
+sends no request for that case. Never put resolved credentials in a configuration file.
+
+When LiteLLM is configured with a custom key header, set **LiteLLM custom key
+header** in the UI or `gateway_access.auth_header` in YAML to that header's name.
+It takes precedence over the default headers when present in the request. Leave
+the setting blank for LiteLLM's native key headers. Cases with other credential
+headers remain unverified until the gateway's custom header is declared. See
+[LiteLLM custom key headers](https://docs.litellm.ai/docs/proxy/virtual_keys#pass-litellm-key-in-custom-header).
 
 The check supports up to 16 cases, a maximum 60-second deadline per request, and
 an output cap of at most 128 tokens. Shared run limits also apply. A complete
@@ -53,6 +60,7 @@ fails the check. Policy observations remain separate from ordinary Endpoint
 access and performance measurements. Unconfigured checks do not stop ordinary
 shared-key tests. Safe configuration references and qualified outcomes survive
 report export and baseline comparison; secrets and raw gateway responses do not.
+Access comparisons require a baseline recorded with effective key qualification.
 
 These cases check only the supplied identities, endpoint and model. They do not
 certify tenant isolation or comprehensive gateway security. Automated fixtures

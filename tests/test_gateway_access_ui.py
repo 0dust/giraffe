@@ -8,10 +8,15 @@ def test_gateway_policy_form_roundtrip_and_validation():
     value = browser_logic(r'''
 const markup=renderTestCard(bootstrap.checks.find(c=>c.id==='gateway_access'),config);
 assert.match(markup,/Declared cases/);assert.match(markup,/Environment references/);
+assert.match(markup,/LiteLLM custom key header/);
+config.gateway_access.auth_header='X-Saved-Key';
+assert.match(renderTestCard(bootstrap.checks.find(c=>c.id==='gateway_access'),config),
+  /name="gateway_access_auth_header"[^>]*value="X-Saved-Key"/);
 const values=new FormData();values.set('gateway_access_rendered','1');
 values.set('gateway_access_profile','litellm');values.set('gateway_access_request_timeout_seconds','3');
 values.set('gateway_access_max_output_tokens','8');
 values.set('gateway_access_cases','valid allowed allow\ninvalid denied deny');
+values.set('gateway_access_auth_header','X-Proxy-Key');
 values.set('gateway_access_identities_0',JSON.stringify(config.targets[0].test_identities));
 const edited=configureGatewayAccess(config,values);
 assert.equal(edited.gateway_access.cases[1].expected,'deny');
@@ -23,6 +28,7 @@ console.log(JSON.stringify(edited));
 ''', config())
     result = RunConfig.model_validate(value)
     assert result.gateway_access.request_timeout_seconds == 3
+    assert result.gateway_access.auth_header == "X-Proxy-Key"
 
 
 def test_gateway_results_show_expected_observed_and_unverified():

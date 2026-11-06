@@ -641,6 +641,7 @@ export function configureGatewayAccess(source, values, {allowInvalid=false}={}) 
     });
   } catch(error) {if(!allowInvalid)throw error;cases=raw;}
   config.gateway_access={profile:values.get('gateway_access_profile')||'unknown',cases,
+    auth_header:String(values.get('gateway_access_auth_header')||'').trim()||null,
     request_timeout_seconds:Number(values.get('gateway_access_request_timeout_seconds')),
     max_output_tokens:Number(values.get('gateway_access_max_output_tokens'))};
   config.targets.forEach((target,index)=>{

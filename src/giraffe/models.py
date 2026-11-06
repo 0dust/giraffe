@@ -1427,6 +1427,7 @@ class GatewayAccessCase(Model):
 
 class GatewayAccess(Model):
     profile: str = Field(default="unknown", pattern=r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
+    auth_header: str | None = Field(default=None, pattern=r"^[A-Za-z][A-Za-z0-9-]{0,63}$")
     cases: list[GatewayAccessCase] = Field(default_factory=list, max_length=16)
     request_timeout_seconds: float = Field(default=10, gt=0, le=60)
     max_output_tokens: int = Field(default=16, ge=1, le=128)

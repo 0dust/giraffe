@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from giraffe.identities import identity_headers, litellm_key_fingerprint
+from giraffe.identities import LITELLM_NATIVE_KEY_HEADERS, identity_headers, litellm_key_fingerprint
 from giraffe.models import CheckResult, RequestSpec
 
 
+EVIDENCE_VERSION = 2
 QUALIFICATION = ("Only the declared identities and endpoint/model were exercised. "
                  "These fixtures do not certify tenant isolation or comprehensive gateway security.")
 
@@ -41,7 +42,7 @@ def _record_case(row, record):
                http_status=record.http_status, request_id=record.id)
 
 
-def _qualify_identities(target, rows):
+def _qualify_identities(target, rows, auth_header):
     by_credentials = {}
     for row in rows:
         try:
@@ -49,10 +50,14 @@ def _qualify_identities(target, rows):
         except ValueError:
             row["reason"] = "identity_unavailable"
             continue
-        # Reuse LiteLLM virtual-key precedence. Preserve custom headers and
-        # explicit anonymous identities when the standard key is absent.
-        credential = litellm_key_fingerprint(headers) or tuple(sorted(
-            (name.lower(), value) for name, value in headers.items() if name.lower() != "accept"))
+        names = {name.lower() for name in headers} - {"accept"}
+        if auth_header is None and names.difference(LITELLM_NATIVE_KEY_HEADERS):
+            row["reason"] = "auth_header_unverified"
+            continue
+        credential = litellm_key_fingerprint(headers, auth_header=auth_header)
+        if credential is None and names:
+            row["reason"] = "auth_header_unverified"
+            continue
         by_credentials.setdefault(credential, []).append(row)
 
     for cases in by_credentials.values():
@@ -69,7 +74,7 @@ async def execute(run, target, client):
         for row in rows:
             row["reason"] = "unsupported_profile"
         return
-    _qualify_identities(target, rows)
+    _qualify_identities(target, rows, settings.auth_header)
     for case, row in zip(settings.cases, rows):
         if row["reason"] != "not_run":
             continue
@@ -96,7 +101,8 @@ def result(run, target):
     summary = ("Observed access differs from the declared policy." if status == "fail" else
                "Declared allow and deny cases matched the observed responses." if status == "pass" else
                "Access policy unverified: configure a supported profile and complete allow/deny cases with available test identities.")
-    metrics = {"profile": settings.profile if settings else "unknown", "cases": rows,
+    metrics = {"evidence_version": EVIDENCE_VERSION,
+               "profile": settings.profile if settings else "unknown", "cases": rows,
                "coverage_complete": complete, "has_allow_and_deny": matrix,
                "qualification": QUALIFICATION}
     return CheckResult(id="gateway_access", title="Gateway access policy", target=target.name,

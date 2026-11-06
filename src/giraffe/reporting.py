@@ -1296,7 +1296,9 @@ def _compare_gateway_attribution(report, baseline, target, compatible):
     return rows
 
 
-def _compare_gateway_access(current, baseline, declarations, compatible):
+def _compare_gateway_access(current, baseline, declarations, compatible, identities_match):
+    from .gateway_access import EVIDENCE_VERSION
+
     def matched(policy, case):
         return next((row for row in policy.get("cases", [])
                      if all(row.get(field) == value for field, value in case.items())), {})
@@ -1307,6 +1309,8 @@ def _compare_gateway_access(current, baseline, declarations, compatible):
 
     current_policy = current.metrics.get("gateway_access", {})
     old_policy = baseline.metrics.get("gateway_access", {}) if baseline else {}
+    evidence_matches = (current_policy.get("evidence_version") == EVIDENCE_VERSION
+                        and old_policy.get("evidence_version") == EVIDENCE_VERSION)
     baseline_passed = (baseline is not None and baseline.status == "pass"
                        and old_policy.get("coverage_complete")
                        and current_policy.get("profile") == old_policy.get("profile") == "litellm")
@@ -1316,7 +1320,11 @@ def _compare_gateway_access(current, baseline, declarations, compatible):
         observed, prior = decision(latest), decision(previous)
         status = "inconclusive"
         if not compatible:
-            reason = "Run settings or target identity references differ."
+            reason = "Run settings differ."
+        elif not identities_match:
+            reason = "Gateway test identity references differ."
+        elif not evidence_matches:
+            reason = "Effective gateway credential evidence is missing. Rerun the access check and baseline."
         elif not baseline_passed or prior != case["expected"]:
             reason = "The baseline lacks a complete passing access matrix for these declarations."
         elif observed not in {"allow", "deny"}:
@@ -1377,9 +1385,6 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
         saturated_runs = [label for label, run in (("Current", report), ("Baseline", baseline))
                           if _generator_saturated(run, name)]
         old_target = old_targets.get(name)
-        if (old_target is not None and "gateway_access" in config.get("checks", [])
-                and target.get("test_identities") != old_target.get("test_identities")):
-            target_reasons.append("Gateway test identity references differ; access-policy cases are not comparable.")
         if (old_target is not None and "gateway_policy" in config.get("checks", [])
                 and target.get("test_identities") != old_target.get("test_identities")):
             target_reasons.append("Gateway policy identity references differ; runs are not comparable.")
@@ -1424,7 +1429,10 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                 declarations = GatewayAccess.model_validate(config.get("gateway_access")).model_dump()["cases"]
             except ValidationError:
                 declarations = []
-            rows.extend(_compare_gateway_access(current_access, old_access, declarations, not target_reasons))
+            identities_match = (old_target is not None
+                                and target.get("test_identities") == old_target.get("test_identities"))
+            rows.extend(_compare_gateway_access(current_access, old_access, declarations,
+                                                not target_reasons, identities_match))
         for current_check in report.checks:
             if current_check.id != "gateway_policy" or current_check.target != name:
                 continue

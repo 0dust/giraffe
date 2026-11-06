@@ -132,7 +132,10 @@ async def test_full_runner_keeps_policy_separate_and_preserves_exports(monkeypat
     altered = report.model_copy(deep=True)
     altered.manifest["config"]["targets"][0]["test_identities"]["allowed"]["api_key_env"] = "DIFFERENT_KEY"
     comparison = compare_baseline(altered, report)
-    assert any("identity references" in reason for reason in comparison.baseline["targets"][0]["reasons"])
+    target = comparison.baseline["targets"][0]
+    assert target["status"] == "inconclusive"
+    assert {row["status"] for row in target["comparisons"]} == {"inconclusive"}
+    assert all("identity references" in row["reason"] for row in target["comparisons"])
 
 
 @pytest.mark.parametrize("mode,expected", [
@@ -140,6 +143,7 @@ async def test_full_runner_keeps_policy_separate_and_preserves_exports(monkeypat
     ("unexpected_access", "fail"),
     ("unverified", "inconclusive"),
     ("unverified_baseline", "inconclusive"),
+    ("old_baseline", "inconclusive"),
 ])
 async def test_baseline_compares_qualified_access_cases(monkeypatch, mode, expected):
     from giraffe.reporting import compare_baseline
@@ -161,6 +165,9 @@ async def test_baseline_compares_qualified_access_cases(monkeypatch, mode, expec
     cfg = config(retention="all")
     baseline = await run_suite(cfg)
     assert baseline.overall == ("inconclusive" if mode == "unverified_baseline" else "pass")
+    if mode == "old_baseline":
+        check = next(check for check in baseline.checks if check.id == "gateway_access")
+        del check.metrics["gateway_access"]["evidence_version"]
     deny_status = {"unexpected_access": 200, "unverified": 503}.get(mode, 401)
     current = await run_suite(cfg)
     compared = compare_baseline(current, baseline)
@@ -175,6 +182,9 @@ async def test_baseline_compares_qualified_access_cases(monkeypatch, mode, expec
         "unexpected_access": "allow", "unverified": "unverified",
     }.get(mode, "deny")
     assert "collect at least" not in target["summary"]
+    if mode == "old_baseline":
+        assert all(row["status"] == "inconclusive" for row in rows.values())
+        assert all("credential evidence is missing" in row["reason"] for row in rows.values())
     if mode == "unexpected_access":
         failure = next(check for check in compared.checks if check.id == "baseline")
         assert failure.evidence_ids == rows["invalid"]["evidence_ids"]

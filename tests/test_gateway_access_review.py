@@ -7,7 +7,7 @@ import pytest
 from giraffe.client import LLMClient
 from giraffe.gateway_access import execute, result
 from giraffe.models import RunConfig, RunReport
-from giraffe.reporting import reproduction_export, write_report
+from giraffe.reporting import compare_baseline, reproduction_export, write_report
 from giraffe.runner import _Run, run_suite
 from tests.test_gateway_access import config
 
@@ -84,16 +84,17 @@ async def test_missing_credentials_keep_explicit_policy_required(monkeypatch, lo
 
 
 @pytest.mark.parametrize("credential", ["api_key_env", "headers_env"])
-async def test_malformed_credentials_leave_budget_for_valid_case(monkeypatch, credential):
-    value = config(max_requests=1).model_dump()
+@pytest.mark.parametrize("value", ["secret\nvalue", "secret ", " secret"])
+async def test_malformed_credentials_leave_budget_for_valid_case(monkeypatch, credential, value):
+    raw = config(max_requests=1).model_dump()
     identity = ({"api_key_env": "MALFORMED_KEY"} if credential == "api_key_env" else
                 {"headers_env": {"X-Test-Key": "MALFORMED_KEY"}})
-    value["targets"][0]["test_identities"] = {"invalid": identity, "anonymous": {}}
-    value["gateway_access"]["cases"] = [
+    raw["targets"][0]["test_identities"] = {"invalid": identity, "anonymous": {}}
+    raw["gateway_access"]["cases"] = [
         {"name": "invalid", "identity": "invalid", "expected": "deny"},
         {"name": "valid", "identity": "anonymous", "expected": "allow"}]
-    cfg = RunConfig.model_validate(value)
-    monkeypatch.setenv("MALFORMED_KEY", "secret\nvalue")
+    cfg = RunConfig.model_validate(raw)
+    monkeypatch.setenv("MALFORMED_KEY", value)
     calls = []
 
     def handler(request):
@@ -124,7 +125,7 @@ def test_finite_access_matrix_has_exact_request_plan():
     assert not any("adaptive traffic" in warning for warning in plan["warnings"])
 
 
-@pytest.mark.parametrize("credential", ["alias", "bearer", "litellm_header", "custom_header", "anonymous"])
+@pytest.mark.parametrize("credential", ["alias", "bearer", "litellm_header", "api_key", "custom_header", "anonymous"])
 async def test_opposite_cases_with_identical_credentials_stay_unverified(monkeypatch, credential):
     secret = "same-virtual-key"
     monkeypatch.setenv("ALLOW_KEY", secret)
@@ -135,11 +136,13 @@ async def test_opposite_cases_with_identical_credentials_stay_unverified(monkeyp
     identities = cfg.targets[0].test_identities
     if credential == "alias":
         cases[1].identity = cases[0].identity
-    elif credential in {"bearer", "litellm_header"}:
-        header = "authorization" if credential == "bearer" else "X-LiteLLM-API-Key"
+    elif credential in {"bearer", "litellm_header", "api_key"}:
+        header = {"bearer": "authorization", "litellm_header": "X-LiteLLM-API-Key", "api_key": "api-key"}[credential]
+        monkeypatch.setenv("AUTH_HEADER", secret if credential == "api_key" else "bearer " + secret)
         identities["denied"] = identities["denied"].model_copy(
             update={"api_key_env": None, "headers_env": {header: "AUTH_HEADER"}})
     elif credential == "custom_header":
+        cfg.gateway_access.auth_header = "X-Proxy-Key"
         for alias, header in (("allowed", "X-Proxy-Key"), ("denied", "x-proxy-key")):
             identities[alias] = identities[alias].model_copy(
                 update={"api_key_env": None, "headers_env": {header: "AUTH_HEADER"}})
@@ -200,9 +203,10 @@ async def test_malformed_evidence_cannot_verify_access(monkeypatch, role, finish
 
 @pytest.mark.parametrize("anonymous", [False, True])
 async def test_distinct_custom_credentials_qualify_with_anonymous_or_custom_denial(monkeypatch, anonymous):
-    monkeypatch.setenv("ALLOW_KEY", "allow-secret")
-    monkeypatch.setenv("DENY_KEY", "deny-secret")
+    monkeypatch.setenv("ALLOW_KEY", "Bearer allow-secret")
+    monkeypatch.setenv("DENY_KEY", "Bearer deny-secret")
     values = config().model_dump()
+    values["gateway_access"]["auth_header"] = "X-Proxy-Key"
     values["targets"][0]["test_identities"] = {
         "allowed": {"headers_env": {"X-Proxy-Key": "ALLOW_KEY"}},
         "denied": {} if anonymous else {"headers_env": {"x-proxy-key": "DENY_KEY"}},
@@ -214,7 +218,7 @@ async def test_distinct_custom_credentials_qualify_with_anonymous_or_custom_deni
             return httpx.Response(404)
         key = request.headers.get("x-proxy-key")
         sent.append(key)
-        if key == "allow-secret":
+        if key == "Bearer allow-secret":
             return httpx.Response(200, json={"choices": [{
                 "message": {"role": "assistant", "content": "OK"}, "finish_reason": "length"}]})
         return httpx.Response(403, json={"error": {"type": "key_model_access_denied", "code": 403}})
@@ -223,4 +227,72 @@ async def test_distinct_custom_credentials_qualify_with_anonymous_or_custom_deni
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
     report = await run_suite(RunConfig.model_validate(values))
     assert report.overall == "pass"
-    assert sent == ["allow-secret", None if anonymous else "deny-secret"]
+    assert sent == ["Bearer allow-secret", None if anonymous else "Bearer deny-secret"]
+
+
+@pytest.mark.parametrize("auth_header,shared_gateway_key,expected_reason", [
+    ("X-Proxy-Key", False, None),
+    ("X-Proxy-Key", True, "identity_conflict"),
+    (None, True, "auth_header_unverified"),
+])
+async def test_access_distinguishes_gateway_key_from_front_proxy_auth(
+        monkeypatch, auth_header, shared_gateway_key, expected_reason):
+    monkeypatch.setenv("ALLOW_KEY", "shared-front-secret" if not shared_gateway_key else "front-allow-secret")
+    monkeypatch.setenv("DENY_KEY", "shared-front-secret" if not shared_gateway_key else "front-deny-secret")
+    monkeypatch.setenv("ALLOW_GATEWAY", "Bearer gateway-allow-secret")
+    monkeypatch.setenv("DENY_GATEWAY", "Bearer gateway-allow-secret" if shared_gateway_key else
+                       "Bearer gateway-deny-secret")
+    value = config().model_dump()
+    value["gateway_access"]["auth_header"] = auth_header
+    for alias, env in (("allowed", "ALLOW_GATEWAY"), ("denied", "DENY_GATEWAY")):
+        value["targets"][0]["test_identities"][alias]["headers_env"] = {"X-Proxy-Key": env}
+    sent = []
+
+    def handler(request):
+        if request.method != "POST":
+            return httpx.Response(404)
+        sent.append(request.headers["x-proxy-key"])
+        if len(sent) == 1:
+            return httpx.Response(200, json={"choices": [{
+                "message": {"role": "assistant", "content": "OK"}, "finish_reason": "stop"}]})
+        return httpx.Response(403, json={"error": {"type": "key_model_access_denied", "code": 403}})
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
+    report = await run_suite(RunConfig.model_validate(value))
+    check = next(check for check in report.checks if check.id == "gateway_access")
+    if expected_reason:
+        assert not sent and not report.requests
+        assert check.status == "inconclusive"
+        assert [row["reason"] for row in check.metrics["gateway_access"]["cases"]] == [expected_reason] * 2
+    else:
+        assert sent == ["Bearer gateway-allow-secret", "Bearer gateway-deny-secret"]
+        assert check.status == "pass"
+        assert reproduction_export(report)["config"]["gateway_access"]["auth_header"] == auth_header
+
+
+async def test_unsupported_access_identity_does_not_veto_serving_baseline(monkeypatch):
+    def handler(request):
+        if request.method != "POST":
+            return httpx.Response(404)
+        assert request.headers.get("authorization") is None
+        return httpx.Response(200, json={"choices": [{
+            "message": {"role": "assistant", "content": "OK"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 8, "completion_tokens": 2}})
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
+
+    async def run_with(ref):
+        raw = config(retention="all").model_dump()
+        raw.update(checks=["serving", "gateway_access"], samples=8)
+        raw["gateway_access"]["profile"] = "other-gateway"
+        raw["targets"][0]["test_identities"]["allowed"]["api_key_env"] = ref
+        return await run_suite(RunConfig.model_validate(raw))
+
+    current, baseline = await run_with("CURRENT_UNUSED"), await run_with("BASELINE_UNUSED")
+    assert current.overall == baseline.overall == "pass"
+    assert all(record.identity is None for report in (current, baseline) for record in report.requests)
+    comparison = compare_baseline(current, baseline).baseline["targets"][0]
+    assert comparison["status"] == "pass"
+    assert any(row["check"] == "serving" and row["status"] == "pass" for row in comparison["comparisons"])
