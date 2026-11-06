@@ -162,9 +162,8 @@ def test_http_selected_cancellation_retains_once_and_peers_continue(retention):
         state.record_sink = retained.append
         async with LLMClient(cfg.targets[0], cfg, max_connections=2) as client:
             await asyncio.wait_for(execute(state, cfg.targets[0], client), 5)
-        cancelled = [r for r in state.records if r.status == "cancelled"]
-        assert len(cancelled) == 1
-        assert cancelled[0].intentional and cancelled[0].answer_chunks == 2
+        cancelled, = [r for r in state.records if r.status == "cancelled"]
+        assert cancelled.intentional and cancelled.answer_chunks >= 2 and not cancelled.stream_terminated
         assert len({r.id for r in retained}) == len(retained) == len(state.records)
         assert state.slots.qsize() == 2
         assert any(r.status == "completed" and r.workload.get("cancellation_role") == "followup" for r in state.records)
@@ -178,15 +177,18 @@ def test_http_selected_cancellation_retains_once_and_peers_continue(retention):
         from giraffe.reporting import _retained
         saved = _retained(RunReport(run_id="cancel", started_at="now", finished_at="later", overall="pass",
             manifest={"config": cfg.model_dump(mode="json")}, requests=state.records))
-        terminal = next(r for r in saved.requests if r.id == cancelled[0].id)
-        assert terminal.answer_chunks == 2 and terminal.workload["user_id"] == "user-02"
+        terminal = next(r for r in saved.requests if r.id == cancelled.id)
+        assert terminal.answer_chunks == cancelled.answer_chunks and terminal.workload["user_id"] == "user-02"
         assert bool(terminal.output) == (retention == "all")
 
     with FakeEndpoint(first_token_delay=.02, chunk_delay=.02) as endpoint:
         asyncio.run(run(endpoint))
 
 
-def test_reasoning_chunks_trigger_selected_cancellation_and_preserve_observations(monkeypatch):
+@pytest.mark.parametrize(("read_mode", "threshold"), [
+    ("separate", 2), ("partial", 1), ("complete", 2), ("finish_then_done", 1), ("done_only_cr", 2),
+])
+def test_selected_cancellation_checks_terminal_events_in_the_same_read(monkeypatch, read_mode, threshold):
     import httpx
     from giraffe.client import LLMClient
     from giraffe.models import LoadTestSettings
@@ -194,24 +196,48 @@ def test_reasoning_chunks_trigger_selected_cancellation_and_preserve_observation
     from giraffe.multi_user_metrics import summarize
     from tests.test_review26_phase4_accuracy import run_virtual
 
+    finish = (b'data: {"choices":[{"delta":{},"finish_reason":"length"}],'
+              b'"usage":{"prompt_tokens":64,"completion_tokens":8}}\n\n')
+    done = b"data: [DONE]\n\n"
+    selected_reads = []
+
     class Stream(httpx.AsyncByteStream):
-        def __init__(self, reasoning):
-            self.reasoning = reasoning
+        def __init__(self, selected):
+            self.selected = selected
+
+        def frame(self, index):
+            field = "reasoning_content" if self.selected and index < 2 else "content"
+            content = "K7P4" if index == 0 else " 42"
+            return f'data: {json.dumps({"choices": [{"delta": {field: content}}]})}\n\n'.encode()
 
         async def __aiter__(self):
+            if self.selected and read_mode != "separate":
+                await asyncio.sleep(.025)
+                selected_reads.append("first")
+                if read_mode == "partial":
+                    yield b"".join(self.frame(index) for index in range(3))
+                    selected_reads.append("after partial")
+                    return
+                answer = b"".join(self.frame(index) for index in range(8))
+                if read_mode == "done_only_cr":
+                    yield (answer + done).replace(b"\n", b"\r")
+                elif read_mode == "complete":
+                    yield answer + finish + done
+                else:
+                    yield answer + finish
+                    yield done
+                return
+
             for index in range(8):
                 await asyncio.sleep(.01)
-                field = "reasoning_content" if self.reasoning and index < 2 else "content"
-                content = "K7P4" if index == 0 else " 42"
-                yield f'data: {json.dumps({"choices": [{"delta": {field: content}}]})}\n\n'.encode()
-            yield (b'data: {"choices":[{"delta":{},"finish_reason":"length"}],'
-                   b'"usage":{"prompt_tokens":64,"completion_tokens":8}}\n\n')
-            yield b'data: [DONE]\n\n'
+                yield self.frame(index)
+            yield finish
+            yield done
 
     async def run():
         cfg = settings(levels=[2], duration_seconds=.36, scenarios=["cancellation"],
                        profile=PROFILE, think_time_seconds={"values": [.1]},
-                       cancellation={"user_id": "user-02", "cancel_after_chunks": 2})
+                       cancellation={"user_id": "user-02", "cancel_after_chunks": threshold})
         target = cfg.targets[0]
         state = runner._Run(cfg, None, None)
         client = LLMClient(target, cfg, max_connections=2)
@@ -229,12 +255,29 @@ def test_reasoning_chunks_trigger_selected_cancellation_and_preserve_observation
             client._client = transport
             await run_window(state, target, client, cfg.multi_user, LoadTestSettings(profile=cfg.multi_user.profile),
                              {("short", "long_output"): {"filler_chars": 100}}, window)
-        cancelled, = [r for r in state.records if r.status == "cancelled"]
-        assert cancelled.termination_reason == "generation_chunk_limit"
-        assert cancelled.generation_chunks == 2 and cancelled.answer_chunks == 0
+        selected, = [r for r in state.records if r.workload.get("cancellation_role") == "selected"]
+        assert any(r.valid and r.workload.get("cancellation_role") == "followup" for r in state.records)
+        assert state.slots.qsize() == 2
         evidence = summarize(observation, state.records)["windows"][0]["cancellation"]
-        assert all(evidence[key]["status"] == "pass" and evidence[key]["request_ids"]
-                   for key in ("cancellation", "peer_continuation", "followup")), evidence
+        if read_mode in {"separate", "partial"}:
+            assert selected.status == "cancelled" and selected.intentional
+            assert selected.termination_reason == "generation_chunk_limit"
+            assert selected.generation_chunks == (3 if read_mode == "partial" else 2)
+            assert selected.answer_chunks == (1 if read_mode == "partial" else 0)
+            assert all(evidence[key]["status"] == "pass" and evidence[key]["request_ids"]
+                       for key in ("cancellation", "peer_continuation", "followup")), evidence
+            if read_mode == "partial":
+                assert selected_reads == ["first"]
+        else:
+            assert selected.generation_chunks == 8 and selected.stream_terminated
+            assert not selected.intentional and selected.client_cancelled_ms is None
+            if read_mode == "done_only_cr":
+                assert selected.status == "failed" and selected.error == "response ended without a completion finish reason"
+            else:
+                assert selected.status == "completed" and selected.valid
+                assert selected.finish_reason == "length" and selected.completion_tokens == 8
+            assert evidence["status"] == evidence["cancellation"]["status"] == "inconclusive"
+            assert not evidence["cancellation"]["request_ids"]
 
     run_virtual(monkeypatch, run())
 

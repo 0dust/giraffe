@@ -105,13 +105,16 @@ async def _limited_body(response: httpx.Response, *, on_read=None, on_body=None)
     return bytes(body)
 
 
-async def _sse_events(response: httpx.Response, *, on_read=None) -> AsyncIterator[tuple[str, str, float]]:
-    """Decode SSE independently of TCP boundaries, including CRLF and multiline data."""
+async def _sse_events(
+    response: httpx.Response, *, on_read=None, mark_read_end=False,
+) -> AsyncIterator[tuple[str | None, str, float]]:
+    """Decode SSE events and optionally mark the end of each transport read."""
     decoder = codecs.getincrementaldecoder("utf-8")("strict")
     buffer = ""
     data: list[str] = []
     event_type = "message"
     consumed = 0
+    skip_lf = False
 
     async def chunks_with_eof() -> AsyncIterator[tuple[bytes, bool]]:
         async with aclosing(response.aiter_bytes()) as chunks:
@@ -127,12 +130,15 @@ async def _sse_events(response: httpx.Response, *, on_read=None) -> AsyncIterato
             consumed += len(chunk)
             if consumed > _MAX_RESPONSE_BYTES:
                 raise _ProtocolError("response exceeded the 4 MiB safety limit")
-            buffer += decoder.decode(chunk, final=final)
+            decoded = decoder.decode(chunk, final=final)
+            if skip_lf and decoded:
+                decoded = decoded.removeprefix("\n")
+                skip_lf = False
+            buffer += decoded
             while (match := re.search(r"[\r\n]", buffer)) is not None:
                 end = match.start()
-                # A CR at the end might be the first half of a fragmented CRLF.
-                if buffer[end] == "\r" and end == len(buffer) - 1 and not final:
-                    break
+                # A CR already ends the line. Skip an optional LF in the next read.
+                skip_lf = buffer[end] == "\r" and end == len(buffer) - 1
                 width = 2 if buffer[end:end + 2] == "\r\n" else 1
                 line, buffer = buffer[:end], buffer[end + width:]
                 if not line:
@@ -146,6 +152,8 @@ async def _sse_events(response: httpx.Response, *, on_read=None) -> AsyncIterato
                         data.append(value)
                     elif field == "event":
                         event_type = value
+            if mark_read_end and not final:
+                yield None, "", observed_at
     if buffer or data:
         raise _ProtocolError("unterminated SSE event at end of response")
 
@@ -345,7 +353,7 @@ class LLMClient:
 
     @staticmethod
     async def _drain_stream(
-        response: httpx.Response, events: AsyncIterator[tuple[str, str, float]],
+        response: httpx.Response, events: AsyncIterator[tuple[str | None, str, float]],
     ) -> None:
         # [DONE] completes the measured response. Consume only the transport tail
         # in the background so HTTPX can return the connection to its pool.
@@ -758,8 +766,19 @@ class LLMClient:
                         if "application/json" in response.headers.get("content-type", ""):
                             _object(await _limited_body(response, on_body=body_received))
                             raise _ProtocolError("endpoint returned JSON instead of an SSE stream")
-                        events = _sse_events(response, on_read=stream_body_received)
+                        chunk_limit = spec.cancel_after_chunks
+                        events = _sse_events(response, on_read=stream_body_received,
+                                             mark_read_end=chunk_limit is not None)
                         async for event_type, event, observed_at in events:
+                            if event_type is None:
+                                # Finish and [DONE] may already have arrived in this read.
+                                if (chunk_limit is not None and record.generation_chunks >= chunk_limit
+                                        and record.finish_reason is None):
+                                    record.client_cancelled_ms = (time.perf_counter() - start) * 1000
+                                    record.client_cancelled_at_ns = time.time_ns()
+                                    record.client_cancelled_monotonic_ns = time.monotonic_ns()
+                                    raise _IntentionalCancellation
+                                continue
                             if event_type == "error":
                                 raise _ProtocolError("endpoint returned an SSE error event")
                             if event.strip() == "[DONE]":
@@ -767,13 +786,6 @@ class LLMClient:
                                 record.stream_terminated = True
                                 break
                             receive(_object(event), streaming=True, observed_at=observed_at)
-                            if (spec.cancel_after_chunks is not None
-                                    and record.generation_chunks >= spec.cancel_after_chunks
-                                    and record.finish_reason is None):
-                                record.client_cancelled_ms = (time.perf_counter() - start) * 1000
-                                record.client_cancelled_at_ns = time.time_ns()
-                                record.client_cancelled_monotonic_ns = time.monotonic_ns()
-                                raise _IntentionalCancellation
                         if not record.stream_terminated:
                             raise _ProtocolError("SSE stream ended without [DONE]")
                     else:
