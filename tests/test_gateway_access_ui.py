@@ -1,4 +1,8 @@
 """Policy setup and results survive browser form and report round trips."""
+import json
+
+import pytest
+
 from giraffe.models import RunConfig
 from tests.test_gateway_access import config
 from tests.test_ux_catalogue import browser_logic
@@ -17,7 +21,8 @@ values.set('gateway_access_profile','litellm');values.set('gateway_access_reques
 values.set('gateway_access_max_output_tokens','8');
 values.set('gateway_access_cases','valid allowed allow\ninvalid denied deny');
 values.set('gateway_access_auth_header','X-Proxy-Key');
-values.set('gateway_access_identities_0',JSON.stringify(config.targets[0].test_identities));
+values.set('gateway_access_identities_0',JSON.stringify({...config.targets[0].test_identities,
+  proxy:{headers_env:{'X-Proxy-Key':'PROXY_KEY'}},anonymous:{}}));
 const edited=configureGatewayAccess(config,values);
 assert.equal(edited.gateway_access.cases[1].expected,'deny');
 assert.equal(edited.targets[0].test_identities.allowed.api_key_env,'ALLOW_KEY');
@@ -29,6 +34,77 @@ console.log(JSON.stringify(edited));
     result = RunConfig.model_validate(value)
     assert result.gateway_access.request_timeout_seconds == 3
     assert result.gateway_access.auth_header == "X-Proxy-Key"
+    assert result.targets[0].test_identities["proxy"].headers_env == {"X-Proxy-Key": "PROXY_KEY"}
+    assert result.targets[0].test_identities["anonymous"].api_key_env is None
+
+
+@pytest.mark.parametrize("malformed,invalid,companions", [
+    ("cases", "bad draft", []),
+    ("identities_0", '{"allowed":', ["gateway_policy", "gateway_attribution"]),
+    ("identities_0", '{"allowed":[]}', ["gateway_policy", "gateway_attribution"]),
+    ("identities_0", '{"allowed":{"api_key_env":["BAD"]}}', []),
+    ("identities_0", '{"allowed":{"headers_env":{"Host":"BAD"}}}', ["gateway_policy", "gateway_attribution"]),
+    ("request_timeout_seconds", "0", []),
+])
+def test_unchecking_gateway_access_keeps_invalid_draft_out_of_live_setup(malformed, invalid, companions):
+    raw = config().model_dump(mode="json")
+    raw.update(checks=["access", "gateway_access", *companions], gateway_attribution={"identities": ["allowed"]},
+               gateway_policy={"affected_identity": "allowed", "users": [
+                   {"identity": alias, "requests": 1, "rpm": 1} for alias in ("allowed", "denied")]})
+    value = browser_logic(f"const [malformed,invalid,companions]={json.dumps([malformed, invalid, companions])};" + r'''
+const controls=Object.entries({gateway_access_rendered:'1',gateway_access_profile:'litellm',
+  gateway_access_auth_header:'',gateway_access_request_timeout_seconds:'10',gateway_access_max_output_tokens:'16',
+  gateway_access_cases:'valid allowed allow\ninvalid denied deny',
+  gateway_access_identities_0:JSON.stringify(config.targets[0].test_identities)})
+  .map(([name,value])=>({name,value,type:'text'}));
+const check={name:'check',value:'gateway_access',checked:true,id:'',matches:()=>false,closest:()=>null,focus(){}};
+const initialIdentities=JSON.stringify(config.targets[0].test_identities),sent=[];
+const NativeFormData=FormData;
+FormData=class extends NativeFormData {
+  constructor(){super();for(const name of ['url','model','name'])this.set(name,config.targets[0][name]);
+    for(const id of ['access',...(check.checked?['gateway_access']:[]),...companions])this.append('check',id);}
+};
+nodes['#new-run-form']={elements:{mode:{value:'normal'},baseline_id:{value:''},restart_target:{value:''}},
+  querySelectorAll:()=>controls};
+const edited=controls.find(input=>input.name==='gateway_access_'+malformed);
+edited.value=invalid;
+tokenizerChoice=()=>config.targets[0].tokenizer;
+tokenizerSetupReady=()=>true;
+renderRequestPreview=()=>{};
+renderNew=()=>{};
+api=async(path,request)=>{const config=JSON.parse(request.body);sent.push({path,config});
+  return {config,migration_notes:[],request_plan:{errors:[]}};};
+const assertActiveError=()=>{
+  if(malformed==='request_timeout_seconds')assert(localSettingErrors().some(issue=>issue.fields.includes('gateway_access.request_timeout_seconds')));
+  else assert.throws(()=>readForm(false),malformed==='cases'?/case name, identity alias/:/Environment references/);
+};
+check.checked=false;
+await listeners.change({target:check});
+const ordinary=readForm(false).config;
+assert.equal(ordinary.checks.join(','),['access',...companions].join(','));
+assert.equal(ordinary.gateway_access,null);
+assert.equal(localSettingErrors().length,0);
+assert.equal(JSON.stringify(ordinary.targets[0].test_identities),initialIdentities);
+await refreshRequestPreview(undefined,{draft:true});
+assert.equal(sent.at(-1).config.gateway_access,null);
+assert.equal(JSON.stringify(sent.at(-1).config.targets[0].test_identities),initialIdentities);
+const exported=portableConfig(await validatedSnapshot({draft:true}));
+assert.equal(exported.gateway_access.cases[0].name,'valid');
+assert.equal(exported.gateway_access.request_timeout_seconds,10);
+assert.equal(JSON.stringify(exported.targets[0].test_identities),initialIdentities);
+saveDraft();await restoreDraft();
+const markup=renderGatewayAccessEditor(state.config);
+if(malformed==='request_timeout_seconds')assert.match(markup,/name="gateway_access_request_timeout_seconds"[^>]*value="0"/);
+else assert(markup.includes(escape(edited.value)));
+check.checked=true;
+await listeners.change({target:check});
+assertActiveError();
+console.log(JSON.stringify({ordinary,exported}));
+''', RunConfig.model_validate(raw))
+    ordinary, exported = (RunConfig.model_validate(value[key]) for key in ("ordinary", "exported"))
+    assert ordinary.checks == ["access", *companions]
+    assert ordinary.gateway_attribution == exported.gateway_attribution
+    assert ordinary.gateway_policy == exported.gateway_policy
 
 
 def test_gateway_results_show_expected_observed_and_unverified():
@@ -66,7 +142,6 @@ def test_expected_denial_is_not_appended_as_a_policy_failure():
 
 
 def test_gateway_access_phase_fallback_matches_canonical_label():
-    import json
     from giraffe.conditions import _SCENARIOS
 
     browser_logic("assert.equal(phaseName('gateway_access'), " +

@@ -37,6 +37,7 @@ def assistant_reply(message, finish_reason, usage, record):
     alternate_reasoning = _text(message.get("reasoning"))
     has_refusal = bool(_text(message.get("refusal")).strip())
     metered_reasoning = (finish_reason == "length" and not has_refusal and message.get("audio") is None
+                         and message.get("images") in (None, [])
                          and _metered_reasoning_usage(usage, record))
     return answer, reasoning or alternate_reasoning, finish_reason == "stop" and has_refusal, metered_reasoning
 
@@ -58,16 +59,23 @@ def _metered_reasoning_usage(usage, record):
     if prompt_details is not None:
         if not isinstance(prompt_details, dict):
             return False
-        # Cached tokens may also be counted in a modality, so bound each field independently.
-        for field in ("audio_tokens", "cache_write_tokens", "cached_tokens", "image_tokens", "text_tokens"):
+        modalities = ("audio_tokens", "image_tokens", "text_tokens", "video_tokens")
+        modality_total = 0
+        for field in (*modalities, "cache_write_tokens", "cached_tokens"):
             if (value := prompt_details.get(field)) is None:
                 continue
             count = _token_count(value)
             if count is None or (prompt is not None and count > prompt):
                 return False
+            # Cache counts can overlap modality counts.
+            if field in modalities:
+                modality_total += count
+        if prompt is not None and modality_total > prompt:
+            return False
     details = usage["completion_tokens_details"]
     return all(details.get(field) is None or _token_count(details[field]) == 0 for field in (
-        "accepted_prediction_tokens", "rejected_prediction_tokens", "audio_tokens", "text_tokens",
+        "accepted_prediction_tokens", "rejected_prediction_tokens", "audio_tokens", "image_tokens",
+        "text_tokens", "video_tokens",
     ))
 
 

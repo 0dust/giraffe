@@ -386,7 +386,7 @@ async def test_access_denial_rules_do_not_change_policy_evidence(monkeypatch, lo
     assert check.status == "pass"
     baseline = report.model_copy(deep=True)
     # A passing quota run saved on the immediate policy predecessor, before gateway access.
-    baseline.manifest["gateway_policy_source_sha256"] = "459756ccfed66b5ae2ae4683b8a949c49368bc3e4244c9b5f48e6a71929a7d8e"
+    baseline.manifest["gateway_policy_source_sha256"] = "f406afadc0dadc85815aeb242fbf23c8cfcd06f040e106fd1973ec21026fd04a"
     assert compare_baseline(report, baseline).baseline["status"] == "pass"
 
 
@@ -394,9 +394,10 @@ async def test_access_denial_rules_do_not_change_policy_evidence(monkeypatch, lo
     pytest.param({}, {"reasoning_content": "deny-secret"}, "allow", id="reasoning-text"),
     pytest.param({}, {}, "allow", id="sparse-usage"),
     pytest.param({"prompt_tokens": 8, "total_tokens": 24, "prompt_tokens_details": {
-        "cached_tokens": 8, "text_tokens": 8, "audio_tokens": None}, "completion_tokens_details": {
-        "reasoning_tokens": 16, "accepted_prediction_tokens": 0, "audio_tokens": None}},
-        {"audio": None, "refusal": ""}, "allow", id="coherent-complete-usage"),
+        "cached_tokens": 8, "text_tokens": 4, "audio_tokens": 4}, "completion_tokens_details": {
+        "reasoning_tokens": 16, "accepted_prediction_tokens": 0, "audio_tokens": None,
+        "image_tokens": 0, "video_tokens": None}},
+        {"audio": None, "images": [], "refusal": ""}, "allow", id="coherent-complete-usage"),
     pytest.param({"prompt_tokens_details": None}, {}, "allow", id="null-optional-prompt-details"),
     pytest.param({"total_tokens": 24, "prompt_tokens_details": {"cached_tokens": 8}},
         {}, "allow", id="implied-prompt-count"),
@@ -416,11 +417,21 @@ async def test_access_denial_rules_do_not_change_policy_evidence(monkeypatch, lo
         {}, "unverified", id="cached-over-prompt-count"),
     pytest.param({"total_tokens": 24, "prompt_tokens_details": {"cached_tokens": 9}},
         {}, "unverified", id="cached-over-implied-prompt-count"),
+    pytest.param({"prompt_tokens": 8, "total_tokens": 24, "prompt_tokens_details": {"text_tokens": 8, "audio_tokens": 8}},
+        {}, "unverified", id="prompt-modalities-exceed-total"),
+    pytest.param({"total_tokens": 24, "prompt_tokens_details": {"image_tokens": 7, "video_tokens": 2}},
+        {}, "unverified", id="prompt-modalities-exceed-implied-total"),
     pytest.param({"prompt_tokens_details": {"text_tokens": False}}, {}, "unverified", id="malformed-prompt-detail"),
     pytest.param({"prompt_tokens_details": []}, {}, "unverified", id="malformed-prompt-breakdown"),
     pytest.param({}, {"refusal": "deny-secret"}, "unverified", id="unfinished-refusal"),
     pytest.param({}, {"audio": {"id": "audio", "data": "AA==", "transcript": "deny-secret", "expires_at": 42}},
         "unverified", id="audio-output"),
+    pytest.param({"completion_tokens_details": {"reasoning_tokens": 16, "image_tokens": 1}},
+        {}, "unverified", id="metered-image-output"),
+    pytest.param({"completion_tokens_details": {"reasoning_tokens": 16, "video_tokens": 1}},
+        {}, "unverified", id="metered-video-output"),
+    pytest.param({}, {"images": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}}]},
+        "unverified", id="image-output"),
 ])
 async def test_reasoning_only_access_requires_metered_cap_exhaustion(monkeypatch, usage, message, observed):
     monkeypatch.setenv("ALLOW_KEY", "allow-secret")
