@@ -447,6 +447,90 @@ def test_exact_access_companion_predecessor_keeps_tool_workloads_comparable():
     assert _settings_reasons(old, current) == []
 
 
+def legacy_gateway_reports(variant, *, include_load=True, change=None):
+    from giraffe import gateway_access
+    from giraffe.tool_checks import default_tool_fixture
+    from tests.test_tool_conversations import fixture
+
+    gateway = "gateway_attribution" if variant == "attribution" else "gateway_access"
+    checks = ["access", "tools", "sessions", *(["load"] if include_load else []), gateway]
+    tool_checks = {"fixtures": [default_tool_fixture()], "conversations": [fixture()], "modes": ["complete"]}
+    settings = {"profile": "litellm", "cases": [
+        {"name": "valid", "identity": "allowed", "expected": "allow"},
+        {"name": "invalid", "identity": "denied", "expected": "deny"},
+    ]} if variant == "configured" else None
+    current, old = exact_conversation_reports(checks, access_companion=True, tool_checks=tool_checks,
+                                               gateway_access=settings)
+    for report, revision, load_source in (
+        (current, "access_shared_targets_first", "788f4c8f0b14421d5fc00f8b32c0ffcef79c04c647730767cb44b16584ed4aa4"),
+        (old, "access_conversations", "113325dd5cffa04626cc7be7ee93bc6e9be67335531288bc329b3542a155c92a"),
+    ):
+        config = report.manifest["config"]
+        if settings:
+            config["targets"][0]["test_identities"] = {
+                "allowed": {"api_key_env": "ALLOW_KEY"}, "denied": {"api_key_env": "DENY_KEY"},
+            }
+        if report is old:
+            if change == "tool_modes":
+                config["tool_checks"]["modes"] = ["stream"]
+            elif change == "load_settings":
+                config["load_test"]["schedule"]["duration_seconds"] += 1
+        shared = _run_limits_workload_identity(report.manifest, revision=revision, include_load=include_load, shared=True)
+        assert shared is not None
+        if include_load:
+            shared["load_test_source_sha256"] = load_source
+        full = {**shared, "settings": {**shared["settings"], gateway: config.get(gateway)}}
+        if gateway == "gateway_access":
+            if report is current:
+                source = hashlib.sha256(Path(gateway_access.__file__).read_bytes()).hexdigest()
+            elif variant == "module_access":
+                source = "4417c0111cd71cf6e40b0e3a730f8b6acf7bbfa6badcae05639012e3722e5939"
+            else:
+                source = "a2589b46b16ae2c103aec0acf9cf94d9fcc10907b6c339a30820df4e9d4bbf27"
+                if change == "gateway_source":
+                    source = "unreviewed-gateway-source"
+            if report is current or variant != "module_access":
+                report.manifest["gateway_access_source_sha256"] = source
+            full["gateway_access_source_sha256"] = source
+        if report is old and change == "generator_source":
+            full["generator_source_sha256"] = "unreviewed-generator"
+        pack = report.manifest["fixture_pack"]
+        pack["workload_fixture_sha256"] = fixture_hash(full)
+        if report is current:
+            pack["shared_workload_fixture_sha256"] = fixture_hash(shared)
+    return current, old
+
+
+@pytest.mark.parametrize("variant", ["attribution", "module_access", "combined_access"])
+@pytest.mark.parametrize("include_load", [False, True])
+def test_legacy_gateway_reports_preserve_verified_shared_work(variant, include_load):
+    current, old = legacy_gateway_reports(variant, include_load=include_load)
+    before = old.model_dump_json()
+    assert _settings_reasons(current, old) == []
+    assert _settings_reasons(old, current) == []
+    assert old.model_dump_json() == before
+
+
+@pytest.mark.parametrize("change", ["generator_source", "gateway_source", "tool_modes", "load_settings"])
+def test_legacy_gateway_reports_keep_unverified_or_changed_work_incompatible(change):
+    current, old = legacy_gateway_reports("combined_access", change=change)
+    assert "Fixture pack identity differs." in _settings_reasons(current, old)
+
+
+def test_legacy_shared_gateway_projection_does_not_certify_stale_access_evidence():
+    from giraffe.models import CheckResult
+
+    current, old = legacy_gateway_reports("configured")
+    for report in (current, old):
+        report.checks.append(CheckResult(id="gateway_access", target="local", title="Gateway access policy",
+                                         status="pass", summary="The configured access matrix passed."))
+    compared = compare_baseline(current, old).baseline["targets"][0]
+    assert compared["reasons"] == []
+    rows = [row for row in compared["comparisons"] if row["check"] == "gateway_access"]
+    assert len(rows) == 2
+    assert all(row["status"] == "inconclusive" and "source identity differs" in row["reason"] for row in rows)
+
+
 @pytest.mark.parametrize("change", [None, "modes", "conversation_source", "earlier_generator"])
 def test_exact_conversation_predecessor_attests_tool_conversation_identity(change):
     from giraffe.tool_checks import default_tool_fixture

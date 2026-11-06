@@ -202,6 +202,8 @@ _COMPANION_REVISIONS = _CONVERSATION_REVISIONS | {
 }
 _CONVERSATION_BRIDGE_CHECKS = {"prefix", "sessions", "consistency"}
 _CONVERSATION_LOAD_SOURCE = "9b694c97a39d449d8ea15b09a9aeb406bf835179c0882827685c4d7888687d36"
+_ACCESS_CONVERSATION_SOURCE = "9ff9179300b4012552a7bd6fd6ef0ae60c016b9023dba33ffabc9ca03783ac2d"
+_COMPANION_LOAD_SOURCE = "113325dd5cffa04626cc7be7ee93bc6e9be67335531288bc329b3542a155c92a"
 
 
 def _baseline_workload_fields(checks, *, shared: bool) -> set[str]:
@@ -273,7 +275,7 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str, include_load
             "shared_conversations": "d9a9e921584262148e06b636f0e8f195b7e530fd2a69c5e98f013359cf947ede",
             "gateway_conversations": "bcdc3b8411d9039e90a35bcd5b109504e7123e95ec6baebd5e654287b4774605",
             "policy_conversations": "7c1455ec2c7d65ec707e41ef1864d117fe72fe6f919ba18992e84f39b2449181",
-            "access_conversations": "9ff9179300b4012552a7bd6fd6ef0ae60c016b9023dba33ffabc9ca03783ac2d",
+            "access_conversations": _ACCESS_CONVERSATION_SOURCE,
             "gateway_shared_first": "7a16b503242045f808ecfdb41df6bc8c507ca68181aaf019f003dc2d4d2ffb72",
             "policy_shared_first": "60eac0571375a103c1ebe7b23c3107b9814ceb0c002797736c55a6248a168f86",
             "access_shared_first": "ffda4bac34b3ab331e55c050a91707b1a0bfa16322347e7109646540e5fc4891",
@@ -394,7 +396,7 @@ def _same_load_workload(current: dict, old: dict, *, fingerprint_key: str = "wor
         (("shared_conversations", "gateway_conversations", "gateway_shared_first", "gateway_shared_targets_first",
           "policy_conversations", "policy_shared_first", "policy_shared_targets_first",
           "access_conversations", "access_shared_first", "access_shared_targets_first"),
-         ("113325dd5cffa04626cc7be7ee93bc6e9be67335531288bc329b3542a155c92a",
+         (_COMPANION_LOAD_SOURCE,
           "788f4c8f0b14421d5fc00f8b32c0ffcef79c04c647730767cb44b16584ed4aa4"), True),
     )
     matches = []
@@ -429,6 +431,44 @@ def _same_load_workload(current: dict, old: dict, *, fingerprint_key: str = "wor
             return False
         matches.append(attestations)
     return bool(matches[0] & matches[1])
+
+
+def _with_legacy_shared_workload(manifest: dict) -> dict:
+    """Recover the shared fingerprint only from a verified historical full identity."""
+    pack = manifest["fixture_pack"]
+    config = manifest.get("config", {})
+    if "shared_workload_fixture_sha256" in pack or config.get("config_version") != 2:
+        return manifest
+    checks = config.get("checks")
+    if not isinstance(checks, list) or not all(isinstance(check, str) for check in checks):
+        return manifest
+    gateways = SHARED_BASELINE_EXCLUDED_WORKLOADS.intersection(checks)
+    if (not gateways or not gateways <= {"gateway_access", "gateway_attribution"}
+            or ("gateway_attribution" in gateways and config.get("gateway_attribution") is not None)):
+        return manifest
+    shared = _run_limits_workload_identity(manifest, revision="access_conversations",
+                                           include_load="load" in checks, shared=True)
+    if shared is None:
+        return manifest
+    if "load" in checks:
+        shared["load_test_source_sha256"] = _COMPANION_LOAD_SOURCE
+    full = {**shared, "settings": {**shared["settings"], **{check: config.get(check) for check in gateways}}}
+    if any(full["settings"].values()):
+        full["generator_source_sha256"] = _ACCESS_CONVERSATION_SOURCE
+    if "gateway_access" in gateways:
+        if "gateway_access" not in config:
+            return manifest
+        # 2099543e recorded the module only in the full hash. 08f99814 also
+        # attested the combined access and response source in the manifest.
+        source = manifest.get("gateway_access_source_sha256")
+        if source is None:
+            source = "4417c0111cd71cf6e40b0e3a730f8b6acf7bbfa6badcae05639012e3722e5939"
+        elif source != "a2589b46b16ae2c103aec0acf9cf94d9fcc10907b6c339a30820df4e9d4bbf27":
+            return manifest
+        full["gateway_access_source_sha256"] = source
+    if fixture_hash(full) != pack.get("workload_fixture_sha256"):
+        return manifest
+    return {**manifest, "fixture_pack": {**pack, "shared_workload_fixture_sha256": fixture_hash(shared)}}
 
 
 def _limits_reached(report: RunReport) -> set[str]:
@@ -632,13 +672,17 @@ def _settings_reasons(report: RunReport, baseline: RunReport, *, details: dict[s
         # fingerprints used a different set of excluded workloads.
         full = current_pack.get(fingerprint_key)
         full_match = isinstance(full, str) and bool(full) and full == old_pack.get(fingerprint_key)
-        if not full_match and all(isinstance(pack.get("shared_workload_fixture_sha256"), str)
-                                  and pack["shared_workload_fixture_sha256"] for pack in (current_pack, old_pack)):
-            fingerprint_key = "shared_workload_fixture_sha256"
-            current_pack, old_pack = ({**pack, "workload_fixture_sha256": pack[fingerprint_key]}
-                                      for pack in (current_pack, old_pack))
-        if (_same_run_limits_workload(report.manifest, baseline.manifest, fingerprint_key=fingerprint_key)
-                or _same_load_workload(report.manifest, baseline.manifest, fingerprint_key=fingerprint_key)):
+        workload_manifests = (report.manifest, baseline.manifest)
+        if not full_match:
+            workload_manifests = tuple(_with_legacy_shared_workload(manifest) for manifest in workload_manifests)
+            shared_packs = tuple(manifest["fixture_pack"] for manifest in workload_manifests)
+            if all(isinstance(pack.get("shared_workload_fixture_sha256"), str)
+                   and pack["shared_workload_fixture_sha256"] for pack in shared_packs):
+                fingerprint_key = "shared_workload_fixture_sha256"
+                current_pack, old_pack = ({**pack, "workload_fixture_sha256": pack[fingerprint_key]}
+                                          for pack in shared_packs)
+        if (_same_run_limits_workload(*workload_manifests, fingerprint_key=fingerprint_key)
+                or _same_load_workload(*workload_manifests, fingerprint_key=fingerprint_key)):
             inactive.add("workload_fixture_sha256")
         if ({key: value for key, value in current_pack.items() if key not in inactive}
                 != {key: value for key, value in old_pack.items() if key not in inactive}):
