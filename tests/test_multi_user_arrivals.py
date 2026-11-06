@@ -275,7 +275,9 @@ def test_http_single_user_burst_overlaps_under_global_cap():
             await execute(state, cfg.targets[0], client)
         assert 2 <= endpoint.peak_active <= 3
         window, = state.observations["service"]["multi_user"]["windows"]
-        assert window["peak_in_flight"] == 3
+        observed_peak = max(sum(record.dispatch_ms <= start.dispatch_ms < record.completed_ms
+                                for record in state.records) for start in state.records)
+        assert 2 <= window["peak_in_flight"] == observed_peak <= 3
         assert window["offer_accounting"]["planned"] == 4
         assert sum(window["offer_accounting"][key] for key in
                    ("dispatched", "dropped_local", "dropped_late", "unissued", "not_offered")) == 4
