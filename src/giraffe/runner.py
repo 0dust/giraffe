@@ -1217,12 +1217,15 @@ def _deferred_identity_client(run, target):
                      max_connections=run.connection_limits[target.name], **tls_options)
 
 
-async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attribution=False, defer_policy=False):
+async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attribution=False, defer_policy=False,
+                  defer_access=False):
     config, enabled = run.config, set(run.config.checks)
     if defer_attribution:
         enabled.discard("gateway_attribution")
     if defer_policy:
         enabled.discard("gateway_policy")
+    if defer_access:
+        enabled.discard("gateway_access")
     telemetry_task = None
     telemetry_stop = asyncio.Event()
     from giraffe import deployment, telemetry, workloads
@@ -1247,7 +1250,7 @@ async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attributio
         gateway_only = config.restart_target != target.name and gateway_identities_only(enabled)
         client_target = _identity_only_target(target) if gateway_only else target
         async with LLMClient(client_target, config, max_connections=run.connection_limits[target.name]) as client:
-            if (defer_attribution or defer_policy) and (context := getattr(client, "tls_context", None)) is not None:
+            if (defer_attribution or defer_policy or defer_access) and (context := getattr(client, "tls_context", None)) is not None:
                 run.deferred_tls_contexts[target.name] = context
             client.logprob_budget = run.logprob_budget
             client.on_response = lambda: run.endpoint_response(target.name)
@@ -1491,7 +1494,7 @@ async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attributio
                                 count=effective.samples, checks=["recovery"])
             run.finish_checks(target.name, {"recovery"})
             await workloads.execute(run, target, client, fixtures, defer_attribution=defer_attribution,
-                                    defer_policy=defer_policy)
+                                    defer_policy=defer_policy, defer_access=defer_access)
             run.finish_checks(target.name, enabled - {"gpu"})
     except asyncio.CancelledError:
         run.unfinished[target.name].update(check for name, check in run.pending_checks if name == target.name)
@@ -1554,6 +1557,36 @@ async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attributio
             _target_error(run, target, enabled, exc)
 
 
+async def _deferred_access(run, target):
+    from .gateway_access import configured_probe_count, execute
+
+    check = "gateway_access"
+    observations = run.observations[target.name]
+    reason = run.stop_reason(target.name)
+    if reason not in {None, "maximum request budget reached"} or observations.get("client_error"):
+        run.mark_unfinished(target.name, {check})
+        return
+    restart = observations["restart"]
+    if run.config.restart_target == target.name and (not restart or restart["status"] != "ready"):
+        run.finish_checks(target.name, {check})
+        return
+    run.emit("scenario_started", target.name, check)
+    try:
+        if configured_probe_count(run.config, target):
+            async with _deferred_identity_client(run, target) as client:
+                await execute(run, target, client)
+        else:
+            await execute(run, target, None)
+    except asyncio.CancelledError:
+        run.mark_unfinished(target.name, {check})
+        raise
+    except Exception as exc:
+        logger.error("Internal gateway access error (%s)", type(exc).__name__)
+    finally:
+        run.finish_checks(target.name, {check})
+        run.emit("scenario_finished", target.name, check)
+
+
 async def _deferred_policy(run, target):
     from .gateway_policy import execute
 
@@ -1583,7 +1616,7 @@ async def _deferred_policy(run, target):
         run.emit("scenario_finished", target.name, check)
 
 
-async def _deferred_attribution(run, target):
+async def _deferred_attribution(run, target, *, deferred=True):
     from .gateway_attribution import CHECK, _state, execute
 
     observations = run.observations[target.name]
@@ -1599,7 +1632,7 @@ async def _deferred_attribution(run, target):
     run.emit("scenario_started", target.name, CHECK)
     try:
         async with _deferred_identity_client(run, target) as client:
-            await execute(run, target, client, deferred=True)
+            await execute(run, target, client, deferred=deferred)
     except asyncio.CancelledError:
         run.mark_unfinished(target.name, {CHECK})
         raise
@@ -2716,11 +2749,15 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
     sampler.sample()
     consume_samples()
 
+    from .gateway_access import deferred_for_shared_targets as defer_gateway_access
     from .gateway_attribution import deferred_for_shared_targets
     from .gateway_policy import deferred_for_shared_targets as defer_gateway_policy
 
-    defer_attribution = deferred_for_shared_targets(config)
-    defer_policy = defer_gateway_policy(config)
+    defer_access = defer_gateway_access(config)
+    cross_target_attribution = deferred_for_shared_targets(config)
+    defer_attribution = cross_target_attribution or (defer_access and "gateway_attribution" in config.checks)
+    defer_policy = defer_gateway_policy(config) or (defer_access and "gateway_policy" in config.checks
+                                                  and config.gateway_policy is not None and config.gateway_policy.supported)
 
     async def shared_target(target):
         deferred = {}
@@ -2728,13 +2765,18 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
             deferred["defer_attribution"] = True
         if defer_policy:
             deferred["defer_policy"] = True
+        if defer_access:
+            deferred["defer_access"] = True
         await _target(run, target, fixtures, **deferred)
+
+    async def check_access(target):
+        await _deferred_access(run, target)
 
     async def check_policy(target):
         await _deferred_policy(run, target)
 
     async def attribute(target):
-        await _deferred_attribution(run, target)
+        await _deferred_attribution(run, target, deferred=cross_target_attribution)
 
     async def target_task(target, execute):
         task = asyncio.create_task(execute(target))
@@ -2758,6 +2800,8 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
 
     async def shared_then_gateway():
         phases = [shared_target]
+        if defer_access:
+            phases.append(check_access)
         if defer_policy:
             phases.append(check_policy)
         if defer_attribution:
@@ -2772,7 +2816,7 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
                         task.cancel()
                 await asyncio.gather(*phase, return_exceptions=True)
 
-    tasks = ([asyncio.create_task(shared_then_gateway())] if defer_attribution or defer_policy
+    tasks = ([asyncio.create_task(shared_then_gateway())] if defer_attribution or defer_policy or defer_access
              else start_targets(shared_target))
     monitor = asyncio.create_task(run.monitor(tasks))
     try:

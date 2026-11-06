@@ -243,7 +243,7 @@ def test_unchanged_text_generator_has_reviewed_identity_table_entry():
                     for revision in ("gateway_shared_first", "gateway_shared_targets_first",
                                      "policy_shared_first", "policy_shared_targets_first", "policy_after_shared_workloads",
                                      "policy_after_all_shared_targets", "access_shared_first", "access_shared_targets_first",
-                                     "access_after_shared_workloads", "access_deferred_policy")]
+                                     "access_after_shared_workloads", "access_deferred_policy", "access_after_all_shared_targets")]
     actual = hashlib.sha256(Path(workloads.__file__).read_bytes()).hexdigest()
     assert any(identity and identity["generator_source_sha256"] == actual for identity in attestations), (
         "generator_source_sha256 changed: review request-level compatibility and update/extend "

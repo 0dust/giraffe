@@ -127,21 +127,24 @@ def test_finite_access_matrix_has_exact_request_plan():
     assert not any("adaptive traffic" in warning for warning in plan["warnings"])
 
 
-async def test_access_plan_and_request_budget_follow_execution_order(monkeypatch):
+@pytest.mark.parametrize("cap", [4, 6])
+async def test_access_plan_and_request_budget_follow_execution_order(monkeypatch, cap):
     from giraffe.planning import request_plan
 
     monkeypatch.setenv("ALLOW_KEY", "allow-secret")
     monkeypatch.setenv("DENY_KEY", "deny-secret")
-    raw = config(max_requests=6, retention="all").model_dump()
+    raw = config(max_requests=cap, retention="all").model_dump()
     raw.update(checks=["prefix", "gateway_access"], prefix={"prefix_chars": 96, "repeats": 2, "history_turns": 2})
     cfg = RunConfig.model_validate(raw)
     plan = request_plan(cfg)
-    assert [(row["id"], row["requests_per_target"]) for row in plan["rows"]] == [("gateway_access", 2), ("prefix", 6)]
+    assert [(row["id"], row["requests_per_target"]) for row in plan["rows"]] == [("prefix", 6), ("gateway_access", 2)]
     warning, = plan["request_warnings"]
-    assert warning["cut_checks"] == ["prefix"]
-    timeline = plan["time_timeline"]
-    assert timeline[0]["id"] == "gateway_access" and timeline[0]["field"] == "gateway_access.request_timeout_seconds"
-    warning, = request_plan(cfg.model_copy(update={"max_requests": 1}))["request_warnings"]
+    assert warning["cut_checks"] == (["gateway_access"] if cap == 6 else ["prefix", "gateway_access"])
+    assert warning["actions"][0]["value"] == 8
+    shared, access = plan["time_timeline"]
+    assert shared["id"] == "prefix" and access["id"] == "gateway_access"
+    assert access["field"] == "gateway_access.request_timeout_seconds"
+    assert plan["budget_high_seconds"] >= 2 * cfg.gateway_access.request_timeout_seconds
     assert any(action["field"] == "gateway_access.cases" for action in warning["actions"])
 
     def handler(request):
@@ -155,9 +158,55 @@ async def test_access_plan_and_request_budget_follow_execution_order(monkeypatch
     original = httpx.AsyncClient
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
     report = await run_suite(cfg)
-    assert [record.scenario for record in report.requests] == ["gateway_access"] * 2 + ["prefix_shared"] * 2 + ["prefix_independent"] * 2
-    assert next(check for check in report.checks if check.id == "gateway_access").status == "pass"
-    assert report.abort_reason == "maximum request budget reached"
+    scenarios = ["prefix_shared"] * 2 + ["prefix_independent"] * 2 + ["prefix_history"] * 2
+    assert [record.scenario for record in report.requests] == scenarios[:cap]
+    assert report.abort_reason == (None if cap == 6 else "maximum request budget reached")
+    access = next(check for check in report.checks if check.id == "gateway_access")
+    assert access.status == "inconclusive"
+    assert all(case["reason"] == "request_budget_exhausted" for case in access.metrics["gateway_access"]["cases"])
+
+
+@pytest.mark.parametrize("overlap", [False, True])
+async def test_slow_unsupported_gateway_access_waits_for_all_shared_targets(monkeypatch, overlap):
+    from giraffe.planning import request_plan
+
+    monkeypatch.setenv("ALLOW_KEY", "allow-secret")
+    monkeypatch.setenv("DENY_KEY", "deny-secret")
+    cfg = config(retention="all", max_memory_mb=0)
+    cfg.max_duration_seconds = .7
+    cfg.checks = ["prefix", "gateway_access"]
+    cfg.overlap_models = overlap
+    raw = cfg.model_dump()
+    raw["prefix"] = {"prefix_chars": 96, "repeats": 2, "history_turns": 2}
+    cfg = RunConfig.model_validate(raw)
+    cfg.targets.append(cfg.targets[0].model_copy(update={"name": "second", "url": "http://second/v1"}))
+    cfg.gateway_access.request_timeout_seconds = 2
+    calls = []
+
+    async def handler(request):
+        if request.method != "POST":
+            return httpx.Response(404)
+        key = request.headers.get("authorization")
+        calls.append((request.url.host, key))
+        if key == "Bearer deny-secret":
+            await asyncio.sleep(2)
+        if key:
+            return httpx.Response(501)
+        return httpx.Response(200, json={"choices": [{"message": {
+            "role": "assistant", "content": "K7P4"}, "finish_reason": "stop"}]})
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
+    report = await run_suite(cfg)
+    assert calls[:12].count(("proxy", None)) == calls[:12].count(("second", None)) == 6
+    assert calls[12:14] and all(key is not None for _, key in calls[12:])
+    access = next(check for check in report.checks if check.id == "gateway_access" and check.target == "proxy")
+    allowed, denied = access.metrics["gateway_access"]["cases"]
+    assert access.status == "inconclusive" and allowed["http_status"] == 501 and allowed["observed"] == "unverified"
+    assert denied["observed"] == "unverified" and "max_duration_seconds" in report.limits_reached
+    timeline = request_plan(cfg)["time_timeline"]
+    assert [(item["target"], item["id"]) for item in timeline] == [
+        ("proxy", "prefix"), ("second", "prefix"), ("proxy", "gateway_access"), ("second", "gateway_access")]
 
 
 def test_access_plan_counts_only_configured_aliases_by_target(monkeypatch):
@@ -199,8 +248,9 @@ def test_access_plan_timeline_reserves_compatible_requests_per_target():
                for component in warning["components"] if component["id"] == "performance_evidence_probe")
 
 
-@pytest.mark.parametrize("cap", [18, 19])
-async def test_access_plan_attribution_limit_covers_target_scoped_compatibility(monkeypatch, local_tokenizer, cap):
+@pytest.mark.parametrize("cap,targets,minimum", [(18, 2, 19), (19, 2, 19), (None, 1, 10)])
+async def test_access_plan_attribution_limit_covers_target_scoped_compatibility(
+        monkeypatch, local_tokenizer, cap, targets, minimum):
     from giraffe.planning import request_plan
     from giraffe.tool_checks import default_tool_fixture
     from tests.test_gateway_attribution import immediate_spend_polls, spend_page
@@ -210,16 +260,22 @@ async def test_access_plan_attribution_limit_covers_target_scoped_compatibility(
     monkeypatch.setenv("DENY_KEY", "deny-secret")
     monkeypatch.setenv("READER_KEY", "reader-secret")
     raw = _mixed_access_attribution_config("tools")
+    raw["targets"] = raw["targets"][:targets]
     raw.update(max_requests=cap, tool_checks={"fixtures": [default_tool_fixture()], "conversations": [fixture()],
                                             "modes": ["complete"]})
     cfg = RunConfig.model_validate(raw)
     immediate_spend_polls(monkeypatch, cfg)
     rows = []
+    reader_preflights = []
     compatibility = {target.name: 0 for target in cfg.targets}
 
     def handler(request):
         if request.method != "POST":
-            return spend_page(request, rows) if request.url.host == "reader" else httpx.Response(404)
+            if request.url.host != "reader":
+                return httpx.Response(404)
+            if not rows:
+                reader_preflights.append(request)
+            return spend_page(request, rows)
         payload = json.loads(request.content)
         usage = {"prompt_tokens": 3, "completion_tokens": 5}
         if marker := request.headers.get("x-litellm-trace-id"):
@@ -252,23 +308,26 @@ async def test_access_plan_attribution_limit_covers_target_scoped_compatibility(
     original = httpx.AsyncClient
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
     plan = request_plan(cfg)
-    assert plan["attribution_request_limit"] == 19
+    assert plan["attribution_request_limit"] == minimum
     warnings = [warning for warning in plan["request_warnings"] if warning["kind"] == "incomplete_coverage"]
     if cap == 18:
         warning, = warnings
-        assert warning["cut_checks"] == ["gateway_attribution"] and warning["actions"][0]["value"] == 19
+        assert warning["cut_checks"] == ["gateway_attribution"] and warning["actions"][0]["value"] == minimum
     else:
         assert not warnings
     report = await run_suite(cfg)
     assert compatibility["proxy"] == 3
+    assert bool(reader_preflights) is (targets > 1)
     checks = {check.id: check for check in report.checks if check.target == "proxy"}
     assert checks["gateway_access"].status == checks["tools"].status == "pass"
     attribution = checks["gateway_attribution"]
     if cap == 18:
         assert attribution.status == "inconclusive" and attribution.metrics["reason_code"] == "budget_limited"
-        assert attribution.remediation["minimum"] == 19
+        assert attribution.remediation["minimum"] == minimum
     else:
         assert attribution.status == "pass" and attribution.metrics["matched_requests"] == 1
+        scenarios = [record.scenario for record in report.requests if record.target == "proxy"]
+        assert scenarios[-3:] == ["gateway_access", "gateway_access", "gateway_attribution"]
 
 
 def _mock_recovery_gateway(monkeypatch):

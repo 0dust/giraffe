@@ -14,7 +14,8 @@ from typing import Any
 
 from giraffe.caps import MAX_TOKEN_EVIDENCE_PROBE_ATTEMPTS
 from giraffe.fixtures import builtin_fixtures
-from giraffe.gateway_access import configured_probe_count as configured_access_probe_count
+from giraffe.gateway_access import (configured_probe_count as configured_access_probe_count,
+                                    deferred_for_shared_targets as defer_gateway_access)
 from giraffe.gateway_attribution import (POLL_FRACTIONS, configured_probe_count,
                                          deferred_for_shared_targets, reader_preflight_bound)
 from giraffe.gateway_policy import deferred_for_shared_targets as defer_gateway_policy
@@ -116,8 +117,11 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
     quotas = _request_quotas(config)
     shared_attribution = (not gateway_identities_only(selected)
                           and any(configured_probe_count(config, target) for target in config.targets))
-    defer_attribution = deferred_for_shared_targets(config)
-    defer_policy = defer_gateway_policy(config)
+    defer_access = defer_gateway_access(config)
+    cross_target_attribution = deferred_for_shared_targets(config)
+    defer_attribution = cross_target_attribution or (defer_access and "gateway_attribution" in selected)
+    defer_policy = defer_gateway_policy(config) or (defer_access and "gateway_policy" in selected
+                                                  and config.gateway_policy is not None and config.gateway_policy.supported)
     attribution_steps = {"gateway_attribution", "gateway_attribution_preflight", "gateway_attribution_settle"}
     requirements = required_concurrency(config)
     pool = min(requirements["peak"], config.concurrency) if config.concurrency else requirements["peak"]
@@ -492,7 +496,7 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
             if name == "gateway_attribution":
                 settings = config.gateway_attribution
                 field = "gateway_attribution.settle_seconds"
-                if preflight := reader_preflight_bound(config, deferred=defer_attribution):
+                if preflight := reader_preflight_bound(config, deferred=cross_target_attribution):
                     fixed(target.name, {"id": "gateway_attribution_preflight", "title": "Gateway reader preflight"},
                           0, field, timeout=preflight)
                 timeout = config.request_timeout_seconds
@@ -792,15 +796,17 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
             row["estimate_source"] = "from your recent runs" if max(duration_runs[row["id"]].values()) > 1 else "from your last run"
 
     def phases(items):
-        shared, policy, attribution = [], [], []
+        shared, access, policy, attribution = [], [], [], []
         for item in items:
-            if defer_policy and item["id"] == "gateway_policy":
+            if defer_access and item["id"] == "gateway_access":
+                access.append(item)
+            elif defer_policy and item["id"] == "gateway_policy":
                 policy.append(item)
             elif defer_attribution and item["id"] in attribution_steps:
                 attribution.append(item)
             else:
                 shared.append(item)
-        return shared, policy, attribution
+        return shared, access, policy, attribution
 
     def combine_phase(items, key):
         totals = [sum(item.get(key, 0) for item in items if item["target"] == target.name) for target in config.targets]
@@ -858,12 +864,13 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
     setup_totals = [sum(item["high_seconds"] for item in timeline
                         if item["target"] == target.name and item["kind"] == "setup") for target in config.targets]
     setup_allowance = max(setup_totals, default=0) if config.overlap_models else sum(setup_totals)
-    # Attribution has bounded serial probes even without comparable
-    # latency samples. Preserve their allowance in the duration remedy.
-    probe_bounds = [item["timeout_bound_seconds"] for item in unknowns if item["id"] == "gateway_attribution"]
-    parallel_probes = config.overlap_models and (pool >= requirements["peak"]
-                                                 or defer_attribution and pool >= len(probe_bounds))
-    probe_allowance = max(probe_bounds, default=0) if parallel_probes else sum(probe_bounds)
+    # Gateway probes have a serial timeout bound per target even without latency samples.
+    probe_allowance = 0
+    for check, deferred in (("gateway_access", defer_access), ("gateway_attribution", defer_attribution)):
+        probe_bounds = [item["timeout_bound_seconds"] for item in unknowns if item["id"] == check]
+        parallel_probes = config.overlap_models and (pool >= requirements["peak"]
+                                                     or deferred and pool >= len(probe_bounds))
+        probe_allowance += max(probe_bounds, default=0) if parallel_probes else sum(probe_bounds)
     budget_high = timeline_high + setup_allowance + probe_allowance
     errors, warnings = [], []
     budget = config.max_duration_seconds
@@ -1165,16 +1172,6 @@ def request_plan(config: RunConfig | ConfigDraft, *,
     if "arrivals" in selected:
         add("arrivals", config.arrivals.requests,
             f"{config.arrivals.requests} scheduled offers; the pending queue and Limits can leave some undispatched.")
-    if "gateway_access" in selected:
-        access_counts = {target.name: configured_access_probe_count(config, target) for target in config.targets}
-        counts = set(access_counts.values())
-        count = next(iter(counts)) if len(counts) == 1 else None
-        add("gateway_access", count,
-            "At most one serial request per declared case with a configured identity. "
-            "Both allow and deny evidence are required for a complete policy observation.",
-            source="declared LiteLLM access cases")
-        if count is None:
-            rows[-1]["target_request_counts"] = access_counts
     if "prefix" in selected:
         settings = config.prefix
         context_limit = config.effective_check("prefix")["context_limit"]
@@ -1289,6 +1286,17 @@ def request_plan(config: RunConfig | ConfigDraft, *,
         add("tools", count, "Tool fixtures in each selected mode. Conversation counts are upper bounds: expected calls plus one final answer; invalid or repeated calls stop a conversation early. No tools execute.",
             source="configured tool fixtures" if config.tool_checks and (config.tool_checks.fixtures or conversations) else "generated examples",
             kind="bounded" if conversations else "exact")
+
+    if "gateway_access" in selected:
+        access_counts = {target.name: configured_access_probe_count(config, target) for target in config.targets}
+        counts = set(access_counts.values())
+        count = next(iter(counts)) if len(counts) == 1 else None
+        add("gateway_access", count,
+            "At most one serial request per declared case with a configured identity. "
+            "Both allow and deny evidence are required for a complete policy observation.",
+            source="declared LiteLLM access cases")
+        if count is None:
+            rows[-1]["target_request_counts"] = access_counts
 
     if "gateway_policy" in selected:
         settings = config.gateway_policy

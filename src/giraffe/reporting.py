@@ -198,7 +198,7 @@ _COMPANION_REVISIONS = _CONVERSATION_REVISIONS | {
     "gateway_policy", "policy_conversations", "policy_shared_first", "policy_shared_targets_first",
     "gateway_access", "gateway_access_policy", "access_conversations", "access_shared_first", "access_shared_targets_first",
     "policy_after_shared_workloads", "policy_after_all_shared_targets", "access_after_shared_workloads",
-    "access_deferred_policy",
+    "access_deferred_policy", "access_after_all_shared_targets",
 }
 _CONVERSATION_BRIDGE_CHECKS = {"prefix", "sessions", "consistency"}
 _CONVERSATION_LOAD_SOURCE = "9b694c97a39d449d8ea15b09a9aeb406bf835179c0882827685c4d7888687d36"
@@ -284,6 +284,7 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str, include_load
             "access_shared_targets_first": "16c362d1f79e5dd0b3f0601e0100ec9b19d7a512f5cee081af72594a683bf49f",
             "access_after_shared_workloads": "2d8a82427a1c241c95e2719c8ab307513d970ba7f14c80db77201d85c35a0897",
             "access_deferred_policy": "13a3e111a4f8985fa4dd8f763a093ade7ec118a6272e875b5f8abe0e1f104d94",
+            "access_after_all_shared_targets": "67da297a94f8a07f9ab21008c9c6ca87090a7fac3d30e4ff9a543e7491427667",
             "policy_after_shared_workloads": "49dcdfb6b173a93720e4e9e5a9bc54ffcea7580346d2ea0210e600e0779a03e6",
             "policy_after_all_shared_targets": "e4ddc7a7e8563f9ab3bba2fc42ad0232ee924c65f67d92dafd89c21025d202d0",
         }[revision] if any(settings.values()) else None,
@@ -310,6 +311,7 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str, include_load
             "access_shared_targets_first": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
             "access_after_shared_workloads": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
             "access_deferred_policy": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
+            "access_after_all_shared_targets": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
             "policy_after_shared_workloads": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
             "policy_after_all_shared_targets": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
         }[revision]
@@ -350,6 +352,7 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str, include_load
             "access_shared_targets_first": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
             "access_after_shared_workloads": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
             "access_deferred_policy": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
+            "access_after_all_shared_targets": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
             "policy_after_shared_workloads": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
             "policy_after_all_shared_targets": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
         }[revision]
@@ -404,7 +407,7 @@ def _same_load_workload(current: dict, old: dict, *, fingerprint_key: str = "wor
                  "policy_conversations", "policy_shared_first", "policy_shared_targets_first",
                  "policy_after_shared_workloads", "policy_after_all_shared_targets",
                  "access_conversations", "access_shared_first", "access_shared_targets_first",
-                 "access_after_shared_workloads", "access_deferred_policy")
+                 "access_after_shared_workloads", "access_deferred_policy", "access_after_all_shared_targets")
     families = (
         # Explicit multi-user stages preserve ordinary Load dispatch.
         (_CONVERSATION_LOAD_SOURCE,

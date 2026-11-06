@@ -5,7 +5,7 @@ import json
 import re
 
 from giraffe.client import REASONING_BUDGET_ERROR, _ProtocolError, _text, _token_count
-from giraffe.identities import LITELLM_NATIVE_KEY_HEADERS, identity_headers, litellm_key_fingerprint
+from giraffe.identities import LITELLM_NATIVE_KEY_HEADERS, gateway_identities_only, identity_headers, litellm_key_fingerprint
 from giraffe.models import CheckResult, RequestSpec
 
 
@@ -29,6 +29,11 @@ def configured_probe_count(config, target):
     if "gateway_access" not in config.checks or settings is None or settings.profile != "litellm":
         return 0
     return sum(case.identity in target.test_identities for case in settings.cases)
+
+
+def deferred_for_shared_targets(config):
+    return (not gateway_identities_only(config.checks)
+            and any(configured_probe_count(config, target) for target in config.targets))
 
 
 def credential_digest(headers: dict[str, str]) -> bytes:

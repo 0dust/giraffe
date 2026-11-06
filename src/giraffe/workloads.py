@@ -512,24 +512,25 @@ async def tools(run, target, client):
                     run.finish_condition(target.name, scenario, request.workload, reason=reason)
 
 
-async def execute(run, target, client, fixtures, *, defer_attribution=False, defer_policy=False):
+async def execute(run, target, client, fixtures, *, defer_attribution=False, defer_policy=False, defer_access=False):
     from giraffe.load_test import execute as load_test
     from giraffe.multi_user import execute as multi_user
     from giraffe.gateway_access import execute as gateway_access
     from giraffe.gateway_policy import execute as gateway_policy
     from giraffe.gateway_attribution import execute as gateway_attribution
     for field, callback in (
-        ("gateway_access", gateway_access),
         ("prefix", prefixes),
         ("load_test", load_test),
         ("multi_user", multi_user),
         ("sessions", sessions),
         ("consistency", consistency),
         ("tool_calling", tools),
+        ("gateway_access", gateway_access),
         ("gateway_policy", gateway_policy),
         ("gateway_attribution", gateway_attribution),
     ):
-        if (defer_attribution and field == "gateway_attribution") or (defer_policy and field == "gateway_policy"):
+        if (defer_attribution and field == "gateway_attribution" or defer_policy and field == "gateway_policy"
+                or defer_access and field == "gateway_access"):
             continue
         selected = WORKLOAD_CHECKS[field].intersection(run.config.checks)
         if selected and (getattr(run.config, field) or field in {"gateway_access", "gateway_attribution"}):
