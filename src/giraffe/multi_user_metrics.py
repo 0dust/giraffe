@@ -1,7 +1,9 @@
 """Per-user delivery over explicit common windows, separate from generation pace."""
 from __future__ import annotations
 
+from bisect import bisect_left
 from collections import Counter, defaultdict
+from operator import itemgetter
 from typing import Any
 
 from .models import LoadTestSettings, MultiUserCriteria, RequestRecord
@@ -39,6 +41,13 @@ def _tokens(records: list[RequestRecord]) -> tuple[int, int]:
 def _first(record: RequestRecord) -> float | None:
     start = record.timing_start_ms if record.timing_start_ms is not None else record.dispatch_ms
     return start + record.first_output_ms if start is not None and record.first_output_ms is not None else None
+
+
+def _first_generation(record: RequestRecord) -> float | None:
+    start = record.timing_start_ms if record.timing_start_ms is not None else record.dispatch_ms
+    first = min((value for value in (record.first_token_ms, record.first_reasoning_ms, record.first_output_ms)
+                 if value is not None), default=None)
+    return start + first if start is not None and first is not None else None
 
 
 def user_latency(record: RequestRecord, first: bool, *, ready: bool = True) -> float | None:
@@ -437,7 +446,17 @@ def _interference(observation, window, control, user_records, criteria, health, 
     if heavy_input == "long":
         min_uncached, _ = input_class_bounds(load_settings, heavy_input,
                                              floors=_input_shape_floors(observation, heavy_output))
-    heavy = [r for uid in window["heavy_user_ids"] for r in user_records.get((window["id"], uid), [])]
+    trigger_time = itemgetter(0)
+    heavy_by_peer = defaultdict(list)
+    for heavy_id in window["heavy_user_ids"]:
+        for competitor in user_records.get((window["id"], heavy_id), []):
+            at = competitor.workload.get("trigger_ms")
+            if not _valid(competitor) or at is None:
+                continue
+            for uid in competitor.workload.get("trigger_peer_ids", []):
+                heavy_by_peer[uid].append((at, competitor))
+    for candidates in heavy_by_peer.values():
+        candidates.sort(key=trigger_time)
     reasons = []
     for phase in (control, window):
         if not phase or phase.get("cut_short") or phase.get("drain_reason"):
@@ -459,7 +478,8 @@ def _interference(observation, window, control, user_records, criteria, health, 
         controls = {r.workload.get("matched_work_sequence"): r
                     for r in user_records.get((control["id"], uid), [])} if control else {}
         probes = user_records.get((window["id"], uid), [])
-        pairs, exposed, excluded = [], set(), set()
+        candidates = heavy_by_peer.get(uid, [])
+        pairs, exposed, excluded = [], {}, set()
         for probe in probes:
             baseline = controls.get(probe.workload.get("matched_work_sequence"))
             if not baseline or not _valid(baseline) or not _valid(probe):
@@ -477,29 +497,33 @@ def _interference(observation, window, control, user_records, criteria, health, 
                         (baseline.output_tokens, probe.output_tokens))):
                 excluded.add("Actual matched short-user token lengths are missing or not comparable.")
                 continue
+            a, b = baseline.completion_tokens, probe.completion_tokens
+            if (a is not None or b is not None) and not _comparable_tokens(a, b, tolerance):
+                excluded.add("Actual matched short-user completion tokens are missing or not comparable.")
+                continue
             if not _comparable_uncached_input(baseline, probe, tolerance):
                 excluded.add("Actual matched short-user uncached input is not comparable.")
                 continue
-            matches = []
-            for competitor in heavy:
-                at = competitor.workload.get("trigger_ms")
-                if (not _valid(competitor) or at is None or uid not in competitor.workload.get("trigger_peer_ids", [])
-                        or not probe.stream or probe.answer_reads < 2 or probe.answer_chunks < 2):
-                    continue
-                first = _first(probe)
-                span = answer_window(probe)
-                if window["trigger"] == "before_output":
-                    short_span = (probe.dispatch_ms, first) if probe.dispatch_ms is not None and first is not None else None
-                else:
-                    short_span = span
-                if short_span is None or not short_span[0] <= at < short_span[1]:
-                    continue
-                if window["heavy_profile"].endswith("_short"):
-                    last = _first(competitor)
+            if not probe.stream or probe.answer_reads < 2 or probe.answer_chunks < 2:
+                continue
+            span = answer_window(probe)
+            if window["trigger"] == "before_output":
+                first = _first_generation(probe)
+                short_span = (probe.dispatch_ms, first) if probe.dispatch_ms is not None and first is not None else None
+            else:
+                short_span = span
+            if short_span is None:
+                continue
+            lo = bisect_left(candidates, short_span[0], key=trigger_time)
+            hi = bisect_left(candidates, short_span[1], lo, key=trigger_time)
+            matched = False
+            for _, competitor in candidates[lo:hi]:
+                if heavy_output == "short":
+                    last = _first_generation(competitor)
                     heavy_span = (competitor.timing_start_ms, last) if competitor.timing_start_ms is not None and last is not None else None
                 else:
                     heavy_span = answer_window(competitor) if competitor.answer_reads >= 2 and competitor.answer_chunks >= 2 else None
-                overlap_span = span if window["heavy_profile"].endswith("_long") else short_span
+                overlap_span = span if heavy_output == "long" else short_span
                 if not _overlap(overlap_span, heavy_span, delays):
                     continue
                 if min_uncached is not None and competitor.cached_prompt_tokens is not None:
@@ -510,12 +534,12 @@ def _interference(observation, window, control, user_records, criteria, health, 
                     if cached > total / 2:
                         excluded.add("More than half the long competitor input was cached.")
                         continue
-                matches.append(competitor)
-            if matches:
+                matched = True
+                exposed[competitor.id] = competitor
+            if matched:
                 pairs.append((baseline, probe))
-                exposed.update(r.id for r in matches)
         before, after = [pair[0] for pair in pairs], [pair[1] for pair in pairs]
-        competitors = [r for r in heavy if r.id in exposed]
+        competitors = list(exposed.values())
         if len(pairs) < criteria.min_samples:
             notes.append(f"Only {len(pairs)} matched samples with the selected trigger and heavy overlap; {criteria.min_samples} required.")
             notes.extend(sorted(excluded))

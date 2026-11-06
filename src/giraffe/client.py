@@ -479,6 +479,8 @@ class LLMClient:
             if record.first_token_ms is None:
                 record.first_token_ms = (at - start) * 1000
                 record.first_token_reason = None
+                if first_output_event is not None and hasattr(first_output_event, "on_first_token"):
+                    first_output_event.on_first_token()
             if kind == "reasoning" and read_id not in reasoning_read_ids:
                 if len(record.reasoning_read_timestamps_ms) < _MAX_CONTENT_READS:
                     record.reasoning_read_timestamps_ms.append((at - start) * 1000)
