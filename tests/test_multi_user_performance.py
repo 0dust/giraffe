@@ -266,8 +266,12 @@ def test_scheduled_stream_gap_qualifies_its_own_samples(monkeypatch, local_token
     assert {row["status"] for row in comparisons if row["metric"] == "latency_ms"} == {"pass"}
 
 
-@pytest.mark.parametrize("work", ["generation", "uncached"])
-def test_scheduled_user_timing_and_acceptance_qualify_observed_work(monkeypatch, local_tokenizer, work):
+@pytest.mark.parametrize(("work", "warning"), [
+    ("same", None), ("generation", "output_work_changed"), ("uncached", "input_work_changed"),
+    ("input_mix", "input_work_changed"), ("missing_input", "input_work_changed"),
+    ("visible_mix", "output_work_changed"),
+])
+def test_scheduled_user_timing_and_acceptance_qualify_observed_work(monkeypatch, local_tokenizer, work, warning):
     from giraffe import runner
     from giraffe.reporting import compare_baseline
     from tests.test_multi_user import settings
@@ -280,28 +284,39 @@ def test_scheduled_user_timing_and_acceptance_qualify_observed_work(monkeypatch,
 
     class Observed(FakeClient):
         delay = .02
-        short_samples = 8
+        changed = False
 
         async def execute(self, spec, **kwargs):
             record = await super().execute(spec, **kwargs)
             if "multi_user" in spec.check_ids:
+                sequence = spec.workload["request_sequence"]
                 if work == "generation":
-                    record.completion_tokens = 2 if spec.workload["request_sequence"] <= self.short_samples else 14
+                    record.completion_tokens = 2 if sequence <= (7 if self.changed else 8) else 14
                     record.reasoning_tokens = record.completion_tokens - 2
-                else:
-                    record.cached_prompt_tokens = 32 if self.short_samples == 7 else 0
+                elif work == "uncached":
+                    record.cached_prompt_tokens = 32 if self.changed else 0
+                elif work == "visible_mix":
+                    record.completion_tokens = 14
+                    record.output_tokens = 10 if self.changed and sequence <= 6 else 2
+                    record.reasoning_tokens = record.completion_tokens - record.output_tokens
+                elif self.changed and sequence <= 6:
+                    if work == "input_mix":
+                        record.input_tokens *= 3
+                    elif work == "missing_input":
+                        record.input_tokens = None
             return record
 
     async def replay():
         baseline = await runner.run_suite(cfg)
         Observed.delay = .06
-        Observed.short_samples = 7
+        Observed.changed = True
         return await runner.run_suite(cfg), baseline
 
     monkeypatch.setattr(runner, "LLMClient", Observed)
     current, baseline = run_virtual(monkeypatch, replay())
     compared = compare_baseline(current, baseline)
-    assert compared.baseline["status"] == "inconclusive"
+    expected = "inconclusive" if warning else "fail"
+    assert compared.baseline["status"] == expected
     rows = compared.baseline["targets"][0]["comparisons"]
     completion = [row for row in rows if row["metric"] == "latency_ms"]
     acceptance = [row for row in rows if row["metric"] == "user_acceptance"]
@@ -309,10 +324,12 @@ def test_scheduled_user_timing_and_acceptance_qualify_observed_work(monkeypatch,
     assert len(completion) == len(acceptance) == len(delivery) == 2
     for row in completion:
         assert (row["current"], row["baseline"]) == pytest.approx((60, 20))
-        assert row["status"] == "inconclusive"
-        warning = "output_work_changed" if work == "generation" else "input_work_changed"
-        assert [item["code"] for item in row["warnings"]] == [warning]
-    assert {row["status"] for row in acceptance} == {"inconclusive"}
+        assert row["status"] == expected
+        assert [item["code"] for item in row["warnings"]] == ([warning] if warning else [])
+    first_answer = [row for row in rows if row["metric"] == "first_output_ms"]
+    assert len(first_answer) == 2
+    assert {row["status"] for row in first_answer} == {"pass" if work in {"same", "visible_mix"} else "inconclusive"}
+    assert {row["status"] for row in acceptance} == {expected}
     assert {row["status"] for row in delivery} == {"pass"}
 
 

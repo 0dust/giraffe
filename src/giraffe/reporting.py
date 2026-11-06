@@ -736,24 +736,18 @@ def _input_work_changed(current, old, threshold):
             and abs(current_input - old_input)*100/old_input > threshold)
 
 
-def _token_lengths_changed(lengths, threshold):
+def _measured_token_work_changed(current, old, threshold, measure):
+    lengths = [[measure(record) for record in cohort] for cohort in (current, old)]
     if any(not values or None in values for values in lengths):
         return True
     medians = [median(values) for values in lengths]
     return max(medians) > min(medians) * (1 + threshold / 100) or _length_mix_differs(lengths, threshold)
 
 
-def _total_generation_work_changed(current, old, threshold):
-    lengths = [[_total_generated_tokens(r) for r in records if r.status == "completed" and r.valid]
-               for records in (current, old)]
-    return _token_lengths_changed(lengths, threshold)
-
-
 def _uncached_input_work_changed(current, old, threshold):
-    cohorts = (current, old)
-    if not any((r.cached_prompt_tokens or 0) > 0 for cohort in cohorts for r in cohort):
+    if not any((r.cached_prompt_tokens or 0) > 0 for cohort in (current, old) for r in cohort):
         return False
-    return _token_lengths_changed([[_uncached_input_tokens(r) for r in cohort] for cohort in cohorts], threshold)
+    return _measured_token_work_changed(current, old, threshold, _uncached_input_tokens)
 
 
 def _live_input_work_changed(current, old, threshold, *, compare_output=False):
@@ -1319,26 +1313,34 @@ def _probe_has_overlap(evidence: dict, records: list[RequestRecord]) -> bool:
 def _recovery_work_changed(current, old, current_records, old_records, threshold):
     for phase in ("control", "sustained", "lighter"):
         field = f"{phase}_request_ids"
-        cohorts = []
+        cohorts, matched = [], []
         for evidence, records in ((current, current_records), (old, old_records)):
             ids = evidence.get(field, [])
             if not ids or any(rid not in records for rid in ids):
                 return True
-            cohorts.append([records[rid] for rid in ids])
-        latest_work, old_work = (Counter((r.workload.get("matched_work_sequence"), r.workload.get("matched_work_sha256"))
-                                         for r in cohort) for cohort in cohorts)
-        if latest_work != old_work or _user_token_work_changed(*cohorts, threshold):
+            cohort = [records[rid] for rid in ids]
+            by_work = defaultdict(list)
+            for record in cohort:
+                sequence = record.workload.get("matched_work_sequence")
+                digest = record.workload.get("matched_work_sha256")
+                if sequence is None or not digest or record.status != "completed" or not record.valid:
+                    return True
+                by_work[sequence, digest].append(record)
+            cohorts.append(cohort)
+            matched.append(by_work)
+        latest_work, old_work = matched
+        if (latest_work.keys() != old_work.keys() or _user_token_work_changed(*cohorts, threshold)
+                or any(len(records) != len(old_work[identity])
+                       or _user_token_work_changed(records, old_work[identity], threshold)
+                       for identity, records in latest_work.items())):
             return True
     return False
 
 
 def _user_token_work_changed(current, previous, tolerance):
     measures = (lambda r: r.input_tokens, lambda r: r.output_tokens, _total_generated_tokens)
-    for measure in measures:
-        lengths = [[measure(record) for record in cohort] for cohort in (current, previous)]
-        if _token_lengths_changed(lengths, tolerance):
-            return True
-    return _uncached_input_work_changed(current, previous, tolerance)
+    return (any(_measured_token_work_changed(current, previous, tolerance, measure) for measure in measures)
+            or _uncached_input_work_changed(current, previous, tolerance))
 
 
 def _compare_user_fairness(current, previous, current_records, old_records):
@@ -1765,7 +1767,7 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                     current_output, old_output = current_work, old_work
                     metric_input_changed, metric_output_changed = input_work_changed, different_work
                     metric_work_reason, metric_mix_changed = None, mix_changed
-                    generation_work_changed = False
+                    generation_work_changed = visible_work_changed = False
                     if scheduled_user and metric in TIMING_METRICS:
                         current_samples, old_samples = current_timing[metric], old_timing[metric]
                         if current_samples and old_samples:
@@ -1773,10 +1775,16 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                         else:
                             metric_mix_changed = False
                         current_output, old_output = _output_work(current_samples), _output_work(old_samples)
-                        metric_input_changed = (_input_work_changed(current_samples, old_samples, threshold)
+                        metric_input_changed = (_measured_token_work_changed(current_samples, old_samples, threshold,
+                                                                             lambda r: r.input_tokens)
                                                 or _uncached_input_work_changed(current_samples, old_samples, threshold))
                         metric_output_changed = _different_output_work(current_output, old_output, threshold)
-                        generation_work_changed = _total_generation_work_changed(current_samples, old_samples, threshold)
+                        generation_work_changed = _measured_token_work_changed(
+                            current_samples, old_samples, threshold, _total_generated_tokens)
+                        # Visible tokens after the first answer affect completion
+                        # and streaming work without changing the first-answer boundary.
+                        visible_work_changed = metric != "first_output_ms" and _measured_token_work_changed(
+                            current_samples, old_samples, threshold, lambda r: r.output_tokens)
                     warnings = []
                     initial_uncertainty = row["reason"] if row["status"] == "inconclusive" else None
                     def warn(code, message, *, preserve_failure=False):
@@ -1784,9 +1792,12 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                         if not preserve_failure or row["status"] != "fail":
                             row["status"] = "inconclusive"
                     if (metric_input_changed or live_inputs_differ) and metric in TIMING_METRICS:
-                        warn("input_work_changed", "Observed input work or live generated histories differ; timing is not like-for-like.")
+                        warn("input_work_changed", "Observed input work differs or lacks evidence; timing requires comparable input work."
+                             if scheduled_user else "Observed input work or live generated histories differ; timing is not like-for-like.")
                     if generation_work_changed and metric in TIMING_METRICS:
                         warn("output_work_changed", "Observed total generation differs or lacks evidence; timing requires comparable generated work.")
+                    elif visible_work_changed:
+                        warn("output_work_changed", "Observed visible output differs or lacks evidence; timing requires comparable generated work.")
                     elif live_output_differs and metric in TIMING_METRICS:
                         warn("output_work_changed", "Observed generated work differs at matching live conversation turns; timing is not like-for-like.")
                     elif metric_output_changed and metric in {"latency_ms", "max_stream_gap_ms", "output_tokens_per_second", "generation_tokens_per_second"}:
