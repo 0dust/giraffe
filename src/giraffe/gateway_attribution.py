@@ -16,10 +16,11 @@ from .models import CheckResult, RequestSpec
 
 
 CHECK = "gateway_attribution"
-COLLECTION_VERSION = 3
+COLLECTION_VERSION = 4
 MAX_BODY_BYTES = 4 * 1024 * 1024
 MAX_PAGES = 8
 PAGE_SIZE = 128
+POLL_FRACTIONS = (0, .425, .85)
 
 
 def _state(state, reason, **details):
@@ -242,7 +243,8 @@ async def execute(run, target, client):
         observation.update(state="unverified", reason="No identified requests were admitted within the run budget.", planned_requests=planned)
         return
     collection_started = time.monotonic()
-    deadline = min(run.deadline, collection_started + settings.settle_seconds)
+    settle_deadline = collection_started + settings.settle_seconds
+    deadline = min(run.deadline, settle_deadline)
     collection_window = max(0, deadline - collection_started)
     end_date = (datetime.now(timezone.utc) + timedelta(seconds=collection_window + 1)).strftime("%Y-%m-%d %H:%M:%S")
     attempts, previous, unstable = 0, {}, False
@@ -254,7 +256,15 @@ async def execute(run, target, client):
             remaining = max(.001, min(run.config.metrics_timeout_seconds, deadline - time.monotonic()))
             reader = await asyncio.to_thread(_client, run.config, headers, remaining)
             async with reader:
-                while attempts < 3 and time.monotonic() < deadline and not run.stop.is_set():
+                for fraction in POLL_FRACTIONS:
+                    next_read = collection_started + collection_window * fraction
+                    if (delay := next_read - time.monotonic()) > 0:
+                        try:
+                            await asyncio.wait_for(run.stop.wait(), timeout=delay)
+                        except TimeoutError:
+                            pass
+                    if time.monotonic() >= deadline or run.stop.is_set():
+                        break
                     attempts += 1
                     async with asyncio.timeout_at(deadline):
                         rows, complete = await _pages(reader, gateway.url, marker,
@@ -270,26 +280,28 @@ async def execute(run, target, client):
                     unstable |= invalid > 0 or any(key not in current or (value["complete"] and current[key] != value)
                                                    for key, value in previous.items())
                     previous = current
-                    assessment = _assess(records, matched, planned, complete=complete and invalid == 0, unstable=unstable)
+                    # Early complete pages can predate conflicting rows from
+                    # asynchronous writes. Qualify only after the final poll.
+                    settled = (attempts == len(POLL_FRACTIONS) and deadline == settle_deadline
+                               and time.monotonic() < deadline)
+                    assessment = _assess(records, matched, planned,
+                        complete=settled and complete and invalid == 0, unstable=unstable)
                     assessment.update(unrelated_rows=unrelated, invalid_rows=invalid,
-                                      collection_complete=complete, evidence_changed=unstable)
-                    if assessment["state"] in {"verified", "mismatch"}:
-                        break
-                    if attempts < 3:
-                        next_read = collection_started + collection_window * .85 * attempts / 2
-                        try:
-                            await asyncio.wait_for(run.stop.wait(), timeout=max(0, next_read - time.monotonic()))
-                        except TimeoutError:
-                            pass
+                                      collection_complete=settled and complete, evidence_changed=unstable)
                 if run.stop.is_set():
                     assessment = _assess(records, {}, planned, complete=False)
                     assessment.update(reason="Gateway evidence collection was interrupted.")
+                elif (assessment["state"] == "unverified"
+                      and (attempts < len(POLL_FRACTIONS) or deadline < settle_deadline)):
+                    assessment.update(reason="The final spend-log read could not qualify within the run budget.")
     except asyncio.CancelledError:
         assessment = _assess(records, {}, planned, complete=False)
         assessment.update(reason="Gateway evidence collection was interrupted.")
         raise
     except (httpx.HTTPError, OSError, TimeoutError, ValueError):
-        assessment.update(state="unverified", reason="Gateway evidence collection did not complete within its bounded window.")
+        assessment = _assess(records, {}, planned, complete=False)
+        assessment.update(reason="Gateway evidence collection did not complete within its bounded window.",
+                          collection_complete=False, evidence_changed=unstable)
     finally:
         # Secret-derived fingerprints are transient and never included in reports.
         for record in records:
@@ -305,6 +317,9 @@ def result(run, target):
     data = (run.observations[target.name].get(CHECK)
             or _state("unverified", "Gateway attribution was not exercised.")) if selected else _state("not_selected", "Not selected.")
     status = {"not_selected": "skipped", "verified": "pass", "mismatch": "fail"}.get(data["state"], "inconclusive")
-    return CheckResult(id=CHECK, target=target.name, title="Gateway usage attribution", required=selected,
+    configured = (run.config.gateway_attribution is not None and target.gateway is not None
+                  and target.gateway.profile == "litellm")
+    required = selected and (configured or run.config.checks == [CHECK])
+    return CheckResult(id=CHECK, target=target.name, title="Gateway usage attribution", required=required,
                        status=status, summary=data["reason"], metrics=data,
                        evidence_ids=[r.id for r in run.records if r.target == target.name and CHECK in r.check_ids])

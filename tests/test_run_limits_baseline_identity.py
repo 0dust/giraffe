@@ -34,8 +34,13 @@ def load_reports(*, load_source=None):
     return current, old, settings
 
 
-def test_ordinary_load_baseline_survives_optional_nonce_builder_argument():
+@pytest.mark.parametrize("additional_checks", [[], ["access"]], ids=["load", "access-and-load"])
+def test_ordinary_load_baseline_survives_optional_nonce_builder_argument(additional_checks):
     current, old, _ = load_reports(load_source=NONCE_ONLY_LOAD)
+    for report in (current, old):
+        config = report.manifest["config"]
+        config["checks"].extend(additional_checks)
+        assert RunConfig.model_validate(config).checks == ["load", *additional_checks]
     assert current.manifest["fixture_pack"] != old.manifest["fixture_pack"]
     assert _settings_reasons(current, old) == []
     assert _settings_reasons(old, current) == []

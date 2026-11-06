@@ -220,7 +220,9 @@ async def test_complete_runner_reports_and_exports_safe_identity_samples(monkeyp
     altered.manifest["config"]["targets"][0]["test_identities"]["alice"]["api_key_env"] = "NEW_ALICE"
     baseline = compare_baseline(altered, report)
     assert baseline.baseline["status"] == "inconclusive"
-    assert any("identity references" in reason for reason in baseline.baseline["targets"][0]["reasons"])
+    rows = {row["scenario"]: row for row in baseline.baseline["targets"][0]["comparisons"]}
+    assert rows["alice"]["status"] == "inconclusive" and "identity references" in rows["alice"]["reason"]
+    assert rows["bob"]["status"] == "pass"
 
 
 @pytest.mark.usefixtures("local_tokenizer")
@@ -247,11 +249,12 @@ async def test_attribution_baseline_compares_qualified_aliases(monkeypatch, mode
 
 
 @pytest.mark.usefixtures("local_tokenizer")
-@pytest.mark.parametrize("version", [None, 2])
+@pytest.mark.parametrize("version", [None, 2, 3])
 async def test_legacy_attribution_baseline_requires_a_fresh_collection(monkeypatch, version):
     from giraffe.reporting import compare_baseline
     _, report, _, _, _ = await exercise(monkeypatch, full=True)
     legacy = report.model_copy(deep=True)
+    legacy.manifest["fixture_pack"].pop("shared_workload_fixture_sha256")
     check = next(check for check in legacy.checks if check.id == "gateway_attribution")
     if version is None:
         check.metrics.pop("collection_version", None)

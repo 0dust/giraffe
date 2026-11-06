@@ -273,16 +273,19 @@ settle period on every page. The adapter requires generated request metadata, th
 marker, a gateway API-key hash, and complete final prompt/completion token counts.
 Each alias must use a distinct virtual key. The adapter recognizes Bearer authorization
 and LiteLLM's `x-litellm-api-key` header, and compares key hashes only in memory.
-Repeated log rows count once. For streamed requests, usage must arrive with or after
-the finish event. Missing rows, log lag beyond the bounded wait, changed or ambiguous
-rows, capped or inconsistent pagination, and missing final token usage leave the
-result **unverified**. Shared counters cannot isolate this test's traffic and
-are not used, so counter resets cannot produce a pass. Results separately name
+Repeated log rows count once. The final read is scheduled at 85% of
+`settle_seconds` to leave time for the request within the collection limit. It must complete
+within the run budget before evidence qualifies. For streamed requests, usage
+must arrive with or after the finish event. Missing rows, log lag beyond the
+bounded wait, changed or ambiguous rows, capped or inconsistent pagination, and
+missing final token usage leave the result **unverified**. The adapter uses
+marked spend-log rows, so shared counter resets cannot produce a pass. Results separately name
 **not selected**, **unavailable**, **unsupported**, **unverified**, and observed
 **mismatch**; a verified result covers only the marked requests observed.
-Identity references and check settings survive report exports and baseline
-configuration; changing either prevents a like-for-like comparison. References
-cannot establish that an operator kept the same underlying credential values.
+Unconfigured or unsupported attribution remains visible and optional in mixed runs.
+Exports retain the reader settings and identity references. Changes to the reader,
+check settings, or participating references affect attribution comparisons only.
+References alone cannot establish that the underlying credential values stayed the same.
 
 The adapter follows LiteLLM's documented
 [spend-log API](https://docs.litellm.ai/docs/proxy/cost_tracking) and

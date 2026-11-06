@@ -103,7 +103,24 @@ class VirtualLoop(asyncio.SelectorEventLoop):
         if not self._ready and self._scheduled and not self._executor_pending:
             self.now = max(self.now, min((handle._when for handle in self._scheduled
                                           if not handle.cancelled()), default=self.now))
+        # asyncio runs timers strictly before now + resolution. On the
+        # virtual clock, even the next representable time is still future.
+        self._clock_resolution = math.ulp(self.now)
         super()._run_once()
+
+
+def test_virtual_loop_does_not_fire_timer_one_ulp_early():
+    async def measure():
+        await asyncio.sleep(.25)
+        loop = asyncio.get_running_loop()
+        deadline = math.nextafter(loop.time(), math.inf)
+        observed = loop.create_future()
+        loop.call_at(deadline, lambda: observed.set_result(loop.time()))
+        loop.call_soon(lambda: None)
+        assert await observed == deadline
+
+    with asyncio.Runner(loop_factory=VirtualLoop) as execution:
+        execution.run(measure())
 
 
 def run_virtual(monkeypatch, coroutine):

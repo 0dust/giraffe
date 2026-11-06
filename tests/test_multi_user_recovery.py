@@ -59,19 +59,49 @@ def test_recovery_exposes_one_slow_user_when_median_recovers():
     assert result["worst_user"]["user_id"] == "user-03"
 
 
-@pytest.mark.parametrize("swap_lengths", [False, True])
-def test_recovery_checks_actual_lengths_of_each_replay(swap_lengths):
+@pytest.mark.parametrize("drift_phase", [None, "lighter", "sustained"])
+def test_recovery_checks_actual_lengths_of_each_replay(drift_phase):
     source, records = recovery_observation(lighter_rate=2)
     source["settings"]["pass_criteria"]["min_samples"] = 2
     for r in records:
-        token_counts = (16, 4) if swap_lengths and r.workload["role"] == "lighter" else (4, 16)
+        token_counts = (16, 4) if r.workload["role"] == drift_phase else (4, 16)
         r.output_tokens = token_counts[r.workload["matched_work_sequence"]-1]
 
     user = summarize(source, records)["windows"][-1]["recovery"]["users"][0]
-    assert user["phases"]["control"]["output_tokens"] == user["phases"]["lighter"]["output_tokens"] == 10
-    assert user["status"] == ("inconclusive" if swap_lengths else "pass")
-    if swap_lengths:
-        assert any("matched" in reason.lower() and "token" in reason.lower() for reason in user["reasons"])
+    assert all(phase["output_tokens"] == 10 for phase in user["phases"].values())
+    assert user["status"] == ("inconclusive" if drift_phase else "pass")
+    if drift_phase:
+        assert f"Actual token lengths drifted between matched control and {drift_phase} requests." in user["reasons"]
+
+
+def test_recovery_allows_extra_replays_of_matched_sustained_work():
+    source, records = recovery_observation(lighter_rate=2, sustained_rate=5)
+    source["settings"]["pass_criteria"]["min_samples"] = 2
+    for r in records:
+        r.output_tokens = (4, 16)[r.workload["matched_work_sequence"]-1]
+
+    user = summarize(source, records)["windows"][-1]["recovery"]["users"][0]
+    assert len(user["control_request_ids"]) == 2
+    assert len(user["sustained_request_ids"]) == 5
+    assert user["phases"]["control"]["output_tokens"] == 10
+    assert user["phases"]["sustained"]["output_tokens"] == 4
+    assert user["status"] == "pass"
+
+
+@pytest.mark.parametrize("drift_phase", ["lighter", "sustained"])
+def test_recovery_qualifies_total_generation_separately_from_visible_output(drift_phase):
+    source, records = recovery_observation()
+    for request in records:
+        has_extra_reasoning = request.workload["role"] == drift_phase and request.workload["user_id"] == "user-03"
+        request.output_tokens = 4
+        request.reasoning_tokens = 12 if has_extra_reasoning else 0
+        request.completion_tokens = request.output_tokens + request.reasoning_tokens
+
+    users = summarize(source, records)["windows"][-1]["recovery"]["users"]
+    assert [user["status"] for user in users] == ["pass", "pass", "inconclusive"]
+    assert users[-1]["slowdown"] == 3
+    assert all(phase["output_tokens"] == 4 for phase in users[-1]["phases"].values())
+    assert f"Actual token lengths drifted between matched control and {drift_phase} requests." in users[-1]["reasons"]
 
 
 @pytest.mark.parametrize("sustained_duration", [.5, .25])
