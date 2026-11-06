@@ -267,6 +267,7 @@ class _Run:
         self.errors = 0
         self.reason: str | None = None
         self.limits_reached = set()
+        self.request_limit_scopes: set[str] = set()
         self.memory_limit_reached = False
         self.memory_stop_reason = None
         self.memory_measured = False
@@ -535,17 +536,21 @@ class _Run:
         return max(0, min(self.config.max_requests - self.budget_used,
                           self.quotas[target] - self.budget_counts[target]))
 
-    def allowed(self, target: str) -> bool:
+    def mark_request_limit(self, *, gateway_probe: bool = False) -> None:
+        self.limits_reached.add("max_requests")
+        self.request_limit_scopes.add("gateway" if gateway_probe else "shared")
+
+    def allowed(self, target: str, *, gateway_probe: bool = False) -> bool:
         reason = self.stop_reason(target)
         remaining = self.remaining(target)
         if remaining == 0:
-            self.limits_reached.add("max_requests")
+            self.mark_request_limit(gateway_probe=gateway_probe)
         if self.config.max_requests is not None and self.budget_used >= self.config.max_requests:
             self.reason = self.reason or "maximum request budget reached"
         return not reason and not self.reason and (remaining is None or remaining > 0)
 
-    def reserve_offer(self, target: str) -> bool:
-        if not self.allowed(target):
+    def reserve_offer(self, target: str, *, gateway_probe: bool = False) -> bool:
+        if not self.allowed(target, gateway_probe=gateway_probe):
             return False
         self.budget_used += 1
         self.budget_counts[target] += 1
@@ -607,6 +612,8 @@ class _Run:
                      and (name != "generation" or spec.scenario == "generation")
                      and (name != "capacity" or spec.scenario.startswith("traffic_stage_"))]
         spec = spec.model_copy(update={"check_ids": check_ids})
+        gateway_probe = (spec.identity is not None and bool(check_ids)
+                         and SHARED_BASELINE_EXCLUDED_WORKLOADS.issuperset(check_ids))
         readiness = spec.scenario == "readiness" or (
             spec.scenario == "initial" and self.config.restart_target == target.name)
         evidence_probe = spec.scenario == "performance_evidence_probe" or spec.identity is not None
@@ -620,7 +627,7 @@ class _Run:
             stopped = not admitted or time.monotonic() >= slot_deadline or (
                 reason is not None and reason != "maximum request budget reached")
             if stopped or (admission_deadline is None and not budget_reserved and not budget_exempt
-                           and not self.reserve_offer(target.name)):
+                           and not self.reserve_offer(target.name, gateway_probe=gateway_probe)):
                 if admission_deadline is None or time.monotonic() >= self.deadline or reason:
                     self.mark_unfinished(target.name, _scenario_checks(spec))
                 return None
@@ -696,7 +703,8 @@ class _Run:
                 nonlocal started, started_at, request_slot, token, pending_start
                 if admission_deadline is not None:
                     started = admission_clock()
-                    if not budget_reserved and not budget_exempt and not self.reserve_offer(target.name):
+                    if (not budget_reserved and not budget_exempt
+                            and not self.reserve_offer(target.name, gateway_probe=gateway_probe)):
                         self.mark_unfinished(target.name, _scenario_checks(spec))
                         raise _DispatchRefused
                     self.attempted += 1
@@ -1438,7 +1446,7 @@ async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attributio
                     while time.monotonic() < end:
                         if (allowance is not None and dispatched >= allowance) or not run.allowed(target.name):
                             if allowance is not None and dispatched >= allowance:
-                                run.limits_reached.add("max_requests")
+                                run.mark_request_limit()
                             exhausted = True
                             return
                         index = dispatched
@@ -2873,7 +2881,8 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
         warnings.append("Client scheduling delay was observed. Timing quality is qualified by overlapping request/stage intervals; raw measurements are retained. Its cause is not established.")
     if (config.max_requests is not None and run.budget_used >= config.max_requests
             and any(run.unfinished.values())):
-        run.limits_reached.add("max_requests")
+        run.mark_request_limit(gateway_probe=all(
+            checks <= SHARED_BASELINE_EXCLUDED_WORKLOADS for checks in run.unfinished.values()))
         warnings.append("Global request budget exhausted; unfinished checks remain inconclusive.")
     cancellation_options = config.test_options.get("cancellation")
     if ("cancellation" in config.checks and cancellation_options
@@ -2905,6 +2914,7 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
                     "target_abort_reasons": target_abort_reasons,
                     "client_timing_health": run.timing_health.snapshot(),
                     "request_budget_used": run.budget_used,
+                    "request_limit_scopes": sorted(run.request_limit_scopes),
                     "inference_duration_seconds": inference_duration,
                     **({"judging": judging_summary} if judging_summary is not None else {}),
                     "replica_coverage": [{"target": t.name, "route": t.route, "parent": t.parent,

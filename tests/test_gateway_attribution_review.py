@@ -16,9 +16,9 @@ from pydantic import ValidationError
 
 from giraffe.client import LLMClient
 from giraffe.gateway_attribution import MAX_BODY_BYTES, execute, result
-from giraffe.models import GatewayEvidence, RequestSpec, RunConfig, RunReport, Sessions, TestIdentity as GatewayIdentity
+from giraffe.models import CheckResult, GatewayEvidence, RequestSpec, RunConfig, RunReport, Sessions, TestIdentity as GatewayIdentity
 from giraffe.planning import request_plan
-from giraffe.reporting import compare_baseline, write_report
+from giraffe.reporting import _settings_reasons, compare_baseline, write_report
 from giraffe.runner import _Run, _checks, run_suite
 from tests.test_gateway_attribution import config, immediate_spend_polls, spend_page
 
@@ -798,6 +798,7 @@ async def test_attribution_does_not_reserve_requests_from_recovery(monkeypatch, 
     target = report.observations["targets"]["proxy"]
     assert target["sustained_budget"]["reserved_later"] == 2
     assert target["sustained_budget"]["allowance"] == 3
+    assert "shared" in report.observations["request_limit_scopes"]
     assert len(reads) == 1
     assert not any(record.identity for record in report.requests)
 
@@ -1004,6 +1005,36 @@ async def test_shortened_collection_window_keeps_complete_pages_unverified(monke
     check = await collect(cfg, run)
     assert reads and check.metrics["collection_complete"] is False
     assert check.metrics["state"] == "unverified" and check.metrics["unverified_requests"] == 2
+
+
+@pytest.mark.parametrize("run_limited", [False, True])
+async def test_final_reader_timeout_records_only_an_elapsed_run_deadline(monkeypatch, local_tokenizer, run_limited):
+    polls = 0
+
+    async def delayed_monitor(run, tasks):
+        await asyncio.Event().wait()
+
+    async def observer(request, rows):
+        nonlocal polls
+        polls += 1
+        if polls == 3:
+            await asyncio.Event().wait()
+        return spend_page(request, rows)
+
+    cfg, _, reads = setup(monkeypatch, observer)
+    cfg.max_duration_seconds = .26 if run_limited else 5
+    cfg.gateway_attribution.settle_seconds = .6 if run_limited else .2
+    # Exercise the reader's own timeout before the periodic monitor sees it.
+    monkeypatch.setattr(_Run, "monitor", delayed_monitor)
+
+    report = await run_suite(cfg)
+    check = next(item for item in report.checks if item.id == "gateway_attribution")
+    assert len(report.requests) == 2 and all(record.valid for record in report.requests)
+    assert len(reads) == check.metrics["collection_attempts"] == 3
+    assert check.metrics["state"] == "unverified" and not check.metrics["collection_complete"]
+    assert report.abort_reason == ("maximum run duration reached" if run_limited else None)
+    assert ("max_duration_seconds" in report.limits_reached) is run_limited
+    assert check.metrics.get("reason_code") == ("time_limited" if run_limited else None)
 
 
 async def test_duration_plan_and_remedy_cover_spend_log_settle(monkeypatch, local_tokenizer):
@@ -1540,6 +1571,74 @@ async def test_saved_baseline_compares_shared_checks_across_attribution_selectio
     pack = forged_plain.manifest["fixture_pack"]
     pack[shared_key], pack[full_key] = pack[full_key], "a" * 64
     assert "Fixture pack identity differs." in compare_baseline(mixed, forged_plain).baseline["targets"][0]["reasons"]
+
+
+@pytest.mark.parametrize("cap", [2, 3, 4])
+async def test_changed_request_cap_only_blocks_comparison_when_shared_work_was_cut(
+        monkeypatch, local_tokenizer, tmp_path, cap):
+    async def observer(request, rows):
+        return spend_page(request, rows)
+
+    client_class = httpx.AsyncClient
+    original_send = client_class.send
+
+    async def saved_run(max_requests, *, checks=None):
+        with monkeypatch.context() as env:
+            cfg, _, _ = setup(env, observer)
+            immediate_spend_polls(env, cfg)
+            cfg.checks = checks or ["serving"] + (["gateway_attribution"] if max_requests else [])
+            cfg.samples = 2
+            cfg.limits.min_samples = 2
+            cfg.max_requests = max_requests
+
+            async def send(client, request, **kwargs):
+                if max_requests and request.method == "POST" and "x-litellm-trace-id" not in request.headers:
+                    await asyncio.sleep(.13)
+                return await original_send(client, request, **kwargs)
+
+            env.setattr(client_class, "send", send)
+            report = await run_suite(cfg)
+            path, _ = write_report(report, tmp_path)
+            return RunReport.model_validate_json(path.read_bytes())
+
+    baseline, current = await saved_run(None), await saved_run(cap)
+    assert baseline.overall == "pass" and "max_requests" in current.limits_reached
+    target = compare_baseline(current, baseline).baseline["targets"][0]
+    if cap == 2:
+        assert "load_shape differs." in target["reasons"]
+        assert any("max_requests differs" in reason for reason in target["reasons"])
+        assert "shared" in current.observations["request_limit_scopes"]
+        assert not any(row["check"] == "serving" for row in target["comparisons"])
+        return
+    assert current.observations["request_limit_scopes"] == ["gateway"]
+    assert [record.request_hash for record in current.requests if record.identity is None] == [
+        record.request_hash for record in baseline.requests]
+    assert next(check for check in current.checks if check.id == "serving").status == "pass"
+    assert target["reasons"] == [] and target["status"] == "fail"
+    assert any(row["check"] == "serving" and row["metric"] == "latency_ms" and row["status"] == "fail"
+               for row in target["comparisons"])
+    assert all(row["status"] == "inconclusive" for row in target["comparisons"] if row["check"] == "gateway_attribution")
+    if cap == 3:
+        stopped = current.model_copy(update={"abort_reason": "maximum request budget reached"})
+        assert compare_baseline(stopped, baseline).baseline["targets"][0]["reasons"] == []
+        isolated = ["gateway_attribution"]
+        isolated_baseline = await saved_run(None, checks=isolated)
+        isolated_current = await saved_run(1, checks=isolated)
+        assert isolated_current.observations["request_limit_scopes"] == ["gateway"]
+        isolated_reasons = compare_baseline(isolated_current, isolated_baseline).baseline["targets"][0]["reasons"]
+        assert any("max_requests differs" in reason for reason in isolated_reasons)
+        for check_id, metrics in (
+            ("load", {"points": [{"reason_code": "budget_limited"}]}),
+            ("recovery", {"sustained_completion": {"reason": "allowance consumed with sustained concurrency"}}),
+        ):
+            constrained = current.model_copy(deep=True)
+            constrained.checks.append(CheckResult(id=check_id, title=check_id, target="proxy", status="inconclusive",
+                                                  summary="Shared work hit a reservation.", metrics=metrics))
+            assert "load_shape differs." in _settings_reasons(constrained, baseline)
+    current.observations.pop("request_limit_scopes")
+    archived = compare_baseline(current, baseline).baseline["targets"][0]
+    assert "load_shape differs." in archived["reasons"]
+    assert any("max_requests differs" in reason for reason in archived["reasons"])
 
 
 @pytest.mark.parametrize("with_builtin", [False, True])

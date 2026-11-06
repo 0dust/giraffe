@@ -12,7 +12,7 @@ from .identities import gateway_identities_only, identity_headers, litellm_key_f
 from .models import CheckResult, RequestSpec
 
 
-VERSION = 17
+VERSION = 18
 PROMPT = "Reply with exactly the word OK."
 
 
@@ -66,7 +66,7 @@ async def execute(run, target, client):
             and run.stop_reason(target.name) in (None, "maximum request budget reached")):
         # A completed shared workload can legitimately use the entire quota.
         # An unsent optional probe does not interrupt that workload.
-        run.limits_reached.add("max_requests")
+        run.mark_request_limit(gateway_probe=True)
         reason = "The request limit left no slots for the configured gateway policy probes."
         observation.update(budget_limited=True, stop_reason=reason, end_ms=observation["start_ms"])
         run.finish_condition(target.name, "gateway_policy", reason=reason)
@@ -74,7 +74,7 @@ async def execute(run, target, client):
 
     async def user_loop(user):
         for sequence in range(user.requests):
-            if time.monotonic() >= end or not run.allowed(target.name):
+            if time.monotonic() >= end or not run.allowed(target.name, gateway_probe=True):
                 return
             ready_ms = (time.monotonic()-run.start)*1000
             spec = RequestSpec(fixture_id="gateway-policy-v1", scenario="gateway_policy",
@@ -117,6 +117,10 @@ async def execute(run, target, client):
         observation["end_ms"] = min((finished-run.start)*1000, observation["end_ms"])
         observation["stop_reason"] = observation["stop_reason"] or run.stop_reason(target.name)
         if not observation["complete"]:
+            if (observation["stop_reason"] is None and run.remaining(target.name) == 0
+                    and not gateway_identities_only(run.config.checks)):
+                observation.update(budget_limited=True,
+                    stop_reason="The target request limit interrupted the configured gateway policy probes.")
             run.mark_unfinished(target.name, ["gateway_policy"])
         run.finish_condition(target.name, "gateway_policy", reason=observation["stop_reason"])
 
@@ -144,6 +148,14 @@ def _least_reported_count(reported, limit, minimum, maximum):
         if not candidates:
             return None
     return candidates[0] if candidates else None
+
+
+def _scoped_limit_conflicts(record, expected):
+    evidence = record.gateway_evidence
+    return evidence is not None and any(
+        scope in expected and (value is None or value != expected[scope])
+        for scope, value in evidence._scoped_limits.items()
+    )
 
 
 def summarize(settings, observation, records):
@@ -185,7 +197,7 @@ def summarize(settings, observation, records):
         return outcome("unavailable", "Selected gateway capability is unsupported.")
     if observation.get("execution_error"):
         return outcome("unverified", observation["execution_error"])
-    if observation.get("credential_issue") or observation.get("budget_limited"):
+    if observation.get("credential_issue") or (observation.get("budget_limited") and not records):
         return outcome("unverified", observation["stop_reason"])
     cached = {record.id for record in records
               if record.gateway_evidence and record.gateway_evidence._response_cache_hit_reported}
@@ -232,7 +244,9 @@ def summarize(settings, observation, records):
         and all(record.reasoning_tokens is None or record.reasoning_tokens < record.completion_tokens for record in successes)
         and len(set(inputs)) == 1 and max(outputs) <= 2*min(outputs))
     if not observation.get("isolated_run"):
-        return outcome("unverified", "Policy qualification requires one target and only policy traffic, with no restart readiness probes.")
+        reason = (summary["stop_reason"] if observation.get("budget_limited") else
+                  "Policy qualification requires one target and only policy traffic, with no restart readiness probes.")
+        return outcome("unverified", reason)
     if settings.window_state == "unknown" or not settings.gateway_version:
         return outcome("unverified", "Gateway version or isolated fresh single-target policy window is unknown.")
     if settings.window_state != "isolated_fresh_single_counter":
@@ -266,6 +280,11 @@ def summarize(settings, observation, records):
         if len(tpm_configs) != 1:
             return outcome("unverified", "Model TPM configuration differs between rejections in the isolated window.")
         model_tpm, rpm_only_saturation = tpm_configs.pop()
+        model_limits = {"model_rpm": settings.model_rpm, "model_tpm": model_tpm}
+        if any(_scoped_limit_conflicts(record, model_limits) for record in [*admissions, *recognized]):
+            return outcome("unverified", "Scoped model RPM or TPM headers contradict the policy rejection evidence.")
+        if any(_scoped_limit_conflicts(record, {"priority_rpm": declared.rpm}) for record in recognized):
+            return outcome("unverified", "Scoped priority RPM headers contradict the declared reservation.")
         if not summary["overlap_observed"] or not summary["comparable_actual_work"]:
             return outcome("unverified", "Comparable actual token work and overlapping requests are required for priority observations.")
         if any(record.gateway_evidence is None or record.gateway_evidence.priority_matches is not True for record in admissions):
@@ -334,7 +353,10 @@ def summarize(settings, observation, records):
         if len(admissions) > settings.model_rpm:
             return outcome("observed_failure", "Total admitted requests exceeded the declared model RPM in the isolated window.", "fail")
         allowance = max(allowance, crossing)
-    elif any(record.gateway_evidence.request_limit != declared.rpm or record.gateway_evidence.request_remaining != 0 for record in recognized):
+    elif (any(record.gateway_evidence.request_limit != declared.rpm or record.gateway_evidence.request_remaining != 0
+              for record in recognized)
+          or any(_scoped_limit_conflicts(record, {"api_key_rpm": declared.rpm})
+                 for record in [*affected_admissions, *recognized])):
         return outcome("unverified", "Gateway key limit differs from the declared RPM.")
     admitted = len(affected_admissions)
     if admitted > allowance:
