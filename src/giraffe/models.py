@@ -2778,6 +2778,7 @@ MAX_TOKENS_PER_READ = 16
 
 
 class GatewayResponseEvidence(PersistedModel):
+    _priority_model_group: str | None = PrivateAttr(default=None)
     error_kind: Literal["authentication", "model_access", "rate_limit", "unknown"] | None = None
     policy_rejection: Literal["key_rpm", "priority_pool", "model_capacity", "unknown"] | None = None
     request_limit: int | None = Field(default=None, ge=0)
@@ -2808,6 +2809,7 @@ class RequestRecord(PersistedModel):
     _timing_started_monotonic: float | None = PrivateAttr(default=None)
     _gateway_key_hash: str | None = PrivateAttr(default=None)
     _gateway_terminal_usage: bool = PrivateAttr(default=False)
+    _request_body_sent_monotonic: float | None = PrivateAttr(default=None)
     id: str
     target: str
     fixture_id: str
@@ -2889,6 +2891,7 @@ class RequestRecord(PersistedModel):
     dispatch_ms: float | None = None
     completed_ms: float | None = None
     timing_start_ms: float | None = None
+    request_body_sent_ms: float | None = None
     client_preparation_ms: float = 0
     scheduled_ms: float | None = None
     client_wait_ms: float | None = None

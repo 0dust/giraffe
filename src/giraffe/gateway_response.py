@@ -5,6 +5,13 @@ import re
 from .models import GatewayResponseEvidence
 
 
+def _model_group(value):
+    if (isinstance(value, str) and 0 < len(value) <= 256 and value.isprintable()
+            and "," not in value and value == value.strip()):
+        return value
+    return None
+
+
 def response_evidence(status, body=b"", headers=None, *, declared_priority=None, expected_key_hash=None):
     kind = None if 200 <= status < 300 else "unknown"
     if status in {401, 403}:
@@ -46,7 +53,10 @@ def response_evidence(status, body=b"", headers=None, *, declared_priority=None,
     tier = headers.get("x-litellm-priority")
     if declared_priority and isinstance(tier, str) and len(tier) <= 64:
         evidence.priority_matches = tier == declared_priority
+    no_reported_fallback = headers.get("x-litellm-attempted-fallbacks") in (None, "0")
     if status != 429:
+        if 200 <= status < 300 and evidence.priority_request_limit is not None and no_reported_fallback:
+            evidence._priority_model_group = _model_group(headers.get("x-litellm-model-group"))
         return evidence
     evidence.policy_rejection = "unknown"
     try:
@@ -72,6 +82,9 @@ def response_evidence(status, body=b"", headers=None, *, declared_priority=None,
         evidence.error_kind = "rate_limit"
         evidence.policy_rejection = "priority_pool" if message.startswith("Priority-based") else "model_capacity"
         evidence.rate_limit_unit, evidence.model_rpm = unit[1], int(rpm[1])
+        model = re.match(r"Priority-based rate limit exceeded\. Model: ([^,]{1,256}), Priority: ", message)
+        if model and no_reported_fallback and headers.get("x-litellm-model-group") in (None, model[1]):
+            evidence._priority_model_group = _model_group(model[1])
         if declared_priority:
             tier_match = re.search(r", Priority: ([^,\r\n]{1,64}),", message)
             if tier_match:

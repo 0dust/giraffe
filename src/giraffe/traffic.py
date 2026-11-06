@@ -189,9 +189,20 @@ class StageEvidence:
     offer_lags_ms: tuple[float | None, ...] = ()
 
 
+@dataclass(frozen=True)
+class ExplicitTrafficStage:
+    """Runtime settings for a stage whose caller has already built its offers."""
+
+    duration_seconds: float
+    max_in_flight: int
+    scheduler_lag_tolerance_ms: float
+    drain_timeout_seconds: float | None = None
+    arrival: str = "steady"
+
+
 async def run_stage(
     *,
-    traffic: TrafficConfig,
+    traffic: TrafficConfig | ExplicitTrafficStage,
     rate_rps: float,
     stage_index: int,
     fixtures: dict[str, list[RequestSpec]],
@@ -231,6 +242,8 @@ async def run_stage(
     if traffic.max_in_flight is None:
         raise ValueError("resolve traffic.max_in_flight against the global bound first")
     if schedule_override is None:
+        if isinstance(traffic, ExplicitTrafficStage):
+            raise ValueError("an explicit traffic stage requires a finite offer schedule")
         schedule, overflow = arrival_schedule(traffic, rate_rps, stage_index)
     else:
         schedule, overflow = schedule_override, len(schedule_override) > MAX_PLANNED_ARRIVALS

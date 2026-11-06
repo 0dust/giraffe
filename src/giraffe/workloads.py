@@ -524,10 +524,10 @@ async def execute(run, target, client, fixtures):
         ("load_test", load_test),
         ("multi_user", multi_user),
         ("gateway_policy", gateway_policy),
-        ("gateway_attribution", gateway_attribution),
         ("sessions", sessions),
         ("consistency", consistency),
         ("tool_calling", tools),
+        ("gateway_attribution", gateway_attribution),
     ):
         selected = WORKLOAD_CHECKS[field].intersection(run.config.checks)
         if selected and (getattr(run.config, field) or field in {"gateway_access", "gateway_attribution"}):
