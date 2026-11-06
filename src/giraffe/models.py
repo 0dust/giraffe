@@ -2766,6 +2766,7 @@ class RequestRecord(PersistedModel):
         return result
     _timing_started_monotonic: float | None = PrivateAttr(default=None)
     _gateway_key_hash: str | None = PrivateAttr(default=None)
+    _gateway_terminal_usage: bool = PrivateAttr(default=False)
     id: str
     target: str
     fixture_id: str

@@ -79,6 +79,71 @@ def test_waiting_for_scenario_opportunity_is_not_pending_admission(monkeypatch, 
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("scenario", ["cancellation", "noisy_neighbors"])
+def test_peer_lost_while_waiting_for_slot_does_not_dispatch_or_leave_pending_wait(monkeypatch, scenario):
+    from giraffe.models import LoadTestSettings
+    from giraffe.multi_user import run_window
+    from giraffe.multi_user_metrics import summarize
+    from tests.test_review26_phase4_accuracy import run_virtual
+    from tests.test_runner import FakeClient
+
+    async def run():
+        cfg = settings(levels=[2], duration_seconds=.13, think_time_seconds={"values": [1]},
+            profile=PROFILE, scenarios=[scenario], cancellation={"user_id": "user-02"},
+            noisy_neighbors={"heavy_user_ids": ["user-02"], "heavy_profiles": ["long_short"],
+                             "triggers": ["before_output"]},
+            pass_criteria={"max_first_answer_ms": 30}).model_copy(update={"concurrency": 1})
+        state = runner._Run(cfg, None, None)
+        observation = _planned_observation(cfg.multi_user)
+        window = observation["windows"][-1]
+        calibration = {(size, mode): {"filler_chars": 100}
+                       for size in ("short", "long") for mode in ("short_answer", "long_output")}
+        await run_window(state, cfg.targets[0], FakeClient(cfg.targets[0], cfg), cfg.multi_user,
+                         LoadTestSettings(profile=cfg.multi_user.profile), calibration, window)
+        assert state.attempted == 1
+        assert [r.workload["user_id"] for r in state.records] == ["user-01"]
+        assert state.slots.qsize() == 1
+        selected = window["users"][1]
+        assert selected["ready_count"] == 1
+        user = summarize(observation, state.records)["windows"][-1]["users"][1]
+        assert user["pending_wait"] is None
+        assert user["status"] == "inconclusive"
+
+    run_virtual(monkeypatch, run())
+
+
+def test_matched_generated_work_does_not_repeat_prefixes_across_windows(monkeypatch):
+    from giraffe.models import LoadTestSettings
+    from giraffe.multi_user import run_window
+    from tests.test_review26_phase4_accuracy import run_virtual
+    from tests.test_runner import FakeClient
+
+    class CaptureClient(FakeClient):
+        async def execute(self, spec, **kwargs):
+            if spec.workload["user_id"] == "user-01":
+                sent.append((spec.messages[0]["content"], spec.workload["matched_work_sha256"]))
+            return await super().execute(spec, **kwargs)
+
+    sent = []
+
+    async def run():
+        cfg = settings(levels=[2], duration_seconds=.03, warmup_seconds=.03,
+            think_time_seconds={"values": [1]}, profile=PROFILE, scenarios=["noisy_neighbors"],
+            noisy_neighbors={"heavy_user_ids": ["user-02"], "heavy_profiles": ["long_short"],
+                             "triggers": ["before_output"]})
+        state = runner._Run(cfg, None, None)
+        client = CaptureClient(cfg.targets[0], cfg)
+        load = LoadTestSettings(profile=cfg.multi_user.profile)
+        calibration = {(size, "short_answer"): {"filler_chars": 100} for size in ("short", "long")}
+        for window in _planned_observation(cfg.multi_user)["windows"]:
+            await run_window(state, cfg.targets[0], client, cfg.multi_user, load, calibration, window)
+
+    run_virtual(monkeypatch, run())
+    assert len(sent) == 4
+    assert len({prompt for prompt, _ in sent}) == 4
+    assert len({identity for _, identity in sent}) == 1
+
+
 @pytest.mark.parametrize("retention", ["none", "failures", "all"])
 def test_http_selected_cancellation_retains_once_and_peers_continue(retention):
     from giraffe.client import LLMClient
@@ -195,6 +260,45 @@ def test_incomplete_interference_never_passes(missing):
     evidence = summarize(source, records)["windows"][1]["interference"]
     assert evidence["status"] == "inconclusive"
     assert not evidence["qualified"]
+
+
+@pytest.mark.parametrize(("cache_counts", "status"), [
+    ((0, 64, 0), "inconclusive"),
+    ((0, 0, 256), "inconclusive"),
+    ((16, 16, 16), "pass"),
+])
+def test_interference_qualifies_cached_input_work(cache_counts, status):
+    from giraffe.multi_user_metrics import summarize
+
+    source, records = matched_observation()
+    for request, cached in zip(records, cache_counts):
+        request.cached_prompt_tokens = cached
+    user, = summarize(source, records)["windows"][1]["interference"]["users"]
+    assert user["status"] == status
+    assert user["matched_samples"] == (1 if status == "pass" else 0)
+
+
+def test_equal_medians_do_not_hide_incomparable_matched_pairs():
+    from giraffe.multi_user_metrics import summarize
+
+    source, records = matched_observation()
+    source["settings"]["pass_criteria"]["min_samples"] = 2
+    second_group = []
+    for original in records:
+        item = original.model_copy(deep=True)
+        item.id += "-2"
+        item.dispatch_ms += 500
+        item.completed_ms += 500
+        item.timing_start_ms += 500
+        item.workload["ready_ms"] += 500
+        item.workload["matched_work_sequence"] = 2
+        if "trigger_ms" in item.workload:
+            item.workload["trigger_ms"] += 500
+        second_group.append(item)
+    records[0].output_tokens = second_group[1].output_tokens = 4
+    user, = summarize(source, records + second_group)["windows"][1]["interference"]["users"]
+    assert user["status"] == "inconclusive"
+    assert user["matched_samples"] == 0
 
 
 def test_short_user_failure_survives_unqualified_comparison():

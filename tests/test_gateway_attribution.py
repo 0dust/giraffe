@@ -20,11 +20,28 @@ def config(**changes):
         gateway_attribution={"identities": ["alice", "bob"], "samples": 1, "settle_seconds": .05}, **changes)
 
 
-async def exercise(monkeypatch, mode="match", *, stream=True, full=False, missing_shared=False):
+def spend_page(request, rows, *, total=None, **overrides):
+    page = int(request.url.params["page"])
+    size = int(request.url.params["page_size"])
+    total = len(rows) if total is None else total
+    return httpx.Response(200, json={"data": rows, "page": page, "page_size": size,
+        "total": total, "total_pages": (total + size - 1) // size, **overrides})
+
+
+async def exercise(monkeypatch, mode="match", *, stream=True, full=False, missing_shared=False,
+                   bob_header=None, bob_authorization=None):
     from giraffe.gateway_attribution import execute, result
     for ref in ("ALICE", "BOB", "OBSERVER"):
         monkeypatch.setenv(ref, "secret-" + ref)
     cfg = config(stream=stream)
+    bob_key = "secret-ALICE" if mode == "duplicate_key" else "secret-BOB"
+    monkeypatch.setenv("BOB", bob_key)
+    if bob_header:
+        from giraffe.models import TestIdentity
+        name, prefix = bob_header
+        monkeypatch.setenv("BOB", prefix + bob_key)
+        cfg.targets[0].test_identities["bob"] = TestIdentity(
+            api_key_env=bob_authorization, headers_env={name: "BOB"})
     if missing_shared:
         monkeypatch.delenv("MISSING_SHARED_KEY", raising=False)
         cfg.targets[0].api_key_env = "MISSING_SHARED_KEY"
@@ -40,20 +57,23 @@ async def exercise(monkeypatch, mode="match", *, stream=True, full=False, missin
             if mode == "unavailable":
                 return httpx.Response(403, text="secret-OBSERVER")
             if mode == "missing" or (mode == "lag" and len(reads) == 1):
-                return httpx.Response(200, json={"data": [], "total_pages": 1})
+                return spend_page(req, [])
             if mode == "malformed":
                 return httpx.Response(200, json={"data": [{"api_key": "secret-ALICE"}]})
             if mode == "reset":
                 snapshot = rows[:1] if len(reads) == 1 else rows[1:] if len(reads) == 2 else rows
-                return httpx.Response(200, json={"data": snapshot, "total_pages": 1})
+                return spend_page(req, snapshot)
             if mode == "duplicate":
-                return httpx.Response(200, json={"data": [*rows, {**rows[0], "request_id": "retry"}], "total_pages": 1})
+                return spend_page(req, [*rows, {**rows[0], "request_id": "retry"}])
             if mode == "truncated":
-                return httpx.Response(200, json={"data": rows, "total_pages": 1, "total_is_capped": True})
-            return httpx.Response(200, json={"data": [*rows, *rows[:1], {"request_id": "other"}], "total_pages": 1})
+                return spend_page(req, rows, total_is_capped=True)
+            if mode == "missing_advertised_row":
+                return spend_page(req, rows, total=3)
+            return spend_page(req, [*rows, *rows[:1], {"request_id": "other"}])
         requests.append(req)
         marker = json.loads(req.headers["x-litellm-spend-logs-metadata"])
-        key = req.headers["authorization"].removeprefix("Bearer ")
+        key = req.headers.get("x-litellm-api-key", req.headers.get("authorization", ""))
+        key = key[7:] if key[:7].lower() == "bearer " else key
         row = {"request_id": "gateway-" + str(len(rows)), "session_id": req.headers["x-litellm-trace-id"],
                "metadata": {"spend_logs_metadata": marker, "user_api_key": key},
                "api_key": hashlib.sha256(key.encode()).hexdigest(), "prompt_tokens": 3, "completion_tokens": 5,
@@ -64,15 +84,27 @@ async def exercise(monkeypatch, mode="match", *, stream=True, full=False, missin
             row.update(completion_tokens=7, total_tokens=10)
         if mode == "missing_usage":
             row.pop("completion_tokens")
+        if mode == "early_usage_matches":
+            row.update(completion_tokens=2, total_tokens=5)
         rows.append(row)
         if not stream:
             return httpx.Response(200, json={"choices": [{"message": {"content": key}, "finish_reason": "stop"}],
                 "usage": {"prompt_tokens": 3, "completion_tokens": 5}})
+        if mode in {"early_usage_matches", "early_usage_differs", "partial_terminal_usage"}:
+            partial = ('data: {"choices":[],"usage":{"prompt_tokens":3}}\n\n'
+                       if mode == "partial_terminal_usage" else "")
+            return httpx.Response(200, text=(
+                'data: {"choices":[{"delta":{"content":"OK"}}],"usage":{"prompt_tokens":3,"completion_tokens":2}}\n\n'
+                'data: {"choices":[{"delta":{"content":" again"},"finish_reason":"stop"}]}\n\n'
+                + partial + 'data: [DONE]\n\n'))
+        terminal_usage = '"usage":{"prompt_tokens":3,"completion_tokens":5}'
+        finish = '"choices":[{"delta":{},"finish_reason":"stop"}]'
+        if mode != "usage_after_finish":
+            finish += ',' + terminal_usage
+        after_finish = '' if mode == "usage_on_finish" else 'data: {"choices":[],' + terminal_usage + '}\n\n'
         return httpx.Response(200, text=(
             'data: {"choices":[{"delta":{"content":"OK"},"finish_reason":null}],"usage":{"prompt_tokens":3,"completion_tokens":2}}\n\n'
-            'data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":5}}\n\n'
-            'data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":5}}\n\n'
-            'data: [DONE]\n\n'))
+            'data: {' + finish + '}\n\n' + after_finish + 'data: [DONE]\n\n'))
 
     original = httpx.AsyncClient
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
@@ -108,11 +140,46 @@ async def test_marked_usage_matches_and_stream_cumulative_counts_once(monkeypatc
     ("lag", "verified", "pass"),
     ("reset", "unverified", "inconclusive"), ("duplicate", "unverified", "inconclusive"),
     ("truncated", "unverified", "inconclusive"),
+    ("early_usage_matches", "unverified", "inconclusive"),
+    ("early_usage_differs", "unverified", "inconclusive"),
+    ("partial_terminal_usage", "unverified", "inconclusive"),
+    ("missing_advertised_row", "unverified", "inconclusive"),
 ])
 async def test_observed_mismatch_is_distinct_from_incomplete_evidence(monkeypatch, mode, state, status):
     _, _, check, _, reads = await exercise(monkeypatch, mode)
     assert check.status == status and check.metrics["state"] == state
     assert len(reads) <= 24
+
+
+@pytest.mark.parametrize("bob_header", [
+    None,
+    ("aUtHoRiZaTiOn", "bearer "),
+    ("X-LiteLLM-API-Key", "Bearer "),
+    ("x-litellm-api-key", ""),
+])
+async def test_same_resolved_key_cannot_exercise_two_identities(monkeypatch, bob_header):
+    _, run, check, requests, reads = await exercise(monkeypatch, "duplicate_key", bob_header=bob_header)
+    assert not requests and not reads and not run.records
+    assert check.status == "inconclusive" and check.metrics["state"] == "unverified"
+    assert "distinct" in check.summary
+    assert "secret-ALICE" not in check.model_dump_json()
+
+
+@pytest.mark.parametrize("mode,bob_header", [
+    ("usage_on_finish", ("aUtHoRiZaTiOn", "bearer ")),
+    ("usage_after_finish", ("x-litellm-api-key", "")),
+])
+async def test_terminal_usage_verifies_distinct_keys_across_supported_headers(monkeypatch, mode, bob_header):
+    _, _, check, _, _ = await exercise(monkeypatch, mode, bob_header=bob_header)
+    assert check.metrics["state"] == "verified"
+    assert check.metrics["completion_tokens"] == 10
+
+
+async def test_litellm_key_header_takes_precedence_over_authorization(monkeypatch):
+    _, _, check, requests, _ = await exercise(monkeypatch, stream=False,
+        bob_header=("X-LiteLLM-API-Key", "Bearer "), bob_authorization="ALICE")
+    assert check.metrics["state"] == "verified"
+    assert len(requests) == 2
 
 
 def test_attribution_selection_is_independent_and_uses_existing_planning():
@@ -188,14 +255,16 @@ async def test_gateway_only_runner_does_not_resolve_unused_shared_credential(mon
     assert not report.abort_reason
 
 
-async def test_reader_pages_individually_and_never_follows_redirects():
-    from giraffe.gateway_attribution import _pages
+async def test_reader_pages_individually_and_never_follows_redirects(monkeypatch):
+    from giraffe import gateway_attribution
+    monkeypatch.setattr(gateway_attribution, "PAGE_SIZE", 1)
+    _pages = gateway_attribution._pages
     seen = []
 
     def handler(req):
         seen.append(req)
         page = int(req.url.params["page"])
-        return httpx.Response(200, json={"data": [{"page": page}], "total_pages": 2})
+        return spend_page(req, [{"page": page}], total=2)
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler), follow_redirects=False) as client:
         rows, complete = await _pages(client, "http://proxy/spend/logs/v2", "marker", max_rows=4, stop=asyncio.Event(),
@@ -210,15 +279,20 @@ async def test_reader_pages_individually_and_never_follows_redirects():
     assert rows == "unavailable" and not complete
 
 
-@pytest.mark.parametrize("reply,max_rows", [
-    ({"data": [{"row": 1}] * 3, "total_pages": 1}, 2),
-    ({"data": [{"row": 1}], "total_pages": True}, 2),
-    ({"data": "unexpected", "total_pages": 1}, 2),
+@pytest.mark.parametrize("overrides", [
+    {"total": 3},
+    {"total": True},
+    {"total_pages": True},
+    {"data": "unexpected"},
+    {"page": 2},
+    {"page_size": 1},
+    {"total_pages": 2},
 ])
-async def test_reader_limits_and_malformed_pages_are_incomplete(reply, max_rows):
+async def test_reader_limits_and_malformed_pages_are_incomplete(overrides):
     from giraffe.gateway_attribution import _pages
-    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda req: httpx.Response(200, json=reply))) as client:
-        _, complete = await _pages(client, "http://proxy/spend/logs/v2", "marker", max_rows=max_rows, stop=asyncio.Event(),
+    transport = httpx.MockTransport(lambda req: spend_page(req, [{"row": 1}], **overrides))
+    async with httpx.AsyncClient(transport=transport) as client:
+        _, complete = await _pages(client, "http://proxy/spend/logs/v2", "marker", max_rows=2, stop=asyncio.Event(),
                                   start_date="2026-11-06 00:00:00", end_date="2026-11-06 00:00:10")
     assert not complete
 
@@ -235,7 +309,7 @@ async def test_missing_observer_reference_sends_no_requests(monkeypatch):
 def test_conflicting_repeated_row_and_anonymous_attribution_are_unverified():
     from giraffe.gateway_attribution import _normalize, _assess
     record = SimpleNamespace(id="local", identity="alice", _gateway_key_hash="a"*64,
-                             input_tokens=2, completion_tokens=3, status="completed", valid=True)
+                             input_tokens=2, completion_tokens=3, status="completed", valid=True, stream=False)
     row = {"request_id": "server", "session_id": "run", "metadata": {"spend_logs_metadata": {
         "giraffe_run": "run", "giraffe_request": "local"}}, "api_key": "a"*64,
         "prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5, "status": "success"}
@@ -265,8 +339,9 @@ async def test_observer_transport_echo_is_suppressed_but_shared_logs_remain(monk
     from giraffe.gateway_attribution import execute, result
     from giraffe.models import RequestRecord
     secret = "observer-credential-echo"
-    for ref in ("ALICE", "BOB", "OBSERVER"):
-        monkeypatch.setenv(ref, secret)
+    monkeypatch.setenv("ALICE", "alice-key")
+    monkeypatch.setenv("BOB", "bob-key")
+    monkeypatch.setenv("OBSERVER", secret)
     cfg = config()
     cfg.gateway_attribution.settle_seconds = .2
     run = _Run(cfg, None, None)
@@ -282,7 +357,8 @@ async def test_observer_transport_echo_is_suppressed_but_shared_logs_remain(monk
             if malformed:
                 writer.write(f"Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n{secret}\r\n".encode())
             else:
-                body = json.dumps({"data": [], "total_pages": 1, "echo": secret}).encode()
+                body = json.dumps({"data": [], "total": 0, "page": 1, "page_size": 128,
+                                   "total_pages": 0, "echo": secret}).encode()
                 writer.write(f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode() + body)
         await writer.drain()
         writer.close()

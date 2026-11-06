@@ -1,6 +1,7 @@
 """Request-scoped credentials for explicit gateway probes."""
 from contextvars import ContextVar
 from contextlib import contextmanager
+import hashlib
 from http.cookiejar import CookieJar
 import logging
 import os
@@ -58,6 +59,21 @@ def credential_headers(identity):
             raise ValueError("Test identity credentials are unavailable.")
         headers[header] = "Bearer " + value if header == "Authorization" and identity.api_key_env else value
     return headers
+
+
+def litellm_key_fingerprint(headers):
+    """Resolve the supported virtual-key headers using LiteLLM's precedence."""
+    headers = {name.lower(): value for name, value in headers.items()}
+    custom_key = headers.get("x-litellm-api-key")
+    value = custom_key if custom_key is not None else headers.get("authorization", "")
+    scheme, separator, token = value.partition(" ")
+    if separator and scheme.lower() == "bearer":
+        value = token
+    elif custom_key is None:
+        return None
+    if not value or any(char.isspace() for char in value):
+        return None
+    return hashlib.sha256(value.encode()).hexdigest()
 
 
 def discard_identity_response(record):

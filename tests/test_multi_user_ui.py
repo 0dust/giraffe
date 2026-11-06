@@ -276,3 +276,33 @@ const markup=renderMultiUserResults({windows:[{phase:'measurement',population:2,
 assert.match(markup,/Observed delivery fairness/);assert.match(markup,/User 2 lacks overlap/);
 assert.match(markup,/conversation-one/);assert.match(markup,/failed turn/);assert.match(markup,/data-request="request-one"/);
 ''', configuration())
+
+
+def test_unchanged_multi_user_form_preserves_live_first_mode_order():
+    config = RunConfig.model_validate({**configuration().model_dump(),
+        'multi_user': {'levels': [2], 'conversations': {'modes': ['live', 'fixed']}}})
+    result = browser_logic(r'''
+const markup=renderMultiUserEditor(config);
+const options=markup.match(/<select[^>]*name="multi_user_conversation_modes"[^>]*>(.*?)<\/select>/)[1];
+const mode=options.match(/<option value="([^"]+)" selected>/)?.[1] || options.match(/<option value="([^"]+)"/)[1];
+const values=new FormData();values.set('multi_user_rendered','1');
+values.set('multi_user_conversation_profile','correctness');
+values.set('multi_user_conversation_modes',mode);
+console.log(JSON.stringify(configureMultiUser(config,values,bootstrap.multi_user.defaults)));
+''', config)
+    assert RunConfig.model_validate(result).multi_user.conversations.modes == ['live', 'fixed']
+
+
+def test_unchanged_multi_user_form_preserves_multiline_recall_prompts():
+    turns = ['Remember the name.\nReply with it only.', 'Repeat it.']
+    config = RunConfig.model_validate({**configuration().model_dump(),
+        'multi_user': {'levels': [2], 'conversations': {'turns': turns}}})
+    result = browser_logic(r'''
+const markup=renderMultiUserEditor(config);
+const prompts=markup.match(/<textarea[^>]*name="multi_user_conversation_turns"[^>]*>([\s\S]*?)<\/textarea>/)[1];
+const values=new FormData();values.set('multi_user_rendered','1');
+values.set('multi_user_conversation_profile','correctness');
+values.set('multi_user_conversation_turns',prompts);
+console.log(JSON.stringify(configureMultiUser(config,values,bootstrap.multi_user.defaults)));
+''', config)
+    assert RunConfig.model_validate(result).multi_user.conversations.turns == turns
