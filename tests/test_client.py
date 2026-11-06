@@ -856,6 +856,8 @@ async def test_execute_closes_untransferred_sse_iterator_before_return(monkeypat
             payload = "{" if failure == "protocol" else json.dumps(
                 {"choices": [{"delta": {"content": "42"}, "finish_reason": None}]})
             yield "message", payload, time.perf_counter()
+            if kwargs.get("mark_read_end"):
+                yield None, "", time.perf_counter()
             await asyncio.Event().wait()
         finally:
             closed.set()
