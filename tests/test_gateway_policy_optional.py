@@ -75,7 +75,8 @@ async def test_unavailable_policy_with_no_identities_keeps_shared_key_access(mon
 
 
 @pytest.mark.usefixtures("local_tokenizer")
-async def test_unavailable_policy_references_do_not_block_serving_baseline(monkeypatch):
+@pytest.mark.parametrize("change", ["reference", "gateway"])
+async def test_unavailable_policy_does_not_block_serving_baseline(monkeypatch, change):
     from giraffe.reporting import compare_baseline
     from tests.test_gateway_policy import configuration as configured_policy
 
@@ -90,8 +91,8 @@ async def test_unavailable_policy_references_do_not_block_serving_baseline(monke
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: original(transport=httpx.MockTransport(handle), **kwargs))
     monkeypatch.setenv("SHARED", "shared-secret")
 
-    async def run(ref):
-        raw = configured_policy(gateway="unsupported").model_dump(mode="json")
+    async def run(ref, gateway="unsupported"):
+        raw = configured_policy(gateway=gateway).model_dump(mode="json")
         raw.update(checks=["serving", "gateway_policy"], stream=False, samples=8)
         raw["targets"][0].update(api_key_env="SHARED", test_identities={"limited": {"api_key_env": ref}})
         report = await run_suite(RunConfig.model_validate(raw))
@@ -99,10 +100,41 @@ async def test_unavailable_policy_references_do_not_block_serving_baseline(monke
         return report
 
     baseline = await run("PREVIOUS_UNUSED")
-    current = await run("CURRENT_UNUSED")
+    current = (await run("CURRENT_UNUSED") if change == "reference"
+               else await run("PREVIOUS_UNUSED", "another-unsupported"))
     compared = compare_baseline(current, baseline).baseline["targets"][0]
     assert compared["status"] == "pass", compared["summary"]
     assert any(row["check"] == "serving" and row["status"] == "pass" for row in compared["comparisons"])
+
+
+@pytest.mark.usefixtures("local_tokenizer")
+async def test_required_policy_cannot_use_unavailable_baseline_for_coverage(monkeypatch):
+    from giraffe.reporting import compare_baseline
+    from tests.test_gateway_policy import configuration as configured_policy
+
+    def handle(request):
+        if request.method != "POST":
+            return httpx.Response(404)
+        return httpx.Response(200, json={"choices": [{"message": {"content": "OK"},
+            "finish_reason": "stop"}], "usage": {"prompt_tokens": 8, "completion_tokens": 2}})
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: original(transport=httpx.MockTransport(handle), **kwargs))
+    monkeypatch.setenv("LIMITED", "limited-secret")
+    monkeypatch.setenv("PEER", "peer-secret")
+
+    async def run(gateway):
+        raw = configured_policy(gateway=gateway).model_dump(mode="json")
+        raw.update(checks=["serving", "gateway_policy"], stream=False, samples=8)
+        return await run_suite(RunConfig.model_validate(raw))
+
+    baseline, current = await run("unsupported"), await run("litellm")
+    assert baseline.overall == "pass"
+    assert next(check for check in current.checks if check.id == "gateway_policy").required
+    compared = compare_baseline(current, baseline).baseline["targets"][0]
+    assert compared["status"] == "inconclusive"
+    assert any(row["check"] == "serving" and row["status"] == "pass" for row in compared["comparisons"])
+    assert "No comparable verdict metric for selected check(s): gateway_policy" in compared["summary"]
 
 
 @pytest.mark.parametrize("credential", [None, " "])

@@ -229,19 +229,17 @@ async def test_unsupported_gateway_dispatches_nothing(monkeypatch):
     assert check.metrics["gateway_policy"]["qualification"] == "unavailable"
 
 
+@pytest.mark.usefixtures("local_tokenizer")
 def test_policy_reports_exports_ui_and_baseline(tmp_path, capsys, monkeypatch):
     from giraffe.cli import _print_result
     from giraffe.reporting import write_report, reproduction_export, compare_baseline
-    from tests.test_reporting import make_report
     from tests.test_ux_catalogue import browser_logic
-    check, state, _ = asyncio.run(exercise(monkeypatch, "priority_rpm"))
-    report = make_report()
-    report.manifest["config"] = state.config.model_dump(mode="json")
-    report.checks, report.requests = [check], state.records
-    report.observations = {"targets": state.observations}
+    check, report, _ = asyncio.run(exercise(monkeypatch, "priority_rpm", full=True))
     json_path, html_path = write_report(report, tmp_path, html=True)
     assert "Gateway policy · observed" in html_path.read_text()
-    assert json.loads(json_path.read_text())["checks"][0]["metrics"]["gateway_policy"]["users"][0]["rejected"] == 3
+    saved_policy = next(item for item in json.loads(json_path.read_text())["checks"]
+                        if item["id"] == "gateway_policy")
+    assert saved_policy["metrics"]["gateway_policy"]["users"][0]["rejected"] == 3
     exported = reproduction_export(report)
     assert exported["gateway_policy"]["proxy"]["settings"]["capability"] == "priority_rpm"
     assert "limited-secret" not in json.dumps(exported)
@@ -271,7 +269,7 @@ assert.match(result,/limited/);assert.match(result,/observed/);
 assert.match(result,/Actual input tokens/);assert.doesNotMatch(result,/limited-secret/);
 const comparison=comparisonTable([{metric:'policy_acceptance',aggregation:'observed',status:'pass',current:'observed',baseline:'observed',current_samples:5,baseline_samples:5}]);
 assert.match(comparison,/Policy evidence/);assert.doesNotMatch(comparison,/Median|No material regression/);
-''', state.config)
+''', RunConfig.model_validate(report.manifest["config"]))
 
 
 def test_parser_never_persists_raw_rate_limit_identity():

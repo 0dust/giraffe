@@ -36,6 +36,35 @@ async def test_baseline_preserves_current_inconclusive_policy_reason(monkeypatch
     assert all(row["reason"] == current_check.summary for row in rows)
 
 
+@pytest.mark.usefixtures("local_tokenizer")
+async def test_matching_legacy_policy_summaries_do_not_establish_a_baseline(monkeypatch):
+    check, report, _ = await exercise(monkeypatch, full=True)
+    assert check.status == "pass"
+    assert compare_baseline(report, report.model_copy(deep=True)).baseline["status"] == "pass"
+
+    check.metrics["gateway_policy"]["version"] = 3
+    compared = compare_baseline(report, report.model_copy(deep=True)).baseline
+    assert compared["status"] == "inconclusive"
+    assert all(row["status"] == "inconclusive" for row in compared["targets"][0]["comparisons"])
+
+
+@pytest.mark.usefixtures("local_tokenizer")
+async def test_policy_baseline_attests_source_separately_from_shared_work(monkeypatch):
+    check, report, _ = await exercise(monkeypatch, full=True)
+    assert check.status == "pass"
+
+    legacy = report.model_copy(deep=True)
+    legacy.manifest.pop("gateway_policy_source_sha256")
+    legacy.manifest["fixture_pack"].pop("shared_workload_fixture_sha256")
+    assert compare_baseline(report, legacy).baseline["status"] == "pass"
+
+    different = report.model_copy(deep=True)
+    different.manifest["gateway_policy_source_sha256"] = "0" * 64
+    compared = compare_baseline(report, different).baseline
+    assert compared["status"] == "inconclusive"
+    assert all(row["status"] == "inconclusive" for row in compared["targets"][0]["comparisons"])
+
+
 @pytest.mark.parametrize("mode", ["key_rpm", "priority_rpm"])
 def test_supported_policy_keeps_declared_plan(mode):
     from tests.test_gateway_policy import configuration
