@@ -1798,6 +1798,72 @@ async def test_concurrency_limit_records_which_requests_waited_for_a_slot():
     assert acquired.is_set()
 
 
+@pytest.mark.parametrize("targets,expiry", [(1, "gateway"), (2, "gateway"), (1, "shared")])
+async def test_gateway_deadline_preserves_completed_judged_inference(
+        monkeypatch, local_tokenizer, tmp_path, targets, expiry):
+    client_class = httpx.AsyncClient
+    original_send = client_class.send
+
+    async def saved_run(*, mixed):
+        async def observer(request, rows):
+            if mixed and rows:
+                await asyncio.sleep(1)
+            return spend_page(request, rows)
+
+        async def send(client, request, **kwargs):
+            if request.url.host == "judge":
+                return httpx.Response(200, request=request, json={"choices": [{
+                    "message": {"role": "assistant", "content": json.dumps({"verdict": True, "reason": "Correct."})},
+                    "finish_reason": "stop"}]})
+            if mixed and expiry == "shared" and request.method == "POST" and b"PACK B" in request.content:
+                await asyncio.sleep(1)
+            return await original_send(client, request, **kwargs)
+
+        with monkeypatch.context() as env:
+            cfg, _, reads = setup(env, observer)
+            immediate_spend_polls(env, cfg)
+            if targets == 2:
+                first = cfg.targets[0]
+                cfg.targets.append(first.model_copy(update={"name": "second", "url": "http://second/v1",
+                    "gateway": first.gateway.model_copy(update={"url": "http://second/spend/logs/v2"})}))
+            cfg = RunConfig.model_validate({
+                **cfg.model_dump(), "checks": ["serving", "correctness"] + (["gateway_attribution"] if mixed else []),
+                "default_concurrency": 1, "samples": 2, "max_requests": None, "max_duration_seconds": .55 if mixed else 1.5,
+                "limits": {**cfg.limits.model_dump(), "min_samples": 2},
+                "request_source": "request_pack", "request_pack": {"version": 1, "cases": [
+                    {"fixture_id": key, "scorer": "judge", "messages": [{"role": "user", "content": f"PACK {key}"}],
+                     "expected": "OK"} for key in ("A", "B")]},
+                "judging": {"judges": [{"name": "judge", "url": "http://judge/v1", "model": "judge"}]},
+            })
+            env.setattr(client_class, "send", send)
+            report = await run_suite(cfg)
+            path, _ = write_report(report, tmp_path)
+            return RunReport.model_validate_json(path.read_bytes()), reads
+
+    baseline, _ = await saved_run(mixed=False)
+    current, reads = await saved_run(mixed=True)
+    assert baseline.abort_reason is None
+    assert current.abort_reason == "maximum run duration reached"
+    assert current.observations["duration_limit_scope"] == expiry
+    assert bool(reads) == (expiry == "gateway")
+    for report in (current, baseline):
+        assert all(check.status == "pass" for check in report.checks if check.id == "serving")
+    compared = compare_baseline(current, baseline).baseline
+    if expiry == "gateway":
+        assert current.observations["judging"]["scored_requests"] == 4 * targets
+        assert [(record.request_hash, record.score) for record in current.requests if record.identity is None] == [
+            (record.request_hash, record.score) for record in baseline.requests]
+        assert all(check.status == "pass" for check in current.checks if check.id == "correctness")
+        for target in compared["targets"]:
+            assert not target["reasons"]
+            assert {row["check"] for row in target["comparisons"] if row["status"] == "pass"} >= {"serving", "correctness"}
+    else:
+        assert 0 < current.observations["judging"]["scored_requests"] < 4
+        target, = compared["targets"]
+        assert any("run was aborted" in reason for reason in target["reasons"])
+        assert not any(row["check"] in {"serving", "correctness"} for row in target["comparisons"])
+
+
 @pytest.mark.parametrize("with_builtin", [False, True])
 async def test_shared_baseline_still_requires_the_active_fixture_sources(monkeypatch, local_tokenizer, with_builtin):
     async def observer(request, rows):
