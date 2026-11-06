@@ -546,10 +546,14 @@ def _bind_existing(report, target, window, records, observation, put):
     by_id = {c.id: c.metrics for c in checks}
     ids = {r.id for r in records}
     cohort = window["cohort_id"]
+    user_summary = by_id.get("multi_user", {}).get("multi_user", observation.get("multi_user", {}).get("summary", {}))
+    user_window = next((value for value in user_summary.get("windows", [])
+                        if value.get("phase") == "measurement" and value.get("id") == cohort), {})
     load = by_id.get("load", observation.get("load_test", {}))
     point_ids = {(row.load_point or {}).get("point_id") for row in records}
     points = [p for p in load.get("points", []) if str(p.get("id")) in point_ids]
-    stage_ids = {row.traffic_stage for row in records if row.traffic_stage is not None}
+    capacity_records = [row for row in records if "capacity" in row.check_ids and row.traffic_stage is not None]
+    stage_ids = {row.traffic_stage for row in capacity_records}
     stage_entries = [(s.get("stage_index", index), s) for index, s in enumerate(
         by_id.get("capacity", {}).get("traffic_stages", observation.get("capacity", [])))
         if isinstance(s, dict) and s.get("stage_index", index) in stage_ids]
@@ -560,10 +564,12 @@ def _bind_existing(report, target, window, records, observation, put):
     elif stages:
         delivery = [{key: s.get(key) for key in ("stage_index", "scheduled", "started", "dispatched", "dropped_local", "dropped_late", "local_drops", "late_drops", "not_offered", "reasons")}
                     for s in stages]
+    elif user_window.get("offer_accounting") and (window["kind"] == "full" or not window.get("includes_drain")):
+        delivery = [{"id": cohort, **user_window["offer_accounting"]}]
     else:
         delivery = None
     put("drops", delivery, "Local drops / late drops / not offered", "requests", "Existing scoped scheduler ledger; unsent work is not an endpoint error",
-        samples=len(points)+len(stages), state="measured" if delivery else "not_applicable")
+        samples=len(delivery or ()), state="measured" if delivery else "not_applicable")
     accepted = [p for p in points if p.get("status") == "pass"]
     rate_findings = [p.get("rate") for p in accepted if p.get("rate") is not None and p.get("pattern") in {"constant", "poisson"} and not p.get("bursts")]
     rate_findings += [s.get("rate_rps") for s in stages if s.get("accepted") and s.get("rate_rps") is not None]
@@ -579,7 +585,7 @@ def _bind_existing(report, target, window, records, observation, put):
     limited = any(capacity_limits.get(key) is not None for key in ("first_output_ms", "latency_ms"))
     valid_counts, scored_counts = Counter(), Counter()
     if stage_entries:
-        for record in records:
+        for record in capacity_records:
             if record.valid and record.status == "completed":
                 valid_counts[record.traffic_stage] += 1
                 scored_counts[record.traffic_stage] += record.score is not None
@@ -665,12 +671,9 @@ def _bind_existing(report, target, window, records, observation, put):
         "Conversation completion rate", "ratio", "Completed / planned conversations from session lifecycle", samples=sessions.get("started_conversations", 0), state="measured" if planned else "not_applicable")
     put("user_fairness", sessions.get("users") or None, "Per-user generation pace / fairness", "tok/s", "Existing per-user estimates and equal-user weighting; missing coverage retained",
         samples=sessions.get("users_with_measured_generation", 0), state="estimated" if sessions.get("users") else "not_applicable")
-    user_summary = by_id.get("multi_user", {}).get("multi_user", observation.get("multi_user", {}).get("summary", {}))
-    user_windows = [value for value in user_summary.get("windows", [])
-                    if value.get("phase") == "measurement" and value.get("id") == cohort]
-    if user_windows:
-        users = user_windows[0].get("users", [])
-        eligible = user_windows[0].get("population", len(users))
+    if user_window:
+        users = user_window.get("users", [])
+        eligible = user_window.get("population", len(users))
         samples = sum(_number(user.get("output_tokens_per_second")) for user in users)
         complete = eligible > 0 and samples == eligible
         put("persistent_user_delivery", users, "Persistent user delivery", "tok/s",

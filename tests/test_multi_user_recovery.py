@@ -51,6 +51,37 @@ def test_recovery_exposes_one_slow_user_when_median_recovers():
     assert result["worst_user"]["user_id"] == "user-03"
 
 
+@pytest.mark.parametrize("swap_lengths", [False, True])
+def test_recovery_checks_actual_lengths_of_each_replay(swap_lengths):
+    source, records = recovery_observation()
+    source["settings"]["pass_criteria"]["min_samples"] = 2
+    for window in source["windows"]:
+        window["offer_accounting"].update(planned=6, offered=6, dispatched=6)
+        for user in window["users"]:
+            first = next(r for r in records if r.id == user["request_ids"][0])
+            first.output_tokens = 4
+            second = first.model_copy(deep=True)
+            second.id += "-second"
+            second.dispatch_ms += 400
+            second.timing_start_ms += 400
+            second.completed_ms += 400
+            second.workload.update(matched_work_sequence=2, matched_work_sha256="second",
+                                   ready_ms=second.dispatch_ms)
+            second.output_tokens = 16
+            if swap_lengths and window["role"] == "lighter":
+                first.output_tokens, second.output_tokens = second.output_tokens, first.output_tokens
+            user["request_ids"].append(second.id)
+            user.update(ready_count=2, dispatched_count=2)
+            user["offer_accounting"].update(planned=2, offered=2, dispatched=2)
+            records.append(second)
+
+    user = summarize(source, records)["windows"][-1]["recovery"]["users"][0]
+    assert user["phases"]["control"]["output_tokens"] == user["phases"]["lighter"]["output_tokens"] == 10
+    assert user["status"] == ("inconclusive" if swap_lengths else "pass")
+    if swap_lengths:
+        assert any("matched" in reason.lower() and "token" in reason.lower() for reason in user["reasons"])
+
+
 @pytest.mark.parametrize("phase", [0, 1, 2])
 def test_recovery_missing_phase_end_is_inconclusive(phase):
     source, records = recovery_observation()

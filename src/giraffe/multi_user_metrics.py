@@ -11,6 +11,7 @@ from .timing import qualify, threshold
 
 
 SUMMARY_VERSION = 1
+_UNDISPATCHED_OFFERS = ("dropped_local", "dropped_late", "unissued", "not_offered")
 
 
 def _status(statuses: list[str], *, measured: bool = False) -> str:
@@ -257,9 +258,13 @@ def _fairness(observation, window, users, records, criteria, health, lag, timing
     limit = criteria.max_throughput_ratio
     start, end = window.get("start_ms"), window.get("end_ms")
     reasons = []
-    if window.get("scenario") == "arrivals" and (len({u.get("activation_seconds", 0) for u in users}) > 1
-            or any(o.get("origin") == "burst" for o in window.get("offers", []))):
-        reasons.append("Work not comparable: arrival exposure or burst work differs between users.")
+    if window.get("scenario") == "arrivals":
+        if len({u.get("activation_seconds", 0) for u in users}) > 1 or any(
+                offer.get("origin") == "burst" for offer in window.get("offers", [])):
+            reasons.append("Work not comparable: arrival exposure or burst work differs between users.")
+        counts = window.get("offer_accounting")
+        if not counts or any(counts.get(outcome, 0) for outcome in _UNDISPATCHED_OFFERS):
+            reasons.append("The generator did not deliver the configured user offer schedule.")
     if len(users) < 2:
         reasons.append("Fairness requires at least two compared users.")
     if window.get("cut_short") or start is None or end is None or end <= start:
@@ -540,7 +545,7 @@ def _recovery(observation, window, control, sustained, user_records, criteria, h
             shared.append("Control, sustained or lighter window has incomplete coverage.")
             continue
         counts = phase.get("offer_accounting", {})
-        if not counts or any(counts.get(key, 0) for key in ("dropped_local", "dropped_late", "unissued", "not_offered")):
+        if not counts or any(counts.get(outcome, 0) for outcome in _UNDISPATCHED_OFFERS):
             shared.append("The generator did not deliver the configured phase schedule.")
         start, end = phase["start_ms"], phase["end_ms"]
         if (qualify([], health, timing_threshold, ("latency_ms", "max_stream_gap_ms"),
@@ -574,6 +579,12 @@ def _recovery(observation, window, control, sustained, user_records, criteria, h
         if any(not b.workload.get("matched_work_sha256")
                or a.workload.get("matched_work_sha256") != b.workload["matched_work_sha256"] for a, b in pairs):
             notes.append("Matched control and recovery work differs.")
+        if any(max(a, b) > min(a, b)*(1+tolerance)
+               for before_request, after_request in pairs
+               for a, b in ((before_request.input_tokens, after_request.input_tokens),
+                            (before_request.output_tokens, after_request.output_tokens))
+               if a is not None and b is not None):
+            notes.append("Actual token lengths drifted between matched control and lighter requests.")
         stress = [r for r in sustained_records if r.workload.get("user_id") == uid and _valid(r)
                   and r.completed_ms is not None and (sustained or {}).get("end_ms") is not None
                   and r.completed_ms <= sustained["end_ms"]]
@@ -670,8 +681,7 @@ def summarize(observation: dict[str, Any], records: list[RequestRecord], *,
                 criteria, timing_health, legacy_max_lag_ms, timing_threshold, scenario_delays)
         if window.get("offers") is not None:
             for user in window["users"]:
-                if any(user.get("offer_accounting", {}).get(key, 0) for key in
-                       ("dropped_local", "dropped_late", "unissued", "not_offered")):
+                if any(user.get("offer_accounting", {}).get(outcome, 0) for outcome in _UNDISPATCHED_OFFERS):
                     user["coverage"]["status"] = "partial" if user["outcomes"]["attempted"] else "unexercised"
                     user["reasons"].append("The configured user offer schedule was not delivered.")
                     if user["status"] != "fail":
