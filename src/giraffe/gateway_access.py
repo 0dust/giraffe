@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+import re
+
 from giraffe.client import REASONING_BUDGET_ERROR
 from giraffe.identities import LITELLM_NATIVE_KEY_HEADERS, identity_headers, litellm_key_fingerprint
 from giraffe.models import CheckResult, RequestSpec
@@ -15,6 +18,31 @@ def configured_cases(config):
     return settings.cases if settings else []
 
 
+def denial_kind(status, body):
+    """Qualify only explicit LiteLLM authentication or model-access denials."""
+    try:
+        data = json.loads(body)
+    except (ValueError, RecursionError):
+        return "unknown"
+    error = data.get("error") if isinstance(data, dict) else None
+    if not isinstance(error, dict):
+        return "unknown"
+    error_type, message = error.get("type"), error.get("message", "")
+    code = error.get("code", status)
+    if (not isinstance(error_type, str) or not isinstance(message, str)
+            or re.search(r"\b\w+Exception\b", message)
+            or type(code) not in (int, str) or code not in (status, str(status))):
+        return "unknown"
+    if status == 401 and error_type in {"token_not_found_in_db", "expired_key"}:
+        return "authentication"
+    if status == 403 and error_type in {
+        "key_model_access_denied", "team_model_access_denied", "user_model_access_denied",
+        "org_model_access_denied", "project_model_access_denied",
+    }:
+        return "model_access"
+    return "unknown"
+
+
 def observation(record):
     if record is None:
         return "unverified", "not_run"
@@ -23,6 +51,8 @@ def observation(record):
     if record.status == "completed" and record.http_status == 200:
         if record.valid:
             return "allow", "valid_completion"
+        if record._gateway_access_refusal:
+            return "allow", "assistant_refusal"
         if (record.error == REASONING_BUDGET_ERROR
                 and record.reasoning_tokens == record.completion_tokens == record.requested_max_tokens > 0):
             return "allow", "metered_reasoning_completion"

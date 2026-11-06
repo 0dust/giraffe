@@ -616,7 +616,14 @@ class LLMClient:
             if spec.workload.get("logprobs") and not streaming:
                 record.logprob_evidence = self.logprob_budget.collect(choice.get("logprobs"), answer,
                                                           spec.workload["top_logprobs"])
-            reasoning = _text(content.get("reasoning_content") or content.get("reasoning"))
+            if access_probe:
+                reasoning = _text(content.get("reasoning_content"))
+                alternate_reasoning = _text(content.get("reasoning"))
+                reasoning = reasoning or alternate_reasoning
+                refusal = _text(content.get("refusal"))
+                record._gateway_access_refusal = bool(refusal.strip()) and choice.get("finish_reason") == "stop"
+            else:
+                reasoning = _text(content.get("reasoning_content") or content.get("reasoning"))
             now = observed_at
             if streaming:
                 token_evidence = choice.get("logprobs")
@@ -761,7 +768,11 @@ class LLMClient:
                     )
                     if not 200 <= response.status_code < 300:
                         error_body = await _limited_body(response, on_body=body_received)
-                        if spec.identity is not None:
+                        if access_probe and response.status_code in (401, 403):
+                            from .gateway_access import denial_kind
+
+                            record.gateway_evidence.error_kind = denial_kind(response.status_code, error_body)
+                        elif spec.identity is not None:
                             expected_key_hash = None
                             policy = self.config.gateway_policy
                             if (response.status_code == 429 and policy_probe
@@ -858,6 +869,9 @@ class LLMClient:
                     from .fixtures import final_answer
                     final, stripped, _ = final_answer(record.output)
                     if spec.scorer != "tool" and not final.strip():
+                        if record._gateway_access_refusal:
+                            record.status = "completed"
+                            return record
                         if record.finish_reason == "length" and (record.reasoning.strip() or stripped
                                                                   or (record.reasoning_tokens or 0) > 0):
                             # The endpoint honoured Giraffe's own output budget: not a

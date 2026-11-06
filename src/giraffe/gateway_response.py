@@ -23,10 +23,8 @@ def response_evidence(status, body=b"", headers=None, *, declared_priority=None,
         if isinstance(error, dict):
             error_type, message = error.get("type"), error.get("message", "")
             provider_error = not isinstance(message, str) or re.search(r"\b\w+Exception\b", message)
-            code = error.get("code", status)
-            matching_status = type(code) in (int, str) and code in (status, str(status))
-            if isinstance(error_type, str) and matching_status and not provider_error:
-                if status == 401 and error_type in {"token_not_found_in_db", "expired_key"}:
+            if isinstance(error_type, str) and not provider_error:
+                if status == 401 and error_type in {"token_not_found_in_db", "expired_key", "auth_error"}:
                     kind = "authentication"
                 if status == 403 and error_type in {
                     "key_model_access_denied", "team_model_access_denied", "user_model_access_denied",

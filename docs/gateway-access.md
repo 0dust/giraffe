@@ -39,6 +39,7 @@ the matrix can pass.
 | Response | Observation |
 | --- | --- |
 | HTTP 200 with a valid assistant answer and a `stop` or `length` finish reason | Allow |
+| HTTP 200 with a nonempty assistant refusal and a `stop` finish reason | Allow |
 | HTTP 200 with a `length` finish and assistant reasoning metered at the full requested output cap | Allow |
 | HTTP 401 with a recognized LiteLLM authentication error | Deny |
 | HTTP 403 with a recognized LiteLLM model-access error | Deny |

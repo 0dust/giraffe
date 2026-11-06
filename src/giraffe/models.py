@@ -2809,6 +2809,7 @@ class RequestRecord(PersistedModel):
     _timing_started_monotonic: float | None = PrivateAttr(default=None)
     _gateway_key_hash: str | None = PrivateAttr(default=None)
     _gateway_terminal_usage: bool = PrivateAttr(default=False)
+    _gateway_access_refusal: bool = PrivateAttr(default=False)
     _request_body_sent_monotonic: float | None = PrivateAttr(default=None)
     id: str
     target: str

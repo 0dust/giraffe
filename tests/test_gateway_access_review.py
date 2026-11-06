@@ -201,6 +201,51 @@ async def test_malformed_evidence_cannot_verify_access(monkeypatch, role, finish
         ["allow", "unverified"] if error_code in (503, "503") else ["unverified", "deny"])
 
 
+@pytest.mark.parametrize("message,finish,error,observed", [
+    ({"refusal": "deny-secret"}, "stop", None, "allow"),
+    ({"refusal": " "}, "stop", None, "unverified"),
+    ({"refusal": "deny-secret"}, "length", None, "unverified"),
+    ({"refusal": "deny-secret"}, "stop", {"type": "upstream_error"}, "unverified"),
+    ({"content": "OK", "refusal": []}, "stop", None, "unverified"),
+    ({"content": "OK", "refusal": "\ud800"}, "stop", None, "unverified"),
+    ({"content": "OK", "reasoning_content": False}, "stop", None, "unverified"),
+    ({"content": "OK", "reasoning_content": "thinking", "reasoning": "\ud800"}, "stop", None, "unverified"),
+    ({"refusal": "deny-secret", "reasoning": {}}, "stop", None, "unverified"),
+])
+async def test_access_requires_valid_assistant_text_fields(monkeypatch, message, finish, error, observed):
+    monkeypatch.setenv("ALLOW_KEY", "allow-secret")
+    monkeypatch.setenv("DENY_KEY", "deny-secret")
+
+    def handler(request):
+        if request.method != "POST":
+            return httpx.Response(404)
+        if request.headers["authorization"] == "Bearer allow-secret":
+            return httpx.Response(200, json={"choices": [{"message": {
+                "role": "assistant", "content": "OK"}, "finish_reason": "stop"}]})
+        return httpx.Response(200, content=json.dumps({"choices": [{"message": {
+            "role": "assistant", **message}, "finish_reason": finish}], "error": error}).encode())
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
+    report = await run_suite(config(retention="all"))
+    check = next(check for check in report.checks if check.id == "gateway_access")
+    denied = check.metrics["gateway_access"]["cases"][1]
+    assert denied["observed"] == observed
+    assert report.overall == check.status == ("fail" if observed == "allow" else "inconclusive")
+    assert "deny-secret" not in report.model_dump_json()
+
+
+async def test_access_denial_rules_do_not_change_policy_evidence(monkeypatch, local_tokenizer):
+    from tests.test_gateway_policy import exercise
+
+    check, report, _ = await exercise(monkeypatch, full=True)
+    assert check.status == "pass"
+    baseline = report.model_copy(deep=True)
+    # A passing quota run saved on the immediate policy predecessor, before gateway access.
+    baseline.manifest["gateway_policy_source_sha256"] = "82df9b4081bec328704711293588bf7020c23e2a9fddf36ff70f6bad57f8c12d"
+    assert compare_baseline(report, baseline).baseline["status"] == "pass"
+
+
 @pytest.mark.parametrize("completion,reasoning,reasoning_text,observed,status", [
     (16, 16, "deny-secret", "allow", "fail"),
     (16, 16, None, "allow", "fail"),
