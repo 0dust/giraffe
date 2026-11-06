@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from copy import deepcopy
 from decimal import Decimal, ROUND_FLOOR
+from fractions import Fraction
 from functools import cached_property
 import math
 import re
@@ -1219,11 +1220,14 @@ class MultiUserBurst(Model):
     requests: StrictInt = Field(default=5, ge=1, le=MAX_BURST_SIZE)
     spacing_seconds: float = Field(default=0, ge=0, le=MAX_STAGE_SECONDS)
 
+    def offer_offset(self, index: int) -> Fraction:
+        return Fraction(str(self.at_seconds)) + index * Fraction(str(self.spacing_seconds))
+
 
 def _steady_offer_count(duration: float, activation: float, rate: float) -> int:
-    # Match the scheduler's half-open window at floating-point boundaries.
-    count = math.ceil((duration-activation)*rate)
-    return count - int(count > 0 and activation+(count-1)/rate >= duration)
+    # Count integer indices with activation + index / rate strictly before duration.
+    remaining = Fraction(str(duration)) - Fraction(str(activation))
+    return math.ceil(remaining * Fraction(str(rate)))
 
 
 class MultiUserArrivals(Model):
@@ -1280,8 +1284,9 @@ class MultiUser(Model):
                 raise ValueError("arrival and burst user IDs must exist at every population level")
             if any(at >= self.duration_seconds for at in arrivals.activations.values()):
                 raise ValueError("user activations must precede the arrival window end")
+            end = Fraction(str(self.duration_seconds))
             if any(b.at_seconds < arrivals.activations.get(b.user_id, 0)
-                   or b.at_seconds + (b.requests-1)*b.spacing_seconds >= self.duration_seconds for b in arrivals.bursts):
+                   or b.offer_offset(b.requests - 1) >= end for b in arrivals.bursts):
                 raise ValueError("every burst must fall after its user activation and before the window end")
             if arrivals.offer_count(self.duration_seconds, max(self.levels)) > MAX_PLANNED_ARRIVALS:
                 raise ValueError("multi-user arrival schedule exceeds the finite offer bound")
@@ -1289,7 +1294,7 @@ class MultiUser(Model):
             recovery = self.recovery
             if recovery.lighter_requests_per_second >= recovery.sustained_requests_per_second:
                 raise ValueError("recovery traffic must be lighter than sustained traffic")
-            if any(math.ceil(seconds*rate)*max(self.levels) > MAX_PLANNED_ARRIVALS for seconds, rate in (
+            if any(_steady_offer_count(seconds, 0, rate)*max(self.levels) > MAX_PLANNED_ARRIVALS for seconds, rate in (
                     (recovery.control_seconds, recovery.lighter_requests_per_second),
                     (recovery.sustained_seconds, recovery.sustained_requests_per_second),
                     (recovery.lighter_seconds, recovery.lighter_requests_per_second))):

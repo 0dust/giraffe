@@ -285,7 +285,7 @@ async def run_stage(
     reasons = []
     peak = 0
     execution_errors = 0
-    discard_through = -1.0
+    discard_through = -math.inf
     stalls: list[tuple[float, float]] = []
     interrupted = overflow
     drain_expired = False
@@ -304,16 +304,19 @@ async def run_stage(
 
     def missed_arrival(offset: float, now: float) -> bool:
         nonlocal discard_through
-        late = (now > started_at + offset + traffic.scheduler_lag_tolerance_ms / 1000
-                if explicit else (now - started_at - offset) * 1000 > traffic.scheduler_lag_tolerance_ms)
+        elapsed = now - started_at
+        # Compare explicit offers on the same clock used to wake their tasks.
+        due = started_at + offset if explicit else offset
+        late = (now > due + traffic.scheduler_lag_tolerance_ms / 1000
+                if explicit else (elapsed - offset) * 1000 > traffic.scheduler_lag_tolerance_ms)
         if late:
             # Discard the entire already-due backlog after an excessive stall,
             # rather than replaying it in a catch-up burst. Close Poisson
             # arrivals within the explicit tolerance are legitimate clusters;
             # the next random gap is not a scheduler lateness threshold.
-            discard_through = max(discard_through, now - started_at)
-            stalls.append((offset, now - started_at))
-        return offset <= discard_through
+            discard_through = max(discard_through, now if explicit else elapsed)
+            stalls.append((offset, elapsed))
+        return due <= discard_through
 
     def blocked_offer(offset: float, now: float, *, refused: bool = False) -> str | None:
         cutoff = stage_cutoff
