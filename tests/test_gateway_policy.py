@@ -34,7 +34,8 @@ def configuration(mode="key_rpm", **changes):
 
 async def exercise(monkeypatch, mode="key_rpm", *, behavior="enforce", full=False,
                    admitted_affected=None, rejection_saturation=None, saturation_header=None, peer_delay=.01,
-                   early_peer_admissions=None, restart=False, model_tpm="not configured", **settings):
+                   early_peer_admissions=None, restart=False, model_tpm="not configured",
+                   rejection_unit=None, **settings):
     monkeypatch.setenv("LIMITED", "limited-secret")
     monkeypatch.setenv("PEER", "peer-secret")
     if behavior == "duplicate_credentials":
@@ -79,8 +80,9 @@ async def exercise(monkeypatch, mode="key_rpm", *, behavior="enforce", full=Fals
             model_rpm = cfg.gateway_policy.model_rpm
             saturation = (f"{admitted / model_rpm:.1%}" if rejection_saturation is None else f"{rejection_saturation}%") if model_rpm else ""
             tier_field = "low, Priority: high" if behavior == "contradictory_priority" else priority
+            tpm_field = "80" if behavior == "conflicting_model_tpm" and counts[who] == threshold + 2 else model_tpm
             message = (f"Priority-based rate limit exceeded. Model: {MODEL_POOL}, Priority: {tier_field}, Rate limit type: requests, "
-                       f"Model TPM: {model_tpm}, Model RPM: {cfg.gateway_policy.model_rpm}, Remaining: 0, "
+                       f"Model TPM: {tpm_field}, Model RPM: {cfg.gateway_policy.model_rpm}, Remaining: 0, "
                        f"Model saturation: {saturation}"
                        if mode == "priority_rpm" else
                        f"Rate limit exceeded for api_key: {subject}. Limit type: requests. Current limit: 2, Remaining: 0. Limit resets at: 2026-01-01")
@@ -90,12 +92,12 @@ async def exercise(monkeypatch, mode="key_rpm", *, behavior="enforce", full=Fals
                 headers["x-litellm-model-group"] = "other-pool"
             if saturation_header is not None:
                 headers["x-litellm-saturation"] = saturation_header
+            if rejection_unit is not None:
+                headers["rate_limit_type"] = rejection_unit
             return httpx.Response(429, headers=headers, json={"error": {
                 "type": "throttling_error", "code": "429", "message": message}})
         admitted += 1
         usage = {"prompt_tokens": 8, "completion_tokens": 2, "total_tokens": 10}
-        if behavior == "missing_total":
-            usage.pop("total_tokens")
         if behavior == "missing_usage":
             usage = {}
         if behavior == "reasoning_work" and who == "limited":

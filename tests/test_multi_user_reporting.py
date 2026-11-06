@@ -332,6 +332,48 @@ def test_recovery_fairness_baseline_requires_applied_threshold_and_keeps_phase_i
     assert all(row["metric"] != "fairness_acceptance" for row in legacy.baseline["targets"][0]["comparisons"])
 
 
+def test_scheduled_fairness_baseline_checks_work_that_finishes_after_delivery_cutoff():
+    def report(*, late_cache):
+        result = user_report()
+        settings = result.manifest["config"]["multi_user"]
+        settings["scenarios"] = ["arrivals"]
+        settings["pass_criteria"]["max_throughput_ratio"] = 1.2
+        source = result.observations["targets"]["local"]["multi_user"]
+        source["settings"] = settings
+        window, = source["windows"]
+        window.update(scenario="arrivals", role="arrivals", offer_accounting={
+            "planned": len(result.requests), "offered": len(result.requests), "dispatched": len(result.requests)})
+        for request in result.requests:
+            request.workload.update(scenario="arrivals", role="arrivals", population=window["population"])
+            request.stream = True
+            request.answer_chunks = request.answer_reads = 3
+            request.last_output_ms = 90
+            request.cached_prompt_tokens = 0
+            if request.id.endswith("-7"):
+                request.completed_ms = window["end_ms"] + 100
+                request.elapsed_ms = request.completed_ms - request.dispatch_ms
+                request.cached_prompt_tokens = 100 if late_cache else 0
+        summary = summarize(source, result.requests)
+        result.checks[0].metrics["multi_user"] = summary
+        result.checks[0].status = result.overall = summary["status"]
+        return result
+
+    current, previous = report(late_cache=True), report(late_cache=False)
+    for result in (current, previous):
+        fairness = result.checks[0].metrics["multi_user"]["windows"][0]["fairness"]
+        assert fairness["status"] == result.overall == "pass"
+        assert fairness["ratio"] == 1
+        assert all(user["valid_samples"] == 7 and user["work_samples"] == 8 for user in fairness["users"])
+
+    comparison = compare_baseline(current, previous)
+    rows = comparison.baseline["targets"][0]["comparisons"]
+    fairness, = [row for row in rows if row["metric"] == "fairness_acceptance"]
+    assert fairness["status"] == "inconclusive"
+    assert fairness["current_samples"] == fairness["baseline_samples"] == 35
+    delivery = [row for row in rows if row["metric"] == "shared_window_output_tokens_per_second"]
+    assert len(delivery) == 5 and all(row["status"] == "pass" and row["current"] == row["baseline"] == 70 for row in delivery)
+
+
 @pytest.mark.parametrize(("drop_request", "changed_work", "expected"), [
     (True, True, "inconclusive"),
     (False, True, "inconclusive"),

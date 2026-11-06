@@ -400,9 +400,9 @@ async def test_priority_matches_gateway_formatting_at_rounding_ties(monkeypatch,
     ((30.0, 20.0), False, None, "inconclusive"),
     ((25.0, 25.0), False, None, "inconclusive"),
     ((37.5, 25.0), False, "80", "inconclusive"),
-    ((25.0, 25.0), False, "80", "pass"),
+    ((25.0, 25.0), False, "80", "inconclusive"),
     ((30.0, 30.0), True, "81", "inconclusive"),
-    ((30.3, 30.3), True, "66", "pass"),
+    ((30.3, 30.3), True, "66", "inconclusive"),
     ((30.0, 30.0), True, "081", "inconclusive"),
 ])
 async def test_priority_rejections_share_one_counter_history(monkeypatch, reported, middle_charge, model_tpm, expected):
@@ -481,7 +481,13 @@ async def test_priority_rejections_share_one_counter_history(monkeypatch, report
     assert check.metrics["gateway_policy"]["peer_continuation"] == (model_tpm not in (None, "081"))
     assert check.status == expected, check.summary
     if expected == "inconclusive":
-        assert ("does not identify" if model_tpm in (None, "081") else "contradicts earlier limiter evidence") in check.summary
+        if model_tpm in (None, "081"):
+            reason = "does not identify"
+        elif reported[0] in (25., 30.3, 37.5):
+            reason = "cannot match any possible model RPM count"
+        else:
+            reason = "contradicts earlier limiter evidence"
+        assert reason in check.summary
 
 
 @pytest.mark.usefixtures("local_tokenizer")
@@ -555,7 +561,7 @@ async def test_priority_borrowing_accounts_for_peer_admission_order(monkeypatch,
         if model_tpm == "not configured":
             reason = "Overlapping admissions leave saturation uncertain"
         elif model_tpm == "60":
-            reason = "Model TPM is configured or unknown"
+            reason = "observed RPM admissions do not establish strict mode"
         else:
             reason = "does not identify"
         assert reason in check.summary
@@ -582,16 +588,19 @@ async def test_priority_requires_canonical_rejection_and_confirmed_named_pools(m
 
 
 @pytest.mark.usefixtures("local_tokenizer")
-@pytest.mark.parametrize("model_tpm,reported,threshold,behavior,expected", [
-    ("1000000", 90.0, .75, "enforce", "inconclusive"),
-    ("80", 25.0, .22, "enforce", "pass"),
-    ("80", 25.0, .22, "missing_total", "inconclusive"),
-    ("80", 20.0, .2, "missing_total", "pass"),
+@pytest.mark.parametrize("model_tpm,reported,header,threshold,expected", [
+    ("1000000", 90.0, "90.00%", .75, "inconclusive"),
+    ("80", 25.0, "25.00%", .22, "inconclusive"),
+    ("80", 23.8, "23.75%", .22, "inconclusive"),
+    ("80", 25.0, "25.00%", .2, "inconclusive"),
+    ("80", 30.0, "30.00%", .25, "inconclusive"),
+    ("80", 30.0, "30.00%", .2, "pass"),
+    ("80", 20.0, "20.00%", .2, "pass"),
 ])
-async def test_priority_tpm_only_saturation_requires_plausible_charges(
-        monkeypatch, model_tpm, reported, threshold, behavior, expected):
+async def test_priority_saturation_requires_independent_rpm_evidence(
+        monkeypatch, model_tpm, reported, header, threshold, expected):
     check, report, _ = await exercise(monkeypatch, "priority_rpm", full=True, model_tpm=model_tpm,
-        saturation_threshold=threshold, rejection_saturation=reported, peer_delay=.2, behavior=behavior,
+        saturation_threshold=threshold, rejection_saturation=reported, saturation_header=header, peer_delay=.2,
         users=[dict(identity="limited", requests=3, rpm=2, priority="low"),
                dict(identity="peer", requests=5, rpm=8, priority="high")])
     rejection = next(record for record in report.requests if record.http_status == 429)
@@ -599,3 +608,21 @@ async def test_priority_tpm_only_saturation_requires_plausible_charges(
                for record in report.requests) == 2
     assert check.metrics["gateway_policy"]["peer_continuation"]
     assert check.status == expected, check.summary
+
+
+@pytest.mark.usefixtures("local_tokenizer")
+async def test_priority_rejections_require_one_model_tpm_configuration(monkeypatch):
+    check, _, _ = await exercise(monkeypatch, "priority_rpm", full=True, behavior="conflicting_model_tpm")
+    assert check.metrics["gateway_policy"]["peer_continuation"]
+    assert check.status == "inconclusive"
+    assert "Model TPM configuration differs" in check.summary
+
+
+@pytest.mark.usefixtures("local_tokenizer")
+@pytest.mark.parametrize("unit,expected", [(None, "pass"), ("requests", "pass"), ("tokens", "inconclusive")])
+async def test_key_rejection_unit_header_agrees_with_body_when_present(monkeypatch, unit, expected):
+    check, _, _ = await exercise(monkeypatch, full=True, rejection_unit=unit)
+    assert check.status == expected, check.summary
+    assert check.metrics["gateway_policy"]["peer_continuation"] == (expected == "pass")
+    if unit == "tokens":
+        assert "does not identify" in check.summary

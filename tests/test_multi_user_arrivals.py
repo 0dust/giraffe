@@ -157,6 +157,7 @@ def test_aggregate_offer_bound_counts_targets_and_accepts_exact_limit(monkeypatc
 
 @pytest.mark.parametrize("case,expected", [
     ("equal", "pass"), ("unused_think_time", "pass"), ("slow", "fail"),
+    ("late_work", "inconclusive"),
     ("newcomer", "inconclusive"), ("burst", "inconclusive"),
     ("unequal_local_drops", "inconclusive"), ("equal_local_drops", "inconclusive"),
     ("measure_only", "measured"),
@@ -187,13 +188,16 @@ def test_selected_arrival_fairness_controls_window_and_overall_verdict(case, exp
         if start > 0 and (case == "equal_local_drops" or case == "unequal_local_drops" and uid == "user-02"):
             offer.update(offered=True, outcome="dropped_local")
             continue
-        end = 11000 if case == "slow" and uid == "user-02" and start > 0 else start+1000
+        late = case in {"slow", "late_work"} and uid == "user-02" and start > 0
+        end = 11000 if late else start+1000
         request = record(uid, identity=f'request-{offer["index"]}', dispatch=start, end=end,
             tokens=16, input_tokens=64, requested_input_tokens=64, requested_output_tokens=16,
             requested_max_tokens=16, stream=True, answer_chunks=3, answer_reads=3,
             last_output_ms=end-start-100, stream_end_ms=end-start)
         request.workload.update(window_id=window["id"], scenario="arrivals", role="arrivals",
                                 cohort=offer["cohort"])
+        if case == "late_work" and late:
+            request.completion_tokens, request.reasoning_tokens = 128, 112
         records.append(request)
         offer.update(offered=True, dispatched=True, outcome="dispatched", request_id=request.id)
     window["offer_accounting"] = _offer_counts(window["offers"])
@@ -205,8 +209,10 @@ def test_selected_arrival_fairness_controls_window_and_overall_verdict(case, exp
     measured = summary["windows"][0]["fairness"]
     assert measured["status"] == expected
     assert measured["qualified"] == (case in {"equal", "unused_think_time", "slow", "measure_only"})
-    if case == "slow":
+    if case in {"slow", "late_work"}:
         assert measured["ratio"] == 2.5
+    if case == "late_work":
+        assert any("total generation lengths" in reason for reason in measured["reasons"])
     if case in {"newcomer", "burst"}:
         assert any("arrival exposure or burst work differs" in reason for reason in measured["reasons"])
     if case.endswith("local_drops"):
