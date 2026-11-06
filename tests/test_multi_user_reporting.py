@@ -192,10 +192,18 @@ def test_selected_fairness_baseline_tracks_threshold_crossings_with_comparable_w
         assert result.baseline["acceptance"]["current"] == ("fail" if new_overlap else "inconclusive")
 
 
-def test_fairness_baseline_rejects_median_token_drift_even_when_mixes_overlap():
+@pytest.mark.parametrize(("drop_request", "changed_work", "expected"), [
+    (True, True, "inconclusive"),
+    (False, True, "inconclusive"),
+    (False, False, "pass"),
+])
+def test_fairness_baseline_qualifies_work_even_when_both_runs_pass(drop_request, changed_work, expected):
     current, previous = user_report(), user_report()
-    current.requests = [request for request in current.requests if request.id != "user-05-0"]
-    for report, lengths in ((previous, [100]*5 + [120]*2 + [200]), (current, [100]*3 + [120]*4 + [200])):
+    if drop_request:
+        current.requests = [request for request in current.requests if request.id != "user-05-0"]
+    old_lengths = [100]*5 + [120]*2 + [200]
+    new_lengths = [100]*3 + [120]*4 + [200] if changed_work else old_lengths
+    for report, lengths in ((previous, old_lengths), (current, new_lengths)):
         settings = report.manifest["config"]["multi_user"]
         settings["pass_criteria"]["max_throughput_ratio"] = 1.1
         for request in report.requests:
@@ -205,7 +213,7 @@ def test_fairness_baseline_rejects_median_token_drift_even_when_mixes_overlap():
             request.input_tokens = lengths[int(request.id.rsplit("-", 1)[1])]
         source = report.observations["targets"]["local"]["multi_user"]
         source["settings"] = settings
-        if report is current:
+        if report is current and drop_request:
             source["windows"][0]["users"][-1]["dispatched_count"] = 7
         summary = summarize(source, report.requests)
         report.checks[0].metrics["multi_user"] = summary
@@ -216,8 +224,8 @@ def test_fairness_baseline_rejects_median_token_drift_even_when_mixes_overlap():
 
     result = compare_baseline(current, previous)
     row = next(row for row in result.baseline["targets"][0]["comparisons"] if row["metric"] == "fairness_acceptance")
-    assert row["status"] == result.baseline["status"] == "inconclusive"
-    assert result.baseline["acceptance"] == {"baseline": "pass", "current": "fail"}
+    assert row["status"] == result.baseline["status"] == expected
+    assert result.baseline["acceptance"] == {"baseline": "pass", "current": "fail" if drop_request else "pass"}
 
 
 def live_user_report():
