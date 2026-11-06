@@ -121,6 +121,78 @@ def test_matching_user_baseline_preserves_per_user_delivery_rows():
     assert all("worsening_interval_95" not in row for row in rates)
 
 
+def live_user_report():
+    report = user_report()
+    window = report.checks[0].metrics["multi_user"]["windows"][0]
+    window["scenario"] = "repeated_conversations"
+    for user in window["users"]:
+        user["profile"] = "conversation:chat"
+    for request in report.requests:
+        turn = int(request.id.rsplit("-", 1)[1]) % 2
+        request.workload.update(mode="live", profile="conversation:chat", turn_id=turn,
+                                scenario="repeated_conversations")
+        request.fixture_id = f"session_live_turn{turn}"
+        request.request_hash = f"same-turn-{turn}"
+        request.finish_reason = "stop"
+    return report
+
+
+@pytest.mark.parametrize(("changed_field", "changed_value"), [
+    ("request_hash", "different-live-history"),
+    ("input_tokens", 400),
+    ("request_hash", None),
+    ("input_tokens", None),
+])
+def test_live_user_baseline_requires_comparable_history_and_input_usage(changed_field, changed_value):
+    current, previous = live_user_report(), live_user_report()
+    assert compare_baseline(previous, previous).baseline["status"] == "pass"
+
+    for request in current.requests:
+        if request.workload["user_id"] == "user-05" and request.workload["turn_id"] == 1:
+            setattr(request, changed_field, changed_value)
+    result = compare_baseline(current, previous)
+    rates = [row for row in result.baseline["targets"][0]["comparisons"]
+             if row["metric"] == "shared_window_output_tokens_per_second"]
+    assert result.baseline["status"] == "inconclusive"
+    assert [row["status"] for row in rates] == ["pass"] * 4 + ["inconclusive"]
+    assert rates[-1]["current"] == rates[-1]["baseline"] == 80
+    assert "live generated histories" in rates[-1]["reason"]
+
+
+def test_same_live_history_mix_can_report_a_real_throughput_regression():
+    current, previous = live_user_report(), live_user_report()
+    user = current.checks[0].metrics["multi_user"]["windows"][0]["users"][-1]
+    unserved = set(user["request_ids"][4:])
+    current.requests = [request for request in current.requests if request.id not in unserved]
+    user["request_ids"] = user["request_ids"][:4]
+    user["outcomes"]["valid_completed"] = 4
+    user["output_tokens_per_second"] = 40
+    result = compare_baseline(current, previous)
+    row = next(row for row in result.baseline["targets"][0]["comparisons"]
+               if row.get("user_id") == "user-05" and row["metric"] == "shared_window_output_tokens_per_second")
+    assert row["status"] == result.baseline["status"] == "fail"
+    assert row["current"] == 40 and row["baseline"] == 80
+
+
+def test_failures_retention_keeps_truncated_conversation_output_in_a_passing_run(tmp_path):
+    report = user_report(retention="failures")
+    truncated = report.requests[0]
+    truncated.workload.update(session_id="conversation", mode="live")
+    truncated.finish_reason = "length"
+    truncated.output = "partial conversation answer"
+    source = report.observations["targets"]["local"]["multi_user"]
+    source["settings"]["pass_criteria"]["max_error_percent"] = 20
+    summary = summarize(source, report.requests)
+    assert summary["status"] == "pass"
+    assert summary["windows"][0]["users"][0]["outcomes"]["errors"] == 1
+    report.checks[0].metrics["multi_user"] = summary
+
+    json_path, _ = write_report(report, tmp_path, html=False)
+    saved = json.loads(json_path.read_text())
+    assert saved["requests"][0]["output"] == "partial conversation answer"
+    assert saved["requests"][1]["output"] == ""
+
+
 def test_ready_wait_regression_is_not_hidden_by_short_dispatch_latency():
     current, previous = user_report(), user_report()
     for item in current.requests:

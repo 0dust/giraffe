@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from bisect import bisect_left
 from collections import Counter, defaultdict
+from itertools import combinations
 from operator import itemgetter
 from typing import Any
 
@@ -29,8 +30,12 @@ def _valid(record: RequestRecord) -> bool:
 
 def _error(record: RequestRecord) -> bool:
     return record.status in {"failed", "timeout"} or record.status == "completed" and (
-        not record.valid or record.score is False
-        or bool(record.workload.get("session_id")) and record.finish_reason == "length")
+        not record.valid or record.score is False or truncated_conversation_turn(record))
+
+
+def truncated_conversation_turn(record: RequestRecord) -> bool:
+    return (record.status == "completed" and bool(record.workload.get("session_id"))
+            and record.finish_reason == "length")
 
 
 def _tokens(records: list[RequestRecord]) -> tuple[int, int]:
@@ -269,6 +274,25 @@ def _total_generated_tokens(record: RequestRecord) -> int | None:
     return None
 
 
+def _length_mix_differs(samples: list[list[int | None]], tolerance: float) -> bool:
+    """Compare how much token work per request changes between sampled length mixes."""
+    histograms = [Counter(value for value in lengths if value is not None) for lengths in samples]
+    cohorts = [(counts, sum(counts.values()), sum(length*count for length, count in counts.items()))
+               for counts in histograms if counts]
+    for (left, left_n, left_tokens), (right, right_n, right_tokens) in combinations(cohorts, 2):
+        # Integrate the gap between normalized cumulative counts. This compares
+        # per-request mixes even when different numbers of requests completed.
+        gap = distance = previous = 0
+        allowed = min(left_tokens*right_n, right_tokens*left_n) * tolerance / 100
+        for length in sorted(left.keys() | right.keys()):
+            distance += abs(gap) * (length - previous)
+            if distance > allowed:
+                return True
+            gap += left.get(length, 0)*right_n - right.get(length, 0)*left_n
+            previous = length
+    return False
+
+
 def _input_shape_floors(observation, output):
     variant = "short_answer" if output == "short" else "long_output"
     return {item["size"]: item["input_tokens"] for item in observation.get("calibrations", [])
@@ -293,7 +317,7 @@ def _fairness(observation, window, users, records, criteria, health, lag, timing
                             phase_intervals=((start, end),) if start is not None and end is not None else ())
     interpretation = (
         "Median user throughput divided by worst user throughput over the common window. "
-        "Comparability tolerance applies to actual median token lengths, including total generation "
+        "Comparability tolerance applies to actual token length medians and mixes, including total generation "
         "and reported uncached input, and active exposure. "
         "This measures observed delivery fairness, not a server scheduling defect."
     )
@@ -327,6 +351,7 @@ def _fairness(observation, window, users, records, criteria, health, lag, timing
     load_settings = LoadTestSettings(profile=settings.get("profile", {}),
                                     pass_criteria={"min_valid_responses": criteria.min_samples})
     measurements, streams = [], {}
+    length_samples = defaultdict(list)
     cache_reuse = cache_unknown = False
     for user in users:
         uid = user["user_id"]
@@ -350,8 +375,9 @@ def _fairness(observation, window, users, records, criteria, health, lag, timing
         if any(r.cached_prompt_tokens is not None and count is None for r, count in zip(samples, uncached)):
             notes.append("Reported cached input usage is invalid.")
         if any(r.finish_reason == "stop" and r.output_tokens is not None
-               and (cap := r.requested_output_tokens if r.requested_output_tokens is not None
-                    else r.requested_max_tokens) is not None and r.output_tokens < cap
+               and (r.requested_output_tokens is not None or not r.workload.get("session_id"))
+               and r.output_tokens < (r.requested_output_tokens if r.requested_output_tokens is not None
+                                      else r.requested_max_tokens)
                for r in work):
             notes.append("An answer ended before its requested output shape was exercised.")
         qualification = None
@@ -367,11 +393,14 @@ def _fairness(observation, window, users, records, criteria, health, lag, timing
             notes.append("Client scheduling delay affects user timing.")
         streams[uid] = [r.model_copy(update={"stream_end_ms": r.last_output_ms}) for r in samples
                         if r.stream and r.answer_reads >= 2 and r.answer_chunks >= 2]
+        lengths = {"input_median_tokens": [r.input_tokens for r in samples],
+                   "output_median_tokens": [r.output_tokens for r in samples],
+                   "uncached_input_median_tokens": uncached,
+                   "total_generated_median_tokens": [_total_generated_tokens(r) for r in samples]}
+        for field, values in lengths.items():
+            length_samples[field].append(values)
         measurements.append({"user_id": uid, "reasons": notes, "valid_samples": len(samples),
-                             "input_median_tokens": median([r.input_tokens for r in samples]),
-                             "output_median_tokens": median([r.output_tokens for r in samples]),
-                             "uncached_input_median_tokens": median(uncached),
-                             "total_generated_median_tokens": median([_total_generated_tokens(r) for r in samples]),
+                             **{field: median(values) for field, values in lengths.items()},
                              "active_exposure_ms": exposure, "input_qualification": qualification})
     overlap_users = []
     for measured in measurements:
@@ -393,6 +422,8 @@ def _fairness(observation, window, users, records, criteria, health, lag, timing
         values = [item[field] for item in measurements if item[field] is not None]
         if values and max(values) > min(values) * (1 + tolerance / 100):
             reasons.append(f"Work not comparable: {label} differ by more than {tolerance:g}%.")
+        elif field in length_samples and _length_mix_differs(length_samples[field], tolerance):
+            reasons.append(f"Work not comparable: {label.replace('median ', '')} have different per-request mixes.")
     rates = [user["output_tokens_per_second"] for user in users]
     ratio = median(rates) / min(rates) if rates and all(value is not None and value > 0 for value in rates) else None
     for measured in measurements:
