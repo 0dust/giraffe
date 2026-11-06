@@ -611,7 +611,10 @@ def test_cancellation_followup_does_not_substitute_for_peer_overlap(delayed):
     assert source == original
 
 
-def test_failed_cancellation_followup_is_named_when_both_users_pass():
+@pytest.mark.parametrize(("peer_overlap", "error_limit", "expected"), [
+    (True, 50, "fail"), (False, 50, "inconclusive"), (False, 0, "fail"),
+])
+def test_failed_cancellation_followup_requires_peer_overlap(peer_overlap, error_limit, expected):
     from tests.test_multi_user_metrics import observation
 
     cancelled = record("user-01", identity="cancelled", status="cancelled", valid=False, intentional=True,
@@ -622,10 +625,11 @@ def test_failed_cancellation_followup_is_named_when_both_users_pass():
     failed = record("user-01", identity="failed", dispatch=350, end=500, status="failed", valid=False)
     for item in (followup, failed):
         item.workload["cancellation_role"] = "followup"
-    peer = record("user-02", identity="peer", end=400, stream=True, answer_reads=2,
+    peer = record("user-02", identity="peer", dispatch=0 if peer_overlap else 200,
+                  end=400 if peer_overlap else 600, stream=True, answer_reads=2,
                   answer_chunks=2, last_output_ms=200)
     records = [cancelled, followup, failed, peer]
-    source = observation(records, criteria={"max_error_percent": 50})
+    source = observation(records, criteria={"max_error_percent": error_limit})
     source["windows"][0].update(scenario="cancellation", selected_user_id="user-01", role="cancellation")
     cfg = settings(levels=[2], scenarios=["cancellation"], cancellation={"user_id": "user-01"})
     target = cfg.targets[0]
@@ -634,12 +638,15 @@ def test_failed_cancellation_followup_is_named_when_both_users_pass():
     state.observations[target.name]["multi_user"] = source
 
     check = result(state, target)
-    assert check.status == "fail"
-    assert check.metrics["multi_user"]["failed_user_windows"] == 0
+    assert check.status == expected
+    assert check.metrics["multi_user"]["failed_user_windows"] == (0 if error_limit else 1)
     evidence = check.metrics["multi_user"]["windows"][0]["cancellation"]
-    assert evidence["cancellation"]["status"] == evidence["peer_continuation"]["status"] == "pass"
+    assert evidence["status"] == ("fail" if peer_overlap else "inconclusive")
+    assert evidence["cancellation"]["status"] == "pass"
+    assert evidence["peer_continuation"]["status"] == ("pass" if peer_overlap else "inconclusive")
     assert evidence["followup"]["status"] == "fail"
-    assert check.summary == "Same-user cancellation follow-up failed for user-01."
+    if peer_overlap:
+        assert check.summary == "Same-user cancellation follow-up failed for user-01."
 
 
 def test_http_global_stop_cancels_all_users_and_retains_partial_once():
@@ -713,6 +720,8 @@ def test_cancel_selected_request_before_admission_sends_nothing_and_peers_surviv
 @pytest.mark.parametrize("trigger", ["before_output", "during_stream"])
 @pytest.mark.parametrize("profile", ["long_short", "short_long"])
 def test_http_noisy_neighbors_replay_short_work_and_observe_injected_slowdown(trigger, profile, monkeypatch):
+    from threading import local
+
     from giraffe.client import LLMClient
     from giraffe.models import Target
     from tests.fake_endpoint import FakeEndpoint
@@ -742,28 +751,38 @@ def test_http_noisy_neighbors_replay_short_work_and_observe_injected_slowdown(tr
     monkeypatch.setattr(local_tokenizer, "_start_worker", tokenizer_worker)
 
     class ContendedEndpoint(FakeEndpoint):
+        response = local()
+
         @property
         def chunk_delay(self):
-            return .012 if self.active > 1 else .001
+            if self.response.heavy:
+                return .004
+            self.response.contended |= self.active > 1
+            return .012 if self.response.contended else .004
 
         @chunk_delay.setter
         def chunk_delay(self, value):
             pass
 
-        @staticmethod
-        def _continue_numbered_list(prompt, answer, budget):
+        def _continue_numbered_list(self, prompt, answer, budget):
+            # Slow the short peer that experiences contention. Keep the heavy
+            # stream moving so each phase has several chances to trigger it.
+            self.response.heavy = (budget >= PROFILE["long"]["output_tokens"]
+                                   or len(prompt.split()) >= PROFILE["medium"]["input_tokens"])
+            self.response.contended = False
             return " ".join([answer, *(str(i) for i in range(budget))])
 
     async def run(endpoint):
+        # The short stream stays open long enough to admit a during-stream probe.
         # Several matched pairs keep one delayed control from dominating the median.
-        cfg = settings(levels=[2], duration_seconds=1.5, scenarios=["noisy_neighbors"], profile=PROFILE,
+        cfg = settings(levels=[2], duration_seconds=2.25, scenarios=["noisy_neighbors"], profile=PROFILE,
             pass_criteria={"min_samples": 3},
             noisy_neighbors={"heavy_user_ids": ["user-02"], "heavy_profiles": [profile],
                              "triggers": [trigger], "max_slowdown": 1.1}).model_copy(update={
                 "targets": [Target(name="service", model="fake-model", url=endpoint.url)]})
         state = runner._Run(cfg, None, None)
         async with LLMClient(cfg.targets[0], cfg, max_connections=2) as client:
-            await asyncio.wait_for(execute(state, cfg.targets[0], client), 5)
+            await asyncio.wait_for(execute(state, cfg.targets[0], client), 8)
         controls = {r.workload["matched_work_sequence"]: r for r in state.records if r.workload.get("role") == "control"}
         probes = [r for r in state.records if r.workload.get("role") == "probe" and r.workload["user_id"] == "user-01"]
         assert probes and all(r.workload["matched_work_sha256"] == controls[r.workload["matched_work_sequence"]].workload["matched_work_sha256"] for r in probes)
@@ -778,7 +797,7 @@ def test_http_noisy_neighbors_replay_short_work_and_observe_injected_slowdown(tr
         assert user["heavy_request_ids"]
         assert state.slots.qsize() == 2
 
-    with ContendedEndpoint(first_token_delay=.03) as endpoint:
+    with ContendedEndpoint(first_token_delay=.05) as endpoint:
         asyncio.run(run(endpoint))
 
 

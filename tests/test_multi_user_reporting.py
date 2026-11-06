@@ -605,7 +605,7 @@ def test_unqualified_scenario_cannot_pass_baseline_with_complete_user_delivery()
     assert any("scenario" in reason.lower() for reason in compared.baseline["targets"][0]["reasons"])
 
 
-@pytest.mark.parametrize("exposure", ["missing", "partial", "complete", "late_unmatched"])
+@pytest.mark.parametrize("exposure", ["missing", "partial", "complete", "late_unmatched", "changed_heavy"])
 def test_probe_timing_regression_requires_heavy_overlap_in_both_runs(exposure):
     current, baseline = scenario_report(), scenario_report()
     late_unmatched = exposure == "late_unmatched"
@@ -614,8 +614,11 @@ def test_probe_timing_regression_requires_heavy_overlap_in_both_runs(exposure):
         windows.pop()  # Compare the noisy-neighbor probe on its own.
         windows[0]["users"] = windows[0]["users"][:1]
         evidence = windows[0]["interference"]
+        heavy = next(item for item in report.requests if item.id == "user-05-0").model_copy(update={"check_ids": []})
+        if exposure == "changed_heavy" and report is current:
+            heavy.input_tokens *= 2
         report.requests = [item for item in report.requests if item.workload["user_id"] == "user-01"]
-        user_requests = report.requests
+        user_requests = list(report.requests)
         if late_unmatched:
             user_requests[-1].completed_ms = windows[0]["end_ms"] + 100
             windows[0]["users"][0]["output_tokens_per_second"] = 70
@@ -625,14 +628,22 @@ def test_probe_timing_regression_requires_heavy_overlap_in_both_runs(exposure):
             matched_requests = user_requests[:-1] if late_unmatched else user_requests
             if report is current and exposure == "partial":
                 matched_requests = matched_requests[:1]
+            controls = [item.model_copy(deep=True, update={"id": f"control-{item.id}", "check_ids": []})
+                        for item in matched_requests]
             evidence["users"][0].update(status="pass", qualified=True, reasons=[],
+                                        matched_samples=len(matched_requests),
+                                        control_request_ids=[item.id for item in controls],
                                         probe_request_ids=[item.id for item in matched_requests])
-        for item in report.requests:
+            report.requests.extend([*controls, heavy])
+        for item in user_requests:
             item.workload.update(scenario="noisy_neighbors", role="probe",
                                  trigger="during_stream", heavy_profile="long_short",
                                  population=windows[0]["population"])
             if report is current and item.workload["user_id"] == "user-01":
                 item.completed_ms += 100
+        if exposure == "changed_heavy" and report is current:
+            windows[0]["users"][0].update(status="fail", criteria={"max_completion_ms": {"status": "fail", "missed": 1}})
+            report.checks[0].status = report.overall = "fail"
 
     compared = compare_baseline(current, baseline)
     row = next(row for row in compared.baseline["targets"][0]["comparisons"]
@@ -642,8 +653,12 @@ def test_probe_timing_regression_requires_heavy_overlap_in_both_runs(exposure):
     delivery = next(row for row in compared.baseline["targets"][0]["comparisons"]
                     if row["metric"] == "shared_window_output_tokens_per_second" and row.get("user_id") == "user-01")
     assert delivery["current"] == delivery["baseline"] == (70 if late_unmatched else 80)
-    assert delivery["status"] == ("pass" if exposure in {"complete", "late_unmatched"} else "inconclusive")
+    assert delivery["status"] == ("pass" if exposure in {"complete", "late_unmatched", "changed_heavy"} else "inconclusive")
     assert compared.baseline["status"] == {"complete": "fail", "late_unmatched": "pass"}.get(exposure, "inconclusive")
+    if exposure == "changed_heavy":
+        acceptance = next(row for row in compared.baseline["targets"][0]["comparisons"] if row["metric"] == "user_acceptance")
+        assert acceptance["status"] == "inconclusive" and "heavy work differs" in acceptance["reason"]
+        assert compared.baseline["acceptance"]["current"] == "fail"
 
 
 @pytest.mark.parametrize(("criterion", "expected"), [
@@ -678,7 +693,7 @@ def test_new_interference_failure_survives_incomplete_peer_cancellation_baseline
     for report in (current, previous):
         interference = report.checks[0].metrics["multi_user"]["windows"][0]["interference"]
         interference.update(status="pass", qualified=True, reasons=[])
-        interference["users"][0].update(status="pass", qualified=True, reasons=[])
+        interference["users"][0].update(status="pass", qualified=True, reasons=[], matched_samples=1)
     current.checks[0].metrics["multi_user"]["windows"][0]["interference"]["users"][0].update(
         status="fail", reasons=["Short user slowdown exceeds the selected limit."])
     compared = compare_baseline(current, previous)
@@ -687,33 +702,43 @@ def test_new_interference_failure_survives_incomplete_peer_cancellation_baseline
                for row in compared.baseline["targets"][0]["comparisons"])
 
 
-def test_interference_baseline_attributes_matched_slowdown_only_to_short_user():
+@pytest.mark.parametrize(("heavy_input", "retain_heavy", "slowdown", "expected"), [
+    (256, True, 4.05, "fail"),
+    (512, True, 4.05, "inconclusive"),
+    (512, True, 1.5, "inconclusive"),
+    (256, False, 4.05, "inconclusive"),
+])
+def test_interference_baseline_attributes_matched_slowdown_only_to_short_user(heavy_input, retain_heavy, slowdown, expected):
     from tests.test_multi_user_scenarios import matched_observation
 
     current, baseline = user_report(), user_report()
     for report in (current, baseline):
         source, requests = matched_observation()
+        report.manifest["config"]["multi_user"].update(source["settings"])
         for item in requests:
             item.target = "local"
             window = next(window for window in source["windows"] if window["id"] == item.workload["window_id"])
             item.workload.update(scenario=window["scenario"], trigger=window["trigger"],
                                  heavy_profile=window["heavy_profile"], population=window["population"])
         if report is current:
-            requests[1].completed_ms = requests[1].workload["ready_ms"] + 810
+            requests[1].completed_ms = requests[1].workload["ready_ms"] + 200 * slowdown
             requests[1].elapsed_ms = requests[1].completed_ms - requests[1].dispatch_ms
+            requests[2].input_tokens = heavy_input
         summary = summarize(source, requests)
         interference = summary["windows"][1]["interference"]
         short, = interference["users"]
-        assert short["slowdown"] == pytest.approx(4.05 if report is current else 1.5)
-        assert interference["status"] == ("fail" if report is current else "pass")
-        report.requests = requests
+        assert short["slowdown"] == pytest.approx(slowdown if report is current else 1.5)
+        assert interference["status"] == ("fail" if report is current and slowdown > 3 else "pass")
+        report.requests = requests if report is baseline or retain_heavy else requests[:2]
         report.checks[0].metrics["multi_user"] = summary
+        report.checks[0].status = report.overall = summary["status"]
 
     compared = compare_baseline(current, baseline).baseline
     acceptance, = [row for row in compared["targets"][0]["comparisons"] if row["metric"] == "scenario_acceptance"]
-    assert acceptance["user_id"] == "user-01" and acceptance["status"] == "fail"
+    assert acceptance["user_id"] == "user-01" and acceptance["status"] == compared["status"] == expected
     assert acceptance["current_samples"] == acceptance["baseline_samples"] == 1
     assert acceptance["evidence_ids"] == [item.id for item in current.requests]
+    assert compared["acceptance"]["current"] == ("fail" if slowdown > 3 else "pass")
 
 
 def test_intentional_user_cancellation_is_not_an_ordinary_baseline_sample():

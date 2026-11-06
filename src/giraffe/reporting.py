@@ -1213,12 +1213,29 @@ def _cancellation_evidence_ids(evidence: dict, records: dict[str, RequestRecord]
                               for rid in evidence.get(name, {}).get("request_ids", []) if rid in records))
 
 
-def _interference_evidence_ids(evidence: dict, user_id: str, records: dict[str, RequestRecord]) -> list[str]:
-    if evidence.get("user_id") != user_id:
-        return []
-    cohorts = [[rid for rid in evidence.get(field, []) if rid in records]
-               for field in ("control_request_ids", "probe_request_ids", "heavy_request_ids")]
-    return list(dict.fromkeys(rid for cohort in cohorts for rid in cohort)) if all(cohorts) else []
+def _compare_interference_work(current, old, user_id, current_records, old_records, tolerance):
+    if current.get("user_id") != user_id or old.get("user_id") != user_id:
+        return [], "Matched short-user interference evidence is missing."
+
+    retained_ids, reasons = [], []
+    for role in ("control", "probe", "heavy"):
+        field = f"{role}_request_ids"
+        cohorts = []
+        complete = True
+        for evidence, records in ((current, current_records), (old, old_records)):
+            ids = evidence.get(field, [])
+            cohort = [records[rid] for rid in ids if rid in records]
+            complete = complete and bool(ids) and len(cohort) == len(ids) == len(set(ids)) and all(
+                record.status == "completed" and record.valid for record in cohort)
+            if role != "heavy" and len(ids) != evidence.get("matched_samples"):
+                complete = False
+            cohorts.append(cohort)
+        retained_ids.extend(record.id for record in cohorts[0])
+        if not complete:
+            reasons.append(f"Matched {role} request evidence is incomplete.")
+        elif any(_load_work_comparison(*cohorts)) or _user_token_work_changed(*cohorts, tolerance):
+            reasons.append(f"Matched {role} work differs or lacks observed token evidence.")
+    return list(dict.fromkeys(retained_ids)), " ".join(reasons) or None
 
 
 def _probe_has_overlap(evidence: dict, records: list[RequestRecord]) -> bool:
@@ -1312,6 +1329,7 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold):
         return rows, incomplete
     current_records = {record.id: record for record in report.requests if record.target == target}
     old_records = {record.id: record for record in baseline.requests if record.target == target}
+    tolerance = (report.manifest.get("config", {}).get("multi_user") or {}).get("fairness_tolerance_percent", 10)
     window_pairs = {}
     for key in sorted(current.keys() | previous.keys()):
         scenario, population, profile, user_id, role, trigger, heavy_profile = key
@@ -1348,6 +1366,12 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold):
         live_work_reason = ("Observed input work or live generated histories differ or lack evidence."
                             if live_work_changed else None)
         noisy_probe = scenario == "noisy_neighbors" and role == "probe"
+        short_probe = noisy_probe and any(evidence.get("user_id") == user_id
+                                          for evidence in (c_scenario, b_scenario))
+        interference_ids, interference_reason = ([], None)
+        if short_probe:
+            interference_ids, interference_reason = _compare_interference_work(
+                c_scenario, b_scenario, user_id, current_records, old_records, tolerance)
         delivery_reason = ("Shared-window delivery includes samples without qualified heavy overlap."
                            if noisy_probe and not scenario_reason and not all(
                                _probe_has_overlap(evidence, records)
@@ -1367,7 +1391,7 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold):
                "evidence_ids": [record.id for record in (current_delivery or comparable_work[0])],
                "method": "Observed completed-output delivery over matching common windows; no cross-run confidence interval."}
         if noisy_probe:
-            row["timing_exposure_qualified"] = not scenario_reason and all(
+            row["timing_exposure_qualified"] = not (scenario_reason or interference_reason) and all(
                 _probe_has_overlap(evidence, [r for r in records if r.status == "completed" and r.valid])
                 for evidence, records in ((c_scenario, current_work), (b_scenario, old_work)))
         if missing:
@@ -1387,7 +1411,24 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold):
                        reason="Observed shared-window delivery decreased beyond the selected threshold."
                               if worsening > threshold else "No material shared-window delivery decrease observed.")
         rows.append(row)
-        if (c_scenario.get("status") == "fail" and b_scenario.get("status") == "pass"
+        if short_probe and b_scenario.get("status") == "pass":
+            reason = scenario_reason or interference_reason
+            observed = c_scenario.get("status", "inconclusive")
+            if reason or observed not in {"pass", "fail"}:
+                status = "inconclusive"
+                reason = f"Multi-user {user_id} at {population} users: {reason or 'Interference evidence is unavailable.'}"
+                incomplete.append(reason)
+            else:
+                status = observed
+                reason = ("This user's previously accepted interference scenario now fails its selected criterion."
+                          if status == "fail" else "The observed slowdown remains within the selected limit.")
+            rows.append({**row, "metric": "scenario_acceptance", "status": status,
+                         "current": observed, "baseline": "pass", "aggregation": "selected_scenario_criteria",
+                         "worsening": {"fail": 100, "pass": 0}.get(status), "reason": reason,
+                         "current_samples": c_scenario.get("matched_samples", 0),
+                         "baseline_samples": b_scenario.get("matched_samples", 0), "evidence_ids": interference_ids,
+                         "observed_change": None, "observed_delta": None})
+        if (not noisy_probe and c_scenario.get("status") == "fail" and b_scenario.get("status") == "pass"
                 and not scenario_reason and not any(_load_work_comparison(current_work, old_work))):
             acceptance = {**row, "metric": "scenario_acceptance", "status": "fail",
                           "current": "fail", "baseline": "pass", "aggregation": "selected_scenario_criteria",
@@ -1398,15 +1439,7 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold):
                 old_evidence = _cancellation_evidence_ids(b_scenario, old_records)
                 acceptance.update(evidence_ids=current_evidence, current_samples=len(current_evidence),
                                   baseline_samples=len(old_evidence))
-            if noisy_probe:
-                current_evidence = _interference_evidence_ids(c_scenario, user_id, current_records)
-                old_evidence = _interference_evidence_ids(b_scenario, user_id, old_records)
-                if current_evidence and old_evidence:
-                    acceptance.update(evidence_ids=current_evidence, current_samples=c_scenario.get("matched_samples"),
-                                      baseline_samples=b_scenario.get("matched_samples"))
-                    rows.append(acceptance)
-            else:
-                rows.append(acceptance)
+            rows.append(acceptance)
         if c.get("status") == "fail" and b.get("status") == "pass":
             # Acceptance also includes attempts that drain after delivery closes.
             current_attempts = [record for record in current_work if not record.intentional]
@@ -1418,7 +1451,7 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold):
             comparable_attempts = not (attempt_reason or attempt_mix_changed or _live_input_work_changed(
                 current_attempts, old_attempts, threshold))
             failed_timing = failed_criteria & {"max_first_answer_ms", "max_completion_ms"}
-            timing_exposed = not noisy_probe or (not scenario_reason
+            timing_exposed = not noisy_probe or (not (scenario_reason or interference_reason)
                 and _probe_has_overlap(c_scenario, current_attempts)
                 and _probe_has_overlap(b_scenario, old_attempts))
             # A pending admission has no request and cannot establish heavy overlap.
@@ -1433,7 +1466,7 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold):
                           "current_samples": len(current_attempts), "baseline_samples": len(old_attempts),
                           "evidence_ids": [record.id for record in current_attempts]}
             if not (delivery_failure or attempt_failure):
-                detail = ("Timing acceptance lacks qualified heavy overlap."
+                detail = (interference_reason or "Timing acceptance lacks qualified heavy overlap."
                           if noisy_probe and failed_timing and (not timing_exposed or not observed_timing_failure)
                           else "Work behind the selected acceptance criteria differs or lacks evidence.")
                 reason = f"Multi-user {user_id} at {population} users: {detail}"
@@ -1638,7 +1671,7 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                         warn("request_mix_changed", "Request work identity shares differ by more than 10 percentage points; observed aggregate values reflect different request mixes.")
                     if metric in TIMING_METRICS:
                         if unqualified_user_probe:
-                            warn("unqualified_interference", "Noisy-neighbor probe timing requires qualified heavy overlap for the timing samples in both runs.")
+                            warn("unqualified_interference", "Noisy-neighbor probe timing requires comparable matched work and qualified heavy overlap in both runs.")
                         if load_point:
                             for label, records in (("Current", current_records), ("Baseline", old_records)):
                                 point = load_points[label].get(records[0].load_point.get("point_id"), records[0].load_point)
