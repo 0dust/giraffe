@@ -41,6 +41,12 @@ class IdentityCookieJar(CookieJar):
             super().extract_cookies(response, request)
 
 
+def gateway_identities_only(checks):
+    """GPU telemetry can accompany identity probes without shared inference."""
+    return (any(check.startswith("gateway_") for check in checks)
+            and all(check == "gpu" or check.startswith("gateway_") for check in checks))
+
+
 def identity_headers(target, alias):
     identity = target.test_identities.get(alias)
     if identity is None:

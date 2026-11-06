@@ -23,6 +23,10 @@ from giraffe.workloads import fixed_session_turns, label_prompt, prefix_admitted
 from giraffe.tool_checks import resolved_tool_fixtures, resolved_tool_modes
 
 
+def _target_count(row, target):
+    return row.get("target_request_counts", {}).get(target, row["requests_per_target"])
+
+
 def _warning_title(row):
     identifier = row["id"]
     check = {"initial": "access", "warm": "access", "context_first_batch": "context",
@@ -386,7 +390,7 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
         has_observations = bool((observations or {}).get(target.name))
         for row in ordered:
             name = row["id"]
-            count = row.get("target_request_counts", {}).get(target.name, row["requests_per_target"])
+            count = _target_count(row, target.name)
             if name == "recovery_prime" and "cancellation" in selected:
                 fixed(target.name, {"id": "recovery_wait", "title": "Recovery cleanup wait"},
                       min(5, config.effective_check("cancellation")["cleanup_seconds"]), "test_options.cancellation.cleanup_seconds")
@@ -1151,7 +1155,7 @@ def request_plan(config: RunConfig | ConfigDraft, *,
         add("gateway_attribution", count,
             "Marked identity probes use spare request budget after shared workloads on configured endpoints."
             if any(counts) else "Attribution is unavailable without a supported reader and all selected aliases.",
-            source="configured test identity references", kind="bounded" if count is None else "exact")
+            source="configured test identity references")
         if count is None:
             rows[-1]["target_request_counts"] = attribution_counts
 
@@ -1186,25 +1190,34 @@ def request_plan(config: RunConfig | ConfigDraft, *,
         warnings.append("Your dataset is inactive: select Answer correctness or Capacity under load to use it.")
     if config.overlap_models and target_count > 1:
         warnings.append("Models run at the same time and share Max concurrency. Their actual overlap depends on when request slots become free.")
-    known = sum(row.get("known_scheduled_requests", row["requests_per_target"] or 0
-                        if row["kind"] == "exact" else 0) for row in rows)
-    unknown = any(row["requests_per_target"] is None for row in rows)
+    known_counts, planned_counts, counted = {}, {}, {}
+    unknown = any(row["requests_per_target"] is None and not row.get("target_request_counts") for row in rows)
+    for target in quotas:
+        counts = [_target_count(row, target) for row in rows]
+        known_counts[target] = sum(row.get("known_scheduled_requests", count or 0
+                                           if row["kind"] == "exact" else 0)
+                                   for row, count in zip(rows, counts))
+        if not unknown:
+            planned_counts[target] = sum(counts)
+        counted[target] = sum(count if count is not None else row.get("expected_scheduled_requests", 0)
+                              for row, count in zip(rows, counts))
+    known = min(known_counts.values())
+    known_total = sum(known_counts.values())
+    planned = next(iter(planned_counts.values())) if len(set(planned_counts.values())) == 1 else None
+    planned_total = sum(planned_counts.values()) if planned_counts else None
     estimated = any(row["kind"] == "estimate" for row in rows)
     kind = "bounded" if unknown or any(row["kind"] == "bounded" for row in rows) else "estimate" if estimated else "exact"
-    planned = None if unknown else sum(row["requests_per_target"] for row in rows)
-    counted = sum(row["requests_per_target"] if row["requests_per_target"] is not None
-                  else row.get("expected_scheduled_requests", 0) for row in rows)
     adaptive_estimates = {}
     if config.max_requests is not None and "recovery" in selected and config.effective_check("recovery")["sustained_seconds"] > 0:
         adaptive_estimates["sustained"] = max(config.effective_check("recovery")["limits"]["min_samples"],
             config.effective_check("recovery")["concurrency"] * 2)
-    estimated_total = counted + sum(adaptive_estimates.values())
+    estimated_total = max(counted.values()) + sum(adaptive_estimates.values())
     # A workload row may contain both unknown refills and a known arrival
     # schedule. Preserve the additive schedule in the run headline as well as
     # in the drawer; Poisson expectations remain explicitly approximate.
     scheduled_extra = sum(row.get("expected_scheduled_requests", 0)
                           - row.get("known_scheduled_requests", 0) for row in rows)
-    headline_count = (known + scheduled_extra) * target_count
+    headline_count = known_total + scheduled_extra * target_count
     request_count_label = ("Unknown + " if unknown and headline_count else "Unknown" if unknown else "")
     if headline_count or not unknown:
         request_count_label += f"{'≈ ' if scheduled_extra or estimated else ''}{headline_count:,.0f}"
@@ -1214,7 +1227,7 @@ def request_plan(config: RunConfig | ConfigDraft, *,
             return "load_test.schedule.duration_seconds"
         if identifier.startswith("pack_"):
             return "request_pack.cases"
-        if identifier in {"arrivals", "prefix", "sessions", "consistency"}:
+        if identifier in {"arrivals", "prefix", "sessions", "consistency", "gateway_attribution"}:
             return identifier
         if identifier == "tools":
             return "tool_checks"
@@ -1228,24 +1241,33 @@ def request_plan(config: RunConfig | ConfigDraft, *,
             return "test_options.cancellation"
         return "test_options." + ("context" if identifier == "context_first_batch" else identifier)
 
+    def required_cap(counts):
+        # A remainder slot goes to each earlier endpoint before the next one.
+        return max(((count - 1) * target_count + index + 1
+                    for index, count in enumerate(counts.values()) if count), default=0)
+
+    exact_limit = required_cap(planned_counts) if kind == "exact" else None
+    required = exact_limit if exact_limit is not None else required_cap(known_counts)
+    if load_plan:
+        # Calibration has a finite attempt allowance. A suggested budget must
+        # cover that allowance as well as scheduled work.
+        calibration = sum(row["requests_per_target"] or 0 for row in rows if row["id"] == "load_calibration")
+        required = required_cap({target: math.ceil(planned_counts[target] if planned_counts else count + calibration)
+                                 for target, count in known_counts.items()})
+
     request_warnings = []
+    affected_targets = []
     for target, quota in quotas.items():
         if quota is None:
             continue
-        if known > quota or planned is not None and planned > quota:
+        if known_counts[target] > quota or planned_counts.get(target, 0) > quota:
             elapsed, cut = 0, []
+            affected_targets.append((target, quota))
             for row in rows:
-                row_count = row["requests_per_target"] or row.get("known_scheduled_requests", 0)
+                row_count = _target_count(row, target) or row.get("known_scheduled_requests", 0)
                 elapsed += row_count
                 if elapsed > quota and row_count:
                     cut.append(row)
-            required = planned * target_count if kind == "exact" else known * target_count
-            if load_plan:
-                # Calibration has a finite attempt allowance. A suggested
-                # budget must cover that allowance as well as scheduled work.
-                required = math.ceil(planned if planned is not None else known + sum(
-                    row["requests_per_target"] or 0 for row in rows
-                    if row["id"] == "load_calibration")) * target_count
             fields = list(dict.fromkeys(["max_requests", *[edit_field(row) for row in cut]]))
             titles = list(dict.fromkeys(_warning_title(row) for row in cut))
             edits = list({(action["label"], action["field"]): action for action in [
@@ -1276,8 +1298,6 @@ def request_plan(config: RunConfig | ConfigDraft, *,
                     "fields": list(dict.fromkeys(field for item in notices for field in item["fields"]))}
         if warning_kind == "incomplete_coverage":
             combined["cut_checks"] = list(dict.fromkeys(check for item in notices for check in item["cut_checks"]))
-            affected_targets = [(target, quota) for target, quota in quotas.items()
-                                if quota is not None and (known > quota or planned is not None and planned > quota)]
             combined["targets"] = [{"target": target, "quota": quota, "cut_checks": item["cut_checks"]}
                                    for (target, quota), item in zip(affected_targets, notices)]
             combined["values"] = {**combined["values"], "quotas": quotas}
@@ -1314,7 +1334,9 @@ def request_plan(config: RunConfig | ConfigDraft, *,
     return {**timing, "arrival_history": arrival_history, "correctness_history": correctness_history,
             "count_kind": kind, "planned_per_target": planned,
             **({"request_count_label": request_count_label} if load_plan else {}),
-            "planned_total": planned * target_count if planned is not None else None,
+            "planned_total": planned_total,
+            **({"planned_target_counts": planned_counts} if planned_counts and planned is None else {}),
+            **({"known_target_counts": known_counts} if len(set(known_counts.values())) > 1 else {}),
             "conservative_requests_per_target": estimated_total, "adaptive_estimates": adaptive_estimates,
             "load_test": load_plan,
             "request_settings": {check: (config.effective_check(check) | {
@@ -1331,9 +1353,9 @@ def request_plan(config: RunConfig | ConfigDraft, *,
             "capacity_warnings": capacity_warnings,
             "required_concurrency": required_concurrency(config),
             "minimum_reserved_per_target": known + (minimum_reservation(config.load_test) if load_plan else 0),
-            "known_per_target": known, "known_total": known * target_count,
+            "known_per_target": known, "known_total": known_total,
             "request_warnings": request_warnings, "request_limit": config.max_requests, "memory_limit_bytes": config.max_memory_mb * 1024**2,
             "memory_limit_label": "Maximum memory (RAM growth during this run)",
-            "required_request_limit": planned * target_count if kind == "exact" else None,
+            "required_request_limit": exact_limit,
             "target_quotas": quotas, "rows": rows, "bucket_cases": bucket_cases,
             "bucket_levels": bucket_levels, "evaluator": evaluator, "warnings": warnings}

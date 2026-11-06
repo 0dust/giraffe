@@ -118,7 +118,7 @@ async def test_mixed_run_distinguishes_unsupported_reader_from_denied_reader(mon
     assert attribution.required is required and report.overall == overall
 
 
-@pytest.mark.parametrize("reader,cap", [("unsupported", 5), ("verified", 7), ("later_unsupported", 7)])
+@pytest.mark.parametrize("reader,cap", [("unsupported", 5), ("verified", 8), ("later_unsupported", 8)])
 async def test_attribution_preserves_shared_sessions_and_uses_spare_budget(monkeypatch, local_tokenizer, reader, cap):
     cfg = config(stream=True)
     cfg.checks = ["access", "sessions", "gateway_attribution"]
@@ -171,8 +171,93 @@ async def test_attribution_preserves_shared_sessions_and_uses_spare_budget(monke
     assert attribution.metrics["state"] == ("verified" if reader == "verified" else "unsupported")
     assert attribution.required is (reader == "verified")
     assert report.overall == "pass"
-    assert traffic[:6] == ["shared"] * 5 + ["reader"]
+    assert traffic[:cap - (0 if reader == "unsupported" else 2) + 1] == (
+        ["shared"] * (5 if reader == "unsupported" else 6) + ["reader"])
     assert traffic.count("identity") == (0 if reader == "unsupported" else 2)
+
+
+@pytest.mark.parametrize("overlap,reader_delay", [(False, .36), (False, .01), (True, .01)])
+async def test_attribution_waits_for_all_shared_targets(monkeypatch, local_tokenizer, overlap, reader_delay):
+    cfg = config(stream=False)
+    cfg.checks = ["access", "gateway_attribution"]
+    cfg.max_duration_seconds = 1
+    cfg.max_requests = 6
+    cfg.gateway_attribution.settle_seconds = .5
+    cfg.overlap_models = overlap
+    first = cfg.targets[0]
+    cfg.targets.append(first.model_copy(update={"name": "second", "url": "http://second/v1", "gateway": None}))
+    for ref in ("ALICE", "BOB", "OBSERVER"):
+        monkeypatch.setenv(ref, "secret-" + ref)
+    traffic = []
+
+    async def handler(request):
+        if request.method == "GET":
+            if request.url.path == "/spend/logs/v2":
+                traffic.append("reader")
+                await asyncio.sleep(reader_delay)
+            return httpx.Response(404)
+        assert "x-litellm-trace-id" not in request.headers
+        await asyncio.sleep(.72 if request.url.host == "second" else .02)
+        traffic.append(request.url.host)
+        return httpx.Response(200, json={"choices": [{"message": {"content": "OK"}, "finish_reason": "stop"}],
+                                         "usage": {"prompt_tokens": 3, "completion_tokens": 5}})
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
+    report = await run_suite(cfg)
+    checks = {(check.target, check.id): check for check in report.checks}
+    assert checks["proxy", "access"].status == checks["second", "access"].status == "pass"
+    assert traffic == ["proxy", "second", "reader"]
+    assert not report.abort_reason
+    attribution = checks["proxy", "gateway_attribution"]
+    if reader_delay > .1:
+        assert attribution.metrics["state"] == "unavailable" and attribution.required
+    else:
+        assert attribution.metrics["state"] == "unsupported" and not attribution.required
+        assert report.overall == "pass"
+
+
+async def test_attribution_does_not_reserve_shared_token_evidence_slot(monkeypatch, local_tokenizer):
+    cfg = config(stream=True)
+    cfg.checks = ["access", "generation", "gateway_attribution"]
+    cfg.samples = 2
+    cfg.limits.min_samples = 2
+    cfg.limits.min_output_tokens_per_second = 1
+    cfg.max_requests = 4
+    cfg.gateway_attribution.settle_seconds = .2
+    for ref in ("ALICE", "BOB", "OBSERVER"):
+        monkeypatch.setenv(ref, "secret-" + ref)
+
+    class Answer(httpx.AsyncByteStream):
+        def __init__(self, body):
+            self.body = body
+
+        async def __aiter__(self):
+            for part in ("Hello ", "there."):
+                await asyncio.sleep(.015)
+                choice = {"delta": {"content": part}}
+                if self.body.get("logprobs"):
+                    choice["logprobs"] = {"content": [{"token": part}]}
+                yield ("data: " + json.dumps({"choices": [choice]}) + "\n\n").encode()
+            yield b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+            if self.body.get("stream_options", {}).get("include_usage"):
+                yield b'data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":2}}\n\n'
+            yield b'data: [DONE]\n\n'
+
+    def handler(request):
+        if request.method == "GET":
+            return httpx.Response(404)
+        assert "x-litellm-trace-id" not in request.headers
+        return httpx.Response(200, stream=Answer(json.loads(request.content)))
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
+    report = await run_suite(cfg)
+    checks = {check.id: check for check in report.checks}
+    assert checks["access"].status == checks["generation"].status == "pass"
+    assert checks["gateway_attribution"].metrics["state"] == "unsupported"
+    assert [r.output_tokens for r in report.requests if r.scenario == "generation"] == [2, 2]
+    assert sum(r.scenario == "performance_evidence_probe" for r in report.requests) == 1
 
 
 async def test_attribution_does_not_reserve_requests_from_recovery(monkeypatch, local_tokenizer):
@@ -207,10 +292,25 @@ def test_plan_does_not_reserve_attribution_on_unsupported_targets():
     assert plan["planned_total"] == plan["minimum_reserved_per_target"] == 0
 
     cfg.targets = [supported, unsupported]
+    cfg.checks = ["access", "gateway_attribution"]
+    cfg.max_requests = 4
     plan = request_plan(cfg)
     row = next(row for row in plan["rows"] if row["id"] == "gateway_attribution")
     assert row["target_request_counts"] == {"proxy": 2, "other": 0}
     assert all(item["target"] == "proxy" for item in plan["unknown_time_components"])
+    assert plan["planned_target_counts"] == plan["known_target_counts"] == {"proxy": 3, "other": 1}
+    assert plan["known_total"] == plan["planned_total"] == 4
+    assert plan["count_kind"] == "exact"
+    assert plan["required_request_limit"] == 5
+    assert plan["target_quotas"] == {"proxy": 2, "other": 2}
+    warning, = plan["request_warnings"]
+    assert warning["kind"] == "incomplete_coverage" and warning["cut_checks"] == ["gateway_attribution"]
+    assert warning["msg"].startswith("proxy:")
+    assert warning["actions"][0]["value"] == 5
+
+    # Equal total work needs a larger cap when the high-count endpoint gets its remainder last.
+    cfg.targets.reverse()
+    assert request_plan(cfg)["required_request_limit"] == 6
 
 
 @pytest.mark.parametrize("fault", ["reused_id", "wrong_session", "missing_id", "unknown_local"])

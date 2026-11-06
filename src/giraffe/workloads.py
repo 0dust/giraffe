@@ -510,7 +510,7 @@ async def tools(run, target, client):
                     run.finish_condition(target.name, scenario, request.workload, reason=reason)
 
 
-async def execute(run, target, client, fixtures):
+async def execute(run, target, client, fixtures, *, defer_attribution=False):
     from giraffe.load_test import execute as load_test
     from giraffe.multi_user import execute as multi_user
     from giraffe.gateway_attribution import execute as gateway_attribution
@@ -523,6 +523,8 @@ async def execute(run, target, client, fixtures):
         ("tool_calling", tools),
         ("gateway_attribution", gateway_attribution),
     ):
+        if defer_attribution and field == "gateway_attribution":
+            continue
         selected = WORKLOAD_CHECKS[field].intersection(run.config.checks)
         if selected and (getattr(run.config, field) or field == "gateway_attribution"):
             run.emit("scenario_started", target.name, field)

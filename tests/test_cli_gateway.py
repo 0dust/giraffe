@@ -15,11 +15,15 @@ def test_gateway_only_cli_sends_only_selected_identity_completions(shared, monke
     run_cli(monkeypatch, tmp_path, capsys, shared=shared)
 
 
+def test_gpu_with_attribution_does_not_require_a_shared_key(monkeypatch, tmp_path, capsys):
+    run_cli(monkeypatch, tmp_path, capsys, shared="missing_env", gpu=True)
+
+
 def test_mixed_cli_retains_shared_completion_preflight(monkeypatch, tmp_path, capsys):
     run_cli(monkeypatch, tmp_path, capsys, shared="configured", mixed=True)
 
 
-def run_cli(monkeypatch, tmp_path, capsys, *, shared, mixed=False):
+def run_cli(monkeypatch, tmp_path, capsys, *, shared, mixed=False, gpu=False):
     cfg = config(stream=False)
     if shared != "absent":
         cfg.targets[0].api_key_env = "SHARED_KEY"
@@ -31,6 +35,8 @@ def run_cli(monkeypatch, tmp_path, capsys, *, shared, mixed=False):
         monkeypatch.setenv(ref, "secret-" + ref)
     if mixed:
         cfg.checks.insert(0, "access")
+    if gpu:
+        cfg.checks.append("gpu")
     rows, completions = [], []
 
     def handler(request):

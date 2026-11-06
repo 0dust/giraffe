@@ -149,19 +149,18 @@ def _spend_page(client, url, marker, start_date, end_date, page, page_size):
         "page_size": page_size, "start_date": start_date, "end_date": end_date})
 
 
-async def preflight_unsupported_reader(run, target):
-    """Detect unsupported readers before spending remaining inference budget."""
+async def _reader_preflight(run, target, headers):
+    """Check the evidence endpoint without admitting an inference request."""
     gateway = target.gateway
     now = time.monotonic()
     stop_reason = run.stop_reason(target.name)
     if stop_reason and stop_reason != "maximum request budget reached":
-        return False
+        return None
     timeout = min(run.config.gateway_attribution.settle_seconds, run.config.metrics_timeout_seconds,
                   (run.deadline - now) / 2)
     if timeout <= 0:
-        return False
+        return None
     try:
-        headers = credential_headers(gateway)
         marker = "giraffe-" + uuid.uuid4().hex
         current = datetime.now(timezone.utc)
         start_date = current.strftime("%Y-%m-%d %H:%M:%S")
@@ -171,14 +170,9 @@ async def preflight_unsupported_reader(run, target):
                 reader = await asyncio.to_thread(_client, run.config, headers, timeout)
                 async with reader:
                     async with _spend_page(reader, gateway.url, marker, start_date, end_date, 1, 1) as response:
-                        unsupported = response.status_code in _UNSUPPORTED_READER_STATUSES
+                        return response.status_code
     except (httpx.HTTPError, OSError, TimeoutError, ValueError):
-        return False
-    if unsupported:
-        run.observations[target.name][CHECK] = _state(
-            "unsupported", "Read-only gateway spend logs are unsupported.",
-            planned_requests=0, observed_requests=0)
-    return unsupported
+        return None
 
 
 async def _pages(client, url, marker, *, start_date, end_date, max_rows, stop):
@@ -230,7 +224,7 @@ async def _pages(client, url, marker, *, start_date, end_date, max_rows, stop):
     return rows, False
 
 
-async def execute(run, target, client):
+async def execute(run, target, client, *, deferred=False):
     settings, gateway = run.config.gateway_attribution, target.gateway
     observation = _state("unavailable", "Gateway evidence endpoint and credentials are not configured.")
     run.observations[target.name][CHECK] = observation
@@ -255,8 +249,14 @@ async def execute(run, target, client):
     except ValueError:
         observation.update(reason="Gateway reader or selected identity credentials are unavailable.")
         return
-    if run.config.max_requests is not None and len(run.config.checks) > 1:
-        if await preflight_unsupported_reader(run, target):
+    if deferred or run.config.max_requests is not None and len(run.config.checks) > 1:
+        reader_status = await _reader_preflight(run, target, headers)
+        if reader_status in _UNSUPPORTED_READER_STATUSES:
+            observation.update(state="unsupported", reason="Read-only gateway spend logs are unsupported.",
+                               planned_requests=0, observed_requests=0)
+            return
+        if deferred and reader_status != 200:
+            observation.update(reason="Read-only gateway spend logs were unavailable within the remaining run budget.")
             return
     marker = "giraffe-" + uuid.uuid4().hex
     start_date = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
