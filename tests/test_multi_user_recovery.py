@@ -235,7 +235,7 @@ def test_recovery_baseline_qualifies_tokens_by_matched_work(monkeypatch, local_t
     cfg = settings(levels=[2], scenarios=["recovery"], profile=PROFILE, recovery={
         "control_seconds": 1, "sustained_seconds": 1, "lighter_seconds": 1,
         "lighter_requests_per_second": 4, "sustained_requests_per_second": 8, "max_slowdown": limit,
-    }).model_copy(update={"custom_fixtures": str(fixtures)})
+    }, pass_criteria={"max_completion_ms": 50}).model_copy(update={"custom_fixtures": str(fixtures)})
 
     class Observed(FakeClient):
         delay = .02
@@ -276,16 +276,21 @@ def test_recovery_baseline_qualifies_tokens_by_matched_work(monkeypatch, local_t
     comparison = compare_baseline(current, baseline).baseline
     rows = comparison["targets"][0]["comparisons"]
     acceptance = [row for row in rows if row["metric"] == "scenario_acceptance"]
+    selected = [row for row in rows if row["metric"] == "user_acceptance"]
     delivery = [row for row in rows if row["metric"] == "shared_window_output_tokens_per_second"]
     expected = "inconclusive" if swap_work else "fail" if slower else "pass"
     assert comparison["status"] == expected
     if slower:
         assert len(acceptance) == 2 and {row["status"] for row in acceptance} == {expected}
+        assert comparison["acceptance"] == {"current": "fail", "baseline": "pass"}
+        assert len(selected) == 2 and {row["status"] for row in selected} == {expected}
+        if swap_work:
+            assert all("Observed work behind timing acceptance differs" in row["reason"] for row in selected)
         if slower == "all":
             latency = [row for row in rows if row["metric"] == "latency_ms" and row.get("role") == "lighter"]
             assert len(latency) == 2 and {row["status"] for row in latency} == {expected}
     else:
-        assert not acceptance
+        assert not (acceptance or selected)
         observed = [row for row in rows if row["metric"] == "matched_recovery_slowdown"]
         assert len(observed) == (2 if swap_work else 0)
         for row in observed:
@@ -296,6 +301,60 @@ def test_recovery_baseline_qualifies_tokens_by_matched_work(monkeypatch, local_t
             assert len(evidence) == 16 and {r.workload["user_id"] for r in evidence} == {row["user_id"]}
             assert {r.workload["role"] for r in evidence} == {"control", "sustained", "lighter"}
     assert len(delivery) == 6 and all(row["status"] == "pass" and row["current"] == row["baseline"] for row in delivery)
+
+
+@pytest.mark.parametrize(("generation_swapped", "completion_breached", "expected"), [
+    (False, False, "fail"),
+    (False, True, "fail"),
+    (True, False, "inconclusive"),
+])
+def test_recovery_first_answer_acceptance_qualifies_independently(
+        generation_swapped, completion_breached, expected):
+    from giraffe.models import RunReport
+    from giraffe.reporting import compare_baseline
+    from tests.test_multi_user_reporting import user_report
+
+    def report(changed):
+        source, records = recovery_observation(lighter_rate=4, sustained_rate=8)
+        source["settings"]["pass_criteria"].update(max_first_answer_ms=40, max_completion_ms=150)
+        result = user_report()
+        target = result.manifest["config"]["targets"][0]["name"]
+        result.manifest["config"]["multi_user"] = source["settings"]
+        result.manifest["config"]["limits"]["min_samples"] = 4
+        for request in records:
+            request.target = target
+            request.workload["population"] = 3
+            sequence = request.workload["matched_work_sequence"]
+            request.output_tokens = 16 if (sequence % 2 == 1) != changed else 2
+            request.completion_tokens = request.output_tokens if generation_swapped else 16
+            request.reasoning_tokens = request.completion_tokens - request.output_tokens
+            if request.workload["role"] == "lighter":
+                # All normal completions are 100ms. The selected user breaches
+                # first answer and can also breach completion on the same work.
+                slow = changed and request.workload["user_id"] == "user-03"
+                latency = 160 if slow and completion_breached else 100
+                request.first_output_ms = 60 if slow else 20
+                request.completed_ms = request.dispatch_ms + latency
+                request.elapsed_ms = request.stream_end_ms = latency
+                request.last_output_ms = latency - 10
+        summary = summarize(source, records)
+        result.requests = records
+        result.checks[0].status = result.overall = summary["status"]
+        result.checks[0].metrics["multi_user"] = summary
+        result.observations = {"targets": {target: {"multi_user": {**source, "summary": summary}}}}
+        return RunReport.model_validate_json(result.model_dump_json())
+
+    current, previous = report(True), report(False)
+    assert (current.overall, previous.overall) == ("fail", "pass")
+    latest = current.checks[0].metrics["multi_user"]["windows"][-1]["users"][-1]["criteria"]
+    assert latest["max_first_answer_ms"]["status"] == "fail"
+    assert latest["max_completion_ms"]["status"] == ("fail" if completion_breached else "pass")
+    compared = compare_baseline(current, previous).baseline
+    rows = {row["metric"]: row for row in compared["targets"][0]["comparisons"]
+            if row.get("user_id") == "user-03" and row.get("role") == "lighter"}
+    assert rows["first_output_ms"]["status"] == rows["user_acceptance"]["status"] == compared["status"] == expected
+    assert rows["latency_ms"]["status"] == "inconclusive"
+    assert rows["shared_window_output_tokens_per_second"]["status"] == "pass"
 
 
 @pytest.mark.parametrize("case", ["control_drain", "lighter_drain", "swapped_sustained_work"])
