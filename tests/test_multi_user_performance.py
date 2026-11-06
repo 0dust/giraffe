@@ -60,6 +60,58 @@ def test_saved_multi_user_stage_numbers_do_not_join_capacity_baselines():
     assert data["metrics"]["baseline_throughput"]["value"] is None
 
 
+@pytest.mark.parametrize(("scenario", "role"), [("arrivals", "arrivals"), ("recovery", "control")])
+@pytest.mark.parametrize("legacy_timing", [False, True])
+def test_full_multi_user_window_binds_only_matching_baseline_cohorts(scenario, role, legacy_timing):
+    from giraffe.reporting import compare_baseline
+
+    report = user_report()
+    user_window = report.checks[0].metrics["multi_user"]["windows"][0]
+    window_id = f"multi_user_5_{scenario}" + (f"_{role}" if scenario == "recovery" else "")
+    user_window.update(id=window_id, scenario=scenario, role=role)
+    for user in user_window["users"]:
+        user["cohort"] = ("shared" if scenario == "recovery" else
+                          "newcomer" if user["user_id"] == "user-05" else "incumbent")
+    cohorts = {user["user_id"]: user["cohort"] for user in user_window["users"]}
+    for request in report.requests:
+        request.scenario = window_id
+        request.workload.update(window_id=window_id, scenario=scenario, role=role,
+                                population=user_window["population"], cohort=cohorts[request.workload["user_id"]])
+    report.observations["targets"]["local"]["schedule_transitions"] = [{
+        "stage_id": window_id, "check_id": "multi_user", "kind": "arrival_rate",
+        "start_ms": 0, "end_ms": 4000, "intended_rate_rps": 5,
+    }]
+
+    compared = compare_baseline(report, report)
+    comparisons = compared.baseline["targets"][0]["comparisons"]
+    timing = [row for row in comparisons if row["metric"] in {"latency_ms", "first_output_ms"}]
+    delivery = [row for row in comparisons if row["metric"] == "shared_window_output_tokens_per_second"]
+    assert len(timing) == 10 and len(delivery) == 5
+    comparisons.extend([
+        {**timing[0], "cohort": "different", "status": "fail"},
+        {**timing[0], "window_id": "another-window", "status": "fail"},
+        {**timing[0], "check": "serving", "scenario": window_id, "status": "fail"},
+        {**delivery[0], "cohort": "different", "status": "fail"},
+    ])
+    if legacy_timing:
+        for row in timing:
+            row.pop("cohort", None)
+    else:
+        assert all(row.get("cohort") == cohorts[row["user_id"]] for row in timing)
+
+    full = f"full:{window_id}"
+    target = build_performance(compared, window=full)["targets"][0]
+    metrics = target["summaries"][full]["metrics"]
+    assert metrics["baseline_timing"]["value"] == timing
+    assert metrics["baseline_throughput"]["value"] == delivery
+    assert metrics["baseline_capacity"]["value"] is None
+
+    stage = f"stage:0:{window_id}"
+    target = build_performance(compared, window=stage)["targets"][0]
+    for metric in ("baseline_timing", "baseline_throughput"):
+        assert target["summaries"][stage]["metrics"][metric]["value"] is None
+
+
 def test_scheduled_user_and_capacity_windows_keep_separate_offer_ledgers():
     from tests.test_multi_user_metrics import record
 

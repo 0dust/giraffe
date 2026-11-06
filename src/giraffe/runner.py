@@ -826,7 +826,8 @@ class _Run:
                                   "id", "target", "fixture_id", "scenario", "condition_id", "intentional", "status", "valid", "score",
                                   "elapsed_ms", "first_output_ms", "check_ids", "http_status",
                                   "request_timeout_seconds", "termination_reason", "termination_limit_seconds",
-                                  "started_at", "dispatch_ms", "completed_ms", "timing_start_ms", "request_body_sent_ms",
+                                  "started_at", "dispatch_ms", "completed_ms", "timing_start_ms",
+                                  *({"request_body_sent_ms"} if record.request_body_sent_ms is not None else ()),
                                   "timing_schema", "first_token_ms", "first_reasoning_ms", "last_output_ms",
                                   "stream", "stream_end_ms", "answer_reads", "answer_chunks", "answer_chars",
                                   "first_read_answer_chars", "max_stream_gap_ms", "input_tokens", "output_tokens",
@@ -1090,8 +1091,17 @@ def _target_error(run, target, enabled, exc):
     run.unfinished[target.name].update(enabled)
 
 
-async def _target(run: _Run, target: Target, fixtures: dict):
+def _identity_only_target(target):
+    # Gateway probes never require or inherit shared credentials.
+    identity_target = target.model_copy(update={"api_key_env": None, "headers_env": {}})
+    identity_target._api_key = None
+    return identity_target
+
+
+async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attribution=False):
     config, enabled = run.config, set(run.config.checks)
+    if defer_attribution:
+        enabled.discard("gateway_attribution")
     telemetry_task = None
     telemetry_stop = asyncio.Event()
     from giraffe import deployment, telemetry, workloads
@@ -1113,12 +1123,9 @@ async def _target(run: _Run, target: Target, fixtures: dict):
         if enabled == {"gpu"} and config.restart_target != target.name:
             await _metrics(run, target, "start")
             return
-        gateway_only = bool(enabled) and all(check.startswith("gateway_") for check in enabled)
-        client_target = target
-        if gateway_only:
-            # Explicit identity probes never require or inherit shared credentials.
-            client_target = target.model_copy(update={"api_key_env": None, "headers_env": {}})
-            client_target._api_key = None
+        from .identities import gateway_identities_only
+        gateway_only = config.restart_target != target.name and gateway_identities_only(enabled)
+        client_target = _identity_only_target(target) if gateway_only else target
         async with LLMClient(client_target, config, max_connections=run.connection_limits[target.name]) as client:
             client.logprob_budget = run.logprob_budget
             client.on_response = lambda: run.endpoint_response(target.name)
@@ -1171,8 +1178,6 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                     await run.group(target, client, initial_specs, "initial", count=1)
             run.finish_checks(target.name, {"access"})
             if config.stream and not gateway_only and hasattr(client, "token_evidence_probe"):
-                from .gateway_attribution import configured_probe_count
-                attribution_reserve = configured_probe_count(config, target)
                 # A one-token inference can still have a slow first response.
                 # Share one configured timeout across compatibility retries.
                 probe_end = min(run.deadline, time.monotonic() + config.request_timeout_seconds)
@@ -1181,8 +1186,7 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                 probe_count = 0
                 while (run.allowed(target.name) and time.monotonic() < probe_end
                        and (run.remaining(target.name) is None or run.remaining(target.name) > max(
-                           1, run.planned_request_reserve_per_target + attribution_reserve
-                           - (run.budget_counts[target.name] - probe_count)))):
+                           1, run.planned_request_reserve_per_target - (run.budget_counts[target.name] - probe_count)))):
                     spec = client.token_evidence_probe()
                     if spec is None:
                         break
@@ -1363,7 +1367,7 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                 await run.group(target, client, probe_specs, "recovery",
                                 count=effective.samples, checks=["recovery"])
             run.finish_checks(target.name, {"recovery"})
-            await workloads.execute(run, target, client, fixtures)
+            await workloads.execute(run, target, client, fixtures, defer_attribution=defer_attribution)
             run.finish_checks(target.name, enabled - {"gpu"})
     except asyncio.CancelledError:
         run.unfinished[target.name].update(check for name, check in run.pending_checks if name == target.name)
@@ -1424,6 +1428,31 @@ async def _target(run: _Run, target: Target, fixtures: dict):
             raise
         except Exception as exc:
             _target_error(run, target, enabled, exc)
+
+
+async def _deferred_attribution(run, target):
+    from .gateway_attribution import CHECK, _state, execute
+
+    reason = run.stop_reason(target.name)
+    if (reason and reason != "maximum request budget reached"
+            or run.observations[target.name].get("client_error")):
+        run.mark_unfinished(target.name, {CHECK})
+        return
+    run.emit("scenario_started", target.name, CHECK)
+    try:
+        async with LLMClient(_identity_only_target(target), run.config,
+                             max_connections=run.connection_limits[target.name]) as client:
+            await execute(run, target, client, deferred=True)
+    except asyncio.CancelledError:
+        run.mark_unfinished(target.name, {CHECK})
+        raise
+    except Exception as exc:
+        # Identity transport failures must not replace completed shared checks.
+        logger.error("Internal gateway attribution error (%s)", type(exc).__name__)
+        run.observations[target.name][CHECK] = _state("unverified", "Gateway attribution could not complete.")
+    finally:
+        run.finish_checks(target.name, {CHECK})
+        run.emit("scenario_finished", target.name, CHECK)
 
 
 def _timing_violations(records, limits, *, unfinished=False):
@@ -2518,8 +2547,18 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
     sampler.sample()
     consume_samples()
 
-    async def target_task(target):
-        task = asyncio.create_task(_target(run, target, fixtures))
+    from .identities import gateway_identities_only
+    defer_attribution = (len(config.targets) > 1 and "gateway_attribution" in config.checks
+                         and not gateway_identities_only(config.checks))
+
+    async def shared_target(target):
+        if defer_attribution:
+            await _target(run, target, fixtures, defer_attribution=True)
+        else:
+            await _target(run, target, fixtures)
+
+    async def target_task(target, execute):
+        task = asyncio.create_task(execute(target))
         run.target_tasks[target.name] = task
         try:
             await task
@@ -2528,13 +2567,32 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
                 raise
             run.unfinished[target.name].update(config.checks)
 
-    if config.overlap_models:
-        tasks = [asyncio.create_task(target_task(target)) for target in config.targets]
-    else:
+    def start_targets(execute):
+        if config.overlap_models:
+            return [asyncio.create_task(target_task(target, execute)) for target in config.targets]
+
         async def sequential():
             for target in config.targets:
-                await target_task(target)
-        tasks = [asyncio.create_task(sequential())]
+                await target_task(target, execute)
+
+        return [asyncio.create_task(sequential())]
+
+    async def shared_then_attribution():
+        async def attribute(target):
+            await _deferred_attribution(run, target)
+
+        for execute in (shared_target, attribute):
+            phase = start_targets(execute)
+            try:
+                await asyncio.gather(*phase)
+            finally:
+                for task in phase:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*phase, return_exceptions=True)
+
+    tasks = ([asyncio.create_task(shared_then_attribution())] if defer_attribution
+             else start_targets(shared_target))
     monitor = asyncio.create_task(run.monitor(tasks))
     try:
         await asyncio.gather(*tasks)

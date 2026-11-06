@@ -822,12 +822,28 @@ def _baseline_rows(report, target, window, records, put):
     baseline = report.baseline
     entry = next((t for t in (baseline or {}).get("targets", []) if t.get("target") == target), {})
     cohort = window["cohort_id"]
-    scenarios = {r.scenario for r in records}
+    check_scenarios = {(check, r.scenario) for r in records for check in r.check_ids}
+    checks = {check for check, _ in check_scenarios}
     load_points = [r.load_point for r in records if r.load_point and "load" in r.check_ids]
+    user_requests = {r.id: (r.workload["user_id"], r.workload.get("cohort") or "")
+                     for r in records if "multi_user" in r.check_ids
+                     and r.workload.get("window_id") == cohort and r.workload.get("user_id")}
+    user_cohorts = set(user_requests.values())
 
     def matches(row):
-        if row.get("check") != "load":
-            return row.get("scenario") in scenarios or row.get("scenario") == cohort
+        check = row.get("check")
+        if check == "multi_user":
+            if window["kind"] != "full" or row.get("window_id") != cohort:
+                return False  # The comparison covers the whole user window.
+            user = row.get("user_id")
+            if "cohort" in row:
+                return (user, row["cohort"] or "") in user_cohorts
+            # Older timing rows identify the cohort through their request links.
+            linked = {user_requests.get(rid) for rid in row.get("evidence_ids") or ()}
+            return len(linked) == 1 and None not in linked and next(iter(linked))[0] == user
+        if check != "load":
+            scenario = row.get("scenario")
+            return (check, scenario) in check_scenarios or (check in checks and scenario == cohort)
         point = row.get("load_point") or {}
         fields = ("source", "type", "workload", "shape", "pattern", "level", "rate", "bursts")
         return bool(point) and any(
@@ -843,7 +859,8 @@ def _baseline_rows(report, target, window, records, put):
     capacity_stage_ids = {record.traffic_stage for record in records if "capacity" in record.check_ids}
     traffic = [row for index, row in enumerate(entry.get("traffic_capacity", {}).get("stages", []))
                if index in capacity_stage_ids and row.get("status") in {"pass", "fail"}]
-    mapping = (("baseline_throughput", "Throughput change", {"output_tokens_per_second"}),
+    mapping = (("baseline_throughput", "Throughput change",
+                {"output_tokens_per_second", "shared_window_output_tokens_per_second"}),
                ("baseline_timing", "Latency / first-output change", {"latency_ms", "first_output_ms", "max_stream_gap_ms"}),
                ("baseline_generation", "Generation pace change", {"generation_tokens_per_second"}),
                ("baseline_quality", "Error / correctness change", {"error_rate", "correctness_rate", "valid_completion_rate"}))
@@ -858,7 +875,8 @@ def _baseline_rows(report, target, window, records, put):
             samples=len(qualified), state="measured" if qualified else ("no_baseline" if baseline is None else "insufficient_evidence"),
             reason=None if qualified else ("No baseline attached." if baseline is None else "No comparable qualified baseline population for this scope."),
             evidence=rows, comparable=bool(qualified),
-            qualification="Output-token rates in existing comparisons are per-request end-to-end rates; goodput deltas use requests/s. No aggregate throughput delta is invented.")
+            qualification="Ordinary output-token rates are per-request end-to-end rates. Shared-window delivery is per user. "
+                          "Goodput deltas use requests/s.")
     point_ids = {point.get("point_id") for point in load_points}
     capacity = [r for r in entry.get("load_test", {}).get("points", [])
                 if (r.get("current") or {}).get("id") in point_ids

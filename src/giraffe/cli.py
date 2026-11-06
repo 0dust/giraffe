@@ -684,7 +684,10 @@ def _main(argv: list[str] | None = None) -> int:
                 print("Configuration preview. No traffic was sent.")
                 print("Targets: " + ", ".join(target.name for target in config.targets))
                 print("Checks: " + ", ".join(config.checks))
-                print(f"Known requests per target: {plan['known_per_target']:,}")
+                if counts := plan.get("known_target_counts"):
+                    print("Known requests by target: " + ", ".join(f"{name}: {count:,}" for name, count in counts.items()))
+                else:
+                    print(f"Known requests per target: {plan['known_per_target']:,}")
                 print(f"Maximum requests: {format(config.max_requests, ',') if config.max_requests is not None else 'Not set'}")
                 for warning in plan["warnings"]:
                     print(f"Warning: {warning}")
@@ -891,12 +894,15 @@ def _main(argv: list[str] | None = None) -> int:
             return 3
         # Explicit identity probes must not spend or require shared credentials
         # before measuring their own gateway policy and attribution evidence.
-        gateway_only = bool(config.checks) and all(check.startswith("gateway_") for check in config.checks)
-        if args.command == "run" and not args.skip_preflight and not gateway_only:
+        from giraffe.identities import gateway_identities_only
+        gateway_only = gateway_identities_only(config.checks)
+        preflight_targets = [target for target in config.targets
+                             if not gateway_only or config.restart_target == target.name]
+        if args.command == "run" and not args.skip_preflight and preflight_targets:
             from giraffe.deployment import preparation_residency
             config._preparation_residency = asyncio.run(preparation_residency(config))
             async def preflight():
-                for target in config.targets:
+                for target in preflight_targets:
                     try:
                         await check_target(target, config)
                     except PreflightError as error:
