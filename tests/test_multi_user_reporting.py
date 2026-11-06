@@ -855,6 +855,85 @@ def test_interference_baseline_attributes_matched_slowdown_only_to_short_user(
     assert interference["evidence_ids"] == [item.id for item in current.requests]
 
 
+
+@pytest.mark.parametrize("limit", [None, 3])
+@pytest.mark.parametrize("case", ["extra_exposure", "extra_pair", "legacy_missing"])
+def test_baseline_compares_heavy_work_per_matched_probe(limit, case):
+    from tests.test_multi_user_scenarios import matched_observation
+
+    current, baseline = user_report(), user_report()
+    extra_exposure = case == "extra_exposure"
+    for report in (current, baseline):
+        source, requests = matched_observation()
+        source["settings"]["noisy_neighbors"]["max_slowdown"] = limit
+        report.manifest["config"]["multi_user"].update(source["settings"])
+        control, probe, heavy = requests
+
+        def later(item, delay, sequence):
+            clone = item.model_copy(deep=True, update={"id": f"{item.id}-later"})
+            for field in ("dispatch_ms", "timing_start_ms", "request_body_sent_ms", "completed_ms"):
+                setattr(clone, field, getattr(item, field) + delay)
+            clone.workload.update(ready_ms=item.workload["ready_ms"] + delay,
+                                  matched_work_sequence=sequence, request_sequence=sequence)
+            if "trigger_ms" in item.workload:
+                clone.workload["trigger_ms"] += delay
+            return clone
+
+        if report is current:
+            if extra_exposure:
+                # The same short response spans two sequential heavy requests.
+                heavy.completed_ms = heavy.dispatch_ms + 110
+                heavy.elapsed_ms = heavy.stream_end_ms = 110
+                heavy.last_output_ms = 105
+                requests.append(later(heavy, 120, 2))
+                probe.completed_ms = probe.workload["ready_ms"] + 810
+                probe.elapsed_ms = probe.completed_ms - probe.dispatch_ms
+            else:
+                requests.extend(later(item, 500, 2) for item in (control, probe, heavy))
+        for window in source["windows"]:
+            for user in window["users"]:
+                cohort = [item for item in requests if item.workload["window_id"] == window["id"]
+                          and item.workload["user_id"] == user["user_id"]]
+                user.update(ready_count=len(cohort), dispatched_count=len(cohort), request_ids=[item.id for item in cohort])
+                for item in cohort:
+                    item.target = "local"
+                    item.workload.update(scenario=window["scenario"], trigger=window["trigger"],
+                                         heavy_profile=window["heavy_profile"], population=window["population"])
+        summary = summarize(source, requests)
+        short, = summary["windows"][1]["interference"]["users"]
+        assert short["qualified"], short["reasons"]
+        assert short["matched_samples"] == (2 if report is current and not extra_exposure else 1)
+        assert len(short["heavy_request_ids"]) == (2 if report is current else 1)
+        assert short["status"] == ("measured" if limit is None else "fail"
+                                   if report is current and extra_exposure else "pass")
+        if report is baseline or case == "legacy_missing":
+            short.pop("probe_heavy_request_ids")
+        report.requests = requests
+        report.checks[0].metrics["multi_user"] = summary
+        report.checks[0].status = report.overall = summary["status"]
+        if report is current and case != "legacy_missing":
+            exported = reproduction_export(report)["multi_user"]["local"]["windows"][1]["interference"]["users"][0]
+            expected = {probe.id: [heavy.id, requests[-1].id]} if extra_exposure else {
+                probe.id: [heavy.id], requests[-2].id: [requests[-1].id]}
+            assert exported["probe_heavy_request_ids"] == expected
+
+    compared = compare_baseline(current, baseline).baseline
+    target, = compared["targets"]
+    assert compared["status"] == target["status"] == ("pass" if case == "extra_pair" else "inconclusive")
+    assert compared["acceptance"]["current"] == ("fail" if limit is not None and extra_exposure else "pass")
+    delivery, = [row for row in target["comparisons"] if row["metric"] == "shared_window_output_tokens_per_second"
+                 and row["role"] == "probe" and row["user_id"] == "user-01"]
+    assert delivery["status"] == "pass"
+    if case != "extra_pair":
+        metric = "matched_interference_slowdown" if limit is None else "scenario_acceptance"
+        comparison, = [row for row in target["comparisons"] if row["metric"] == metric]
+        assert comparison["status"] == "inconclusive"
+        reason = ("exposure per matched probe differs" if extra_exposure
+                  else "exposure per probe is missing or incomplete")
+        assert reason in comparison["reason"]
+        assert set(comparison["evidence_ids"]) == {item.id for item in current.requests}
+
+
 def test_intentional_user_cancellation_is_not_an_ordinary_baseline_sample():
     report = scenario_report()
     window = report.checks[0].metrics["multi_user"]["windows"][-1]

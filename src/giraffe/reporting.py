@@ -809,12 +809,15 @@ def _input_work_changed(current, old, threshold):
             and abs(current_input - old_input)*100/old_input > threshold)
 
 
-def _measured_token_work_changed(current, old, threshold, measure):
-    lengths = [[measure(record) for record in cohort] for cohort in (current, old)]
+def _work_samples_changed(lengths, threshold):
     if any(not values or None in values for values in lengths):
         return True
     medians = [median(values) for values in lengths]
     return max(medians) > min(medians) * (1 + threshold / 100) or _length_mix_differs(lengths, threshold)
+
+
+def _measured_token_work_changed(current, old, threshold, measure):
+    return _work_samples_changed([[measure(record) for record in cohort] for cohort in (current, old)], threshold)
 
 
 def _uncached_input_work_changed(current, old, threshold):
@@ -1373,7 +1376,44 @@ def _compare_interference_work(current, old, user_id, current_records, old_recor
             reasons.append(f"Matched {role} request evidence is incomplete.")
         elif any(_load_work_comparison(*cohorts)) or _user_token_work_changed(*cohorts, tolerance):
             reasons.append(f"Matched {role} work differs or lacks observed token evidence.")
+    if not reasons:
+        exposure = [_interference_exposure(evidence, records)
+                    for evidence, records in ((current, current_records), (old, old_records))]
+        if any(groups is None for groups in exposure):
+            reasons.append("Matched heavy exposure per probe is missing or incomplete.")
+        elif _heavy_work_per_probe_changed(exposure, tolerance):
+            reasons.append("Matched heavy exposure per matched probe differs between runs.")
     return list(dict.fromkeys(retained_ids)), " ".join(reasons) or None
+
+
+def _interference_exposure(evidence, records):
+    probes, heavy_ids = evidence["probe_request_ids"], set(evidence["heavy_request_ids"])
+    links = evidence.get("probe_heavy_request_ids")
+    if links is None and (len(probes) == 1 or len(heavy_ids) == 1):
+        # Older reports only retain the union. In either case it determines every group.
+        links = {probe: sorted(heavy_ids) for probe in probes}
+    if not isinstance(links, dict) or set(links) != set(probes):
+        return None
+    represented = set()
+    for ids in links.values():
+        if (not isinstance(ids, list) or not ids
+                or any(not isinstance(rid, str) or rid not in heavy_ids for rid in ids)
+                or len(ids) != len(set(ids))):
+            return None
+        represented.update(ids)
+    if represented != heavy_ids:
+        return None
+    return [[records[rid] for rid in links[probe]] for probe in probes]
+
+
+def _heavy_work_per_probe_changed(exposure, tolerance):
+    if _work_samples_changed([[len(group) for group in run] for run in exposure], tolerance):
+        return True
+    measures = _token_work_measures(record for run in exposure for group in run for record in group)
+    # Every retained heavy record has already passed the individual token work check.
+    return any(_work_samples_changed(
+        [[sum(measure(record) for record in group) for group in run] for run in exposure], tolerance)
+        for measure in measures)
 
 
 def _probe_has_overlap(evidence: dict, records: list[RequestRecord]) -> bool:
@@ -1386,37 +1426,51 @@ def _probe_has_overlap(evidence: dict, records: list[RequestRecord]) -> bool:
 _RECOVERY_WORK_PHASES = ("control", "sustained", "lighter")
 
 
+def _matched_recovery_work_changed(current, old, threshold, *, compare_visible=True):
+    matched = []
+    for cohort in (current, old):
+        by_work = defaultdict(list)
+        for record in cohort:
+            sequence = record.workload.get("matched_work_sequence")
+            digest = record.workload.get("matched_work_sha256")
+            if sequence is None or not digest or record.status != "completed" or not record.valid:
+                return True
+            by_work[sequence, digest].append(record)
+        matched.append(by_work)
+    latest_work, old_work = matched
+    return latest_work.keys() != old_work.keys() or any(
+        len(records) != len(old_work[identity]) or _user_token_work_changed(
+            records, old_work[identity], threshold, compare_visible=compare_visible)
+        for identity, records in latest_work.items())
+
+
 def _recovery_work_changed(current, old, current_records, old_records, threshold):
     for phase in _RECOVERY_WORK_PHASES:
         field = f"{phase}_request_ids"
-        cohorts, matched = [], []
+        cohorts = []
         for evidence, records in ((current, current_records), (old, old_records)):
             ids = evidence.get(field, [])
             if not ids or any(rid not in records for rid in ids):
                 return True
-            cohort = [records[rid] for rid in ids]
-            by_work = defaultdict(list)
-            for record in cohort:
-                sequence = record.workload.get("matched_work_sequence")
-                digest = record.workload.get("matched_work_sha256")
-                if sequence is None or not digest or record.status != "completed" or not record.valid:
-                    return True
-                by_work[sequence, digest].append(record)
-            cohorts.append(cohort)
-            matched.append(by_work)
-        latest_work, old_work = matched
-        if (latest_work.keys() != old_work.keys() or _user_token_work_changed(*cohorts, threshold)
-                or any(len(records) != len(old_work[identity])
-                       or _user_token_work_changed(records, old_work[identity], threshold)
-                       for identity, records in latest_work.items())):
+            cohorts.append([records[rid] for rid in ids])
+        if _user_token_work_changed(*cohorts, threshold) or _matched_recovery_work_changed(*cohorts, threshold):
             return True
     return False
 
 
-def _user_token_work_changed(current, previous, tolerance):
-    measures = (lambda r: r.input_tokens, lambda r: r.output_tokens, _total_generated_tokens)
-    return (any(_measured_token_work_changed(current, previous, tolerance, measure) for measure in measures)
-            or _uncached_input_work_changed(current, previous, tolerance))
+def _token_work_measures(records, *, compare_visible=True):
+    measures = (lambda r: r.input_tokens, _total_generated_tokens)
+    if compare_visible:
+        measures += (lambda r: r.output_tokens,)
+    if any((record.cached_prompt_tokens or 0) > 0 for record in records):
+        measures += (_uncached_input_tokens,)
+    return measures
+
+
+def _user_token_work_changed(current, previous, tolerance, *, compare_visible=True):
+    measures = _token_work_measures((record for cohort in (current, previous) for record in cohort),
+                                   compare_visible=compare_visible)
+    return any(_measured_token_work_changed(current, previous, tolerance, measure) for measure in measures)
 
 
 def _compare_user_fairness(current, previous, current_records, old_records):
@@ -1987,7 +2041,7 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                     current_output, old_output = current_work, old_work
                     metric_input_changed, metric_output_changed = input_work_changed, different_work
                     metric_work_reason, metric_mix_changed = None, mix_changed
-                    generation_work_changed = visible_work_changed = False
+                    generation_work_changed = visible_work_changed = recovery_work_changed = False
                     if scheduled_user and metric in TIMING_METRICS:
                         current_samples, old_samples = current_timing[metric], old_timing[metric]
                         if current_samples and old_samples:
@@ -2005,6 +2059,9 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                         # and streaming work without changing the first-answer boundary.
                         visible_work_changed = metric != "first_output_ms" and _measured_token_work_changed(
                             current_samples, old_samples, threshold, lambda r: r.output_tokens)
+                        if workload.get("scenario") == "recovery" and current_samples and old_samples:
+                            recovery_work_changed = _matched_recovery_work_changed(
+                                current_samples, old_samples, threshold, compare_visible=metric != "first_output_ms")
                     warnings = []
                     initial_uncertainty = row["reason"] if row["status"] == "inconclusive" else None
                     def warn(code, message, *, preserve_failure=False):
@@ -2027,6 +2084,8 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                              "These timings include different amounts of generated work; this does not establish a speed improvement or regression.")
                     if metric_work_reason:
                         warn("requested_work_changed", metric_work_reason)
+                    if recovery_work_changed:
+                        warn("matched_recovery_work_changed", "Observed work differs or lacks evidence for matched recovery requests.")
                     if metric_mix_changed:
                         warn("request_mix_changed", "Request work identity shares differ by more than 10 percentage points; observed aggregate values reflect different request mixes.")
                     if metric in TIMING_METRICS:
@@ -2630,7 +2689,8 @@ def _multi_user_scenario_export(window: dict[str, Any]) -> dict[str, Any]:
     if evidence := window.get("interference"):
         fields = ("status", "qualified", "control_window_id", "trigger", "heavy_profile", "heavy_user_ids", "reasons")
         user_fields = ("user_id", "status", "qualified", "reasons", "matched_samples", "control_request_ids",
-            "probe_request_ids", "heavy_request_ids", "slowdown", "first_answer_change_ms", "completion_change_ms",
+            "probe_request_ids", "heavy_request_ids", "probe_heavy_request_ids", "slowdown",
+            "first_answer_change_ms", "completion_change_ms",
             "stream_gap_change_ms", "output_tokens_change", "control_input_median_tokens", "probe_input_median_tokens",
             "control_output_median_tokens", "probe_output_median_tokens",
             "heavy_input_median_tokens", "heavy_output_median_tokens")

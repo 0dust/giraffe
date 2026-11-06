@@ -159,6 +159,41 @@ async def test_mixed_run_distinguishes_unsupported_reader_from_denied_reader(mon
     assert attribution.required is required and report.overall == overall
 
 
+@pytest.mark.parametrize("status,cap,state,planned,observed,read_count", [
+    (200, 1, "unverified", 2, 0, 1), (200, 3, "verified", 2, 2, 4),
+    (403, 1, "unavailable", 2, 0, 1), (403, 3, "unavailable", 2, 2, 2),
+    (404, 1, "unsupported", 0, 0, 1),
+])
+async def test_mixed_attribution_retains_known_reader_state_at_exhausted_quota(
+        monkeypatch, local_tokenizer, status, cap, state, planned, observed, read_count):
+    async def observer(request, rows):
+        if status == 200:
+            return spend_page(request, rows)
+        return httpx.Response(status)
+
+    cfg, _, reads = setup(monkeypatch, observer)
+    immediate_spend_polls(monkeypatch, cfg)
+    cfg.checks = ["access", "gateway_attribution"]
+    cfg.max_requests = cap
+
+    report = await run_suite(cfg)
+    checks = {check.id: check for check in report.checks}
+    assert checks["access"].status == "pass"
+    attribution = checks["gateway_attribution"]
+    assert attribution.metrics["state"] == state
+    assert attribution.metrics["planned_requests"] == planned
+    assert attribution.metrics["observed_requests"] == observed
+    assert len(reads) == read_count
+    assert len(report.requests) == 1 + observed
+    if state == "unverified":
+        assert attribution.metrics["reason_code"] == "budget_limited"
+        assert attribution.remediation == {"action": "set_limit", "limit": "max_requests", "minimum": 3}
+    elif state != "verified":
+        assert "reason_code" not in attribution.metrics
+        assert attribution.remediation["action"] == "review_check"
+        assert "max_requests" not in attribution.summary
+
+
 @pytest.mark.parametrize("reader,cap", [("unsupported", 5), ("verified", 8), ("later_unsupported", 8)])
 async def test_attribution_preserves_shared_sessions_and_uses_spare_budget(monkeypatch, local_tokenizer, reader, cap):
     cfg = config(stream=True)
@@ -736,6 +771,34 @@ async def test_partial_probe_budget_does_not_hide_observed_mismatch(monkeypatch,
     assert check.metrics["observed_requests"] == check.metrics["mismatched_requests"] == 1
     assert check.metrics["planned_requests"] == 2
     assert "reason_code" not in check.metrics
+
+
+@pytest.mark.parametrize("stop_after,interrupted", [(1, "identity probes"), (2, "evidence collection")])
+async def test_manual_stop_after_probe_retains_the_interrupted_stage(monkeypatch, local_tokenizer, stop_after, interrupted):
+    stop = asyncio.Event()
+    completed = 0
+
+    async def observer(request, rows):
+        return spend_page(request, rows)
+
+    def progress(event):
+        nonlocal completed
+        if event["event"] == "request_completed" and event["scenario"] == "gateway_attribution":
+            completed += 1
+            if completed == stop_after:
+                stop.set()
+
+    cfg, _, reads = setup(monkeypatch, observer)
+    report = await run_suite(cfg, progress=progress, stop_event=stop)
+    check = next(item for item in report.checks if item.id == "gateway_attribution")
+    assert report.abort_reason == "cancelled by user" and check.status == "inconclusive"
+    assert check.metrics["planned_requests"] == 2
+    assert check.metrics["observed_requests"] == check.metrics["unverified_requests"] == stop_after
+    assert check.metrics["collection_attempts"] == 0 and not reads
+    assert all(record.valid for record in report.requests)
+    assert check.evidence_ids == [record.id for record in report.requests]
+    assert interrupted in check.finding_summary and "reason_code" not in check.metrics
+    assert check.remediation["action"] == "review_check"
 
 
 async def test_duration_remedy_covers_restart_and_attribution(monkeypatch, local_tokenizer):
