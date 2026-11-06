@@ -326,8 +326,7 @@ class _Run:
     def token_evidence_reserve(self, target):
         from .planning import token_evidence_request_reserve
 
-        return token_evidence_request_reserve(self.request_plan_rows, target=target.name,
-                                              runtime_counts=self.runtime_gateway_request_counts(target))
+        return token_evidence_request_reserve(self.request_plan_rows, target=target.name)
 
     def _condition(self, target, scenario, workload=None, *, request_parameters=None):
         condition = condition_for(scenario, workload or {}, self.config, request_parameters=request_parameters)

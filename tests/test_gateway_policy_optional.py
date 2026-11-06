@@ -76,13 +76,15 @@ async def test_unavailable_policy_with_no_identities_keeps_shared_key_access(mon
 
 
 @pytest.mark.usefixtures("local_tokenizer")
-@pytest.mark.parametrize("policy", ["absent", "missing", "duplicate", "available"])
-async def test_policy_reserves_probe_budget_only_when_credentials_can_dispatch(monkeypatch, policy):
+@pytest.mark.parametrize("policy,cap", [
+    ("absent", 4), ("missing", 4), ("duplicate", 4), ("available", 3), ("available", 4), ("available", 7),
+])
+async def test_shared_token_evidence_has_precedence_over_policy_probes(monkeypatch, policy, cap):
     from tests.test_gateway_policy import configuration as configured_policy
 
-    raw = configured_policy(users=[dict(identity="limited", requests=3, rpm=2),
-                                   dict(identity="peer", requests=3, rpm=3)]).model_dump(mode="json")
-    raw.update(checks=["access", "generation"], stream=True, samples=2, max_requests=4,
+    raw = configured_policy(users=[dict(identity="limited", requests=2, rpm=1),
+                                   dict(identity="peer", requests=2, rpm=2)]).model_dump(mode="json")
+    raw.update(checks=["access", "generation"], stream=True, samples=2, max_requests=cap,
                max_memory_mb=0, retention="all", limits={"min_samples": 2, "min_output_tokens_per_second": 1})
     if policy == "absent":
         raw["gateway_policy"] = None
@@ -126,22 +128,62 @@ async def test_policy_reserves_probe_budget_only_when_credentials_can_dispatch(m
 
     original = httpx.AsyncClient
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
+    baseline = None
+    if cap == 7:
+        baseline = await run_suite(config.model_copy(update={"checks": ["access", "generation"]}))
+        assert next(check for check in baseline.checks if check.id == "generation").status == "pass"
+        sent.clear()
     report = await run_suite(config)
     checks = {check.id: check.status for check in report.checks}
     assert checks["access"] == "pass"
-    assert report.observations["request_budget_used"] == len(sent) == 4
+    assert checks["generation"] == ("pass" if cap > 3 else "inconclusive")
+    ordinary = ["initial"]
+    if cap > 3:
+        ordinary.append("performance_evidence_probe")
+    ordinary.extend(["generation", "generation"])
+    identity_count = max(0, cap - len(ordinary)) if policy == "available" else 0
+    assert report.observations["request_budget_used"] == len(sent) == len(ordinary) + identity_count
+    assert sent[:len(ordinary)] == ["Bearer shared-secret"] * len(ordinary)
+    assert all(auth in {"Bearer limited-secret", "Bearer peer-secret"} for auth in sent[len(ordinary):])
+    assert [record.scenario for record in report.requests] == ordinary + ["gateway_policy"] * identity_count
+    if baseline is not None:
+        assert [record.request_hash for record in report.requests if record.identity is None] == [
+            record.request_hash for record in baseline.requests]
     if policy != "absent":
-        planned = next(row for row in request_plan(config)["rows"] if row["id"] == "gateway_policy")
-        assert planned["requests_per_target"] == 6
+        plan = request_plan(config)
+        row = next(row for row in plan["rows"] if row["id"] == "gateway_policy")
+        assert row["requests_per_target"] == 4
+        assert any(item["id"] == "performance_evidence_probe" for item in plan["time_timeline"]) is (cap > 3)
+        warning, = plan["request_warnings"]
+        assert warning["cut_checks"] == ["gateway_policy"]
+        assert warning["values"]["required_request_limit"] == 10
+        assert "up to 3 streamed compatibility attempts" in warning["msg"]
     if policy == "available":
-        assert checks["generation"] == "inconclusive"
-        assert sent[:3] == ["Bearer shared-secret"] * 3
-        assert sent[3] in {"Bearer limited-secret", "Bearer peer-secret"}
-        assert [record.scenario for record in report.requests] == ["initial", "generation", "generation", "gateway_policy"]
-    else:
-        assert checks["generation"] == "pass"
-        assert sent == ["Bearer shared-secret"] * 4
-        assert [record.scenario for record in report.requests] == ["initial", "performance_evidence_probe", "generation", "generation"]
+        assert report.abort_reason is None
+        assert report.limits_reached == ["max_requests"]
+        assert report.observations["request_limit_scopes"] == ["gateway"]
+        policy_check = next(check for check in report.checks if check.id == "gateway_policy")
+        assert policy_check.status == "inconclusive"
+        assert not policy_check.metrics["gateway_policy"]["complete"]
+
+
+def test_attribution_budget_plan_keeps_policy_and_shared_compatibility_work():
+    from tests.test_gateway_policy import configuration as configured_policy
+
+    raw = configured_policy(users=[dict(identity="limited", requests=2, rpm=1),
+                                   dict(identity="peer", requests=2, rpm=2)]).model_dump(mode="json")
+    raw.update(checks=["access", "generation", "gateway_policy", "gateway_attribution"], stream=True,
+               samples=2, max_requests=10,
+               gateway_attribution={"identities": ["limited", "peer"], "samples": 1})
+    raw["targets"][0]["gateway"] = {"profile": "litellm", "url": "http://proxy/spend/logs/v2"}
+    plan = request_plan(RunConfig.model_validate(raw))
+    assert plan["required_request_limit"] == plan["planned_total"] == 9
+    assert plan["attribution_request_limit"] == 12
+    warning, = plan["request_warnings"]
+    assert warning["cut_checks"] == ["gateway_attribution"]
+    assert warning["values"]["required_request_limit"] == 12
+    timeline = [item["id"] for item in plan["time_timeline"]]
+    assert timeline.index("performance_evidence_probe") < timeline.index("generation") < timeline.index("gateway_policy")
 
 
 @pytest.mark.usefixtures("local_tokenizer")
