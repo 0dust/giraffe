@@ -26,9 +26,9 @@ from .caps import (MAX_HTML_PREVIEW_CHARS, MAX_HTML_JSON_PREVIEW_CHARS,
                    MAX_FAILURE_SUMMARY_CHARS)
 from .deployment import deployment_diff, fixture_hash, safe_config, sanitize
 from .report_inputs import input_ref as _input_ref
-from .multi_user_metrics import truncated_conversation_turn, user_latency
+from .multi_user_metrics import truncated_conversation_turn, user_delivery_completions, user_latency
 from .models import (CHECK_NAMES, SHAPES, SHARED_BASELINE_EXCLUDED_WORKLOADS, CheckResult, GatewayAccess,
-                     GatewayAttribution, RequestRecord, RunConfig, RunReport, overall_status, load_shape_label,
+                     GatewayAttribution, GatewayPolicy, RequestRecord, RunConfig, RunReport, overall_status, load_shape_label,
                      migrate_concurrent_load, migrate_run_limits, is_supported_schema, CURRENT_SCHEMA)
 from .stats import median, percentile
 from .storage import DEFAULT_LIMITS, format_size, fsync_directory, update_metadata, write_metadata
@@ -529,10 +529,11 @@ def _settings_reasons(report: RunReport, baseline: RunReport, *, details: dict[s
         reasons.append("Fixture pack identity is missing or unknown.")
     else:
         inactive = {"custom", "shared_workload_fixture_sha256"}
-        # Older reports attest the full identity only. Keep their existing
-        # compatibility when those recorded identities still match.
-        if all(isinstance(pack.get("shared_workload_fixture_sha256"), str)
-               and pack["shared_workload_fixture_sha256"] for pack in (current_pack, old_pack)):
+        # A matching full identity also supports older reports whose shared
+        # identity used a different set of excluded workloads.
+        if (current_pack.get("workload_fixture_sha256") != old_pack.get("workload_fixture_sha256")
+                and all(isinstance(pack.get("shared_workload_fixture_sha256"), str)
+                        and pack["shared_workload_fixture_sha256"] for pack in (current_pack, old_pack))):
             current_pack, old_pack = ({**pack, "workload_fixture_sha256": pack["shared_workload_fixture_sha256"]}
                                       for pack in (current_pack, old_pack))
         if (_same_run_limits_workload(report.manifest, baseline.manifest)
@@ -1222,8 +1223,11 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold):
         scenario_reason = ("Scenario evidence is missing or unqualified in the current run or baseline."
                            if any(item and (not item.get("qualified") or item.get("status") == "inconclusive")
                                   for item in (c_scenario, b_scenario)) else None)
+        live_work_changed = _live_input_work_changed(
+            user_delivery_completions(current_work, c_window, user_id),
+            user_delivery_completions(old_work, b_window, user_id), threshold)
         live_work_reason = ("Observed input work or live generated histories differ or lack evidence."
-                            if _live_input_work_changed(current_work, old_work, threshold) else None)
+                            if live_work_changed else None)
         missing = (not c or not b or c.get("coverage", {}).get("status") != "complete"
                    or b.get("coverage", {}).get("status") != "complete"
                    or c_rate is None or b_rate is None or work_reason or mix_changed or live_work_reason or scenario_reason)
@@ -1396,6 +1400,8 @@ def _compare_gateway_access(current, baseline, declarations, incompatibility):
 
 def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
     """Return a new report with explicit baseline evidence; never mutate or promote a baseline."""
+    from .gateway_policy import VERSION as POLICY_VERSION
+
     result = report.model_copy(deep=True)
     result.checks = [check for check in result.checks if check.id != "baseline"]
     reason_details = {}
@@ -1502,17 +1508,32 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                                                     [case.model_dump() for case in access_settings.cases],
                                                     incompatibility))
         for current_check in report.checks:
-            if current_check.id != "gateway_policy" or current_check.target != name:
+            if current_check.id != "gateway_policy" or current_check.target != name or not current_check.required:
                 continue
             current_policy = current_check.metrics.get("gateway_policy", {})
             old_policy = next((check.metrics.get("gateway_policy", {}) for check in baseline.checks
-                               if check.id == "gateway_policy" and check.target == name), {})
+                               if check.id == "gateway_policy" and check.target == name and check.required), {})
+            try:
+                settings = GatewayPolicy.model_validate(config.get("gateway_policy"))
+                old_settings = GatewayPolicy.model_validate(old_config.get("gateway_policy"))
+            except ValidationError:
+                settings = old_settings = None
             current_refs = target.get("test_identities") or {}
             old_refs = (old_target or {}).get("test_identities") or {}
-            refs_match = all(current_refs.get(user["identity"]) == old_refs.get(user["identity"])
-                             for user in current_policy.get("users", []))
-            compatible = (not target_reasons and refs_match and current_policy.get("version") == old_policy.get("version")
-                          and current_policy.get("settings") == old_policy.get("settings")
+            refs_match = settings is not None and all(
+                user.identity in current_refs and current_refs[user.identity] == old_refs.get(user.identity)
+                for user in settings.users)
+            source = report.manifest.get("gateway_policy_source_sha256")
+            old_source = baseline.manifest.get("gateway_policy_source_sha256")
+            if not target_reasons and (not source or not old_source):
+                # Earlier policy reports attested their source in the full workload identity.
+                source = report.manifest["fixture_pack"].get("workload_fixture_sha256")
+                old_source = baseline.manifest["fixture_pack"].get("workload_fixture_sha256")
+            compatible = (not target_reasons and refs_match and isinstance(source, str) and bool(source)
+                          and source == old_source
+                          and current_policy.get("version") == old_policy.get("version") == POLICY_VERSION
+                          and settings == old_settings
+                          and settings.model_dump(mode="json") == current_policy.get("settings") == old_policy.get("settings")
                           and old_policy.get("qualification") == "observed")
             for user in current_policy.get("users", []):
                 previous = next((item for item in old_policy.get("users", []) if item["identity"] == user["identity"]), None)
@@ -1526,7 +1547,7 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                     "qualification": current_policy.get("qualification"), "threshold": 0,
                     "worsening": 100 if status == "fail" else 0,
                     "reason": current_check.summary if compatible and previous else
-                              "Policy identity references, settings, summary version or qualified passing baseline do not match.",
+                              "Policy identity references, settings, source, summary version or qualified passing baseline do not match.",
                     "evidence_ids": user["request_ids"]})
         user_rows, user_reasons = _compare_user_delivery(report, baseline, name, target_reasons, threshold)
         rows.extend(user_rows)
@@ -1707,15 +1728,15 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                            and check.id in config.get("checks", []) and check.id in request_paths}
         covered = {row["check"] for row in assessed
                    if row["metric"] in verdict_metrics.get(row["check"], {row["metric"]})}
-        if current_access and (current_access.status != "pass" or any(
-                row["check"] == "gateway_access" and row["status"] == "inconclusive" for row in rows)):
+        if current_access and current_access.status != "pass":
             covered.discard("gateway_access")
         if any(row["status"] in {"pass", "fail"} for row in (traffic or {}).get("stages", [])):
             covered.add("capacity")
         if any(row["status"] in {"pass", "fail"} for row in (load_tests or {}).get("points", [])):
             covered.add("load")
-        if any(row["check"] == "gateway_attribution" and row["status"] == "inconclusive" for row in rows):
-            covered.discard("gateway_attribution")
+        covered.difference_update(row["check"] for row in rows
+                                  if row["check"] in SHARED_BASELINE_EXCLUDED_WORKLOADS
+                                  and row["status"] == "inconclusive")
         missing_checks = sorted(selected_checks - covered)
         traffic_failures = [row for row in (traffic or {}).get("stages", []) if row["status"] == "fail"]
         load_failures = [row for row in (load_tests or {}).get("points", []) if row["status"] == "fail"]

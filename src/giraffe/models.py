@@ -48,7 +48,7 @@ CHECK_NAMES = {
 }
 CATALOGUE_NAMES = INTERNAL_CHECK_NAMES = CHECK_NAMES
 # These checks compare their own declared workload and evidence.
-SHARED_BASELINE_EXCLUDED_WORKLOADS = frozenset({"gateway_attribution", "gateway_access"})
+SHARED_BASELINE_EXCLUDED_WORKLOADS = frozenset({"gateway_access", "gateway_attribution", "gateway_policy"})
 CORE_CHECKS = ("access", "serving", "first_output", "generation", "load", "context",
                "correctness", "json", "cancellation", "recovery", "gpu")
 DEFAULT_CHECKS = ("access", "serving", "correctness", "first_output")
