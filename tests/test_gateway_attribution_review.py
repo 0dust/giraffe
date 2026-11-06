@@ -249,6 +249,96 @@ async def test_run_deadline_during_attribution_preflight_preserves_configured_pr
     assert len(report.requests) == 1 and report.requests[0].identity is None
 
 
+@pytest.mark.parametrize("preflight", [False, True])
+async def test_stop_while_building_spend_reader_sends_no_get(monkeypatch, local_tokenizer, preflight):
+    from giraffe import gateway_attribution
+
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    original = gateway_attribution._client
+
+    def build_reader(*args):
+        reader = original(*args)
+        loop.call_soon_threadsafe(stop.set)
+        return reader
+
+    async def observer(request, rows):
+        return spend_page(request, rows)
+
+    cfg, _, reads = setup(monkeypatch, observer)
+    if preflight:
+        cfg.checks = ["access", "gateway_attribution"]
+        cfg.max_requests = 1
+    cfg.gateway_attribution.settle_seconds = .5
+    monkeypatch.setattr(gateway_attribution, "_client", build_reader)
+
+    report = await run_suite(cfg, stop_event=stop)
+    check = next(item for item in report.checks if item.id == "gateway_attribution")
+    assert report.abort_reason == "cancelled by user" and not reads
+    assert check.metrics["planned_requests"] == 2
+    assert check.metrics["observed_requests"] == (0 if preflight else 2)
+    assert check.metrics["collection_attempts"] == 0
+    assert ("reader preflight" if preflight else "evidence collection") in check.finding_summary
+    assert len(report.requests) == (1 if preflight else 2)
+
+
+@pytest.mark.parametrize("duration,delay,reason", [(.5, .55, "time_limited"), (10, .12, "budget_limited")])
+async def test_preflight_rechecks_deadline_after_building_get(monkeypatch, local_tokenizer, duration, delay, reason):
+    original = httpx.AsyncClient.build_request
+
+    def build_request(self, *args, **kwargs):
+        request = original(self, *args, **kwargs)
+        if request.method == "GET" and request.url.path == "/spend/logs/v2":
+            time.sleep(delay)
+        return request
+
+    async def observer(request, rows):
+        return spend_page(request, rows)
+
+    monkeypatch.setattr(httpx.AsyncClient, "build_request", build_request)
+    cfg, _, reads = setup(monkeypatch, observer)
+    cfg.checks = ["access", "gateway_attribution"]
+    cfg.max_requests = 1 if reason == "budget_limited" else 10
+    cfg.max_duration_seconds = duration
+    cfg.request_timeout_seconds = .2
+    cfg.gateway_attribution.settle_seconds = .05
+
+    report = await run_suite(cfg)
+    check = next(item for item in report.checks if item.id == "gateway_attribution")
+    assert not reads and len(report.requests) == 1
+    assert check.metrics["reason_code"] == reason
+    assert check.metrics["planned_requests"] == 2 and check.metrics["observed_requests"] == 0
+    if reason == "time_limited":
+        assert report.abort_reason == "maximum run duration reached"
+        assert check.remediation["limit"] == "max_duration"
+    else:
+        assert check.remediation["limit"] == "max_requests"
+
+
+@pytest.mark.parametrize("duration,settle,reason", [(.25, .5, "time_limited"), (10, .25, None)])
+async def test_collection_does_not_dispatch_next_page_after_deadline(monkeypatch, local_tokenizer, duration, settle, reason):
+    monkeypatch.setattr("giraffe.gateway_attribution.PAGE_SIZE", 1)
+
+    async def observer(request, rows):
+        page = int(request.url.params["page"])
+        if page == 1:
+            time.sleep(.26)
+        return spend_page(request, rows[page - 1:page], total=2)
+
+    cfg, _, reads = setup(monkeypatch, observer)
+    cfg.max_duration_seconds = duration
+    cfg.gateway_attribution.settle_seconds = settle
+
+    report = await run_suite(cfg)
+    check = next(item for item in report.checks if item.id == "gateway_attribution")
+    assert [read.url.params["page"] for read in reads] == ["1"]
+    assert len(report.requests) == 2 and all(record.valid for record in report.requests)
+    assert check.metrics.get("reason_code") == reason and check.metrics["collection_attempts"] == 1
+    assert check.metrics["planned_requests"] == check.metrics["observed_requests"] == 2
+    assert check.metrics["collection_complete"] is False and check.metrics["matched_requests"] == 0
+    assert report.abort_reason == ("maximum run duration reached" if reason else None)
+
+
 @pytest.mark.parametrize("reader,cap", [("unsupported", 5), ("verified", 8), ("later_unsupported", 8)])
 async def test_attribution_preserves_shared_sessions_and_uses_spare_budget(monkeypatch, local_tokenizer, reader, cap):
     cfg = config(stream=True)

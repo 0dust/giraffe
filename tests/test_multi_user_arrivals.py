@@ -611,3 +611,86 @@ def test_scheduled_admission_checks_lazy_http_lane_preparation(monkeypatch):
         assert state.budget_used == 2 and state.slots.qsize() == state.max_connections
 
     run_virtual(monkeypatch, run())
+
+
+@pytest.mark.parametrize(("scenario", "tail", "dispatches"), [
+    ("arrivals", .03, [0, 30]),
+    ("arrivals", .06, [0]),
+    ("repeated_requests", .085, [0]),
+])
+def test_transport_lane_wait_respects_actual_user_sending_end(monkeypatch, scenario, tail, dispatches):
+    import httpx
+
+    from giraffe.client import LLMClient
+    from giraffe.models import RunReport
+    from giraffe.performance import build_performance
+    from giraffe.transport import HTTPClientPool
+
+    class Stream(httpx.AsyncByteStream):
+        def __init__(self, hold):
+            self.hold = hold
+
+        async def __aiter__(self):
+            yield b'data: {"choices":[{"delta":{"content":"K7P4"}}]}\n\n'
+            yield b'data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":128,"completion_tokens":4}}\n\n'
+            yield b'data: [DONE]\n\n'
+            await asyncio.sleep(self.hold)
+            yield b': transport tail\n\n'
+
+    async def run():
+        scheduled = scenario == "arrivals"
+        cfg = settings(levels=[1], scenarios=[scenario], duration_seconds=.2 if scheduled else .06,
+                       profile=PROFILE, arrivals={"requests_per_second": 50}).model_copy(
+                           update={"max_requests": 2 if scheduled else None, "stream": True})
+        target = cfg.targets[0]
+        events = []
+        state = runner._Run(cfg, events.append, None)
+        sent = []
+
+        async def respond(request):
+            sent.append((asyncio.get_running_loop().time() - state.start) * 1000)
+            return httpx.Response(200, stream=Stream(tail if len(sent) == 1 else 0))
+
+        client = LLMClient(target, cfg)
+        client._client = HTTPClientPool(lambda: httpx.AsyncClient(transport=httpx.MockTransport(respond)), 1)
+        try:
+            await execute(state, target, client)
+        finally:
+            await client.__aexit__(None, None, None)
+        observation = state.observations[target.name]
+        window, = observation["multi_user"]["windows"]
+        accepted = len(dispatches)
+        assert sent == pytest.approx(dispatches)
+        assert len(state.records) == state.attempted == accepted
+        assert all(record.status == "completed" and record.valid for record in state.records)
+        assert [record.dispatch_ms for record in state.records] == pytest.approx(sent)
+        assert [event["event"] for event in events if event["event"].startswith("request_")] == [
+            "request_started", "request_completed",
+        ] * accepted
+        assert state.slots.qsize() == state.max_connections
+        assert window["end_ms"] == pytest.approx(40 if scheduled else 60)
+        if scheduled:
+            assert state.budget_used == 2
+            assert state.dropped_offers == 2 - accepted
+            assert window["peak_in_flight"] == 1
+            assert window["offer_accounting"] == {"planned": 10, "offered": 2, "dispatched": accepted,
+                "dropped_local": 0, "dropped_late": 0, "unissued": 2 - accepted, "not_offered": 8}
+            second = window["offers"][1]
+            assert second["outcome"] == ("dispatched" if accepted == 2 else "unissued")
+            assert second["request_id"] == (state.records[1].id if accepted == 2 else None)
+            check = result(state, target)
+            report = RunReport(run_id="arrivals", suite_version="test", overall=check.status,
+                started_at="2026-01-01T00:00:00Z", finished_at="2026-01-01T00:00:01Z",
+                manifest={"config": cfg.model_dump(mode="json")}, requests=state.records,
+                checks=[check], observations={"targets": {target.name: observation}})
+            view = build_performance(report)["targets"][0]
+            stage, = [entry for entry in view["windows"] if entry["kind"] == "stage" and not entry["includes_drain"]]
+            metrics = build_performance(report, window=stage["id"])["targets"][0]["summaries"][stage["id"]]["metrics"]
+            assert metrics["dispatch_rate"]["value"] == window["dispatched_requests_per_second"] == accepted / .04
+        else:
+            assert state.budget_used == 1
+            user, = window["users"]
+            assert user["dispatched_count"] == 1 and user["ready_count"] == 2
+            assert user["pending_observed_ms"] == window["end_ms"]
+
+    run_virtual(monkeypatch, run())

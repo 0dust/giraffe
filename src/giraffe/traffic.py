@@ -228,6 +228,7 @@ async def run_stage(
     schedule_stage_id: str | None = None,
     schedule_label: str | None = None,
     schedule_pattern: str | None = None,
+    admission_closed: asyncio.Event | None = None,
 ) -> dict:
     """Run one stage; callbacks own shared run budgets and global admission slots.
 
@@ -238,6 +239,7 @@ async def run_stage(
     attaching it as ``giraffe_record`` to the propagated CancelledError.
     ``on_drop`` reports reserved offers that never dispatch, including tasks
     cancelled before starting; unreserved schedule entries are not drops.
+    ``admission_closed`` signals the end of sending to requests still preparing.
     """
     if traffic.max_in_flight is None:
         raise ValueError("resolve traffic.max_in_flight against the global bound first")
@@ -310,21 +312,30 @@ async def run_stage(
         return offset <= discard_through
 
     def blocked_offer(offset: float, now: float, *, refused: bool = False) -> str | None:
+        cutoff = stage_cutoff
         if explicit:
             if interruption() is not None:
                 return "not_offered"
-            refused = refused or now >= stage_end
+            if sending_finished_at is not None:
+                cutoff = sending_finished_at
+            refused = refused or now >= cutoff
         if refused:
             # A closed window takes precedence when it precedes the lag limit.
             # The public ledger keeps reserved offers that did not dispatch.
-            late = (started_at+offset+traffic.scheduler_lag_tolerance_ms/1000 < stage_cutoff
+            late = (started_at+offset+traffic.scheduler_lag_tolerance_ms/1000 < cutoff
                     and (explicit or interruption() is None) and missed_arrival(offset, now))
             return "dropped_late" if late else "not_offered"
         return "dropped_late" if missed_arrival(offset, now) else None
 
-    def sending_end() -> float:
-        now = time.monotonic()
-        return max(started_at, min(now, stage_cutoff)) if explicit else now
+    def finish_sending() -> float:
+        nonlocal sending_finished_at
+        if sending_finished_at is None:
+            now = time.monotonic()
+            sending_finished_at = max(started_at, min(now, stage_cutoff)) if explicit else now
+            if admission_closed is not None:
+                admission_closed.set()
+            intent.begin_drain(sending_finished_at)
+        return sending_finished_at
 
     def drop(index: int, outcome: str):
         outcomes[index] = outcome
@@ -388,6 +399,8 @@ async def run_stage(
             record = getattr(exc, "giraffe_record", None)
             if record is not None:
                 records.append((index, record))
+            elif explicit:
+                drop(index, "not_offered")
         except Exception:
             # Backend normally records exceptions. Keep a truthful failure if a
             # callback unexpectedly escapes without leaking transport text.
@@ -435,8 +448,7 @@ async def run_stage(
                     reasons.append(reason)
                     interrupted = True
 
-        sending_finished_at = sending_end()
-        intent.begin_drain(sending_finished_at)
+        sending_finished_at = finish_sending()
         drain_deadline = (deadline if traffic.drain_timeout_seconds is None else
                           min(deadline, sending_finished_at + traffic.drain_timeout_seconds))
         while tasks:
@@ -454,9 +466,7 @@ async def run_stage(
         reasons.append("Traffic stage cancelled.")
         interrupted = True
     finally:
-        if sending_finished_at is None:
-            sending_finished_at = sending_end()
-        intent.begin_drain(sending_finished_at)
+        finish_sending()
         # Copy: task completion callbacks remove tasks from the live set.
         pending = list(tasks)
         for task in pending:

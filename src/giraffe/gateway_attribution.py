@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import defaultdict
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 import json
 import ssl
@@ -156,9 +157,19 @@ def _client(config, headers, timeout):
                              timeout=timeout, follow_redirects=False)
 
 
-def _spend_page(client, url, marker, start_date, end_date, page, page_size):
-    return client.stream("GET", url, params={"session_id": marker, "page": page,
+@asynccontextmanager
+async def _spend_page(client, url, marker, start_date, end_date, page, page_size, *, stop, deadline):
+    request = client.build_request("GET", url, params={"session_id": marker, "page": page,
         "page_size": page_size, "start_date": start_date, "end_date": end_date})
+    # Building a request can cross a deadline before asyncio can deliver cancellation.
+    if stop.is_set() or time.monotonic() >= deadline:
+        yield None
+        return
+    response = await client.send(request, stream=True)
+    try:
+        yield response
+    finally:
+        await response.aclose()
 
 
 async def _reader_preflight(run, target, headers, bound):
@@ -171,30 +182,37 @@ async def _reader_preflight(run, target, headers, bound):
     timeout = min(bound, (run.deadline - now) / 2)
     if timeout <= 0:
         return None
+    deadline = now + timeout
     try:
         marker = "giraffe-" + uuid.uuid4().hex
         current = datetime.now(timezone.utc)
         start_date = current.strftime("%Y-%m-%d %H:%M:%S")
         end_date = (current + timedelta(seconds=1)).strftime("%Y-%m-%d %H:%M:%S")
         with identity_scope(True):
-            async with asyncio.timeout_at(now + timeout):
+            async with asyncio.timeout_at(deadline):
                 reader = await asyncio.to_thread(_client, run.config, headers, timeout)
                 async with reader:
-                    async with _spend_page(reader, gateway.url, marker, start_date, end_date, 1, 1) as response:
-                        return response.status_code
+                    if run.stop_reason(target.name) not in {None, "maximum request budget reached"}:
+                        return None
+                    async with _spend_page(reader, gateway.url, marker, start_date, end_date, 1, 1,
+                                           stop=run.stop, deadline=deadline) as response:
+                        return response.status_code if response is not None else None
     except (httpx.HTTPError, OSError, TimeoutError, ValueError):
         return None
 
 
-async def _pages(client, url, marker, *, start_date, end_date, max_rows, stop):
+async def _pages(client, url, marker, *, start_date, end_date, max_rows, stop, deadline=float("inf")):
     rows = []
     row_ids = set()
     expected_total = None
     page_size = min(PAGE_SIZE, max_rows)
     for page in range(1, MAX_PAGES + 1):
-        if stop.is_set():
+        if stop.is_set() or time.monotonic() >= deadline:
             return rows, False
-        async with _spend_page(client, url, marker, start_date, end_date, page, page_size) as response:
+        async with _spend_page(client, url, marker, start_date, end_date, page, page_size,
+                               stop=stop, deadline=deadline) as response:
+            if response is None:
+                return rows, False
             if response.status_code in _UNSUPPORTED_READER_STATUSES:
                 return "unsupported", False
             if response.status_code != 200:
@@ -376,7 +394,7 @@ async def execute(run, target, client, *, deferred=False):
                     async with asyncio.timeout_at(deadline):
                         rows, complete = await _pages(reader, gateway.url, marker,
                             start_date=start_date, end_date=end_date,
-                            max_rows=run.config.metrics_max_series, stop=run.stop)
+                            max_rows=run.config.metrics_max_series, stop=run.stop, deadline=deadline)
                     if isinstance(rows, str):
                         assessment = _assess(records, {}, planned, complete=False)
                         assessment.update(state=rows, reason="Read-only gateway spend logs are unavailable or unsupported.")
