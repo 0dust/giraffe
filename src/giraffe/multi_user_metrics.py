@@ -338,6 +338,7 @@ def _fairness(observation, window, users, records, criteria, health, lag, timing
     settings = observation.get("settings", {})
     tolerance = settings.get("fairness_tolerance_percent", 10)
     limit = criteria.max_throughput_ratio
+    scheduled = window.get("scenario") in {"arrivals", "recovery"}
     start, end = window.get("start_ms"), window.get("end_ms")
     phase_quality = qualify([], health, timing_threshold, ("latency_ms",), legacy_max_lag_ms=lag,
                             phase_intervals=((start, end),) if start is not None and end is not None else ())
@@ -347,6 +348,8 @@ def _fairness(observation, window, users, records, criteria, health, lag, timing
         "and reported uncached input, and active exposure. "
         "This measures observed delivery fairness, not a server scheduling defect."
     )
+    if scheduled:
+        interpretation += " Work qualification includes valid completions during drain."
     if len(users) < 2:
         return {"status": "not_applicable", "qualified": False, "threshold": limit,
                 "tolerance_percent": tolerance, "ratio": None, "compared_user_ids": [],
@@ -358,7 +361,7 @@ def _fairness(observation, window, users, records, criteria, health, lag, timing
         if len({u.get("activation_seconds", 0) for u in users}) > 1 or any(
                 offer.get("origin") == "burst" for offer in window.get("offers", [])):
             reasons.append("Work not comparable: arrival exposure or burst work differs between users.")
-    if window.get("scenario") in {"arrivals", "recovery"} and not _fully_dispatched(window.get("offer_accounting")):
+    if scheduled and not _fully_dispatched(window.get("offer_accounting")):
         reasons.append("The generator did not deliver the configured user offer schedule.")
     if window.get("cut_short") or start is None or end is None or end <= start:
         reasons.append("The common measurement window was not completed.")
@@ -366,7 +369,7 @@ def _fairness(observation, window, users, records, criteria, health, lag, timing
         reasons.append("The measurement has incomplete drain coverage.")
     if len({user["profile"] for user in users}) > 1:
         reasons.append("Work not comparable: assigned profiles differ.")
-    if window.get("scenario") not in {"arrivals", "recovery"}:
+    if not scheduled:
         plans = [user.get("think_time_plan", settings.get("think_time_seconds", {"values": [0]}))
                  for user in users]
         if plans and (any(plan != plans[0] for plan in plans[1:])
@@ -392,20 +395,24 @@ def _fairness(observation, window, users, records, criteria, health, lag, timing
         work = [r for r in rows if _valid(r) and not r.intentional
                 and start is not None and end is not None and r.dispatch_ms is not None
                 and start <= r.dispatch_ms < end]
-        samples = [r for r in work if r.completed_ms is not None and r.completed_ms <= end]
+        completed = [r for r in work if r.completed_ms is not None]
+        samples = [r for r in completed if r.completed_ms <= end]
+        comparison_work = completed if scheduled else samples
         notes = []
         if len(samples) < criteria.min_samples:
             notes.append(f"Only {len(samples)} valid in-window samples; {criteria.min_samples} required.")
         if user["outcomes"]["errors"] or user["outcomes"]["cancelled"] or user["outcomes"]["missing_terminal"]:
             notes.append("Failed or incomplete requests prevent an equal-work comparison.")
+        if scheduled and len(completed) != len(work):
+            notes.append("Missing completion timestamps prevent an equal-work comparison.")
         if user["coverage"]["unadmitted_conversation_turn"]:
             notes.append("Unadmitted conversation turns prevent an equal-work comparison.")
         if any(r.input_tokens is None or r.output_tokens is None for r in work):
             notes.append("Input or output usage is missing.")
-        uncached = [_uncached_input_tokens(r) for r in samples]
-        cache_reuse |= any((r.cached_prompt_tokens or 0) > 0 for r in samples)
-        cache_unknown |= any(r.cached_prompt_tokens is None for r in samples)
-        if any(r.cached_prompt_tokens is not None and count is None for r, count in zip(samples, uncached)):
+        uncached = [_uncached_input_tokens(r) for r in comparison_work]
+        cache_reuse |= any((r.cached_prompt_tokens or 0) > 0 for r in comparison_work)
+        cache_unknown |= any(r.cached_prompt_tokens is None for r in comparison_work)
+        if any(r.cached_prompt_tokens is not None and count is None for r, count in zip(comparison_work, uncached)):
             notes.append("Reported cached input usage is invalid.")
         if any(r.finish_reason == "stop" and r.output_tokens is not None
                and (r.requested_output_tokens is not None or not r.workload.get("session_id"))
@@ -418,6 +425,10 @@ def _fairness(observation, window, users, records, criteria, health, lag, timing
             qualification = _input_shape(observation, load_settings, user["profile"], samples)
             if not qualification["qualified"]:
                 notes.append("Input shape not qualified: " + qualification["reason"])
+            if len(comparison_work) != len(samples):
+                work_shape = _input_shape(observation, load_settings, user["profile"], comparison_work)
+                if not work_shape["qualified"]:
+                    notes.append("Input shape not qualified across all completed work: " + work_shape["reason"])
         activated = user.get("activated_ms")
         exposure = max(0, end - max(start, activated)) if all(value is not None for value in (start, end, activated)) else None
         if exposure is None or exposure <= 0:
@@ -426,13 +437,14 @@ def _fairness(observation, window, users, records, criteria, health, lag, timing
             notes.append("Client scheduling delay affects user timing.")
         streams[uid] = [r.model_copy(update={"stream_end_ms": r.last_output_ms}) for r in samples
                         if r.stream and r.answer_reads >= 2 and r.answer_chunks >= 2]
-        lengths = {"input_median_tokens": [r.input_tokens for r in samples],
-                   "output_median_tokens": [r.output_tokens for r in samples],
+        lengths = {"input_median_tokens": [r.input_tokens for r in comparison_work],
+                   "output_median_tokens": [r.output_tokens for r in comparison_work],
                    "uncached_input_median_tokens": uncached,
-                   "total_generated_median_tokens": [_total_generated_tokens(r) for r in samples]}
+                   "total_generated_median_tokens": [_total_generated_tokens(r) for r in comparison_work]}
         for field, values in lengths.items():
             length_samples[field].append(values)
         measurements.append({"user_id": uid, "reasons": notes, "valid_samples": len(samples),
+                             **({"work_samples": len(comparison_work)} if scheduled else {}),
                              **{field: median(values) for field, values in lengths.items()},
                              "active_exposure_ms": exposure, "input_qualification": qualification})
     overlap_users = []
@@ -737,13 +749,13 @@ def _recovery(observation, window, control, sustained, user_records, criteria, h
             sustained["offer_accounting"]["dispatched"] <= sustained["population"]
             or delivered["sustained"] <= max(delivered["control"], delivered["lighter"])):
         shared.append("The delivered sustained schedule did not exercise more load than the control and lighter schedules.")
-    sustained_records = [r for user in (sustained or {}).get("users", [])
-                         for r in user_records.get((sustained["id"], user["user_id"]), [])]
     sustained_end = (sustained or {}).get("end_ms")
-    sustained_streams = [r.model_copy(update={"stream_end_ms": r.last_output_ms}) for r in sustained_records
-                         if _valid(r) and r.stream and r.answer_reads >= 2 and r.answer_chunks >= 2
-                         and r.max_stream_gap_ms is not None and r.completed_ms is not None
-                         and sustained_end is not None and r.completed_ms <= sustained_end
+    sustained_streams = [r.model_copy(update={"stream_end_ms": r.last_output_ms})
+                         for user in (sustained or {}).get("users", [])
+                         for r in user_delivery_completions(
+                             user_records.get((sustained["id"], user["user_id"]), []), sustained, user["user_id"])
+                         if r.stream and r.answer_reads >= 2 and r.answer_chunks >= 2
+                         and r.max_stream_gap_ms is not None
                          and qualify([r], health, timing_threshold,
                              ("latency_ms", "first_output_ms", "max_stream_gap_ms"),
                              legacy_max_lag_ms=lag)["status"] == "qualified"]
@@ -753,23 +765,34 @@ def _recovery(observation, window, control, sustained, user_records, criteria, h
         notes = list(shared)
         before = user_records.get(((control or {}).get("id"), uid), [])
         after = user_records.get((window["id"], uid), [])
+        sustained_work = user_records.get(((sustained or {}).get("id"), uid), [])
+        completed_work = {}
+        for label, phase, requests in (("control", control, before), ("sustained", sustained, sustained_work),
+                                       ("lighter", window, after)):
+            completed = user_delivery_completions(requests, phase or {}, uid, include_drain=True)
+            expected = next((item.get("dispatched_count", len(requests)) for item in (phase or {}).get("users", [])
+                             if item["user_id"] == uid), len(requests))
+            if len(completed) != len(requests) or len(completed) != expected:
+                notes.append(f"Actual {label} work has failed or incomplete terminal coverage.")
+            completed_work[label] = completed
         control_end = (control or {}).get("end_ms")
         lighter_end = window.get("end_ms")
-        controls = {r.workload["matched_work_sequence"]: r for r in before
-                    if _valid(r) and r.workload.get("matched_work_sequence") is not None
-                    and r.completed_ms is not None and control_end is not None and r.completed_ms <= control_end}
-        pairs = [(baseline, r) for r in after if _valid(r)
-                 and r.completed_ms is not None and lighter_end is not None and r.completed_ms <= lighter_end
+        controls = {r.workload["matched_work_sequence"]: r for r in completed_work["control"]
+                    if r.workload.get("matched_work_sequence") is not None
+                    and control_end is not None and r.completed_ms <= control_end}
+        pairs = [(baseline, r) for r in completed_work["lighter"]
+                 if lighter_end is not None and r.completed_ms <= lighter_end
                  and (baseline := controls.get(r.workload.get("matched_work_sequence"))) is not None]
         if len({a.id for a, _ in pairs}) < criteria.min_samples or len(pairs) != len(after):
             notes.append("Recovery lacks sufficient matched completed control samples.")
-        stress = [r for r in sustained_records if r.workload.get("user_id") == uid and _valid(r)
-                  and r.completed_ms is not None and sustained_end is not None and r.completed_ms <= sustained_end]
-        stress_pairs = [(baseline, r) for r in stress
-                        if (baseline := controls.get(r.workload.get("matched_work_sequence"))) is not None]
-        if len(stress_pairs) != len(stress):
-            notes.append("Sustained work lacks a matched completed control sample.")
-        for phase, matched in (("lighter", pairs), ("sustained", stress_pairs)):
+        stress = [r for r in completed_work["sustained"] if sustained_end is not None and r.completed_ms <= sustained_end]
+        work_controls = {r.workload["matched_work_sequence"]: r for r in completed_work["control"]
+                         if r.workload.get("matched_work_sequence") is not None}
+        for phase in ("lighter", "sustained"):
+            matched = [(baseline, r) for r in completed_work[phase]
+                       if (baseline := work_controls.get(r.workload.get("matched_work_sequence"))) is not None]
+            if len(matched) != len(completed_work[phase]):
+                notes.append(f"{phase.capitalize()} work lacks a matched completed control sample.")
             if any(not replay.workload.get("matched_work_sha256")
                    or baseline.workload.get("matched_work_sha256") != replay.workload["matched_work_sha256"]
                    for baseline, replay in matched):
@@ -790,12 +813,16 @@ def _recovery(observation, window, control, sustained, user_records, criteria, h
             notes.append("This user lacks sustained samples with qualified peer streaming overlap.")
         values = {}
         for label, rows in (("control", [a for a, _ in pairs]), ("lighter", [b for _, b in pairs]), ("sustained", stress)):
-            if not _input_shape(observation, load_settings, user["profile"], rows)["qualified"]:
+            work = completed_work[label]
+            if (not _input_shape(observation, load_settings, user["profile"], rows)["qualified"]
+                    or not _input_shape(observation, load_settings, user["profile"], work)["qualified"]):
                 notes.append(f"Actual {label} input shape is unqualified.")
-            if any(r.input_tokens is None or r.output_tokens is None for r in rows):
+            if any(r.input_tokens is None or r.output_tokens is None for r in work):
                 notes.append(f"Actual {label} token usage is missing.")
+            if any(r.cached_prompt_tokens is not None and _uncached_input_tokens(r) is None for r in work):
+                notes.append(f"Actual {label} cached input usage is invalid.")
             if user["profile"].endswith("_long") and any(r.output_tokens is None or
-                    r.output_tokens < (r.requested_output_tokens or 0)*(1-tolerance) for r in rows):
+                    r.output_tokens < (r.requested_output_tokens or 0)*(1-tolerance) for r in work):
                 notes.append(f"Actual {label} output did not exercise the requested shape.")
             if any(not r.stream or r.answer_reads < 2 or r.max_stream_gap_ms is None for r in rows):
                 notes.append(f"Actual {label} stream gaps are unqualified.")
@@ -817,8 +844,8 @@ def _recovery(observation, window, control, sustained, user_records, criteria, h
             notes.append(f"Recovery slowdown {slowdown:g} exceeds {limit:g}.")
         measured.append({"user_id": uid, "profile": user["profile"], "status": status, "qualified": qualified,
             "slowdown": slowdown, "matched_samples": len(pairs), "reasons": list(dict.fromkeys(notes)),
-            "control_request_ids": [a.id for a, _ in pairs], "lighter_request_ids": [b.id for _, b in pairs],
-            "sustained_request_ids": [r.id for r in stress], "phases": values})
+            **{f"{label}_request_ids": [r.id for r in work] for label, work in completed_work.items()},
+            "phases": values})
     statuses = [user["status"] for user in measured]
     return {"status": _status(statuses, measured=all(s == "measured" for s in statuses)),
             "qualified": bool(measured) and all(user["qualified"] for user in measured),

@@ -1068,7 +1068,7 @@ The finite offer ledger preserves identity, cohort, intended time and outcome ev
 
 The combined schedule is limited to 100,000 offers across all selected population levels, arrival and recovery phases, and targets. The request budget can stop execution earlier; it does not increase this planning limit.
 
-Results show scheduled and observed activation, achieved traffic, per-user accounting and overlap evidence. Newcomer exposure and selected-user bursts cannot establish equal-work fairness against incumbents. Independent user acceptance failures remain visible. Warmup drains before the scheduled measurement begins and does not contribute output to it.
+Results show scheduled and observed activation, achieved traffic, per-user accounting and overlap evidence. Newcomer exposure and selected-user bursts cannot establish equal-work fairness against incumbents. Independent user acceptance failures remain visible. For scheduled arrivals and recovery, valid requests that finish during drain contribute to work qualification. Shared-window throughput and the overlap used for fairness still use in-window completions. Warmup drains before the scheduled measurement begins and does not contribute output to it.
 
 ### Sustained shared use and lighter recovery
 
