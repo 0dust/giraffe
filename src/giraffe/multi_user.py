@@ -14,9 +14,9 @@ from copy import deepcopy
 from giraffe.concurrent_load import OutputProgress, calibrate
 from giraffe.load_test import _shape_sources, build_spec
 from giraffe.models import (
-    CheckResult, LoadTestSettings, Limits, TrafficConfig, _steady_offer_count, required_concurrency,
+    CheckResult, LoadTestSettings, Limits, _steady_offer_count, required_concurrency,
 )
-from giraffe.traffic import run_stage
+from giraffe.traffic import ExplicitTrafficStage, run_stage
 
 
 WINDOW_POLICY = "completed-output-v1"
@@ -499,9 +499,9 @@ async def run_arrival_window(run, target, client, settings, load_settings, calib
     # The shared scheduler observes one interval. Expand it at the actual
     # sending boundary for plans with activations or separate burst offers.
     stage_rows = [] if staged_arrivals else transitions
-    evidence = await run_stage(traffic=TrafficConfig(duration_seconds=window["planned_duration_seconds"],
-        rates=[per_user_rate], max_in_flight=required_concurrency(run.config)["by_check"]["multi_user"],
-        scheduler_lag_tolerance_ms=lag_tolerance_ms, drain_timeout_seconds=None),
+    evidence = await run_stage(traffic=ExplicitTrafficStage(duration_seconds=window["planned_duration_seconds"],
+        max_in_flight=required_concurrency(run.config)["by_check"]["multi_user"],
+        scheduler_lag_tolerance_ms=lag_tolerance_ms),
         rate_rps=per_user_rate*activations[0],
         stage_index=0, fixtures={}, execute=send, reserve_offer=reserve, try_acquire=run.try_acquire_slot,
         release=run.release_slot, stop_reason=stop, deadline=run.deadline, limits=Limits(),

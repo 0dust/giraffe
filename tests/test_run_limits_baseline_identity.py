@@ -46,6 +46,21 @@ def test_ordinary_load_baseline_survives_optional_nonce_builder_argument(additio
     assert _settings_reasons(old, current) == []
 
 
+@pytest.mark.parametrize("additional_checks", [[], ["access"]], ids=["load", "access-and-load"])
+def test_ordinary_load_baseline_survives_explicit_multi_user_stage(additional_checks):
+    current, old, settings = load_reports()
+    for report in (current, old):
+        report.manifest["config"]["checks"].extend(additional_checks)
+    old.manifest["fixture_pack"]["workload_fixture_sha256"] = fixture_hash({
+        "generator_source_sha256": "d9a9e921584262148e06b636f0e8f195b7e530fd2a69c5e98f013359cf947ede",
+        "settings": settings,
+        "load_test_source_sha256": "113325dd5cffa04626cc7be7ee93bc6e9be67335531288bc329b3542a155c92a",
+    })
+    assert current.manifest["fixture_pack"] != old.manifest["fixture_pack"]
+    assert _settings_reasons(current, old) == []
+    assert _settings_reasons(old, current) == []
+
+
 def test_post_build_admission_guard_requires_new_load_baseline():
     current, old, _ = load_reports()
     assert "Fixture pack identity differs." in _settings_reasons(current, old)
@@ -210,7 +225,7 @@ def test_source_bridge_requires_an_explicitly_attested_generator_revision(monkey
 def test_unchanged_text_generator_has_reviewed_identity_table_entry():
     configured = RunConfig(targets=[{"name": "local", "url": "http://localhost", "model": "test"}],
                            checks=["consistency"])
-    identity = _run_limits_workload_identity({"config": configured.model_dump(mode="json")}, revision="policy_conversations")
+    identity = _run_limits_workload_identity({"config": configured.model_dump(mode="json")}, revision="policy_shared_first")
     actual = {
         "generator_source_sha256": hashlib.sha256(Path(workloads.__file__).read_bytes()).hexdigest(),
     }

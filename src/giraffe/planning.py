@@ -13,6 +13,7 @@ import random
 from typing import Any
 
 from giraffe.fixtures import builtin_fixtures
+from giraffe.gateway_attribution import configured_probe_count
 from giraffe.concurrent_load import prompt_overhead
 from giraffe.logprob_workload import corpus_width, sample_count
 from giraffe.load_test import context_window, calibration_keys, load_time_plan, minimum_reservation, test_points, point_shapes, settings_sets, saved_shape_warnings
@@ -384,7 +385,8 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
     for target in config.targets:
         has_observations = bool((observations or {}).get(target.name))
         for row in ordered:
-            name, count = row["id"], row["requests_per_target"]
+            name = row["id"]
+            count = row.get("target_request_counts", {}).get(target.name, row["requests_per_target"])
             if name == "recovery_prime" and "cancellation" in selected:
                 fixed(target.name, {"id": "recovery_wait", "title": "Recovery cleanup wait"},
                       min(5, config.effective_check("cancellation")["cleanup_seconds"]), "test_options.cancellation.cleanup_seconds")
@@ -844,6 +846,7 @@ def request_plan(config: RunConfig | ConfigDraft, *,
     rows: list[dict[str, Any]] = []
     warnings: list[str] = []
     target_count = len(config.targets)
+    attribution_counts = {target.name: configured_probe_count(config, target) for target in config.targets}
     if config.max_requests is None:
         quotas = {target.name: None for target in config.targets}
     else:
@@ -1011,7 +1014,8 @@ def request_plan(config: RunConfig | ConfigDraft, *,
                 kind="bounded", title="Backend cancellation verification")
     if "recovery" in selected:
         options = config.effective_check("recovery")
-        later = [name for name in config.checks if name not in CORE_CHECKS or name == "load"]
+        later = [name for name in config.checks
+                 if (name not in CORE_CHECKS or name == "load") and name != "gateway_attribution"]
         later_known = request_plan(config.model_copy(update={"checks": later, "restart_target": None}))["minimum_reserved_per_target"]
         prior = sum(row["requests_per_target"] or 0 for row in rows)
         needed = later_known + 2 * options["samples"] + max(options["limits"]["min_samples"], options["concurrency"] * 2)
@@ -1027,13 +1031,6 @@ def request_plan(config: RunConfig | ConfigDraft, *,
                 kind="bounded", title="Sustained load")
     if "gpu" in selected:
         add("gpu", 0, "Observes metrics without adding inference requests.", source="configured metrics endpoint")
-    if "gateway_attribution" in selected:
-        settings = config.gateway_attribution
-        add("gateway_attribution", len(settings.identities) * settings.samples if settings else 0,
-            "Marked identity probes plus bounded read-only gateway spend-log collection." if settings
-            else "No identity selection configured; attribution remains unavailable without sending probes.",
-            source="configured test identity references")
-
     if "arrivals" in selected:
         add("arrivals", config.arrivals.requests,
             f"{config.arrivals.requests} scheduled offers; the pending queue and Limits can leave some undispatched.")
@@ -1165,6 +1162,16 @@ def request_plan(config: RunConfig | ConfigDraft, *,
         add("tools", count, "Tool fixtures in each selected mode. Conversation counts are upper bounds: expected calls plus one final answer; invalid or repeated calls stop a conversation early. No tools execute.",
             source="configured tool fixtures" if config.tool_checks and (config.tool_checks.fixtures or conversations) else "generated examples",
             kind="bounded" if conversations else "exact")
+
+    if "gateway_attribution" in selected:
+        counts = set(attribution_counts.values())
+        count = next(iter(counts)) if len(counts) == 1 else None
+        add("gateway_attribution", count,
+            "Marked identity probes use spare request budget after shared workloads on configured endpoints."
+            if any(counts) else "Attribution is unavailable without a supported reader and all selected aliases.",
+            source="configured test identity references", kind="bounded" if count is None else "exact")
+        if count is None:
+            rows[-1]["target_request_counts"] = attribution_counts
 
     sample_counts = {}
     if "arrivals" in selected:

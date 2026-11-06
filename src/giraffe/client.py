@@ -39,6 +39,7 @@ _MAX_OUTPUT_EVENTS = 4096
 # Reuse completed HTTP/1.1 streams without waiting on servers that never send EOF.
 _STREAM_DRAIN_SECONDS = 0.1
 _REASONING_TAG = re.compile(r"<(/?)(think|thinking|reasoning)>", re.IGNORECASE)
+_SURROGATE = re.compile(r"[\ud800-\udfff]")
 REASONING_BUDGET_ERROR = "reasoning exhausted the output budget before an answer"
 
 
@@ -168,6 +169,8 @@ def _text(value: Any) -> str:
         return ""
     if not isinstance(value, str):
         raise _ProtocolError("response content must be text")
+    if not value.isascii() and _SURROGATE.search(value):
+        raise _ProtocolError("response text contains invalid Unicode")
     return value
 
 
@@ -725,6 +728,22 @@ class LLMClient:
                     # Rebuild the complete headers from this identity instead.
                     request.headers = httpx.Request("POST", request.url, json=payload,
                                                     headers=selected_headers).headers
+                if spec.workload.get("scenario") == "noisy_neighbors" and spec.workload.get("role") == "probe":
+                    sending_post = False
+
+                    async def observe_send(event: str, info: dict) -> None:
+                        nonlocal sending_post
+                        protocol, _, name = event.partition(".")
+                        if protocol not in {"http11", "http2"}:
+                            return
+                        if name == "send_request_body.started":
+                            # A proxy CONNECT can inherit this request's trace extension.
+                            sending_post = info["request"].method == b"POST"
+                        elif name == "send_request_body.complete" and sending_post:
+                            record._request_body_sent_monotonic = monotonic()
+                            sending_post = False
+
+                    request.extensions["trace"] = observe_send
                 response = await self._client.send(request, stream=True)
                 events = None
                 try:

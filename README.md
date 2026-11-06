@@ -283,6 +283,9 @@ marked spend-log rows, so shared counter resets cannot produce a pass. Results s
 **not selected**, **unavailable**, **unsupported**, **unverified**, and observed
 **mismatch**; a verified result covers only the marked requests observed.
 Unconfigured or unsupported attribution remains visible and optional in mixed runs.
+Shared-key workloads, including Recovery, run before attribution. Attribution uses
+the remaining request budget. In a request-capped mixed run, Giraffe checks the
+reader's status with a bounded GET before sending identity probes.
 Exports retain the reader settings and identity references. Changes to the reader,
 check settings, or participating references affect attribution comparisons only.
 References alone cannot establish that the underlying credential values stayed the same.

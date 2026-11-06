@@ -3,6 +3,7 @@ import asyncio
 from datetime import datetime, timezone
 import hashlib
 import json
+import re
 import time
 
 import httpx
@@ -10,7 +11,8 @@ import pytest
 
 from giraffe.client import LLMClient
 from giraffe.gateway_attribution import execute, result
-from giraffe.models import RequestSpec, TestIdentity as GatewayIdentity
+from giraffe.models import RequestSpec, Sessions, TestIdentity as GatewayIdentity
+from giraffe.planning import request_plan
 from giraffe.reporting import compare_baseline
 from giraffe.runner import _Run, _checks, run_suite
 from tests.test_gateway_attribution import config, spend_page
@@ -37,6 +39,9 @@ def setup(monkeypatch, observer, *, rejected=None):
                 return httpx.Response(401, content=b'{"error":' + b'[' * 2000 + b'0' + b']' * 2000 + b'}')
             if rejected == "deep_success":
                 return httpx.Response(200, content=b'{"choices":' + b'[' * 2000 + b'0' + b']' * 2000 + b'}')
+            if rejected == "invalid_unicode":
+                return httpx.Response(200, content=b'{"choices":[{"message":{"content":"\\ud800"},'
+                                      b'"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":5}}')
             return httpx.Response(401, json={"error": {"type": "expired_key"}})
         if "x-litellm-spend-logs-metadata" in request.headers:
             rows.append({"request_id": str(len(rows)), "session_id": request.headers["x-litellm-trace-id"],
@@ -108,9 +113,104 @@ async def test_mixed_run_distinguishes_unsupported_reader_from_denied_reader(mon
     checks = {check.id: check for check in report.checks}
     assert checks["access"].status == checks["serving"].status == "pass"
     attribution = checks["gateway_attribution"]
-    assert reads and attribution.metrics["observed_requests"] == 2
+    assert reads and attribution.metrics["observed_requests"] == (0 if status == 404 else 2)
     assert attribution.metrics["state"] == state and attribution.status == "inconclusive"
     assert attribution.required is required and report.overall == overall
+
+
+@pytest.mark.parametrize("reader,cap", [("unsupported", 5), ("verified", 7), ("later_unsupported", 7)])
+async def test_attribution_preserves_shared_sessions_and_uses_spare_budget(monkeypatch, local_tokenizer, reader, cap):
+    cfg = config(stream=True)
+    cfg.checks = ["access", "sessions", "gateway_attribution"]
+    cfg.sessions = Sessions(sessions=2, concurrency=2, modes=["fixed"], delay_seconds=0)
+    cfg.max_requests = cap
+    cfg.gateway_attribution.settle_seconds = .2
+    cfg.limits.min_samples = 2
+    for ref in ("ALICE", "BOB", "OBSERVER"):
+        monkeypatch.setenv(ref, "secret-" + ref)
+    traffic, rows = [], []
+
+    class Answer(httpx.AsyncByteStream):
+        def __init__(self, answer):
+            self.answer = answer
+
+        async def __aiter__(self):
+            for part in (self.answer[:1], self.answer[1:]):
+                await asyncio.sleep(.01)
+                yield ("data: " + json.dumps({"choices": [{"delta": {"content": part}}]}) + "\n\n").encode()
+            yield b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+            yield b'data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":5}}\n\ndata: [DONE]\n\n'
+
+    def handler(request):
+        if request.method == "GET":
+            if request.url.path != "/spend/logs/v2":
+                return httpx.Response(404)
+            traffic.append("reader")
+            if reader == "unsupported" or reader == "later_unsupported" and rows:
+                return httpx.Response(404)
+            return spend_page(request, rows)
+        if "x-litellm-trace-id" in request.headers:
+            traffic.append("identity")
+            key = request.headers["authorization"].removeprefix("Bearer ")
+            rows.append({"request_id": str(len(rows)), "session_id": request.headers["x-litellm-trace-id"],
+                "metadata": {"spend_logs_metadata": json.loads(request.headers["x-litellm-spend-logs-metadata"])},
+                "api_key": hashlib.sha256(key.encode()).hexdigest(), "prompt_tokens": 3,
+                "completion_tokens": 5, "total_tokens": 8, "status": "success"})
+        else:
+            traffic.append("shared")
+        body = json.loads(request.content)
+        marker = re.search(r"Session_\d+_fixed", body["messages"][0]["content"])
+        return httpx.Response(200, stream=Answer(marker[0] if marker else "OK"))
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
+    report = await run_suite(cfg)
+    checks = {check.id: check for check in report.checks}
+    assert checks["access"].status == checks["sessions"].status == "pass"
+    attribution = checks["gateway_attribution"]
+    assert attribution.metrics["state"] == ("verified" if reader == "verified" else "unsupported")
+    assert attribution.required is (reader == "verified")
+    assert report.overall == "pass"
+    assert traffic[:6] == ["shared"] * 5 + ["reader"]
+    assert traffic.count("identity") == (0 if reader == "unsupported" else 2)
+
+
+async def test_attribution_does_not_reserve_requests_from_recovery(monkeypatch, local_tokenizer):
+    from tests.test_runner import FakeClient
+
+    async def observer(request, rows):
+        return httpx.Response(404)
+
+    cfg, _, reads = setup(monkeypatch, observer)
+    monkeypatch.setattr("giraffe.runner.LLMClient", FakeClient)
+    cfg.checks = ["recovery", "gateway_attribution"]
+    cfg.concurrency = 1
+    cfg.samples = 2
+    cfg.limits.min_samples = 2
+    cfg.max_requests = 8
+    cfg.sustained_seconds = .1
+    report = await run_suite(cfg)
+    target = report.observations["targets"]["proxy"]
+    assert target["sustained_budget"]["reserved_later"] == 2
+    assert target["sustained_budget"]["allowance"] == 3
+    assert len(reads) == 1
+    assert not any(record.identity for record in report.requests)
+
+
+def test_plan_does_not_reserve_attribution_on_unsupported_targets():
+    cfg = config()
+    supported = cfg.targets[0]
+    unsupported = supported.model_copy(update={"name": "other",
+        "gateway": supported.gateway.model_copy(update={"profile": "unsupported"})})
+    cfg.targets = [unsupported]
+    plan = request_plan(cfg)
+    assert plan["planned_total"] == plan["minimum_reserved_per_target"] == 0
+
+    cfg.targets = [supported, unsupported]
+    plan = request_plan(cfg)
+    row = next(row for row in plan["rows"] if row["id"] == "gateway_attribution")
+    assert row["target_request_counts"] == {"proxy": 2, "other": 0}
+    assert all(item["target"] == "proxy" for item in plan["unknown_time_components"])
 
 
 @pytest.mark.parametrize("fault", ["reused_id", "wrong_session", "missing_id", "unknown_local"])
@@ -362,7 +462,8 @@ async def test_runner_fallback_records_keep_selected_identity_and_health_isolati
 
 @pytest.mark.usefixtures("local_tokenizer")
 @pytest.mark.parametrize("rejected,http_status,evidence", [
-    ("expired", 401, "authentication"), ("deep_json", 401, "unknown"), ("deep_success", 200, None),
+    ("expired", 401, "authentication"), ("deep_json", 401, "unknown"),
+    ("deep_success", 200, None), ("invalid_unicode", 200, None),
 ])
 async def test_mixed_full_run_keeps_shared_checks_passing_with_rejected_identity(monkeypatch, rejected, http_status, evidence):
     async def observer(request, rows):
