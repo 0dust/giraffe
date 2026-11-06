@@ -261,6 +261,46 @@ console.log(JSON.stringify(configureMultiUser(config,values,bootstrap.multi_user
     assert saved.workloads == config.multi_user.conversations.workloads
 
 
+def test_first_performance_selection_uses_presets_and_deleted_tasks_stay_unselected():
+    config = RunConfig.model_validate({**configuration().model_dump(),
+        'multi_user': {'levels': [2], 'conversations': {'profile': 'performance', 'modes': ['live'],
+            'workloads': [{'name': 'custom-1', 'turns': ['First', 'Second']}]}}})
+    browser_logic(r'''
+const selected=markup=>[...markup.matchAll(/name="multi_user_conversation_task_(\d+)_enabled" checked/g)].map(row=>Number(row[1]));
+const fresh={...config,multi_user:{...config.multi_user,conversations:null}};
+const presets=bootstrap.session_workloads.presets;
+const performanceForm=()=>{
+  const values=new FormData();values.set('multi_user_rendered','1');
+  values.set('multi_user_conversation_profile','performance');
+  values.set('multi_user_conversation_modes','fixed,live');
+  values.set('multi_user_conversation_task_count',presets.length);
+  return values;
+};
+const initial=performanceForm();
+for(const i of selected(renderMultiUserConversationEditor(fresh.multi_user))){
+  const key=`multi_user_conversation_task_${i}_`,task=presets[i];
+  initial.set(key+'enabled','on');initial.set(key+'name',task.name);initial.set(key+'weight',task.weight);
+  initial.set(key+'cap',task.max_tokens??'');initial.set(key+'turn_count',task.turns.length);
+  task.turns.forEach((turn,j)=>initial.set(key+'turn_'+j,turn));
+}
+const first=configureMultiUser(fresh,initial,bootstrap.multi_user.defaults).multi_user.conversations;
+assert(sameConfig(first.workloads,presets));
+assert.equal(JSON.stringify(first.modes),'["live"]');
+nodes['#new-run-form']={elements:{multi_user_conversation_task_0_name:{value:'custom-1'}}};
+captureFormDraft=()=>{};
+configChanged=()=>{};
+let markup;
+renderNew=()=>{markup=renderMultiUserEditor(state.config);};
+editUserConversation('user-remove-task',0);
+assert.equal(state.config.multi_user.conversations.workloads.length,0);
+assert.equal(selected(markup).length,0);
+const values=performanceForm();
+const draft=configureMultiUser(state.config,values,bootstrap.multi_user.defaults,{allowInvalid:true});
+assert.equal(draft.multi_user.conversations.workloads.length,0);
+assert.throws(()=>configureMultiUser(state.config,values,bootstrap.multi_user.defaults),/Select at least one conversation task/);
+''', config)
+
+
 def test_unchanged_multi_user_form_preserves_multiline_recall_prompts():
     turns = ['Remember the name.\nReply with it only.', 'Repeat it.']
     config = RunConfig.model_validate({**configuration().model_dump(),
