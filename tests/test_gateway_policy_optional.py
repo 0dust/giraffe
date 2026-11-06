@@ -35,10 +35,18 @@ async def test_unconfigured_policy_is_unavailable_without_traffic(tmp_path, caps
 
 
 @pytest.mark.usefixtures("local_tokenizer")
-async def test_unsupported_policy_with_no_identities_keeps_shared_key_access(monkeypatch):
+@pytest.mark.parametrize("capability", [None, "key_rpm", "priority_rpm"])
+async def test_unavailable_policy_with_no_identities_keeps_shared_key_access(monkeypatch, capability):
     from tests.test_gateway_policy import configuration as configured_policy
 
     raw = configured_policy(gateway="unsupported").model_dump(mode="json")
+    if capability is None:
+        raw["gateway_policy"] = None
+    else:
+        raw["gateway_policy"]["capability"] = capability
+        if capability == "priority_rpm":
+            for user in raw["gateway_policy"]["users"]:
+                user["priority"] = None
     raw["checks"] = ["access", "gateway_policy"]
     raw["stream"] = False
     raw["targets"][0].update(test_identities={}, api_key_env="SHARED")
@@ -60,8 +68,42 @@ async def test_unsupported_policy_with_no_identities_keeps_shared_key_access(mon
     checks = {check.id: check for check in report.checks}
     assert checks["access"].status == "pass", checks["access"].summary
     assert checks["gateway_policy"].metrics["gateway_policy"]["qualification"] == "unavailable"
+    assert not checks["gateway_policy"].required
+    assert report.overall == "pass"
     assert sent == ["Bearer shared-secret"]
     assert all("gateway_policy" not in record.check_ids for record in report.requests)
+
+
+@pytest.mark.parametrize("credential", [None, " "])
+async def test_unavailable_policy_credentials_do_not_consume_requests(monkeypatch, credential):
+    from tests.test_gateway_policy import configuration as configured_policy
+
+    config = configured_policy().model_copy(update={"max_requests": 3})
+    monkeypatch.setenv("LIMITED", "limited-secret")
+    if credential is None:
+        monkeypatch.delenv("PEER", raising=False)
+    else:
+        monkeypatch.setenv("PEER", credential)
+    sent = []
+
+    def handle(request):
+        if request.method == "POST":
+            sent.append(request)
+        return httpx.Response(404)
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: original(transport=httpx.MockTransport(handle), **kwargs))
+    report = await run_suite(config)
+    check = next(check for check in report.checks if check.id == "gateway_policy")
+    policy = check.metrics["gateway_policy"]
+    assert report.overall == check.status == "inconclusive"
+    assert policy["qualification"] == "unverified"
+    assert "credentials are unavailable" in check.summary
+    assert [user["dispatched"] for user in policy["users"]] == [0, 0]
+    assert not sent
+    assert not report.requests
+    assert report.observations["request_budget_used"] == 0
+    assert report.abort_reason is None
 
 
 def test_configured_policy_still_requires_all_identity_references():

@@ -1132,6 +1132,8 @@ class GatewayPolicy(Model):
         aliases = [user.identity for user in self.users]
         if len(set(aliases)) != len(aliases) or self.affected_identity not in aliases:
             raise ValueError("Policy users must be distinct and include the affected identity")
+        if not self.supported:
+            return self
         if any(user.requests > user.rpm for user in self.users if user.identity != self.affected_identity):
             raise ValueError("Peer offered request caps must stay within their declared RPM")
         if self.capability == "priority_rpm":
