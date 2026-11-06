@@ -373,6 +373,75 @@ def test_scheduled_user_and_capacity_windows_keep_separate_offer_ledgers():
     assert capacity["highest_acceptable_rate"]["value"] == 50
 
 
+@pytest.mark.parametrize("scenario,population", [("arrivals", 1), ("recovery", 2)])
+@pytest.mark.parametrize("duration,global_limit,sending_ms", [(.05, 10, 50), (.5, .15, 150)])
+def test_scheduled_performance_sending_rate_uses_bounded_window_after_stall(
+    monkeypatch, local_tokenizer, scenario, population, duration, global_limit, sending_ms,
+):
+    import asyncio
+
+    import httpx
+
+    from giraffe import multi_user, runner
+    from giraffe.client import LLMClient
+    from tests.test_multi_user import settings
+    from tests.test_multi_user_scenarios import PROFILE
+    from tests.test_review26_phase4_accuracy import run_virtual
+
+    cfg = settings(levels=[population], scenarios=[scenario], duration_seconds=duration, profile=PROFILE,
+        arrivals={"requests_per_second": 25}, recovery={"control_seconds": duration,
+            "sustained_seconds": duration, "lighter_seconds": duration,
+            "lighter_requests_per_second": 25, "sustained_requests_per_second": 50,
+        }).model_copy(update={"max_duration_seconds": global_limit})
+    work_hash = multi_user._matched_work_sha256
+    hashed = 0
+
+    def delayed(spec, **kwargs):
+        nonlocal hashed
+        value = work_hash(spec, **kwargs)
+        hashed += 1
+        if hashed == population+1:
+            asyncio.get_running_loop().now += .2
+        return value
+
+    async def respond(request):
+        await asyncio.sleep(.01)
+        return httpx.Response(200, text='data: {"choices":[{"delta":{"content":"1 2"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+
+    class Observed(LLMClient):
+        def _create_client(self):
+            return httpx.AsyncClient(transport=httpx.MockTransport(respond))
+
+        async def ready(self, deadline):
+            return True
+
+        def token_evidence_probe(self):
+            return None
+
+    monkeypatch.setattr(multi_user, "_matched_work_sha256", delayed)
+    monkeypatch.setattr(runner, "LLMClient", Observed)
+    report = run_virtual(monkeypatch, runner.run_suite(cfg))
+    target = report.observations["targets"]["service"]
+    phase = target["multi_user"]["windows"][0]
+    records = [r for r in report.requests if r.workload.get("window_id") == phase["id"]]
+    assert len(records) == phase["offer_accounting"]["dispatched"] == phase["peak_in_flight"] == population
+    assert all(r.valid and r.status == "completed" for r in records)
+    assert phase["offers"][population]["scheduler_lag_ms"] == pytest.approx(200)
+    assert phase["offers"][population]["outcome"] == "unissued"
+    assert phase["end_ms"]-phase["start_ms"] == pytest.approx(sending_ms)
+    sending, drain = target["schedule_transitions"][:2]
+    assert sending["end_ms"] == drain["start_ms"] == pytest.approx(phase["end_ms"])
+    assert drain["end_ms"]-sending["start_ms"] == pytest.approx(240)
+    rate = population*1000/sending_ms
+    assert phase["dispatched_requests_per_second"] == pytest.approx(rate)
+
+    performance = build_performance(report)["targets"][0]
+    window, = [window for window in performance["windows"] if window.get("stage_id") == phase["id"]]
+    assert window["duration_s"]*1000 == pytest.approx(sending_ms)
+    performance = build_performance(report, window=window["id"])["targets"][0]
+    assert performance["summaries"][window["id"]]["metrics"]["dispatch_rate"]["value"] == pytest.approx(rate)
+
+
 @pytest.mark.parametrize("missing_users", [0, 1, 5])
 def test_delivery_envelope_counts_known_zero_rates_and_missing_usage(missing_users):
     report = user_report()
