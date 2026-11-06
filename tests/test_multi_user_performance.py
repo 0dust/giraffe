@@ -31,6 +31,35 @@ def test_scenario_measurement_labels_preserve_condition_identity(scenarios):
     assert len(set(labels)) == len(scenarios)
 
 
+def test_saved_multi_user_stage_numbers_do_not_join_capacity_baselines():
+    from giraffe.reporting import compare_baseline
+    from tests.test_traffic_reporting import traffic_report
+
+    current, baseline = traffic_report("current"), traffic_report("baseline")
+    user_window = "multi_user_5_arrivals"
+    for report, tokens in ((current, 64), (baseline, 10)):
+        for row in report.requests:
+            row.output_tokens = 10
+        arrivals = user_report().requests
+        for row in arrivals:
+            row.scenario = user_window
+            row.traffic_stage = 0
+            row.workload.update(window_id=user_window, scenario="arrivals", role="arrivals")
+            row.output_tokens = tokens
+        report.requests.extend(arrivals)
+
+    compared = compare_baseline(current, baseline)
+    stage = compared.baseline["targets"][0]["traffic_capacity"]["stages"][0]
+    assert stage["evidence_ids"] == [r.id for r in current.requests if "capacity" in r.check_ids and r.traffic_stage == 0]
+    assert stage["timing_comparable"]
+    assert stage["output_work"]["current"] == stage["output_work"]["baseline"]
+
+    scope = f"full:{user_window}"
+    data = build_performance(compared, window=scope)["targets"][0]["summaries"][scope]
+    assert data["metrics"]["baseline_capacity"]["value"] is None
+    assert data["metrics"]["baseline_throughput"]["value"] is None
+
+
 def test_scheduled_user_and_capacity_windows_keep_separate_offer_ledgers():
     from tests.test_multi_user_metrics import record
 

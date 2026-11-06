@@ -958,13 +958,17 @@ def _compare_traffic(
             or [stage.get("rate_rps") for stage in current_stages] != planned_rates):
         result["reason"] = "The runs lack the same complete set of planned rate stages."
         return result
+    def stage_records(run, index):
+        return [record for record in run.requests if record.target == target
+                and "capacity" in record.check_ids and record.traffic_stage == index]
+
     for index, (stage, previous) in enumerate(zip(current_stages, old_stages)):
+        current_records = stage_records(report, index)
         row: dict[str, Any] = {
             "rate_rps": stage["rate_rps"], "current": stage, "baseline": previous,
             "status": "inconclusive", "reason": "Stage evidence is incomplete or generator-limited.",
             "goodput_delta_rps": None, "timing_comparable": False,
-            "evidence_ids": [record.id for record in report.requests
-                             if record.target == target and record.traffic_stage == index],
+            "evidence_ids": [record.id for record in current_records],
         }
         comparable = all(
             item.get("fully_offered") and not item.get("generator_limited")
@@ -980,11 +984,8 @@ def _compare_traffic(
                 row.update(status="fail", reason="This previously acceptable rate now fails its configured criteria.")
             else:
                 row.update(status="pass", reason="No loss of previously acceptable traffic at this tested rate.")
-            current_work, old_work = (
-                _output_work([record for record in run.requests
-                              if record.target == target and record.traffic_stage == index])
-                for run in (report, baseline)
-            )
+            current_work = _output_work(current_records)
+            old_work = _output_work(stage_records(baseline, index))
             row["output_work"] = {"current": current_work, "baseline": old_work}
             row["timing_comparable"] = bool(
                 current_work["valid_completions"] and old_work["valid_completions"]
@@ -2064,7 +2065,7 @@ def _multi_user_export(data: dict[str, Any]) -> dict[str, Any]:
         "duration_seconds", "planned_duration_seconds", "drain_seconds", "cut_short", "reason", "drain_reason", "status", "fairness",
         "role", "trigger", "heavy_profile", "heavy_user_ids", "control_window_id", "selected_user_id",
         "sustained_window_id", "requests_per_second", "planned_requests_per_second", "dispatched_requests_per_second",
-        "offer_accounting", "peak_in_flight", "scheduler_stalls")
+        "offer_accounting", "burst_offer_accounting", "peak_in_flight", "scheduler_stalls")
     value = {key: data.get(key) for key in ("version", "window_policy", "settings", "population",
                                           "status", "worst_user", "interpretation")}
     value["windows"] = [{**{key: window.get(key) for key in window_fields}, **_multi_user_scenario_export(window),
@@ -2084,8 +2085,10 @@ def _multi_user_scenario_html(window: dict[str, Any], anchors: dict[str, str]) -
 
     parts = []
     if counts := window.get("offer_accounting"):
-        parts.append('<h5>Scheduled and achieved traffic</h5><p>' + _e(' · '.join(f'{key}: {value}' for key, value in counts.items()))
-            + '</p><p>Planned = offered + not offered. Offered = dispatched + local drops + late drops + unissued. '
+        parts.append('<h5>Scheduled and achieved traffic</h5><p>' + _e(' · '.join(f'{key}: {value}' for key, value in counts.items())) + '</p>')
+        if bursts := window.get("burst_offer_accounting"):
+            parts.append('<p>Burst offers: ' + _e(' · '.join(f'{key}: {value}' for key, value in bursts.items())) + '</p>')
+        parts.append('<p>Planned = offered + not offered. Offered = dispatched + local drops + late drops + unissued. '
               'Client admission is not server queue time.</p><div class="table"><table><tr><th>User / cohort</th>'
               '<th>Scheduled / observed activation (ms)</th><th>Offer accounting</th></tr>')
         for user in window["users"]:
