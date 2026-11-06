@@ -232,6 +232,95 @@ async def test_priority_matches_gateway_formatting_at_rounding_ties(monkeypatch,
 
 
 @pytest.mark.usefixtures("local_tokenizer")
+@pytest.mark.parametrize("reported,middle_charge,model_tpm,expected", [
+    ((30.0, 20.0), False, "not configured", "inconclusive"),
+    ((30.0, 30.0), False, "not configured", "pass"),
+    ((20.0, 30.0), False, "not configured", "pass"),
+    ((30.0, 30.0), True, "not configured", "inconclusive"),
+    ((30.0, 40.0), True, "not configured", "pass"),
+    ((30.0, 20.0), False, None, "inconclusive"),
+    ((25.0, 25.0), False, None, "pass"),
+    ((37.5, 25.0), False, "80", "inconclusive"),
+    ((25.0, 25.0), False, "80", "pass"),
+])
+async def test_priority_rejections_share_one_counter_history(monkeypatch, reported, middle_charge, model_tpm, expected):
+    from giraffe.runner import _Run
+
+    raw = configuration("priority_rpm", saturation_threshold=.2).model_dump()
+    raw["gateway_policy"]["users"] = [dict(identity="limited", requests=4, rpm=2, priority="low"),
+        dict(identity="peer", requests=2, rpm=4, priority="high"),
+        dict(identity="middle", requests=1, rpm=4, priority="middle")]
+    raw["targets"][0]["test_identities"]["middle"] = {"api_key_env": "MIDDLE"}
+    config = RunConfig.model_validate(raw)
+    users = {user.identity: user for user in config.gateway_policy.users}
+    for name in users:
+        monkeypatch.setenv(name.upper(), f"{name}-secret")
+    counts = dict.fromkeys(users, 0)
+    peer_started = asyncio.Event()
+    first_rejected = asyncio.Event()
+    second_rejected = asyncio.Event()
+    middle_completed = asyncio.Event()
+
+    async def handler(request):
+        if request.method != "POST":
+            return httpx.Response(404)
+        who = request.headers["authorization"].removeprefix("Bearer ").removesuffix("-secret")
+        user = users[who]
+        counts[who] += 1
+        sequence = counts[who]
+        headers = {"x-litellm-priority": user.priority, "retry-after": "60", "x-litellm-rate-limiter-version": "v3",
+                   "x-ratelimit-priority_model-limit-requests": str(user.rpm), "x-litellm-model-group": MODEL_POOL}
+        if who == "peer" and sequence == 1:
+            peer_started.set()
+            await second_rejected.wait()
+        if who == "limited" and sequence >= 3:
+            tpm = f"Model TPM: {model_tpm}, " if model_tpm is not None else ""
+            message = (f"Priority-based rate limit exceeded. Model: {MODEL_POOL}, Priority: low, Rate limit type: requests, "
+                       f"{tpm}Model RPM: 10, Remaining: 0, Model saturation: {reported[sequence - 3]}%")
+            return httpx.Response(429, headers=headers, json={"error": {"type": "throttling_error", "code": "429", "message": message}})
+        return httpx.Response(200, headers=headers, json={"choices": [{"message": {"role": "assistant", "content": "OK"},
+            "finish_reason": "stop"}], "usage": {"prompt_tokens": 8, "completion_tokens": 2}})
+
+    request = _Run.request
+
+    async def ordered_request(self, target, client, spec, **kwargs):
+        sequence = spec.workload["request_sequence"]
+        if spec.identity == "middle":
+            await (first_rejected if middle_charge else second_rejected).wait()
+        if spec.identity == "limited" and sequence == 2:
+            await peer_started.wait()
+        if middle_charge and spec.identity == "limited" and sequence == 4:
+            await middle_completed.wait()
+        record = await request(self, target, client, spec, **kwargs)
+        if spec.identity == "limited" and sequence == 3:
+            first_rejected.set()
+        if spec.identity == "limited" and sequence == 4:
+            second_rejected.set()
+        if spec.identity == "middle":
+            middle_completed.set()
+        return record
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
+    monkeypatch.setattr(_Run, "request", ordered_request)
+    # The middle identity needs a slot while the first peer is still in flight.
+    config.concurrency = 3
+    report = await run_suite(config)
+    first, second = [record for record in report.requests if record.http_status == 429]
+    first_peer = next(record for record in report.requests if record.identity == "peer")
+    assert first_peer.dispatch_ms < first.dispatch_ms < first.completed_ms < second.dispatch_ms
+    assert second.completed_ms < first_peer.completed_ms
+    if middle_charge:
+        middle = next(record for record in report.requests if record.identity == "middle")
+        assert first.completed_ms < middle.dispatch_ms < middle.completed_ms < second.dispatch_ms
+    check = next(check for check in report.checks if check.id == "gateway_policy")
+    assert check.metrics["gateway_policy"]["peer_continuation"]
+    assert check.status == expected, check.summary
+    if expected == "inconclusive":
+        assert "contradicts earlier limiter evidence" in check.summary
+
+
+@pytest.mark.usefixtures("local_tokenizer")
 @pytest.mark.parametrize("early_peers,model_tpm,expected", [
     (1, "not configured", "pass"), (2, "not configured", "inconclusive"),
     (3, "not configured", "fail"), (1, "60", "inconclusive"),
