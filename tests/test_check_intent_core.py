@@ -341,7 +341,15 @@ async def test_intentional_cancellation_does_not_mark_run_unfinished():
     run = runner._Run(config, None, None)
     spec = builtin_fixtures(config)["short"][0].model_copy(update={
         "scenario": "warm", "check_ids": ["serving"], "cancel_after_chunks": 1})
-    await run.request(config.targets[0], FakeClient(status="cancelled"), spec)
+
+    class ChunkCancelled(FakeClient):
+        async def execute(self, spec, **kwargs):
+            record = await super().execute(spec, **kwargs)
+            record.termination_reason = "generation_chunk_limit"
+            return record
+
+    record = await run.request(config.targets[0], ChunkCancelled(status="cancelled"), spec)
+    assert record.intentional
     assert not run.unfinished["t"] and run.reason is None and run.errors == 0
 
 
