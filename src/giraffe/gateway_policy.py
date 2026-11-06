@@ -10,7 +10,7 @@ from .identities import identity_headers, litellm_key_fingerprint
 from .models import CheckResult, RequestSpec
 
 
-VERSION = 8
+VERSION = 9
 PROMPT = "Reply with exactly the word OK."
 
 
@@ -95,6 +95,13 @@ async def execute(run, target, client):
         if not observation["complete"]:
             run.mark_unfinished(target.name, ["gateway_policy"])
         run.finish_condition(target.name, "gateway_policy", reason=observation["stop_reason"])
+
+
+def _completed_before_dispatch(admissions, record):
+    if record.dispatch_ms is None:
+        return 0
+    return sum(other is not record and other.completed_ms is not None and other.completed_ms < record.dispatch_ms
+               for other in admissions)
 
 
 def summarize(settings, observation, records):
@@ -196,11 +203,8 @@ def summarize(settings, observation, records):
         if settings.saturation_cache_seconds != 0:
             return outcome("unverified", "Cached saturation can differ between gateway nodes; this check requires zero cache delay.")
         evidence = [record.gateway_evidence for record in recognized]
-        threshold_percent = Decimal(str(settings.saturation_threshold)) * 100
-        if any(item.model_rpm != settings.model_rpm or item.priority_matches is not True
-               or item.saturation_percent is None or Decimal(str(item.saturation_percent)) < threshold_percent
-               for item in evidence):
-            return outcome("unverified", "Priority tier, model RPM or strict-mode evidence does not match the declaration.")
+        if any(item.model_rpm != settings.model_rpm or item.priority_matches is not True for item in evidence):
+            return outcome("unverified", "Priority tier or model RPM evidence does not match the declaration.")
         if not summary["overlap_observed"] or not summary["comparable_actual_work"]:
             return outcome("unverified", "Comparable actual token work and overlapping requests are required for priority observations.")
         if any(record.gateway_evidence is None or record.gateway_evidence.priority_matches is not True for record in admissions):
@@ -214,11 +218,21 @@ def summarize(settings, observation, records):
                or record.gateway_evidence.priority_request_limit != reservations[record.identity]
                for record in admissions):
             return outcome("unverified", "Scoped v3 priority RPM limits are missing or differ from the declared reservations.")
-        if len(admissions) > settings.model_rpm:
-            return outcome("observed_failure", "Total admitted requests exceeded the declared model RPM in the isolated window.", "fail")
         # The last borrowed request crosses the same ratio threshold as LiteLLM.
         crossing = bisect_left(range(settings.model_rpm + 1), settings.saturation_threshold,
                                key=lambda count: count / settings.model_rpm)
+        threshold_percent = Decimal(str(settings.saturation_threshold)) * 100
+        for rejection in recognized:
+            bounds = rejection.gateway_evidence._saturation_bounds
+            completed = _completed_before_dispatch(admissions, rejection)
+            if bounds is None or bounds[1] < threshold_percent or (
+                bounds[0] < threshold_percent and completed < crossing
+            ):
+                return outcome("unverified", "Strict-mode evidence does not establish the declared saturation threshold.")
+            if completed * 100 > bounds[1] * settings.model_rpm:
+                return outcome("unverified", "Reported saturation contradicts completed admissions in the isolated window.")
+        if len(admissions) > settings.model_rpm:
+            return outcome("observed_failure", "Total admitted requests exceeded the declared model RPM in the isolated window.", "fail")
         allowance = max(allowance, crossing)
     elif any(record.gateway_evidence.request_limit != declared.rpm or record.gateway_evidence.request_remaining != 0 for record in recognized):
         return outcome("unverified", "Gateway key limit differs from the declared RPM.")
@@ -236,13 +250,11 @@ def summarize(settings, observation, records):
         return outcome("observed_failure", "A request dispatched after strict priority pool exhaustion was admitted in the same window.", "fail")
     borrowing_uncertain = False
     if settings.capability == "priority_rpm":
+        rpm_only_saturation = all(item._model_tpm_unconfigured for item in evidence)
         # Each identity dispatches serially, so only admissions beyond its
         # reservation depend on whether the shared pool had reached saturation.
         for record in affected_admissions[declared.rpm:]:
-            if record.dispatch_ms is not None and sum(
-                other is not record and other.completed_ms is not None and other.completed_ms < record.dispatch_ms
-                for other in admissions
-            ) >= crossing:
+            if _completed_before_dispatch(admissions, record) >= crossing:
                 return outcome("observed_failure", "A request exceeded its reserved RPM after completed admissions reached model saturation.", "fail")
             if record.completed_ms is None or sum(
                 other is not record and (other.dispatch_ms is None or other.dispatch_ms <= record.completed_ms)
@@ -263,6 +275,8 @@ def summarize(settings, observation, records):
         return outcome("unverified", "Affected identity received 429 responses that do not identify the declared gateway policy.")
     if not summary["complete"] or any(user["cancelled"] or user["other_failures"] for user in users):
         return outcome("unverified", "Traffic was interrupted or non-policy failures left incomplete evidence.")
+    if settings.capability == "priority_rpm" and admitted > declared.rpm and not rpm_only_saturation:
+        return outcome("unverified", "Model TPM is configured or unknown, so request counts cannot establish borrowing below saturation.")
     if borrowing_uncertain:
         return outcome("unverified", "Overlapping admissions leave saturation uncertain when a request exceeded its reserved RPM.")
     if not summary["peer_continuation"]:

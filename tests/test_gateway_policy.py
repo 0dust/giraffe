@@ -32,15 +32,19 @@ def configuration(mode="key_rpm", **changes):
 
 
 async def exercise(monkeypatch, mode="key_rpm", *, behavior="enforce", full=False,
-                   admitted_affected=None, rejection_saturation=50.0, saturation_header=None, peer_delay=.01, **settings):
+                   admitted_affected=None, rejection_saturation=None, saturation_header=None, peer_delay=.01,
+                   early_peer_admissions=None, **settings):
     monkeypatch.setenv("LIMITED", "limited-secret")
     monkeypatch.setenv("PEER", "peer-secret")
     if behavior == "duplicate_credentials":
         monkeypatch.setenv("PEER", "limited-secret")
     seen = []
+    admitted = 0
     counts = {"limited": 0, "peer": 0}
+    early_peers_completed = asyncio.Event()
 
     async def handle(request):
+        nonlocal admitted
         if request.method != "POST":
             return httpx.Response(404)
         who = {"Bearer limited-secret": "limited", "Bearer peer-secret": "peer"}.get(request.headers.get("authorization"))
@@ -58,11 +62,18 @@ async def exercise(monkeypatch, mode="key_rpm", *, behavior="enforce", full=Fals
                    "x-ratelimit-priority_model-limit-requests": str(user.rpm)}
         threshold = admitted_affected if admitted_affected is not None else {"overadmit": 3, "early": 1}.get(behavior, 2)
         bucket_reset = behavior == "short_bucket_reset" and counts[who] == 5
+        if early_peer_admissions is not None:
+            if who == "limited" and counts[who] == threshold:
+                await early_peers_completed.wait()
+            if who == "peer" and counts[who] == early_peer_admissions:
+                early_peers_completed.set()
         if who == "limited" and counts[who] > threshold and behavior != "ignore" and not bucket_reset:
             subject = PEER_KEY_HASH if behavior == "wrong_subject" else LIMITED_KEY_HASH
+            model_rpm = cfg.gateway_policy.model_rpm
+            saturation = (f"{admitted / model_rpm:.1%}" if rejection_saturation is None else f"{rejection_saturation}%") if model_rpm else ""
             message = (f"Priority-based rate limit exceeded. Model: {MODEL_POOL}, Priority: {priority}, Rate limit type: requests, "
                        f"Model TPM: not configured, Model RPM: {cfg.gateway_policy.model_rpm}, Remaining: 0, "
-                       f"Model saturation: {rejection_saturation}%"
+                       f"Model saturation: {saturation}"
                        if mode == "priority_rpm" else
                        f"Rate limit exceeded for api_key: {subject}. Limit type: requests. Current limit: 2, Remaining: 0. Limit resets at: 2026-01-01")
             if behavior == "unknown" or (behavior == "mixed_rejections" and counts[who] > threshold + 1):
@@ -73,6 +84,7 @@ async def exercise(monkeypatch, mode="key_rpm", *, behavior="enforce", full=Fals
                 headers["x-litellm-saturation"] = saturation_header
             return httpx.Response(429, headers=headers, json={"error": {
                 "type": "throttling_error", "code": "429", "message": message}})
+        admitted += 1
         usage = {"prompt_tokens": 8, "completion_tokens": 2}
         if behavior == "missing_usage":
             usage = {}

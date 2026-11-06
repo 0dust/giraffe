@@ -13,21 +13,24 @@ def _model_group(value):
     return None
 
 
-def _saturation_percent(message, header):
-    match = re.search(r", Model saturation: ([0-9]{1,3}(?:\.[0-9]{1,6})?)%$", message)
+def _saturation_evidence(suffix, header):
+    match = re.fullmatch(r", Model saturation: ([0-9]{1,3}(?:\.[0-9]{1,6})?)%", suffix)
     if not match or (body := Decimal(match[1])) > 100:
-        return None
+        return None, None
+    body_places = body.as_tuple().exponent
+    body_radius = Decimal(5).scaleb(body_places - 1)
+    lower, upper = max(Decimal(0), body - body_radius), min(Decimal(100), body + body_radius)
     if header is None:
-        return float(body)
+        return float(body), (lower, upper)
     match = re.fullmatch(r"([0-9]{1,3}\.[0-9]{2})%", header) if isinstance(header, str) else None
     if not match or (precise := Decimal(match[1])) > 100:
-        return None
-    # The limiter formats the same value separately in the body and header.
-    # Compare rounding intervals to handle values on a decimal boundary.
-    body_places = body.as_tuple().exponent
-    if abs(body - precise) >= Decimal(5).scaleb(body_places - 1) + Decimal("0.005"):
-        return None
-    return float(precise if body_places > -2 else body)
+        return None, None
+    # LiteLLM rounds the same value separately for the body and header.
+    header_radius = Decimal("0.005")
+    lower, upper = max(lower, precise - header_radius), min(upper, precise + header_radius)
+    if lower >= upper:
+        return None, None
+    return float(precise if body_places > -2 else body), (lower, upper)
 
 
 def response_evidence(status, body=b"", headers=None, *, declared_priority=None, expected_key_hash=None):
@@ -93,7 +96,7 @@ def response_evidence(status, body=b"", headers=None, *, declared_priority=None,
         evidence.request_limit, evidence.request_remaining = int(key[2]), int(key[3])
     elif message.startswith(("Priority-based rate limit exceeded. Model: ", "Model capacity reached for ")):
         unit = re.search(r", Rate limit type: (requests|tokens),", message)
-        rpm = re.search(r", Model RPM: ([0-9]{1,12}), Remaining: 0(?:,|$)", message)
+        rpm = re.search(r", Model RPM: ([0-9]{1,12}), Remaining: 0(?=,|$)", message)
         if not unit or not rpm:
             return evidence
         evidence.error_kind = "rate_limit"
@@ -107,5 +110,8 @@ def response_evidence(status, body=b"", headers=None, *, declared_priority=None,
             if tier_match:
                 matches = tier_match[1] == declared_priority
                 evidence.priority_matches = matches if evidence.priority_matches is None else matches and evidence.priority_matches
-        evidence.saturation_percent = _saturation_percent(message, headers.get("x-litellm-saturation"))
+        # Only the canonical TPM field between the rate type and RPM fields can prove absence.
+        evidence._model_tpm_unconfigured = message[unit.end():rpm.start()] == " Model TPM: not configured"
+        evidence.saturation_percent, evidence._saturation_bounds = _saturation_evidence(
+            message[rpm.end():], headers.get("x-litellm-saturation"))
     return evidence
