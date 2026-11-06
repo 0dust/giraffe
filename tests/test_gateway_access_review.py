@@ -235,16 +235,16 @@ def _mixed_access_attribution_config(check):
     return raw
 
 
-def test_access_plan_timeline_reserves_compatible_requests_per_target():
+def test_access_plan_timeline_preserves_compatibility_for_target_with_spare_shared_quota():
     from giraffe.planning import request_plan
 
     raw = _mixed_access_attribution_config("generation")
-    raw.update(max_requests=9, max_duration_seconds=5)
+    raw.update(max_requests=7, max_duration_seconds=5)
     plan = request_plan(RunConfig.model_validate(raw))
-    assert plan["target_quotas"] == {"proxy": 5, "shared": 4}
+    assert plan["target_quotas"] == {"proxy": 4, "shared": 3}
     assert [item["target"] for item in plan["time_timeline"]
-            if item["id"] == "performance_evidence_probe"] == ["shared"]
-    assert all(component["target"] == "shared" for warning in plan["time_warnings"]
+            if item["id"] == "performance_evidence_probe"] == ["proxy"]
+    assert all(component["target"] == "proxy" for warning in plan["time_warnings"]
                for component in warning["components"] if component["id"] == "performance_evidence_probe")
 
 
@@ -424,9 +424,15 @@ async def test_unavailable_access_preserves_the_cap_for_other_adaptive_work(monk
     assert any(record.scenario.startswith("session_") for record in report.requests)
 
 
-@pytest.mark.parametrize("availability", ["missing_aliases", "missing_env", "conflicting_keys", "partial_env"])
-async def test_unavailable_access_probes_leave_shared_token_evidence_budget(monkeypatch, local_tokenizer, availability):
-    cfg = config(max_requests=5 if availability == "partial_env" else 4, retention="all")
+@pytest.mark.parametrize("availability", [
+    "missing_aliases", "missing_env", "conflicting_keys", "partial_env", "available", "unsupported_response",
+])
+async def test_access_probes_leave_shared_token_evidence_budget(monkeypatch, local_tokenizer, availability):
+    from giraffe.planning import request_plan
+
+    both_keys = availability in {"available", "unsupported_response"}
+    sends_access = both_keys or availability == "partial_env"
+    cfg = config(max_requests=5 if sends_access else 4, retention="all")
     cfg.checks = ["access", "generation", "gateway_access"]
     cfg.stream = True
     cfg.samples = cfg.limits.min_samples = 2
@@ -438,8 +444,10 @@ async def test_unavailable_access_probes_leave_shared_token_evidence_budget(monk
     elif availability == "conflicting_keys":
         monkeypatch.setenv("ALLOW_KEY", "same-secret")
         monkeypatch.setenv("DENY_KEY", "same-secret")
-    elif availability == "partial_env":
+    elif sends_access:
         monkeypatch.setenv("ALLOW_KEY", "allow-secret")
+        if both_keys:
+            monkeypatch.setenv("DENY_KEY", "deny-secret")
 
     class Answer(httpx.AsyncByteStream):
         def __init__(self, body):
@@ -460,21 +468,39 @@ async def test_unavailable_access_probes_leave_shared_token_evidence_budget(monk
     def handler(request):
         if request.method != "POST":
             return httpx.Response(404)
-        if request.headers.get("authorization") == "Bearer allow-secret":
+        key = request.headers.get("authorization")
+        if key == "Bearer deny-secret":
+            return httpx.Response(401, json={"error": {"type": "token_not_found_in_db"}})
+        if key == "Bearer allow-secret":
+            if availability == "unsupported_response":
+                return httpx.Response(501)
             return httpx.Response(200, json={"choices": [{"message": {
                 "role": "assistant", "content": "OK"}, "finish_reason": "stop"}]})
         return httpx.Response(200, stream=Answer(json.loads(request.content)))
 
     original = httpx.AsyncClient
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
+    shared = ["initial", "performance_evidence_probe", "generation", "generation"]
+    if both_keys:
+        baseline = await run_suite(cfg.model_copy(update={"checks": ["access", "generation"]}))
+        assert baseline.overall == "pass" and [record.scenario for record in baseline.requests] == shared
     report = await run_suite(cfg)
     checks = {check.id: check for check in report.checks}
-    assert checks["generation"].status == "pass"
-    assert [record.scenario for record in report.requests] == ["initial", "performance_evidence_probe", "generation", "generation"] + (
-        ["gateway_access"] if availability == "partial_env" else [])
+    assert checks["access"].status == checks["generation"].status == "pass"
+    assert [record.scenario for record in report.requests] == shared + (["gateway_access"] if sends_access else [])
     rows = checks["gateway_access"].metrics["gateway_access"]["cases"]
-    assert [row["observed"] for row in rows] == ["allow" if availability == "partial_env" else "unverified", "unverified"]
-    assert rows[1]["reason"] == ("identity_conflict" if availability == "conflicting_keys" else "identity_unavailable")
+    observed = "allow" if availability in {"available", "partial_env"} else "unverified"
+    assert [row["observed"] for row in rows] == [observed, "unverified"]
+    if both_keys:
+        assert rows[0]["http_status"] == (501 if availability == "unsupported_response" else 200)
+        assert rows[1]["reason"] == "request_budget_exhausted" and rows[1]["request_id"] is None
+        assert report.abort_reason is None and report.observations["request_limit_scopes"] == ["gateway"]
+        plan = request_plan(cfg)
+        warning, = [item for item in plan["request_warnings"] if item["kind"] == "incomplete_coverage"]
+        assert warning["cut_checks"] == ["gateway_access"] and warning["actions"][0]["value"] == 8
+        assert any(item["id"] == "performance_evidence_probe" for item in plan["time_timeline"])
+    else:
+        assert rows[1]["reason"] == ("identity_conflict" if availability == "conflicting_keys" else "identity_unavailable")
 
 
 @pytest.mark.parametrize("credential", ["alias", "bearer", "litellm_header", "api_key", "custom_header", "anonymous"])
