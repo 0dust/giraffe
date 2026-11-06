@@ -77,6 +77,8 @@ def test_full_multi_user_window_binds_only_matching_baseline_cohorts(scenario, r
         request.scenario = window_id
         request.workload.update(window_id=window_id, scenario=scenario, role=role,
                                 population=user_window["population"], cohort=cohorts[request.workload["user_id"]])
+        if scenario == "recovery":
+            request.workload.update(matched_work_sequence=1, matched_work_sha256=request.fixture_id)
     report.observations["targets"]["local"]["schedule_transitions"] = [{
         "stage_id": window_id, "check_id": "multi_user", "kind": "arrival_rate",
         "start_ms": 0, "end_ms": 4000, "intended_rate_rps": 5,
