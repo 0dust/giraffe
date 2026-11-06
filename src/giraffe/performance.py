@@ -871,12 +871,13 @@ def _baseline_rows(report, target, window, records, put):
             qualified += [{"goodput_delta_rps": row.get("goodput_delta_rps"), "rate_rps": row.get("rate_rps"),
                            "kind": "qualified arrival goodput change", "status": row["status"]} for row in traffic
                           if row.get("goodput_delta_rps") is not None]
+        qualification = ("Shared-window delivery compares completed output per user in the common measurement interval."
+                         if key == "baseline_throughput" and window["kind"] == "full" and user_cohorts else
+                         "Output-token rates in existing comparisons are per-request end-to-end rates; goodput deltas use requests/s. No aggregate throughput delta is invented.")
         put(key, qualified or None, label, "% change / percentage points", "Existing like-for-like qualified baseline comparisons; per-check/scenario",
             samples=len(qualified), state="measured" if qualified else ("no_baseline" if baseline is None else "insufficient_evidence"),
             reason=None if qualified else ("No baseline attached." if baseline is None else "No comparable qualified baseline population for this scope."),
-            evidence=rows, comparable=bool(qualified),
-            qualification="Ordinary output-token rates are per-request end-to-end rates. Shared-window delivery is per user. "
-                          "Goodput deltas use requests/s.")
+            evidence=rows, comparable=bool(qualified), qualification=qualification)
     point_ids = {point.get("point_id") for point in load_points}
     capacity = [r for r in entry.get("load_test", {}).get("points", [])
                 if (r.get("current") or {}).get("id") in point_ids

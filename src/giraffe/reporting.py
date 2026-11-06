@@ -700,6 +700,13 @@ def _input_work_changed(current, old, threshold):
             and abs(current_input - old_input)*100/old_input > threshold)
 
 
+def _total_generation_work_changed(current, old, threshold):
+    lengths = [[_total_generated_tokens(r) for r in records if r.status == "completed" and r.valid]
+               for records in (current, old)]
+    return (any(not values or None in values for values in lengths)
+            or _length_mix_differs(lengths, threshold))
+
+
 def _live_input_work_changed(current, old, threshold, *, compare_output=False):
     """Match generated history at each repeated conversation's logical turn."""
     def output_work(record):
@@ -1223,6 +1230,20 @@ def _probe_has_overlap(evidence: dict, records: list[RequestRecord]) -> bool:
     return bool(records) and all(record.id in exposed for record in records)
 
 
+def _recovery_generation_work_changed(current, old, current_records, old_records, threshold):
+    for phase in ("control", "sustained", "lighter"):
+        field = f"{phase}_request_ids"
+        cohorts = []
+        for evidence, records in ((current, current_records), (old, old_records)):
+            ids = evidence.get(field, [])
+            if not ids or any(rid not in records for rid in ids):
+                return True
+            cohorts.append([records[rid] for rid in ids])
+        if _total_generation_work_changed(*cohorts, threshold):
+            return True
+    return False
+
+
 def _compare_user_delivery(report, baseline, target, reasons, threshold):
     current, previous = _user_measurements(report, target), _user_measurements(baseline, target)
     rows, incomplete = [], []
@@ -1292,10 +1313,16 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold):
         rows.append(row)
         if (c_scenario.get("status") == "fail" and b_scenario.get("status") == "pass"
                 and not scenario_reason and not any(_load_work_comparison(current_work, old_work))):
-            rows.append({**row, "metric": "scenario_acceptance", "status": "fail",
-                         "current": "fail", "baseline": "pass", "aggregation": "selected_scenario_criteria",
-                         "worsening": 100, "reason": "This user's previously accepted scenario now fails its selected criteria.",
-                         "observed_change": None, "observed_delta": None})
+            acceptance = {**row, "metric": "scenario_acceptance", "status": "fail",
+                          "current": "fail", "baseline": "pass", "aggregation": "selected_scenario_criteria",
+                          "worsening": 100, "reason": "This user's previously accepted scenario now fails its selected criteria.",
+                          "observed_change": None, "observed_delta": None}
+            if scenario == "recovery" and _recovery_generation_work_changed(
+                    c_scenario, b_scenario, current_records, old_records, threshold):
+                reason = f"Multi-user {user_id} at {population} users: Total generated work differs or lacks evidence across recovery runs."
+                incomplete.append(reason)
+                acceptance.update(status="inconclusive", worsening=None, reason=reason)
+            rows.append(acceptance)
         if c.get("status") == "fail" and b.get("status") == "pass":
             # Acceptance also includes attempts that drain after delivery closes.
             current_attempts = [record for record in current_work if not record.intentional]
@@ -1303,10 +1330,14 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold):
             attempt_reason, attempt_mix_changed = _load_work_comparison(current_attempts, old_attempts)
             failed_criteria = {name for name, criterion in c.get("criteria", {}).items()
                                if criterion.get("status") == "fail"}
+            if scenario == "recovery" and c_scenario.get("status") == "fail" and not failed_criteria:
+                continue  # The window user status also includes the recovery scenario result.
             delivery_failure = "min_output_tokens_per_second" in failed_criteria and not missing
             comparable_attempts = not (attempt_reason or attempt_mix_changed or _live_input_work_changed(
                 current_attempts, old_attempts, threshold))
             failed_timing = failed_criteria & {"max_first_answer_ms", "max_completion_ms"}
+            generation_work_changed = (bool(failed_timing) and scenario in {"arrivals", "recovery"}
+                and _total_generation_work_changed(current_attempts, old_attempts, threshold))
             timing_exposed = not noisy_probe or (not scenario_reason
                 and _probe_has_overlap(c_scenario, current_attempts)
                 and _probe_has_overlap(b_scenario, old_attempts))
@@ -1315,7 +1346,7 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold):
                 or c["criteria"][name].get("missed") for name in failed_timing)
             attempt_failure = comparable_attempts and ("max_error_percent" in failed_criteria
                 or timing_exposed and (not failed_criteria
-                    or observed_timing_failure and not _live_input_work_changed(
+                    or observed_timing_failure and not generation_work_changed and not _live_input_work_changed(
                         current_attempts, old_attempts, threshold, compare_output=True)))
             acceptance = {**row, "metric": "user_acceptance", "current": "fail", "baseline": "pass",
                           "aggregation": "selected_criteria", "observed_change": None, "observed_delta": None,
@@ -1324,6 +1355,8 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold):
             if not (delivery_failure or attempt_failure):
                 detail = ("Timing acceptance lacks qualified heavy overlap."
                           if noisy_probe and failed_timing and (not timing_exposed or not observed_timing_failure)
+                          else "Total generated work behind timing acceptance differs or lacks evidence."
+                          if generation_work_changed
                           else "Work behind the selected acceptance criteria differs or lacks evidence.")
                 reason = f"Multi-user {user_id} at {population} users: {detail}"
                 incomplete.append(reason)
@@ -1486,8 +1519,10 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                 observed_outputs.extend(outputs)
                 different_work = _different_output_work(current_work, old_work, threshold)
                 input_work_changed = _input_work_changed(current_records, old_records, threshold)
-                live_output_differs = False
+                live_output_differs = generation_work_changed = False
                 if check == "multi_user":
+                    generation_work_changed = (workload.get("scenario") in {"arrivals", "recovery"}
+                        and _total_generation_work_changed(current_records, old_records, threshold))
                     completions = [[r for r in cohort if r.status == "completed" and r.valid]
                                    for cohort in (current_records, old_records)]
                     live_inputs_differ = _live_input_work_changed(*completions, threshold)
@@ -1511,7 +1546,9 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                             row["status"] = "inconclusive"
                     if (input_work_changed or live_inputs_differ) and metric in {"latency_ms", "first_output_ms", "max_stream_gap_ms", "output_tokens_per_second", "generation_tokens_per_second"}:
                         warn("input_work_changed", "Observed input work or live generated histories differ; timing is not like-for-like.")
-                    if live_output_differs and metric in TIMING_METRICS:
+                    if generation_work_changed and metric in TIMING_METRICS:
+                        warn("output_work_changed", "Observed total generation differs or lacks evidence; timing requires comparable generated work.")
+                    elif live_output_differs and metric in TIMING_METRICS:
                         warn("output_work_changed", "Observed generated work differs at matching live conversation turns; timing is not like-for-like.")
                     elif different_work and metric in {"latency_ms", "max_stream_gap_ms", "output_tokens_per_second", "generation_tokens_per_second"}:
                         warn("output_work_changed", "Actual generated output lengths differ materially: "
