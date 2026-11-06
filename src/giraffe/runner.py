@@ -35,7 +35,7 @@ from .timing import TimingHealth, configured_metrics, exceeded_unfinished, quali
 from .models import (
     INTERNAL_CHECK_NAMES as CHECK_NAMES, CHECK_NAMES as PUBLIC_CHECK_NAMES,
     CORE_CHECKS, CheckResult, Limits, RequestRecord, RequestSpec, RunConfig, RunReport, Target,
-    overall_status, required_concurrency,
+    SHARED_BASELINE_EXCLUDED_WORKLOADS, overall_status, required_concurrency,
 )
 
 
@@ -2726,6 +2726,16 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
                 "conversation_source_sha256": SOURCE_SHA256}
                if config.tool_checks and config.tool_checks.conversations else {}),
         }
+    shared_workload_hash = {}
+    if SHARED_BASELINE_EXCLUDED_WORKLOADS.intersection(workload_settings):
+        shared_settings = {key: value for key, value in workload_settings.items()
+                           if key not in SHARED_BASELINE_EXCLUDED_WORKLOADS}
+        excluded_sources = {f"{key}_source_sha256" for key in SHARED_BASELINE_EXCLUDED_WORKLOADS}
+        shared_workload_hash["shared_workload_fixture_sha256"] = fixture_hash({
+            **{key: value for key, value in workload_identity.items() if key not in excluded_sources},
+            "settings": shared_settings,
+            "generator_source_sha256": FIXTURE_SOURCE_SHA256 if any(shared_settings.values()) else None,
+        })
     fixture_values = {key: [spec.model_dump() for spec in specs] for key, specs in fixtures.items()}
     # An unused optional field must not invalidate existing baseline fingerprints.
     for specs in fixture_values.values():
@@ -2756,7 +2766,7 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
                                  "custom_sha256": custom_hash,
                                  "builtin_sha256": (None if run.pack_specs and set(config.checks) <= {"load", "capacity", "correctness"}
                                                     else fixture_hash(fixture_values)),
-                                 "workload_fixture_sha256": fixture_hash(workload_identity)},
+                                 "workload_fixture_sha256": fixture_hash(workload_identity), **shared_workload_hash},
                 "run_location": {"hostname": socket.gethostname(), "system": platform.system(),
                                  "machine": platform.machine(), "python": platform.python_version()},
                 "load_shape": {**({"arrival_rates_rps": config.traffic.rates,

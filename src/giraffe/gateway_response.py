@@ -5,7 +5,7 @@ import re
 from .models import GatewayResponseEvidence
 
 
-def response_evidence(status, body=b"", headers=None, *, declared_priority=None):
+def response_evidence(status, body=b"", headers=None, *, declared_priority=None, expected_key_hash=None):
     kind = None if 200 <= status < 300 else "unknown"
     if status in {401, 403}:
         try:
@@ -59,11 +59,11 @@ def response_evidence(status, body=b"", headers=None, *, declared_priority=None)
     message = error.get("message")
     if not isinstance(message, str) or len(message) > 8192 or re.search(r"\b\w+Exception\b", message):
         return evidence
-    key = re.fullmatch(r"Rate limit exceeded for api_key: [^\r\n]{1,256}\. Limit type: requests\. Current limit: ([0-9]{1,12}), Remaining: ([0-9]{1,12})\. Limit resets at: [^\r\n]{1,128}", message)
-    if key:
+    key = re.fullmatch(r"Rate limit exceeded for api_key: ([0-9a-f]{64})\. Limit type: requests\. Current limit: ([0-9]{1,12}), Remaining: ([0-9]{1,12})\. Limit resets at: [^\r\n]{1,128}", message)
+    if key and key[1] == expected_key_hash:
         evidence.error_kind, evidence.policy_rejection = "rate_limit", "key_rpm"
         evidence.rate_limit_unit = "requests"
-        evidence.request_limit, evidence.request_remaining = map(int, key.groups())
+        evidence.request_limit, evidence.request_remaining = int(key[2]), int(key[3])
     elif message.startswith(("Priority-based rate limit exceeded. Model: ", "Model capacity reached for ")):
         unit = re.search(r", Rate limit type: (requests|tokens),", message)
         rpm = re.search(r", Model RPM: ([0-9]{1,12}), Remaining: 0(?:,|$)", message)

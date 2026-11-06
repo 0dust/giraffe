@@ -3,7 +3,7 @@ import pytest
 
 from giraffe.gateway_policy import summarize
 from giraffe.gateway_response import response_evidence
-from tests.test_gateway_policy import exercise
+from tests.test_gateway_policy import LIMITED_KEY_HASH, exercise
 
 
 def observed(run):
@@ -28,15 +28,16 @@ async def test_conflicting_effective_windows_stay_unverified(monkeypatch):
     assert observed(run)["qualification"] == "unverified"
 
 
-async def test_legitimate_admission_after_short_bucket_reset_is_not_policy_failure(monkeypatch):
+@pytest.mark.parametrize("completed_ms", [4500, 6150])
+async def test_legitimate_admission_after_short_bucket_reset_is_not_policy_failure(monkeypatch, completed_ms):
     _, run, _ = await exercise(monkeypatch)
     for record in run.records:
         if record.http_status == 429:
             record.gateway_evidence.retry_after_seconds = 5
     last = [record for record in run.records if record.identity == "limited"][-1]
     last.status, last.http_status, last.valid = "completed", 200, True
-    last.dispatch_ms, last.completed_ms = 6100, 6150
-    run.observations["proxy"]["gateway_policy"].update(start_ms=0, end_ms=7000)
+    last.dispatch_ms, last.completed_ms = completed_ms - 50, completed_ms
+    run.observations["proxy"]["gateway_policy"].update(start_ms=0, end_ms=completed_ms)
     assert observed(run)["qualification"] == "unverified"
 
 
@@ -92,7 +93,7 @@ async def test_declared_custom_auth_header_qualifies_only_distinct_keys(monkeypa
         if identity == "limited" and counts[identity] > 2:
             return httpx.Response(429, headers={"retry-after": "60"}, json={"error": {
                 "type": "throttling_error", "code": "429", "message":
-                "Rate limit exceeded for api_key: private-hash. Limit type: requests. Current limit: 2, Remaining: 0. Limit resets at: now"}})
+                f"Rate limit exceeded for api_key: {LIMITED_KEY_HASH}. Limit type: requests. Current limit: 2, Remaining: 0. Limit resets at: now"}})
         return httpx.Response(200, json={"choices": [{"message": {"content": "OK"}, "finish_reason": "stop"}],
             "usage": {"prompt_tokens": 8, "completion_tokens": 2}})
 
