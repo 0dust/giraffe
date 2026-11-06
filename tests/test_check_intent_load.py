@@ -226,7 +226,9 @@ async def test_arrivals_cancelled_at_run_deadline_are_not_a_pass():
     assert p['cancelled']>0 and p['status'] == result.status == 'inconclusive'
 
 
-async def test_arrivals_without_timing_limit_are_inconclusive_and_pass_with_one():
+async def test_arrivals_without_timing_limit_are_inconclusive_and_pass_with_one(monkeypatch):
+    # A shared-runner stall over 100 ms would drop the backlog; this test is about timing limits.
+    monkeypatch.setattr(load_test, "SCHEDULER_LAG_MS", 2000)
     with FakeEndpoint(first_token_delay=.05) as server:
         c=load_configuration(targets=[{'name':'local','url':server.url,'model':'test'}],concurrency=16,load={'patterns':{'concurrent':{'enabled':False},'constant':{'enabled':True},'rates':[20]},'pass_criteria':{'max_completion_ms':None,'max_first_answer_ms':None}})
         short_windows(c,.2)

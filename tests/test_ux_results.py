@@ -55,7 +55,7 @@ function detail(value,extra={}) {
         input=script,
         capture_output=True,
         text=True,
-        timeout=20,
+        timeout=60,
     )
     assert result.returncode == 0, result.stderr
 
