@@ -13,7 +13,7 @@ import ssl
 import time
 import uuid
 from collections import Counter, defaultdict
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager, nullcontext
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
@@ -268,6 +268,9 @@ class _Run:
         self.reason: str | None = None
         self.limits_reached = set()
         self.request_limit_scopes: set[str] = set()
+        self.concurrency_limit_scopes: set[str] = set()
+        self.duration_limit_scope: str | None = None
+        self._gateway_only_phase = False
         self.memory_limit_reached = False
         self.memory_stop_reason = None
         self.memory_measured = False
@@ -454,6 +457,35 @@ class _Run:
             if not (self.judging_pending and check in {"correctness", "capacity", "load"}):
                 self.pending_checks.discard((target, check))
 
+    @contextmanager
+    def gateway_limit_phase(self):
+        non_inference = SHARED_BASELINE_EXCLUDED_WORKLOADS | {"gpu"}
+        restart = self.observations.get(self.config.restart_target, {}).get("restart")
+        if (any(check not in non_inference for _, check in self.pending_checks)
+                or any(checks - non_inference for checks in self.unfinished.values())
+                or any(target.get("client_error") for target in self.observations.values())
+                or (self.config.restart_target and (not restart or restart["status"] != "ready"))):
+            yield
+            return
+        # Attribute the first reached deadline to the phase that owned it,
+        # including when the monitor has not had a chance to wake.
+        if time.monotonic() >= self.deadline:
+            self.stop_reason()
+        previous = self._gateway_only_phase
+        self._gateway_only_phase = True
+        try:
+            yield
+        finally:
+            if time.monotonic() >= self.deadline:
+                self.stop_reason()
+            self._gateway_only_phase = previous
+
+    def inline_gateway_limit_phase(self):
+        ordinary = set(self.config.checks) - SHARED_BASELINE_EXCLUDED_WORKLOADS - {"gpu"}
+        if len(self.config.targets) == 1 and ordinary:
+            return self.gateway_limit_phase()
+        return nullcontext()
+
     def memory_sample(self, rss, unfinished=None):
         if self.memory_sampling_done:
             return
@@ -486,6 +518,8 @@ class _Run:
             self.reason = self.reason or "cancelled by user"
         if time.monotonic() >= self.deadline:
             self.limits_reached.add("max_duration_seconds")
+            if self.duration_limit_scope is None:
+                self.duration_limit_scope = "gateway" if self._gateway_only_phase else "shared"
             self.reason = self.reason or "maximum run duration reached"
         for name, health in self.endpoint_health.items():
             since = health["last_response_seconds"]
@@ -567,16 +601,18 @@ class _Run:
         except asyncio.QueueEmpty:
             if self.ceiling_constrains_pool:
                 self.limits_reached.add("concurrency")
+                self.concurrency_limit_scopes.add("shared")
             return False
 
     def release_slot(self) -> None:
         self.slots.put_nowait(None)
 
     @asynccontextmanager
-    async def slot(self, reserved: bool, deadline: float | None = None):
+    async def slot(self, reserved: bool, deadline: float | None = None, *, gateway_probe: bool = False):
         if not reserved:
             if self.slots.empty() and self.ceiling_constrains_pool:
                 self.limits_reached.add("concurrency")
+                self.concurrency_limit_scopes.add("gateway" if gateway_probe else "shared")
             if deadline is None:
                 await self.slots.get()
             else:
@@ -620,7 +656,7 @@ class _Run:
         slot_deadline = min(self.deadline, deadline_override if deadline_override is not None else self.deadline)
         if admission_deadline is not None:
             slot_deadline = min(slot_deadline, admission_deadline)
-        async with self.slot(slot_reserved, slot_deadline) as admitted:
+        async with self.slot(slot_reserved, slot_deadline, gateway_probe=gateway_probe) as admitted:
             # An offered arrival owns its budget even if a later arrival exhausts
             # the ceiling. Only a real stop condition can prevent its dispatch.
             reason = self.stop_reason(target.name)
@@ -2807,14 +2843,15 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
         if defer_attribution:
             phases.append(attribute)
         for execute in phases:
-            phase = start_targets(execute)
-            try:
-                await asyncio.gather(*phase)
-            finally:
-                for task in phase:
-                    if not task.done():
-                        task.cancel()
-                await asyncio.gather(*phase, return_exceptions=True)
+            with (nullcontext() if execute is shared_target else run.gateway_limit_phase()):
+                phase = start_targets(execute)
+                try:
+                    await asyncio.gather(*phase)
+                finally:
+                    for task in phase:
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(*phase, return_exceptions=True)
 
     tasks = ([asyncio.create_task(shared_then_gateway())] if defer_attribution or defer_policy or defer_access
              else start_targets(shared_target))
@@ -2959,6 +2996,8 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
                     "client_timing_health": run.timing_health.snapshot(),
                     "request_budget_used": run.budget_used,
                     "request_limit_scopes": sorted(run.request_limit_scopes),
+                    "concurrency_limit_scopes": sorted(run.concurrency_limit_scopes),
+                    **({"duration_limit_scope": run.duration_limit_scope} if run.duration_limit_scope else {}),
                     "inference_duration_seconds": inference_duration,
                     **({"judging": judging_summary} if judging_summary is not None else {}),
                     "replica_coverage": [{"target": t.name, "route": t.route, "parent": t.parent,

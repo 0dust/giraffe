@@ -944,7 +944,7 @@ async def test_access_denial_rules_do_not_change_policy_evidence(monkeypatch, lo
     assert check.status == "pass"
     baseline = report.model_copy(deep=True)
     # A passing quota run saved on the immediate policy predecessor, before gateway access.
-    baseline.manifest["gateway_policy_source_sha256"] = "3c297e1d5d231f0a48bb23a262ab3c0c97cbe92169c3e2ca310da84ec0851a71"
+    baseline.manifest["gateway_policy_source_sha256"] = "3694df73f10d503e4de3017fd6fd7f52e2aa28bb90b32446730b21dfbb2facef"
     assert compare_baseline(report, baseline).baseline["status"] == "pass"
 
 

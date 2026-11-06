@@ -177,7 +177,7 @@ async def test_policy_admission_needs_completion_inside_observation(monkeypatch,
             limited_count += 1
             if limited_count == 3:
                 message = (f"Rate limit exceeded for api_key: {LIMITED_KEY_HASH}. Limit type: requests. "
-                           "Current limit: 2, Remaining: 0. Limit resets at: test")
+                           "Current limit: 2, Remaining: 0. Limit resets at: 2026-01-01 00:00:00 UTC")
                 return httpx.Response(429, headers={"retry-after": "2"}, json={
                     "error": {"type": "throttling_error", "code": "429", "message": message}})
             if late and limited_count == 4:
@@ -733,6 +733,8 @@ async def test_policy_rejection_version_and_scoped_remaining_agree(
 @pytest.mark.parametrize("body_reset,header,expected", [
     ("2026-01-01 00:00:00 UTC", None, "pass"),
     ("2026-01-01 00:00:00 UTC", "2026-01-01 00:00:00 UTC", "pass"),
+    ("now", None, "inconclusive"),
+    ("2026-02-31 00:00:00 UTC", None, "inconclusive"),
     ("2026-01-01 00:00:00 UTC", "2026-01-01 00:00:01 UTC", "inconclusive"),
     ("2026-02-31 00:00:00 UTC", "2026-02-31 00:00:00 UTC", "inconclusive"),
 ])
@@ -751,4 +753,23 @@ async def test_key_rejection_reset_header_matches_body(monkeypatch, body_reset, 
     monkeypatch.setattr(httpx, "MockTransport", add_reset_header)
     check, report, _ = await exercise(monkeypatch, full=True, key_reset=body_reset)
     assert check.status == expected, check.summary
-    assert body_reset not in report.model_dump_json()
+    serialized = report.model_dump_json()
+    assert f'"{body_reset}"' not in serialized
+    assert "Limit resets at:" not in serialized
+
+
+@pytest.mark.usefixtures("local_tokenizer")
+@pytest.mark.parametrize("reset,expected", [
+    ("2026-01-01 00:00:00 UTC", "fail"),
+    ("now", "inconclusive"),
+    ("2026-02-31 00:00:00 UTC", "inconclusive"),
+])
+async def test_key_policy_early_rejection_needs_valid_body_reset(monkeypatch, reset, expected):
+    check, _, _ = await exercise(monkeypatch, behavior="early", full=True, key_reset=reset)
+    summary = check.metrics["gateway_policy"]
+    assert summary["users"][0]["admitted"] == 1
+    assert summary["users"][0]["rejected"] == 4
+    assert check.status == expected, check.summary
+    if expected == "inconclusive":
+        assert summary["qualification"] == "unverified"
+        assert "does not identify" in check.summary

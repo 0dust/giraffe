@@ -45,10 +45,8 @@ def _scoped_remaining_matches(headers, scope, unit, expected, *, clamp=False):
     return (max(0, remaining) if clamp else remaining) == expected
 
 
-def _key_reset_matches(headers, reported_reset):
-    if "reset_at" not in headers:
-        return True
-    if headers["reset_at"] != reported_reset:
+def _valid_key_reset(headers, reported_reset):
+    if "reset_at" in headers and headers["reset_at"] != reported_reset:
         return False
     try:
         return datetime.strptime(reported_reset, _KEY_RESET_FORMAT).strftime(_KEY_RESET_FORMAT) == reported_reset
@@ -138,7 +136,7 @@ def response_evidence(status, body=b"", headers=None, *, declared_priority=None,
         remaining = int(key[3])
         if (headers.get("rate_limit_type") not in (None, "requests")
                 or not _scoped_remaining_matches(headers, "api_key", "requests", remaining, clamp=True)
-                or not _key_reset_matches(headers, key["reset"])):
+                or not _valid_key_reset(headers, key["reset"])):
             return evidence
         evidence.error_kind, evidence.policy_rejection = "rate_limit", "key_rpm"
         evidence.rate_limit_unit = "requests"

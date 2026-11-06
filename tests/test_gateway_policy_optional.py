@@ -417,3 +417,70 @@ async def test_optional_policy_preserves_shared_traffic_at_run_limits(monkeypatc
                 assert report.observations["request_limit_scopes"] == ["gateway"]
                 assert all(row["status"] == "inconclusive" for row in target["comparisons"]
                            if row["check"] == "gateway_policy")
+
+
+@pytest.mark.usefixtures("local_tokenizer")
+@pytest.mark.parametrize("limit", ["concurrency", "max_duration_seconds"])
+async def test_inline_policy_limit_preserves_saved_serving_comparison(monkeypatch, tmp_path, limit):
+    from giraffe.models import RunReport
+    from giraffe.reporting import compare_baseline, write_report
+    from tests.test_gateway_policy import configuration as configured_policy
+
+    raw = configured_policy(duration_seconds=2, users=[dict(identity="limited", requests=2, rpm=1),
+                                                     dict(identity="peer", requests=2, rpm=5)]).model_dump(mode="json")
+    raw.update(checks=["serving"], stream=False, samples=2, concurrency=None, max_duration_seconds=None,
+               request_timeout_seconds=2, max_memory_mb=0, retention="all", limits={"min_samples": 2})
+    raw["targets"][0]["api_key_env"] = "SHARED"
+    monkeypatch.setenv("SHARED", "shared-secret")
+    monkeypatch.setenv("LIMITED", "limited-secret")
+    monkeypatch.setenv("PEER", "peer-secret")
+    sent = []
+    policy_stalled = asyncio.Event()
+
+    async def handle(request):
+        if request.method != "POST":
+            return httpx.Response(404)
+        auth = request.headers["authorization"]
+        sent.append(auth)
+        if auth != "Bearer shared-secret":
+            if limit == "max_duration_seconds":
+                await policy_stalled.wait()
+            else:
+                await asyncio.sleep(.03)
+        return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "OK"},
+            "finish_reason": "stop"}], "usage": {"prompt_tokens": 8, "completion_tokens": 2}})
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handle), **kw))
+    baseline = await run_suite(RunConfig.model_validate(raw))
+    assert sent == ["Bearer shared-secret"] * 3
+    sent.clear()
+    raw["checks"].append("gateway_policy")
+    raw[limit] = 1
+    current = await run_suite(RunConfig.model_validate(raw))
+
+    baseline_path, _ = write_report(baseline, tmp_path / "baseline")
+    current_path, _ = write_report(current, tmp_path / "current")
+    baseline, current = [RunReport.model_validate_json(path.read_bytes()) for path in (baseline_path, current_path)]
+    assert sent[:3] == ["Bearer shared-secret"] * 3
+    assert sent[3:] and all(auth != "Bearer shared-secret" for auth in sent[3:])
+    assert [record.request_hash for record in current.requests if record.identity is None] == [
+        record.request_hash for record in baseline.requests]
+    checks = {check.id: check for check in current.checks}
+    assert checks["serving"].status == "pass"
+    assert checks["gateway_policy"].status == "inconclusive"
+    assert limit in current.limits_reached
+    if limit == "max_duration_seconds":
+        assert current.abort_reason == "maximum run duration reached"
+    else:
+        assert current.abort_reason is None
+        assert len(sent[3:]) == 4
+
+    compared = compare_baseline(current, baseline).baseline["targets"][0]
+    assert not compared["reasons"], compared["reasons"]
+    assert any(row["check"] == "serving" and row["metric"] == "valid_completion_rate" and row["status"] == "pass"
+               for row in compared["comparisons"])
+    if limit == "max_duration_seconds":
+        assert current.observations["duration_limit_scope"] == "gateway"
+    else:
+        assert current.observations["concurrency_limit_scopes"] == ["gateway"]

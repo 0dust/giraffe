@@ -12,7 +12,7 @@ from .identities import gateway_identities_only, identity_headers, litellm_key_f
 from .models import CheckResult, RequestSpec
 
 
-VERSION = 19
+VERSION = 20
 PROMPT = "Reply with exactly the word OK."
 
 
@@ -39,6 +39,11 @@ def credential_issue(settings, target):
 
 
 async def execute(run, target, client):
+    with run.inline_gateway_limit_phase():
+        await _execute(run, target, client)
+
+
+async def _execute(run, target, client):
     settings = run.config.gateway_policy
     if settings is None:
         return
