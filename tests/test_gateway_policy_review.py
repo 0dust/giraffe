@@ -686,3 +686,69 @@ async def test_present_priority_rejection_header_must_agree_with_body(monkeypatc
     if expected == "inconclusive":
         assert priority not in report.model_dump_json()
         assert "Priority tier" in check.summary
+
+
+@pytest.mark.usefixtures("local_tokenizer")
+@pytest.mark.parametrize("mode,scope", [("key_rpm", "api_key"), ("priority_rpm", "priority_model")])
+@pytest.mark.parametrize("version,remaining,expected", [
+    (None, None, "pass"),
+    ("v3", "0", "pass"),
+    ("v2", None, "inconclusive"),
+    ("v3, v2", None, "inconclusive"),
+    ("", None, "inconclusive"),
+    ("v3", "1", "inconclusive"),
+    ("v3", "0, 0", "inconclusive"),
+    ("v3", "-1", "key_only"),
+])
+async def test_policy_rejection_version_and_scoped_remaining_agree(
+        monkeypatch, mode, scope, version, remaining, expected):
+    transport = httpx.MockTransport
+
+    def replace_headers(handler):
+        async def response(request):
+            result = await handler(request)
+            if result.status_code == 429:
+                if version is None:
+                    result.headers.pop("x-litellm-rate-limiter-version")
+                else:
+                    result.headers["x-litellm-rate-limiter-version"] = version
+                if remaining is not None:
+                    result.headers[f"x-ratelimit-{scope}-remaining-requests"] = remaining
+                result.headers[f"x-ratelimit-{scope}-remaining-tokens"] = "7"
+                result.headers["x-ratelimit-model_saturation_check-remaining-requests"] = "7"
+                result.headers["x-ratelimit-remaining-requests"] = "7"
+            return result
+
+        return transport(response)
+
+    monkeypatch.setattr(httpx, "MockTransport", replace_headers)
+    check, _, _ = await exercise(monkeypatch, mode, full=True)
+    if expected == "key_only":
+        expected = "pass" if mode == "key_rpm" else "inconclusive"
+    assert check.status == expected, check.summary
+    assert check.metrics["gateway_policy"]["peer_continuation"] == (expected == "pass")
+
+
+@pytest.mark.usefixtures("local_tokenizer")
+@pytest.mark.parametrize("body_reset,header,expected", [
+    ("2026-01-01 00:00:00 UTC", None, "pass"),
+    ("2026-01-01 00:00:00 UTC", "2026-01-01 00:00:00 UTC", "pass"),
+    ("2026-01-01 00:00:00 UTC", "2026-01-01 00:00:01 UTC", "inconclusive"),
+    ("2026-02-31 00:00:00 UTC", "2026-02-31 00:00:00 UTC", "inconclusive"),
+])
+async def test_key_rejection_reset_header_matches_body(monkeypatch, body_reset, header, expected):
+    transport = httpx.MockTransport
+
+    def add_reset_header(handler):
+        async def response(request):
+            result = await handler(request)
+            if result.status_code == 429 and header is not None:
+                result.headers["reset_at"] = header
+            return result
+
+        return transport(response)
+
+    monkeypatch.setattr(httpx, "MockTransport", add_reset_header)
+    check, report, _ = await exercise(monkeypatch, full=True, key_reset=body_reset)
+    assert check.status == expected, check.summary
+    assert body_reset not in report.model_dump_json()

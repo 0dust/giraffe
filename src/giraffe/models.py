@@ -861,6 +861,11 @@ def migrate_run_limits(value):
     return value, notes
 
 
+def scheduled_multi_user_slots(config) -> int:
+    """Return the local slot limit for a scheduled multi-user window."""
+    return config.concurrency or config.inherited_concurrency(config.default_concurrency)
+
+
 def required_concurrency(config) -> dict[str, Any]:
     """Conservative simultaneous target-request peak, independent of suite limits."""
     by_check = {}
@@ -874,9 +879,12 @@ def required_concurrency(config) -> dict[str, Any]:
             arrival = config.effective_arrivals()
             peak = arrival.max_in_flight if arrival else config.inherited_concurrency(config.default_concurrency)
         elif check == "multi_user":
-            peak = ((config.concurrency or config.inherited_concurrency(config.default_concurrency))
-                    if set(config.multi_user.scenarios) & {"arrivals", "recovery"}
-                    else max(config.multi_user.levels))
+            scenarios = set(config.multi_user.scenarios)
+            scheduled = {"arrivals", "recovery"}
+            if scenarios - scheduled:
+                peak = max(config.multi_user.levels)
+            if scenarios & scheduled:
+                peak = max(peak, scheduled_multi_user_slots(config))
         elif check == "gateway_policy":
             peak = len(config.gateway_policy.users) if config.gateway_policy and config.gateway_policy.supported else 0
         elif check == "sessions":

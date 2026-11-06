@@ -96,9 +96,14 @@ async def exercise(monkeypatch, mode="match", *, stream=True, full=False, missin
         if mode == "early_usage_matches":
             row.update(completion_tokens=2, total_tokens=5)
         rows.append(row)
+        usage = {"prompt_tokens": 3, "completion_tokens": 5}
+        if mode == "consistent_total":
+            usage["total_tokens"] = 8
+        if mode == "inconsistent_total":
+            usage["total_tokens"] = 99
         if not stream:
             return httpx.Response(200, json={"choices": [{"message": {"content": key}, "finish_reason": "stop"}],
-                "usage": {"prompt_tokens": 3, "completion_tokens": 5}})
+                "usage": usage})
         if mode in {"early_usage_matches", "early_usage_differs", "partial_terminal_usage"}:
             partial = ('data: {"choices":[],"usage":{"prompt_tokens":3}}\n\n'
                        if mode == "partial_terminal_usage" else "")
@@ -106,11 +111,14 @@ async def exercise(monkeypatch, mode="match", *, stream=True, full=False, missin
                 'data: {"choices":[{"delta":{"content":"OK"}}],"usage":{"prompt_tokens":3,"completion_tokens":2}}\n\n'
                 'data: {"choices":[{"delta":{"content":" again"},"finish_reason":"stop"}]}\n\n'
                 + partial + 'data: [DONE]\n\n'))
-        terminal_usage = '"usage":{"prompt_tokens":3,"completion_tokens":5}'
+        terminal_usage = '"usage":' + json.dumps(usage)
         finish = '"choices":[{"delta":{},"finish_reason":"stop"}]'
         if mode != "usage_after_finish":
             finish += ',' + terminal_usage
-        after_finish = '' if mode == "usage_on_finish" else 'data: {"choices":[],' + terminal_usage + '}\n\n'
+        if mode == "split_inconsistent_total":
+            after_finish = 'data: {"choices":[],"usage":{"total_tokens":99}}\n\ndata: {"choices":[],' + terminal_usage + '}\n\n'
+        else:
+            after_finish = '' if mode == "usage_on_finish" else 'data: {"choices":[],' + terminal_usage + '}\n\n'
         return httpx.Response(200, text=(
             'data: {"choices":[{"delta":{"content":"OK"},"finish_reason":null}],"usage":{"prompt_tokens":3,"completion_tokens":2}}\n\n'
             'data: {' + finish + '}\n\n' + after_finish + 'data: [DONE]\n\n'))
@@ -140,6 +148,21 @@ async def test_marked_usage_matches_and_stream_cumulative_counts_once(monkeypatc
     for ref in ("ALICE", "BOB", "OBSERVER"):
         assert "secret-" + ref not in serialized
         assert hashlib.sha256(("secret-" + ref).encode()).hexdigest() not in serialized
+
+
+@pytest.mark.parametrize("stream,mode,expected", [
+    (False, "consistent_total", "verified"),
+    (True, "consistent_total", "verified"),
+    (False, "inconsistent_total", "unverified"),
+    (True, "inconsistent_total", "unverified"),
+    (True, "split_inconsistent_total", "unverified"),
+])
+async def test_explicit_marked_total_must_agree_with_final_counts(monkeypatch, stream, mode, expected):
+    _, run, check, _, _ = await exercise(monkeypatch, mode, stream=stream)
+    assert check.metrics["state"] == expected
+    if expected == "unverified":
+        assert check.metrics["matched_requests"] == 0
+        assert all("inconsistent total usage" in record.error for record in run.records)
 
 
 @pytest.mark.parametrize("mode,state,status", [
@@ -256,7 +279,7 @@ async def test_attribution_baseline_compares_qualified_aliases(monkeypatch, mode
 
 
 @pytest.mark.usefixtures("local_tokenizer")
-@pytest.mark.parametrize("version", [None, 2, 3])
+@pytest.mark.parametrize("version", [None, 2, 3, 6])
 async def test_legacy_attribution_baseline_requires_a_fresh_collection(monkeypatch, version):
     from giraffe.reporting import compare_baseline
     _, report, _, _, _ = await exercise(monkeypatch, full=True)

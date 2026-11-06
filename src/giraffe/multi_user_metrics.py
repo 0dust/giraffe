@@ -775,22 +775,13 @@ def _recovery(observation, window, control, sustained, user_records, criteria, h
             if len(completed) != len(requests) or len(completed) != expected:
                 notes.append(f"Actual {label} work has failed or incomplete terminal coverage.")
             completed_work[label] = completed
-        control_end = (control or {}).get("end_ms")
-        lighter_end = window.get("end_ms")
         controls = {r.workload["matched_work_sequence"]: r for r in completed_work["control"]
-                    if r.workload.get("matched_work_sequence") is not None
-                    and control_end is not None and r.completed_ms <= control_end}
-        pairs = [(baseline, r) for r in completed_work["lighter"]
-                 if lighter_end is not None and r.completed_ms <= lighter_end
-                 and (baseline := controls.get(r.workload.get("matched_work_sequence"))) is not None]
-        if len({a.id for a, _ in pairs}) < criteria.min_samples or len(pairs) != len(after):
-            notes.append("Recovery lacks sufficient matched completed control samples.")
-        stress = [r for r in completed_work["sustained"] if sustained_end is not None and r.completed_ms <= sustained_end]
-        work_controls = {r.workload["matched_work_sequence"]: r for r in completed_work["control"]
-                         if r.workload.get("matched_work_sequence") is not None}
+                    if r.workload.get("matched_work_sequence") is not None}
+        matched_work = {}
         for phase in ("lighter", "sustained"):
             matched = [(baseline, r) for r in completed_work[phase]
-                       if (baseline := work_controls.get(r.workload.get("matched_work_sequence"))) is not None]
+                       if (baseline := controls.get(r.workload.get("matched_work_sequence"))) is not None]
+            matched_work[phase] = matched
             if len(matched) != len(completed_work[phase]):
                 notes.append(f"{phase.capitalize()} work lacks a matched completed control sample.")
             if any(not replay.workload.get("matched_work_sha256")
@@ -807,6 +798,10 @@ def _recovery(observation, window, control, sustained, user_records, criteria, h
                    and not _comparable_uncached_input(baseline, replay, tolerance)
                    for baseline, replay in matched):
                 notes.append(f"Actual uncached input drifted between matched control and {phase} requests.")
+        pairs = matched_work["lighter"]
+        if len({a.id for a, _ in pairs}) < criteria.min_samples or len(pairs) != len(after):
+            notes.append("Recovery lacks sufficient matched completed control samples.")
+        stress = [r for r in completed_work["sustained"] if sustained_end is not None and r.completed_ms <= sustained_end]
         if len(stress) < criteria.min_samples or max_evidenced_overlap(
                 [r for r in sustained_streams if r.workload.get("user_id") == uid],
                 [r for r in sustained_streams if r.workload.get("user_id") != uid], delays) < 2:

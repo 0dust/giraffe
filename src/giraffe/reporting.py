@@ -835,6 +835,36 @@ def _metric_values(records: list[RequestRecord], *,
     }
 
 
+def _stream_options_reason(current: list[RequestRecord], old: list[RequestRecord]) -> str | None:
+    if not current or not old:
+        return None
+
+    def signature(record):
+        evidence = record.workload.get("token_evidence")
+        if isinstance(evidence, dict):
+            options = evidence.get("requested_logprobs"), evidence.get("requested_usage")
+            if all(type(option) is bool for option in options):
+                return options
+        return None
+
+    # Earlier reports could omit flags when the compatibility probe did not run.
+    # Their exact outbound payload hash can attest matching options.
+    known = {record.request_hash: options for cohort in (current, old) for record in cohort
+             if record.stream and record.request_hash and (options := signature(record)) is not None}
+    mixes = []
+    for cohort in (current, old):
+        counts = defaultdict(Counter)
+        for record in cohort:
+            if record.stream:
+                shape = (record.fixture_id, (record.load_point or {}).get("shape"))
+                counts[shape][signature(record) or known.get(record.request_hash)] += 1
+        mixes.append({shape: {options: Fraction(count, counts.total()) for options, count in counts.items()}
+                      for shape, counts in counts.items()})
+    if any(mixes[0][shape] != mixes[1][shape] for shape in mixes[0].keys() & mixes[1].keys()):
+        return "Requested stream logprobs or usage options differ or lack matching evidence."
+    return None
+
+
 def _output_work(records: list[RequestRecord]) -> dict[str, Any]:
     completed = [r for r in records if r.status == "completed" and r.valid]
     tokens = [r.output_tokens for r in completed if r.output_tokens is not None]
@@ -932,7 +962,7 @@ def _traffic_metrics(report: RunReport, target: str) -> dict[str, Any] | None:
 _LOAD_POINT_FIELDS = ("source", "type", "workload", "shape", "pattern", "level", "rate", "bursts")
 
 
-def _load_work_comparison(current, old):
+def _load_work_comparison(current, old, *, compare_stream_options=True):
     if not current or not old:
         return "Request samples are absent from one run.", False
     cohorts = []
@@ -968,7 +998,7 @@ def _load_work_comparison(current, old):
         mix_changed |= any(abs(Fraction(counts[0][key], len(paired[0]))
                                - Fraction(counts[1][key], len(paired[1]))) > Fraction(1, 10)
                            for key in counts[0])
-    return None, mix_changed
+    return _stream_options_reason(current, old) if compare_stream_options else None, mix_changed
 
 
 def _input_work_changed(current, old, threshold):
@@ -1332,6 +1362,7 @@ def _compare_traffic(
 
     for index, (stage, previous) in enumerate(zip(current_stages, old_stages)):
         current_records = stage_records(report, index)
+        old_records = stage_records(baseline, index)
         row: dict[str, Any] = {
             "rate_rps": stage["rate_rps"], "current": stage, "baseline": previous,
             "status": "inconclusive", "reason": "Stage evidence is incomplete or generator-limited.",
@@ -1346,14 +1377,17 @@ def _compare_traffic(
             comparable = comparable and all(item.get("coverage_complete")
                                             and item.get("all_cases_scored")
                                             for item in (stage, previous))
-        if comparable:
+        stream_reason = _stream_options_reason(current_records, old_records) if comparable else None
+        if stream_reason:
+            row["reason"] = stream_reason
+        elif comparable:
             row["goodput_delta_rps"] = stage["goodput_rps"] - previous["goodput_rps"]
             if previous.get("accepted") and not stage.get("accepted"):
                 row.update(status="fail", reason="This previously acceptable rate now fails its configured criteria.")
             else:
                 row.update(status="pass", reason="No loss of previously acceptable traffic at this tested rate.")
             current_work = _output_work(current_records)
-            old_work = _output_work(stage_records(baseline, index))
+            old_work = _output_work(old_records)
             row["output_work"] = {"current": current_work, "baseline": old_work}
             row["timing_comparable"] = bool(
                 current_work["valid_completions"] and old_work["valid_completions"]
@@ -1666,6 +1700,11 @@ def _probe_has_overlap(evidence: dict, records: list[RequestRecord]) -> bool:
 _RECOVERY_WORK_PHASES = ("control", "sustained", "lighter")
 
 
+def _recovery_evidence_ids(evidence, records):
+    return list(dict.fromkeys(rid for phase in _RECOVERY_WORK_PHASES
+                             for rid in evidence.get(f"{phase}_request_ids", []) if rid in records))
+
+
 def _matched_recovery_work_changed(current, old, threshold, *, compare_visible=True):
     matched = []
     for cohort in (current, old):
@@ -1843,6 +1882,8 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold, slot_ch
                 or scheduled and any(record.cached_prompt_tokens is not None and _uncached_input_tokens(record) is None
                                      for cohort in comparable_work for record in cohort)):
             work_reason = "Observed work including drained requests differs or lacks token evidence."
+        elif drain_comparison and scenario == "recovery" and _matched_recovery_work_changed(*comparable_work, threshold):
+            work_reason = "Matched recovery work including drained requests differs or lacks token evidence."
         live_work_changed = _live_input_work_changed(*comparable_work, threshold)
         live_work_reason = ("Observed input work or live generated histories differ or lack evidence."
                             if live_work_changed else None)
@@ -1946,18 +1987,20 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold, slot_ch
                 old_evidence = _cancellation_evidence_ids(b_scenario, old_records)
                 acceptance.update(evidence_ids=current_evidence, current_samples=len(current_evidence),
                                   baseline_samples=len(old_evidence))
-            elif recovery_reason:
-                acceptance.update(status="inconclusive", worsening=None, reason=recovery_reason)
+            elif scenario == "recovery":
+                acceptance.update(evidence_ids=_recovery_evidence_ids(c_scenario, current_records),
+                                  current_samples=c_scenario.get("matched_samples", 0),
+                                  baseline_samples=b_scenario.get("matched_samples", 0))
+                if recovery_reason:
+                    acceptance.update(status="inconclusive", worsening=None, reason=recovery_reason)
             rows.append(acceptance)
         elif recovery_reason:
-            evidence_ids = list(dict.fromkeys(rid for phase in _RECOVERY_WORK_PHASES
-                for rid in c_scenario.get(f"{phase}_request_ids", []) if rid in current_records))
             rows.append({**identity,
                 "metric": "matched_recovery_slowdown", "status": "inconclusive", "threshold": None,
                 "current": c_scenario.get("slowdown"), "baseline": b_scenario.get("slowdown"),
                 "current_samples": c_scenario.get("matched_samples", 0),
                 "baseline_samples": b_scenario.get("matched_samples", 0),
-                "reason": recovery_reason, "evidence_ids": evidence_ids,
+                "reason": recovery_reason, "evidence_ids": _recovery_evidence_ids(c_scenario, current_records),
             })
         if c.get("status") == "fail" and b.get("status") == "pass":
             # Acceptance also includes attempts that drain after delivery closes.
@@ -2346,7 +2389,7 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                     counts = Counter((r.fixture_id, r.input_chars, r.requested_max_tokens, r.stream)
                                      for r in records)
                     return {shape: Fraction(count, len(records)) for shape, count in counts.items()}
-                work_reason, mix_changed = (_load_work_comparison(current_records, old_records)
+                work_reason, mix_changed = (_load_work_comparison(current_records, old_records, compare_stream_options=False)
                                             if check in {"load", "multi_user"} else (None, False))
                 if check not in {"load", "multi_user"} and (not current_records or not old_records or shapes(current_records) != shapes(old_records)):
                     work_reason = "missing or different request shapes or proportions."
@@ -2366,8 +2409,8 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                                        for shape in current_mix.keys() | old_mix.keys())
                 scheduled_user = check == "multi_user" and workload.get("scenario") in {"arrivals", "recovery"}
                 current_timing, old_timing = {}, {}
-                current_metrics = _metric_values(current_records, timing_records=current_timing if scheduled_user else None)
-                old_metrics = _metric_values(old_records, timing_records=old_timing if scheduled_user else None)
+                current_metrics = _metric_values(current_records, timing_records=current_timing)
+                old_metrics = _metric_values(old_records, timing_records=old_timing)
                 current_work, old_work = _output_work(current_records), _output_work(old_records)
                 outputs = _output_observations(check, scenario, current_work, old_work)
                 if load_point:
@@ -2401,7 +2444,8 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                     if scheduled_user and metric in TIMING_METRICS:
                         current_samples, old_samples = current_timing[metric], old_timing[metric]
                         if current_samples and old_samples:
-                            metric_work_reason, metric_mix_changed = _load_work_comparison(current_samples, old_samples)
+                            metric_work_reason, metric_mix_changed = _load_work_comparison(
+                                current_samples, old_samples, compare_stream_options=False)
                         else:
                             metric_mix_changed = False
                         current_output, old_output = _output_work(current_samples), _output_work(old_samples)
@@ -2445,6 +2489,9 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                     if metric_mix_changed:
                         warn("request_mix_changed", "Request work identity shares differ by more than 10 percentage points; observed aggregate values reflect different request mixes.")
                     if metric in TIMING_METRICS:
+                        stream_reason = _stream_options_reason(current_timing[metric], old_timing[metric])
+                        if stream_reason:
+                            warn("stream_options_changed", stream_reason)
                         if unqualified_user_probe:
                             warn("unqualified_interference", "Noisy-neighbor probe timing requires comparable matched work and qualified heavy overlap in both runs.")
                         if load_point:
