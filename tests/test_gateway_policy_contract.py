@@ -66,6 +66,24 @@ def test_allowlisted_priority_limit_has_version_provenance():
     assert getattr(evidence, "priority_request_limit", None) == 3
 
 
+@pytest.mark.parametrize("status,error_type,expected", [
+    (401, "auth_error", "authentication"),
+    (403, "key_model_access_denied", "model_access"),
+    (429, "throttling_error", "rate_limit"),
+])
+def test_duplicate_error_types_do_not_attest_gateway_policy(status, error_type, expected):
+    message = (f"Rate limit exceeded for api_key: {LIMITED_KEY_HASH}. Limit type: requests. "
+               "Current limit: 2, Remaining: 0. Limit resets at: now")
+    body = f'"type":"{error_type}","code":{status},"message":"{message}"'
+    clear = ('{"error":{' + body + '}}').encode()
+    duplicate = ('{"error":{"type":"auth_provider_unavailable",' + body + '}}').encode()
+    assert response_evidence(status, clear, expected_key_hash=LIMITED_KEY_HASH).error_kind == expected
+    evidence = response_evidence(status, duplicate, expected_key_hash=LIMITED_KEY_HASH)
+    assert evidence.error_kind == "unknown"
+    if status == 429:
+        assert evidence.policy_rejection == "unknown"
+
+
 @pytest.mark.parametrize("duplicate", [False, True])
 async def test_declared_custom_auth_header_qualifies_only_distinct_keys(monkeypatch, duplicate):
     import httpx

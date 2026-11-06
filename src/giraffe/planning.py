@@ -37,11 +37,21 @@ def _request_quotas(config):
     return {target.name: base + (index < extra) for index, target in enumerate(config.targets)}
 
 
-def token_evidence_request_reserve(rows):
-    # Optional evidence probes must leave room for finite shared work, including
-    # bounded tool conversations that are excluded from the known request total.
-    return sum(row["requests_per_target"] or row.get("known_scheduled_requests", 0)
-               for row in rows if row["id"] != "gateway_attribution")
+def token_evidence_request_reserve(rows, *, target=None, runtime_counts=None):
+    # Optional evidence probes leave room for finite shared work, including
+    # bounded tool conversations excluded from the known request total.
+    runtime_counts = runtime_counts or {}
+    reserve = 0
+    for row in rows:
+        if row["id"] == "gateway_attribution":
+            continue
+        if row["id"] in runtime_counts:
+            reserve += runtime_counts[row["id"]]
+        elif target in row.get("target_request_counts", {}):
+            reserve += _target_count(row, target)
+        else:
+            reserve += row["requests_per_target"] or row.get("known_scheduled_requests", 0)
+    return reserve
 
 
 def _warning_title(row):

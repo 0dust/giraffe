@@ -291,8 +291,8 @@ class _Run:
         self.conditions = {}
         from .conditions import planned_conditions
         self.planned_condition_ids = {(row["target"], row["condition_id"]) for row in planned_conditions(config)}
-        from .planning import request_plan, token_evidence_request_reserve
-        self.planned_request_reserve_per_target = token_evidence_request_reserve(request_plan(config)["rows"])
+        from .planning import request_plan
+        self.request_plan_rows = request_plan(config)["rows"]
         self.endpoint_health = {t.name: {"first_attempt_seconds": None, "last_response_seconds": None,
             "consecutive_failures": 0, "failure_request_ids": [], "abort_reason": None} for t in config.targets}
         self.target_tasks = {}
@@ -306,6 +306,16 @@ class _Run:
                     "timeout_seconds": config.metrics_timeout_seconds,
                     "max_samples": config.metrics_max_samples,
                     "max_series": config.metrics_max_series, "collection_gaps_seconds": []})
+
+    def token_evidence_reserve(self, target):
+        from .gateway_policy import credential_issue
+        from .planning import token_evidence_request_reserve
+
+        runtime_counts = {}
+        policy = self.config.gateway_policy
+        if "gateway_policy" in self.config.checks and policy and policy.supported and credential_issue(policy, target):
+            runtime_counts["gateway_policy"] = 0
+        return token_evidence_request_reserve(self.request_plan_rows, target=target.name, runtime_counts=runtime_counts)
 
     def _condition(self, target, scenario, workload=None, *, request_parameters=None):
         condition = condition_for(scenario, workload or {}, self.config, request_parameters=request_parameters)
@@ -1261,9 +1271,10 @@ async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attributio
                 run.preparation(target.name, "performance_evidence_probe", "Checking streamed token and usage evidence", "running")
                 client.on_response = None
                 probe_count = 0
+                planned_reserve = run.token_evidence_reserve(target)
                 while (run.allowed(target.name) and time.monotonic() < probe_end
                        and (run.remaining(target.name) is None or run.remaining(target.name) > max(
-                           1, run.planned_request_reserve_per_target - (run.budget_counts[target.name] - probe_count)))):
+                           1, planned_reserve - (run.budget_counts[target.name] - probe_count)))):
                     spec = client.token_evidence_probe()
                     if spec is None:
                         break

@@ -1,4 +1,5 @@
 """Selecting optional policies without configuring them must not invent traffic."""
+import asyncio
 import json
 
 import httpx
@@ -72,6 +73,75 @@ async def test_unavailable_policy_with_no_identities_keeps_shared_key_access(mon
     assert report.overall == "pass"
     assert sent == ["Bearer shared-secret"]
     assert all("gateway_policy" not in record.check_ids for record in report.requests)
+
+
+@pytest.mark.usefixtures("local_tokenizer")
+@pytest.mark.parametrize("policy", ["absent", "missing", "duplicate", "available"])
+async def test_policy_reserves_probe_budget_only_when_credentials_can_dispatch(monkeypatch, policy):
+    from tests.test_gateway_policy import configuration as configured_policy
+
+    raw = configured_policy(users=[dict(identity="limited", requests=3, rpm=2),
+                                   dict(identity="peer", requests=3, rpm=3)]).model_dump(mode="json")
+    raw.update(checks=["access", "generation"], stream=True, samples=2, max_requests=4,
+               max_memory_mb=0, retention="all", limits={"min_samples": 2, "min_output_tokens_per_second": 1})
+    if policy == "absent":
+        raw["gateway_policy"] = None
+    else:
+        raw["checks"].append("gateway_policy")
+    raw["targets"][0]["api_key_env"] = "SHARED"
+    monkeypatch.setenv("SHARED", "shared-secret")
+    monkeypatch.delenv("LIMITED", raising=False)
+    monkeypatch.delenv("PEER", raising=False)
+    if policy in {"duplicate", "available"}:
+        monkeypatch.setenv("LIMITED", "limited-secret")
+        monkeypatch.setenv("PEER", "peer-secret" if policy == "available" else "limited-secret")
+    config = RunConfig.model_validate(raw)
+    sent = []
+
+    class Answer(httpx.AsyncByteStream):
+        def __init__(self, payload):
+            self.payload = payload
+
+        async def __aiter__(self):
+            for part in ("Hello ", "there."):
+                await asyncio.sleep(.015)
+                choice = {"delta": {"content": part}}
+                if self.payload.get("logprobs"):
+                    choice["logprobs"] = {"content": [{"token": part}]}
+                yield ("data: " + json.dumps({"choices": [choice]}) + "\n\n").encode()
+            yield b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+            if self.payload.get("stream_options", {}).get("include_usage"):
+                yield b'data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":2}}\n\n'
+            yield b"data: [DONE]\n\n"
+
+    def handler(request):
+        if request.method != "POST":
+            return httpx.Response(404)
+        auth = request.headers["authorization"]
+        sent.append(auth)
+        if auth == "Bearer shared-secret":
+            return httpx.Response(200, stream=Answer(json.loads(request.content)))
+        return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "OK"},
+            "finish_reason": "stop"}], "usage": {"prompt_tokens": 8, "completion_tokens": 2}})
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
+    report = await run_suite(config)
+    checks = {check.id: check.status for check in report.checks}
+    assert checks["access"] == "pass"
+    assert report.observations["request_budget_used"] == len(sent) == 4
+    if policy != "absent":
+        planned = next(row for row in request_plan(config)["rows"] if row["id"] == "gateway_policy")
+        assert planned["requests_per_target"] == 6
+    if policy == "available":
+        assert checks["generation"] == "inconclusive"
+        assert sent[:3] == ["Bearer shared-secret"] * 3
+        assert sent[3] in {"Bearer limited-secret", "Bearer peer-secret"}
+        assert [record.scenario for record in report.requests] == ["initial", "generation", "generation", "gateway_policy"]
+    else:
+        assert checks["generation"] == "pass"
+        assert sent == ["Bearer shared-secret"] * 4
+        assert [record.scenario for record in report.requests] == ["initial", "performance_evidence_probe", "generation", "generation"]
 
 
 @pytest.mark.usefixtures("local_tokenizer")
