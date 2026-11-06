@@ -526,3 +526,84 @@ async def test_inline_policy_limit_preserves_saved_serving_comparison(monkeypatc
         assert current.observations["duration_limit_scope"] == "gateway"
     else:
         assert current.observations["concurrency_limit_scopes"] == ["gateway"]
+
+
+@pytest.mark.usefixtures("local_tokenizer")
+@pytest.mark.parametrize("cap,overlap,counts,reasons", [
+    (13, False, [2, 1], [
+        "The target request limit interrupted the configured gateway policy probes.",
+        "maximum request budget reached",
+    ]),
+    (17, True, [4, 3], [None, "maximum request budget reached"]),
+])
+async def test_policy_budget_stop_reason_belongs_to_the_target(monkeypatch, cap, overlap, counts, reasons):
+    from tests.test_gateway_policy import configuration as configured_policy
+
+    raw = configured_policy(users=[dict(identity="limited", requests=2, rpm=1),
+                                   dict(identity="peer", requests=2, rpm=2)]).model_dump()
+    raw.update(checks=["serving", "gateway_policy"], stream=False, samples=4, concurrency=4,
+               max_requests=cap, overlap_models=overlap, max_memory_mb=0, retention="all")
+    raw["targets"][0]["api_key_env"] = "SHARED"
+    raw["targets"].append(dict(raw["targets"][0], name="second", url="http://second"))
+    config = RunConfig.model_validate(raw)
+    for name in ("SHARED", "LIMITED", "PEER"):
+        monkeypatch.setenv(name, name.lower() + "-secret")
+    ordinary = {"proxy": 0, "second": 0}
+    offered = ordinary.copy()
+    last_complete_offer = asyncio.Event()
+    truncated_finished = asyncio.Event()
+
+    def progress(event):
+        if (event["event"], event["target"], event["scenario"]) == ("scenario_finished", "second", "gateway_policy"):
+            truncated_finished.set()
+
+    async def handle(request):
+        if request.method != "POST":
+            return httpx.Response(404)
+        target = request.url.host
+        if request.headers["authorization"] == "Bearer shared-secret":
+            ordinary[target] += 1
+        else:
+            assert ordinary == {"proxy": 5, "second": 5}
+            offered[target] += 1
+            # The complete target has admitted its fourth request, but
+            # finalizes only after the other target sees the exhausted budget.
+            if overlap and target == "proxy" and offered[target] == 4:
+                last_complete_offer.set()
+                await truncated_finished.wait()
+            if overlap and target == "second" and offered[target] == 3:
+                await last_complete_offer.wait()
+        return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "OK"},
+            "finish_reason": "stop"}], "usage": {"prompt_tokens": 8, "completion_tokens": 2}})
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handle), **kw))
+    report = await run_suite(config, progress=progress)
+    assert [offered["proxy"], offered["second"]] == counts
+    assert report.observations["request_budget_used"] == cap
+    assert report.observations["request_limit_scopes"] == ["gateway"]
+    assert report.limits_reached == ["max_requests"] and report.abort_reason is None
+    assert all(check.status == "pass" for check in report.checks if check.id == "serving")
+
+    policies = [check for check in report.checks if check.id == "gateway_policy"]
+    for check, dispatched, reason in zip(policies, counts, reasons, strict=True):
+        summary = check.metrics["gateway_policy"]
+        observation = report.observations["targets"][check.target]["gateway_policy"]
+        assert summary["complete"] == (dispatched == 4)
+        assert sum(user["dispatched"] for user in summary["users"]) == dispatched
+        assert summary["stop_reason"] == reason
+        assert bool(observation.get("budget_limited")) == (reason is not None)
+        if reason is not None:
+            assert reason in check.summary
+
+
+@pytest.mark.usefixtures("local_tokenizer")
+async def test_isolated_policy_completed_at_exact_cap_keeps_verdict(monkeypatch):
+    from tests.test_gateway_policy import exercise
+
+    check, report, sent = await exercise(monkeypatch, full=True, max_requests=13)
+    summary = check.metrics["gateway_policy"]
+    assert len(sent) == report.observations["request_budget_used"] == 13
+    assert check.status == "pass" and summary["qualification"] == "observed"
+    assert summary["complete"] and summary["stop_reason"] is None
+    assert report.abort_reason is None

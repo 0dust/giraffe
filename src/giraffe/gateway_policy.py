@@ -120,12 +120,12 @@ async def _execute(run, target, client):
             observation["complete"] = False
             observation["stop_reason"] = observation["stop_reason"] or "Policy traffic duration reached."
         observation["end_ms"] = min((finished-run.start)*1000, observation["end_ms"])
-        observation["stop_reason"] = observation["stop_reason"] or run.stop_reason(target.name)
         if not observation["complete"]:
-            if (observation["stop_reason"] is None and run.remaining(target.name) == 0
-                    and not gateway_identities_only(run.config.checks)):
-                observation.update(budget_limited=True,
-                    stop_reason="The target request limit interrupted the configured gateway policy probes.")
+            reason = observation["stop_reason"] or run.stop_reason(target.name)
+            if reason in (None, "maximum request budget reached") and run.remaining(target.name) == 0:
+                observation["budget_limited"] = True
+                reason = reason or "The target request limit interrupted the configured gateway policy probes."
+            observation["stop_reason"] = reason
             run.mark_unfinished(target.name, ["gateway_policy"])
         run.finish_condition(target.name, "gateway_policy", reason=observation["stop_reason"])
 
