@@ -2,13 +2,15 @@
 from __future__ import annotations
 
 import asyncio
+from bisect import bisect_left
+from decimal import Decimal
 import time
 
 from .identities import identity_headers, litellm_key_fingerprint
 from .models import CheckResult, RequestSpec
 
 
-VERSION = 6
+VERSION = 7
 PROMPT = "Reply with exactly the word OK."
 
 
@@ -58,7 +60,8 @@ async def execute(run, target, client):
             spec = RequestSpec(fixture_id="gateway-policy-v1", scenario="gateway_policy",
                 check_ids=["gateway_policy"], identity=user.identity,
                 messages=[{"role": "user", "content": PROMPT}], stream=False,
-                max_tokens=settings.max_output_tokens, options={"temperature": 0},
+                max_tokens=settings.max_output_tokens,
+                options={"temperature": 0, "cache": {"no-cache": True, "no-store": True}},
                 workload={"user_id": user.identity, "request_sequence": sequence+1,
                           "ready_ms": ready_ms, "declared_priority": user.priority})
 
@@ -119,6 +122,7 @@ def summarize(settings, observation, records):
         "identities_distinct": observation.get("identities_distinct", False),
         "qualification": "unverified", "status": "inconclusive", "reasons": [],
         "peer_continuation": False, "overlap_observed": False, "comparable_actual_work": False,
+        "response_cache_hit_reported": False,
         "interpretation": "Observed admission under declared policy and window assumptions; no queue-order, latency-causality or production-wide guarantee."}
 
     def outcome(qualification, reason, status="inconclusive"):
@@ -132,6 +136,11 @@ def summarize(settings, observation, records):
         return outcome("unavailable", "Selected gateway capability is unsupported.")
     if observation.get("credential_issue"):
         return outcome("unverified", observation["stop_reason"])
+    if any(record.gateway_evidence and record.gateway_evidence._response_cache_hit_reported for record in records):
+        summary["response_cache_hit_reported"] = True
+        return outcome("unverified", "Gateway reported a cached completion, so this policy probe could not verify fresh work.")
+    if settings.capability == "priority_rpm" and any(user.priority == "default_pool" for user in settings.users):
+        return outcome("unverified", "LiteLLM reserves default_pool for unreserved traffic. Use distinct named reservations.")
     if not records:
         return outcome("unexercised", "No policy traffic was dispatched.")
     affected = [record for record in records if record.identity == settings.affected_identity]
@@ -182,12 +191,14 @@ def summarize(settings, observation, records):
             or start is None or end is None or end < start or end - start >= (windows[0] - 1)*1000):
         return outcome("unverified", "Cannot establish a single policy window from Retry-After and the observation duration.")
     summary["effective_window_seconds"] = windows[0]
+    allowance = declared.rpm
     if settings.capability == "priority_rpm":
         if settings.saturation_cache_seconds != 0:
             return outcome("unverified", "Cached saturation can differ between gateway nodes; this check requires zero cache delay.")
         evidence = [record.gateway_evidence for record in recognized]
+        threshold_percent = Decimal(str(settings.saturation_threshold)) * 100
         if any(item.model_rpm != settings.model_rpm or item.priority_matches is not True
-               or item.saturation_percent is None or item.saturation_percent < settings.saturation_threshold*100
+               or item.saturation_percent is None or Decimal(str(item.saturation_percent)) < threshold_percent
                for item in evidence):
             return outcome("unverified", "Priority tier, model RPM or strict-mode evidence does not match the declaration.")
         if not summary["overlap_observed"] or not summary["comparable_actual_work"]:
@@ -205,14 +216,13 @@ def summarize(settings, observation, records):
             return outcome("unverified", "Scoped v3 priority RPM limits are missing or differ from the declared reservations.")
         if len(admissions) > settings.model_rpm:
             return outcome("observed_failure", "Total admitted requests exceeded the declared model RPM in the isolated window.", "fail")
+        # The last borrowed request crosses the same ratio threshold as LiteLLM.
+        crossing = bisect_left(range(settings.model_rpm + 1), settings.saturation_threshold,
+                               key=lambda count: count / settings.model_rpm)
+        allowance = max(allowance, crossing)
     elif any(record.gateway_evidence.request_limit != declared.rpm or record.gateway_evidence.request_remaining != 0 for record in recognized):
         return outcome("unverified", "Gateway key limit differs from the declared RPM.")
     admitted = len(affected_admissions)
-    allowance = declared.rpm
-    if settings.capability == "priority_rpm":
-        # Before saturation idle capacity may be borrowed; integer crossing admits one request.
-        import math
-        allowance = max(allowance, math.ceil(settings.saturation_threshold*settings.model_rpm))
     if admitted > allowance:
         return outcome("observed_failure", "Admitted requests exceeded the declared RPM allowance in the isolated window.", "fail")
     first_rejection = min((record.completed_ms for record in recognized if record.completed_ms is not None), default=None)

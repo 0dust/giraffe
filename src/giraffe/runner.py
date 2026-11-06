@@ -1433,10 +1433,15 @@ async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attributio
 async def _deferred_attribution(run, target):
     from .gateway_attribution import CHECK, _state, execute
 
+    observations = run.observations[target.name]
     reason = run.stop_reason(target.name)
-    if (reason and reason != "maximum request budget reached"
-            or run.observations[target.name].get("client_error")):
+    if reason and reason != "maximum request budget reached" or observations.get("client_error"):
         run.mark_unfinished(target.name, {CHECK})
+        return
+    restart = observations["restart"]
+    if run.config.restart_target == target.name and (not restart or restart["status"] != "ready"):
+        observations[CHECK] = _state("unverified", "Gateway attribution did not run because restart readiness was not established.")
+        run.finish_checks(target.name, {CHECK})
         return
     run.emit("scenario_started", target.name, CHECK)
     try:
@@ -1449,7 +1454,7 @@ async def _deferred_attribution(run, target):
     except Exception as exc:
         # Identity transport failures must not replace completed shared checks.
         logger.error("Internal gateway attribution error (%s)", type(exc).__name__)
-        run.observations[target.name][CHECK] = _state("unverified", "Gateway attribution could not complete.")
+        observations[CHECK] = _state("unverified", "Gateway attribution could not complete.")
     finally:
         run.finish_checks(target.name, {CHECK})
         run.emit("scenario_finished", target.name, CHECK)
@@ -2154,7 +2159,8 @@ def _deadline_remediation(config):
     plan = request_plan(config)
     high = plan.get("budget_high_seconds")
     action = {"action": "set_limit", "limit": "max_duration"}
-    if not plan["unknown_time_components"] and high is not None and math.isfinite(high):
+    if (all(item["id"] == "gateway_attribution" for item in plan["unknown_time_components"])
+            and high is not None and math.isfinite(high)):
         action["minimum"] = math.ceil(high)
     return action
 
@@ -2406,6 +2412,8 @@ def _verdict_summary(check, config, records, budget):
                   f"and {config.samples} successful requests in each baseline and recovery batch; "
                   + (_deadline_guidance(config) + " "
                      if config.max_duration_seconds is not None else "") + budget)
+    elif check.id == "gateway_attribution" and reason == "time_limited":
+        remedy = _deadline_guidance(config).rstrip(".")
     elif any(word in text for word in ("run budget", "run deadline", "no applicable")):
         remedy = budget + (" Allow more max_duration_seconds (or --max-duration) if the run deadline stops traffic"
                           if config.max_duration_seconds is not None else "")
@@ -2549,9 +2557,8 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
     sampler.sample()
     consume_samples()
 
-    from .identities import gateway_identities_only
-    defer_attribution = (len(config.targets) > 1 and "gateway_attribution" in config.checks
-                         and not gateway_identities_only(config.checks))
+    from .gateway_attribution import deferred_for_shared_targets
+    defer_attribution = deferred_for_shared_targets(config)
 
     async def shared_target(target):
         if defer_attribution:

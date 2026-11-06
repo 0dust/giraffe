@@ -13,7 +13,8 @@ import random
 from typing import Any
 
 from giraffe.fixtures import builtin_fixtures
-from giraffe.gateway_attribution import configured_probe_count
+from giraffe.gateway_attribution import (POLL_FRACTIONS, configured_probe_count,
+                                         deferred_for_shared_targets, reader_preflight_bound)
 from giraffe.concurrent_load import prompt_overhead
 from giraffe.logprob_workload import corpus_width, sample_count
 from giraffe.load_test import context_window, calibration_keys, load_time_plan, minimum_reservation, test_points, point_shapes, settings_sets, saved_shape_warnings
@@ -61,6 +62,8 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
     observation_notes = []
     duration_estimates, duration_runs = {}, {}
     selected = set(config.checks)
+    defer_attribution = deferred_for_shared_targets(config)
+    attribution_steps = {"gateway_attribution", "gateway_attribution_preflight", "gateway_attribution_settle"}
     requirements = required_concurrency(config)
     pool = min(requirements["peak"], config.concurrency) if config.concurrency else requirements["peak"]
     shares = {target.name: min(requirements["per_target_peak"], pool) for target in config.targets}
@@ -143,7 +146,8 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
                  "backend_cancellation": "cancellation", "cancellation_intentional": "cancellation"}.get(identifier, identifier)
         return {"capacity": "traffic.duration_seconds", "arrivals": "arrivals.requests",
                 "sessions": "sessions", "consistency": "consistency", "tools": "tool_checks",
-                "prefix": "prefix", "sessions_wait": "sessions.delay_seconds"}.get(check, "test_options." + check)
+                "prefix": "prefix", "sessions_wait": "sessions.delay_seconds",
+                "gateway_attribution": "request_timeout_seconds"}.get(check, "test_options." + check)
 
     def unknown(target, row, count, timeout, bound):
         item = {"id": row["id"], "title": row["title"], "target": target,
@@ -411,6 +415,21 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
                                      if "access" in selected else "test_options.serving.request_timeout_seconds",
                                      "low_seconds": 0, "high_seconds": config.effective_initial()["request_timeout_seconds"],
                                      "wait": True})
+                continue
+            if name == "gateway_attribution":
+                settings = config.gateway_attribution
+                field = "gateway_attribution.settle_seconds"
+                if preflight := reader_preflight_bound(config, deferred=defer_attribution):
+                    fixed(target.name, {"id": "gateway_attribution_preflight", "title": "Gateway reader preflight"},
+                          0, field, timeout=preflight)
+                timeout = config.request_timeout_seconds
+                unknown(target.name, row, count, timeout, count * timeout)
+                minimum = POLL_FRACTIONS[-1] * settings.settle_seconds
+                settle = {"id": "gateway_attribution_settle", "title": "Gateway spend-log settle",
+                          "target": target.name, "kind": "fixed", "fixed_seconds": minimum,
+                          "low_seconds": minimum, "high_seconds": settings.settle_seconds}
+                components.append(settle)
+                timeline.append({**settle, "field": field, "coverage_high_seconds": settings.settle_seconds})
                 continue
             if name == "load_calibration":
                 timeout = max(own.request_timeout_seconds for _, own in settings_sets(config.load_test))
@@ -700,21 +719,30 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
             row["estimated_requests_per_target"] = next(iter(estimates.values()))
             row["estimate_source"] = "from your recent runs" if max(duration_runs[row["id"]].values()) > 1 else "from your last run"
 
-    def combine(key):
-        totals = [sum(item.get(key, 0) for item in components if item["target"] == target.name) for target in config.targets]
+    def phases(items):
+        if defer_attribution:
+            return ([item for item in items if item["id"] not in attribution_steps],
+                    [item for item in items if item["id"] in attribution_steps])
+        return (items,)
+
+    def combine_phase(items, key):
+        totals = [sum(item.get(key, 0) for item in items if item["target"] == target.name) for target in config.targets]
         if not config.overlap_models:
             return sum(totals)
         combined = max(totals, default=0)
         if pool < requirements["peak"]:
-            finite = sum(item.get(key, 0) for item in components if item["kind"] == "finite")
+            finite = sum(item.get(key, 0) for item in items if item["kind"] == "finite")
             if key == "low_seconds" and pool < len(config.targets):
                 combined = max(combined, finite / pool)
             elif key == "high_seconds":
-                other = max((sum(item.get(key, 0) for item in components
+                other = max((sum(item.get(key, 0) for item in items
                              if item["target"] == target.name and item["kind"] != "finite")
                              for target in config.targets), default=0)
                 combined = max(combined, other + finite)
         return combined
+
+    def combine(key):
+        return sum(combine_phase(phase, key) for phase in phases(components))
 
     low, high, fixed_seconds = combine("low_seconds"), combine("high_seconds"), combine("fixed_seconds")
     timeline_high = high
@@ -722,24 +750,26 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
     # Keep individual component highs in the budget timeline for a conservative
     # completion remedy. Shared-pool overlap retains its contention upper bound.
     if not config.overlap_models or pool >= requirements["peak"]:
-        ranges = []
-        for target in config.targets:
-            items = [item for item in components if item["target"] == target.name]
-            finite_items = [item for item in items if item["kind"] == "finite" and not item.get("upper_bound")]
-            mean = sum(item["expected_seconds"] for item in finite_items)
-            # Welch-Satterthwaite df for independent estimated variances keeps
-            # one small cohort from setting the df for all sequential work.
-            variance = sum(item["prediction_variance"] for item in finite_items)
-            df_denominator = sum(item["prediction_variance"] ** 2 / max(1, item["prediction_samples"] - 1)
-                                 for item in finite_items)
-            samples = 1 + variance ** 2 / df_denominator if df_denominator else None
-            finite_low, finite_high = prediction(mean, variance,
-                                                sum(item["prediction_third"] for item in finite_items), samples)
-            other = [item for item in items if item["kind"] != "finite" or item.get("upper_bound")]
-            ranges.append((sum(item["low_seconds"] for item in other) + finite_low,
-                           sum(item["high_seconds"] for item in other) + finite_high))
-        low = max((item[0] for item in ranges), default=0) if config.overlap_models else sum(item[0] for item in ranges)
-        high = max((item[1] for item in ranges), default=0) if config.overlap_models else sum(item[1] for item in ranges)
+        low = high = 0
+        for phase in phases(components):
+            ranges = []
+            for target in config.targets:
+                items = [item for item in phase if item["target"] == target.name]
+                finite_items = [item for item in items if item["kind"] == "finite" and not item.get("upper_bound")]
+                mean = sum(item["expected_seconds"] for item in finite_items)
+                # Welch-Satterthwaite df for independent estimated variances keeps
+                # one small cohort from setting the df for all sequential work.
+                variance = sum(item["prediction_variance"] for item in finite_items)
+                df_denominator = sum(item["prediction_variance"] ** 2 / max(1, item["prediction_samples"] - 1)
+                                     for item in finite_items)
+                samples = 1 + variance ** 2 / df_denominator if df_denominator else None
+                finite_low, finite_high = prediction(mean, variance,
+                                                    sum(item["prediction_third"] for item in finite_items), samples)
+                other = [item for item in items if item["kind"] != "finite" or item.get("upper_bound")]
+                ranges.append((sum(item["low_seconds"] for item in other) + finite_low,
+                               sum(item["high_seconds"] for item in other) + finite_high))
+            low += max((item[0] for item in ranges), default=0) if config.overlap_models else sum(item[0] for item in ranges)
+            high += max((item[1] for item in ranges), default=0) if config.overlap_models else sum(item[1] for item in ranges)
     midpoint = (low + high) / 2
     drain_fraction = combine("drain_uncertainty_seconds") / midpoint if midpoint else 0
     fixed_fraction = fixed_seconds / midpoint if midpoint else 0
@@ -751,28 +781,42 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
     setup_totals = [sum(item["high_seconds"] for item in timeline
                         if item["target"] == target.name and item["kind"] == "setup") for target in config.targets]
     setup_allowance = max(setup_totals, default=0) if config.overlap_models else sum(setup_totals)
-    budget_high = timeline_high + setup_allowance
+    # Attribution has bounded serial probes even without comparable
+    # latency samples. Preserve their allowance in the duration remedy.
+    probe_bounds = [item["timeout_bound_seconds"] for item in unknowns if item["id"] == "gateway_attribution"]
+    parallel_probes = config.overlap_models and (pool >= requirements["peak"]
+                                                 or defer_attribution and pool >= len(probe_bounds))
+    probe_allowance = max(probe_bounds, default=0) if parallel_probes else sum(probe_bounds)
+    budget_high = timeline_high + setup_allowance + probe_allowance
     errors, warnings = [], []
     budget = config.max_duration_seconds
     if budget is not None:
         cut, first_start = [], None
         risk_over_budget = False
         cursor_low = cursor_high = cursor_risk = 0
-        for target in config.targets:
+        for phase in phases(timeline):
+            phase_start, phase_ends = (cursor_low, cursor_high, cursor_risk), []
+            for target in config.targets:
+                if config.overlap_models:
+                    cursor_low, cursor_high, cursor_risk = phase_start
+                for item in (item for item in phase if item["target"] == target.name):
+                    if not item.get("wait"):
+                        first_start = min(first_start, cursor_low) if first_start is not None else cursor_low
+                    estimated = item["low_seconds"] if item["kind"] in {"unknown", "setup"} else item.get("coverage_high_seconds", item["high_seconds"])
+                    end_high = cursor_high + estimated
+                    cursor_risk = (cursor_risk + item["high_seconds"]
+                                   if cursor_risk is not None and item["high_seconds"] is not None else None)
+                    risk_over_budget |= cursor_risk is None or cursor_risk > budget
+                    if not item.get("wait") and end_high > budget:
+                        cut.append(item)
+                    cursor_low += item["low_seconds"]
+                    cursor_high = end_high
+                phase_ends.append((cursor_low, cursor_high, cursor_risk))
             if config.overlap_models:
-                cursor_low = cursor_high = cursor_risk = 0
-            for item in (item for item in timeline if item["target"] == target.name):
-                if not item.get("wait"):
-                    first_start = min(first_start, cursor_low) if first_start is not None else cursor_low
-                estimated = item["low_seconds"] if item["kind"] in {"unknown", "setup"} else item.get("coverage_high_seconds", item["high_seconds"])
-                end_high = cursor_high + estimated
-                cursor_risk = (cursor_risk + item["high_seconds"]
-                               if cursor_risk is not None and item["high_seconds"] is not None else None)
-                risk_over_budget |= cursor_risk is None or cursor_risk > budget
-                if not item.get("wait") and end_high > budget:
-                    cut.append(item)
-                cursor_low += item["low_seconds"]
-                cursor_high = end_high
+                cursor_low = max(end[0] for end in phase_ends)
+                cursor_high = max(end[1] for end in phase_ends)
+                cursor_risk = (None if any(end[2] is None for end in phase_ends)
+                               else max(end[2] for end in phase_ends))
         if cut:
             fields = list(dict.fromkeys(["max_duration_seconds", *(item["field"] for item in cut)]))
             fully_known = not unknowns
@@ -832,7 +876,7 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
             "unknown_time_components": unknowns, "confidence": confidence,
             "confidence_details": {"fixed_fraction": fixed_fraction, "drain_uncertainty_fraction": drain_fraction,
                                    "insufficient_observations": list(dict.fromkeys(uncertain_observations))},
-            "time_timeline": timeline, "budget_high_seconds": budget_high,
+            "time_timeline": [item for phase in phases(timeline) for item in phase], "budget_high_seconds": budget_high,
             "estimate_exclusions": ["setup/connection", "AI evaluation", "report generation"],
             "time_bound_reasons": reasons, "time_estimate_assumptions": ([
                 "Finite request groups model immediate replenishment from comparable recorded distributions; explicit batch barriers retain batch maxima. Large variable pools use conservative work/drain bounds. A nominal 99% prediction interval combines service variance and finite-cohort uncertainty across sequential groups, with Student-t and measured-skew corrections. Medium confidence requires 150 samples from one run or at least 15 samples per setting across 3 consistent runs, at least 99% accounted timing coverage (including small measured inter-batch overhead only after 3 runs), no unknown components and a combined relative half-width at most 50% (single-run components also require a prediction half-width at most 40%). Each run has equal total weight, so recent runs weigh no less than older runs; pooling stops at a detected latency shift."
