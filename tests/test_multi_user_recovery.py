@@ -81,6 +81,10 @@ def test_recovery_offer_counts_and_replay_use_half_open_windows(monkeypatch, loc
 @pytest.mark.parametrize("case, fairness_status, check_status", [
     ("equal", "pass", "pass"),
     ("slow", "fail", "fail"),
+    ("late_reasoning", "inconclusive", "inconclusive"),
+    ("late_cache", "inconclusive", "inconclusive"),
+    ("late_missing", "inconclusive", "inconclusive"),
+    ("late_invalid_cache", "inconclusive", "inconclusive"),
     ("unequal", "inconclusive", "inconclusive"),
     ("partial", "inconclusive", "inconclusive"),
     ("error", "inconclusive", "fail"),
@@ -104,10 +108,20 @@ def test_recovery_applies_selected_fairness_only_with_qualified_work(
     class Endpoint(FakeClient):
         async def execute(self, spec, **kwargs):
             request = await super().execute(spec, **kwargs)
+            if case.startswith("late_"):
+                request.cached_prompt_tokens = 0
             if spec.workload["role"] == "sustained" and spec.workload["user_id"] == "user-02":
-                if case == "slow" and spec.workload["work_sequence"] > 1:
+                if (case == "slow" or case.startswith("late_")) and spec.workload["work_sequence"] > 1:
                     await asyncio.sleep(.85)
                     request.elapsed_ms += 850
+                    if case == "late_reasoning":
+                        request.completion_tokens, request.reasoning_tokens = 128, 126
+                    elif case == "late_cache":
+                        request.cached_prompt_tokens = 64
+                    elif case == "late_missing":
+                        request.output_tokens = None
+                    elif case == "late_invalid_cache":
+                        request.cached_prompt_tokens = 65
                 elif case == "error":
                     request.status, request.valid = "failed", False
             return request
@@ -139,6 +153,18 @@ def test_recovery_applies_selected_fairness_only_with_qualified_work(
             assert "Observed delivery fairness failed. Recovery sustained phase." in check.summary
         elif case == "unequal":
             assert any("assigned profiles differ" in reason for reason in fairness["reasons"])
+        elif case.startswith("late_"):
+            expected = {"late_reasoning": "total generation lengths", "late_cache": "uncached input lengths",
+                        "late_missing": "usage is missing", "late_invalid_cache": "cached input usage is invalid"}
+            assert any(expected[case] in reason for reason in fairness["reasons"])
+            assert fairness["ratio"] == 2.5
+            measured = next(user for user in fairness["users"] if user["user_id"] == "user-02")
+            assert measured["valid_samples"] == 1 and measured["work_samples"] == 4
+            users = windows["sustained"]["users"]
+            assert {user["user_id"]: user["output_tokens_per_second"] for user in users} == {"user-01": 8, "user-02": 2}
+            recovered = next(user for user in windows["lighter"]["recovery"]["users"] if user["user_id"] == "user-02")
+            assert recovered["status"] == "inconclusive"
+            assert len(recovered["sustained_request_ids"]) == 4
         else:
             assert windows["sustained"]["cut_short"]
             assert any("configured user offer schedule" in reason for reason in fairness["reasons"])

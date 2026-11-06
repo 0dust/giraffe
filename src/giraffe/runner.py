@@ -9,6 +9,7 @@ import logging
 import math
 import platform
 import socket
+import ssl
 import time
 import uuid
 from collections import Counter, defaultdict
@@ -250,6 +251,7 @@ class _Run:
         self.ceiling_constrains_pool = config.concurrency is not None and peak["peak"] > config.concurrency
         self.max_connections = min(peak["per_target_peak"], pool_size)
         self.connection_limits = {target.name: self.max_connections for target in config.targets}
+        self.deferred_tls_contexts: dict[str, ssl.SSLContext] = {}
         self.slots = asyncio.Queue(maxsize=pool_size)
         for _ in range(pool_size):
             self.slots.put_nowait(None)
@@ -1190,6 +1192,14 @@ def _identity_only_target(target):
     return identity_target
 
 
+def _deferred_identity_client(run, target):
+    # Use the shared phase's loaded trust while creating a separate identity pool.
+    context = run.deferred_tls_contexts.get(target.name)
+    tls_options = {"_tls_context": context} if context is not None else {}
+    return LLMClient(_identity_only_target(target), run.config,
+                     max_connections=run.connection_limits[target.name], **tls_options)
+
+
 async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attribution=False, defer_policy=False):
     config, enabled = run.config, set(run.config.checks)
     if defer_attribution:
@@ -1221,6 +1231,8 @@ async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attributio
         gateway_only = config.restart_target != target.name and gateway_identities_only(enabled)
         client_target = _identity_only_target(target) if gateway_only else target
         async with LLMClient(client_target, config, max_connections=run.connection_limits[target.name]) as client:
+            if (defer_attribution or defer_policy) and (context := getattr(client, "tls_context", None)) is not None:
+                run.deferred_tls_contexts[target.name] = context
             client.logprob_budget = run.logprob_budget
             client.on_response = lambda: run.endpoint_response(target.name)
             data = run.observations[target.name]["serving_telemetry"]
@@ -1541,8 +1553,7 @@ async def _deferred_policy(run, target):
         return
     run.emit("scenario_started", target.name, check)
     try:
-        async with LLMClient(_identity_only_target(target), run.config,
-                             max_connections=run.connection_limits[target.name]) as client:
+        async with _deferred_identity_client(run, target) as client:
             await execute(run, target, client)
     except asyncio.CancelledError:
         run.mark_unfinished(target.name, {check})
@@ -1571,8 +1582,7 @@ async def _deferred_attribution(run, target):
         return
     run.emit("scenario_started", target.name, CHECK)
     try:
-        async with LLMClient(_identity_only_target(target), run.config,
-                             max_connections=run.connection_limits[target.name]) as client:
+        async with _deferred_identity_client(run, target) as client:
             await execute(run, target, client, deferred=True)
     except asyncio.CancelledError:
         run.mark_unfinished(target.name, {CHECK})

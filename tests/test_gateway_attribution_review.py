@@ -374,6 +374,41 @@ async def test_collection_reuses_loaded_tls_after_ca_file_disappears(monkeypatch
     assert check.metrics["state"] == "verified" and check.metrics["collection_complete"]
 
 
+async def test_deferred_attribution_reuses_each_targets_loaded_tls(monkeypatch, local_tokenizer, tmp_path):
+    ca_bundle = tmp_path / "ca.pem"
+    ca_bundle.write_bytes(Path(certifi.where()).read_bytes())
+    connections = {}
+    original = LLMClient._create_client
+
+    def create_client(client):
+        shared = client.target.api_key_env is not None
+        if not shared:
+            ca_bundle.unlink(missing_ok=True)
+        pool = original(client)
+        connections[client.target.name, shared] = (client._tls_context, pool)
+        return pool
+
+    async def observer(request, rows):
+        return spend_page(request, [row for row in rows if row["session_id"] == request.url.params["session_id"]])
+
+    cfg, _, reads = setup(monkeypatch, observer)
+    cfg.ca_bundle = str(ca_bundle)
+    cfg.checks = ["access", "gateway_attribution"]
+    cfg.targets[0].api_key_env = "SHARED"
+    cfg.targets.append(cfg.targets[0].model_copy(update={"name": "proxy2"}, deep=True))
+    immediate_spend_polls(monkeypatch, cfg)
+    monkeypatch.setattr(LLMClient, "_create_client", create_client)
+
+    report = await run_suite(cfg)
+    assert report.overall == "pass" and report.abort_reason is None
+    assert len(reads) == 8 and all(request.headers["authorization"] == "Bearer secret-OBSERVER" for request in reads)
+    assert [record.identity for record in report.requests] == [None, None, "alice", "bob", "alice", "bob"]
+    for target in cfg.targets:
+        shared_context, shared_pool = connections[target.name, True]
+        identity_context, identity_pool = connections[target.name, False]
+        assert shared_context is identity_context and shared_pool is not identity_pool
+
+
 @pytest.mark.parametrize("duration,delay,reason", [(.5, .55, "time_limited"), (10, .12, "budget_limited")])
 async def test_preflight_rechecks_deadline_after_building_get(monkeypatch, local_tokenizer, duration, delay, reason):
     original = httpx.AsyncClient.build_request
