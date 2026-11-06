@@ -85,11 +85,32 @@ async def test_observer_denial_keeps_attempted_identity_coverage(monkeypatch, st
         return httpx.Response(status)
     cfg, run, _ = setup(monkeypatch, observer)
     check = await collect(cfg, run)
-    assert check.metrics["state"] == state
+    assert check.required and check.metrics["state"] == state
     assert check.metrics["planned_requests"] == check.metrics["observed_requests"] == 2
     assert check.metrics["unverified_requests"] == 2
     assert {r["identity"] for r in check.metrics["identities"]} == {"alice", "bob"}
     assert {i for r in check.metrics["identities"] for i in r["request_ids"]} == {r.id for r in run.records}
+
+
+@pytest.mark.usefixtures("local_tokenizer")
+@pytest.mark.parametrize("status,state,required,overall", [
+    (404, "unsupported", False, "pass"), (403, "unavailable", True, "inconclusive"),
+])
+async def test_mixed_run_distinguishes_unsupported_reader_from_denied_reader(monkeypatch, status, state, required, overall):
+    async def observer(request, rows):
+        return httpx.Response(status)
+
+    cfg, _, reads = setup(monkeypatch, observer)
+    cfg.checks = ["access", "serving", "gateway_attribution"]
+    cfg.targets[0].api_key_env = "SHARED"
+    cfg.limits.min_samples = 2
+    report = await run_suite(cfg)
+    checks = {check.id: check for check in report.checks}
+    assert checks["access"].status == checks["serving"].status == "pass"
+    attribution = checks["gateway_attribution"]
+    assert reads and attribution.metrics["observed_requests"] == 2
+    assert attribution.metrics["state"] == state and attribution.status == "inconclusive"
+    assert attribution.required is required and report.overall == overall
 
 
 @pytest.mark.parametrize("fault", ["reused_id", "wrong_session", "missing_id", "unknown_local"])
