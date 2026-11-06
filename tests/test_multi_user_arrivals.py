@@ -433,3 +433,43 @@ def test_final_admission_stall_discards_backlog_without_catchup(monkeypatch):
         assert window["scheduler_stalls"] == [
             {"start_ms": 0, "end_ms": 200}, {"start_ms": 50, "end_ms": 200}]
     run_virtual(monkeypatch, run())
+
+
+@pytest.mark.parametrize("immediate", [False, True])
+def test_scheduled_request_enters_transport_before_blocking_progress(monkeypatch, immediate):
+    from tests.test_multi_user_metrics import record as user_record
+
+    async def run():
+        cfg = settings(levels=[1], scenarios=["arrivals"], duration_seconds=.05,
+                       profile=PROFILE, arrivals={"requests_per_second": 1})
+        events, dispatches = [], []
+
+        def progress(event):
+            if event.get("user"):
+                events.append(event)
+                if event["event"] == "request_started":
+                    asyncio.get_running_loop().now += .2
+
+        state = runner._Run(cfg, progress, None)
+
+        class SpyClient(FakeClient):
+            async def execute(self, spec, **kwargs):
+                dispatches.append((asyncio.get_running_loop().now-state.start)*1000)
+                if immediate:
+                    return user_record("user-01", end=0, scenario=spec.scenario, workload={})
+                return await super().execute(spec, **kwargs)
+
+        await execute(state, cfg.targets[0], SpyClient(cfg.targets[0], cfg))
+        window, = state.observations["service"]["multi_user"]["windows"]
+        record, = state.records
+        assert dispatches == pytest.approx([record.dispatch_ms])
+        assert record.dispatch_ms < window["planned_end_ms"]
+        if immediate:
+            assert record.completed_ms == pytest.approx(record.dispatch_ms)
+        assert window["offer_accounting"]["dispatched"] == 1
+        assert window["offers"][0]["request_id"] == record.id
+        assert [event["event"] for event in events] == ["request_started", "request_completed"]
+        assert [event["request_slot"] for event in events] == [0, 0]
+        assert state.slots.qsize() == state.max_connections
+
+    run_virtual(monkeypatch, run())

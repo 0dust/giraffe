@@ -16,21 +16,21 @@ def _model_group(value):
 def _saturation_evidence(suffix, header):
     match = re.fullmatch(r", Model saturation: ([0-9]{1,3}(?:\.[0-9]{1,6})?)%", suffix)
     if not match or (body := Decimal(match[1])) > 100:
-        return None, None
+        return (), None
     body_places = body.as_tuple().exponent
     body_radius = Decimal(5).scaleb(body_places - 1)
     lower, upper = max(Decimal(0), body - body_radius), min(Decimal(100), body + body_radius)
     if header is None:
-        return float(body), (lower, upper)
+        return (body,), (lower, upper)
     match = re.fullmatch(r"([0-9]{1,3}\.[0-9]{2})%", header) if isinstance(header, str) else None
     if not match or (precise := Decimal(match[1])) > 100:
-        return None, None
+        return (), None
     # LiteLLM rounds the same value separately for the body and header.
     header_radius = Decimal("0.005")
     lower, upper = max(lower, precise - header_radius), min(upper, precise + header_radius)
     if lower >= upper:
-        return None, None
-    return float(precise if body_places > -2 else body), (lower, upper)
+        return (), None
+    return (body, precise), (lower, upper)
 
 
 def response_evidence(status, body=b"", headers=None, *, declared_priority=None, expected_key_hash=None):
@@ -112,6 +112,8 @@ def response_evidence(status, body=b"", headers=None, *, declared_priority=None,
                 evidence.priority_matches = matches if evidence.priority_matches is None else matches and evidence.priority_matches
         # Only the canonical TPM field between the rate type and RPM fields can prove absence.
         evidence._model_tpm_unconfigured = message[unit.end():rpm.start()] == " Model TPM: not configured"
-        evidence.saturation_percent, evidence._saturation_bounds = _saturation_evidence(
+        evidence._reported_saturation, evidence._saturation_bounds = _saturation_evidence(
             message[rpm.end():], headers.get("x-litellm-saturation"))
+        if evidence._reported_saturation:
+            evidence.saturation_percent = float(min(evidence._reported_saturation, key=lambda value: value.as_tuple().exponent))
     return evidence

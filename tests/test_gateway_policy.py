@@ -2,6 +2,7 @@
 import asyncio
 import hashlib
 import json
+import sys
 
 import httpx
 import pytest
@@ -33,7 +34,7 @@ def configuration(mode="key_rpm", **changes):
 
 async def exercise(monkeypatch, mode="key_rpm", *, behavior="enforce", full=False,
                    admitted_affected=None, rejection_saturation=None, saturation_header=None, peer_delay=.01,
-                   early_peer_admissions=None, **settings):
+                   early_peer_admissions=None, restart=False, **settings):
     monkeypatch.setenv("LIMITED", "limited-secret")
     monkeypatch.setenv("PEER", "peer-secret")
     if behavior == "duplicate_credentials":
@@ -46,11 +47,17 @@ async def exercise(monkeypatch, mode="key_rpm", *, behavior="enforce", full=Fals
     async def handle(request):
         nonlocal admitted
         if request.method != "POST":
+            if restart and request.url.path.endswith("/models"):
+                return httpx.Response(200, json={"data": []})
             return httpx.Response(404)
         who = {"Bearer limited-secret": "limited", "Bearer peer-secret": "peer"}.get(request.headers.get("authorization"))
         if who is None:
             return httpx.Response(401, json={"error": {"type": "authentication_error"}})
-        assert json.loads(request.content)["cache"] == {"no-cache": True, "no-store": True}
+        cache = json.loads(request.content).get("cache")
+        if restart and not seen:
+            assert cache is None and who == "limited"
+        else:
+            assert cache == {"no-cache": True, "no-store": True}
         counts[who] += 1
         seen.append(who)
         await asyncio.sleep(.01 if who == "limited" else peer_delay)
@@ -113,8 +120,15 @@ async def exercise(monkeypatch, mode="key_rpm", *, behavior="enforce", full=Fals
     if behavior == "cached_response":
         cfg.request_options = {"cache": {"no-cache": False, "no-store": False, "use-cache": True}}
     if full:
-        cfg.targets[0].api_key_env = "UNUSED_SHARED_CREDENTIAL"
-        monkeypatch.delenv("UNUSED_SHARED_CREDENTIAL", raising=False)
+        target = cfg.targets[0]
+        if restart:
+            cfg.restart_target = target.name
+            cfg.stream = False
+            target.restart_command = [sys.executable, "-c", "pass"]
+            target.api_key_env = "LIMITED"
+        else:
+            target.api_key_env = "UNUSED_SHARED_CREDENTIAL"
+            monkeypatch.delenv("UNUSED_SHARED_CREDENTIAL", raising=False)
         report = await runner.run_suite(cfg)
         return next(check for check in report.checks if check.id == "gateway_policy"), report, seen
     state = runner._Run(cfg, None, None)

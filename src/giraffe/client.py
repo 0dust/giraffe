@@ -21,7 +21,7 @@ from typing import Any, AsyncIterator
 import httpx
 
 from .caps import (
-    MAX_SERVER_ID_CHARS, MAX_TOOL_CALLS,
+    MAX_SERVER_ID_CHARS, MAX_TOKEN_EVIDENCE_PROBE_ATTEMPTS, MAX_TOOL_CALLS,
 )
 from giraffe.models import RequestRecord, RequestSpec, RunConfig, Target
 from giraffe.logprobs import LogprobBudget, LogprobCollector
@@ -257,7 +257,8 @@ class LLMClient:
         Only an explicit optional-field rejection permits another setup probe.
         Measured requests are never retried or used to discover compatibility.
         """
-        if self._evidence_probe_finished or self._evidence_probe_attempts >= 3 or not self.config.stream:
+        if (self._evidence_probe_finished or self._evidence_probe_attempts >= MAX_TOKEN_EVIDENCE_PROBE_ATTEMPTS
+                or not self.config.stream):
             return None
         self._evidence_probe_attempts += 1
         options = {}
@@ -278,7 +279,8 @@ class LLMClient:
             self._evidence_fields.discard(field)
             self.token_evidence["logprobs" if field == "logprobs" else "usage"] = "rejected"
             self.token_evidence.update(status="probing", reason=f"Endpoint rejected {rejected} (HTTP {record.http_status}).")
-            self._evidence_probe_finished = not self._evidence_fields or self._evidence_probe_attempts >= 3
+            self._evidence_probe_finished = (not self._evidence_fields
+                                            or self._evidence_probe_attempts >= MAX_TOKEN_EVIDENCE_PROBE_ATTEMPTS)
         else:
             self._evidence_probe_finished = True
             completed = record.http_status == 200 and record.stream_terminated
@@ -452,7 +454,8 @@ class LLMClient:
             record.tool_request_options = {key: payload[key] for key in
                 ("tools", "tool_choice", "parallel_tool_calls") if key in payload}
         probing = spec.workload.get("performance_evidence_probe")
-        if stream and not probing:
+        # The shared key may route to a different backend from marked identities.
+        if stream and not probing and not attribution:
             if self.token_evidence["usage"] == "supported":
                 payload.setdefault("stream_options", {"include_usage": True})
             if self._evidence_probe_attempts:
@@ -464,7 +467,7 @@ class LLMClient:
                     payload["logprobs"] = True
                     payload.setdefault("top_logprobs", 0)
         record.workload = dict(spec.workload)
-        if not probing and self._evidence_probe_attempts:
+        if not probing and not attribution and self._evidence_probe_attempts:
             record.workload["token_evidence"] = dict(self.token_evidence)
             evidence = record.workload["token_evidence"]
             evidence["requested_logprobs"] = payload.get("logprobs") is True

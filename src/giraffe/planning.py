@@ -12,6 +12,7 @@ import heapq
 import random
 from typing import Any
 
+from giraffe.caps import MAX_TOKEN_EVIDENCE_PROBE_ATTEMPTS
 from giraffe.fixtures import builtin_fixtures
 from giraffe.gateway_attribution import (POLL_FRACTIONS, configured_probe_count,
                                          deferred_for_shared_targets, reader_preflight_bound)
@@ -1355,20 +1356,43 @@ def request_plan(config: RunConfig | ConfigDraft, *,
                     for index, count in enumerate(counts.values()) if count), default=0)
 
     exact_limit = required_cap(planned_counts) if kind == "exact" else None
-    required = exact_limit if exact_limit is not None else required_cap(known_counts)
+    coverage_counts = planned_counts if exact_limit is not None else known_counts
     if load_plan:
         # Calibration has a finite attempt allowance. A suggested budget must
         # cover that allowance as well as scheduled work.
         calibration = sum(row["requests_per_target"] or 0 for row in rows if row["id"] == "load_calibration")
-        required = required_cap({target: math.ceil(planned_counts[target] if planned_counts else count + calibration)
-                                 for target, count in known_counts.items()})
+        coverage_counts = {target: math.ceil(planned_counts[target] if planned_counts else count + calibration)
+                           for target, count in known_counts.items()}
+    required = required_cap(coverage_counts)
+
+    compatibility_quotas = {}
+    if config.stream and any(attribution_counts.values()):
+        shared_reserve = token_evidence_request_reserve(rows)
+        gateway_only = gateway_identities_only(selected)
+        for target in config.targets:
+            restart = config.restart_target == target.name
+            probes = attribution_counts[target.name]
+            if not probes or (restart and not target.restart_command):
+                continue
+            if gateway_only and not restart:
+                continue
+            initial_count = int(initial and not restart)
+            shared_and_marked = max(coverage_counts[target.name], shared_reserve + probes)
+            count = shared_and_marked - int(initial and restart)
+            # Below this floor, the runtime skips optional setup. Above it,
+            # allow its full retry bound before the marked traffic starts.
+            if count > max(initial_count + 1, shared_reserve):
+                compatibility_quotas[target.name] = count + MAX_TOKEN_EVIDENCE_PROBE_ATTEMPTS
+    attribution_limit = required_cap(coverage_counts | compatibility_quotas) if compatibility_quotas else None
+    required = max(required, attribution_limit or 0)
 
     request_warnings = []
     affected_targets = []
     for target, quota in quotas.items():
         if quota is None:
             continue
-        if known_counts[target] > quota or planned_counts.get(target, 0) > quota:
+        compatibility_risk = compatibility_quotas.get(target, 0) > quota
+        if known_counts[target] > quota or planned_counts.get(target, 0) > quota or compatibility_risk:
             elapsed, cut = 0, []
             affected_targets.append((target, quota))
             for row in rows:
@@ -1376,12 +1400,20 @@ def request_plan(config: RunConfig | ConfigDraft, *,
                 elapsed += row_count
                 if elapsed > quota and row_count:
                     cut.append(row)
+            fixed_cut = bool(cut)
+            if compatibility_risk and not any(row["id"] == "gateway_attribution" for row in cut):
+                cut.append(next(row for row in rows if row["id"] == "gateway_attribution"))
             fields = list(dict.fromkeys(["max_requests", *[edit_field(row) for row in cut]]))
             titles = list(dict.fromkeys(_warning_title(row) for row in cut))
             edits = list({(action["label"], action["field"]): action for action in [
                 {"label": f"Edit {_warning_title(row)}", "field": edit_field(row)} for row in cut]}.values())
-            message = (f"{target}: incomplete coverage for {', '.join(titles)}; "
-                       f"the planned requests exceed this endpoint's share of the request limit (Maximum requests: {quota:,}).")
+            if fixed_cut or not compatibility_risk:
+                message = (f"{target}: incomplete coverage for {', '.join(titles)}; "
+                           f"the planned requests exceed this endpoint's share of the request limit (Maximum requests: {quota:,}).")
+            else:
+                message = f"{target}: {CATALOGUE_NAMES['gateway_attribution']} may run out of request quota (Maximum requests: {quota:,})."
+            if compatibility_risk:
+                message += f" Allow for up to {MAX_TOKEN_EVIDENCE_PROBE_ATTEMPTS} streamed compatibility attempts before attribution."
             request_warnings.append({"kind": "incomplete_coverage", "fields": fields,
                 "values": {"max_requests": config.max_requests, "required_request_limit": required, "quota": quota},
                 "cut_checks": [row["id"] for row in cut], "msg": message,
@@ -1465,5 +1497,6 @@ def request_plan(config: RunConfig | ConfigDraft, *,
             "request_warnings": request_warnings, "request_limit": config.max_requests, "memory_limit_bytes": config.max_memory_mb * 1024**2,
             "memory_limit_label": "Maximum memory (RAM growth during this run)",
             "required_request_limit": exact_limit,
+            **({"attribution_request_limit": attribution_limit} if attribution_limit is not None else {}),
             "target_quotas": quotas, "rows": rows, "bucket_cases": bucket_cases,
             "bucket_levels": bucket_levels, "evaluator": evaluator, "warnings": warnings}

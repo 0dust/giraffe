@@ -20,6 +20,12 @@ def config(**changes):
         gateway_attribution={"identities": ["alice", "bob"], "samples": 1, "settle_seconds": .05}, **changes)
 
 
+def immediate_spend_polls(monkeypatch, cfg):
+    # Synthetic rows change by poll index. Real timing tests keep the production schedule.
+    monkeypatch.setattr("giraffe.gateway_attribution.POLL_FRACTIONS", (0, 0, 0))
+    cfg.gateway_attribution.settle_seconds = 1
+
+
 def spend_page(request, rows, *, total=None, **overrides):
     page = int(request.url.params["page"])
     size = int(request.url.params["page_size"])
@@ -34,6 +40,7 @@ async def exercise(monkeypatch, mode="match", *, stream=True, full=False, missin
     for ref in ("ALICE", "BOB", "OBSERVER"):
         monkeypatch.setenv(ref, "secret-" + ref)
     cfg = config(stream=stream)
+    immediate_spend_polls(monkeypatch, cfg)
     bob_key = "secret-ALICE" if mode == "duplicate_key" else "secret-BOB"
     monkeypatch.setenv("BOB", bob_key)
     if bob_header:
