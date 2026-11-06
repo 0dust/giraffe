@@ -3072,7 +3072,7 @@ function resultGuidance(report) {
 // Report navigation is scoped to this visit. Polls never override an explicit tab choice.
 let reportView={id:null,tab:null,explicit:false,wasLive:false,terminalSwitch:false,performance:null,target:null,window:null,error:'',pending:false,sequence:0,lastFetch:0};
 const reportSections=[['overview','Performance overview',null],['timing','Request timing',null],['throughput','Throughput & capacity','throughput_capacity'],['delivery','Load delivery','delivery'],['outcomes','Outcomes & quality','outcomes'],['tokens','Workload & tokens','token_accounting'],['effects','Conversations & workload effects','conversations'],['server','Server observations','server'],['baseline','Baseline comparison','baseline']];
-const comparisonSections=[['answers','Answers & correctness'],['timing','Response timing'],['delivery','Request completion']];
+const comparisonSections=[['answers','Answers & correctness'],['timing','Response timing'],['delivery','Request completion'],['gateway-access-decisions','Gateway access decisions']];
 const reportResultSections=[['comparison','Baseline comparison'],['acceptance','Pass / fail','comparison'],['load-acceptance','Tested load acceptance','comparison'],...comparisonSections.map(([id,label])=>[id,label,'comparison']),['checks','Checks & evidence'],['configuration','Run configuration'],['requests','All requests'],['resources','Peak memory (RAM)']];
 function reportRoute(hash=typeof location==='undefined'?'':location.hash) {
   const request=hash.match(/^#runs\/([^/]+)\/requests\/([^/]+)$/);
@@ -3858,7 +3858,7 @@ function comparisonMetricLabel(row) {
 function comparisonWarnings(row) {
   return row.warnings?.length?row.warnings.map(w=>w.message):row.status==='inconclusive'?[row.reason||'Insufficient evidence to interpret this change.']:[];
 }
-function comparisonCategory(row){return ['correctness_rate','output_tokens','output_chars'].includes(row.metric)?'answers':['valid_completion_rate','error_rate'].includes(row.metric)?'delivery':'timing';}
+function comparisonCategory(row){return row.check==='gateway_access'?'gateway-access-decisions':['correctness_rate','output_tokens','output_chars'].includes(row.metric)?'answers':['valid_completion_rate','error_rate'].includes(row.metric)?'delivery':'timing';}
 function comparisonWarningSummary(row) {
   const notes=[];
   for(const warning of row.warnings||[]){
@@ -3889,7 +3889,7 @@ function comparisonTable(rows) {
 }
 function comparisonCohort(row){return row.load_point?['source','type','workload','shape','pattern','level','rate','bursts','phase','role'].map(name=>row.load_point[name]):row.scenario;}
 function comparisonGroup(id,rows) {
-  const row=rows[0],label=row?.load_point?comparisonLoadLabel(row.load_point):scenarioLabel(row);
+  const row=rows[0],label=row?.load_point?comparisonLoadLabel(row.load_point):row?.scenario_label||scenarioLabel(row);
   return `<div class="comparison-check-group" data-comparison-group="${escape(id)}"><p class="comparison-group-heading hint">${escape(row?.targetName||'')} · ${escape(catalogTitle(id))} · ${escape(label)}</p>${comparisonTable(rows)}</div>`;
 }
 

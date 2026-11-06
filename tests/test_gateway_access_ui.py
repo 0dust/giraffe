@@ -65,3 +65,17 @@ def test_gateway_access_phase_fallback_matches_canonical_label():
 
     browser_logic("assert.equal(phaseName('gateway_access'), " +
                   json.dumps(_SCENARIOS['gateway_access'][0]) + ");", config())
+
+
+def test_access_baseline_shows_decisions_as_policy_evidence():
+    browser_logic(r'''
+const html=renderComparison({baseline:{run_id:'reference',targets:[{target:'proxy',comparisons:[{
+  check:'gateway_access',scenario:'invalid',scenario_label:'invalid (denied) · expected deny',
+  metric:'policy_acceptance',aggregation:'observed',status:'fail',
+  baseline:'deny',current:'allow',baseline_samples:1,current_samples:1,
+}]}]}});
+assert.match(html,/Gateway access decisions/);
+assert.match(html,/invalid \(denied\) · expected deny/);
+assert.match(html,/Observed failure/);
+assert.doesNotMatch(html,/Response timing/);
+''', config())

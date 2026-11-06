@@ -27,7 +27,7 @@ from .caps import (MAX_HTML_PREVIEW_CHARS, MAX_HTML_JSON_PREVIEW_CHARS,
 from .deployment import deployment_diff, fixture_hash, safe_config, sanitize
 from .report_inputs import input_ref as _input_ref
 from .multi_user_metrics import user_latency
-from .models import (CHECK_NAMES, SHAPES, CheckResult, RequestRecord, RunConfig, RunReport, overall_status, load_shape_label,
+from .models import (CHECK_NAMES, SHAPES, CheckResult, GatewayAccess, RequestRecord, RunConfig, RunReport, overall_status, load_shape_label,
                      migrate_concurrent_load, migrate_run_limits, is_supported_schema, CURRENT_SCHEMA)
 from .stats import median, percentile
 from .storage import DEFAULT_LIMITS, format_size, fsync_directory, update_metadata, write_metadata
@@ -1234,6 +1234,47 @@ def _acceptance_status(report: RunReport) -> str:
         memory_limit_interrupted=any(check.required and (check.target, check.id) in interrupted for check in checks))
 
 
+def _compare_gateway_access(current, baseline, declarations, compatible):
+    def matched(policy, case):
+        return next((row for row in policy.get("cases", [])
+                     if all(row.get(field) == value for field, value in case.items())), {})
+
+    def decision(row):
+        observed = row.get("observed")
+        return observed if observed in ("allow", "deny") else "unverified"
+
+    current_policy = current.metrics.get("gateway_access", {})
+    old_policy = baseline.metrics.get("gateway_access", {}) if baseline else {}
+    baseline_passed = (baseline is not None and baseline.status == "pass"
+                       and old_policy.get("coverage_complete")
+                       and current_policy.get("profile") == old_policy.get("profile") == "litellm")
+    rows = []
+    for case in declarations:
+        latest, previous = matched(current_policy, case), matched(old_policy, case)
+        observed, prior = decision(latest), decision(previous)
+        status = "inconclusive"
+        if not compatible:
+            reason = "Run settings or target identity references differ."
+        elif not baseline_passed or prior != case["expected"]:
+            reason = "The baseline lacks a complete passing access matrix for these declarations."
+        elif observed not in {"allow", "deny"}:
+            reason = "The current run has no qualified access observation for this case."
+        else:
+            status = "pass" if observed == case["expected"] else "fail"
+            reason = ("The observed decision still matches the declared policy." if status == "pass" else
+                      "This previously passing access case now differs from the declared policy.")
+        rows.append({"check": "gateway_access", "scenario": case["name"],
+                     "identity": case["identity"], "expected": case["expected"],
+                     "scenario_label": f'{case["name"]} ({case["identity"]}) · expected {case["expected"]}',
+                     "metric": "policy_acceptance", "aggregation": "observed", "status": status,
+                     "current": observed, "baseline": prior,
+                     "current_samples": int(observed in {"allow", "deny"}),
+                     "baseline_samples": int(prior in {"allow", "deny"}),
+                     "threshold": 0, "worsening": 100 if status == "fail" else 0,
+                     "reason": reason, "evidence_ids": [latest["request_id"]] if latest.get("request_id") else []})
+    return rows
+
+
 def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
     """Return a new report with explicit baseline evidence; never mutate or promote a baseline."""
     result = report.model_copy(deep=True)
@@ -1311,6 +1352,16 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                         "comparable": not target_reasons,
                         "interpretation": "Repeatability and task correctness are separate. Different answers alone do not prove regression."})
         rows = []
+        current_access = next((check for check in report.checks if check.id == "gateway_access"
+                               and check.target == name and check.required), None)
+        if current_access and "gateway_access" in config.get("checks", []):
+            old_access = next((check for check in baseline.checks if check.id == "gateway_access"
+                               and check.target == name and check.required), None)
+            try:
+                declarations = GatewayAccess.model_validate(config.get("gateway_access")).model_dump()["cases"]
+            except ValidationError:
+                declarations = []
+            rows.extend(_compare_gateway_access(current_access, old_access, declarations, not target_reasons))
         for current_check in report.checks:
             if current_check.id != "gateway_policy" or current_check.target != name:
                 continue
@@ -1514,6 +1565,9 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                            and check.id in config.get("checks", []) and check.id in request_paths}
         covered = {row["check"] for row in assessed
                    if row["metric"] in verdict_metrics.get(row["check"], {row["metric"]})}
+        if current_access and (current_access.status != "pass" or any(
+                row["check"] == "gateway_access" and row["status"] == "inconclusive" for row in rows)):
+            covered.discard("gateway_access")
         if any(row["status"] in {"pass", "fail"} for row in (traffic or {}).get("stages", [])):
             covered.add("capacity")
         if any(row["status"] in {"pass", "fail"} for row in (load_tests or {}).get("points", [])):
@@ -1566,7 +1620,7 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
             summary += " " + load_tests["reason"]
         if excluded:
             summary += f" {excluded} metric(s) not comparable (low samples, undefined values or uncertain attribution); see comparison details."
-        if status == "inconclusive" and missing_checks:
+        if status == "inconclusive" and set(missing_checks) - {"gateway_access"}:
             summary += (f" To conclude, collect at least {minimum} measured samples per metric in both the current and baseline runs,"
                         " using the same workload and settings; rerun longer if variation remains uncertain.")
         entry = {"target": name, "status": status, "summary": summary, "reasons": target_reasons,

@@ -23,6 +23,7 @@ def config(**changes):
     (401, "token_not_found_in_db", None, "pass"),
     (403, "key_model_access_denied", None, "pass"),
     (200, None, "answer", "fail"),
+    (401, "auth_error", "Authentication Error, custom identity backend connection refused", "inconclusive"),
     (401, "upstream_error", None, "inconclusive"),
     (429, "rate_limit_error", None, "inconclusive"),
     (500, None, None, "inconclusive"),
@@ -45,7 +46,7 @@ async def test_policy_matrix_uses_evidence_not_failed_requests(monkeypatch, stat
             raise httpx.ConnectError("deny-secret")
         if status == 200:
             return httpx.Response(200, json={"choices": [{"message": {"content": body}, "finish_reason": "stop"}]})
-        return httpx.Response(status, json={"error": {"type": error_type, "message": "deny-secret"}})
+        return httpx.Response(status, json={"error": {"type": error_type, "message": body or "deny-secret"}})
 
     original = httpx.AsyncClient
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
@@ -132,6 +133,51 @@ async def test_full_runner_keeps_policy_separate_and_preserves_exports(monkeypat
     altered.manifest["config"]["targets"][0]["test_identities"]["allowed"]["api_key_env"] = "DIFFERENT_KEY"
     comparison = compare_baseline(altered, report)
     assert any("identity references" in reason for reason in comparison.baseline["targets"][0]["reasons"])
+
+
+@pytest.mark.parametrize("mode,expected", [
+    ("match", "pass"),
+    ("unexpected_access", "fail"),
+    ("unverified", "inconclusive"),
+    ("unverified_baseline", "inconclusive"),
+])
+async def test_baseline_compares_qualified_access_cases(monkeypatch, mode, expected):
+    from giraffe.reporting import compare_baseline
+    from giraffe.runner import run_suite
+
+    monkeypatch.setenv("ALLOW_KEY", "allow-secret")
+    monkeypatch.setenv("DENY_KEY", "deny-secret")
+    deny_status = 503 if mode == "unverified_baseline" else 401
+
+    def handler(req):
+        if req.method != "POST":
+            return httpx.Response(404)
+        if req.headers["authorization"] == "Bearer deny-secret" and deny_status != 200:
+            return httpx.Response(deny_status, json={"error": {"type": "token_not_found_in_db"}})
+        return httpx.Response(200, json={"choices": [{"message": {"content": "OK"}, "finish_reason": "stop"}]})
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
+    cfg = config(retention="all")
+    baseline = await run_suite(cfg)
+    assert baseline.overall == ("inconclusive" if mode == "unverified_baseline" else "pass")
+    deny_status = {"unexpected_access": 200, "unverified": 503}.get(mode, 401)
+    current = await run_suite(cfg)
+    compared = compare_baseline(current, baseline)
+    assert compared.baseline["status"] == expected
+    target = compared.baseline["targets"][0]
+    rows = {row["scenario"]: row for row in target["comparisons"]}
+    assert set(rows) == {"valid", "invalid"}
+    assert rows["valid"]["baseline"] == rows["valid"]["current"] == "allow"
+    assert rows["invalid"]["status"] == expected
+    assert rows["invalid"]["baseline"] == ("unverified" if mode == "unverified_baseline" else "deny")
+    assert rows["invalid"]["current"] == {
+        "unexpected_access": "allow", "unverified": "unverified",
+    }.get(mode, "deny")
+    assert "collect at least" not in target["summary"]
+    if mode == "unexpected_access":
+        failure = next(check for check in compared.checks if check.id == "baseline")
+        assert failure.evidence_ids == rows["invalid"]["evidence_ids"]
 
 
 @pytest.mark.parametrize("change", [{"max_requests": 1}, {"gateway_access": None},

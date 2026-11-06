@@ -34,7 +34,9 @@ produce qualified evidence before the matrix can pass.
 | HTTP 403 with a recognized LiteLLM model-access error | Deny |
 | Timeout, network error, 429, 5xx, redirect, unknown authentication error, malformed or incomplete response | Unverified |
 
-Recognized 401 types are `token_not_found_in_db`, `expired_key`, and `auth_error`.
+Recognized 401 types are `token_not_found_in_db` and `expired_key`. Generic
+`auth_error` responses remain unverified because they can indicate an
+authentication backend failure.
 Recognized 403 types are `key_model_access_denied`, `team_model_access_denied`,
 `user_model_access_denied`, `org_model_access_denied`, and
 `project_model_access_denied`. Types must match their HTTP status; provider
