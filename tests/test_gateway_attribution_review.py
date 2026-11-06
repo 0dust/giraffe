@@ -10,8 +10,9 @@ import pytest
 
 from giraffe.client import LLMClient
 from giraffe.gateway_attribution import execute, result
-from giraffe.models import RequestSpec
-from giraffe.runner import _Run, _checks
+from giraffe.models import RequestSpec, TestIdentity as GatewayIdentity
+from giraffe.reporting import compare_baseline
+from giraffe.runner import _Run, _checks, run_suite
 from tests.test_gateway_attribution import config, spend_page
 
 
@@ -34,6 +35,8 @@ def setup(monkeypatch, observer, *, rejected=None):
                 raise httpx.ConnectError("unreachable", request=request)
             if rejected == "deep_json":
                 return httpx.Response(401, content=b'{"error":' + b'[' * 2000 + b'0' + b']' * 2000 + b'}')
+            if rejected == "deep_success":
+                return httpx.Response(200, content=b'{"choices":' + b'[' * 2000 + b'0' + b']' * 2000 + b'}')
             return httpx.Response(401, json={"error": {"type": "expired_key"}})
         if "x-litellm-spend-logs-metadata" in request.headers:
             rows.append({"request_id": str(len(rows)), "session_id": request.headers["x-litellm-trace-id"],
@@ -63,11 +66,12 @@ async def test_litellm_required_utc_dates_cover_probes_and_are_stable_on_all_pag
         page = int(request.url.params["page"])
         return spend_page(request, rows[page-1:page], total=len(rows))
     cfg, run, reads = setup(monkeypatch, observer)
+    cfg.gateway_attribution.settle_seconds = .2
     before = datetime.now(timezone.utc)
     check = await collect(cfg, run)
     after = datetime.now(timezone.utc)
     assert check.metrics["state"] == "verified"
-    assert len(reads) == 2
+    assert len(reads) == 6
     bounds = {(r.url.params["start_date"], r.url.params["end_date"]) for r in reads}
     assert len(bounds) == 1
     start, end = [datetime.strptime(value, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc) for value in bounds.pop()]
@@ -189,6 +193,55 @@ async def test_late_logs_are_read_in_final_part_of_settle_window(monkeypatch):
     assert time.monotonic() - started < .6
 
 
+async def test_early_complete_read_cannot_hide_late_conflicting_rows(monkeypatch):
+    started = None
+
+    async def observer(request, rows):
+        nonlocal started
+        now = time.monotonic()
+        started = now if started is None else started
+        if now - started >= .02:
+            rows = [*rows, {**rows[0], "request_id": "late-row", "api_key": "0" * 64}]
+        return spend_page(request, rows)
+
+    cfg, run, reads = setup(monkeypatch, observer)
+    cfg.gateway_attribution.settle_seconds = .2
+    check = await collect(cfg, run)
+    assert len(reads) == 3 and check.metrics["collection_complete"]
+    assert check.metrics["state"] == "unverified"
+    assert check.metrics["matched_requests"] == check.metrics["unverified_requests"] == 1
+
+
+async def test_final_read_timeout_does_not_reuse_early_complete_evidence(monkeypatch):
+    polls = 0
+
+    async def observer(request, rows):
+        nonlocal polls
+        polls += 1
+        if polls == 3:
+            await asyncio.Event().wait()
+        return spend_page(request, rows)
+
+    cfg, run, _ = setup(monkeypatch, observer)
+    cfg.gateway_attribution.settle_seconds = .2
+    check = await collect(cfg, run)
+    assert polls == 3 and check.metrics["collection_complete"] is False
+    assert check.metrics["state"] == "unverified"
+    assert check.metrics["matched_requests"] == 0 and check.metrics["unverified_requests"] == 2
+
+
+async def test_shortened_collection_window_keeps_complete_pages_unverified(monkeypatch):
+    async def observer(request, rows):
+        return spend_page(request, rows)
+
+    cfg, run, reads = setup(monkeypatch, observer)
+    cfg.gateway_attribution.settle_seconds = 1
+    run.deadline = time.monotonic() + .25
+    check = await collect(cfg, run)
+    assert reads and check.metrics["collection_complete"] is False
+    assert check.metrics["state"] == "unverified" and check.metrics["unverified_requests"] == 2
+
+
 async def test_cancelling_reader_keeps_probe_counts_and_clears_transient_hashes(monkeypatch):
     reading = asyncio.Event()
     async def observer(request, rows):
@@ -287,9 +340,10 @@ async def test_runner_fallback_records_keep_selected_identity_and_health_isolati
 
 
 @pytest.mark.usefixtures("local_tokenizer")
-@pytest.mark.parametrize("rejected,evidence", [("expired", "authentication"), ("deep_json", "unknown")])
-async def test_mixed_full_run_keeps_shared_checks_passing_with_rejected_identity(monkeypatch, rejected, evidence):
-    from giraffe.runner import run_suite
+@pytest.mark.parametrize("rejected,http_status,evidence", [
+    ("expired", 401, "authentication"), ("deep_json", 401, "unknown"), ("deep_success", 200, None),
+])
+async def test_mixed_full_run_keeps_shared_checks_passing_with_rejected_identity(monkeypatch, rejected, http_status, evidence):
     async def observer(request, rows):
         return spend_page(request, rows)
     cfg, _, _ = setup(monkeypatch, observer, rejected=rejected)
@@ -304,5 +358,57 @@ async def test_mixed_full_run_keeps_shared_checks_passing_with_rejected_identity
     assert len([record for record in report.requests if record.identity is not None]) == 2
     assert all(record.http_status == 200 for record in report.requests if record.identity is None)
     probe = next(record for record in report.requests if record.identity == "alice")
-    assert probe.http_status == 401
+    assert probe.status == "failed" and probe.http_status == http_status
     assert probe.gateway_evidence.error_kind == evidence
+
+
+@pytest.mark.usefixtures("local_tokenizer")
+@pytest.mark.parametrize("change", ["unused_alias", "reader", "settings", "unsupported", "unconfigured", "enabled"])
+async def test_attribution_changes_do_not_veto_shared_baseline_evidence(monkeypatch, change):
+    async def observer(request, rows):
+        assert change not in {"unsupported", "unconfigured"}, "inactive attribution read gateway evidence"
+        return spend_page(request, rows)
+
+    async def run_variant(current):
+        with monkeypatch.context() as env:
+            cfg, _, _ = setup(env, observer)
+            cfg.checks = ["access", "serving", "gateway_attribution"]
+            cfg.targets[0].api_key_env = "SHARED"
+            cfg.limits.min_samples = 2
+            cfg.limits.regression_percent = 100000
+            cfg.samples = 8
+            cfg.max_requests = 30
+            cfg.gateway_attribution.settle_seconds = .2
+            if change == "unsupported" or (change == "enabled" and not current):
+                cfg.targets[0].gateway.profile = "other"
+            if change in {"settings", "unsupported"} and current:
+                cfg.gateway_attribution.settle_seconds = .25
+            if change == "unconfigured":
+                cfg.gateway_attribution = None
+                cfg.targets[0].gateway = None
+            if change in {"unsupported", "unconfigured", "unused_alias"}:
+                cfg.targets[0].test_identities["unused"] = GatewayIdentity(
+                    api_key_env="UNUSED_NEW" if current else "UNUSED_OLD")
+            if change == "reader" and current:
+                cfg.targets[0].gateway.api_key_env = "OTHER_READER"
+                env.setenv("OTHER_READER", "secret-OBSERVER")
+            return await run_suite(cfg)
+
+    baseline = await run_variant(False)
+    current = await run_variant(True)
+    assert baseline.overall == current.overall == "pass"
+    target = compare_baseline(current, baseline).baseline["targets"][0]
+    assert not target["reasons"]
+    assert any(row["check"] == "serving" and row["metric"] == "valid_completion_rate"
+               and row["status"] == "pass" for row in target["comparisons"])
+    attribution = next(check for check in current.checks if check.id == "gateway_attribution")
+    attribution_rows = [row for row in target["comparisons"] if row["check"] == "gateway_attribution"]
+    if change in {"unsupported", "unconfigured"}:
+        assert not attribution.required and not attribution_rows
+        assert not any(record.identity for record in current.requests)
+    else:
+        assert attribution.required and len(attribution_rows) == 2
+        expected = "pass" if change == "unused_alias" else "inconclusive"
+        assert all(row["status"] == expected for row in attribution_rows)
+        if change == "enabled":
+            assert target["status"] == "inconclusive" and "gateway_attribution" in target["summary"]

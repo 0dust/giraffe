@@ -153,7 +153,7 @@ async def _sse_events(response: httpx.Response, *, on_read=None) -> AsyncIterato
 def _object(payload: str | bytes) -> dict[str, Any]:
     try:
         value = json.loads(payload)
-    except (ValueError, UnicodeDecodeError) as exc:
+    except (ValueError, RecursionError) as exc:
         raise _ProtocolError("malformed JSON in response") from exc
     if not isinstance(value, dict):
         raise _ProtocolError("response must contain a JSON object")
