@@ -244,6 +244,7 @@ async def test_malformed_assistant_reply_does_not_show_peer_continuation(monkeyp
 @pytest.mark.usefixtures("local_tokenizer")
 @pytest.mark.parametrize("behavior,reasoning_tokens,expected", [
     ("peer_inconsistent_reasoning", 128, "inconclusive"),
+    ("peer_zero_answer_tokens", 2, "inconclusive"),
     ("peer_consistent_reasoning", 1, "pass"),
 ])
 async def test_policy_requires_reasoning_tokens_to_fit_completion_total(monkeypatch, behavior, reasoning_tokens, expected):
@@ -397,12 +398,12 @@ async def test_priority_matches_gateway_formatting_at_rounding_ties(monkeypatch,
     ((30.0, 30.0), True, "not configured", "inconclusive"),
     ((30.0, 40.0), True, "not configured", "pass"),
     ((30.0, 20.0), False, None, "inconclusive"),
-    ((25.0, 25.0), False, None, "pass"),
+    ((25.0, 25.0), False, None, "inconclusive"),
     ((37.5, 25.0), False, "80", "inconclusive"),
     ((25.0, 25.0), False, "80", "pass"),
     ((30.0, 30.0), True, "81", "inconclusive"),
     ((30.3, 30.3), True, "66", "pass"),
-    ((30.0, 30.0), True, "081", "pass"),
+    ((30.0, 30.0), True, "081", "inconclusive"),
 ])
 async def test_priority_rejections_share_one_counter_history(monkeypatch, reported, middle_charge, model_tpm, expected):
     from giraffe.runner import _Run
@@ -442,7 +443,7 @@ async def test_priority_rejections_share_one_counter_history(monkeypatch, report
                        f"{tpm}Model RPM: 10, Remaining: 0, Model saturation: {saturation:.1f}%")
             return httpx.Response(429, headers=headers, json={"error": {"type": "throttling_error", "code": "429", "message": message}})
         return httpx.Response(200, headers=headers, json={"choices": [{"message": {"role": "assistant", "content": "OK"},
-            "finish_reason": "stop"}], "usage": {"prompt_tokens": 8, "completion_tokens": 2}})
+            "finish_reason": "stop"}], "usage": {"prompt_tokens": 8, "completion_tokens": 2, "total_tokens": 10}})
 
     request = _Run.request
 
@@ -477,10 +478,10 @@ async def test_priority_rejections_share_one_counter_history(monkeypatch, report
         middle = next(record for record in report.requests if record.identity == "middle")
         assert first.completed_ms < middle.dispatch_ms < middle.completed_ms < second.dispatch_ms
     check = next(check for check in report.checks if check.id == "gateway_policy")
-    assert check.metrics["gateway_policy"]["peer_continuation"]
+    assert check.metrics["gateway_policy"]["peer_continuation"] == (model_tpm not in (None, "081"))
     assert check.status == expected, check.summary
     if expected == "inconclusive":
-        assert "contradicts earlier limiter evidence" in check.summary
+        assert ("does not identify" if model_tpm in (None, "081") else "contradicts earlier limiter evidence") in check.summary
 
 
 @pytest.mark.usefixtures("local_tokenizer")
@@ -551,5 +552,50 @@ async def test_priority_borrowing_accounts_for_peer_admission_order(monkeypatch,
     if expected == "fail":
         assert "completed admissions reached model saturation" in check.summary
     if expected == "inconclusive":
-        reason = "Overlapping admissions leave saturation uncertain" if model_tpm == "not configured" else "Model TPM is configured or unknown"
+        if model_tpm == "not configured":
+            reason = "Overlapping admissions leave saturation uncertain"
+        elif model_tpm == "60":
+            reason = "Model TPM is configured or unknown"
+        else:
+            reason = "does not identify"
         assert reason in check.summary
+
+
+@pytest.mark.usefixtures("local_tokenizer")
+@pytest.mark.parametrize("behavior,confirmation,expected", [
+    ("enforce", True, "pass"),
+    ("enforce", False, "inconclusive"),
+    ("contradictory_priority", True, "inconclusive"),
+])
+async def test_priority_requires_canonical_rejection_and_confirmed_named_pools(monkeypatch, behavior, confirmation, expected):
+    check, _, _ = await exercise(monkeypatch, "priority_rpm", full=True, behavior=behavior,
+                                 named_reservations_confirmed=confirmation)
+    summary = check.metrics["gateway_policy"]
+    assert check.status == expected, check.summary
+    assert [user["admitted"] for user in summary["users"]] == [2, 8]
+    if behavior == "contradictory_priority":
+        assert not summary["peer_continuation"]
+        assert "does not identify" in check.summary
+    elif not confirmation:
+        assert summary["peer_continuation"]
+        assert "configured named reservations" in check.summary
+
+
+@pytest.mark.usefixtures("local_tokenizer")
+@pytest.mark.parametrize("model_tpm,reported,threshold,behavior,expected", [
+    ("1000000", 90.0, .75, "enforce", "inconclusive"),
+    ("80", 25.0, .22, "enforce", "pass"),
+    ("80", 25.0, .22, "missing_total", "inconclusive"),
+    ("80", 20.0, .2, "missing_total", "pass"),
+])
+async def test_priority_tpm_only_saturation_requires_plausible_charges(
+        monkeypatch, model_tpm, reported, threshold, behavior, expected):
+    check, report, _ = await exercise(monkeypatch, "priority_rpm", full=True, model_tpm=model_tpm,
+        saturation_threshold=threshold, rejection_saturation=reported, peer_delay=.2, behavior=behavior,
+        users=[dict(identity="limited", requests=3, rpm=2, priority="low"),
+               dict(identity="peer", requests=5, rpm=8, priority="high")])
+    rejection = next(record for record in report.requests if record.http_status == 429)
+    assert sum(record.http_status == 200 and record.completed_ms < rejection.dispatch_ms
+               for record in report.requests) == 2
+    assert check.metrics["gateway_policy"]["peer_continuation"]
+    assert check.status == expected, check.summary

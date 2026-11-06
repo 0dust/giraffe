@@ -320,6 +320,19 @@ def _input_shape(observation, settings, profile, records):
     return input_qualification(settings, size, records, floors=_input_shape_floors(observation, output))
 
 
+def fairness_applies(window):
+    """Identify measurement windows where a selected fairness limit can apply."""
+    role, scenario = window.get("role"), window.get("scenario")
+    return window.get("phase") == "measurement" and (
+        not role or scenario == "arrivals"
+        or (scenario == "recovery" and role in {"control", "sustained", "lighter"}))
+
+
+def _fully_dispatched(counts):
+    return bool(counts and counts.get("dispatched") and counts["dispatched"] == counts.get("planned")
+                and not any(counts.get(outcome, 0) for outcome in _UNDISPATCHED_OFFERS))
+
+
 def _fairness(observation, window, users, records, criteria, health, lag, timing_threshold):
     """Qualify observed delivery, never attribute a difference to server scheduling."""
     settings = observation.get("settings", {})
@@ -345,9 +358,8 @@ def _fairness(observation, window, users, records, criteria, health, lag, timing
         if len({u.get("activation_seconds", 0) for u in users}) > 1 or any(
                 offer.get("origin") == "burst" for offer in window.get("offers", [])):
             reasons.append("Work not comparable: arrival exposure or burst work differs between users.")
-        counts = window.get("offer_accounting")
-        if not counts or any(counts.get(outcome, 0) for outcome in _UNDISPATCHED_OFFERS):
-            reasons.append("The generator did not deliver the configured user offer schedule.")
+    if window.get("scenario") in {"arrivals", "recovery"} and not _fully_dispatched(window.get("offer_accounting")):
+        reasons.append("The generator did not deliver the configured user offer schedule.")
     if window.get("cut_short") or start is None or end is None or end <= start:
         reasons.append("The common measurement window was not completed.")
     if window.get("drain_reason"):
@@ -711,8 +723,7 @@ def _recovery(observation, window, control, sustained, user_records, criteria, h
         counts = phase.get("offer_accounting", {})
         start, end = phase["start_ms"], phase["end_ms"]
         dispatched = counts.get("dispatched", 0)
-        if (not dispatched or end <= start or dispatched != counts.get("planned")
-                or any(counts.get(outcome, 0) for outcome in _UNDISPATCHED_OFFERS)):
+        if end <= start or not _fully_dispatched(counts):
             shared.append("The generator did not deliver the configured phase schedule.")
         else:
             # Qualified recovery windows delivered every offer in their finite plan.
@@ -836,8 +847,12 @@ def summarize(observation: dict[str, Any], records: list[RequestRecord], *,
         fairness = _fairness(observation, window, users, user_records, criteria, timing_health,
                              legacy_max_lag_ms, timing_threshold)
         statuses = [user["status"] for user in users]
-        if (criteria.max_throughput_ratio is not None and fairness["status"] != "not_applicable"
-                and (not window.get("role") or window.get("scenario") == "arrivals")):
+        selected_fairness = (criteria.max_throughput_ratio is not None and fairness["status"] != "not_applicable"
+                             and fairness_applies(window))
+        if window.get("scenario") == "recovery":
+            # Older reports measured this ratio without applying it to acceptance.
+            fairness["acceptance_applies"] = selected_fairness
+        if selected_fairness:
             statuses.append(fairness["status"])
         window_status = _status(statuses, measured=all(status == "measured" for status in statuses))
         windows.append({**window, "users": users, "status": window_status, "fairness": fairness})
@@ -882,8 +897,7 @@ def summarize(observation: dict[str, Any], records: list[RequestRecord], *,
                  for user in window["users"]]
     measurement_windows = [window for window in windows if window["phase"] == "measurement"]
     statuses = [window["status"] for window in measurement_windows]
-    fairness_windows = [window for window in measurement_windows
-                        if not window.get("role") or window.get("scenario") == "arrivals"]
+    fairness_windows = [window for window in measurement_windows if fairness_applies(window)]
     if criteria.max_throughput_ratio is not None and all(
             window["fairness"]["status"] == "not_applicable" for window in fairness_windows):
         statuses.append("inconclusive")

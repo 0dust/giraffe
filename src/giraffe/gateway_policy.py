@@ -8,12 +8,18 @@ from fractions import Fraction
 from math import ceil, floor, inf
 import time
 
-from .identities import identity_headers, litellm_key_fingerprint
+from .identities import gateway_identities_only, identity_headers, litellm_key_fingerprint
 from .models import CheckResult, RequestSpec
 
 
-VERSION = 15
+VERSION = 16
 PROMPT = "Reply with exactly the word OK."
+
+
+def deferred_for_shared_targets(config):
+    return (len(config.targets) > 1 and "gateway_policy" in config.checks
+            and config.gateway_policy is not None and config.gateway_policy.supported
+            and not gateway_identities_only(config.checks))
 
 
 def credential_issue(settings, target):
@@ -53,7 +59,6 @@ async def execute(run, target, client):
     reason = credential_issue(settings, target)
     if reason:
         observation.update(credential_issue=True, stop_reason=reason, end_ms=observation["start_ms"])
-        run.mark_unfinished(target.name, ["gateway_policy"])
         run.finish_condition(target.name, "gateway_policy", reason=reason)
         return
     observation["identities_distinct"] = True
@@ -169,6 +174,8 @@ def summarize(settings, observation, records):
         return outcome("unavailable", "Gateway policy is not configured; declare identities, policy and offered work.")
     if not settings.supported:
         return outcome("unavailable", "Selected gateway capability is unsupported.")
+    if observation.get("execution_error"):
+        return outcome("unverified", observation["execution_error"])
     if observation.get("credential_issue"):
         return outcome("unverified", observation["stop_reason"])
     cached = {record.id for record in records
@@ -213,7 +220,7 @@ def summarize(settings, observation, records):
     outputs = [record.completion_tokens for record in successes]
     summary["comparable_actual_work"] = bool({record.identity for record in successes} == {user.identity for user in settings.users}
         and all(value is not None and value > 0 for value in inputs+outputs)
-        and all(record.reasoning_tokens is None or record.reasoning_tokens <= record.completion_tokens for record in successes)
+        and all(record.reasoning_tokens is None or record.reasoning_tokens < record.completion_tokens for record in successes)
         and len(set(inputs)) == 1 and max(outputs) <= 2*min(outputs))
     if not observation.get("isolated_run"):
         return outcome("unverified", "Policy qualification requires one target and only policy traffic, with no restart readiness probes.")
@@ -239,6 +246,8 @@ def summarize(settings, observation, records):
     summary["effective_window_seconds"] = windows[0]
     allowance = declared.rpm
     if settings.capability == "priority_rpm":
+        if not settings.named_reservations_confirmed:
+            return outcome("unverified", "Operator confirmation of distinct configured named reservations is required.")
         if settings.saturation_cache_seconds != 0:
             return outcome("unverified", "Cached saturation can differ between gateway nodes; this check requires zero cache delay.")
         evidence = [record.gateway_evidence for record in recognized]
@@ -285,26 +294,33 @@ def summarize(settings, observation, records):
                 return outcome("unverified", "Reported saturation contradicts earlier limiter evidence in the isolated window.")
             reported = rejection.gateway_evidence._reported_saturation
             model_tpm = rejection.gateway_evidence._model_tpm
-            # LiteLLM reports the greater of RPM and TPM saturation. If no
-            # integer token count produces the reading, it must reflect RPM.
-            if (rejection.gateway_evidence._model_tpm_unconfigured or model_tpm is not None
-                    and _least_reported_count(reported, model_tpm, 0, model_tpm) is None):
-                # A recognized priority rejection changes neither counter. Other
-                # failures may have been charged before the gateway replied.
-                possible = sum(record.id not in rejected_ids and (
-                    record.dispatch_ms is None or rejection.completed_ms is None
-                    or record.dispatch_ms <= rejection.completed_ms
-                ) for record in records)
-                minimum_count = ceil(minimum_saturation * settings.model_rpm / 100)
-                maximum_count = min(possible, floor(bounds[1] * settings.model_rpm / 100))
-                least_matching = _least_reported_count(reported, settings.model_rpm, minimum_count, maximum_count)
-                if least_matching is None:
+            # A recognized priority rejection changes neither counter. Other
+            # failures may have been charged before the gateway replied.
+            possible = [record for record in records if record.id not in rejected_ids
+                        and (record.dispatch_ms is None or rejection.completed_ms is None
+                             or record.dispatch_ms <= rejection.completed_ms)]
+            minimum_count = ceil(minimum_saturation * settings.model_rpm / 100)
+            maximum_count = min(len(possible), floor(bounds[1] * settings.model_rpm / 100))
+            least_matching_rpm = _least_reported_count(reported, settings.model_rpm, minimum_count, maximum_count)
+            # LiteLLM reports the greater of RPM and TPM saturation. Its
+            # token count starts at zero and is charged after a success. Count
+            # even possible later completions for a conservative upper bound.
+            charges = [record.gateway_evidence._tpm_charge_upper
+                       if record.status == "completed" and record.valid and record.gateway_evidence else None
+                       for record in possible]
+            bounded_tpm = model_tpm is not None and all(charge is not None for charge in charges)
+            token_max = min(sum(charges), model_tpm) if bounded_tpm else model_tpm
+            tpm_may_explain = (not rejection.gateway_evidence._model_tpm_unconfigured
+                               and (token_max is None or _least_reported_count(reported, model_tpm, 0, token_max) is not None))
+            if not tpm_may_explain:
+                if least_matching_rpm is None:
                     return outcome("unverified", "Reported saturation cannot match any possible model RPM count in the isolated window.")
-                if least_matching < crossing:
+                if least_matching_rpm < crossing:
                     return outcome("unverified", strict_evidence_missing)
-                minimum_rpm = least_matching
-                minimum_saturation = Fraction(least_matching * 100, settings.model_rpm)
-            elif minimum_saturation < threshold_percent and minimum_rpm < crossing:
+                minimum_rpm = least_matching_rpm
+                minimum_saturation = Fraction(least_matching_rpm * 100, settings.model_rpm)
+            elif minimum_rpm < crossing and (minimum_saturation < threshold_percent
+                    or not bounded_tpm and (least_matching_rpm is None or least_matching_rpm < crossing)):
                 return outcome("unverified", strict_evidence_missing)
             if rejection.completed_ms is not None:
                 earlier_readings.append((rejection.completed_ms, minimum_rpm, minimum_saturation))

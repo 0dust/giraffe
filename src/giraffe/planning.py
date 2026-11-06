@@ -17,6 +17,7 @@ from giraffe.fixtures import builtin_fixtures
 from giraffe.gateway_access import configured_probe_count as configured_access_probe_count
 from giraffe.gateway_attribution import (POLL_FRACTIONS, configured_probe_count,
                                          deferred_for_shared_targets, reader_preflight_bound)
+from giraffe.gateway_policy import deferred_for_shared_targets as defer_gateway_policy
 from giraffe.concurrent_load import prompt_overhead
 from giraffe.identities import gateway_identities_only
 from giraffe.logprob_workload import corpus_width, sample_count
@@ -116,6 +117,7 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
     shared_attribution = (not gateway_identities_only(selected)
                           and any(configured_probe_count(config, target) for target in config.targets))
     defer_attribution = deferred_for_shared_targets(config)
+    defer_policy = defer_gateway_policy(config)
     attribution_steps = {"gateway_attribution", "gateway_attribution_preflight", "gateway_attribution_settle"}
     requirements = required_concurrency(config)
     pool = min(requirements["peak"], config.concurrency) if config.concurrency else requirements["peak"]
@@ -790,10 +792,15 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
             row["estimate_source"] = "from your recent runs" if max(duration_runs[row["id"]].values()) > 1 else "from your last run"
 
     def phases(items):
-        if defer_attribution:
-            return ([item for item in items if item["id"] not in attribution_steps],
-                    [item for item in items if item["id"] in attribution_steps])
-        return (items,)
+        shared, policy, attribution = [], [], []
+        for item in items:
+            if defer_policy and item["id"] == "gateway_policy":
+                policy.append(item)
+            elif defer_attribution and item["id"] in attribution_steps:
+                attribution.append(item)
+            else:
+                shared.append(item)
+        return shared, policy, attribution
 
     def combine_phase(items, key):
         totals = [sum(item.get(key, 0) for item in items if item["target"] == target.name) for target in config.targets]

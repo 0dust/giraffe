@@ -78,6 +78,78 @@ def test_recovery_offer_counts_and_replay_use_half_open_windows(monkeypatch, loc
     run_virtual(monkeypatch, run())
 
 
+@pytest.mark.parametrize("case, fairness_status, check_status", [
+    ("equal", "pass", "pass"),
+    ("slow", "fail", "fail"),
+    ("unequal", "inconclusive", "inconclusive"),
+    ("partial", "inconclusive", "inconclusive"),
+    ("error", "inconclusive", "fail"),
+])
+def test_recovery_applies_selected_fairness_only_with_qualified_work(
+        monkeypatch, local_tokenizer, case, fairness_status, check_status):
+    from giraffe import multi_user, runner
+    from giraffe.models import RequestSpec
+    from tests.test_review26_phase4_accuracy import run_virtual
+    from tests.test_runner import FakeClient
+
+    async def calibrate(*args, **kwargs):
+        return {"status": "calibrated"}
+
+    def build(run, settings, point, profile, calibration, **kwargs):
+        tokens = PROFILE[profile.split("_")[0]]["input_tokens"]
+        return RequestSpec(fixture_id="short", scenario=point["id"], check_ids=["multi_user"],
+            messages=[{"role": "user", "content": "x" * (tokens * 4)}], input_chars=tokens * 4,
+            requested_input_tokens=tokens, requested_output_tokens=2, stream=True, max_tokens=2)
+
+    class Endpoint(FakeClient):
+        async def execute(self, spec, **kwargs):
+            request = await super().execute(spec, **kwargs)
+            if spec.workload["role"] == "sustained" and spec.workload["user_id"] == "user-02":
+                if case == "slow" and spec.workload["work_sequence"] > 1:
+                    await asyncio.sleep(.85)
+                    request.elapsed_ms += 850
+                elif case == "error":
+                    request.status, request.valid = "failed", False
+            return request
+
+    async def run():
+        cfg = settings(levels=[2], scenarios=["arrivals", "recovery"] if case == "slow" else ["recovery"],
+            profile=PROFILE, shapes=["short_short", "medium_short"] if case == "unequal" else ["short_short"],
+            duration_seconds=1, arrivals={"requests_per_second": 2}, recovery={
+                "control_seconds": 1, "sustained_seconds": 1, "lighter_seconds": 1,
+                "lighter_requests_per_second": 2, "sustained_requests_per_second": 4, "max_slowdown": 2,
+            }, pass_criteria={"max_throughput_ratio": 1.5}).model_copy(
+                update={"max_requests": 7 if case in {"partial", "error"} else None})
+        target = cfg.targets[0]
+        state = runner._Run(cfg, None, None)
+        await multi_user.execute(state, target, Endpoint(target, cfg))
+        check = multi_user.result(state, target)
+        windows = {window["role"]: window for window in check.metrics["multi_user"]["windows"]}
+        fairness = windows["sustained"]["fairness"]
+        assert fairness["acceptance_applies"] is True
+        assert fairness["status"] == fairness_status, fairness["reasons"]
+        assert check.status == check_status, windows["sustained"]["users"]
+        if case == "equal":
+            assert [window["fairness"]["status"] for window in windows.values()] == ["pass"] * 3
+        elif case == "slow":
+            assert windows["arrivals"]["status"] == "pass"
+            assert windows["sustained"]["status"] == "fail"
+            assert all(user["status"] == "pass" for user in windows["sustained"]["users"])
+            assert fairness["ratio"] == 2.5
+            assert "Observed delivery fairness failed. Recovery sustained phase." in check.summary
+        elif case == "unequal":
+            assert any("assigned profiles differ" in reason for reason in fairness["reasons"])
+        else:
+            assert windows["sustained"]["cut_short"]
+            assert any("configured user offer schedule" in reason for reason in fairness["reasons"])
+            if case == "error":
+                assert any(user["status"] == "fail" for user in windows["sustained"]["users"])
+
+    monkeypatch.setattr(multi_user, "calibrate", calibrate)
+    monkeypatch.setattr(multi_user, "build_spec", build)
+    run_virtual(monkeypatch, run())
+
+
 def test_recovery_exposes_one_slow_user_when_median_recovers():
     source, records = recovery_observation()
     result = summarize(source, records)

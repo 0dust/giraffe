@@ -26,7 +26,7 @@ from .caps import (MAX_HTML_PREVIEW_CHARS, MAX_HTML_JSON_PREVIEW_CHARS,
                    MAX_FAILURE_SUMMARY_CHARS)
 from .deployment import deployment_diff, fixture_hash, safe_config, sanitize
 from .report_inputs import input_ref as _input_ref
-from .multi_user_metrics import (_length_mix_differs, _total_generated_tokens, _uncached_input_tokens, truncated_conversation_turn,
+from .multi_user_metrics import (_length_mix_differs, _total_generated_tokens, _uncached_input_tokens, fairness_applies, truncated_conversation_turn,
                                  user_delivery_completions, user_latency)
 from .models import (CHECK_NAMES, CORE_CHECKS, SHAPES, SHARED_BASELINE_EXCLUDED_WORKLOADS, CheckResult, GatewayAccess,
                      GatewayAttribution, GatewayEvidence, GatewayPolicy, RequestRecord, RunConfig, RunReport,
@@ -197,7 +197,8 @@ _COMPANION_REVISIONS = _CONVERSATION_REVISIONS | {
     "gateway_attribution", "gateway_conversations", "gateway_shared_first", "gateway_shared_targets_first",
     "gateway_policy", "policy_conversations", "policy_shared_first", "policy_shared_targets_first",
     "gateway_access", "gateway_access_policy", "access_conversations", "access_shared_first", "access_shared_targets_first",
-    "policy_after_shared_workloads", "access_after_shared_workloads",
+    "policy_after_shared_workloads", "policy_after_all_shared_targets", "access_after_shared_workloads",
+    "access_deferred_policy",
 }
 _CONVERSATION_BRIDGE_CHECKS = {"prefix", "sessions", "consistency"}
 _CONVERSATION_LOAD_SOURCE = "9b694c97a39d449d8ea15b09a9aeb406bf835179c0882827685c4d7888687d36"
@@ -282,7 +283,9 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str, include_load
             "policy_shared_targets_first": "d72acf540fbf8fbd8c45d3ab76d6041054209bb45913c681df171525f8ddc158",
             "access_shared_targets_first": "16c362d1f79e5dd0b3f0601e0100ec9b19d7a512f5cee081af72594a683bf49f",
             "access_after_shared_workloads": "2d8a82427a1c241c95e2719c8ab307513d970ba7f14c80db77201d85c35a0897",
+            "access_deferred_policy": "13a3e111a4f8985fa4dd8f763a093ade7ec118a6272e875b5f8abe0e1f104d94",
             "policy_after_shared_workloads": "49dcdfb6b173a93720e4e9e5a9bc54ffcea7580346d2ea0210e600e0779a03e6",
+            "policy_after_all_shared_targets": "e4ddc7a7e8563f9ab3bba2fc42ad0232ee924c65f67d92dafd89c21025d202d0",
         }[revision] if any(settings.values()) else None,
         "settings": settings,
     }
@@ -306,7 +309,9 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str, include_load
             "policy_shared_targets_first": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
             "access_shared_targets_first": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
             "access_after_shared_workloads": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
+            "access_deferred_policy": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
             "policy_after_shared_workloads": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
+            "policy_after_all_shared_targets": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
         }[revision]
     if "concurrency" in resolved.checks:
         identity["concurrent_load_source_sha256"] = {
@@ -344,7 +349,9 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str, include_load
             "policy_shared_targets_first": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
             "access_shared_targets_first": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
             "access_after_shared_workloads": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
+            "access_deferred_policy": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
             "policy_after_shared_workloads": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
+            "policy_after_all_shared_targets": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
         }[revision]
     if "tools" in resolved.checks:
         from .tool_checks import resolved_tool_fixtures, resolved_tool_modes
@@ -395,8 +402,9 @@ def _same_load_workload(current: dict, old: dict, *, fingerprint_key: str = "wor
     revisions = ("shared_conversations", "gateway_conversations",
                  "gateway_shared_first", "gateway_shared_targets_first",
                  "policy_conversations", "policy_shared_first", "policy_shared_targets_first",
-                 "policy_after_shared_workloads", "access_conversations", "access_shared_first",
-                 "access_shared_targets_first", "access_after_shared_workloads")
+                 "policy_after_shared_workloads", "policy_after_all_shared_targets",
+                 "access_conversations", "access_shared_first", "access_shared_targets_first",
+                 "access_after_shared_workloads", "access_deferred_policy")
     families = (
         # Explicit multi-user stages preserve ordinary Load dispatch.
         (_CONVERSATION_LOAD_SOURCE,
@@ -1647,7 +1655,9 @@ def _compare_user_fairness(current, previous, current_records, old_records):
     latest, old = current.get("fairness", {}), previous.get("fairness", {})
     limit = old.get("threshold")
     latest_status = latest.get("status")
-    if (any(window.get("role") and window.get("scenario") != "arrivals" for window in (current, previous))
+    recovery = current.get("scenario") == "recovery"
+    if (not all(fairness_applies(window) for window in (current, previous))
+            or (recovery and not all(item.get("acceptance_applies") is True for item in (latest, old)))
             or limit is None or latest.get("threshold") != limit
             or old.get("status") != "pass" or old.get("qualified") is not True
             or latest_status not in {"pass", "fail", "inconclusive"}):
@@ -1693,11 +1703,15 @@ def _compare_user_fairness(current, previous, current_records, old_records):
             evidence.extend(record.id for record in cohorts[0])
 
     scenario, population = current["scenario"], current["population"]
+    role = {"role": current["role"]} if recovery else {}
+    label = f"{scenario} / {population}"
+    if recovery:
+        label += f" / {current['role']}"
     status = latest_status if comparable else "inconclusive"
     reasons = {"pass": "Observed delivery fairness stayed within the previously accepted threshold.",
                "fail": "Observed delivery fairness exceeded the previously accepted threshold.",
                "inconclusive": "Observed fairness work or overlap differs or lacks evidence."}
-    return {"check": "multi_user", "scenario": f"{scenario} / {population}", "population": population,
+    return {"check": "multi_user", "scenario": label, "population": population, **role,
             "window_id": current["id"], "metric": "fairness_acceptance", "aggregation": "selected_criteria",
             "current": latest.get("ratio"), "baseline": old.get("ratio"), "threshold": limit,
             "current_samples": sum(item.get("valid_samples", 0) for item in latest.get("users", [])),

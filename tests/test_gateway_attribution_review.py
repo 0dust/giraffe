@@ -4,10 +4,12 @@ from datetime import datetime, timezone
 import gzip
 import hashlib
 import json
+from pathlib import Path
 import re
 import sys
 import time
 
+import certifi
 import httpx
 import pytest
 from pydantic import ValidationError
@@ -320,26 +322,25 @@ async def test_run_deadline_during_attribution_preflight_preserves_configured_pr
 
 @pytest.mark.parametrize("preflight", [False, True])
 async def test_stop_while_building_spend_reader_sends_no_get(monkeypatch, local_tokenizer, preflight):
-    from giraffe import gateway_attribution
-
     stop = asyncio.Event()
-    loop = asyncio.get_running_loop()
-    original = gateway_attribution._reader_tls
-
-    def load_tls(cfg):
-        verify = original(cfg)
-        loop.call_soon_threadsafe(stop.set)
-        return verify
 
     async def observer(request, rows):
         return spend_page(request, rows)
 
     cfg, _, reads = setup(monkeypatch, observer)
+    original = httpx.AsyncClient
+
+    def build_client(**kwargs):
+        client = original(**kwargs)
+        if httpx.Headers(kwargs.get("headers")).get("authorization") == "Bearer secret-OBSERVER":
+            stop.set()
+        return client
+
+    monkeypatch.setattr(httpx, "AsyncClient", build_client)
     if preflight:
         cfg.checks = ["access", "gateway_attribution"]
         cfg.max_requests = 1
     cfg.gateway_attribution.settle_seconds = .5
-    monkeypatch.setattr(gateway_attribution, "_reader_tls", load_tls)
 
     report = await run_suite(cfg, stop_event=stop)
     check = next(item for item in report.checks if item.id == "gateway_attribution")
@@ -351,29 +352,26 @@ async def test_stop_while_building_spend_reader_sends_no_get(monkeypatch, local_
     assert len(report.requests) == (1 if preflight else 2)
 
 
-async def test_collection_bounds_reader_setup_by_settle_window(monkeypatch, local_tokenizer):
-    from giraffe import gateway_attribution
+async def test_collection_reuses_loaded_tls_after_ca_file_disappears(monkeypatch, local_tokenizer, tmp_path):
+    ca_bundle = tmp_path / "ca.pem"
+    ca_bundle.write_bytes(Path(certifi.where()).read_bytes())
 
-    def load_tls(cfg):
-        # Slower than the full settle window. No HTTP client has been allocated.
-        time.sleep(.6)
-        return True
+    async def before_marked(key):
+        if key == "secret-BOB":
+            ca_bundle.unlink()
 
     async def observer(request, rows):
         return spend_page(request, rows)
 
-    cfg, _, reads = setup(monkeypatch, observer)
-    cfg.gateway_attribution.settle_seconds = .05
-    monkeypatch.setattr(gateway_attribution, "_reader_tls", load_tls)
+    cfg, _, reads = setup(monkeypatch, observer, before_marked=before_marked)
+    cfg.ca_bundle = str(ca_bundle)
+    immediate_spend_polls(monkeypatch, cfg)
 
-    started = time.monotonic()
     report = await run_suite(cfg)
-    assert time.monotonic() - started < .6
     check = next(item for item in report.checks if item.id == "gateway_attribution")
-    assert report.abort_reason is None and not reads
+    assert report.abort_reason is None and len(reads) == 3
     assert len(report.requests) == 2 and all(record.valid for record in report.requests)
-    assert check.metrics["state"] == "unverified" and not check.metrics["collection_complete"]
-    assert check.metrics["collection_attempts"] == 0 and "bounded window" in check.finding_summary
+    assert check.metrics["state"] == "verified" and check.metrics["collection_complete"]
 
 
 @pytest.mark.parametrize("duration,delay,reason", [(.5, .55, "time_limited"), (10, .12, "budget_limited")])
@@ -747,11 +745,14 @@ async def test_marked_requests_do_not_inherit_shared_logprobs(monkeypatch, local
 async def test_attribution_does_not_reserve_requests_from_recovery(monkeypatch, local_tokenizer):
     from tests.test_runner import FakeClient
 
+    class RecoveryClient(FakeClient):
+        tls_context = httpx.create_ssl_context()
+
     async def observer(request, rows):
         return httpx.Response(404)
 
     cfg, _, reads = setup(monkeypatch, observer)
-    monkeypatch.setattr("giraffe.runner.LLMClient", FakeClient)
+    monkeypatch.setattr("giraffe.runner.LLMClient", RecoveryClient)
     cfg.checks = ["recovery", "gateway_attribution"]
     cfg.concurrency = 1
     cfg.samples = 2
@@ -1416,7 +1417,7 @@ async def test_attribution_changes_do_not_veto_shared_baseline_evidence(monkeypa
     current = await run_variant(True)
     assert baseline.overall == current.overall == "pass"
     if change == "legacy_collection":
-        next(check for check in baseline.checks if check.id == "gateway_attribution").metrics["collection_version"] = 4
+        next(check for check in baseline.checks if check.id == "gateway_attribution").metrics["collection_version"] = 5
     target = compare_baseline(current, baseline).baseline["targets"][0]
     assert not target["reasons"]
     assert any(row["check"] == "serving" and row["metric"] == "valid_completion_rate"

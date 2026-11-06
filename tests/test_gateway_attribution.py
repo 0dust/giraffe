@@ -432,7 +432,8 @@ async def test_observer_transport_echo_is_suppressed_but_shared_logs_remain(monk
         async with httpx.AsyncClient() as client:
             await client.get(url + "/shared")
     try:
-        await asyncio.gather(execute(run, cfg.targets[0], None), shared())
+        async with LLMClient(cfg.targets[0], cfg) as client:
+            await asyncio.gather(execute(run, cfg.targets[0], client), shared())
     finally:
         server.close()
         await server.wait_closed()

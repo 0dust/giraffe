@@ -512,7 +512,7 @@ async def tools(run, target, client):
                     run.finish_condition(target.name, scenario, request.workload, reason=reason)
 
 
-async def execute(run, target, client, fixtures, *, defer_attribution=False):
+async def execute(run, target, client, fixtures, *, defer_attribution=False, defer_policy=False):
     from giraffe.load_test import execute as load_test
     from giraffe.multi_user import execute as multi_user
     from giraffe.gateway_access import execute as gateway_access
@@ -529,12 +529,13 @@ async def execute(run, target, client, fixtures, *, defer_attribution=False):
         ("gateway_policy", gateway_policy),
         ("gateway_attribution", gateway_attribution),
     ):
-        if defer_attribution and field == "gateway_attribution":
+        if (defer_attribution and field == "gateway_attribution") or (defer_policy and field == "gateway_policy"):
             continue
         selected = WORKLOAD_CHECKS[field].intersection(run.config.checks)
         if selected and (getattr(run.config, field) or field in {"gateway_access", "gateway_attribution"}):
             run.emit("scenario_started", target.name, field)
-            if field not in {"load_test", "multi_user", "gateway_access", "gateway_attribution"} and not run.allowed(target.name):
+            if field not in {"load_test", "multi_user", "gateway_access", "gateway_attribution",
+                             "gateway_policy"} and not run.allowed(target.name):
                 run.unfinished[target.name].update(selected)
                 continue
             if field in {"arrivals", "consistency"}:

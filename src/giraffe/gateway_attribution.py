@@ -5,7 +5,6 @@ import asyncio
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-import ssl
 import time
 import uuid
 
@@ -18,7 +17,7 @@ from .models import CheckResult, RequestSpec
 
 
 CHECK = "gateway_attribution"
-COLLECTION_VERSION = 5
+COLLECTION_VERSION = 6
 MAX_BODY_BYTES = 4 * 1024 * 1024
 MAX_PAGES = 8
 PAGE_SIZE = 128
@@ -148,27 +147,16 @@ def _assess(records, matched, planned, *, complete, unstable=False):
     return totals
 
 
-def _reader_tls(config):
-    return (ssl.create_default_context(cafile=config.ca_bundle) if config.ca_bundle else
-            httpx.create_ssl_context(verify=True, trust_env=True))
-
-
 def _reader_interrupted(stop, deadline):
     return stop.is_set() or time.monotonic() >= deadline
 
 
 @asynccontextmanager
-async def _reader(config, headers, timeout, *, stop, deadline):
-    # Only certificate loading needs a worker. If setup times out, there is
-    # no HTTP client in the worker that would need to be closed afterward.
+async def _reader(config, headers, timeout, *, verify, stop, deadline):
     if _reader_interrupted(stop, deadline):
         yield None
         return
-    async with asyncio.timeout_at(deadline):
-        verify = await asyncio.to_thread(_reader_tls, config)
-    if _reader_interrupted(stop, deadline):
-        yield None
-        return
+    # Share loaded trust material only. The reader has its own auth and pool.
     async with httpx.AsyncClient(headers=headers, verify=verify, proxy=config.proxy,
                                  timeout=timeout, follow_redirects=False) as reader:
         yield reader
@@ -190,7 +178,7 @@ async def _spend_page(client, url, marker, start_date, end_date, page, page_size
         await response.aclose()
 
 
-async def _reader_preflight(run, target, headers, bound):
+async def _reader_preflight(run, target, headers, bound, verify):
     """Check the evidence endpoint without admitting an inference request."""
     gateway = target.gateway
     now = time.monotonic()
@@ -208,7 +196,7 @@ async def _reader_preflight(run, target, headers, bound):
         end_date = (current + timedelta(seconds=1)).strftime("%Y-%m-%d %H:%M:%S")
         with identity_scope(True):
             async with asyncio.timeout_at(deadline):
-                async with _reader(run.config, headers, timeout, stop=run.stop, deadline=deadline) as reader:
+                async with _reader(run.config, headers, timeout, verify=verify, stop=run.stop, deadline=deadline) as reader:
                     if reader is None or run.stop_reason(target.name) not in {None, "maximum request budget reached"}:
                         return None
                     async with _spend_page(reader, gateway.url, marker, start_date, end_date, 1, 1,
@@ -300,6 +288,7 @@ async def execute(run, target, client, *, deferred=False):
     except ValueError:
         observation.update(reason="Gateway reader or selected identity credentials are unavailable.")
         return
+    verify = client.tls_context
     planned = settings.samples * len(settings.identities)
     reader_status = None
     if preflight_bound := reader_preflight_bound(run.config, deferred=deferred):
@@ -314,7 +303,7 @@ async def execute(run, target, client, *, deferred=False):
                 observation.update(reason="The user stopped the run during the gateway spend-log reader preflight.")
 
         try:
-            reader_status = await _reader_preflight(run, target, headers, preflight_bound)
+            reader_status = await _reader_preflight(run, target, headers, preflight_bound, verify)
         except asyncio.CancelledError:
             report_preflight_stop(run.stop_reason(target.name))
             raise
@@ -407,7 +396,7 @@ async def execute(run, target, client, *, deferred=False):
     try:
         with identity_scope(True):
             remaining = max(.001, min(run.config.metrics_timeout_seconds, deadline - time.monotonic()))
-            async with _reader(run.config, headers, remaining, stop=run.stop, deadline=deadline) as reader:
+            async with _reader(run.config, headers, remaining, verify=verify, stop=run.stop, deadline=deadline) as reader:
                 for fraction in POLL_FRACTIONS:
                     if reader is None:
                         break
