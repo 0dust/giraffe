@@ -395,6 +395,21 @@ def _cancellation(window, records, criteria, health, lag, timing_threshold, dela
             "peer_continuation": peers, "followup": followup, "backend_release": "unverified"}
 
 
+def _comparable_tokens(a, b, tolerance):
+    return a is not None and b is not None and max(a, b) <= min(a, b) * (1 + tolerance)
+
+
+def _comparable_uncached_input(control, probe, tolerance):
+    a, b = control.cached_prompt_tokens, probe.cached_prompt_tokens
+    if a is None or b is None:
+        # An unreported count can coexist with no observed cache reuse, but
+        # cannot establish equivalence to a request with known cached input.
+        return not (a or b)
+    if not (0 <= a <= control.input_tokens and 0 <= b <= probe.input_tokens):
+        return False
+    return _comparable_tokens(control.input_tokens - a, probe.input_tokens - b, tolerance)
+
+
 def _interference(observation, window, control, user_records, criteria, health, lag, timing_threshold, delays):
     """Compare the same logical short work, retaining the exposure that exercised it."""
     settings = observation.get("settings", {})
@@ -424,7 +439,7 @@ def _interference(observation, window, control, user_records, criteria, health, 
         controls = {r.workload.get("matched_work_sequence"): r
                     for r in user_records.get((control["id"], uid), [])} if control else {}
         probes = user_records.get((window["id"], uid), [])
-        pairs, exposed = [], set()
+        pairs, exposed, excluded = [], set(), set()
         for probe in probes:
             baseline = controls.get(probe.workload.get("matched_work_sequence"))
             if not baseline or not _valid(baseline) or not _valid(probe):
@@ -436,6 +451,14 @@ def _interference(observation, window, control, user_records, criteria, health, 
                 continue
             if any(r.completed_ms is None or phase.get("end_ms") is None or r.completed_ms > phase["end_ms"]
                    for r, phase in ((baseline, control), (probe, window))):
+                continue
+            if not all(_comparable_tokens(a, b, tolerance) for a, b in
+                       ((baseline.input_tokens, probe.input_tokens),
+                        (baseline.output_tokens, probe.output_tokens))):
+                excluded.add("Actual matched short-user token lengths are missing or not comparable.")
+                continue
+            if not _comparable_uncached_input(baseline, probe, tolerance):
+                excluded.add("Actual matched short-user uncached input is not comparable.")
                 continue
             matches = []
             for competitor in heavy:
@@ -457,8 +480,13 @@ def _interference(observation, window, control, user_records, criteria, health, 
                 else:
                     heavy_span = answer_window(competitor) if competitor.answer_reads >= 2 and competitor.answer_chunks >= 2 else None
                 overlap_span = span if window["heavy_profile"].endswith("_long") else short_span
-                if _overlap(overlap_span, heavy_span, delays):
-                    matches.append(competitor)
+                if not _overlap(overlap_span, heavy_span, delays):
+                    continue
+                if (window["heavy_profile"].startswith("long_") and competitor.input_tokens
+                        and (competitor.cached_prompt_tokens or 0) > competitor.input_tokens / 2):
+                    excluded.add("More than half the long competitor input was cached.")
+                    continue
+                matches.append(competitor)
             if matches:
                 pairs.append((baseline, probe))
                 exposed.update(r.id for r in matches)
@@ -466,8 +494,10 @@ def _interference(observation, window, control, user_records, criteria, health, 
         competitors = [r for r in heavy if r.id in exposed]
         if len(pairs) < criteria.min_samples:
             notes.append(f"Only {len(pairs)} matched samples with the selected trigger and heavy overlap; {criteria.min_samples} required.")
+            notes.extend(sorted(excluded))
         if {r.workload.get("user_id") for r in competitors} != set(window["heavy_user_ids"]):
             notes.append("Not every selected heavy user has qualified overlap.")
+            notes.extend(sorted(excluded))
         values = {}
         for label, rows, shape in (("control", before, "short_short"), ("probe", after, "short_short"),
                                    ("heavy", competitors, window["heavy_profile"])):
@@ -487,10 +517,6 @@ def _interference(observation, window, control, user_records, criteria, health, 
             if qualify(rows, health, timing_threshold, ("latency_ms", "first_output_ms", "max_stream_gap_ms"),
                        legacy_max_lag_ms=lag)["status"] != "qualified":
                 notes.append(f"Actual {label} timing is unqualified.")
-        for suffix in ("input_median_tokens", "output_median_tokens"):
-            a, b = values["control_"+suffix], values["probe_"+suffix]
-            if a is None or b is None or max(a, b) > min(a, b)*(1+tolerance):
-                notes.append("Actual short-user token lengths are not comparable.")
         control_user = next((u for u in (control or {}).get("users", []) if u["user_id"] == uid), {})
         bounds = [(phase.get("start_ms"), phase.get("end_ms"), u.get("activated_ms"))
                   for phase, u in ((control or {}, control_user), (window, user))]
