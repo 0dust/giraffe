@@ -1428,7 +1428,6 @@ def request_plan(config: RunConfig | ConfigDraft, *,
             probes = sum(_target_count(row, target.name) or 0 for row in gateway_rows)
             if not probes or (restart and not target.restart_command) or (gateway_only and not restart):
                 continue
-            shared_reserve = token_evidence_request_reserve(rows, target=target.name)
             initial_count = int(initial and not restart)
             shared_reserve = token_evidence_request_reserve(rows, target=target.name)
             compatibility_floor = max(initial_count + 1, shared_reserve)
