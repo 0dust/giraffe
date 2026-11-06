@@ -298,6 +298,95 @@ def test_recovery_baseline_qualifies_tokens_by_matched_work(monkeypatch, local_t
     assert len(delivery) == 6 and all(row["status"] == "pass" and row["current"] == row["baseline"] for row in delivery)
 
 
+@pytest.mark.parametrize("case", ["control_drain", "lighter_drain", "swapped_sustained_work"])
+def test_recovery_compares_admitted_work_that_completes_during_drain(monkeypatch, local_tokenizer, tmp_path, case):
+    import json
+
+    from giraffe import runner
+    from giraffe.models import RunReport
+    from giraffe.reporting import compare_baseline
+    from tests.test_review26_phase4_accuracy import run_virtual
+    from tests.test_runner import FakeClient
+
+    fixtures = tmp_path / "fixtures.json"
+    fixtures.write_text(json.dumps([
+        {"fixture_id": "fixture-a", "scorer": "none", "max_tokens": 20,
+         "messages": [{"role": "user", "content": "x" * 256}]}
+    ]))
+    work_swap = case == "swapped_sustained_work"
+    duration, lighter_rate, sustained_rate = (1, 2, 4) if work_swap else (2, 5, 10)
+    cfg = settings(levels=[3], scenarios=["recovery"], profile=PROFILE, recovery={
+        "control_seconds": duration, "sustained_seconds": duration, "lighter_seconds": duration,
+        "lighter_requests_per_second": lighter_rate, "sustained_requests_per_second": sustained_rate,
+        "max_slowdown": 2,
+    }, pass_criteria={"min_samples": 2}).model_copy(update={"concurrency": 8, "custom_fixtures": str(fixtures)})
+
+    class Endpoint(FakeClient):
+        delay = .02
+        changed = False
+
+        async def execute(self, spec, **kwargs):
+            record = await super().execute(spec, **kwargs)
+            if spec.workload.get("scenario") != "recovery":
+                return record
+            role = spec.workload["role"]
+            extra = 0
+            if work_swap:
+                long_answer = (spec.workload["matched_work_sequence"] == 1) != self.changed
+                record.output_tokens = record.completion_tokens = 20 if long_answer else 2
+                if role == "sustained":
+                    extra = .28
+            elif self.changed and spec.workload["user_id"] == "user-03" and case == f"{role}_drain":
+                extra = .22 if role == "lighter" else .20 if spec.workload["matched_work_sequence"] == 10 else 0
+            if extra:
+                await asyncio.sleep(extra)
+                record.elapsed_ms += extra * 1000
+                record.stream_end_ms = record.elapsed_ms
+                record.last_output_ms = record.elapsed_ms - 1
+                record.max_stream_gap_ms = record.last_output_ms - record.first_output_ms
+            return record
+
+    async def run():
+        previous = await runner.run_suite(cfg)
+        Endpoint.changed = True
+        current = await runner.run_suite(cfg)
+        return (RunReport.model_validate_json(report.model_dump_json()) for report in (current, previous))
+
+    monkeypatch.setattr(runner, "LLMClient", Endpoint)
+    current, previous = run_virtual(monkeypatch, run())
+    assert previous.overall == "pass"
+    windows = next(check for check in current.checks if check.id == "multi_user").metrics["multi_user"]["windows"]
+    comparison = compare_baseline(current, previous).baseline
+    rows = comparison["targets"][0]["comparisons"]
+    if work_swap:
+        assert current.overall == "pass"
+        delivery = next(row for row in rows if row["metric"] == "shared_window_output_tokens_per_second"
+                        and row["role"] == "sustained" and row["user_id"] == "user-01")
+        assert (delivery["current"], delivery["baseline"]) == (24, 42)
+        assert delivery["current_samples"] == delivery["baseline_samples"] == 3
+        assert delivery["status"] == comparison["status"] == "inconclusive"
+        assert "Matched recovery work including drained requests" in delivery["reason"]
+        return
+
+    slow_lighter = case == "lighter_drain"
+    window = windows[-1] if slow_lighter else windows[0]
+    user_id = "user-03"
+    delivery_user = next(user for user in window["users"] if user["user_id"] == user_id)
+    assert delivery_user["late_completed"] == 1 and delivery_user["outcomes"]["valid_completed"] == 10
+    user = next(user for user in windows[-1]["recovery"]["users"] if user["user_id"] == user_id)
+    assert user["matched_samples"] == 10
+    assert user["slowdown"] == pytest.approx(12 if slow_lighter else 1)
+    assert user["status"] == current.overall == ("fail" if slow_lighter else "pass")
+    if slow_lighter:
+        acceptance = next(row for row in rows if row["metric"] == "scenario_acceptance" and row["user_id"] == user_id)
+        assert acceptance["status"] == "fail"
+        assert acceptance["current_samples"] == acceptance["baseline_samples"] == 10
+        assert set(user["lighter_request_ids"]) <= set(acceptance["evidence_ids"])
+    delivery = next(row for row in rows if row["metric"] == "shared_window_output_tokens_per_second"
+                    and row["role"] == window["role"] and row["user_id"] == user_id)
+    assert (delivery["current_samples"], delivery["baseline_samples"]) == (9, 10)
+
+
 @pytest.mark.parametrize("drift_phase", ["lighter", "sustained"])
 def test_recovery_qualifies_total_generation_separately_from_visible_output(drift_phase):
     source, records = recovery_observation()
