@@ -193,6 +193,20 @@ def _token_count(value: Any) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
 
 
+def _gateway_usage_total(usage: dict[str, Any]) -> int | None:
+    if "total_tokens" not in usage:
+        return None
+    total = _token_count(usage["total_tokens"])
+    if total is None:
+        raise _ProtocolError("invalid total usage in gateway response")
+    return total
+
+
+def _check_gateway_usage_total(prompt: int | None, completion: int | None, total: int | None) -> None:
+    if total is not None and prompt is not None and completion is not None and total != prompt + completion:
+        raise _ProtocolError("inconsistent total usage in gateway response")
+
+
 def _rejected_evidence_field(body: bytes) -> str | None:
     """Retain a known field name only, never arbitrary endpoint error content."""
     try:
@@ -494,7 +508,7 @@ class LLMClient:
                     payload["logprobs"] = True
                     payload.setdefault("top_logprobs", 0)
         record.workload = dict(spec.workload)
-        if not probing and not attribution and self._evidence_probe_attempts:
+        if not probing and not attribution and (stream or self._evidence_probe_attempts):
             record.workload["token_evidence"] = dict(self.token_evidence)
             evidence = record.workload["token_evidence"]
             evidence["requested_logprobs"] = payload.get("logprobs") is True
@@ -874,7 +888,7 @@ class LLMClient:
                             _object(await _limited_body(response, on_body=body_received))
                             raise _ProtocolError("endpoint returned JSON instead of an SSE stream")
                         chunk_limit = spec.cancel_after_chunks
-                        terminal_usage = (None, None)
+                        terminal_usage = (None, None, None)
                         events = _sse_events(response, on_read=stream_body_received,
                                              mark_read_end=chunk_limit is not None)
                         async for event_type, event, observed_at in events:
@@ -895,15 +909,17 @@ class LLMClient:
                                 break
                             data = _object(event, strict_gateway_json=True) if attribution else _object(event)
                             receive(data, streaming=True, observed_at=observed_at)
-                            if attribution and record.finish_reason is not None and isinstance(data.get("usage"), dict):
-                                counts = (record.input_tokens, record.completion_tokens)
+                            usage = data.get("usage")
+                            if attribution and record.finish_reason is not None and isinstance(usage, dict):
+                                counts = (record.input_tokens, record.completion_tokens, _gateway_usage_total(usage))
                                 if any(previous is not None and current is not None and previous != current
                                        for previous, current in zip(terminal_usage, counts)):
                                     record._gateway_terminal_usage = False
                                     raise _ProtocolError("conflicting terminal usage in gateway response")
-                                terminal_usage = (counts[0] if counts[0] is not None else terminal_usage[0],
-                                                  counts[1] if counts[1] is not None else terminal_usage[1])
-                                record._gateway_terminal_usage = None not in counts
+                                terminal_usage = tuple(current if current is not None else previous
+                                                       for previous, current in zip(terminal_usage, counts))
+                                _check_gateway_usage_total(*terminal_usage)
+                                record._gateway_terminal_usage = None not in counts[:2]
                         if not record.stream_terminated:
                             raise _ProtocolError("SSE stream ended without [DONE]")
                     else:
@@ -914,6 +930,9 @@ class LLMClient:
                         data = (_object(body, strict_gateway_json=True)
                                 if attribution or policy_probe else _object(body))
                         receive(data, streaming=False, observed_at=observed_at)
+                        usage = data.get("usage")
+                        if attribution and isinstance(usage, dict):
+                            _check_gateway_usage_total(record.input_tokens, record.completion_tokens, _gateway_usage_total(usage))
                         record.stream_terminated = True
                     if record.finish_reason is None:
                         raise _ProtocolError("response ended without a completion finish reason")
