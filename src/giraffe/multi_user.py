@@ -526,7 +526,7 @@ async def run_arrival_window(run, target, client, settings, load_settings, calib
         duration_seconds=evidence.sending_seconds, drain_seconds=max(0, evidence.observation_seconds-evidence.sending_seconds),
         cut_short=evidence.interrupted, reason="; ".join(evidence.reasons) or None,
         drain_reason="Drain interrupted" if evidence.drain_expired else None,
-        offer_accounting=_offer_counts(offers), peak_in_flight=evidence.peak,
+        offer_accounting=_offer_counts(offers), peak_in_flight=run.peak.get((target.name, window["id"]), 0),
         planned_requests_per_second=len(offers)/window["planned_duration_seconds"],
         dispatched_requests_per_second=sum(o["dispatched"] for o in offers)/evidence.sending_seconds
             if evidence.sending_seconds else None,
