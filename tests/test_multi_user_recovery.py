@@ -89,7 +89,8 @@ def test_recovery_allows_extra_replays_of_matched_sustained_work():
 
 
 @pytest.mark.parametrize("swap_work", [False, True])
-def test_recovery_baseline_qualifies_tokens_by_matched_work(monkeypatch, local_tokenizer, tmp_path, swap_work):
+@pytest.mark.parametrize(("slower", "limit"), [(True, 2), (False, 2), (False, None)])
+def test_recovery_baseline_qualifies_tokens_by_matched_work(monkeypatch, local_tokenizer, tmp_path, swap_work, slower, limit):
     import json
 
     from giraffe import runner
@@ -105,7 +106,7 @@ def test_recovery_baseline_qualifies_tokens_by_matched_work(monkeypatch, local_t
     ]))
     cfg = settings(levels=[2], scenarios=["recovery"], profile=PROFILE, recovery={
         "control_seconds": 1, "sustained_seconds": 1, "lighter_seconds": 1,
-        "lighter_requests_per_second": 4, "sustained_requests_per_second": 8, "max_slowdown": 2,
+        "lighter_requests_per_second": 4, "sustained_requests_per_second": 8, "max_slowdown": limit,
     }).model_copy(update={"custom_fixtures": str(fixtures)})
 
     class Observed(FakeClient):
@@ -118,7 +119,7 @@ def test_recovery_baseline_qualifies_tokens_by_matched_work(monkeypatch, local_t
                 first_fixture = spec.fixture_id == "fixture-a"
                 record.output_tokens = 2 if first_fixture != (swap_work and self.changed) else 14
                 record.completion_tokens = record.output_tokens
-                if (spec.workload.get("role") == "lighter" and first_fixture
+                if (slower and spec.workload.get("role") == "lighter" and first_fixture
                         and (record.output_tokens == 14 if swap_work else self.changed)):
                     await asyncio.sleep(.06)
                     record.elapsed_ms += 60
@@ -131,7 +132,9 @@ def test_recovery_baseline_qualifies_tokens_by_matched_work(monkeypatch, local_t
 
     monkeypatch.setattr(runner, "LLMClient", Observed)
     current, baseline = run_virtual(monkeypatch, replay())
-    for report, slowdown, status in ((baseline, 1, "pass"), (current, 2.5, "fail")):
+    baseline_status = "measured" if limit is None else "pass"
+    current_status = "fail" if slower else baseline_status
+    for report, slowdown, status in ((baseline, 1, baseline_status), (current, 2.5 if slower else 1, current_status)):
         check = next(check for check in report.checks if check.id == "multi_user")
         users = check.metrics["multi_user"]["windows"][-1]["recovery"]["users"]
         assert len(users) == 2
@@ -143,10 +146,22 @@ def test_recovery_baseline_qualifies_tokens_by_matched_work(monkeypatch, local_t
     rows = comparison["targets"][0]["comparisons"]
     acceptance = [row for row in rows if row["metric"] == "scenario_acceptance"]
     delivery = [row for row in rows if row["metric"] == "shared_window_output_tokens_per_second"]
-    expected = "inconclusive" if swap_work else "fail"
-    assert len(acceptance) == 2 and {row["status"] for row in acceptance} == {expected}
-    assert len(delivery) == 6 and all(row["status"] == "pass" and row["current"] == row["baseline"] for row in delivery)
+    expected = "inconclusive" if swap_work else "fail" if slower else "pass"
     assert comparison["status"] == expected
+    if slower:
+        assert len(acceptance) == 2 and {row["status"] for row in acceptance} == {expected}
+    else:
+        assert not acceptance
+        observed = [row for row in rows if row["metric"] == "matched_recovery_slowdown"]
+        assert len(observed) == (2 if swap_work else 0)
+        for row in observed:
+            assert row["status"] == "inconclusive" and row["threshold"] is None
+            assert row["current"] == pytest.approx(row["baseline"])
+            assert row["current_samples"] == row["baseline_samples"] == 4
+            evidence = [r for r in current.requests if r.id in row["evidence_ids"]]
+            assert len(evidence) == 16 and {r.workload["user_id"] for r in evidence} == {row["user_id"]}
+            assert {r.workload["role"] for r in evidence} == {"control", "sustained", "lighter"}
+    assert len(delivery) == 6 and all(row["status"] == "pass" and row["current"] == row["baseline"] for row in delivery)
 
 
 @pytest.mark.parametrize("drift_phase", ["lighter", "sustained"])

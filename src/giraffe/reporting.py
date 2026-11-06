@@ -1383,8 +1383,11 @@ def _probe_has_overlap(evidence: dict, records: list[RequestRecord]) -> bool:
     return bool(records) and all(record.id in exposed for record in records)
 
 
+_RECOVERY_WORK_PHASES = ("control", "sustained", "lighter")
+
+
 def _recovery_work_changed(current, old, current_records, old_records, threshold):
-    for phase in ("control", "sustained", "lighter"):
+    for phase in _RECOVERY_WORK_PHASES:
         field = f"{phase}_request_ids"
         cohorts, matched = [], []
         for evidence, records in ((current, current_records), (old, old_records)):
@@ -1605,6 +1608,13 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold):
                 "baseline_samples": b_scenario.get("matched_samples", 0),
                 "reason": reason, "evidence_ids": interference_ids,
             })
+        recovery_reason = None
+        if (scenario == "recovery" and role == "lighter" and not scenario_reason
+                and b_scenario.get("status") in {"pass", "measured"}
+                and c_scenario.get("status") in {"pass", "fail", "measured"}
+                and _recovery_work_changed(c_scenario, b_scenario, current_records, old_records, threshold)):
+            recovery_reason = f"Multi-user {user_id} at {population} users: Matched work differs or lacks evidence across recovery runs."
+            incomplete.append(recovery_reason)
         if (not noisy_probe and c_scenario.get("status") == "fail" and b_scenario.get("status") == "pass"
                 and not scenario_reason and not any(_load_work_comparison(current_work, old_work))):
             acceptance = {**row, "metric": "scenario_acceptance", "status": "fail",
@@ -1616,12 +1626,19 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold):
                 old_evidence = _cancellation_evidence_ids(b_scenario, old_records)
                 acceptance.update(evidence_ids=current_evidence, current_samples=len(current_evidence),
                                   baseline_samples=len(old_evidence))
-            elif scenario == "recovery" and _recovery_work_changed(
-                    c_scenario, b_scenario, current_records, old_records, threshold):
-                reason = f"Multi-user {user_id} at {population} users: Matched work differs or lacks evidence across recovery runs."
-                incomplete.append(reason)
-                acceptance.update(status="inconclusive", worsening=None, reason=reason)
+            elif recovery_reason:
+                acceptance.update(status="inconclusive", worsening=None, reason=recovery_reason)
             rows.append(acceptance)
+        elif recovery_reason:
+            evidence_ids = list(dict.fromkeys(rid for phase in _RECOVERY_WORK_PHASES
+                for rid in c_scenario.get(f"{phase}_request_ids", []) if rid in current_records))
+            rows.append({**identity,
+                "metric": "matched_recovery_slowdown", "status": "inconclusive", "threshold": None,
+                "current": c_scenario.get("slowdown"), "baseline": b_scenario.get("slowdown"),
+                "current_samples": c_scenario.get("matched_samples", 0),
+                "baseline_samples": b_scenario.get("matched_samples", 0),
+                "reason": recovery_reason, "evidence_ids": evidence_ids,
+            })
         if c.get("status") == "fail" and b.get("status") == "pass":
             # Acceptance also includes attempts that drain after delivery closes.
             current_attempts = [record for record in current_work if not record.intentional]
