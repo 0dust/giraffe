@@ -278,6 +278,34 @@ def test_selected_fairness_baseline_tracks_threshold_crossings_with_comparable_w
         assert result.baseline["acceptance"]["current"] == ("fail" if new_overlap else "inconclusive")
 
 
+def test_fairness_baseline_rejects_median_token_drift_even_when_mixes_overlap():
+    current, previous = user_report(), user_report()
+    current.requests = [request for request in current.requests if request.id != "user-05-0"]
+    for report, lengths in ((previous, [100]*5 + [120]*2 + [200]), (current, [100]*3 + [120]*4 + [200])):
+        settings = report.manifest["config"]["multi_user"]
+        settings["pass_criteria"]["max_throughput_ratio"] = 1.1
+        for request in report.requests:
+            request.stream = True
+            request.answer_chunks = request.answer_reads = 3
+            request.last_output_ms = 90
+            request.input_tokens = lengths[int(request.id.rsplit("-", 1)[1])]
+        source = report.observations["targets"]["local"]["multi_user"]
+        source["settings"] = settings
+        if report is current:
+            source["windows"][0]["users"][-1]["dispatched_count"] = 7
+        summary = summarize(source, report.requests)
+        report.checks[0].metrics["multi_user"] = summary
+        report.checks[0].status = report.overall = summary["status"]
+        fairness = summary["windows"][0]["fairness"]
+        assert fairness["qualified"]
+        assert [sample["input_median_tokens"] for sample in fairness["users"]] == [lengths[3]] * 5
+
+    result = compare_baseline(current, previous)
+    row = next(row for row in result.baseline["targets"][0]["comparisons"] if row["metric"] == "fairness_acceptance")
+    assert row["status"] == result.baseline["status"] == "inconclusive"
+    assert result.baseline["acceptance"] == {"baseline": "pass", "current": "fail"}
+
+
 def live_user_report():
     report = user_report()
     window = report.checks[0].metrics["multi_user"]["windows"][0]
@@ -735,3 +763,44 @@ def test_new_interference_failure_survives_incomplete_peer_cancellation_baseline
     assert compared.baseline["status"] == "fail"
     assert any(row["metric"] == "scenario_acceptance" and row["status"] == "fail"
                for row in compared.baseline["targets"][0]["comparisons"])
+
+
+@pytest.mark.parametrize("qualified", [True, False])
+def test_failed_followup_baseline_is_scoped_to_selected_user_with_scenario_evidence(qualified):
+    current, baseline = scenario_report(), scenario_report()
+    for report in (current, baseline):
+        check = report.checks[0]
+        window = check.metrics["multi_user"]["windows"][-1]
+        check.metrics["multi_user"]["windows"] = [window]
+        evidence = window["cancellation"]
+        failed = report is current
+        evidence["status"] = evidence["followup"]["status"] = "fail" if failed else "pass"
+        if not failed or qualified:
+            evidence["peer_continuation"].update(status="pass", request_ids=["user-01-0"], reasons=[])
+        report.requests = [item for item in report.requests
+                           if item.workload["user_id"] != "user-02" or item.id in {"user-02-0", "user-02-1"}]
+        for item in report.requests:
+            item.workload.update(scenario="cancellation", role="cancellation", window_id=window["id"],
+                                 population=window["population"])
+            if item.id == "user-02-0":
+                item.status, item.valid, item.intentional = "cancelled", False, True
+            elif failed and item.id == "user-02-1":
+                item.status, item.valid = "failed", False
+        user = window["users"][1]
+        user.update(request_ids=["user-02-0", "user-02-1"], output_tokens_per_second=0 if failed else 10)
+        user["outcomes"]["attempted"] = 2
+        check.status = report.overall = "fail" if failed else "pass"
+
+    compared = compare_baseline(current, baseline).baseline
+    rows = compared["targets"][0]["comparisons"]
+    failures = [row for row in rows if row["metric"] == "scenario_acceptance"]
+    if qualified:
+        failure, = failures
+        assert failure["status"] == "fail" and failure["user_id"] == "user-02"
+        assert failure["evidence_ids"] == ["user-02-0", "user-01-0", "user-02-1"]
+        assert failure["current_samples"] == failure["baseline_samples"] == 3
+    else:
+        assert not failures
+    assert compared["acceptance"]["current"] == "fail"
+    assert any(row["user_id"] == "user-01" and row["metric"] == "shared_window_output_tokens_per_second"
+               and row["status"] == "pass" for row in rows)
