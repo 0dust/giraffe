@@ -48,6 +48,36 @@ def recovery_observation(*, duration=1, sustained_duration=None, lighter_rate=1,
     return source, records
 
 
+def test_recovery_offer_counts_and_replay_use_half_open_windows(monkeypatch, local_tokenizer):
+    from giraffe import runner
+    from giraffe.multi_user import execute
+    from tests.test_review26_phase4_accuracy import run_virtual
+    from tests.test_runner import FakeClient
+
+    async def run():
+        cfg = settings(levels=[2], scenarios=["recovery"], profile=PROFILE, recovery={
+            "control_seconds": 100, "sustained_seconds": 100, "lighter_seconds": 100,
+            "lighter_requests_per_second": .07, "sustained_requests_per_second": .14,
+        }).model_copy(update={"max_duration_seconds": 310})
+        expected = [14, 28, 14]
+        planned = _planned_observation(cfg.multi_user, include_offers=False)["windows"]
+        assert [window["scheduled_offers"] for window in planned] == expected
+
+        target = cfg.targets[0]
+        state = runner._Run(cfg, None, None)
+        await execute(state, target, FakeClient(target, cfg))
+        windows = state.observations[target.name]["multi_user"]["windows"]
+        assert [len(window["offers"]) for window in windows] == expected
+        assert [window["offer_accounting"]["dispatched"] for window in windows] == expected
+        assert {window["control_work_count"] for window in windows} == {7}
+        lighter = [record for record in state.records if record.workload["role"] == "lighter"
+                   and record.workload["user_id"] == "user-01"]
+        assert [record.workload["work_sequence"] for record in lighter] == list(range(15, 22))
+        assert [record.workload["matched_work_sequence"] for record in lighter] == list(range(1, 8))
+
+    run_virtual(monkeypatch, run())
+
+
 def test_recovery_exposes_one_slow_user_when_median_recovers():
     source, records = recovery_observation()
     result = summarize(source, records)
