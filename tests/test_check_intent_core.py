@@ -261,6 +261,26 @@ async def test_rate_limit_does_not_consume_generic_error_budget():
     assert run.errors == 0
     assert run.reason is None
     assert run.records[0].rate_limited
+    stats = runner._stats(run.records)
+    assert stats["rate_limited"] == 1 and stats["failed"] == 0
+    assert stats["error_rate"] is None
+    assert next(c for c in runner._checks(run, config.targets[0]) if c.id == "serving").status == "inconclusive"
+
+
+async def test_rate_limit_wait_honors_extended_window():
+    import time
+
+    config = cfg()
+    run = runner._Run(config, None, None)
+    spec = builtin_fixtures(config)["short"][0].model_copy(update={
+        "scenario": "warm", "check_ids": ["serving"]})
+    run.rate_limit_until["t"] = time.monotonic() + .05
+    task = asyncio.create_task(run.request(config.targets[0], FakeClient(), spec))
+    await asyncio.sleep(.02)
+    run.rate_limit_until["t"] = time.monotonic() + .1
+    await asyncio.sleep(.06)
+    assert not task.done()
+    await task
 
 
 

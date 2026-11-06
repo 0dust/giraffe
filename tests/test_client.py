@@ -90,6 +90,17 @@ async def test_rate_limit_records_retry_after(monkeypatch):
     assert record.error == "rate limited (HTTP 429); retry after 1.5s"
 
 
+def test_retry_after_accepts_http_date_and_rejects_invalid_values():
+    from datetime import datetime, timedelta, timezone
+    from email.utils import format_datetime
+    from giraffe.client import _retry_after
+
+    future = format_datetime(datetime.now(timezone.utc) + timedelta(seconds=30), usegmt=True)
+    assert 28 <= _retry_after(future) <= 30
+    assert _retry_after("nan") is None
+    assert _retry_after("invalid") is None
+
+
 class Chunks(httpx.AsyncByteStream):
     def __init__(self, chunks):
         self.parts = chunks

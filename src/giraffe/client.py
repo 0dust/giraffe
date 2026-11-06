@@ -16,6 +16,8 @@ import time
 import uuid
 from time import monotonic
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+import math
 from typing import Any, AsyncIterator
 
 import httpx
@@ -28,6 +30,22 @@ from giraffe.logprobs import LogprobBudget, LogprobCollector
 from giraffe.transport import HTTPClientPool, _finish_cleanup
 
 logger = logging.getLogger(__name__)
+
+
+def _retry_after(value: str | None) -> float | None:
+    if not value:
+        return None
+    try:
+        seconds = float(value)
+        return max(0.0, seconds) if math.isfinite(seconds) else None
+    except ValueError:
+        try:
+            date = parsedate_to_datetime(value)
+            if date.tzinfo is None:
+                return None
+            return max(0.0, (date - datetime.now(timezone.utc)).total_seconds())
+        except (TypeError, ValueError, OverflowError):
+            return None
 
 
 # A non-cooperative endpoint must not grow the test process's memory indefinitely.
@@ -726,12 +744,7 @@ class LLMClient:
                     record.http_status = response.status_code
                     if response.status_code == 429:
                         record.rate_limited = True
-                        retry_after = response.headers.get("retry-after")
-                        if retry_after:
-                            try:
-                                record.retry_after_seconds = max(0.0, float(retry_after))
-                            except ValueError:
-                                pass
+                        record.retry_after_seconds = _retry_after(response.headers.get("retry-after"))
                     record.backend_id = response.headers.get("x-backend-id") or response.headers.get(
                         "x-replica-id",
                     )
