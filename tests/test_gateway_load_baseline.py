@@ -83,8 +83,15 @@ async def test_completed_load_survives_only_known_gateway_dispatch_changes(monke
         assert "Fixture pack identity differs." in _settings_reasons(changed, current), change
 
 
-async def test_saved_load_and_fixed_sessions_baseline_survives_gateway_dispatch(monkeypatch, local_tokenizer, tmp_path):
-    cfg = RunConfig.model_validate({**config().model_dump(), "checks": ["load", "sessions"], "stream": True,
+@pytest.mark.parametrize("checks", [
+    ["load", "sessions"],
+    ["serving", "load", "sessions"],
+    ["load", "sessions", "gateway_attribution"],
+    ["serving", "sessions"],
+    ["sessions", "gateway_attribution"],
+])
+async def test_saved_fixed_sessions_baseline_survives_gateway_dispatch(monkeypatch, local_tokenizer, tmp_path, checks):
+    cfg = RunConfig.model_validate({**config().model_dump(), "checks": checks, "stream": True,
         "sessions": {"sessions": 2, "modes": ["fixed"], "concurrency": 2}, "limits": {"min_samples": 2}})
     usage = {"prompt_tokens": 128, "completion_tokens": 4}
 
@@ -114,20 +121,28 @@ async def test_saved_load_and_fixed_sessions_baseline_survives_gateway_dispatch(
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
     current = await runner.run_suite(cfg)
     assert current.overall == "pass"
-    identity = {"generator_source_sha256": workloads.FIXTURE_SOURCE_SHA256, "load_test_source_sha256": CURRENT_LOAD_SOURCE,
-                "settings": {"load_test": cfg.load_test.model_dump(mode="json"), "sessions": cfg.sessions.model_dump(mode="json")}}
-    assert fixture_hash(identity) == current.manifest["fixture_pack"]["workload_fixture_sha256"]
-    identity["generator_source_sha256"] = CORE_GENERATOR
+    identity = {"generator_source_sha256": workloads.FIXTURE_SOURCE_SHA256,
+                "settings": {"sessions": cfg.sessions.model_dump(mode="json")}}
+    if "load" in checks:
+        identity["load_test_source_sha256"] = CURRENT_LOAD_SOURCE
+        identity["settings"]["load_test"] = cfg.load_test.model_dump(mode="json")
+    shared = "gateway_attribution" in checks
+    fingerprint_key = "shared_workload_fixture_sha256" if shared else "workload_fixture_sha256"
+    assert fixture_hash(identity) == current.manifest["fixture_pack"][fingerprint_key]
+    identity["generator_source_sha256"] = GATEWAY_GENERATORS[0] if shared else CORE_GENERATOR
     baseline = current.model_copy(deep=True)
-    baseline.run_id = "core-load-and-sessions"
-    baseline.manifest["fixture_pack"]["workload_fixture_sha256"] = fixture_hash(identity)
+    baseline.run_id = "older-ordinary-workload"
+    baseline.manifest["fixture_pack"][fingerprint_key] = fixture_hash(identity)
+    if shared:
+        baseline.manifest["fixture_pack"]["workload_fixture_sha256"] = fixture_hash({
+            **identity, "settings": {**identity["settings"], "gateway_attribution": None}})
     saved, _ = write_report(baseline, tmp_path)
     baseline = RunReport.model_validate_json(saved.read_bytes())
     for report, previous in ((current, baseline), (baseline, current)):
         assert _settings_reasons(report, previous) == []
         result = compare_baseline(report, previous).baseline["targets"][0]
         assert result["status"] == "pass"
-        assert {row["check"] for row in result["comparisons"]} >= {"load", "sessions"}
+        assert {row["check"] for row in result["comparisons"]} >= set(checks) - {"gateway_attribution"}
 
     for change in (
         {"load_test_source_sha256": "df3b7bbf30cab87d2e8c1c6dab8819f9cfe592b181407caa7c32af4c5f720cd4"},
@@ -136,5 +151,5 @@ async def test_saved_load_and_fixed_sessions_baseline_survives_gateway_dispatch(
         {"session_sampling_source_sha256": "unknown"},
     ):
         unverified = baseline.model_copy(deep=True)
-        unverified.manifest["fixture_pack"]["workload_fixture_sha256"] = fixture_hash({**identity, **change})
+        unverified.manifest["fixture_pack"][fingerprint_key] = fixture_hash({**identity, **change})
         assert "Fixture pack identity differs." in _settings_reasons(current, unverified)

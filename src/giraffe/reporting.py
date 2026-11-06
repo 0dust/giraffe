@@ -162,7 +162,13 @@ def _comparison_manifest(manifest: dict) -> dict:
     return value
 
 
-def _run_limits_workload_identity(manifest: dict, *, revision: str, include_load: bool = False) -> dict | None:
+def _baseline_workload_fields(checks, *, shared: bool) -> set[str]:
+    return {field for field, workload_checks in WORKLOAD_CHECKS.items()
+            if workload_checks.intersection(checks) and (not shared or field not in SHARED_BASELINE_EXCLUDED_WORKLOADS)}
+
+
+def _run_limits_workload_identity(manifest: dict, *, revision: str, include_load: bool = False,
+                                  shared: bool = False) -> dict | None:
     """Reconstruct only identities whose generator revision is known exactly."""
     raw = manifest.get("config", {})
     legacy = revision == "legacy"
@@ -172,23 +178,23 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str, include_load
         resolved = RunConfig.model_validate({**config, "max_requests": None, "max_duration_seconds": None})
     except ValidationError:
         return None
+    fields = _baseline_workload_fields(resolved.checks, shared=shared)
     if revision in {"issue45", "issue95", "issue95_pauses", "issue95_pause_evidence", "persistent_users", "gateway_attribution", "shared_conversations", "gateway_conversations", "gateway_shared_first", "gateway_shared_targets_first"}:
-        unchanged_checks = {"sessions", "consistency"}
+        unchanged_fields = {"sessions", "consistency"}
         if revision in {"issue95_pause_evidence", "persistent_users", "gateway_attribution", "shared_conversations", "gateway_conversations", "gateway_shared_first", "gateway_shared_targets_first"}:
             # Optional user/gateway dispatch changed the shared file; these
             # specialist requests are unchanged at these exact revisions.
-            unchanged_checks.add("prefix")
+            unchanged_fields.add("prefix")
         if include_load:
-            unchanged_checks.add("load")  # The caller separately attests the Load source.
-        if not set(resolved.checks) <= unchanged_checks:
+            unchanged_fields.add("load_test")  # The caller separately attests the Load source.
+        # Legacy concurrency has a separate source and needs its own attested revision.
+        if "concurrency" in resolved.checks or not fields <= unchanged_fields:
             return None
     sampled_sessions = "sessions" in resolved.checks and resolved.sessions and resolved.sessions.sampling is not None
     if sampled_sessions and revision not in {"persistent_users", "shared_conversations", "gateway_attribution", "gateway_conversations", "gateway_shared_first", "gateway_shared_targets_first"}:
         return None  # Earlier revisions have no attested sampled-traffic equivalent.
     settings = {}
-    for field, checks in WORKLOAD_CHECKS.items():
-        if not checks.intersection(resolved.checks):
-            continue
+    for field in fields:
         if field not in raw:
             return None  # A fingerprint cannot attest settings missing from the saved config.
         value = raw[field] if legacy else getattr(resolved, field)
@@ -266,23 +272,25 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str, include_load
     return identity
 
 
-def _same_run_limits_workload(current: dict, old: dict) -> bool:
+def _same_run_limits_workload(current: dict, old: dict, *, fingerprint_key: str = "workload_fixture_sha256") -> bool:
     if current.get("config", {}).get("config_version") != 2 or old.get("config", {}).get("config_version", 2) != 2:
         return False
+    shared = fingerprint_key == "shared_workload_fixture_sha256"
     for manifest in (current, old):
         revisions = ("phase2", "phase3", "review26", "caps26", "issue45", "issue95", "issue95_pauses", "issue95_pause_evidence", "persistent_users", "gateway_attribution", "shared_conversations", "gateway_conversations", "gateway_shared_first", "gateway_shared_targets_first") if "config_version" in manifest.get("config", {}) else ("legacy",)
-        identities = [_run_limits_workload_identity(manifest, revision=revision) for revision in revisions]
-        if not any(identity is not None and fixture_hash(identity) == manifest.get("fixture_pack", {}).get("workload_fixture_sha256")
+        identities = [_run_limits_workload_identity(manifest, revision=revision, shared=shared) for revision in revisions]
+        recorded = manifest.get("fixture_pack", {}).get(fingerprint_key)
+        if not any(identity is not None and fixture_hash(identity) == recorded
                    for identity in identities):
             return False
     current_config = _comparison_manifest(current)["config"]
     old_config = _comparison_manifest(old)["config"]
     selected = set(current_config.get("checks", [])) | set(old_config.get("checks", []))
     return all(current_config.get(field) == old_config.get(field)
-               for field, checks in WORKLOAD_CHECKS.items() if checks & selected)
+               for field in _baseline_workload_fields(selected, shared=shared))
 
 
-def _same_load_workload(current: dict, old: dict) -> bool:
+def _same_load_workload(current: dict, old: dict, *, fingerprint_key: str = "workload_fixture_sha256") -> bool:
     """Attest unchanged Load dispatch within exact source-equivalence groups."""
     # Keep the historical nonce-only change separate from current admission
     # semantics. Only the newer group attests Load with specialist workloads.
@@ -295,6 +303,7 @@ def _same_load_workload(current: dict, old: dict) -> bool:
           "788f4c8f0b14421d5fc00f8b32c0ffcef79c04c647730767cb44b16584ed4aa4"), True),
     )
     matches = []
+    shared = fingerprint_key == "shared_workload_fixture_sha256"
     for manifest in (current, old):
         raw = manifest.get("config", {})
         if raw.get("config_version") != 2 or "load_test" not in raw:
@@ -303,19 +312,17 @@ def _same_load_workload(current: dict, old: dict) -> bool:
             resolved = RunConfig.model_validate(raw)
         except ValidationError:
             return False
-        fields = {field for field, checks in WORKLOAD_CHECKS.items() if checks.intersection(resolved.checks)}
+        fields = _baseline_workload_fields(resolved.checks, shared=shared)
         if "load_test" not in fields:
             return False
         load_only = fields == {"load_test"}
-        # Core checks with no generated workload keep their existing Load bridge.
-        identity_manifest = {**manifest, "config": {**raw, "checks": ["load"]}} if load_only else manifest
-        recorded = manifest.get("fixture_pack", {}).get("workload_fixture_sha256")
+        recorded = manifest.get("fixture_pack", {}).get(fingerprint_key)
         attestations = set()
         for index, (revisions, sources, allows_specialists) in enumerate(families):
             if not load_only and not allows_specialists:
                 continue
             for revision in revisions:
-                identity = _run_limits_workload_identity(identity_manifest, revision=revision, include_load=True)
+                identity = _run_limits_workload_identity(manifest, revision=revision, include_load=True, shared=shared)
                 if identity is None or not any(fixture_hash({**identity, "load_test_source_sha256": source}) == recorded
                                                for source in sources):
                     continue
@@ -525,14 +532,16 @@ def _settings_reasons(report: RunReport, baseline: RunReport, *, details: dict[s
         reasons.append("Fixture pack identity is missing or unknown.")
     else:
         inactive = {"custom", "shared_workload_fixture_sha256"}
+        fingerprint_key = "workload_fixture_sha256"
         # Older reports attest the full identity only. Keep their existing
         # compatibility when those recorded identities still match.
         if all(isinstance(pack.get("shared_workload_fixture_sha256"), str)
                and pack["shared_workload_fixture_sha256"] for pack in (current_pack, old_pack)):
-            current_pack, old_pack = ({**pack, "workload_fixture_sha256": pack["shared_workload_fixture_sha256"]}
+            fingerprint_key = "shared_workload_fixture_sha256"
+            current_pack, old_pack = ({**pack, "workload_fixture_sha256": pack[fingerprint_key]}
                                       for pack in (current_pack, old_pack))
-        if (_same_run_limits_workload(report.manifest, baseline.manifest)
-                or _same_load_workload(report.manifest, baseline.manifest)):
+        if (_same_run_limits_workload(report.manifest, baseline.manifest, fingerprint_key=fingerprint_key)
+                or _same_load_workload(report.manifest, baseline.manifest, fingerprint_key=fingerprint_key)):
             inactive.add("workload_fixture_sha256")
         if ({key: value for key, value in current_pack.items() if key not in inactive}
                 != {key: value for key, value in old_pack.items() if key not in inactive}):
