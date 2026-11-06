@@ -466,7 +466,7 @@ def _metric_values(records: list[RequestRecord]) -> dict[str, list[float]]:
     def clock_value(record, arrival_field, dispatch_field):
         arrival = (record.load_point or {}).get("pattern") in {"constant", "poisson", "bursts"}
         return getattr(record, arrival_field if arrival else dispatch_field)
-    return {
+    values = {
         "valid_completion_rate": [float(r.status == "completed" and r.valid) for r in records],
         "error_rate": [float(r.status in {"failed", "timeout"}) for r in records],
         "correctness_rate": [float(r.score) for r in records if r.score is not None],
@@ -479,6 +479,12 @@ def _metric_values(records: list[RequestRecord]) -> dict[str, list[float]]:
         "generation_tokens_per_second": [value for r in completed
                                          if (value := r.generation_tokens_per_second) is not None],
     }
+    # Keep the raw samples for tail comparisons; _compare_metric selects the
+    # p95 aggregate from the metric name so bootstrap uncertainty remains
+    # sample-aware.
+    for metric in ("latency_ms", "first_output_ms", "max_stream_gap_ms"):
+        values[f"{metric.removesuffix('_ms')}_p95_ms"] = values[metric]
+    return values
 
 
 def _output_work(records: list[RequestRecord]) -> dict[str, Any]:
@@ -526,11 +532,12 @@ def _compare_metric(
         "status": "inconclusive",
     }
     is_rate = name.endswith("_rate")
-    aggregate = (lambda data: sum(data) / len(data)) if is_rate else median
+    is_p95 = name.endswith("p95_ms")
+    aggregate = (lambda data: sum(data) / len(data)) if is_rate else (lambda data: percentile(data, .95) if is_p95 else median(data))
     current_value = aggregate(current) if current else None
     old_value = aggregate(old) if old else None
     result.update(current=current_value, baseline=old_value,
-                  aggregation="mean" if is_rate else "median",
+                  aggregation="mean" if is_rate else ("p95" if is_p95 else "median"),
                   change_unit="percentage_points" if is_rate else "percent")
     if current_value is not None and old_value is not None:
         result["observed_delta"] = current_value - old_value
@@ -1195,16 +1202,17 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                         warnings.append({"code": code, "message": message})
                         if not preserve_failure or row["status"] != "fail":
                             row["status"] = "inconclusive"
-                    if (input_work_changed or live_inputs_differ) and metric in {"latency_ms", "first_output_ms", "max_stream_gap_ms", "output_tokens_per_second", "generation_tokens_per_second"}:
+                    base_metric = metric.removesuffix("_p95_ms") + "_ms" if metric.endswith("_p95_ms") else metric
+                    if (input_work_changed or live_inputs_differ) and base_metric in {"latency_ms", "first_output_ms", "max_stream_gap_ms", "output_tokens_per_second", "generation_tokens_per_second"}:
                         warn("input_work_changed", "Observed input work or live generated histories differ; timing is not like-for-like.")
-                    if different_work and metric in {"latency_ms", "max_stream_gap_ms", "output_tokens_per_second", "generation_tokens_per_second"}:
+                    if different_work and base_metric in {"latency_ms", "max_stream_gap_ms", "output_tokens_per_second", "generation_tokens_per_second"}:
                         warn("output_work_changed", "Actual generated output lengths differ materially: "
                              f"median {old_work['reported_output_tokens_p50']} → {current_work['reported_output_tokens_p50']} tokens "
                              f"and {old_work['output_chars_p50']} → {current_work['output_chars_p50']} characters. "
                              "These timings include different amounts of generated work; this does not establish a speed improvement or regression.")
                     if mix_changed:
                         warn("request_mix_changed", "Request work identity shares differ by more than 10 percentage points; observed aggregate values reflect different request mixes.")
-                    if metric in TIMING_METRICS:
+                    if base_metric in TIMING_METRICS:
                         if load_point:
                             for label, records in (("Current", current_records), ("Baseline", old_records)):
                                 point = load_points[label].get(records[0].load_point.get("point_id"), records[0].load_point)
