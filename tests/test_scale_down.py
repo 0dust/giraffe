@@ -3,8 +3,10 @@ from copy import deepcopy
 
 import pytest
 
+from giraffe.client import REASONING_BUDGET_ERROR
+from giraffe.fixtures import reasoning_budget
 from giraffe.models import Limits, RequestRecord, ScaleDownConfig, ScaleDownEvidence
-from giraffe.scale_down import evaluate_scale_down
+from giraffe.scale_down import _history, evaluate_scale_down
 
 
 def scenario():
@@ -53,6 +55,134 @@ def test_complete_graceful_evidence_passes_each_result():
     assert result.id == "scale_down" and result.status == "pass"
     assert statuses(result) == dict(continuity="pass", drain="pass", capacity="pass")
     assert "long" in result.metrics["results"]["continuity"]["request_ids"]
+
+
+@pytest.mark.parametrize("conflict", ["client", "midstream"])
+def test_attribution_conflict_prevents_drain_pass(conflict):
+    settings, evidence, records = scenario()
+    if conflict == "client":
+        records[1] = records[1].model_copy(update=dict(backend_id="a"))
+    else:
+        evidence["attribution_conflict_request_ids"] = ["long"]
+    result = evaluate(settings, evidence, records)
+    assert statuses(result) == dict(continuity="pass", drain="inconclusive", capacity="pass")
+    assert "Client and backend attribution conflict for an overlapping stream." in result.metrics["results"]["drain"]["limitations"]
+    assert "long" not in result.metrics["results"]["drain"]["request_ids"]
+
+
+def test_contradictory_coverage_prevents_drain_completeness():
+    settings, evidence, records = scenario()
+    evidence["snapshots"][-1]["export"]["coverage"].append(dict(
+        replica_id="b", start_sequence=0, end_sequence=6, complete=False, scope="all", gaps=[5]))
+    result = evaluate(settings, evidence, records)
+    assert statuses(result) == dict(continuity="pass", drain="inconclusive", capacity="pass")
+    assert "Coverage claims for the removed replica conflict." in result.metrics["results"]["drain"]["limitations"]
+    assert result.metrics["results"]["drain"]["metrics"]["complete_coverage"] is False
+
+
+def test_output_budget_exhaustion_is_inconclusive_not_endpoint_failure():
+    settings, evidence, records = scenario()
+    records[2] = records[2].model_copy(update=dict(
+        status="completed", valid=False, error=REASONING_BUDGET_ERROR, finish_reason="length",
+        output="", reasoning="thinking...", reasoning_tokens=50, score=None, answer_chars=0))
+    assert reasoning_budget(records[2]) is True
+    result = evaluate(settings, evidence, records)
+    assert statuses(result) == dict(continuity="pass", drain="pass", capacity="inconclusive")
+    windows = result.metrics["results"]["capacity"]["metrics"]["windows"]
+    assert windows["post_removal"]["status"] == "inconclusive"
+    assert "Some responses exhausted Giraffe's output budget before an answer; they are not endpoint failures." in windows["post_removal"]["limitations"]
+
+
+def test_latest_baseline_inventory_must_establish_multiple_replicas():
+    settings, evidence, records = scenario()
+    evidence["snapshots"][0]["export"]["inventories"] = [
+        dict(event_id="inv-old", sequence=0, time_ms=0, replicas=["a", "b"]),
+        dict(event_id="inventory-1", sequence=1, time_ms=0, replicas=["b"]),
+    ]
+    evidence["snapshots"][1]["export"]["inventories"][0]["replicas"] = ["b"]
+    evidence["snapshots"][2]["export"]["inventories"][0]["replicas"] = ["c"]
+    result = evaluate(settings, evidence, records)
+    assert statuses(result) == dict(continuity="inconclusive", drain="inconclusive", capacity="inconclusive")
+    for subresult in result.metrics["results"].values():
+        assert "Baseline inventory does not establish at least two replica incarnations." in subresult["limitations"]
+
+
+@pytest.mark.parametrize("second_score,expected", [(None, "inconclusive"), (False, "fail")])
+def test_unscored_responses_use_best_possible_correctness(second_score, expected):
+    settings, evidence, records = scenario()
+    records[2] = records[2].model_copy(update=dict(score=False))
+    records.append(records[2].model_copy(update=dict(id="post2", score=second_score)))
+    evidence["followup_request_ids"].append("post2")
+    result = evaluate_scale_down(settings, ScaleDownEvidence.model_validate(evidence), records, Limits(min_correctness=.5))
+    assert statuses(result) == dict(continuity="pass", drain="pass", capacity=expected)
+    windows = result.metrics["results"]["capacity"]["metrics"]["windows"]
+    assert windows["post_removal"]["status"] == expected
+    if second_score is None:
+        assert "Some responses lack configured correctness evidence." in windows["post_removal"]["limitations"]
+
+
+@pytest.mark.parametrize("coverage", ["earlier", "latest_giraffe"])
+def test_absent_completeness_claim_does_not_conflict_with_latest_coverage(coverage):
+    settings, evidence, records = scenario()
+    if coverage == "earlier":
+        evidence["snapshots"][0]["export"]["coverage"][0]["complete"] = False
+    else:
+        evidence["snapshots"][-1]["export"]["coverage"].append(dict(
+            replica_id="b", start_sequence=0, end_sequence=6, scope="giraffe", complete=False))
+    result = evaluate(settings, evidence, records)
+    assert statuses(result) == dict(continuity="pass", drain="pass", capacity="pass")
+    assert "Coverage claims for the removed replica conflict." not in result.metrics["results"]["drain"]["limitations"]
+
+
+def test_earlier_absent_coverage_claim_cannot_hide_unfinished_original():
+    settings, evidence, records = scenario()
+    evidence["snapshots"][0]["export"]["coverage"][0]["complete"] = False
+    for snapshot in evidence["snapshots"]:
+        snapshot["export"]["events"] = [e for e in snapshot["export"]["events"] if e["kind"] != "request_completed"]
+    result = evaluate(settings, evidence, records)
+    assert statuses(result) == dict(continuity="pass", drain="fail", capacity="pass")
+    assert result.metrics["results"]["drain"]["metrics"]["complete_coverage"] is True
+
+
+def test_correlated_hedge_admission_supports_client_attribution():
+    settings, evidence, records = scenario()
+    events = deepcopy(evidence["snapshots"][-1]["export"]["events"])
+    for event in events:
+        event["sequence"] = {4: 5, 5: 7, 6: 8}.get(event["sequence"], event["sequence"])
+    events.extend([
+        dict(event_id="hedge-admit", sequence=4, time_ms=120, kind="request_admitted",
+             replica_id="a", request_id="long", attempt_id="hedge"),
+        dict(event_id="hedge-done", sequence=6, time_ms=250, kind="request_completed",
+             replica_id="a", request_id="long", attempt_id="hedge", outcome="completed"),
+    ])
+    events.sort(key=lambda event: event["sequence"])
+    for snapshot in evidence["snapshots"]:
+        export = snapshot["export"]
+        sequence = {1: 1, 4: 5, 6: 8}[export["through_sequence"]]
+        export["through_sequence"] = sequence
+        export["events"] = [event for event in events if event["sequence"] <= sequence]
+        export["inventories"][0].update(event_id=f"inventory-{sequence}", sequence=sequence,
+                                         time_ms={1: 0, 5: 200, 8: 400}[sequence])
+        export["coverage"][0]["end_sequence"] = sequence
+    assert _history(settings, ScaleDownEvidence.model_validate(evidence)).conflicts == ()
+    original = evaluate(settings, evidence, records)
+    records[1] = records[1].model_copy(update=dict(backend_id="a"))
+    result = evaluate(settings, evidence, records)
+    assert statuses(result) == statuses(original) == dict(continuity="pass", drain="pass", capacity="pass")
+    assert "Client and backend attribution conflict for an overlapping stream." not in result.metrics["results"]["drain"]["limitations"]
+
+
+def test_retained_output_budget_exhaustion_is_not_endpoint_failure():
+    settings, evidence, records = scenario()
+    records[2] = records[2].model_copy(update=dict(
+        status="completed", valid=False, error=REASONING_BUDGET_ERROR, finish_reason="length",
+        output="", reasoning="", reasoning_tokens=None, score=None, answer_chars=0))
+    assert reasoning_budget(records[2]) is False
+    result = evaluate(settings, evidence, records)
+    assert statuses(result) == dict(continuity="pass", drain="pass", capacity="inconclusive")
+    windows = result.metrics["results"]["capacity"]["metrics"]["windows"]
+    assert windows["post_removal"]["status"] == "inconclusive"
+    assert "Some responses exhausted Giraffe's output budget before an answer; they are not endpoint failures." in windows["post_removal"]["limitations"]
 
 
 @pytest.mark.parametrize("phase,dispatch", [("drain", 250), ("post_removal", 500)])

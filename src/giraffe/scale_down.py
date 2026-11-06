@@ -8,9 +8,12 @@ from bisect import bisect_right
 from dataclasses import dataclass
 
 from .caps import MAX_SANITIZE_ITEMS
+from .client import REASONING_BUDGET_ERROR
 from .deployment import scale_down_enabled
+from .fixtures import reasoning_budget
 from .models import (
-    MAX_SCALE_DOWN_SNAPSHOTS, CheckResult, Limits, RequestRecord, ScaleDownConfig, ScaleDownEvidence,
+    MAX_PLANNED_ARRIVALS, MAX_SCALE_DOWN_SNAPSHOTS, MAX_SIMULTANEOUS_REQUESTS,
+    CheckResult, Limits, RequestRecord, ScaleDownConfig, ScaleDownEvidence,
     ScaleDownInventory, ScaleDownLifecycleFact, ScaleDownSnapshot, ScaleDownSubresult,
 )
 from .timing import configured_metrics, qualify, qualified_violations, threshold
@@ -148,23 +151,31 @@ def _answer_started(record: RequestRecord, evidence: ScaleDownEvidence) -> float
     return max(observed, record.timing_start_ms + record.answer_read_timestamps_ms[0])
 
 
+def _budget_exhausted(record: RequestRecord) -> bool:
+    return reasoning_budget(record) or (record.status == "completed" and not record.valid
+        and record.finish_reason == "length" and record.error == REASONING_BUDGET_ERROR)
+
+
 def _request_outcome(records: list[RequestRecord], limits: Limits, evidence: ScaleDownEvidence,
                      minimum: int, *, strict_errors: bool) -> tuple[list[str], list[str], dict]:
     violations, missing = [], []
     interrupted = [r for r in records if r.status == "cancelled"]
-    measured = [r for r in records if r.status != "cancelled"]
+    measured = [r for r in records if r.status != "cancelled" and not _budget_exhausted(r)]
     errors = [r for r in measured if (r.status != "completed" or not r.valid
               or r.error or not r.stream_terminated or r.finish_reason not in {"stop", "length", "end_turn", "eos_token"})]
     if errors and (strict_errors or len(errors) / max(1, len(measured)) > limits.max_error_rate):
         violations.append("Original requests failed or did not end with a valid terminal response.")
     if interrupted:
         missing.append("Giraffe cancelled requests; those outcomes do not establish endpoint interruption.")
+    if any(_budget_exhausted(r) for r in records):
+        missing.append("Some responses exhausted Giraffe's output budget before an answer; they are not endpoint failures.")
     valid = [r for r in measured if r not in errors]
     if len(valid) < minimum:
         missing.append(f"Need {minimum} valid responses; observed {len(valid)}.")
     correctness = [r for r in valid if r.evaluation is None or r.evaluation.scorer != "none"]
     scored = [r for r in correctness if r.score is not None]
-    if scored and sum(r.score is True for r in scored) / len(scored) < limits.min_correctness:
+    unscored = len(correctness) - len(scored)
+    if correctness and (sum(r.score is True for r in scored) + unscored) / len(correctness) < limits.min_correctness:
         violations.append("Configured answer correctness was not met.")
     if limits.min_correctness > 0 and len(scored) != len(correctness):
         missing.append("Some responses lack configured correctness evidence.")
@@ -250,8 +261,10 @@ def evaluate_scale_down(settings: ScaleDownConfig, evidence: ScaleDownEvidence,
         shared.append("The confirmed transition lacks a bounded interval in the armed run.")
         transition = None
     removed_interval = _bracket(terminated, history) if terminated else None
-    baseline_topology = any(len(i.replicas) >= 2 and replica_id in i.replicas and i.sequence < transition_fact.sequence
-                            for i in history.inventories) if transition_fact else False
+    baseline_inventory = max((i for i in history.inventories if i.sequence < transition_fact.sequence),
+                             key=lambda i: i.sequence, default=None) if transition_fact else None
+    baseline_topology = (baseline_inventory is not None and len(baseline_inventory.replicas) >= 2
+                         and replica_id in baseline_inventory.replicas)
     if not baseline_topology:
         shared.append("Baseline inventory does not establish at least two replica incarnations.")
     by_id = {r.id: r for r in records if r.target == settings.target}
@@ -273,6 +286,11 @@ def evaluate_scale_down(settings: ScaleDownConfig, evidence: ScaleDownEvidence,
     complete = not history.conflicts and any(c.replica_id == replica_id and c.complete and c.scope == "all"
                    and not c.gaps and not c.truncated and c.start_sequence == 0
                    and c.end_sequence >= terminated.sequence for c in latest_coverage) if terminated else False
+    coverage_conflict = any(c.replica_id == replica_id and c.start_sequence <= terminated.sequence
+                           and (c.truncated or any(0 <= gap <= terminated.sequence for gap in c.gaps))
+                           for c in latest_coverage) if terminated else False
+    if coverage_conflict:
+        complete = False
 
     def active_attempts(record):
         if transition_fact is None:
@@ -309,7 +327,18 @@ def evaluate_scale_down(settings: ScaleDownConfig, evidence: ScaleDownEvidence,
                          transition_interval_ms=transition, **continuity_timing)
 
     drain_bad, drain_missing = [], list(shared)
-    attributed = [r for r in cohort if active_attempts(r)]
+    attribution_conflicts = set(evidence.attribution_conflict_request_ids)
+    for record in cohort:
+        if record.backend_id is None:
+            continue
+        record_admissions = [e for e in history.events if e.kind == "request_admitted" and correlated(e, record)]
+        if record_admissions and not any(e.replica_id == record.backend_id for e in record_admissions):
+            attribution_conflicts.add(record.id)
+    attributed = [r for r in cohort if r.id not in attribution_conflicts and active_attempts(r)]
+    if any(r.id in attribution_conflicts for r in cohort):
+        drain_missing.append("Client and backend attribution conflict for an overlapping stream.")
+    if coverage_conflict:
+        drain_missing.append("Coverage claims for the removed replica conflict.")
     if drain is None:
         drain_missing.append("The effective admission cutoff is unconfirmed.")
     if not attributed:
@@ -525,6 +554,7 @@ async def execute(run, target, client, fixtures, *, collector_task=None):
     control = run.scale_down_control
     observation = run.observations[target.name]
     active_answers = set()
+    backend_ids = {}
     tasks = []
     stage = None
     sending_done = False
@@ -563,6 +593,11 @@ async def execute(run, target, client, fixtures, *, collector_task=None):
     control.on_change = publish
     def observer(role):
         def observed(event):
+            if event.backend_id is not None:
+                previous = backend_ids.setdefault(event.request_id, event.backend_id)
+                if (previous != event.backend_id and event.request_id not in evidence.attribution_conflict_request_ids
+                        and len(evidence.attribution_conflict_request_ids) < MAX_SIMULTANEOUS_REQUESTS + MAX_PLANNED_ARRIVALS):
+                    evidence.attribution_conflict_request_ids.append(event.request_id)
             if event.kind == "started":
                 getattr(evidence, role + "_request_ids").append(event.request_id)
             elif event.kind == "answer" and event.stream:

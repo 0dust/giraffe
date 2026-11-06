@@ -98,6 +98,26 @@ def test_recovery_never_promotes_incomplete_coverage_to_pass(tmp_path):
     assert {r['status'] for r in recovered.checks[0].metrics['results'].values()} == {'inconclusive'}
 
 
+def test_recovery_with_retention_none_preserves_output_budget_uncertainty(tmp_path):
+    from giraffe.client import REASONING_BUDGET_ERROR
+    from giraffe.fixtures import reasoning_budget
+    from tests.test_scale_down import statuses
+    report = report_fixture()
+    report.requests[2] = report.requests[2].model_copy(update=dict(
+        status='completed', valid=False, error=REASONING_BUDGET_ERROR, finish_reason='length',
+        output='', reasoning='thinking...', reasoning_tokens=None, score=None, answer_chars=0))
+    assert reasoning_budget(report.requests[2]) is True
+    recovered = journal_report(tmp_path, report)
+    post = next(record for record in recovered.requests if record.id == 'post')
+    assert post.output == post.reasoning == '' and post.reasoning_tokens is None
+    assert reasoning_budget(post) is False
+    check = next(check for check in recovered.checks if check.id == 'scale_down')
+    assert statuses(check) == dict(continuity='inconclusive', drain='inconclusive', capacity='inconclusive')
+    window = check.metrics['results']['capacity']['metrics']['windows']['post_removal']
+    assert window['status'] == 'inconclusive'
+    assert "Some responses exhausted Giraffe's output budget before an answer; they are not endpoint failures." in window['limitations']
+
+
 def test_cleanup_recognizes_control_artifacts_but_protects_active_run(tmp_path):
     directory = tmp_path / 'scale-run'
     write_metadata(directory, {'id':'scale-run', 'run_id':'scale-run', 'state':'completed', 'started_at':'2026-11-01T00:00:00Z'})

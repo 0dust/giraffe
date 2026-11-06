@@ -2097,6 +2097,8 @@ class ScaleDownEvidence(Model):
     baseline_request_ids: list[ScaleDownIdentifier] = Field(default_factory=list, max_length=MAX_PLANNED_ARRIVALS)
     long_request_ids: list[ScaleDownIdentifier] = Field(default_factory=list, max_length=MAX_SIMULTANEOUS_REQUESTS)
     followup_request_ids: list[ScaleDownIdentifier] = Field(default_factory=list, max_length=MAX_PLANNED_ARRIVALS)
+    attribution_conflict_request_ids: list[ScaleDownIdentifier] = Field(default_factory=list,
+        max_length=MAX_SIMULTANEOUS_REQUESTS + MAX_PLANNED_ARRIVALS)
     answer_started_ms: dict[ScaleDownIdentifier, Annotated[float, Field(ge=0)]] = Field(default_factory=dict,
         description="First real answer content observed by the client callback, in runner monotonic offsets.")
     post_started_ms: float | None = Field(default=None, ge=0)
