@@ -507,8 +507,9 @@ async def run_arrival_window(run, target, client, settings, load_settings, calib
     # The shared scheduler observes one interval. Expand it at the actual
     # sending boundary for plans with activations or separate burst offers.
     stage_rows = [] if staged_arrivals else transitions
+    max_in_flight = required_concurrency(run.config)["by_check"]["multi_user"]
     evidence = await run_stage(traffic=ExplicitTrafficStage(duration_seconds=window["planned_duration_seconds"],
-        max_in_flight=required_concurrency(run.config)["by_check"]["multi_user"],
+        max_in_flight=max_in_flight,
         scheduler_lag_tolerance_ms=lag_tolerance_ms),
         rate_rps=per_user_rate*activations[0],
         stage_index=0, fixtures={}, execute=send, reserve_offer=reserve, try_acquire=run.try_acquire_slot,
@@ -530,11 +531,13 @@ async def run_arrival_window(run, target, client, settings, load_settings, calib
                             else "unissued" if offer["offered"] else "not_offered")
         offer["scheduled_ms"] = start + offer["offset_seconds"]*1000
         offer["scheduler_lag_ms"] = evidence.offer_lags_ms[index]
+    accounting = _offer_counts(offers)
     window.update(start_ms=start, end_ms=end, planned_end_ms=start+window["planned_duration_seconds"]*1000,
         duration_seconds=evidence.sending_seconds, drain_seconds=max(0, evidence.observation_seconds-evidence.sending_seconds),
         cut_short=evidence.interrupted, reason="; ".join(evidence.reasons) or None,
         drain_reason="Drain interrupted" if evidence.drain_expired else None,
-        offer_accounting=_offer_counts(offers), peak_in_flight=run.peak.get((target.name, window["id"]), 0),
+        offer_accounting=accounting, peak_in_flight=run.peak.get((target.name, window["id"]), 0),
+        max_in_flight=min(max_in_flight, run.slots.maxsize), slot_limit_reached=bool(accounting["dropped_local"]),
         planned_requests_per_second=len(offers)/window["planned_duration_seconds"],
         dispatched_requests_per_second=sum(o["dispatched"] for o in offers)/evidence.sending_seconds
             if evidence.sending_seconds else None,
