@@ -1,6 +1,7 @@
 """Selecting optional policies without configuring them must not invent traffic."""
 import json
 
+import httpx
 import pytest
 
 from giraffe.models import RunConfig
@@ -31,6 +32,36 @@ async def test_unconfigured_policy_is_unavailable_without_traffic(tmp_path, caps
     _print_result(report, json_path, html_path, tmp_path, {})
     assert "unavailable" in capsys.readouterr().out
     assert compare_baseline(report, report.model_copy(deep=True)).baseline["status"] == "inconclusive"
+
+
+@pytest.mark.usefixtures("local_tokenizer")
+async def test_unsupported_policy_with_no_identities_keeps_shared_key_access(monkeypatch):
+    from tests.test_gateway_policy import configuration as configured_policy
+
+    raw = configured_policy(gateway="unsupported").model_dump(mode="json")
+    raw["checks"] = ["access", "gateway_policy"]
+    raw["stream"] = False
+    raw["targets"][0].update(test_identities={}, api_key_env="SHARED")
+    monkeypatch.setenv("SHARED", "shared-secret")
+    config = RunConfig.model_validate(raw)
+
+    sent = []
+
+    def handle(request):
+        if request.method != "POST":
+            return httpx.Response(404)
+        sent.append(request.headers.get("authorization"))
+        return httpx.Response(200, json={"choices": [{"message": {"content": "OK"},
+            "finish_reason": "stop"}], "usage": {"prompt_tokens": 8, "completion_tokens": 2}})
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: original(transport=httpx.MockTransport(handle), **kwargs))
+    report = await run_suite(config)
+    checks = {check.id: check for check in report.checks}
+    assert checks["access"].status == "pass", checks["access"].summary
+    assert checks["gateway_policy"].metrics["gateway_policy"]["qualification"] == "unavailable"
+    assert sent == ["Bearer shared-secret"]
+    assert all("gateway_policy" not in record.check_ids for record in report.requests)
 
 
 def test_configured_policy_still_requires_all_identity_references():
