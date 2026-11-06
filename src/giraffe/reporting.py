@@ -1233,9 +1233,21 @@ def _user_scenario_evidence(window: dict, user_id: str) -> dict:
         evidence = window.get("interference") or {"status": "inconclusive", "qualified": False}
         return next((user for user in evidence.get("users", []) if user.get("user_id") == user_id), evidence)
     if window.get("scenario") == "cancellation":
-        evidence = window.get("cancellation") or {"status": "inconclusive"}
-        return {**evidence, "qualified": evidence.get("status") in {"pass", "fail"}}
+        evidence = window.get("cancellation") or {}
+        if user_id != (evidence.get("selected_user_id") or window.get("selected_user_id")):
+            return {}
+        qualified = (evidence.get("status") in {"pass", "fail"}
+                     and not (window.get("cut_short") or window.get("drain_reason"))
+                     and all(evidence.get(name, {}).get("status") == "pass"
+                             for name in ("cancellation", "peer_continuation"))
+                     and evidence.get("followup", {}).get("status") in {"pass", "fail"})
+        return {**evidence, "status": evidence.get("status", "inconclusive"), "qualified": qualified}
     return {}
+
+
+def _cancellation_evidence_ids(evidence: dict, records: dict[str, RequestRecord]) -> list[str]:
+    return list(dict.fromkeys(rid for name in ("cancellation", "peer_continuation", "followup")
+                              for rid in evidence.get(name, {}).get("request_ids", []) if rid in records))
 
 
 def _probe_has_overlap(evidence: dict, records: list[RequestRecord]) -> bool:
@@ -1265,7 +1277,10 @@ def _user_token_work_changed(current, previous, tolerance):
         measures += (_uncached_input_tokens,)
     for measure in measures:
         lengths = [[measure(record) for record in cohort] for cohort in (current, previous)]
-        if any(not values or None in values for values in lengths) or _length_mix_differs(lengths, tolerance):
+        if any(not values or None in values for values in lengths):
+            return True
+        medians = [median(values) for values in lengths]
+        if max(medians) > min(medians) * (1 + tolerance / 100) or _length_mix_differs(lengths, tolerance):
             return True
     return False
 
@@ -1427,7 +1442,12 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold):
                           "current": "fail", "baseline": "pass", "aggregation": "selected_scenario_criteria",
                           "worsening": 100, "reason": "This user's previously accepted scenario now fails its selected criteria.",
                           "observed_change": None, "observed_delta": None}
-            if scenario == "recovery" and _recovery_generation_work_changed(
+            if scenario == "cancellation":
+                current_evidence = _cancellation_evidence_ids(c_scenario, current_records)
+                old_evidence = _cancellation_evidence_ids(b_scenario, old_records)
+                acceptance.update(evidence_ids=current_evidence, current_samples=len(current_evidence),
+                                  baseline_samples=len(old_evidence))
+            elif scenario == "recovery" and _recovery_generation_work_changed(
                     c_scenario, b_scenario, current_records, old_records, threshold):
                 reason = f"Multi-user {user_id} at {population} users: Total generated work differs or lacks evidence across recovery runs."
                 incomplete.append(reason)
