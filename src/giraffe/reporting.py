@@ -26,7 +26,7 @@ from .caps import (MAX_HTML_PREVIEW_CHARS, MAX_HTML_JSON_PREVIEW_CHARS,
                    MAX_FAILURE_SUMMARY_CHARS)
 from .deployment import deployment_diff, fixture_hash, safe_config, sanitize
 from .report_inputs import input_ref as _input_ref
-from .multi_user_metrics import user_latency
+from .multi_user_metrics import truncated_conversation_turn, user_latency
 from .models import (CHECK_NAMES, SHAPES, CheckResult, RequestRecord, RunConfig, RunReport, overall_status, load_shape_label,
                      migrate_concurrent_load, migrate_run_limits, is_supported_schema, CURRENT_SCHEMA)
 from .stats import median, percentile
@@ -651,6 +651,33 @@ def _load_work_comparison(current, old):
     return None, mix_changed
 
 
+def _input_work_changed(current, old, threshold):
+    current_input = median(r.input_tokens for r in current if r.valid)
+    old_input = median(r.input_tokens for r in old if r.valid)
+    return (current_input is not None and old_input is not None and old_input > 0
+            and abs(current_input - old_input)*100/old_input > threshold)
+
+
+def _live_input_work_changed(current, old, threshold):
+    histories = []
+    for records in (current, old):
+        groups = defaultdict(list)
+        for record in records:
+            if record.valid and record.workload.get("mode") == "live":
+                if not record.request_hash or record.input_tokens is None:
+                    return True
+                groups[record.request_hash].append(record)
+        histories.append(groups)
+    current_histories, old_histories = histories
+    current_count = sum(map(len, current_histories.values()))
+    old_count = sum(map(len, old_histories.values()))
+    return (set(current_histories) != set(old_histories)
+            or any(abs(Fraction(len(records), current_count)
+                       - Fraction(len(old_histories[request_hash]), old_count)) > Fraction(1, 10)
+                   or _input_work_changed(records, old_histories[request_hash], threshold)
+                   for request_hash, records in current_histories.items()))
+
+
 def _load_not_delivered(point):
     # A higher-priority failure can own reason_code despite missing concurrency.
     # The flag applies only to concurrent points; older reports may omit it.
@@ -1093,9 +1120,10 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold):
         current_work = [current_records[rid] for rid in c.get("request_ids", []) if rid in current_records]
         old_work = [old_records[rid] for rid in b.get("request_ids", []) if rid in old_records]
         work_reason, mix_changed = _load_work_comparison(current_work, old_work)
+        live_work_changed = _live_input_work_changed(current_work, old_work, threshold)
         missing = (not c or not b or c.get("coverage", {}).get("status") != "complete"
                    or b.get("coverage", {}).get("status") != "complete"
-                   or c_rate is None or b_rate is None or work_reason or mix_changed)
+                   or c_rate is None or b_rate is None or work_reason or mix_changed or live_work_changed)
         row = {"check": "multi_user", "scenario": " / ".join(map(str, key)),
                "user_id": user_id, "population": population, "profile": profile,
                "window_id": c_window.get("id", b_window.get("id")),
@@ -1107,6 +1135,7 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold):
                "method": "Observed completed-output delivery over matching common windows; no cross-run confidence interval."}
         if missing:
             detail = (work_reason or "Requested work proportions differ." if mix_changed or work_reason else
+                      "Observed input work or live generated histories differ or lack evidence." if live_work_changed else
                       "Missing or incomplete shared-window coverage.")
             message = f"Multi-user {user_id} at {population} users: {detail}"
             row["reason"] = message
@@ -1276,9 +1305,7 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                         output["load_point"] = load_point
                 observed_outputs.extend(outputs)
                 different_work = _different_output_work(current_work, old_work, threshold)
-                current_inputs = [r.input_tokens for r in current_records if r.valid and r.input_tokens is not None]
-                old_inputs = [r.input_tokens for r in old_records if r.valid and r.input_tokens is not None]
-                input_work_changed = bool(current_inputs and old_inputs and median(old_inputs)>0 and abs(median(current_inputs)-median(old_inputs))*100/median(old_inputs)>threshold)
+                input_work_changed = _input_work_changed(current_records, old_records, threshold)
                 live_inputs_differ = any(r.workload.get("mode")=="live" for r in current_records) and Counter(r.request_hash for r in current_records) != Counter(r.request_hash for r in old_records)
                 for metric, values in current_metrics.items():
                     if not values and not old_metrics[metric]:
@@ -1504,6 +1531,7 @@ def _retained(report: RunReport) -> RunReport:
         keep = policy == "all" or (policy == "failures" and (
             (record.status in {"failed", "timeout"} and record.scenario not in {"client_cancel", "client_deadline"})
             or (record.status == "completed" and not record.valid) or record.score is False
+            or ("multi_user" in record.check_ids and truncated_conversation_turn(record))
             or record.evaluation_error is not None or record.id in failed_evidence
         ))
         if (policy != "all" and "multi_user" in record.check_ids
