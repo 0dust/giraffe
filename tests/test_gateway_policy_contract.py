@@ -3,7 +3,7 @@ import pytest
 
 from giraffe.gateway_policy import summarize
 from giraffe.gateway_response import response_evidence
-from tests.test_gateway_policy import LIMITED_KEY_HASH, exercise
+from tests.test_gateway_policy import LIMITED_KEY_HASH, MODEL_POOL, exercise
 
 
 def observed(run):
@@ -48,7 +48,8 @@ async def test_priority_pool_requires_matching_scoped_v3_limit(monkeypatch, limi
                dict(identity="peer", requests=5, rpm=7, priority="high")])
     for record in run.records:
         if record.http_status == 200:
-            headers = {"x-litellm-priority": "low" if record.identity == "limited" else "high"}
+            headers = {"x-litellm-priority": "low" if record.identity == "limited" else "high",
+                       "x-litellm-model-group": MODEL_POOL}
             if version:
                 headers["x-litellm-rate-limiter-version"] = version
             if limit is not None:
@@ -94,7 +95,7 @@ async def test_declared_custom_auth_header_qualifies_only_distinct_keys(monkeypa
             return httpx.Response(429, headers={"retry-after": "60"}, json={"error": {
                 "type": "throttling_error", "code": "429", "message":
                 f"Rate limit exceeded for api_key: {LIMITED_KEY_HASH}. Limit type: requests. Current limit: 2, Remaining: 0. Limit resets at: now"}})
-        return httpx.Response(200, json={"choices": [{"message": {"content": "OK"}, "finish_reason": "stop"}],
+        return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "OK"}, "finish_reason": "stop"}],
             "usage": {"prompt_tokens": 8, "completion_tokens": 2}})
 
     original = httpx.AsyncClient

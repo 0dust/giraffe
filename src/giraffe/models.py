@@ -2756,6 +2756,7 @@ MAX_TOKENS_PER_READ = 16
 
 
 class GatewayResponseEvidence(PersistedModel):
+    _priority_model_group: str | None = PrivateAttr(default=None)
     error_kind: Literal["authentication", "model_access", "rate_limit", "unknown"] | None = None
     policy_rejection: Literal["key_rpm", "priority_pool", "model_capacity", "unknown"] | None = None
     request_limit: int | None = Field(default=None, ge=0)

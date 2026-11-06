@@ -13,6 +13,7 @@ from giraffe import runner
 
 LIMITED_KEY_HASH = hashlib.sha256(b"limited-secret").hexdigest()
 PEER_KEY_HASH = hashlib.sha256(b"peer-secret").hexdigest()
+MODEL_POOL = "routed-test-pool"
 
 
 def configuration(mode="key_rpm", **changes):
@@ -55,11 +56,13 @@ async def exercise(monkeypatch, mode="key_rpm", *, behavior="enforce", full=Fals
         bucket_reset = behavior == "short_bucket_reset" and counts[who] == 5
         if who == "limited" and counts[who] > threshold and behavior != "ignore" and not bucket_reset:
             subject = PEER_KEY_HASH if behavior == "wrong_subject" else LIMITED_KEY_HASH
-            message = ("Priority-based rate limit exceeded. Model: test, Priority: low, Rate limit type: requests, Model TPM: not configured, Model RPM: 10, Remaining: 0, Model saturation: 50%"
+            message = (f"Priority-based rate limit exceeded. Model: {MODEL_POOL}, Priority: low, Rate limit type: requests, Model TPM: not configured, Model RPM: 10, Remaining: 0, Model saturation: 50%"
                        if mode == "priority_rpm" else
                        f"Rate limit exceeded for api_key: {subject}. Limit type: requests. Current limit: 2, Remaining: 0. Limit resets at: 2026-01-01")
             if behavior == "unknown" or (behavior == "mixed_rejections" and counts[who] > threshold + 1):
                 message = "OpenAIException: provider rate limit"
+            if behavior == "contradictory_pool":
+                headers["x-litellm-model-group"] = "other-pool"
             return httpx.Response(429, headers=headers, json={"error": {
                 "type": "throttling_error", "code": "429", "message": message}})
         usage = {"prompt_tokens": 8, "completion_tokens": 2}
@@ -68,8 +71,14 @@ async def exercise(monkeypatch, mode="key_rpm", *, behavior="enforce", full=Fals
         if behavior == "reasoning_work" and who == "limited":
             usage = {"prompt_tokens": 8, "completion_tokens": 128,
                      "completion_tokens_details": {"reasoning_tokens": 126}}
-        return httpx.Response(200, headers=headers, json={"choices": [{"message": {
-            "content": "OK"}, "finish_reason": "stop"}], "usage": usage})
+        group = "other-pool" if behavior == "different_pool" and who == "peer" else MODEL_POOL
+        if behavior != "missing_pool":
+            headers["x-litellm-model-group"] = group
+        if behavior == "fallback_pool" and who == "peer":
+            headers["x-litellm-attempted-fallbacks"] = "1"
+        role = "user" if behavior == "malformed_peer" and who == "peer" else "assistant"
+        return httpx.Response(200, headers=headers, json={"model": "test", "choices": [{"message": {
+            "role": role, "content": "OK"}, "finish_reason": "stop"}], "usage": usage})
 
     original = httpx.AsyncClient
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handle), **kw))
@@ -97,6 +106,7 @@ async def test_full_runner_keeps_policy_verdict_and_does_not_send_shared_setup(m
     assert len(report.requests) == 13
     assert "limited-secret" not in report.model_dump_json()
     assert LIMITED_KEY_HASH not in report.model_dump_json()
+    assert MODEL_POOL not in report.model_dump_json()
 
 
 @pytest.mark.parametrize("mode", ["key_rpm", "priority_rpm"])

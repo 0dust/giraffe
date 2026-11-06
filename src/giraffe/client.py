@@ -412,6 +412,7 @@ class LLMClient:
         )
         selected_headers = None
         attribution = spec.identity is not None and "gateway_attribution" in spec.check_ids
+        policy_probe = spec.identity is not None and "gateway_policy" in spec.check_ids
         if spec.identity is not None:
             from .identities import identity_headers
             try:
@@ -599,6 +600,9 @@ class LLMClient:
                     record.assistant_message = {"role": "assistant", **content}
                 else:
                     assistant_content_present |= isinstance(content.get("content"), str)
+            if policy_probe and (content.get("role") != "assistant"
+                                 or choice.get("finish_reason") not in ("stop", "length")):
+                raise _ProtocolError("gateway policy probe requires a completed assistant answer")
             answer = _text(content.get("content"))
             if logprob_collector is not None:
                 logprob_collector.add(choice.get("logprobs"))
@@ -737,7 +741,7 @@ class LLMClient:
                         if spec.identity is not None:
                             expected_key_hash = None
                             policy = self.config.gateway_policy
-                            if (response.status_code == 429 and "gateway_policy" in spec.check_ids
+                            if (response.status_code == 429 and policy_probe
                                     and policy is not None and policy.capability == "key_rpm"):
                                 from .identities import litellm_key_fingerprint
 

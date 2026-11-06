@@ -8,7 +8,7 @@ from .identities import identity_headers, litellm_key_fingerprint
 from .models import CheckResult, RequestSpec
 
 
-VERSION = 4
+VERSION = 5
 PROMPT = "Reply with exactly the word OK."
 
 
@@ -137,6 +137,8 @@ def summarize(settings, observation, records):
     affected = [record for record in records if record.identity == settings.affected_identity]
     peers = [record for record in records if record.identity != settings.affected_identity]
     successes = [record for record in records if record.status == "completed" and record.valid]
+    affected_admissions = [record for record in affected
+                           if record.http_status is not None and 200 <= record.http_status < 300]
     declared = next(user for user in settings.users if user.identity == settings.affected_identity)
     rejection_kind = "key_rpm" if settings.capability == "key_rpm" else "priority_pool"
     affected_rejections = [record for record in affected if record.http_status == 429]
@@ -188,16 +190,21 @@ def summarize(settings, observation, records):
             return outcome("unverified", "Priority tier, model RPM or strict-mode evidence does not match the declaration.")
         if not summary["overlap_observed"] or not summary["comparable_actual_work"]:
             return outcome("unverified", "Comparable actual token work and overlapping requests are required for priority observations.")
-        if any(record.gateway_evidence is None or record.gateway_evidence.priority_matches is not True for record in successes):
+        admissions = [*affected_admissions, *(record for record in successes if record.identity != settings.affected_identity)]
+        if any(record.gateway_evidence is None or record.gateway_evidence.priority_matches is not True for record in admissions):
             return outcome("unverified", "Successful responses do not confirm each declared priority tier.")
+        groups = {record.gateway_evidence._priority_model_group if record.gateway_evidence else None
+                  for record in [*recognized, *admissions]}
+        if len(groups) != 1 or None in groups:
+            return outcome("unverified", "A common resolved model pool is not established by the priority evidence.")
         reservations = {user.identity: user.rpm for user in settings.users}
         if any(record.gateway_evidence.limiter_version != "v3"
                or record.gateway_evidence.priority_request_limit != reservations[record.identity]
-               for record in successes):
+               for record in admissions):
             return outcome("unverified", "Scoped v3 priority RPM limits are missing or differ from the declared reservations.")
     elif any(record.gateway_evidence.request_limit != declared.rpm or record.gateway_evidence.request_remaining != 0 for record in recognized):
         return outcome("unverified", "Gateway key limit differs from the declared RPM.")
-    admitted = sum(record.http_status is not None and 200 <= record.http_status < 300 for record in affected)
+    admitted = len(affected_admissions)
     allowance = declared.rpm
     if settings.capability == "priority_rpm":
         # Before saturation idle capacity may be borrowed; integer crossing admits one request.
@@ -209,15 +216,13 @@ def summarize(settings, observation, records):
     if first_rejection is None:
         return outcome("unverified", "Attributed rejection timing is unavailable.")
     if settings.capability == "priority_rpm" and any(
-        record.http_status is not None and 200 <= record.http_status < 300
-        and record.dispatch_ms is not None and record.dispatch_ms > first_rejection
+        record.dispatch_ms is not None and record.dispatch_ms > first_rejection
         and record.completed_ms is not None and record.completed_ms <= observation.get("end_ms", 0)
-        for record in affected
+        for record in affected_admissions
     ):
         return outcome("observed_failure", "A request dispatched after strict priority pool exhaustion was admitted in the same window.", "fail")
-    prior_admissions = [record for record in affected
-                        if record.http_status is not None and 200 <= record.http_status < 300
-                        and record.completed_ms is not None and record.completed_ms < first_rejection]
+    prior_admissions = [record for record in affected_admissions
+                        if record.completed_ms is not None and record.completed_ms < first_rejection]
     if len(prior_admissions) < declared.rpm:
         # RPM can be charged before a downstream failure; its admission is unknown.
         uncertain_prior = sum(record not in prior_admissions and record not in recognized
