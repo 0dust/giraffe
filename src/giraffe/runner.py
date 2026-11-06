@@ -61,7 +61,8 @@ def _stats(records: list[RequestRecord]) -> dict:
     good = [r for r in records if r.status == "completed" and r.valid]
     latencies = [r.elapsed_ms for r in good]
     output = [r.first_output_ms for r in good if r.first_output_ms is not None]
-    evaluated = [r for r in records if r.status != "cancelled" and not _reasoning_budget(r)]
+    evaluated = [r for r in records if r.status != "cancelled" and not _reasoning_budget(r)
+                 and not r.rate_limited]
     errors = sum(r.status in {"failed", "timeout"} or (r.status == "completed" and not r.valid) for r in evaluated)
     rates = [r.output_tokens / (r.elapsed_ms / 1000) for r in good
              if r.output_tokens is not None and r.elapsed_ms > 0]
@@ -73,6 +74,7 @@ def _stats(records: list[RequestRecord]) -> dict:
         "reasoning_budget_exhausted": sum(map(_reasoning_budget, records)),
         "timed_out": sum(r.status == "timeout" for r in records),
         "cancelled": sum(r.status == "cancelled" for r in records),
+        "rate_limited": sum(r.rate_limited for r in records),
         "error_rate": errors / len(evaluated) if evaluated else None,
         "p50_ms": percentile(latencies, .5), "p95_ms": percentile(latencies, .95),
         "first_output_p50_ms": percentile(output, .5),
@@ -257,6 +259,7 @@ class _Run:
         self.dropped_offers = 0
         self.budget_counts = Counter()
         self.errors = 0
+        self.rate_limit_until = {target.name: 0.0 for target in config.targets}
         self.reason: str | None = None
         self.limits_reached = set()
         self.memory_limit_reached = False
@@ -572,6 +575,9 @@ class _Run:
         ``finalize_record`` synchronously adds scheduler-owned measurements before
         the evidence snapshot, including cancellation and postprocessing failures.
         """
+        wait = self.rate_limit_until[target.name] - time.monotonic()
+        if wait > 0:
+            await asyncio.sleep(min(wait, max(0.0, self.deadline - time.monotonic())))
         check_ids = [name for name in spec.check_ids if name in self.config.checks
                      and (not _stress(spec.scenario) or name not in {"access", "serving", "first_output", "generation"})
                      and (name != "generation" or spec.scenario == "generation")
@@ -774,7 +780,12 @@ class _Run:
                         self.mark_unfinished(target.name, _scenario_checks(spec))
                 budget_only = bool(set(spec.check_ids) & {"prefix", "sessions", "tools"}) and reasoning_budget(record)
                 if _serving_failure(record, spec.scenario) and not readiness and not intentional and not budget_only:
-                    self.errors += 1
+                    if record.rate_limited:
+                        retry_after = record.retry_after_seconds or 0.0
+                        self.rate_limit_until[target.name] = max(
+                            self.rate_limit_until[target.name], time.monotonic() + retry_after)
+                    else:
+                        self.errors += 1
                     record.check_ids = list(dict.fromkeys([*record.check_ids, *[
                         name for name in ("access", "serving", "first_output") if name in self.config.checks]]))
                 if budget_exempt:

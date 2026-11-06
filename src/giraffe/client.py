@@ -724,6 +724,14 @@ class LLMClient:
                 events = None
                 try:
                     record.http_status = response.status_code
+                    if response.status_code == 429:
+                        record.rate_limited = True
+                        retry_after = response.headers.get("retry-after")
+                        if retry_after:
+                            try:
+                                record.retry_after_seconds = max(0.0, float(retry_after))
+                            except ValueError:
+                                pass
                     record.backend_id = response.headers.get("x-backend-id") or response.headers.get(
                         "x-replica-id",
                     )
@@ -768,6 +776,10 @@ class LLMClient:
                                     "context size", "context window", "max_model_len",
                                     "inputs` tokens + `max_new_tokens`", "inputs` must have less than")):
                                 raise _ProtocolError(f"HTTP {response.status_code}: context length rejection")
+                        if response.status_code == 429:
+                            suffix = (f"; retry after {record.retry_after_seconds:g}s"
+                                      if record.retry_after_seconds is not None else "")
+                            raise _ProtocolError(f"rate limited (HTTP 429){suffix}")
                         raise _ProtocolError(f"HTTP {response.status_code}")
                     if stream:
                         if "application/json" in response.headers.get("content-type", ""):

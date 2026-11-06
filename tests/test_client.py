@@ -73,6 +73,23 @@ async def test_answer_stream_counts_usage_and_preserves_finish(monkeypatch):
     assert received[0]["max_tokens"] == 7
 
 
+async def test_rate_limit_records_retry_after(monkeypatch):
+    target = Target(name="local", url="http://local/v1", model="test")
+    config = RunConfig(targets=[target])
+    original = httpx.AsyncClient
+    monkeypatch.setattr("giraffe.client.httpx.AsyncClient", lambda **kwargs: original(
+        transport=httpx.MockTransport(lambda _: httpx.Response(429, headers={"Retry-After": "1.5"})), **kwargs,
+    ))
+    async with LLMClient(target, config) as client:
+        record = await client.execute(spec())
+
+    assert record.status == "failed"
+    assert record.http_status == 429
+    assert record.rate_limited
+    assert record.retry_after_seconds == 1.5
+    assert record.error == "rate limited (HTTP 429); retry after 1.5s"
+
+
 class Chunks(httpx.AsyncByteStream):
     def __init__(self, chunks):
         self.parts = chunks
