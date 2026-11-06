@@ -161,7 +161,7 @@ def _comparison_manifest(manifest: dict) -> dict:
     return value
 
 
-def _run_limits_workload_identity(manifest: dict, *, revision: str) -> dict | None:
+def _run_limits_workload_identity(manifest: dict, *, revision: str, include_load: bool = False) -> dict | None:
     """Reconstruct only identities whose generator revision is known exactly."""
     raw = manifest.get("config", {})
     legacy = revision == "legacy"
@@ -171,16 +171,18 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str) -> dict | No
         resolved = RunConfig.model_validate({**config, "max_requests": None, "max_duration_seconds": None})
     except ValidationError:
         return None
-    if revision in {"issue45", "issue95", "issue95_pauses", "issue95_pause_evidence", "persistent_users", "gateway_attribution", "shared_conversations", "gateway_conversations", "gateway_shared_first"}:
+    if revision in {"issue45", "issue95", "issue95_pauses", "issue95_pause_evidence", "persistent_users", "gateway_attribution", "shared_conversations", "gateway_conversations", "gateway_shared_first", "gateway_shared_targets_first"}:
         unchanged_checks = {"sessions", "consistency"}
-        if revision in {"issue95_pause_evidence", "persistent_users", "gateway_attribution", "shared_conversations", "gateway_conversations", "gateway_shared_first"}:
+        if revision in {"issue95_pause_evidence", "persistent_users", "gateway_attribution", "shared_conversations", "gateway_conversations", "gateway_shared_first", "gateway_shared_targets_first"}:
             # Optional user/gateway dispatch changed the shared file; these
             # specialist requests are unchanged at these exact revisions.
             unchanged_checks.add("prefix")
+        if include_load:
+            unchanged_checks.add("load")  # The caller separately attests the Load source.
         if not set(resolved.checks) <= unchanged_checks:
-            return None  # Load generators changed; attest unchanged specialists only.
+            return None
     sampled_sessions = "sessions" in resolved.checks and resolved.sessions and resolved.sessions.sampling is not None
-    if sampled_sessions and revision not in {"persistent_users", "shared_conversations", "gateway_attribution", "gateway_conversations", "gateway_shared_first"}:
+    if sampled_sessions and revision not in {"persistent_users", "shared_conversations", "gateway_attribution", "gateway_conversations", "gateway_shared_first", "gateway_shared_targets_first"}:
         return None  # Earlier revisions have no attested sampled-traffic equivalent.
     settings = {}
     for field, checks in WORKLOAD_CHECKS.items():
@@ -210,6 +212,7 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str) -> dict | No
             "shared_conversations": "d9a9e921584262148e06b636f0e8f195b7e530fd2a69c5e98f013359cf947ede",
             "gateway_conversations": "bcdc3b8411d9039e90a35bcd5b109504e7123e95ec6baebd5e654287b4774605",
             "gateway_shared_first": "7a16b503242045f808ecfdb41df6bc8c507ca68181aaf019f003dc2d4d2ffb72",
+            "gateway_shared_targets_first": "8037d490881621f37f1aef446474bc52a1ba276bcfcd174f39a14e37032dc9f0",
         }[revision] if any(settings.values()) else None,
         "settings": settings,
     }
@@ -220,6 +223,7 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str) -> dict | No
             "gateway_attribution": "2fab1370faeab7ddb91a7ae9c0e49520ee9a67e305441a0663877bb12bca24c3",
             "gateway_conversations": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
             "gateway_shared_first": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
+            "gateway_shared_targets_first": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
         }[revision]
     if "concurrency" in resolved.checks:
         identity["concurrent_load_source_sha256"] = {
@@ -246,6 +250,7 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str) -> dict | No
             "shared_conversations": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
             "gateway_conversations": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
             "gateway_shared_first": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
+            "gateway_shared_targets_first": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
         }[revision]
     if "tools" in resolved.checks:
         from .tool_checks import resolved_tool_fixtures, resolved_tool_modes
@@ -264,7 +269,7 @@ def _same_run_limits_workload(current: dict, old: dict) -> bool:
     if current.get("config", {}).get("config_version") != 2 or old.get("config", {}).get("config_version", 2) != 2:
         return False
     for manifest in (current, old):
-        revisions = ("phase2", "phase3", "review26", "caps26", "issue45", "issue95", "issue95_pauses", "issue95_pause_evidence", "persistent_users", "gateway_attribution", "shared_conversations", "gateway_conversations", "gateway_shared_first") if "config_version" in manifest.get("config", {}) else ("legacy",)
+        revisions = ("phase2", "phase3", "review26", "caps26", "issue45", "issue95", "issue95_pauses", "issue95_pause_evidence", "persistent_users", "gateway_attribution", "shared_conversations", "gateway_conversations", "gateway_shared_first", "gateway_shared_targets_first") if "config_version" in manifest.get("config", {}) else ("legacy",)
         identities = [_run_limits_workload_identity(manifest, revision=revision) for revision in revisions]
         if not any(identity is not None and fixture_hash(identity) == manifest.get("fixture_pack", {}).get("workload_fixture_sha256")
                    for identity in identities):
@@ -279,19 +284,16 @@ def _same_run_limits_workload(current: dict, old: dict) -> bool:
 def _same_load_workload(current: dict, old: dict) -> bool:
     """Attest unchanged Load dispatch within exact source-equivalence groups."""
     # Keep the historical nonce-only change separate from current admission
-    # semantics. Optional gateway dispatch changes the generator file, not Load.
-    revisions = (
-        (("d9a9e921584262148e06b636f0e8f195b7e530fd2a69c5e98f013359cf947ede",),
+    # semantics. Only the newer group attests Load with specialist workloads.
+    families = (
+        (("shared_conversations",),
          ("9b694c97a39d449d8ea15b09a9aeb406bf835179c0882827685c4d7888687d36",
-          "df3b7bbf30cab87d2e8c1c6dab8819f9cfe592b181407caa7c32af4c5f720cd4")),
-        (("d9a9e921584262148e06b636f0e8f195b7e530fd2a69c5e98f013359cf947ede",
-          "bcdc3b8411d9039e90a35bcd5b109504e7123e95ec6baebd5e654287b4774605",
-          "7a16b503242045f808ecfdb41df6bc8c507ca68181aaf019f003dc2d4d2ffb72"),
+          "df3b7bbf30cab87d2e8c1c6dab8819f9cfe592b181407caa7c32af4c5f720cd4"), False),
+        (("shared_conversations", "gateway_conversations", "gateway_shared_first", "gateway_shared_targets_first"),
          ("113325dd5cffa04626cc7be7ee93bc6e9be67335531288bc329b3542a155c92a",
-          "788f4c8f0b14421d5fc00f8b32c0ffcef79c04c647730767cb44b16584ed4aa4")),
+          "788f4c8f0b14421d5fc00f8b32c0ffcef79c04c647730767cb44b16584ed4aa4"), True),
     )
-    settings = []
-    matched_groups = []
+    matches = []
     for manifest in (current, old):
         raw = manifest.get("config", {})
         if raw.get("config_version") != 2 or "load_test" not in raw:
@@ -301,20 +303,29 @@ def _same_load_workload(current: dict, old: dict) -> bool:
         except ValidationError:
             return False
         fields = {field for field, checks in WORKLOAD_CHECKS.items() if checks.intersection(resolved.checks)}
-        if fields != {"load_test"}:
+        if "load_test" not in fields:
             return False
-        load_settings = resolved.load_test.model_dump(mode="json")
-        groups = {index for index, (generators, sources) in enumerate(revisions)
-                  if any(fixture_hash({"generator_source_sha256": generator,
-                                       "settings": {"load_test": load_settings},
-                                       "load_test_source_sha256": source}) ==
-                         manifest.get("fixture_pack", {}).get("workload_fixture_sha256")
-                         for generator in generators for source in sources)}
-        if not groups:
+        load_only = fields == {"load_test"}
+        # Core checks with no generated workload keep their existing Load bridge.
+        identity_manifest = {**manifest, "config": {**raw, "checks": ["load"]}} if load_only else manifest
+        recorded = manifest.get("fixture_pack", {}).get("workload_fixture_sha256")
+        attestations = set()
+        for index, (revisions, sources, allows_specialists) in enumerate(families):
+            if not load_only and not allows_specialists:
+                continue
+            for revision in revisions:
+                identity = _run_limits_workload_identity(identity_manifest, revision=revision, include_load=True)
+                if identity is None or not any(fixture_hash({**identity, "load_test_source_sha256": source}) == recorded
+                                               for source in sources):
+                    continue
+                # The generator and Load source are attested by the family.
+                # Specialist sources and settings must still match exactly.
+                del identity["generator_source_sha256"]
+                attestations.add((index, fixture_hash(identity)))
+        if not attestations:
             return False
-        settings.append(load_settings)
-        matched_groups.append(groups)
-    return settings[0] == settings[1] and bool(matched_groups[0] & matched_groups[1])
+        matches.append(attestations)
+    return bool(matches[0] & matches[1])
 
 
 def _limits_reached(report: RunReport) -> set[str]:
