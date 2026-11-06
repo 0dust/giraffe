@@ -714,6 +714,8 @@ def test_probe_timing_regression_requires_heavy_overlap_in_both_runs(exposure):
             matched_requests = user_requests[:-1] if late_unmatched else user_requests
             if report is current and exposure == "partial":
                 matched_requests = matched_requests[:1]
+            for item in matched_requests:
+                item.workload["matched_work_sha256"] = "same"
             controls = [item.model_copy(deep=True, update={"id": f"control-{item.id}", "check_ids": []})
                         for item in matched_requests]
             evidence["users"][0].update(status="pass", qualified=True, reasons=[],
@@ -779,7 +781,11 @@ def test_new_interference_failure_survives_incomplete_peer_cancellation_baseline
     for report in (current, previous):
         interference = report.checks[0].metrics["multi_user"]["windows"][0]["interference"]
         interference.update(status="pass", qualified=True, reasons=[])
-        interference["users"][0].update(status="pass", qualified=True, reasons=[], matched_samples=1)
+        user = interference["users"][0]
+        user.update(status="pass", qualified=True, reasons=[], matched_samples=1)
+        for item in report.requests:
+            if item.id in user["control_request_ids"] + user["probe_request_ids"]:
+                item.workload["matched_work_sha256"] = "same"
     current.checks[0].metrics["multi_user"]["windows"][0]["interference"]["users"][0].update(
         status="fail", reasons=["Short user slowdown exceeds the selected limit."])
     compared = compare_baseline(current, previous)
@@ -931,6 +937,90 @@ def test_baseline_compares_heavy_work_per_matched_probe(limit, case):
         reason = ("exposure per matched probe differs" if extra_exposure
                   else "exposure per probe is missing or incomplete")
         assert reason in comparison["reason"]
+        assert set(comparison["evidence_ids"]) == {item.id for item in current.requests}
+
+
+
+@pytest.mark.parametrize("limit", [None, 3])
+@pytest.mark.parametrize("case", ["swapped_exposure", "swapped_short_work", "extra_repetitions", "missing_work"])
+def test_baseline_compares_competitor_exposure_for_the_same_short_work(limit, case):
+    from tests.test_multi_user_scenarios import matched_observation
+
+    current, baseline = user_report(), user_report()
+    slow_case = case in {"swapped_exposure", "swapped_short_work"}
+    for report in (current, baseline):
+        source, templates = matched_observation()
+        source["settings"].update(duration_seconds=4)
+        source["settings"]["noisy_neighbors"]["max_slowdown"] = limit
+        report.manifest["config"]["multi_user"].update(source["settings"])
+        control_window, probe_window = source["windows"]
+        for start, window in zip((0, 4000), source["windows"]):
+            window.update(start_ms=start, end_ms=start + 4000, planned_end_ms=start + 4000,
+                          duration_seconds=4, planned_duration_seconds=4)
+            for user in window["users"]:
+                user.update(activated_ms=start, ready_count=0, dispatched_count=0, request_ids=[])
+
+        def add(template, window, sequence, dispatch, elapsed, **fields):
+            item = template.model_copy(deep=True, update={
+                "id": f"{template.id}-{sequence}-{dispatch}", "target": "local",
+                "dispatch_ms": dispatch, "timing_start_ms": dispatch, "request_body_sent_ms": dispatch,
+                "completed_ms": dispatch + elapsed, "elapsed_ms": elapsed, "stream_end_ms": elapsed,
+                "last_output_ms": elapsed - 5, **fields,
+            })
+            item.workload.update(scenario=window["scenario"], trigger=window["trigger"],
+                                 heavy_profile=window["heavy_profile"], population=window["population"],
+                                 request_sequence=sequence, matched_work_sequence=sequence, ready_ms=dispatch)
+            user = next(user for user in window["users"] if user["user_id"] == item.workload["user_id"])
+            user["ready_count"] += 1
+            user["dispatched_count"] += 1
+            user["request_ids"].append(item.id)
+            requests.append(item)
+            return item
+
+        requests = []
+        repeat = report is current and case == "extra_repetitions"
+        for sequence, work in enumerate("BABA" if repeat else "AB", 1):
+            offset = 100 + (sequence - 1) * 900
+            changed_work = report is current and case == "swapped_short_work"
+            tokens = 8 if (work == "A") != changed_work else 16
+            elapsed = 850 if report is current and slow_case else 350
+            control = add(templates[0], control_window, sequence, offset, 200,
+                          fixture_id=work, output_tokens=tokens)
+            probe = add(templates[1], probe_window, sequence, 4000 + offset, elapsed,
+                        fixture_id=work, output_tokens=tokens)
+            control.workload["matched_work_sha256"] = probe.workload["matched_work_sha256"] = work
+            swapped_exposure = report is current and case == "swapped_exposure"
+            heavy_count = 2 if (work == "A") != swapped_exposure else 1
+            for index in range(heavy_count):
+                competitor = add(templates[2], probe_window, sequence, 4070 + offset + 120 * index, 110)
+                competitor.workload["trigger_ms"] = competitor.dispatch_ms
+
+        summary = summarize(source, requests)
+        short, = summary["windows"][1]["interference"]["users"]
+        assert short["qualified"], short["reasons"]
+        assert short["matched_samples"] == (4 if repeat else 2)
+        assert len(short["heavy_request_ids"]) == (6 if repeat else 3)
+        assert short["slowdown"] == (4.25 if report is current and slow_case else 1.75)
+        if report is current and case == "missing_work":
+            probe.workload.pop("matched_work_sha256")
+        report.requests = requests
+        report.checks[0].metrics["multi_user"] = summary
+        report.checks[0].status = report.overall = summary["status"]
+
+    compared = compare_baseline(current, baseline).baseline
+    target, = compared["targets"]
+    comparable = case == "extra_repetitions"
+    assert compared["status"] == target["status"] == ("pass" if comparable else "inconclusive")
+    assert compared["acceptance"]["current"] == ("fail" if limit is not None and slow_case else "pass")
+    delivery, = [row for row in target["comparisons"] if row["metric"] == "shared_window_output_tokens_per_second"
+                 and row["role"] == "probe" and row["user_id"] == "user-01"]
+    assert delivery["status"] == "pass"
+    assert delivery["timing_exposure_qualified"] == comparable
+    if not comparable:
+        metric = "matched_interference_slowdown" if limit is None else "scenario_acceptance"
+        comparison, = [row for row in target["comparisons"] if row["metric"] == metric]
+        assert comparison["status"] == "inconclusive"
+        assert "logical short work" in comparison["reason"]
         assert set(comparison["evidence_ids"]) == {item.id for item in current.requests}
 
 
