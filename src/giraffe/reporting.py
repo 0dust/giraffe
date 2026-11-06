@@ -26,7 +26,7 @@ from .caps import (MAX_HTML_PREVIEW_CHARS, MAX_HTML_JSON_PREVIEW_CHARS,
                    MAX_FAILURE_SUMMARY_CHARS)
 from .deployment import deployment_diff, fixture_hash, safe_config, sanitize
 from .report_inputs import input_ref as _input_ref
-from .multi_user_metrics import truncated_conversation_turn, user_delivery_completions, user_latency
+from .multi_user_metrics import _length_mix_differs, truncated_conversation_turn, user_delivery_completions, user_latency
 from .models import (CHECK_NAMES, SHAPES, CheckResult, RequestRecord, RunConfig, RunReport, overall_status, load_shape_label,
                      migrate_concurrent_load, migrate_run_limits, is_supported_schema, CURRENT_SCHEMA)
 from .stats import median, percentile
@@ -689,23 +689,53 @@ def _input_work_changed(current, old, threshold):
 
 
 def _live_input_work_changed(current, old, threshold):
+    """Match generated history at each repeated conversation's logical turn."""
     histories = []
     for records in (current, old):
-        groups = defaultdict(list)
+        history = {}
         for record in records:
-            if record.valid and record.workload.get("mode") == "live":
-                if not record.request_hash or record.input_tokens is None:
-                    return True
-                groups[record.request_hash].append(record)
-        histories.append(groups)
-    current_histories, old_histories = histories
-    current_count = sum(map(len, current_histories.values()))
-    old_count = sum(map(len, old_histories.values()))
-    return (set(current_histories) != set(old_histories)
-            or any(abs(Fraction(len(records), current_count)
-                       - Fraction(len(old_histories[request_hash]), old_count)) > Fraction(1, 10)
-                   or _input_work_changed(records, old_histories[request_hash], threshold)
-                   for request_hash, records in current_histories.items()))
+            if record.intentional or record.workload.get("mode") != "live":
+                continue
+            sequence, turn = (record.workload.get(key) for key in ("conversation_sequence", "turn_id"))
+            if (type(sequence) is not int or sequence < 1 or type(turn) is not int or turn < 0
+                    or not record.request_hash or record.input_tokens is None or (sequence, turn) in history):
+                return True
+            history[sequence, turn] = record
+        histories.append(history)
+    if not any(histories):
+        return False
+
+    positions = [sorted(history) for history in histories]
+    common = min(map(len, positions))
+    if not common or positions[0][:common] != positions[1][:common]:
+        return True
+    for position in positions[0][:common]:
+        latest, previous = (history[position] for history in histories)
+        if (latest.request_hash != previous.request_hash
+                or abs(latest.input_tokens - previous.input_tokens)*100 > previous.input_tokens*threshold):
+            return True
+    if len(positions[0]) == len(positions[1]):
+        return False
+
+    # An extra exact-recall repetition has a fresh marker even with identical
+    # work. Only a scored suffix with comparable token work can be unmatched.
+    cohorts = []
+    for history, keys in zip(histories, positions):
+        if any(record.workload.get("task_type") != "exact_repeat" or record.score is not True
+               for record in (history[key] for key in keys[common:])):
+            return True
+        turns = defaultdict(list)
+        for (_, turn), record in history.items():
+            turns[turn].append(record)
+        cohorts.append(turns)
+    if cohorts[0].keys() != cohorts[1].keys():
+        return True
+    for turn in cohorts[0]:
+        for metric in ("input_tokens", "output_tokens"):
+            lengths = [[getattr(record, metric) for record in turns[turn]] for turns in cohorts]
+            if any(None in values for values in lengths) or _length_mix_differs(lengths, threshold):
+                return True
+    return False
 
 
 def _load_not_delivered(point):
@@ -1219,10 +1249,18 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold):
                          "worsening": 100, "reason": "This user's previously accepted scenario now fails its selected criteria.",
                          "observed_change": None, "observed_delta": None})
         if c.get("status") == "fail" and b.get("status") == "pass" and not work_reason and not mix_changed:
-            rows.append({**row, "metric": "user_acceptance", "status": "fail",
-                         "current": "fail", "baseline": "pass", "aggregation": "selected_criteria",
-                         "worsening": 100, "reason": "This previously accepted user now fails its selected criteria.",
-                         "observed_change": None, "observed_delta": None})
+            acceptance = {**row, "metric": "user_acceptance", "current": "fail", "baseline": "pass",
+                          "aggregation": "selected_criteria", "observed_change": None, "observed_delta": None}
+            # Acceptance also includes attempts that drain after delivery closes.
+            if _live_input_work_changed(current_work, old_work, threshold):
+                reason = (f"Multi-user {user_id} at {population} users: Live work behind the selected "
+                          "acceptance criteria differs or lacks evidence.")
+                incomplete.append(reason)
+                acceptance.update(status="inconclusive", worsening=None, reason=reason)
+            else:
+                acceptance.update(status="fail", worsening=100,
+                                  reason="This previously accepted user now fails its selected criteria.")
+            rows.append(acceptance)
     return rows, incomplete
 
 
@@ -1377,7 +1415,14 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                 observed_outputs.extend(outputs)
                 different_work = _different_output_work(current_work, old_work, threshold)
                 input_work_changed = _input_work_changed(current_records, old_records, threshold)
-                live_inputs_differ = any(r.workload.get("mode")=="live" for r in current_records) and Counter(r.request_hash for r in current_records) != Counter(r.request_hash for r in old_records)
+                if check == "multi_user":
+                    live_inputs_differ = _live_input_work_changed(
+                        [r for r in current_records if r.status == "completed" and r.valid],
+                        [r for r in old_records if r.status == "completed" and r.valid], threshold)
+                else:
+                    live_inputs_differ = (any(r.workload.get("mode") == "live" for r in current_records)
+                                          and Counter(r.request_hash for r in current_records)
+                                          != Counter(r.request_hash for r in old_records))
                 for metric, values in current_metrics.items():
                     if not values and not old_metrics[metric]:
                         continue
