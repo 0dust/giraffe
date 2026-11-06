@@ -303,6 +303,7 @@ class _Run:
         self.request_plan_rows = request_plan(config)["rows"]
         self.endpoint_health = {t.name: {"first_attempt_seconds": None, "last_response_seconds": None,
             "consecutive_failures": 0, "failure_request_ids": [], "abort_reason": None} for t in config.targets}
+        self._retired_endpoint_watchdogs: set[str] = set()
         self.target_tasks = {}
         self.stop_notified = False
         for target, observation in self.observations.items():
@@ -460,6 +461,11 @@ class _Run:
                     self.pending_checks[key] = "judging"
             else:
                 self.pending_checks.pop(key, None)
+        if (self.config.unresponsive_after_failures and target not in self._retired_endpoint_watchdogs
+                and not any(name == target and phase == "inference"
+                            and check != "gpu" and check not in SHARED_BASELINE_EXCLUDED_WORKLOADS
+                            for (name, check), phase in self.pending_checks.items())):
+            self.retire_endpoint_watchdog(target)
 
     @contextmanager
     def gateway_limit_phase(self):
@@ -526,18 +532,9 @@ class _Run:
             if self.duration_limit_scope is None:
                 self.duration_limit_scope = "gateway" if self._gateway_only_phase else "shared"
             self.reason = self.reason or "maximum run duration reached"
-        for name, health in self.endpoint_health.items():
-            since = health["last_response_seconds"]
-            if since is None:
-                since = health["first_attempt_seconds"]
-            silence = time.monotonic() - self.start - since if since is not None else 0
-            if (self.config.unresponsive_after_failures and not health["abort_reason"]
-                    and health["consecutive_failures"] >= self.config.unresponsive_after_failures
-                    and silence >= self.config.unresponsive_for_seconds):
-                health["abort_reason"] = (f"Endpoint {name} unresponsive: no response for {silence:.3g}s "
-                    f"after {health['consecutive_failures']} consecutive failed requests")
-                self.unfinished[name].update(self.config.checks)
-                self.emit("target_stopping", name, abort_reason=health["abort_reason"])
+        if self.config.unresponsive_after_failures:
+            for name in self.endpoint_health:
+                self._check_endpoint_watchdog(name)
         if all(health["abort_reason"] for health in self.endpoint_health.values()):
             self.reason = self.reason or "; ".join(health["abort_reason"] for health in self.endpoint_health.values())
         if self.errors >= self.config.stop_after_errors:
@@ -547,6 +544,28 @@ class _Run:
             self.stop_notified = True
             self.emit("run_stopping", abort_reason=self.reason)
         return (self.endpoint_health[target]["abort_reason"] if target else None) or self.reason
+
+    def _check_endpoint_watchdog(self, target):
+        health = self.endpoint_health[target]
+        if (target in self._retired_endpoint_watchdogs or health["abort_reason"]
+                or health["consecutive_failures"] < self.config.unresponsive_after_failures):
+            return
+        since = health["last_response_seconds"]
+        if since is None:
+            since = health["first_attempt_seconds"]
+        silence = time.monotonic() - self.start - since if since is not None else 0
+        if silence >= self.config.unresponsive_for_seconds:
+            health["abort_reason"] = (f"Endpoint {target} unresponsive: no response for {silence:.3g}s "
+                f"after {health['consecutive_failures']} consecutive failed requests")
+            self.unfinished[target].update(self.config.checks)
+            self.emit("target_stopping", target, abort_reason=health["abort_reason"])
+
+    def retire_endpoint_watchdog(self, target):
+        # Record an already-reached threshold before excluding later gateway
+        # work, judging, and teardown from this endpoint's silence window.
+        if self.config.unresponsive_after_failures and target not in self._retired_endpoint_watchdogs:
+            self._check_endpoint_watchdog(target)
+            self._retired_endpoint_watchdogs.add(target)
 
     def endpoint_attempt(self, target):
         health = self.endpoint_health[target]
@@ -1547,6 +1566,7 @@ async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attributio
 
     finally:
         try:
+            run.retire_endpoint_watchdog(target.name)
             preparation = run.observations[target.name].get("preparation", {})
             if preparation.get("status") == "running":
                 reason = run.stop_reason(target.name)

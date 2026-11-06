@@ -35,7 +35,7 @@ def configuration(mode="key_rpm", **changes):
 async def exercise(monkeypatch, mode="key_rpm", *, behavior="enforce", full=False,
                    admitted_affected=None, rejection_saturation=None, saturation_header=None, peer_delay=.01,
                    early_peer_admissions=None, restart=False, model_tpm="not configured",
-                   rejection_unit=None, key_reset="2026-01-01 00:00:00 UTC", **settings):
+                   rejection_unit=None, key_reset="2026-01-01 00:00:00 UTC", max_requests=None, **settings):
     monkeypatch.setenv("LIMITED", "limited-secret")
     monkeypatch.setenv("PEER", "peer-secret")
     if behavior == "duplicate_credentials":
@@ -135,6 +135,8 @@ async def exercise(monkeypatch, mode="key_rpm", *, behavior="enforce", full=Fals
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handle), **kw))
     from giraffe.gateway_policy import execute, result
     cfg = configuration(mode, **settings)
+    if max_requests is not None:
+        cfg.max_requests = max_requests
     if behavior == "cached_response":
         cfg.request_options = {"cache": {"no-cache": False, "no-store": False, "use-cache": True}}
     if full:
