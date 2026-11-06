@@ -319,7 +319,7 @@ def result(run, target):
     status = {"not_selected": "skipped", "verified": "pass", "mismatch": "fail"}.get(data["state"], "inconclusive")
     configured = (run.config.gateway_attribution is not None and target.gateway is not None
                   and target.gateway.profile == "litellm")
-    required = selected and (configured or run.config.checks == [CHECK])
+    required = selected and (run.config.checks == [CHECK] or (configured and data["state"] != "unsupported"))
     return CheckResult(id=CHECK, target=target.name, title="Gateway usage attribution", required=required,
                        status=status, summary=data["reason"], metrics=data,
                        evidence_ids=[r.id for r in run.records if r.target == target.name and CHECK in r.check_ids])
