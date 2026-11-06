@@ -32,7 +32,7 @@ def configuration(mode="key_rpm", **changes):
 
 
 async def exercise(monkeypatch, mode="key_rpm", *, behavior="enforce", full=False,
-                   admitted_affected=None, rejection_saturation=50.0, peer_delay=.01, **settings):
+                   admitted_affected=None, rejection_saturation=50.0, saturation_header=None, peer_delay=.01, **settings):
     monkeypatch.setenv("LIMITED", "limited-secret")
     monkeypatch.setenv("PEER", "peer-secret")
     if behavior == "duplicate_credentials":
@@ -69,6 +69,8 @@ async def exercise(monkeypatch, mode="key_rpm", *, behavior="enforce", full=Fals
                 message = "OpenAIException: provider rate limit"
             if behavior == "contradictory_pool":
                 headers["x-litellm-model-group"] = "other-pool"
+            if saturation_header is not None:
+                headers["x-litellm-saturation"] = saturation_header
             return httpx.Response(429, headers=headers, json={"error": {
                 "type": "throttling_error", "code": "429", "message": message}})
         usage = {"prompt_tokens": 8, "completion_tokens": 2}
@@ -84,9 +86,13 @@ async def exercise(monkeypatch, mode="key_rpm", *, behavior="enforce", full=Fals
             headers["x-litellm-attempted-fallbacks"] = "1"
         if behavior == "cached_response":
             headers["x-litellm-cache-key"] = CACHE_KEY
-        role = "user" if behavior == "malformed_peer" and who == "peer" else "assistant"
-        return httpx.Response(200, headers=headers, json={"model": "test", "choices": [{"message": {
-            "role": role, "content": "OK"}, "finish_reason": "stop"}], "usage": usage})
+        message = {"role": "assistant", "content": "OK"}
+        if who == "peer":
+            message.update({"malformed_peer": {"role": "user"}, "peer_tool_call": {"tool_calls": [{}]},
+                            "peer_function_call": {"function_call": {}},
+                            "peer_invalid_refusal": {"refusal": []}}.get(behavior, {}))
+        return httpx.Response(200, headers=headers, json={"model": "test", "choices": [{"message": message,
+            "finish_reason": "stop"}], "usage": usage})
 
     original = httpx.AsyncClient
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handle), **kw))

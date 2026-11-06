@@ -10,7 +10,7 @@ from .identities import identity_headers, litellm_key_fingerprint
 from .models import CheckResult, RequestSpec
 
 
-VERSION = 7
+VERSION = 8
 PROMPT = "Reply with exactly the word OK."
 
 
@@ -234,6 +234,21 @@ def summarize(settings, observation, records):
         for record in affected_admissions
     ):
         return outcome("observed_failure", "A request dispatched after strict priority pool exhaustion was admitted in the same window.", "fail")
+    borrowing_uncertain = False
+    if settings.capability == "priority_rpm":
+        # Each identity dispatches serially, so only admissions beyond its
+        # reservation depend on whether the shared pool had reached saturation.
+        for record in affected_admissions[declared.rpm:]:
+            if record.dispatch_ms is not None and sum(
+                other is not record and other.completed_ms is not None and other.completed_ms < record.dispatch_ms
+                for other in admissions
+            ) >= crossing:
+                return outcome("observed_failure", "A request exceeded its reserved RPM after completed admissions reached model saturation.", "fail")
+            if record.completed_ms is None or sum(
+                other is not record and (other.dispatch_ms is None or other.dispatch_ms <= record.completed_ms)
+                for other in admissions
+            ) >= crossing:
+                borrowing_uncertain = True
     prior_admissions = [record for record in affected_admissions
                         if record.completed_ms is not None and record.completed_ms < first_rejection]
     if len(prior_admissions) < declared.rpm:
@@ -248,6 +263,8 @@ def summarize(settings, observation, records):
         return outcome("unverified", "Affected identity received 429 responses that do not identify the declared gateway policy.")
     if not summary["complete"] or any(user["cancelled"] or user["other_failures"] for user in users):
         return outcome("unverified", "Traffic was interrupted or non-policy failures left incomplete evidence.")
+    if borrowing_uncertain:
+        return outcome("unverified", "Overlapping admissions leave saturation uncertain when a request exceeded its reserved RPM.")
     if not summary["peer_continuation"]:
         return outcome("unexercised", "Peer service after policy rejection was not observed within the same window.")
     if any(user["rejected"] for user in users if user["identity"] != settings.affected_identity):

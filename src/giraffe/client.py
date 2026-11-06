@@ -603,9 +603,12 @@ class LLMClient:
                     record.assistant_message = {"role": "assistant", **content}
                 else:
                     assistant_content_present |= isinstance(content.get("content"), str)
-            if policy_probe and (content.get("role") != "assistant"
-                                 or choice.get("finish_reason") not in ("stop", "length")):
-                raise _ProtocolError("gateway policy probe requires a completed assistant answer")
+            if policy_probe:
+                if (content.get("role") != "assistant" or choice.get("finish_reason") not in ("stop", "length")
+                        or content.get("tool_calls") not in (None, []) or content.get("function_call") is not None):
+                    raise _ProtocolError("gateway policy probe requires a completed assistant answer")
+                for field in ("reasoning_content", "reasoning", "refusal"):
+                    _text(content.get(field))
             answer = _text(content.get("content"))
             if logprob_collector is not None:
                 logprob_collector.add(choice.get("logprobs"))
