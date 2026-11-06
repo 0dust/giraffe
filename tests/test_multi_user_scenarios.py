@@ -651,7 +651,8 @@ def test_http_global_stop_cancels_all_users_and_retains_partial_once():
         cfg = settings(levels=[2], duration_seconds=60, scenarios=["cancellation"], profile=PROFILE,
                        cancellation={"cancel_after_chunks": 1000}).model_copy(update={
             "targets": [Target(name="service", model="fake-model", url=endpoint.url)]})
-        state = runner._Run(cfg, None, None)
+        events = []
+        state = runner._Run(cfg, events.append, None)
         async with LLMClient(cfg.targets[0], cfg, max_connections=2) as client:
             task = asyncio.create_task(execute(state, cfg.targets[0], client))
             async with asyncio.timeout(3):
@@ -662,6 +663,14 @@ def test_http_global_stop_cancels_all_users_and_retains_partial_once():
                 await task
         assert len(state.records) == len({r.id for r in state.records}) == 2
         assert all(r.status == "cancelled" and r.termination_reason == "user_stop" for r in state.records)
+        assert any(r.workload.get("cancellation_role") == "selected" for r in state.records)
+        assert not any(r.intentional for r in state.records)
+        completed = [event for event in events if event["event"] == "request_completed"]
+        assert len(completed) == 2
+        assert all(not event["intentional"] and not event["request"]["intentional"] for event in completed)
+        window = result(state, cfg.targets[0]).metrics["multi_user"]["windows"][0]
+        assert all(user["outcomes"]["cancelled"] == 1 and user["outcomes"]["intentional_cancelled"] == 0
+                   for user in window["users"])
         assert state.slots.qsize() == 2
         assert not any(r.workload.get("cancellation_role") == "followup" for r in state.records)
 

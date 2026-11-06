@@ -744,7 +744,7 @@ class _Run:
                     record.termination_reason = "request_timeout"
                     record.termination_limit_seconds = record.request_timeout_seconds
                 elif not record.termination_reason:
-                    record.termination_reason = "intentional_cancellation" if spec.cancel_after_ms or spec.cancel_after_chunks else "workload_cancelled"
+                    record.termination_reason = "intentional_cancellation" if spec.cancel_after_ms else "workload_cancelled"
                     record.termination_limit_seconds = spec.cancel_after_ms / 1000 if spec.cancel_after_ms else None
             record.condition_id = condition_id
             record.dispatch_ms = (started-self.start)*1000
@@ -760,8 +760,9 @@ class _Run:
             record.scheduled_ms = spec.workload.get("scheduled_ms")
             record.client_wait_ms = max(0, record.dispatch_ms-record.scheduled_ms) if record.scheduled_ms is not None else None
             record.overlap = overlap
-            intentional = ((spec.cancel_after_ms is not None or spec.cancel_after_chunks is not None)
-                           and record.status == "cancelled") or (
+            intentional = (record.status == "cancelled" and record.termination_reason in {
+                "generation_chunk_limit", "intentional_cancellation", "intentional_cancellation_deadline",
+            }) or (
                 timeout_override is not None and record.status == "timeout")
             record.intentional = intentional
             propagating_error = False
@@ -2161,7 +2162,9 @@ def _deadline_remediation(config):
     action = {"action": "set_limit", "limit": "max_duration"}
     if (all(item["id"] == "gateway_attribution" for item in plan["unknown_time_components"])
             and high is not None and math.isfinite(high)):
-        action["minimum"] = math.ceil(high)
+        minimum = math.ceil(high)
+        if minimum > (config.max_duration_seconds or 0):
+            action["minimum"] = minimum
     return action
 
 
