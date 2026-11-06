@@ -120,6 +120,77 @@ def test_matching_user_baseline_preserves_per_user_delivery_rows():
     assert all("worsening_interval_95" not in row for row in rates)
 
 
+@pytest.mark.parametrize(("change", "expected"), [({}, "fail"), ({"input_tokens": 200}, "inconclusive"),
+                                                    ({"output_tokens": None}, "inconclusive")])
+def test_measured_zero_delivery_compares_when_the_same_work_drains_after_cutoff(change, expected):
+    current, previous = user_report(), user_report()
+    for report in (current, previous):
+        settings = report.manifest["config"]["multi_user"]
+        settings["pass_criteria"]["min_output_tokens_per_second"] = 1
+        source = report.observations["targets"]["local"]["multi_user"]
+        source["settings"] = settings
+        if report is current:
+            for request in report.requests:
+                if request.workload["user_id"] == "user-05":
+                    request.completed_ms = 10100
+                    request.elapsed_ms = request.completed_ms - request.dispatch_ms
+                    for field, value in change.items():
+                        setattr(request, field, value)
+        summary = summarize(source, report.requests)
+        report.checks[0].metrics["multi_user"] = summary
+        report.checks[0].status = report.overall = summary["status"]
+
+    result = compare_baseline(current, previous)
+    rows = {row["metric"]: row for row in result.baseline["targets"][0]["comparisons"]
+            if row.get("user_id") == "user-05"}
+    rate = rows["shared_window_output_tokens_per_second"]
+    assert result.baseline["acceptance"] == {"current": "fail", "baseline": "pass"}
+    assert rate["status"] == rows["user_acceptance"]["status"] == expected
+    assert (rate["current"], rate["baseline"]) == (0, 80)
+    assert rate["current_samples"] == 0
+    if expected == "fail":
+        assert result.baseline["status"] == "fail"
+        assert rate["evidence_ids"] == [f"user-05-{i}" for i in range(8)]
+
+
+@pytest.mark.parametrize(("limit", "new_input_tokens", "new_overlap", "expected"), [
+    (1.1, 100, True, "fail"),
+    (1.1, 200, True, "inconclusive"),
+    (1.1, 100, False, "inconclusive"),
+    (None, 100, True, "pass"),
+])
+def test_selected_fairness_baseline_tracks_threshold_crossings_with_comparable_work(
+        limit, new_input_tokens, new_overlap, expected):
+    current, previous = user_report(), user_report()
+    current.requests = [request for request in current.requests if request.id != "user-05-7"]
+    for report in (current, previous):
+        settings = report.manifest["config"]["multi_user"]
+        settings["pass_criteria"]["max_throughput_ratio"] = limit
+        for request in report.requests:
+            request.stream = True
+            request.answer_chunks = request.answer_reads = 3 if report is previous or new_overlap else 1
+            request.last_output_ms = 90
+            if report is current:
+                request.input_tokens = new_input_tokens
+        source = report.observations["targets"]["local"]["multi_user"]
+        source["settings"] = settings
+        if report is current:
+            source["windows"][0]["users"][-1]["dispatched_count"] = 7
+        summary = summarize(source, report.requests)
+        report.checks[0].metrics["multi_user"] = summary
+        report.checks[0].status = report.overall = summary["status"]
+
+    result = compare_baseline(current, previous)
+    assert result.baseline["status"] == expected
+    fairness = [row for row in result.baseline["targets"][0]["comparisons"] if row["metric"] == "fairness_acceptance"]
+    if limit is None:
+        assert not fairness
+    else:
+        assert len(fairness) == 1 and fairness[0]["status"] == expected
+        assert fairness[0]["baseline"] == 1 and fairness[0]["current"] == pytest.approx(8 / 7)
+        assert result.baseline["acceptance"]["current"] == ("fail" if new_overlap else "inconclusive")
+
+
 def live_user_report():
     report = user_report()
     window = report.checks[0].metrics["multi_user"]["windows"][0]
