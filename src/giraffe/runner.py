@@ -569,7 +569,8 @@ class _Run:
     async def request(self, target, client, spec, event=None, on_start=None, timeout_override=None,
                       *, slot_reserved=False, budget_reserved=False, deadline_override=None,
                       admission_deadline=None, prepared_admission=False, admission_check=None,
-                      budget_exempt=False, evaluate_record=None, finalize_record=None, request_parameters=None):
+                      on_preparation_failure=None, budget_exempt=False, evaluate_record=None,
+                      finalize_record=None, request_parameters=None):
         """Complete a request and persist its terminal evidence once.
 
         ``finalize_record`` synchronously adds scheduler-owned measurements before
@@ -578,6 +579,7 @@ class _Run:
         their ordinary timeout, unlike ``deadline_override``.
         With ``prepared_admission``, HTTP preparation precedes admission and progress.
         ``admission_check`` checks caller-owned eligibility before committing an attempt.
+        ``on_preparation_failure`` can read a client diagnostic without recording an attempt.
         """
         check_ids = [name for name in spec.check_ids if name in self.config.checks
                      and (not _stress(spec.scenario) or name not in {"access", "serving", "first_output", "generation"})
@@ -725,6 +727,9 @@ class _Run:
                         raise asyncio.CancelledError
                     if deadline.expired():
                         self.mark_unfinished(target.name, _scenario_checks(spec))
+                    elif on_preparation_failure is not None:
+                        admission_clock()
+                        on_preparation_failure(record)
                     return None
                 if deadline.expired():
                     record.status, record.valid = ("cancelled" if global_deadline else "timeout"), False

@@ -11,6 +11,10 @@ from giraffe.models import CheckResult, RequestSpec
 
 EVIDENCE_VERSION = 2
 IDENTITY_CHANGED = "Test identity credentials changed after access preflight."
+_IDENTITY_FAILURE_REASONS = {
+    IDENTITY_CHANGED: "identity_changed",
+    "Test identity credentials are unavailable.": "identity_unavailable",
+}
 _TOOL_OPTIONS = ("tools", "tool_choice", "parallel_tool_calls", "functions", "function_call")
 QUALIFICATION = ("Only the declared identities and endpoint/model were exercised. "
                  "These fixtures do not certify tenant isolation or comprehensive gateway security.")
@@ -109,8 +113,8 @@ def observation(record):
         return "unverified", "not_run"
     if record.status == "cancelled":
         return "unverified", "request_cancelled"
-    if record.error == IDENTITY_CHANGED:
-        return "unverified", "identity_changed"
+    if reason := _IDENTITY_FAILURE_REASONS.get(record.error):
+        return "unverified", reason
     if record.status == "completed" and record.http_status == 200:
         if record.valid:
             return "allow", "valid_completion"
@@ -166,6 +170,17 @@ def _qualify_identities(target, rows, auth_header):
     return digests
 
 
+def _cutoff_reason(run, target):
+    reason = run.stop_reason(target)
+    if reason == "maximum run duration reached":
+        return "run_deadline"
+    if reason and reason != "maximum request budget reached":
+        return "run_stopped"
+    if reason or run.remaining(target) == 0:
+        return "request_budget_exhausted"
+    return None
+
+
 async def execute(run, target, client):
     settings = run.config.gateway_access
     rows = [_row(case) for case in configured_cases(run.config)]
@@ -175,21 +190,34 @@ async def execute(run, target, client):
             row["reason"] = "unsupported_profile"
         return
     digests = _qualify_identities(target, rows, settings.auth_header)
-    for case, row in zip(settings.cases, rows):
-        if row["reason"] != "not_run":
-            continue
-        if not run.allowed(target.name):
-            row["reason"] = "run_budget_or_stop"
-            continue
-        spec = RequestSpec(fixture_id="gateway-access-" + case.name,
-            scenario="gateway_access", check_ids=["gateway_access"], identity=case.identity,
-            messages=[{"role": "user", "content": "Reply with OK."}], stream=False,
-            options=dict.fromkeys(_TOOL_OPTIONS),
-            max_tokens=settings.max_output_tokens,
-            request_timeout_seconds=settings.request_timeout_seconds,
-            workload={"case": case.name, "expected": case.expected})
-        spec._gateway_access_credential_digest = digests.pop(case.name)
-        await run.request(target, client, spec, finalize_record=lambda record: _record_case(row, record))
+    try:
+        for case, row in zip(settings.cases, rows):
+            if row["reason"] != "not_run":
+                continue
+            if not run.allowed(target.name):
+                break
+            spec = RequestSpec(fixture_id="gateway-access-" + case.name,
+                scenario="gateway_access", check_ids=["gateway_access"], identity=case.identity,
+                messages=[{"role": "user", "content": "Reply with OK."}], stream=False,
+                options=dict.fromkeys(_TOOL_OPTIONS),
+                max_tokens=settings.max_output_tokens,
+                request_timeout_seconds=settings.request_timeout_seconds,
+                workload={"case": case.name, "expected": case.expected})
+            spec._gateway_access_credential_digest = digests.pop(case.name)
+            record = await run.request(target, client, spec, admission_deadline=run.deadline,
+                prepared_admission=True, finalize_record=lambda record: _record_case(row, record),
+                on_preparation_failure=lambda record: row.update(reason=_IDENTITY_FAILURE_REASONS.get(
+                    record.error, "request_not_dispatched")))
+            if record is None and row["reason"] == "not_run":
+                if not run.allowed(target.name):
+                    break
+                row["reason"] = "request_not_dispatched"
+    finally:
+        pending = [row for row in rows if row["reason"] == "not_run"]
+        if pending and (reason := _cutoff_reason(run, target.name)):
+            for row in pending:
+                row["reason"] = reason
+            run.mark_unfinished(target.name, ["gateway_access"])
 
 
 def result(run, target):

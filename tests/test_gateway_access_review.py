@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 
 import httpx
 import pytest
@@ -345,7 +346,60 @@ async def test_access_baseline_matches_transmitted_request_options(monkeypatch, 
     assert "Run setting request_options differs." in comparison["reasons"]
 
 
-async def test_rotated_credential_does_not_observe_another_access_identity(monkeypatch):
+@pytest.mark.parametrize("limit,case_reason,abort_reason", [
+    ("stop", "run_stopped", "cancelled by user"),
+    ("deadline", "run_deadline", "maximum run duration reached"),
+    ("budget", "request_budget_exhausted", "maximum request budget reached"),
+])
+async def test_access_only_counts_requests_admitted_to_transport(monkeypatch, limit, case_reason, abort_reason):
+    monkeypatch.setenv("ALLOW_KEY", "allow-secret")
+    monkeypatch.setenv("DENY_KEY", "deny-secret")
+    cfg = config(retention="all", max_requests=1 if limit == "budget" else 2)
+    if limit == "deadline":
+        cfg.max_duration_seconds = .5
+    stop = asyncio.Event()
+    sent, events = [], []
+    interrupted = False
+    original, build = httpx.AsyncClient, httpx.AsyncClient.build_request
+
+    def handler(request):
+        if request.method != "POST":
+            return httpx.Response(404)
+        sent.append(request.headers["authorization"])
+        if sent[-1] == "Bearer deny-secret":
+            return httpx.Response(401, json={"error": {"type": "token_not_found_in_db"}})
+        return httpx.Response(200, json={"choices": [{"message": {
+            "role": "assistant", "content": "OK"}, "finish_reason": "stop"}]})
+
+    def build_request(self, method, *args, **kwargs):
+        nonlocal interrupted
+        request = build(self, method, *args, **kwargs)
+        if method == "POST" and len(sent) == 1:
+            interrupted = True
+            if limit == "stop":
+                stop.set()
+            elif limit == "deadline":
+                # Let the run's wall-clock deadline pass without yielding to its timer.
+                time.sleep(.55)
+        return request
+
+    monkeypatch.setattr(original, "build_request", build_request)
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
+    report = await run_suite(cfg, stop_event=stop, progress=events.append)
+    check = next(check for check in report.checks if check.id == "gateway_access")
+    allowed, denied = check.metrics["gateway_access"]["cases"]
+    assert interrupted is (limit != "budget")
+    assert sent == ["Bearer allow-secret"]
+    assert report.overall == check.status == "inconclusive" and report.abort_reason == abort_reason
+    assert allowed["observed"] == "allow" and denied["observed"] == "unverified"
+    assert denied["reason"] == case_reason and denied["request_id"] is None
+    assert check.evidence_ids == [allowed["request_id"]] == [record.id for record in report.requests]
+    assert report.observations["request_budget_used"] == events[-1]["attempted"] == 1
+    assert [event["fixture_id"] for event in events if event["event"] == "request_started"] == ["gateway-access-valid"]
+
+
+@pytest.mark.parametrize("replacement,reason", [("allow-secret", "identity_changed"), (None, "identity_unavailable")])
+async def test_rotated_credential_does_not_observe_another_access_identity(monkeypatch, replacement, reason):
     monkeypatch.setenv("ALLOW_KEY", "allow-secret")
     monkeypatch.setenv("DENY_KEY", "deny-secret")
     sent = []
@@ -363,8 +417,11 @@ async def test_rotated_credential_does_not_observe_another_access_identity(monke
 
     def progress(event):
         events.append(event)
-        if event["event"] == "request_started" and event.get("fixture_id") == "gateway-access-invalid":
-            monkeypatch.setenv("DENY_KEY", "allow-secret")
+        if event["event"] == "request_completed" and event["request"]["fixture_id"] == "gateway-access-valid":
+            if replacement is None:
+                monkeypatch.delenv("DENY_KEY")
+            else:
+                monkeypatch.setenv("DENY_KEY", replacement)
 
     original = httpx.AsyncClient
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
@@ -373,8 +430,11 @@ async def test_rotated_credential_does_not_observe_another_access_identity(monke
     allowed, denied = check.metrics["gateway_access"]["cases"]
     assert report.overall == check.status == "inconclusive"
     assert allowed["observed"] == "allow"
-    assert denied["observed"] == "unverified" and denied["reason"] == "identity_changed"
+    assert denied["observed"] == "unverified" and denied["reason"] == reason and denied["request_id"] is None
     assert sent == ["Bearer allow-secret"]
+    assert check.evidence_ids == [allowed["request_id"]] == [record.id for record in report.requests]
+    assert report.observations["request_budget_used"] == events[-1]["attempted"] == 1
+    assert [event["fixture_id"] for event in events if event["event"] == "request_started"] == ["gateway-access-valid"]
     serialized = report.model_dump_json() + json.dumps(events)
     assert "allow-secret" not in serialized and "deny-secret" not in serialized
 
