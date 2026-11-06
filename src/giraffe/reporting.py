@@ -179,9 +179,9 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str) -> dict | No
             # requests are unchanged across these exact generator revisions.
             unchanged_checks.add("prefix")
         if revision in _CONVERSATION_REVISIONS:
-            # Ordinary core dispatch and the separate Load sources are the
-            # same on both sides of the shared conversation refactor.
-            unchanged_checks.update(CORE_CHECKS)
+            # Core and Tool calling dispatch are unchanged in this refactor.
+            # Load also has a separate source digest below.
+            unchanged_checks.update(CORE_CHECKS, {"tools"})
         if not set(resolved.checks) <= unchanged_checks:
             return None  # Load generators changed; attest unchanged specialists only.
     sampled_sessions = "sessions" in resolved.checks and resolved.sessions and resolved.sessions.sampling is not None
@@ -247,11 +247,12 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str) -> dict | No
         }[revision]
     if "tools" in resolved.checks:
         from .tool_checks import resolved_tool_fixtures, resolved_tool_modes
+        tool_conversation_revisions = _CONVERSATION_REVISIONS | {"phase3", "review26", "caps26"}
         identity["resolved_tool_checks"] = {
             "fixtures": [fixture.model_dump(mode="json") for fixture in resolved_tool_fixtures(resolved)],
             "modes": resolved_tool_modes(resolved),
             **({"conversations": [fixture.model_dump(mode="json") for fixture in resolved.tool_checks.conversations],
-                "conversation_source_sha256": ("4080132330b5ceb3d7e0b824bb26244a73967d81ae6b467441600e45c483eb48" if revision in {"phase3", "review26", "caps26"} else
+                "conversation_source_sha256": ("4080132330b5ceb3d7e0b824bb26244a73967d81ae6b467441600e45c483eb48" if revision in tool_conversation_revisions else
                                                "283d1eb18bb852ca0132a2d4a8c63e49bc7155614603e74740dd80afe8189714")}
                if resolved.tool_checks and resolved.tool_checks.conversations else {}),
         }
