@@ -127,7 +127,9 @@ async def test_full_runner_keeps_policy_separate_and_preserves_exports(monkeypat
     altered.manifest["config"]["gateway_access"]["cases"][0]["expected"] = "deny"
     comparison = compare_baseline(altered, report)
     assert comparison.baseline["status"] == "inconclusive"
-    assert any("gateway_access" in reason for reason in comparison.baseline["targets"][0]["reasons"])
+    rows = comparison.baseline["targets"][0]["comparisons"]
+    assert len(rows) == 2
+    assert all("Gateway access settings differ" in row["reason"] for row in rows)
     assert next(c for c in comparison.checks if c.id == "gateway_access").metrics == check.metrics
     altered = report.model_copy(deep=True)
     altered.manifest["config"]["targets"][0]["test_identities"]["allowed"]["api_key_env"] = "DIFFERENT_KEY"
@@ -144,6 +146,8 @@ async def test_full_runner_keeps_policy_separate_and_preserves_exports(monkeypat
     ("unverified", "inconclusive"),
     ("unverified_baseline", "inconclusive"),
     ("old_baseline", "inconclusive"),
+    ("legacy_source", "pass"),
+    ("changed_source", "inconclusive"),
 ])
 async def test_baseline_compares_qualified_access_cases(monkeypatch, mode, expected):
     from giraffe.reporting import compare_baseline
@@ -168,6 +172,10 @@ async def test_baseline_compares_qualified_access_cases(monkeypatch, mode, expec
     if mode == "old_baseline":
         check = next(check for check in baseline.checks if check.id == "gateway_access")
         del check.metrics["gateway_access"]["evidence_version"]
+    elif mode == "legacy_source":
+        del baseline.manifest["gateway_access_source_sha256"]
+    elif mode == "changed_source":
+        baseline.manifest["gateway_access_source_sha256"] = "different-source"
     deny_status = {"unexpected_access": 200, "unverified": 503}.get(mode, 401)
     current = await run_suite(cfg)
     compared = compare_baseline(current, baseline)
@@ -185,6 +193,8 @@ async def test_baseline_compares_qualified_access_cases(monkeypatch, mode, expec
     if mode == "old_baseline":
         assert all(row["status"] == "inconclusive" for row in rows.values())
         assert all("credential evidence is missing" in row["reason"] for row in rows.values())
+    if mode == "changed_source":
+        assert all(row["status"] == "inconclusive" and "source identity" in row["reason"] for row in rows.values())
     if mode == "unexpected_access":
         failure = next(check for check in compared.checks if check.id == "baseline")
         assert failure.evidence_ids == rows["invalid"]["evidence_ids"]

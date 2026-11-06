@@ -271,7 +271,7 @@ async def test_access_distinguishes_gateway_key_from_front_proxy_auth(
         assert reproduction_export(report)["config"]["gateway_access"]["auth_header"] == auth_header
 
 
-async def test_unsupported_access_identity_does_not_veto_serving_baseline(monkeypatch):
+async def test_unsupported_access_settings_do_not_veto_serving_baseline(monkeypatch):
     def handler(request):
         if request.method != "POST":
             return httpx.Response(404)
@@ -283,16 +283,65 @@ async def test_unsupported_access_identity_does_not_veto_serving_baseline(monkey
     original = httpx.AsyncClient
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
 
-    async def run_with(ref):
+    async def run_with(profile, ref):
         raw = config(retention="all").model_dump()
         raw.update(checks=["serving", "gateway_access"], samples=8)
-        raw["gateway_access"]["profile"] = "other-gateway"
+        raw["gateway_access"]["profile"] = profile
         raw["targets"][0]["test_identities"]["allowed"]["api_key_env"] = ref
         return await run_suite(RunConfig.model_validate(raw))
 
-    current, baseline = await run_with("CURRENT_UNUSED"), await run_with("BASELINE_UNUSED")
+    current = await run_with("other-gateway", "CURRENT_UNUSED")
+    baseline = await run_with("unknown-gateway", "BASELINE_UNUSED")
     assert current.overall == baseline.overall == "pass"
     assert all(record.identity is None for report in (current, baseline) for record in report.requests)
+    assert reproduction_export(current)["config"]["gateway_access"]["profile"] == "other-gateway"
     comparison = compare_baseline(current, baseline).baseline["targets"][0]
     assert comparison["status"] == "pass"
     assert any(row["check"] == "serving" and row["status"] == "pass" for row in comparison["comparisons"])
+
+
+async def test_access_baseline_scopes_settings_and_identity_references_to_its_cases(monkeypatch):
+    monkeypatch.setenv("ALLOW_KEY", "allow-secret")
+    monkeypatch.setenv("DENY_KEY", "deny-secret")
+
+    def handler(request):
+        if request.method != "POST":
+            return httpx.Response(404)
+        if request.headers.get("authorization") == "Bearer deny-secret":
+            return httpx.Response(403, json={"error": {"type": "key_model_access_denied"}})
+        return httpx.Response(200, json={"choices": [{
+            "message": {"role": "assistant", "content": "OK"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 8, "completion_tokens": 2}})
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
+
+    async def run_with(unused_ref, max_output_tokens, profile="litellm"):
+        raw = config(retention="all").model_dump()
+        raw.update(checks=["serving", "gateway_access"], samples=8)
+        raw["gateway_access"]["max_output_tokens"] = max_output_tokens
+        raw["gateway_access"]["profile"] = profile
+        raw["targets"][0]["test_identities"]["unused"] = {"api_key_env": unused_ref}
+        report = await run_suite(RunConfig.model_validate(raw))
+        assert report.overall == "pass"
+        return report
+
+    baseline = await run_with("BASELINE_UNUSED", 16)
+    current = await run_with("CURRENT_UNUSED", 16)
+    target = compare_baseline(current, baseline).baseline["targets"][0]
+    assert target["status"] == "pass"
+    assert [row["status"] for row in target["comparisons"] if row["check"] == "gateway_access"] == ["pass", "pass"]
+
+    current = await run_with("CURRENT_UNUSED", 32)
+    target = compare_baseline(current, baseline).baseline["targets"][0]
+    assert target["status"] == "inconclusive"
+    assert any(row["check"] == "serving" and row["status"] == "pass" for row in target["comparisons"])
+    rows = [row for row in target["comparisons"] if row["check"] == "gateway_access"]
+    assert len(rows) == 2
+    assert all(row["status"] == "inconclusive" and "settings differ" in row["reason"] for row in rows)
+
+    unsupported = await run_with("BASELINE_UNUSED", 32, profile="other-gateway")
+    target = compare_baseline(current, unsupported).baseline["targets"][0]
+    assert target["status"] == "inconclusive"
+    assert "No comparable verdict metric for selected check(s): gateway_access" in target["summary"]
+    assert any(row["check"] == "serving" and row["status"] == "pass" for row in target["comparisons"])

@@ -2742,6 +2742,8 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
                 "invocation": {"source": "python_api", "argv": None},
                 "config_migration_notes": list(config._migration_notes),
                 "timing_measurement_version": 3,
+                **({"gateway_access_source_sha256": workload_identity["gateway_access_source_sha256"]}
+                   if "gateway_access_source_sha256" in workload_identity else {}),
                 **({"request_pack": pack_identity(config)} if run.pack_specs else {}),
                 "workload_selection": {key: "selected" if key in public_config.checks else "not selected"
                                        for key in PUBLIC_CHECK_NAMES if key not in CORE_CHECKS},

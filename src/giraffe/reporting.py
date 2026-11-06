@@ -1296,7 +1296,7 @@ def _compare_gateway_attribution(report, baseline, target, compatible):
     return rows
 
 
-def _compare_gateway_access(current, baseline, declarations, compatible, identities_match):
+def _compare_gateway_access(current, baseline, declarations, incompatibility):
     from .gateway_access import EVIDENCE_VERSION
 
     def matched(policy, case):
@@ -1319,10 +1319,8 @@ def _compare_gateway_access(current, baseline, declarations, compatible, identit
         latest, previous = matched(current_policy, case), matched(old_policy, case)
         observed, prior = decision(latest), decision(previous)
         status = "inconclusive"
-        if not compatible:
-            reason = "Run settings differ."
-        elif not identities_match:
-            reason = "Gateway test identity references differ."
+        if incompatibility:
+            reason = incompatibility
         elif not evidence_matches:
             reason = "Effective gateway credential evidence is missing. Rerun the access check and baseline."
         elif not baseline_passed or prior != case["expected"]:
@@ -1359,7 +1357,8 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
     limits = config.get("limits", {})
     minimum = max(2, int(limits.get("min_samples", 5)))
     threshold = float(limits.get("regression_percent", 20))
-    old_targets = {t["name"]: t for t in baseline.manifest.get("config", {}).get("targets", [])}
+    old_config = baseline.manifest.get("config", {})
+    old_targets = {t["name"]: t for t in old_config.get("targets", [])}
     targets = config.get("targets", [])
     comparison: dict[str, Any] = {
         "run_id": baseline.run_id, "status": "inconclusive", "targets": [],
@@ -1423,13 +1422,37 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
             old_access = next((check for check in baseline.checks if check.id == "gateway_access"
                                and check.target == name and check.required), None)
             try:
-                declarations = GatewayAccess.model_validate(config.get("gateway_access")).model_dump()["cases"]
+                access_settings = GatewayAccess.model_validate(config.get("gateway_access"))
             except ValidationError:
-                declarations = []
-            identities_match = (old_target is not None
-                                and target.get("test_identities") == old_target.get("test_identities"))
-            rows.extend(_compare_gateway_access(current_access, old_access, declarations,
-                                                not target_reasons, identities_match))
+                access_settings = None
+            try:
+                old_access_settings = GatewayAccess.model_validate(old_config.get("gateway_access"))
+            except ValidationError:
+                old_access_settings = None
+            if access_settings is not None:
+                current_refs = target.get("test_identities") or {}
+                old_refs = (old_target or {}).get("test_identities") or {}
+                incompatibility = None
+                if target_reasons:
+                    incompatibility = "Run settings differ."
+                elif access_settings != old_access_settings:
+                    incompatibility = "Gateway access settings differ or are missing."
+                elif any(case.identity not in current_refs
+                         or current_refs.get(case.identity) != old_refs.get(case.identity)
+                         for case in access_settings.cases):
+                    incompatibility = "Gateway test identity references differ."
+                else:
+                    source = report.manifest.get("gateway_access_source_sha256")
+                    old_source = baseline.manifest.get("gateway_access_source_sha256")
+                    if not source or not old_source:
+                        # Earlier access reports attested the probe source in the raw workload hash.
+                        source = report.manifest["fixture_pack"].get("workload_fixture_sha256")
+                        old_source = baseline.manifest["fixture_pack"].get("workload_fixture_sha256")
+                    if not source or source != old_source:
+                        incompatibility = "Gateway access source identity differs or is missing. Rerun the access check and baseline."
+                rows.extend(_compare_gateway_access(current_access, old_access,
+                                                    [case.model_dump() for case in access_settings.cases],
+                                                    incompatibility))
         for current_check in report.checks:
             if current_check.id != "gateway_policy" or current_check.target != name:
                 continue
@@ -1631,9 +1654,11 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
         request_paths = ((set(CHECK_NAMES) - non_request_checks)
                          | {"capacity", "concurrency", "fairness", "arrivals", "buckets", "mixed", "token_stress"}
                          | {check for check, _ in set(current_groups) | set(old_groups)})
+        # The current access matrix still needs coverage if the baseline made it optional.
         selected_checks = {check.id for check in report.checks
                            if check.target == name and check.id != "baseline" and check.required
-                           and check.status != "skipped" and check.id not in non_verdict_checks
+                           and check.status != "skipped"
+                           and (check.id == "gateway_access" or check.id not in non_verdict_checks)
                            and check.id in config.get("checks", []) and check.id in request_paths}
         covered = {row["check"] for row in assessed
                    if row["metric"] in verdict_metrics.get(row["check"], {row["metric"]})}
