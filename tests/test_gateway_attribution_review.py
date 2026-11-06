@@ -1701,6 +1701,103 @@ async def test_serving_comparison_qualifies_actual_stream_options_after_compatib
     assert warm_rows(unchanged, archive)["latency_ms"]["status"] == "pass"
 
 
+@pytest.mark.parametrize("targets,expiry", [(1, "gateway"), (2, "gateway"), (2, "shared")])
+async def test_duration_limit_preserves_only_shared_work_completed_before_gateway_phase(
+        monkeypatch, local_tokenizer, tmp_path, targets, expiry):
+    client_class = httpx.AsyncClient
+    original_send = client_class.send
+
+    async def saved_run(*, mixed):
+        async def observer(request, rows):
+            if mixed and rows:
+                await asyncio.sleep(1)
+            return spend_page(request, rows)
+
+        async def send(client, request, **kwargs):
+            if mixed and expiry == "shared" and request.method == "POST" and request.url.host == "second":
+                await asyncio.sleep(1)
+            return await original_send(client, request, **kwargs)
+
+        with monkeypatch.context() as env:
+            cfg, _, reads = setup(env, observer)
+            immediate_spend_polls(env, cfg)
+            if targets == 2:
+                first = cfg.targets[0]
+                cfg.targets.append(first.model_copy(update={"name": "second", "url": "http://second/v1",
+                    "gateway": first.gateway.model_copy(update={"url": "http://second/spend/logs/v2"})}))
+            cfg.checks = ["serving"] + (["gateway_attribution"] if mixed else [])
+            cfg.samples = cfg.limits.min_samples = 2
+            cfg.max_requests = None
+            cfg.max_duration_seconds = .55 if mixed else 1.5
+            env.setattr(client_class, "send", send)
+            report = await run_suite(cfg)
+            path, _ = write_report(report, tmp_path)
+            return RunReport.model_validate_json(path.read_bytes()), reads
+
+    baseline, _ = await saved_run(mixed=False)
+    current, reads = await saved_run(mixed=True)
+    assert baseline.abort_reason is None
+    assert current.abort_reason == "maximum run duration reached"
+    assert "max_duration_seconds" in current.limits_reached
+    assert current.observations["duration_limit_scope"] == expiry
+    assert bool(reads) == (expiry == "gateway")
+    if expiry == "gateway":
+        assert [record.request_hash for record in current.requests if record.identity is None] == [
+            record.request_hash for record in baseline.requests]
+        assert all(check.status == "pass" for check in current.checks if check.id == "serving")
+        assert next(check for check in current.checks if check.id == "gateway_attribution").metrics["reason_code"] == "time_limited"
+
+    for report, previous in ((current, baseline), (baseline, current)):
+        compared = compare_baseline(report, previous).baseline
+        assert len(compared["targets"]) == targets
+        for entry in compared["targets"]:
+            if expiry == "gateway":
+                assert not entry["reasons"]
+                assert any(row["check"] == "serving" and row["metric"] == "valid_completion_rate"
+                           and row["status"] == "pass" for row in entry["comparisons"])
+            else:
+                assert any("run was aborted" in reason for reason in entry["reasons"])
+                assert any("max_duration_seconds differs" in reason for reason in entry["reasons"])
+                assert not any(row["check"] == "serving" for row in entry["comparisons"])
+    if expiry == "gateway" and targets == 1:
+        limited = current.model_copy(deep=True)
+        limited.manifest["config"]["concurrency"] = 1
+        limited.limits_reached.append("concurrency")
+        for scopes, comparable in ((["gateway"], True), (["gateway", "shared"], False), ([], False)):
+            limited.observations["concurrency_limit_scopes"] = scopes
+            reasons = _settings_reasons(limited, baseline)
+            assert bool(reasons) != comparable
+            if not comparable:
+                assert any("concurrency differs" in reason for reason in reasons)
+    current.observations.pop("duration_limit_scope")
+    assert all(any("run was aborted" in reason for reason in entry["reasons"])
+               for entry in compare_baseline(current, baseline).baseline["targets"])
+
+
+async def test_concurrency_limit_records_which_requests_waited_for_a_slot():
+    cfg = config(stream=False)
+    cfg.checks = ["serving", "gateway_attribution"]
+    cfg.concurrency = 1
+    run = _Run(cfg, None, None)
+    run.ceiling_constrains_pool = True
+    acquired = asyncio.Event()
+
+    async def gateway():
+        async with run.slot(False, gateway_probe=True):
+            acquired.set()
+
+    async with run.slot(False):
+        waiting = asyncio.create_task(gateway())
+        await asyncio.sleep(0)
+        assert not acquired.is_set()
+        assert run.limits_reached == {"concurrency"}
+        assert run.concurrency_limit_scopes == {"gateway"}
+        assert not run.try_acquire_slot()
+        assert run.concurrency_limit_scopes == {"gateway", "shared"}
+    await waiting
+    assert acquired.is_set()
+
+
 @pytest.mark.parametrize("with_builtin", [False, True])
 async def test_shared_baseline_still_requires_the_active_fixture_sources(monkeypatch, local_tokenizer, with_builtin):
     async def observer(request, rows):

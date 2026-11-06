@@ -371,9 +371,9 @@ def _same_load_workload(current: dict, old: dict, *, fingerprint_key: str = "wor
     return bool(matches[0] & matches[1])
 
 
-def _gateway_limited_mixed_run(report: RunReport) -> bool:
+def _mixed_gateway_run(report: RunReport) -> bool:
     checks = report.manifest.get("config", {}).get("checks")
-    if report.observations.get("request_limit_scopes") != ["gateway"] or not isinstance(checks, list):
+    if not isinstance(checks, list):
         return False
     selected = {check for check in checks if isinstance(check, str)}
     return (bool(selected & SHARED_BASELINE_EXCLUDED_WORKLOADS)
@@ -409,10 +409,15 @@ def _limits_reached(report: RunReport) -> set[str]:
            for group in metrics.get("load_types", {}).values()
            for point in group.get("points", [])):
         reached.add("max_requests")
-    elif _gateway_limited_mixed_run(report):
+    elif (report.observations.get("request_limit_scopes") == ["gateway"] and _mixed_gateway_run(report)
+          and not any(_shared_budget_cutoff(check) for check in report.checks)):
         # Shared schedulers can also report a local reservation cutoff.
-        if not any(_shared_budget_cutoff(check) for check in report.checks):
-            reached.discard("max_requests")
+        reached.discard("max_requests")
+    if _mixed_gateway_run(report):
+        if report.observations.get("concurrency_limit_scopes") == ["gateway"]:
+            reached.discard("concurrency")
+        if report.observations.get("duration_limit_scope") == "gateway":
+            reached.discard("max_duration_seconds")
     return reached
 
 
@@ -432,9 +437,13 @@ def _settings_reasons(report: RunReport, baseline: RunReport, *, details: dict[s
 
     def shared_abort(run, limits):
         gateway_budget = (run.abort_reason == "maximum request budget reached"
-                          and _gateway_limited_mixed_run(run)
+                          and run.observations.get("request_limit_scopes") == ["gateway"]
+                          and _mixed_gateway_run(run)
                           and "max_requests" not in limits)
-        return run.observations.get("target_abort_reasons") or (run.abort_reason and not gateway_budget)
+        gateway_deadline = (run.abort_reason == "maximum run duration reached"
+                            and "max_duration_seconds" in run.limits_reached
+                            and "max_duration_seconds" not in limits)
+        return run.observations.get("target_abort_reasons") or (run.abort_reason and not (gateway_budget or gateway_deadline))
 
     if shared_abort(report, current_limits):
         reasons.append("Current run was aborted; incomplete traffic cannot establish a regression.")

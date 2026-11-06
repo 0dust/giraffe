@@ -264,6 +264,14 @@ async def _pages(client, url, marker, *, start_date, end_date, max_rows, stop, d
 
 
 async def execute(run, target, client, *, deferred=False):
+    if deferred:
+        await _execute(run, target, client, deferred=True)
+    else:
+        with run.inline_gateway_limit_phase():
+            await _execute(run, target, client)
+
+
+async def _execute(run, target, client, *, deferred=False):
     settings, gateway = run.config.gateway_attribution, target.gateway
     observation = _state("unavailable", "Gateway evidence endpoint and credentials are not configured.")
     run.observations[target.name][CHECK] = observation
