@@ -174,6 +174,39 @@ def test_same_live_history_mix_can_report_a_real_throughput_regression():
     assert row["current"] == 40 and row["baseline"] == 80
 
 
+@pytest.mark.parametrize(("current_long_index", "expected"), [(5, "inconclusive"), (None, "pass")])
+def test_live_baseline_qualifies_only_the_completions_delivered_in_the_window(current_long_index, expected):
+    current, previous = live_user_report(), live_user_report()
+    for report, long_index in ((current, current_long_index), (previous, 7)):
+        source = report.observations["targets"]["local"]["multi_user"]
+        window = source["windows"][0]
+        window["scenario"] = "repeated_conversations"
+        for user in window["users"]:
+            user["profile"] = "conversation:chat"
+        for request in report.requests:
+            if request.workload["user_id"] != "user-05":
+                continue
+            index = int(request.id.rsplit("-", 1)[1])
+            if index == long_index:
+                request.request_hash = "long-history"
+                request.input_tokens = 400
+            if index == 7:
+                request.completed_ms = window["end_ms"] + 10
+                request.elapsed_ms = request.completed_ms - request.dispatch_ms
+        summary = summarize(source, report.requests)
+        report.checks[0].metrics["multi_user"] = summary
+        user = summary["windows"][0]["users"][-1]
+        assert user["coverage"]["status"] == "complete"
+        assert user["late_completed"] == 1
+        assert user["output_tokens_per_second"] == 70
+
+    result = compare_baseline(current, previous)
+    row = next(row for row in result.baseline["targets"][0]["comparisons"]
+               if row.get("user_id") == "user-05" and row["metric"] == "shared_window_output_tokens_per_second")
+    assert row["status"] == result.baseline["status"] == expected
+    assert row["current"] == row["baseline"] == 70
+
+
 def test_failures_retention_keeps_truncated_conversation_output_in_a_passing_run(tmp_path):
     report = user_report(retention="failures")
     truncated = report.requests[0]

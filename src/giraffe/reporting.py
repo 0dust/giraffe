@@ -26,7 +26,7 @@ from .caps import (MAX_HTML_PREVIEW_CHARS, MAX_HTML_JSON_PREVIEW_CHARS,
                    MAX_FAILURE_SUMMARY_CHARS)
 from .deployment import deployment_diff, fixture_hash, safe_config, sanitize
 from .report_inputs import input_ref as _input_ref
-from .multi_user_metrics import truncated_conversation_turn, user_latency
+from .multi_user_metrics import truncated_conversation_turn, user_delivery_completions, user_latency
 from .models import (CHECK_NAMES, SHAPES, CheckResult, RequestRecord, RunConfig, RunReport, overall_status, load_shape_label,
                      migrate_concurrent_load, migrate_run_limits, is_supported_schema, CURRENT_SCHEMA)
 from .stats import median, percentile
@@ -1165,8 +1165,11 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold):
         scenario_reason = ("Scenario evidence is missing or unqualified in the current run or baseline."
                            if any(item and (not item.get("qualified") or item.get("status") == "inconclusive")
                                   for item in (c_scenario, b_scenario)) else None)
+        live_work_changed = _live_input_work_changed(
+            user_delivery_completions(current_work, c_window, user_id),
+            user_delivery_completions(old_work, b_window, user_id), threshold)
         live_work_reason = ("Observed input work or live generated histories differ or lack evidence."
-                            if _live_input_work_changed(current_work, old_work, threshold) else None)
+                            if live_work_changed else None)
         missing = (not c or not b or c.get("coverage", {}).get("status") != "complete"
                    or b.get("coverage", {}).get("status") != "complete"
                    or c_rate is None or b_rate is None or work_reason or mix_changed or live_work_reason or scenario_reason)

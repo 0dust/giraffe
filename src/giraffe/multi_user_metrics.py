@@ -61,6 +61,18 @@ def user_latency(record: RequestRecord, first: bool, *, ready: bool = True) -> f
     return max(0, end - start) if start is not None and end is not None else None
 
 
+def user_delivery_completions(records: list[RequestRecord], window: dict[str, Any],
+                              user_id: str) -> list[RequestRecord]:
+    """Select the completed work included in this user's shared-window rate."""
+    start, end = window.get("start_ms"), window.get("end_ms")
+    if start is None or end is None:
+        return []
+    return [r for r in records if r.workload.get("user_id") == user_id
+            and r.workload.get("window_id") == window["id"] and not r.intentional and _valid(r)
+            and r.dispatch_ms is not None and start <= r.dispatch_ms < end
+            and r.completed_ms is not None and r.completed_ms <= end]
+
+
 def _user_summary(user: dict[str, Any], window: dict[str, Any], records: list[RequestRecord],
                   criteria: MultiUserCriteria, health: dict | None, lag: float,
                   timing_threshold: float) -> dict[str, Any]:
@@ -81,7 +93,7 @@ def _user_summary(user: dict[str, Any], window: dict[str, Any], records: list[Re
     terminal_failures = {r.id for r in errors + cancelled}
     unadmitted_turn = any(item.get("stopped_before_cutoff") and terminal_failures.isdisjoint(item["turns"])
                           for item in user.get("conversations", []))
-    eligible = [r for r in valid if r.dispatch_ms < end and r.completed_ms is not None and r.completed_ms <= end]
+    eligible = user_delivery_completions(records, window, user["user_id"])
     unclassified = [r for r in valid if r.completed_ms is None]
     late = [r for r in valid if r.completed_ms is not None and r.completed_ms > end]
     partial = [r for r in rows if not _valid(r)]
