@@ -1256,7 +1256,44 @@ def _compare_interference_work(current, old, user_id, current_records, old_recor
             reasons.append(f"Matched {role} request evidence is incomplete.")
         elif any(_load_work_comparison(*cohorts)) or _user_token_work_changed(*cohorts, tolerance):
             reasons.append(f"Matched {role} work differs or lacks observed token evidence.")
+    if not reasons:
+        exposure = [_interference_exposure(evidence, records)
+                    for evidence, records in ((current, current_records), (old, old_records))]
+        if any(groups is None for groups in exposure):
+            reasons.append("Matched heavy exposure per probe is missing or incomplete.")
+        elif _heavy_work_per_probe_changed(exposure, tolerance):
+            reasons.append("Matched heavy exposure per matched probe differs between runs.")
     return list(dict.fromkeys(retained_ids)), " ".join(reasons) or None
+
+
+def _interference_exposure(evidence, records):
+    probes, heavy_ids = evidence["probe_request_ids"], set(evidence["heavy_request_ids"])
+    links = evidence.get("probe_heavy_request_ids")
+    if links is None and (len(probes) == 1 or len(heavy_ids) == 1):
+        # Older reports only retain the union. In either case it determines every group.
+        links = {probe: sorted(heavy_ids) for probe in probes}
+    if not isinstance(links, dict) or set(links) != set(probes):
+        return None
+    represented = set()
+    for ids in links.values():
+        if (not isinstance(ids, list) or not ids
+                or any(not isinstance(rid, str) or rid not in heavy_ids for rid in ids)
+                or len(ids) != len(set(ids))):
+            return None
+        represented.update(ids)
+    if represented != heavy_ids:
+        return None
+    return [[records[rid] for rid in links[probe]] for probe in probes]
+
+
+def _heavy_work_per_probe_changed(exposure, tolerance):
+    if _work_samples_changed([[len(group) for group in run] for run in exposure], tolerance):
+        return True
+    measures = _token_work_measures(record for run in exposure for group in run for record in group)
+    # Every retained heavy record has already passed the individual token work check.
+    return any(_work_samples_changed(
+        [[sum(measure(record) for record in group) for group in run] for run in exposure], tolerance)
+        for measure in measures)
 
 
 def _probe_has_overlap(evidence: dict, records: list[RequestRecord]) -> bool:
@@ -1266,18 +1303,25 @@ def _probe_has_overlap(evidence: dict, records: list[RequestRecord]) -> bool:
     return bool(records) and all(record.id in exposed for record in records)
 
 
-def _user_token_work_changed(current, previous, tolerance):
+def _token_work_measures(records):
     measures = (lambda r: r.input_tokens, lambda r: r.output_tokens, _total_generated_tokens)
-    if any((record.cached_prompt_tokens or 0) > 0 for cohort in (current, previous) for record in cohort):
+    if any((record.cached_prompt_tokens or 0) > 0 for record in records):
         measures += (_uncached_input_tokens,)
-    for measure in measures:
-        lengths = [[measure(record) for record in cohort] for cohort in (current, previous)]
-        if any(not values or None in values for values in lengths):
-            return True
-        medians = [median(values) for values in lengths]
-        if max(medians) > min(medians) * (1 + tolerance / 100) or _length_mix_differs(lengths, tolerance):
-            return True
-    return False
+    return measures
+
+
+def _work_samples_changed(lengths, tolerance):
+    if any(not values or None in values for values in lengths):
+        return True
+    medians = [median(values) for values in lengths]
+    return max(medians) > min(medians) * (1 + tolerance / 100) or _length_mix_differs(lengths, tolerance)
+
+
+def _user_token_work_changed(current, previous, tolerance):
+    cohorts = current, previous
+    measures = _token_work_measures(record for cohort in cohorts for record in cohort)
+    return any(_work_samples_changed([[measure(record) for record in cohort] for cohort in cohorts], tolerance)
+               for measure in measures)
 
 
 def _compare_user_fairness(current, previous, current_records, old_records):
@@ -2290,7 +2334,8 @@ def _multi_user_scenario_export(window: dict[str, Any]) -> dict[str, Any]:
     if evidence := window.get("interference"):
         fields = ("status", "qualified", "control_window_id", "trigger", "heavy_profile", "heavy_user_ids", "reasons")
         user_fields = ("user_id", "status", "qualified", "reasons", "matched_samples", "control_request_ids",
-            "probe_request_ids", "heavy_request_ids", "slowdown", "first_answer_change_ms", "completion_change_ms",
+            "probe_request_ids", "heavy_request_ids", "probe_heavy_request_ids", "slowdown",
+            "first_answer_change_ms", "completion_change_ms",
             "stream_gap_change_ms", "output_tokens_change", "control_input_median_tokens", "probe_input_median_tokens",
             "control_output_median_tokens", "probe_output_median_tokens",
             "heavy_input_median_tokens", "heavy_output_median_tokens")

@@ -560,7 +560,7 @@ def _interference(observation, window, control, user_records, criteria, health, 
                     for r in user_records.get((control["id"], uid), [])} if control else {}
         probes = user_records.get((window["id"], uid), [])
         candidates = heavy_by_peer.get(uid, [])
-        pairs, exposed, excluded = [], {}, set()
+        pairs, exposed, probe_heavy_ids, excluded = [], {}, {}, set()
         for probe in probes:
             baseline = controls.get(probe.workload.get("matched_work_sequence"))
             if not baseline or not _valid(baseline) or not _valid(probe):
@@ -599,7 +599,7 @@ def _interference(observation, window, control, user_records, criteria, health, 
                 continue
             lo = bisect_left(candidates, trigger_span[0], key=trigger_time)
             hi = bisect_left(candidates, trigger_span[1], lo, key=trigger_time)
-            matched = False
+            matched_heavy = []
             for _, competitor in candidates[lo:hi]:
                 # Runner admission can precede a connection wait or upload.
                 sent = competitor.request_body_sent_ms
@@ -621,10 +621,11 @@ def _interference(observation, window, control, user_records, criteria, health, 
                     if cached > total / 2:
                         excluded.add("More than half the long competitor input was cached.")
                         continue
-                matched = True
+                matched_heavy.append(competitor.id)
                 exposed[competitor.id] = competitor
-            if matched:
+            if matched_heavy:
                 pairs.append((baseline, probe))
+                probe_heavy_ids[probe.id] = matched_heavy
         before, after = [pair[0] for pair in pairs], [pair[1] for pair in pairs]
         competitors = list(exposed.values())
         if len(pairs) < criteria.min_samples:
@@ -673,7 +674,7 @@ def _interference(observation, window, control, user_records, criteria, health, 
         measured.append({"user_id": uid, "status": status, "qualified": qualified, "reasons": list(dict.fromkeys(notes)),
             "matched_samples": len(pairs), "control_request_ids": [r.id for r in before],
             "probe_request_ids": [r.id for r in after], "heavy_request_ids": sorted(exposed),
-            "slowdown": slowdown, "first_answer_change_ms": difference(
+            "probe_heavy_request_ids": probe_heavy_ids, "slowdown": slowdown, "first_answer_change_ms": difference(
                 median([user_latency(r, True) for r in before]), median([user_latency(r, True) for r in after])),
             "completion_change_ms": difference(control_completion, probe_completion),
             "stream_gap_change_ms": difference(median([r.max_stream_gap_ms for r in before]), median([r.max_stream_gap_ms for r in after])),
