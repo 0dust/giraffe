@@ -46,6 +46,31 @@ def test_rate_baseline_uses_percentage_point_threshold():
     assert timing["threshold"] == 20
 
 
+def test_default_rate_threshold_detects_real_request_outcomes():
+    baseline = make_report("baseline", count=400)
+    current = make_report(count=400)
+    for record in current.requests[:45]:
+        record.status = "failed"
+        record.http_status = 500
+        record.valid = False
+        record.score = None
+    result = compare_baseline(current, baseline)
+    rows = [row for target in result.baseline["targets"] for row in target["comparisons"]]
+    error = next(row for row in rows if row["metric"] == "error_rate")
+    assert error["threshold"] == 5
+    assert error["status"] == "fail"
+
+    baseline = make_report("baseline", count=200)
+    current = make_report(count=200)
+    for record in current.requests[:24]:
+        record.score = False
+    result = compare_baseline(current, baseline)
+    rows = [row for target in result.baseline["targets"] for row in target["comparisons"]]
+    correctness = next(row for row in rows if row["metric"] == "correctness_rate")
+    assert correctness["threshold"] == 5
+    assert correctness["status"] == "fail"
+
+
 def test_comparison_setting_reasons_include_structured_values_without_changing_text():
     current, previous = make_report(), make_report("baseline")
     current.manifest["config"]["request_timeout_seconds"] = 300

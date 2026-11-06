@@ -4011,6 +4011,11 @@ async function rerun(){
     try{const result=await api('/api/config/draft',{method:'POST',body:JSON.stringify(source)});if(version!==state.routeVersion)return;source=result.config;notes=result.migration_notes;}
     catch(error){toast(error.message);return;}
   }
+  source=clone(source);
+  source.limits ||= {};
+  if(source.limits.regression_rate_points == null){
+    source.limits.regression_rate_points=state.bootstrap.limits_schema.properties.regression_rate_points.default;
+  }
   replaceMigrationNotes(notes);state.config=clone(source);state.autoModel=null;state.setupStep=1;invalidateModelDiscovery();state.datasetSelection=[];state.config.restart_target=null;state.formMode='normal';state.formRestartTarget=null;state.jsonDraft=null;state.jsonBase=null;state.configView='form';configChanged();state.prefillBaseline=state.detail.baseline_id || '';location.hash='#new';
 }
 function portableConfig(payload) {return {...payload.config,restart_target:payload.mode==='cold-start'?payload.restart_target:null};}

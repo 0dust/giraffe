@@ -1061,7 +1061,7 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
     limits = config.get("limits", {})
     minimum = max(2, int(limits.get("min_samples", 5)))
     threshold = float(limits.get("regression_percent", 20))
-    rate_threshold = float(limits.get("regression_rate_points", 10))
+    rate_threshold = float(limits.get("regression_rate_points", 5))
     old_targets = {t["name"]: t for t in baseline.manifest.get("config", {}).get("targets", [])}
     targets = config.get("targets", [])
     comparison: dict[str, Any] = {

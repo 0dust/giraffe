@@ -1320,7 +1320,7 @@ class Limits(Model):
     recovery_max_ratio: float | None = Field(default=None, gt=1)
     gpu_max_temperature_c: float | None = Field(default=None, gt=0)
     regression_percent: float = Field(default=20, ge=0)
-    regression_rate_points: float = Field(default=10, ge=0)
+    regression_rate_points: float = Field(default=5, ge=0)
     min_samples: int = Field(default=5, ge=2)
 
 
