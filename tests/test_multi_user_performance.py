@@ -112,6 +112,75 @@ def test_full_multi_user_window_binds_only_matching_baseline_cohorts(scenario, r
         assert target["summaries"][stage]["metrics"][metric]["value"] is None
 
 
+@pytest.mark.parametrize(("generated", "expected"), [(2, "fail"), (14, "inconclusive")])
+@pytest.mark.parametrize("lighter_only", [False, True], ids=["all-windows", "recovery-lighter"])
+def test_scheduled_user_timing_requires_comparable_total_generation(monkeypatch, local_tokenizer, generated, expected, lighter_only):
+    import asyncio
+
+    from giraffe import runner
+    from giraffe.reporting import compare_baseline
+    from tests.test_multi_user import settings
+    from tests.test_multi_user_scenarios import PROFILE
+    from tests.test_review26_phase4_accuracy import run_virtual
+    from tests.test_runner import FakeClient
+
+    cfg = settings(levels=[2], scenarios=["arrivals", "recovery"], duration_seconds=1, profile=PROFILE,
+        arrivals={"requests_per_second": 5, "activations": {"user-02": .4}},
+        recovery={"control_seconds": 1, "lighter_seconds": 1, "sustained_seconds": 1,
+                  "lighter_requests_per_second": 4, "sustained_requests_per_second": 8, "max_slowdown": 2},
+        pass_criteria={} if lighter_only else {"max_completion_ms": 40})
+
+    class Observed(FakeClient):
+        delay = .02
+        completion_tokens = 2
+        slower = False
+
+        async def execute(self, spec, **kwargs):
+            record = await super().execute(spec, **kwargs)
+            if "multi_user" in spec.check_ids:
+                record.completion_tokens = self.completion_tokens
+                record.reasoning_tokens = self.completion_tokens - 2
+                if self.slower and lighter_only and spec.workload.get("role") == "lighter":
+                    await asyncio.sleep(.04)
+                    record.elapsed_ms += 40
+            return record
+
+    async def replay():
+        baseline = await runner.run_suite(cfg)
+        if not lighter_only:
+            Observed.delay = .06
+        Observed.slower = True
+        Observed.completion_tokens = generated
+        return await runner.run_suite(cfg), baseline
+
+    monkeypatch.setattr(runner, "LLMClient", Observed)
+    current, baseline = run_virtual(monkeypatch, replay())
+    for report in (current, baseline):
+        check = next(check for check in report.checks if check.id == "multi_user")
+        status = "fail" if lighter_only and report is current else "pass"
+        assert check.metrics["multi_user"]["windows"][-1]["recovery"]["status"] == status
+    compared = compare_baseline(current, baseline)
+    assert compared.baseline["acceptance"] == {"current": "fail", "baseline": "pass"}
+    assert compared.baseline["status"] == expected
+    if lighter_only:
+        comparisons = compared.baseline["targets"][0]["comparisons"]
+        recovery = [row for row in comparisons if row["metric"] == "scenario_acceptance"]
+        assert len(recovery) == 2 and {row["status"] for row in recovery} == {expected}
+        assert all(row["metric"] != "user_acceptance" for row in comparisons)
+    for role in ("arrivals", "recovery_control", "recovery_sustained", "recovery_lighter"):
+        window = f"full:multi_user_2_{role}"
+        target, = build_performance(compared, target="service", window=window)["targets"]
+        metrics = target["summaries"][window]["metrics"]
+        completion = [row for row in metrics["baseline_timing"]["evidence"] if row["metric"] == "latency_ms"]
+        slower = not lighter_only or role == "recovery_lighter"
+        status = expected if slower or generated == 14 else "pass"
+        assert len(completion) == 2 and {row["status"] for row in completion} == {status}
+        assert [row["baseline"] for row in completion] == pytest.approx([20, 20])
+        assert [row["current"] for row in completion] == pytest.approx([60, 60] if slower else [20, 20])
+        delivery = metrics["baseline_throughput"]["value"]
+        assert len(delivery) == 2 and all(row["current"] == row["baseline"] for row in delivery)
+
+
 def test_scheduled_user_and_capacity_windows_keep_separate_offer_ledgers():
     from tests.test_multi_user_metrics import record
 
