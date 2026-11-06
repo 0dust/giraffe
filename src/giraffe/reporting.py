@@ -325,19 +325,20 @@ def _same_run_limits_workload(current: dict, old: dict, *, fingerprint_key: str 
 
 def _same_load_workload(current: dict, old: dict, *, fingerprint_key: str = "workload_fixture_sha256") -> bool:
     """Attest unchanged Load dispatch within exact source-equivalence groups."""
-    # Keep the historical nonce-only change separate from current admission
-    # semantics. Only the newer group attests Load with specialist workloads.
+    revisions = ("shared_conversations", "gateway_conversations",
+                 "gateway_shared_first", "gateway_shared_targets_first")
     families = (
-        (("shared_conversations",),
-         (_CONVERSATION_LOAD_SOURCE,
-          "df3b7bbf30cab87d2e8c1c6dab8819f9cfe592b181407caa7c32af4c5f720cd4"), False),
-        (("shared_conversations", "gateway_conversations", "gateway_shared_first", "gateway_shared_targets_first"),
-         ("113325dd5cffa04626cc7be7ee93bc6e9be67335531288bc329b3542a155c92a",
-          "788f4c8f0b14421d5fc00f8b32c0ffcef79c04c647730767cb44b16584ed4aa4",
-          "4caab6e7a9eb457a5ceddf272112c434a97c101a2c27c3943f8a4155fb71bdb0",
-          "3c8a5f9d0154e7f174b96005258e34c925614fbbd3546e10ffb831616b7f9bdd",
-          "9f8084f595656375f3f32b0cbcdc473a5d69c06909530c1c243ac77e72481c4b",
-          "25a9937e5ce84572a64e26de759f6c97d0fd182b2620aaa91d876a2bf6669eac"), True),
+        # Explicit multi-user stages preserve ordinary Load dispatch.
+        (_CONVERSATION_LOAD_SOURCE,
+         "df3b7bbf30cab87d2e8c1c6dab8819f9cfe592b181407caa7c32af4c5f720cd4",
+         "fa40b2a909d2b067529ab02bd686c61adb8a175063e481d802ad33d308ef49fa"),
+        # Interim versions also applied a post-preparation cutoff to Load.
+        ("113325dd5cffa04626cc7be7ee93bc6e9be67335531288bc329b3542a155c92a",
+         "788f4c8f0b14421d5fc00f8b32c0ffcef79c04c647730767cb44b16584ed4aa4",
+         "4caab6e7a9eb457a5ceddf272112c434a97c101a2c27c3943f8a4155fb71bdb0",
+         "3c8a5f9d0154e7f174b96005258e34c925614fbbd3546e10ffb831616b7f9bdd",
+         "9f8084f595656375f3f32b0cbcdc473a5d69c06909530c1c243ac77e72481c4b",
+         "25a9937e5ce84572a64e26de759f6c97d0fd182b2620aaa91d876a2bf6669eac"),
     )
     matches = []
     shared = fingerprint_key == "shared_workload_fixture_sha256"
@@ -352,12 +353,9 @@ def _same_load_workload(current: dict, old: dict, *, fingerprint_key: str = "wor
         fields = _baseline_workload_fields(resolved.checks, shared=shared)
         if "load_test" not in fields:
             return False
-        load_only = fields == {"load_test"}
         recorded = manifest.get("fixture_pack", {}).get(fingerprint_key)
         attestations = set()
-        for index, (revisions, sources, allows_specialists) in enumerate(families):
-            if not load_only and not allows_specialists:
-                continue
+        for index, sources in enumerate(families):
             for revision in revisions:
                 identity = _run_limits_workload_identity(manifest, revision=revision, include_load=True, shared=shared)
                 if identity is None or not any(fixture_hash({**identity, "load_test_source_sha256": source}) == recorded

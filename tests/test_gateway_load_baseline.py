@@ -21,7 +21,7 @@ GATEWAY_GENERATORS = (
     "7a16b503242045f808ecfdb41df6bc8c507ca68181aaf019f003dc2d4d2ffb72",
     "8037d490881621f37f1aef446474bc52a1ba276bcfcd174f39a14e37032dc9f0",
 )
-CURRENT_LOAD_SOURCE = "25a9937e5ce84572a64e26de759f6c97d0fd182b2620aaa91d876a2bf6669eac"
+CURRENT_LOAD_SOURCE = "fa40b2a909d2b067529ab02bd686c61adb8a175063e481d802ad33d308ef49fa"
 
 
 @pytest.mark.asyncio
@@ -62,11 +62,11 @@ async def test_completed_load_survives_only_known_gateway_dispatch_changes(monke
     compared = compare_baseline(current, baseline)
     assert compared.baseline["targets"][0]["load_test"]["points"]
 
-    for change in ("old_traffic", "pre_final_admission", "unknown_traffic", "unknown_generator", "settings", "missing_settings"):
+    for change in ("interim_traffic", "pre_final_admission", "unknown_traffic", "unknown_generator", "settings", "missing_settings"):
         changed = baseline.model_copy(deep=True)
         altered = json.loads(json.dumps(identity))
-        if change == "old_traffic":
-            altered["load_test_source_sha256"] = "df3b7bbf30cab87d2e8c1c6dab8819f9cfe592b181407caa7c32af4c5f720cd4"
+        if change == "interim_traffic":
+            altered["load_test_source_sha256"] = "113325dd5cffa04626cc7be7ee93bc6e9be67335531288bc329b3542a155c92a"
         elif change == "pre_final_admission":
             altered["load_test_source_sha256"] = "b7b9faf687f2e5f96f3642b65e347960860211969d1be2a6e9d9a9144ec4e628"
         elif change == "unknown_traffic":
@@ -145,7 +145,7 @@ async def test_saved_fixed_sessions_baseline_survives_gateway_dispatch(monkeypat
         assert {row["check"] for row in result["comparisons"]} >= set(checks) - {"gateway_attribution"}
 
     for change in (
-        {"load_test_source_sha256": "df3b7bbf30cab87d2e8c1c6dab8819f9cfe592b181407caa7c32af4c5f720cd4"},
+        {"load_test_source_sha256": "113325dd5cffa04626cc7be7ee93bc6e9be67335531288bc329b3542a155c92a"},
         {"load_test_source_sha256": "unknown"},
         {"generator_source_sha256": "unknown"},
         {"session_sampling_source_sha256": "unknown"},

@@ -285,7 +285,7 @@ async def run_stage(
     reasons = []
     peak = 0
     execution_errors = 0
-    discard_through = -math.inf
+    discard_through = -math.inf if explicit else -1.0
     stalls: list[tuple[float, float]] = []
     interrupted = overflow
     drain_expired = False
@@ -319,18 +319,16 @@ async def run_stage(
         return due <= discard_through
 
     def blocked_offer(offset: float, now: float, *, refused: bool = False) -> str | None:
-        cutoff = stage_cutoff
-        if explicit:
-            if interruption() is not None:
-                return "not_offered"
-            if sending_finished_at is not None:
-                cutoff = sending_finished_at
-            refused = refused or now >= cutoff
-        if refused:
+        if not explicit:
+            return "dropped_late" if missed_arrival(offset, now) else None
+        if interruption() is not None:
+            return "not_offered"
+        cutoff = stage_cutoff if sending_finished_at is None else sending_finished_at
+        if refused or now >= cutoff:
             # A closed window takes precedence when it precedes the lag limit.
             # The public ledger keeps reserved offers that did not dispatch.
             late = (started_at+offset+traffic.scheduler_lag_tolerance_ms/1000 < cutoff
-                    and (explicit or interruption() is None) and missed_arrival(offset, now))
+                    and missed_arrival(offset, now))
             return "dropped_late" if late else "not_offered"
         return "dropped_late" if missed_arrival(offset, now) else None
 
@@ -358,7 +356,8 @@ async def run_stage(
             clock_start = record.timing_start_ms if record.timing_start_ms is not None else record.dispatch_ms
             if clock_start is not None:
                 lag_ms = max(lag_ms, clock_start-record.scheduled_ms)
-        offer_lags_ms[index] = lag_ms
+        if explicit:
+            offer_lags_ms[index] = lag_ms
         record.dispatch_lag_ms = lag_ms
         record.arrival_first_output_ms = (lag_ms + record.first_output_ms
                                            if record.first_output_ms is not None else None)
@@ -386,17 +385,18 @@ async def run_stage(
             })
             if run_start is not None:
                 spec.workload = {**spec.workload, "scheduled_ms": (started_at - run_start + offset) * 1000}
-            ready = time.monotonic()
-            lag_ms = max(0.0, (ready - started_at - offset) * 1000)
-            offer_lags_ms[index] = lag_ms
-            if outcome := blocked_offer(offset, ready):
-                drop(index, outcome)
-                return
             def annotate_record(record):
                 annotate(index, kind, offset, lag_ms, record)
 
             refusal = None
             if explicit:
+                ready = time.monotonic()
+                lag_ms = max(0.0, (ready - started_at - offset) * 1000)
+                offer_lags_ms[index] = lag_ms
+                if outcome := blocked_offer(offset, ready):
+                    drop(index, outcome)
+                    return
+
                 def check_admission():
                     nonlocal refusal
                     now = time.monotonic()
@@ -409,7 +409,7 @@ async def run_stage(
             else:
                 record = await execute(spec, annotate_record)
             if record is None:
-                if refusal is None:
+                if explicit and refusal is None:
                     refused = time.monotonic()
                     offer_lags_ms[index] = max(0.0, (refused-started_at-offset)*1000)
                     refusal = blocked_offer(offset, refused, refused=True)
