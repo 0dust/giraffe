@@ -202,6 +202,7 @@ def capabilities(config: RunConfig | None = None, *, restart_allowed: bool = Fal
         "limits_schema": Limits.model_json_schema(),
         "baseline_comparison": {"regression_percent": configured.limits.regression_percent,
                                 "regression_rate_points": configured.limits.regression_rate_points,
+                                "field": "limits.regression_percent",
                                 "fields": {"timing": "limits.regression_percent",
                                            "rates": "limits.regression_rate_points"}},
         "traffic_schema": TrafficConfig.model_json_schema(),
