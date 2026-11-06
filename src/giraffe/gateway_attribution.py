@@ -11,7 +11,8 @@ import uuid
 
 import httpx
 
-from .identities import credential_headers, identity_headers, identity_scope, litellm_key_fingerprint
+from .identities import (credential_headers, gateway_identities_only, identity_headers,
+                         identity_scope, litellm_key_fingerprint)
 from .models import CheckResult, RequestSpec
 
 
@@ -22,6 +23,17 @@ MAX_PAGES = 8
 PAGE_SIZE = 128
 POLL_FRACTIONS = (0, .425, .85)
 _UNSUPPORTED_READER_STATUSES = {404, 405, 501}
+
+
+def deferred_for_shared_targets(config):
+    return (len(config.targets) > 1 and CHECK in config.checks
+            and not gateway_identities_only(config.checks))
+
+
+def reader_preflight_bound(config, *, deferred=False):
+    if deferred or (config.max_requests is not None and len(config.checks) > 1):
+        return min(config.gateway_attribution.settle_seconds, config.metrics_timeout_seconds)
+    return 0
 
 
 def configured_probe_count(config, target):
@@ -149,15 +161,14 @@ def _spend_page(client, url, marker, start_date, end_date, page, page_size):
         "page_size": page_size, "start_date": start_date, "end_date": end_date})
 
 
-async def _reader_preflight(run, target, headers):
+async def _reader_preflight(run, target, headers, bound):
     """Check the evidence endpoint without admitting an inference request."""
     gateway = target.gateway
     now = time.monotonic()
     stop_reason = run.stop_reason(target.name)
     if stop_reason and stop_reason != "maximum request budget reached":
         return None
-    timeout = min(run.config.gateway_attribution.settle_seconds, run.config.metrics_timeout_seconds,
-                  (run.deadline - now) / 2)
+    timeout = min(bound, (run.deadline - now) / 2)
     if timeout <= 0:
         return None
     try:
@@ -249,8 +260,8 @@ async def execute(run, target, client, *, deferred=False):
     except ValueError:
         observation.update(reason="Gateway reader or selected identity credentials are unavailable.")
         return
-    if deferred or run.config.max_requests is not None and len(run.config.checks) > 1:
-        reader_status = await _reader_preflight(run, target, headers)
+    if preflight_bound := reader_preflight_bound(run.config, deferred=deferred):
+        reader_status = await _reader_preflight(run, target, headers, preflight_bound)
         if reader_status in _UNSUPPORTED_READER_STATUSES:
             observation.update(state="unsupported", reason="Read-only gateway spend logs are unsupported.",
                                planned_requests=0, observed_requests=0)
@@ -296,6 +307,7 @@ async def execute(run, target, client, *, deferred=False):
     collection_window = max(0, deadline - collection_started)
     end_date = (datetime.now(timezone.utc) + timedelta(seconds=collection_window + 1)).strftime("%Y-%m-%d %H:%M:%S")
     attempts, previous, unstable = 0, {}, False
+    cancelled = False
     assessment = _assess(records, {}, planned, complete=False)
     run.observations[target.name][CHECK] = assessment
     expected = {record.id: record for record in records}
@@ -343,6 +355,7 @@ async def execute(run, target, client, *, deferred=False):
                       and (attempts < len(POLL_FRACTIONS) or deadline < settle_deadline)):
                     assessment.update(reason="The final spend-log read could not qualify within the run budget.")
     except asyncio.CancelledError:
+        cancelled = True
         assessment = _assess(records, {}, planned, complete=False)
         assessment.update(reason="Gateway evidence collection was interrupted.")
         raise
@@ -354,6 +367,11 @@ async def execute(run, target, client, *, deferred=False):
         # Secret-derived fingerprints are transient and never included in reports.
         for record in records:
             record._gateway_key_hash = None
+        if (assessment["state"] == "unverified" and len(records) == planned
+                and deadline < settle_deadline and not run.stop.is_set()
+                and (not cancelled or run.reason == "maximum run duration reached")):
+            assessment.update(reason_code="time_limited",
+                              reason="The run deadline did not leave the configured spend-log settle window after all identity probes.")
         assessment.update(collection_attempts=attempts, collection_version=COLLECTION_VERSION,
             source="litellm_spend_logs_v2",
             evidence_scope="Exact generated request markers; aggregate counters and counter resets are not used.")
