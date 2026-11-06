@@ -791,7 +791,8 @@ async def test_access_only_counts_requests_admitted_to_transport(monkeypatch, li
 
 
 @pytest.mark.parametrize("cap", [3, 4])
-async def test_access_quota_cutoff_preserves_completed_serving_comparison(monkeypatch, cap):
+@pytest.mark.parametrize("baseline_capped", [False, True])
+async def test_access_quota_cutoff_preserves_completed_serving_comparison(monkeypatch, cap, baseline_capped):
     monkeypatch.setenv("ALLOW_KEY", "allow-secret")
     monkeypatch.setenv("DENY_KEY", "deny-secret")
     calls = []
@@ -808,7 +809,8 @@ async def test_access_quota_cutoff_preserves_completed_serving_comparison(monkey
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
     cfg = config(retention="all", max_requests=cap, samples=2, limits={"min_samples": 2})
     cfg.checks = ["serving", "gateway_access"]
-    baseline = await run_suite(cfg.model_copy(update={"checks": ["serving"]}))
+    baseline = await run_suite(cfg.model_copy(update={
+        "checks": ["serving"], "max_requests": cap if baseline_capped else None}))
     current = await run_suite(cfg)
     assert baseline.overall == "pass" and current.overall == "inconclusive"
     assert calls == [None] * 6 + ["Bearer allow-secret"] * (cap - 3)
@@ -828,7 +830,10 @@ async def test_access_quota_cutoff_preserves_completed_serving_comparison(monkey
         for record in report.requests:
             record.elapsed_ms = 10
             record.first_output_ms = 5
+    current = RunReport.model_validate_json(current.model_dump_json())
+    baseline = RunReport.model_validate_json(baseline.model_dump_json())
     comparison = compare_baseline(current, baseline).baseline["targets"][0]
+    assert not comparison["reasons"]
     assert any(row["check"] == "serving" and row["status"] == "pass" for row in comparison["comparisons"])
 
 
@@ -880,7 +885,7 @@ async def test_access_denial_rules_do_not_change_policy_evidence(monkeypatch, lo
     assert check.status == "pass"
     baseline = report.model_copy(deep=True)
     # A passing quota run saved on the immediate policy predecessor, before gateway access.
-    baseline.manifest["gateway_policy_source_sha256"] = "4f81244d2c774764d6d24739f966ba32c69c4f90c41c68d19fbb6fc1dafdf440"
+    baseline.manifest["gateway_policy_source_sha256"] = "188edf5da8e11b84afd8c851b4c5a96c3206ff24bb8d6ac04077eec17a0d7c5d"
     assert compare_baseline(report, baseline).baseline["status"] == "pass"
 
 

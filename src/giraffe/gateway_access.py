@@ -222,7 +222,7 @@ async def execute(run, target, client):
         for case, row in zip(settings.cases, rows):
             if row["reason"] != "not_run":
                 continue
-            if not run.allowed(target.name):
+            if not run.allowed(target.name, gateway_probe=True):
                 break
             spec = RequestSpec(fixture_id="gateway-access-" + case.name,
                 scenario="gateway_access", check_ids=["gateway_access"], identity=case.identity,
@@ -237,7 +237,7 @@ async def execute(run, target, client):
                 on_preparation_failure=lambda record: row.update(reason=_IDENTITY_FAILURE_REASONS.get(
                     record.error, "request_not_dispatched")))
             if record is None and row["reason"] == "not_run":
-                if not run.allowed(target.name):
+                if not run.allowed(target.name, gateway_probe=True):
                     break
                 row["reason"] = "request_not_dispatched"
     finally:
