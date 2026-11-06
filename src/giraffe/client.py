@@ -159,11 +159,18 @@ async def _sse_events(
         raise _ProtocolError("unterminated SSE event at end of response")
 
 
-def _object(payload: str | bytes) -> dict[str, Any]:
-    try:
-        value = json.loads(payload)
-    except (ValueError, RecursionError) as exc:
-        raise _ProtocolError("malformed JSON in response") from exc
+def _object(payload: str | bytes, *, strict_gateway_json: bool = False) -> dict[str, Any]:
+    if strict_gateway_json:
+        from .gateway_json import parse_gateway_json
+
+        value = parse_gateway_json(payload)
+        if value is None:
+            raise _ProtocolError("malformed JSON in response")
+    else:
+        try:
+            value = json.loads(payload)
+        except (ValueError, RecursionError) as exc:
+            raise _ProtocolError("malformed JSON in response") from exc
     if not isinstance(value, dict):
         raise _ProtocolError("response must contain a JSON object")
     if value.get("error") is not None:
@@ -253,6 +260,7 @@ class LLMClient:
         self.max_connections = max_connections
         self.logprob_budget = LogprobBudget()
         self._client: httpx.AsyncClient | HTTPClientPool | None = None
+        self._tls_context: ssl.SSLContext | None = None
         self._stream_drains: set[asyncio.Task[None]] = set()
         self.on_response = None
         self._evidence_fields = {"logprobs", "stream_options"}
@@ -309,6 +317,12 @@ class LLMClient:
     def _request_headers(self) -> dict[str, str]:
         return _headers(self.target)
 
+    @property
+    def tls_context(self) -> ssl.SSLContext:
+        if self._client is None or self._tls_context is None:
+            raise RuntimeError("Use LLMClient as an async context manager")
+        return self._tls_context
+
     def _create_client(self) -> HTTPClientPool:
         # HTTPX loads TLS certificates even for HTTP endpoints. Keep that
         # synchronous setup away from concurrent inference and the heartbeat.
@@ -316,6 +330,7 @@ class LLMClient:
         verify = (ssl.create_default_context(cafile=self.config.ca_bundle)
                   if self.config.ca_bundle else
                   httpx.create_ssl_context(verify=True, trust_env=True))
+        self._tls_context = verify
         if self.target.test_identities:
             from .identities import IdentityCookieJar
             cookies = IdentityCookieJar()
@@ -447,6 +462,9 @@ class LLMClient:
             key: value for key, value in (self.config.request_options | spec.options).items()
             if key not in _RESERVED_OPTIONS and value is not None
         }
+        if attribution:
+            # LiteLLM can log an explicit caller session instead of the trace header.
+            payload["litellm_session_id"] = spec.workload["gateway_run"]
         payload.update(model=self.target.model, messages=spec.messages, stream=stream,
                        max_tokens=budget, n=1)
         if spec.scorer == "tool":
@@ -833,6 +851,7 @@ class LLMClient:
                             _object(await _limited_body(response, on_body=body_received))
                             raise _ProtocolError("endpoint returned JSON instead of an SSE stream")
                         chunk_limit = spec.cancel_after_chunks
+                        terminal_usage = (None, None)
                         events = _sse_events(response, on_read=stream_body_received,
                                              mark_read_end=chunk_limit is not None)
                         async for event_type, event, observed_at in events:
@@ -851,11 +870,17 @@ class LLMClient:
                                 record.stream_end_ms = (observed_at - start) * 1000
                                 record.stream_terminated = True
                                 break
-                            data = _object(event)
+                            data = _object(event, strict_gateway_json=True) if attribution else _object(event)
                             receive(data, streaming=True, observed_at=observed_at)
-                            if attribution and isinstance(data.get("usage"), dict):
-                                record._gateway_terminal_usage = (record.finish_reason is not None
-                                    and record.input_tokens is not None and record.completion_tokens is not None)
+                            if attribution and record.finish_reason is not None and isinstance(data.get("usage"), dict):
+                                counts = (record.input_tokens, record.completion_tokens)
+                                if any(previous is not None and current is not None and previous != current
+                                       for previous, current in zip(terminal_usage, counts)):
+                                    record._gateway_terminal_usage = False
+                                    raise _ProtocolError("conflicting terminal usage in gateway response")
+                                terminal_usage = (counts[0] if counts[0] is not None else terminal_usage[0],
+                                                  counts[1] if counts[1] is not None else terminal_usage[1])
+                                record._gateway_terminal_usage = None not in counts
                         if not record.stream_terminated:
                             raise _ProtocolError("SSE stream ended without [DONE]")
                     else:
@@ -863,7 +888,8 @@ class LLMClient:
                             record.stream_end_ms = (at - start) * 1000
                         body = await _limited_body(response, on_read=body_read, on_body=body_received)
                         observed_at = start + record.stream_end_ms / 1000 if record.stream_end_ms is not None else time.perf_counter()
-                        receive(_object(body), streaming=False, observed_at=observed_at)
+                        data = _object(body, strict_gateway_json=True) if attribution else _object(body)
+                        receive(data, streaming=False, observed_at=observed_at)
                         record.stream_terminated = True
                     if record.finish_reason is None:
                         raise _ProtocolError("response ended without a completion finish reason")
