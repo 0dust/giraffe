@@ -186,6 +186,59 @@ def test_http_selected_cancellation_retains_once_and_peers_continue(retention):
         asyncio.run(run(endpoint))
 
 
+def test_reasoning_chunks_trigger_selected_cancellation_and_preserve_observations(monkeypatch):
+    import httpx
+    from giraffe.client import LLMClient
+    from giraffe.models import LoadTestSettings
+    from giraffe.multi_user import run_window
+    from giraffe.multi_user_metrics import summarize
+    from tests.test_review26_phase4_accuracy import run_virtual
+
+    class Stream(httpx.AsyncByteStream):
+        def __init__(self, reasoning):
+            self.reasoning = reasoning
+
+        async def __aiter__(self):
+            for index in range(8):
+                await asyncio.sleep(.01)
+                field = "reasoning_content" if self.reasoning and index < 2 else "content"
+                content = "K7P4" if index == 0 else " 42"
+                yield f'data: {json.dumps({"choices": [{"delta": {field: content}}]})}\n\n'.encode()
+            yield (b'data: {"choices":[{"delta":{},"finish_reason":"length"}],'
+                   b'"usage":{"prompt_tokens":64,"completion_tokens":8}}\n\n')
+            yield b'data: [DONE]\n\n'
+
+    async def run():
+        cfg = settings(levels=[2], duration_seconds=.36, scenarios=["cancellation"],
+                       profile=PROFILE, think_time_seconds={"values": [.1]},
+                       cancellation={"user_id": "user-02", "cancel_after_chunks": 2})
+        target = cfg.targets[0]
+        state = runner._Run(cfg, None, None)
+        client = LLMClient(target, cfg, max_connections=2)
+        requests = 0
+
+        async def respond(request):
+            nonlocal requests
+            requests += 1
+            # The selected request waits for the first peer to begin streaming.
+            return httpx.Response(200, stream=Stream(requests == 2))
+
+        observation = _planned_observation(cfg.multi_user)
+        window, = observation["windows"]
+        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as transport:
+            client._client = transport
+            await run_window(state, target, client, cfg.multi_user, LoadTestSettings(profile=cfg.multi_user.profile),
+                             {("short", "long_output"): {"filler_chars": 100}}, window)
+        cancelled, = [r for r in state.records if r.status == "cancelled"]
+        assert cancelled.termination_reason == "generation_chunk_limit"
+        assert cancelled.generation_chunks == 2 and cancelled.answer_chunks == 0
+        evidence = summarize(observation, state.records)["windows"][0]["cancellation"]
+        assert all(evidence[key]["status"] == "pass" and evidence[key]["request_ids"]
+                   for key in ("cancellation", "peer_continuation", "followup")), evidence
+
+    run_virtual(monkeypatch, run())
+
+
 def matched_observation(trigger="during_stream", heavy_profile="long_short"):
     cfg = settings(levels=[2], duration_seconds=1, scenarios=["noisy_neighbors"], profile=PROFILE,
         noisy_neighbors={"heavy_user_ids": ["user-02"], "heavy_profiles": [heavy_profile],
@@ -265,6 +318,8 @@ def test_incomplete_interference_never_passes(missing):
 @pytest.mark.parametrize(("cache_counts", "status"), [
     ((0, 64, 0), "inconclusive"),
     ((0, 0, 256), "inconclusive"),
+    ((0, 0, 120), "inconclusive"),
+    ((0, 0, 64), "pass"),
     ((16, 16, 16), "pass"),
 ])
 def test_interference_qualifies_cached_input_work(cache_counts, status):
@@ -379,11 +434,13 @@ def test_http_partial_cancellation_cannot_pass_without_user_criteria():
         asyncio.run(run(endpoint))
 
 
-def test_cancellation_followup_does_not_substitute_for_peer_overlap():
+@pytest.mark.parametrize("delayed", [False, True])
+def test_cancellation_followup_does_not_substitute_for_peer_overlap(delayed):
     from giraffe.multi_user_metrics import summarize
     from tests.test_multi_user_metrics import observation
     cancelled = record("user-01", identity="cancelled", status="cancelled", valid=False, intentional=True,
-        end=100, answer_chunks=2, client_cancelled_ms=90, client_cancelled_at_ns=1, finish_reason=None)
+        end=100, answer_chunks=2, generation_chunks=2, termination_reason="generation_chunk_limit",
+        client_cancelled_ms=90, client_cancelled_at_ns=1, finish_reason=None)
     cancelled.workload["cancellation_role"] = "selected"
     followup = record("user-01", identity="followup", dispatch=200, end=300)
     followup.workload["cancellation_role"] = "followup"
@@ -391,8 +448,9 @@ def test_cancellation_followup_does_not_substitute_for_peer_overlap():
     source = observation([cancelled, followup, peer])
     source["windows"][0].update(scenario="cancellation", selected_user_id="user-01", role="cancellation")
     original = deepcopy(source)
-    result = summarize(source, [cancelled, followup, peer])
+    result = summarize(source, [cancelled, followup, peer], legacy_max_lag_ms=1000 if delayed else 0)
     evidence = result["windows"][0]["cancellation"]
+    assert evidence["cancellation"]["status"] == ("inconclusive" if delayed else "pass")
     assert evidence["followup"]["status"] == "pass"
     assert evidence["peer_continuation"]["status"] == "inconclusive"
     assert result["status"] == "inconclusive"
