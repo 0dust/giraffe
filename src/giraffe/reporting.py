@@ -1146,6 +1146,14 @@ def _user_scenario_evidence(window: dict, user_id: str) -> dict:
     return {}
 
 
+def _probe_timing_has_overlap(evidence: dict, records: list[RequestRecord]) -> bool:
+    exposed = set(evidence.get("probe_request_ids", []))
+    # The fallback for a heavy user describes the whole probe window.
+    exposed.update(rid for user in evidence.get("users", []) for rid in user.get("heavy_request_ids", []))
+    return bool(exposed) and all(record.id in exposed for record in records
+                                 if record.status == "completed" and record.valid)
+
+
 def _compare_user_delivery(report, baseline, target, reasons, threshold):
     current, previous = _user_measurements(report, target), _user_measurements(baseline, target)
     rows, incomplete = [], []
@@ -1183,6 +1191,10 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold):
                "baseline_samples": b.get("outcomes", {}).get("valid_completed", 0),
                "threshold": threshold, "change_unit": "percent", "evidence_ids": c.get("request_ids", []),
                "method": "Observed completed-output delivery over matching common windows; no cross-run confidence interval."}
+        if scenario == "noisy_neighbors" and role == "probe":
+            row["timing_exposure_qualified"] = (not scenario_reason
+                                                and _probe_timing_has_overlap(c_scenario, current_work)
+                                                and _probe_timing_has_overlap(b_scenario, old_work))
         if missing:
             detail = (work_reason or "Requested work proportions differ." if mix_changed or work_reason else
                       live_work_reason or scenario_reason or "Missing or incomplete shared-window coverage.")
@@ -1291,6 +1303,7 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
         rows = []
         user_rows, user_reasons = _compare_user_delivery(report, baseline, name, target_reasons, threshold)
         rows.extend(user_rows)
+        qualified_user_probes = {row["scenario"] for row in user_rows if row.get("timing_exposure_qualified")}
         # Optional observations and checks without inference/acceptance cohorts
         # do not participate in baseline verdicts or sample-collection guidance.
         non_request_checks = {"gpu"}
@@ -1325,6 +1338,9 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                 current_records = current_groups.get((check, scenario), [])
                 old_records = old_groups.get((check, scenario), [])
                 point_records = current_records or old_records
+                workload = point_records[0].workload
+                unqualified_user_probe = (check == "multi_user" and workload.get("scenario") == "noisy_neighbors"
+                                          and workload.get("role") == "probe" and scenario not in qualified_user_probes)
                 load_point = ({field: point_records[0].load_point.get(field) for field in (*_LOAD_POINT_FIELDS, "point_id")}
                               if check == "load" and point_records else None)
                 if load_point and load_point["pattern"] == "interference":
@@ -1384,6 +1400,8 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                     if mix_changed:
                         warn("request_mix_changed", "Request work identity shares differ by more than 10 percentage points; observed aggregate values reflect different request mixes.")
                     if metric in TIMING_METRICS:
+                        if unqualified_user_probe:
+                            warn("unqualified_interference", "Noisy-neighbor probe timing requires qualified heavy overlap for the timing samples in both runs.")
                         if load_point:
                             for label, records in (("Current", current_records), ("Baseline", old_records)):
                                 point = load_points[label].get(records[0].load_point.get("point_id"), records[0].load_point)

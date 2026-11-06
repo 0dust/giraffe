@@ -684,9 +684,26 @@ class LLMClient:
                       spec.cancel_after_ms / 1000 if spec.cancel_after_ms else float("inf"))
         try:
             async with asyncio.timeout(timeout):
-                response = await self._client.send(self._client.build_request(
+                request = self._client.build_request(
                     "POST", completion_url(self.target.url), json=payload,
-                    timeout=httpx.Timeout(None, connect=min(request_timeout * .9, 10))), stream=True)
+                    timeout=httpx.Timeout(None, connect=min(request_timeout * .9, 10)))
+                if spec.workload.get("scenario") == "noisy_neighbors" and spec.workload.get("role") == "probe":
+                    sending_post = False
+
+                    async def observe_send(event: str, info: dict) -> None:
+                        nonlocal sending_post
+                        protocol, _, name = event.partition(".")
+                        if protocol not in {"http11", "http2"}:
+                            return
+                        if name == "send_request_body.started":
+                            # A proxy CONNECT can inherit this request's trace extension.
+                            sending_post = info["request"].method == b"POST"
+                        elif name == "send_request_body.complete" and sending_post:
+                            record._request_body_sent_monotonic = monotonic()
+                            sending_post = False
+
+                    request.extensions["trace"] = observe_send
+                response = await self._client.send(request, stream=True)
                 events = None
                 try:
                     record.http_status = response.status_code

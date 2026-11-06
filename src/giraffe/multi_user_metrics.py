@@ -588,18 +588,24 @@ def _interference(observation, window, control, user_records, criteria, health, 
             span = answer_window(probe)
             if window["trigger"] == "before_output":
                 first = _first_generation(probe)
-                short_span = (probe.dispatch_ms, first) if probe.dispatch_ms is not None and first is not None else None
+                trigger_span = (probe.dispatch_ms, first) if probe.dispatch_ms is not None and first is not None else None
+                short_span = ((probe.request_body_sent_ms, first)
+                              if probe.request_body_sent_ms is not None and first is not None else None)
             else:
-                short_span = span
-            if short_span is None:
+                trigger_span = short_span = span
+            if trigger_span is None or short_span is None:
                 continue
-            lo = bisect_left(candidates, short_span[0], key=trigger_time)
-            hi = bisect_left(candidates, short_span[1], lo, key=trigger_time)
+            lo = bisect_left(candidates, trigger_span[0], key=trigger_time)
+            hi = bisect_left(candidates, trigger_span[1], lo, key=trigger_time)
             matched = False
             for _, competitor in candidates[lo:hi]:
+                # Runner admission can precede a connection wait or upload.
+                sent = competitor.request_body_sent_ms
+                if sent is None or not short_span[0] <= sent < short_span[1]:
+                    continue
                 if heavy_output == "short":
                     last = _first_generation(competitor)
-                    heavy_span = (competitor.timing_start_ms, last) if competitor.timing_start_ms is not None and last is not None else None
+                    heavy_span = (sent, last) if last is not None else None
                 else:
                     heavy_span = answer_window(competitor) if competitor.answer_reads >= 2 and competitor.answer_chunks >= 2 else None
                 overlap_span = span if heavy_output == "long" else short_span

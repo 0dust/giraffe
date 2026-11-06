@@ -397,6 +397,34 @@ def test_unqualified_scenario_cannot_pass_baseline_with_complete_user_delivery()
     assert any("scenario" in reason.lower() for reason in compared.baseline["targets"][0]["reasons"])
 
 
+@pytest.mark.parametrize("exposure", ["missing", "partial", "complete"])
+def test_probe_timing_regression_requires_heavy_overlap_in_both_runs(exposure):
+    current, baseline = scenario_report(), scenario_report()
+    for report in (current, baseline):
+        windows = report.checks[0].metrics["multi_user"]["windows"]
+        windows.pop()  # Compare the noisy-neighbor probe on its own.
+        evidence = windows[0]["interference"]
+        has_overlap = report is baseline or exposure != "missing"
+        if has_overlap:
+            evidence.update(status="pass", qualified=True, reasons=[])
+            user_requests = [item.id for item in report.requests if item.workload["user_id"] == "user-01"]
+            matched_requests = user_requests[:1] if report is current and exposure == "partial" else user_requests
+            evidence["users"][0].update(status="pass", qualified=True, reasons=[], probe_request_ids=matched_requests)
+        for item in report.requests:
+            item.workload.update(scenario="noisy_neighbors", role="probe",
+                                 trigger="during_stream", heavy_profile="long_short",
+                                 population=windows[0]["population"])
+            if report is current and item.workload["user_id"] == "user-01":
+                item.completed_ms += 100
+
+    compared = compare_baseline(current, baseline)
+    row = next(row for row in compared.baseline["targets"][0]["comparisons"]
+               if row["metric"] == "latency_ms" and row.get("user_id") == "user-01")
+    assert row["current"] == 200 and row["baseline"] == 100
+    assert row["status"] == ("fail" if exposure == "complete" else "inconclusive")
+    assert compared.baseline["status"] == {"missing": "inconclusive", "partial": "pass", "complete": "fail"}[exposure]
+
+
 def test_new_interference_failure_survives_incomplete_peer_cancellation_baseline():
     current, previous = scenario_report(), scenario_report()
     for report in (current, previous):

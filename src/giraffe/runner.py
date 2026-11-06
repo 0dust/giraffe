@@ -749,6 +749,8 @@ class _Run:
             record.dispatch_ms = (started-self.start)*1000
             record.timing_start_ms = ((record._timing_started_monotonic - self.start) * 1000
                 if record._timing_started_monotonic is not None else record.dispatch_ms)
+            if record._request_body_sent_monotonic is not None:
+                record.request_body_sent_ms = (record._request_body_sent_monotonic - self.start) * 1000
             record.completed_ms = (time.monotonic()-self.start)*1000
             record.workload = {**spec.workload, **record.workload}
             record.load_point = dict(spec.load_point) if spec.load_point else None
@@ -823,7 +825,7 @@ class _Run:
                                   "id", "target", "fixture_id", "scenario", "condition_id", "intentional", "status", "valid", "score",
                                   "elapsed_ms", "first_output_ms", "check_ids", "http_status",
                                   "request_timeout_seconds", "termination_reason", "termination_limit_seconds",
-                                  "started_at", "dispatch_ms", "completed_ms", "timing_start_ms",
+                                  "started_at", "dispatch_ms", "completed_ms", "timing_start_ms", "request_body_sent_ms",
                                   "timing_schema", "first_token_ms", "first_reasoning_ms", "last_output_ms",
                                   "stream", "stream_end_ms", "answer_reads", "answer_chunks", "answer_chars",
                                   "first_read_answer_chars", "max_stream_gap_ms", "input_tokens", "output_tokens",
