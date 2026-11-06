@@ -443,8 +443,10 @@ def test_probe_timing_regression_requires_heavy_overlap_in_both_runs(exposure):
     for report in (current, baseline):
         windows = report.checks[0].metrics["multi_user"]["windows"]
         windows.pop()  # Compare the noisy-neighbor probe on its own.
+        windows[0]["users"] = windows[0]["users"][:1]
         evidence = windows[0]["interference"]
-        user_requests = [item for item in report.requests if item.workload["user_id"] == "user-01"]
+        report.requests = [item for item in report.requests if item.workload["user_id"] == "user-01"]
+        user_requests = report.requests
         if late_unmatched:
             user_requests[-1].completed_ms = windows[0]["end_ms"] + 100
             windows[0]["users"][0]["output_tokens_per_second"] = 70
