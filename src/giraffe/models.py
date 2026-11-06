@@ -2293,7 +2293,7 @@ class RunConfig(Model):
 
     @model_validator(mode="after")
     def validate_run(self) -> RunConfig:
-        if "gateway_policy" in self.checks and self.gateway_policy is not None:
+        if "gateway_policy" in self.checks and self.gateway_policy is not None and self.gateway_policy.supported:
             for target in self.targets:
                 if any(user.identity not in target.test_identities for user in self.gateway_policy.users):
                     raise ValueError("Every policy identity must be configured in each target's test_identities")
@@ -2787,6 +2787,7 @@ class RequestRecord(PersistedModel):
         return result
     _timing_started_monotonic: float | None = PrivateAttr(default=None)
     _gateway_key_hash: str | None = PrivateAttr(default=None)
+    _gateway_terminal_usage: bool = PrivateAttr(default=False)
     id: str
     target: str
     fixture_id: str

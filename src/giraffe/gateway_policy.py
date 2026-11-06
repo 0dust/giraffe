@@ -126,7 +126,8 @@ def summarize(settings, observation, records):
     successes = [record for record in records if record.status == "completed" and record.valid]
     declared = next(user for user in settings.users if user.identity == settings.affected_identity)
     rejection_kind = "key_rpm" if settings.capability == "key_rpm" else "priority_pool"
-    recognized = [record for record in affected if record.http_status == 429 and record.gateway_evidence
+    affected_rejections = [record for record in affected if record.http_status == 429]
+    recognized = [record for record in affected_rejections if record.gateway_evidence
                   and record.gateway_evidence.policy_rejection == rejection_kind
                   and record.gateway_evidence.rate_limit_unit == "requests"]
     for rejection in recognized:
@@ -153,7 +154,7 @@ def summarize(settings, observation, records):
     if not observation.get("identities_distinct"):
         return outcome("unverified", "Distinct authenticated test credentials could not be established locally.")
     if not recognized:
-        if any(record.http_status == 429 for record in affected):
+        if affected_rejections:
             return outcome("unverified", "Rejection does not identify the declared gateway policy.")
         return outcome("unexercised", "No attributed policy rejection was observed within offered work.")
     windows = [record.gateway_evidence.retry_after_seconds for record in recognized]
@@ -210,6 +211,8 @@ def summarize(settings, observation, records):
         if len(prior_admissions) + uncertain_prior >= declared.rpm:
             return outcome("unverified", "Prior requests with unknown admission could have consumed the declared RPM allowance.")
         return outcome("observed_failure", "Attributed rejection occurred before the declared RPM allowance was served.", "fail")
+    if len(recognized) != len(affected_rejections):
+        return outcome("unverified", "Affected identity received 429 responses that do not identify the declared gateway policy.")
     if not summary["complete"] or any(user["cancelled"] or user["other_failures"] for user in users):
         return outcome("unverified", "Traffic was interrupted or non-policy failures left incomplete evidence.")
     if not summary["peer_continuation"]:

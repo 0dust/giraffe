@@ -380,7 +380,12 @@ export function configureMultiUser(source, values, defaults, {allowInvalid=false
       const prefix='multi_user_conversation_';
       for(const name of ['max_tokens','delay_seconds'])if(values.has(prefix+name))conversation[name]=number('conversation_'+name,name);
       if(values.has(prefix+'modes'))conversation.modes=profile==='performance'?['live']:String(values.get(prefix+'modes')).split(',');
-      if(values.has(prefix+'turns'))conversation.turns=String(values.get(prefix+'turns')).split('\n');
+      if(values.has(prefix+'turns')){
+        const text=String(values.get(prefix+'turns')).replace(/\r\n?/g,'\n');
+        // Textareas normalize line endings and omit the first newline in their HTML content.
+        const saved=conversation.turns?.join('\n').replace(/\r\n?/g,'\n').replace(/^\n/,'');
+        if(text!==saved)conversation.turns=text.split('\n');
+      }
       if(values.has(prefix+'sampling_seed')){
         const sampling={seed:number('conversation_sampling_seed','Sampling seed')};
         for(const key of ['think_time_seconds','input_tokens','output_tokens','turn_count']){

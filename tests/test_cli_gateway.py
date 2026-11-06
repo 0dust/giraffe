@@ -7,7 +7,7 @@ import httpx
 import pytest
 
 from giraffe.cli import main
-from tests.test_gateway_attribution import config
+from tests.test_gateway_attribution import config, spend_page
 
 
 @pytest.mark.parametrize("shared", ["absent", "configured", "missing_env"])
@@ -37,7 +37,7 @@ def run_cli(monkeypatch, tmp_path, capsys, *, shared, mixed=False):
         if request.method == "GET":
             if request.url.path == "/spend/logs/v2":
                 assert request.headers["authorization"] == "Bearer secret-OBSERVER"
-                return httpx.Response(200, json={"data": rows, "total_pages": 1})
+                return spend_page(request, rows)
             return httpx.Response(404)
         authorization = request.headers.get("authorization")
         completions.append((authorization, request.headers.get("x-giraffe-preflight")))

@@ -65,6 +65,7 @@ def test_aggregate_offer_bound_counts_targets_and_accepts_exact_limit(monkeypatc
 
 @pytest.mark.parametrize("case,expected", [
     ("equal", "pass"), ("slow", "fail"), ("newcomer", "inconclusive"), ("burst", "inconclusive"),
+    ("unequal_local_drops", "inconclusive"), ("equal_local_drops", "inconclusive"),
     ("measure_only", "measured"),
 ])
 def test_selected_arrival_fairness_controls_window_and_overall_verdict(case, expected):
@@ -89,7 +90,10 @@ def test_selected_arrival_fairness_controls_window_and_overall_verdict(case, exp
     records = []
     for offer in window["offers"]:
         uid, start = offer["user_id"], offer["offset_seconds"]*1000
-        end = 11000 if case != "equal" and uid == "user-02" and start > 0 else start+1000
+        if start > 0 and (case == "equal_local_drops" or case == "unequal_local_drops" and uid == "user-02"):
+            offer.update(offered=True, outcome="dropped_local")
+            continue
+        end = 11000 if case == "slow" and uid == "user-02" and start > 0 else start+1000
         request = record(uid, identity=f'request-{offer["index"]}', dispatch=start, end=end,
             tokens=16, input_tokens=64, requested_input_tokens=64, requested_output_tokens=16,
             requested_max_tokens=16, stream=True, answer_chunks=3, answer_reads=3,
@@ -102,7 +106,7 @@ def test_selected_arrival_fairness_controls_window_and_overall_verdict(case, exp
     for user in window["users"]:
         own = [offer for offer in window["offers"] if offer["user_id"] == user["user_id"]]
         user.update(activated_ms=user["activation_seconds"]*1000, ready_count=len(own),
-                    dispatched_count=len(own), offer_accounting=_offer_counts(own))
+                    dispatched_count=sum(offer["dispatched"] for offer in own), offer_accounting=_offer_counts(own))
     summary = summarize(source, records)
     measured = summary["windows"][0]["fairness"]
     assert measured["status"] == expected
@@ -111,6 +115,8 @@ def test_selected_arrival_fairness_controls_window_and_overall_verdict(case, exp
         assert measured["ratio"] == 2.5
     if case in {"newcomer", "burst"}:
         assert any("arrival exposure or burst work differs" in reason for reason in measured["reasons"])
+    if case.endswith("local_drops"):
+        assert any("offer schedule" in reason for reason in measured["reasons"])
     assert summary["windows"][0]["status"] == summary["status"] == expected
 
 

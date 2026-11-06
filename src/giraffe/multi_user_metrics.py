@@ -11,6 +11,7 @@ from .timing import qualify, threshold
 
 
 SUMMARY_VERSION = 1
+_UNDISPATCHED_OFFERS = ("dropped_local", "dropped_late", "unissued", "not_offered")
 
 
 def _status(statuses: list[str], *, measured: bool = False) -> str:
@@ -257,9 +258,13 @@ def _fairness(observation, window, users, records, criteria, health, lag, timing
     limit = criteria.max_throughput_ratio
     start, end = window.get("start_ms"), window.get("end_ms")
     reasons = []
-    if window.get("scenario") == "arrivals" and (len({u.get("activation_seconds", 0) for u in users}) > 1
-            or any(o.get("origin") == "burst" for o in window.get("offers", []))):
-        reasons.append("Work not comparable: arrival exposure or burst work differs between users.")
+    if window.get("scenario") == "arrivals":
+        if len({u.get("activation_seconds", 0) for u in users}) > 1 or any(
+                offer.get("origin") == "burst" for offer in window.get("offers", [])):
+            reasons.append("Work not comparable: arrival exposure or burst work differs between users.")
+        counts = window.get("offer_accounting")
+        if not counts or any(counts.get(outcome, 0) for outcome in _UNDISPATCHED_OFFERS):
+            reasons.append("The generator did not deliver the configured user offer schedule.")
     if len(users) < 2:
         reasons.append("Fairness requires at least two compared users.")
     if window.get("cut_short") or start is None or end is None or end <= start:
@@ -308,7 +313,7 @@ def _fairness(observation, window, users, records, criteria, health, lag, timing
             notes.append("An answer ended before its requested output shape was exercised.")
         qualification = None
         if "_" in user["profile"] and not user["profile"].startswith("conversation:"):
-            qualification = _input_shape(observation, load_settings, user["profile"], work)
+            qualification = _input_shape(observation, load_settings, user["profile"], samples)
             if not qualification["qualified"]:
                 notes.append("Input shape not qualified: " + qualification["reason"])
         activated = user.get("activated_ms")
@@ -320,8 +325,8 @@ def _fairness(observation, window, users, records, criteria, health, lag, timing
         streams[uid] = [r.model_copy(update={"stream_end_ms": r.last_output_ms}) for r in samples
                         if r.stream and r.answer_reads >= 2 and r.answer_chunks >= 2]
         measurements.append({"user_id": uid, "reasons": notes, "valid_samples": len(samples),
-                             "input_median_tokens": median([r.input_tokens for r in work]),
-                             "output_median_tokens": median([r.output_tokens for r in work]),
+                             "input_median_tokens": median([r.input_tokens for r in samples]),
+                             "output_median_tokens": median([r.output_tokens for r in samples]),
                              "active_exposure_ms": exposure, "input_qualification": qualification})
     overlap_users = []
     for measured in measurements:
@@ -398,6 +403,21 @@ def _cancellation(window, records, criteria, health, lag, timing_threshold, dela
             "peer_continuation": peers, "followup": followup, "backend_release": "unverified"}
 
 
+def _comparable_tokens(a, b, tolerance):
+    return a is not None and b is not None and max(a, b) <= min(a, b) * (1 + tolerance)
+
+
+def _comparable_uncached_input(control, probe, tolerance):
+    a, b = control.cached_prompt_tokens, probe.cached_prompt_tokens
+    if a is None or b is None:
+        # An unreported count can coexist with no observed cache reuse, but
+        # cannot establish equivalence to a request with known cached input.
+        return not (a or b)
+    if not (0 <= a <= control.input_tokens and 0 <= b <= probe.input_tokens):
+        return False
+    return _comparable_tokens(control.input_tokens - a, probe.input_tokens - b, tolerance)
+
+
 def _interference(observation, window, control, user_records, criteria, health, lag, timing_threshold, delays):
     """Compare the same logical short work, retaining the exposure that exercised it."""
     settings = observation.get("settings", {})
@@ -427,7 +447,7 @@ def _interference(observation, window, control, user_records, criteria, health, 
         controls = {r.workload.get("matched_work_sequence"): r
                     for r in user_records.get((control["id"], uid), [])} if control else {}
         probes = user_records.get((window["id"], uid), [])
-        pairs, exposed = [], set()
+        pairs, exposed, excluded = [], set(), set()
         for probe in probes:
             baseline = controls.get(probe.workload.get("matched_work_sequence"))
             if not baseline or not _valid(baseline) or not _valid(probe):
@@ -439,6 +459,14 @@ def _interference(observation, window, control, user_records, criteria, health, 
                 continue
             if any(r.completed_ms is None or phase.get("end_ms") is None or r.completed_ms > phase["end_ms"]
                    for r, phase in ((baseline, control), (probe, window))):
+                continue
+            if not all(_comparable_tokens(a, b, tolerance) for a, b in
+                       ((baseline.input_tokens, probe.input_tokens),
+                        (baseline.output_tokens, probe.output_tokens))):
+                excluded.add("Actual matched short-user token lengths are missing or not comparable.")
+                continue
+            if not _comparable_uncached_input(baseline, probe, tolerance):
+                excluded.add("Actual matched short-user uncached input is not comparable.")
                 continue
             matches = []
             for competitor in heavy:
@@ -460,8 +488,13 @@ def _interference(observation, window, control, user_records, criteria, health, 
                 else:
                     heavy_span = answer_window(competitor) if competitor.answer_reads >= 2 and competitor.answer_chunks >= 2 else None
                 overlap_span = span if window["heavy_profile"].endswith("_long") else short_span
-                if _overlap(overlap_span, heavy_span, delays):
-                    matches.append(competitor)
+                if not _overlap(overlap_span, heavy_span, delays):
+                    continue
+                if (window["heavy_profile"].startswith("long_") and competitor.input_tokens
+                        and (competitor.cached_prompt_tokens or 0) > competitor.input_tokens / 2):
+                    excluded.add("More than half the long competitor input was cached.")
+                    continue
+                matches.append(competitor)
             if matches:
                 pairs.append((baseline, probe))
                 exposed.update(r.id for r in matches)
@@ -469,8 +502,10 @@ def _interference(observation, window, control, user_records, criteria, health, 
         competitors = [r for r in heavy if r.id in exposed]
         if len(pairs) < criteria.min_samples:
             notes.append(f"Only {len(pairs)} matched samples with the selected trigger and heavy overlap; {criteria.min_samples} required.")
+            notes.extend(sorted(excluded))
         if {r.workload.get("user_id") for r in competitors} != set(window["heavy_user_ids"]):
             notes.append("Not every selected heavy user has qualified overlap.")
+            notes.extend(sorted(excluded))
         values = {}
         for label, rows, shape in (("control", before, "short_short"), ("probe", after, "short_short"),
                                    ("heavy", competitors, window["heavy_profile"])):
@@ -490,10 +525,6 @@ def _interference(observation, window, control, user_records, criteria, health, 
             if qualify(rows, health, timing_threshold, ("latency_ms", "first_output_ms", "max_stream_gap_ms"),
                        legacy_max_lag_ms=lag)["status"] != "qualified":
                 notes.append(f"Actual {label} timing is unqualified.")
-        for suffix in ("input_median_tokens", "output_median_tokens"):
-            a, b = values["control_"+suffix], values["probe_"+suffix]
-            if a is None or b is None or max(a, b) > min(a, b)*(1+tolerance):
-                notes.append("Actual short-user token lengths are not comparable.")
         control_user = next((u for u in (control or {}).get("users", []) if u["user_id"] == uid), {})
         bounds = [(phase.get("start_ms"), phase.get("end_ms"), u.get("activated_ms"))
                   for phase, u in ((control or {}, control_user), (window, user))]
@@ -540,7 +571,7 @@ def _recovery(observation, window, control, sustained, user_records, criteria, h
             shared.append("Control, sustained or lighter window has incomplete coverage.")
             continue
         counts = phase.get("offer_accounting", {})
-        if not counts or any(counts.get(key, 0) for key in ("dropped_local", "dropped_late", "unissued", "not_offered")):
+        if not counts or any(counts.get(outcome, 0) for outcome in _UNDISPATCHED_OFFERS):
             shared.append("The generator did not deliver the configured phase schedule.")
         start, end = phase["start_ms"], phase["end_ms"]
         if (qualify([], health, timing_threshold, ("latency_ms", "max_stream_gap_ms"),
@@ -574,6 +605,12 @@ def _recovery(observation, window, control, sustained, user_records, criteria, h
         if any(not b.workload.get("matched_work_sha256")
                or a.workload.get("matched_work_sha256") != b.workload["matched_work_sha256"] for a, b in pairs):
             notes.append("Matched control and recovery work differs.")
+        if any(not _comparable_tokens(a, b, tolerance)
+               for before_request, after_request in pairs
+               for a, b in ((before_request.input_tokens, after_request.input_tokens),
+                            (before_request.output_tokens, after_request.output_tokens))
+               if a is not None and b is not None):
+            notes.append("Actual token lengths drifted between matched control and lighter requests.")
         stress = [r for r in sustained_records if r.workload.get("user_id") == uid and _valid(r)
                   and r.completed_ms is not None and (sustained or {}).get("end_ms") is not None
                   and r.completed_ms <= sustained["end_ms"]]
@@ -670,8 +707,7 @@ def summarize(observation: dict[str, Any], records: list[RequestRecord], *,
                 criteria, timing_health, legacy_max_lag_ms, timing_threshold, scenario_delays)
         if window.get("offers") is not None:
             for user in window["users"]:
-                if any(user.get("offer_accounting", {}).get(key, 0) for key in
-                       ("dropped_local", "dropped_late", "unissued", "not_offered")):
+                if any(user.get("offer_accounting", {}).get(outcome, 0) for outcome in _UNDISPATCHED_OFFERS):
                     user["coverage"]["status"] = "partial" if user["outcomes"]["attempted"] else "unexercised"
                     user["reasons"].append("The configured user offer schedule was not delivered.")
                     if user["status"] != "fail":

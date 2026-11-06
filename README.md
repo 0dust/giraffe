@@ -278,11 +278,12 @@ Ordinary requests continue to use the target's shared credentials.
 The LiteLLM reader sends a bounded UTC date window covering the probes and
 settle period on every page. The adapter requires generated request metadata, the matching session
 marker, a gateway API-key hash, and complete final prompt/completion token counts.
-The hash is compared in memory and discarded. Repeated log rows and cumulative
-streaming usage count once. Header-only or anonymous identities without a bearer
-key cannot prove key attribution. Missing rows, log lag beyond the bounded wait,
-changed or ambiguous rows, incomplete pagination, and missing token usage leave
-the result **unverified**. Shared counters cannot isolate this test's traffic and
+Each alias must use a distinct virtual key. The adapter recognizes Bearer authorization
+and LiteLLM's `x-litellm-api-key` header, and compares key hashes only in memory.
+Repeated log rows count once. For streamed requests, usage must arrive with or after
+the finish event. Missing rows, log lag beyond the bounded wait, changed or ambiguous
+rows, capped or inconsistent pagination, and missing final token usage leave the
+result **unverified**. Shared counters cannot isolate this test's traffic and
 are not used, so counter resets cannot produce a pass. Results separately name
 **not selected**, **unavailable**, **unsupported**, **unverified**, and observed
 **mismatch**; a verified result covers only the marked requests observed.

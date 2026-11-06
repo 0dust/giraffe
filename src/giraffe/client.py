@@ -411,6 +411,7 @@ class LLMClient:
                 "Non-streamed replies do not provide first-token arrival timing."),
         )
         selected_headers = None
+        attribution = spec.identity is not None and "gateway_attribution" in spec.check_ids
         if spec.identity is not None:
             from .identities import identity_headers
             try:
@@ -418,11 +419,11 @@ class LLMClient:
             except ValueError:
                 record.error = "Test identity credentials are unavailable."
                 return record
-            if "gateway_attribution" in spec.check_ids:
+            if attribution:
+                from .identities import litellm_key_fingerprint
+
+                record._gateway_key_hash = litellm_key_fingerprint(selected_headers)
                 selected_headers = dict(httpx.Headers(selected_headers))
-                authorization = httpx.Headers(selected_headers).get("authorization", "")
-                if authorization.startswith("Bearer "):
-                    record._gateway_key_hash = hashlib.sha256(authorization[7:].encode()).hexdigest()
                 selected_headers["x-litellm-trace-id"] = spec.workload["gateway_run"]
                 selected_headers["x-litellm-spend-logs-metadata"] = json.dumps({
                     "giraffe_run": spec.workload["gateway_run"], "giraffe_request": record.id})
@@ -786,7 +787,11 @@ class LLMClient:
                                 record.stream_end_ms = (observed_at - start) * 1000
                                 record.stream_terminated = True
                                 break
-                            receive(_object(event), streaming=True, observed_at=observed_at)
+                            data = _object(event)
+                            receive(data, streaming=True, observed_at=observed_at)
+                            if attribution and isinstance(data.get("usage"), dict):
+                                record._gateway_terminal_usage = (record.finish_reason is not None
+                                    and record.input_tokens is not None and record.completion_tokens is not None)
                             if (spec.cancel_after_chunks is not None
                                     and record.generation_chunks >= spec.cancel_after_chunks
                                     and record.finish_reason is None):

@@ -51,7 +51,7 @@ async def exercise(monkeypatch, mode="key_rpm", *, behavior="enforce", full=Fals
             message = ("Priority-based rate limit exceeded. Model: test, Priority: low, Rate limit type: requests, Model TPM: not configured, Model RPM: 10, Remaining: 0, Model saturation: 50%"
                        if mode == "priority_rpm" else
                        "Rate limit exceeded for api_key: private-hash. Limit type: requests. Current limit: 2, Remaining: 0. Limit resets at: 2026-01-01")
-            if behavior == "unknown":
+            if behavior == "unknown" or (behavior == "mixed_rejections" and counts[who] > threshold + 1):
                 message = "OpenAIException: provider rate limit"
             return httpx.Response(429, headers=headers, json={"error": {
                 "type": "throttling_error", "code": "429", "message": message}})
@@ -112,6 +112,19 @@ async def test_unknown_429_is_not_policy_enforcement_or_failure(monkeypatch, mod
     check, _, _ = await exercise(monkeypatch, mode, behavior="unknown")
     assert check.status == "inconclusive"
     assert check.metrics["gateway_policy"]["qualification"] == "unverified"
+
+
+@pytest.mark.parametrize("mode,attributed", [("key_rpm", "key_rpm"), ("priority_rpm", "priority_pool")])
+async def test_mixed_affected_rejections_leave_admissions_unverified(monkeypatch, mode, attributed):
+    check, _, _ = await exercise(monkeypatch, mode, behavior="mixed_rejections")
+    summary = check.metrics["gateway_policy"]
+    affected = summary["users"][0]
+    assert affected["admitted"] == 2 and affected["rejected"] == 3
+    assert [row["policy"]["policy_rejection"] for row in affected["evidence"] if row["http_status"] == 429] == [
+        attributed, "unknown", "unknown"]
+    assert summary["peer_continuation"]
+    assert check.status == "inconclusive"
+    assert summary["qualification"] == "unverified"
 
 
 async def test_unknown_window_cannot_certify_priority(monkeypatch):
