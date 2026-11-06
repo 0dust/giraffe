@@ -27,6 +27,7 @@ from .conditions import condition_aggregate, condition_for, request_status
 from .deployment import fixture_hash
 from .fixtures import (FIXTURE_VERSION, builtin_fixtures, load_custom_fixtures,
                        score_response, traffic_fixtures, deterministic_options, reasoning_budget)
+from .identities import gateway_identities_only
 from .overlap import NEEDS_STREAM, max_evidenced_overlap, scheduling_delay_windows
 from .request_pack import pack_identity, pack_preview, pack_specs
 from .stats import percentile
@@ -1227,7 +1228,6 @@ async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attributio
         if enabled == {"gpu"} and config.restart_target != target.name:
             await _metrics(run, target, "start")
             return
-        from .identities import gateway_identities_only
         gateway_only = config.restart_target != target.name and gateway_identities_only(enabled)
         client_target = _identity_only_target(target) if gateway_only else target
         async with LLMClient(client_target, config, max_connections=run.connection_limits[target.name]) as client:
@@ -3009,8 +3009,13 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
     memory_required_interrupted = any(check.required and (check.target, check.id)
                                      in run.memory_interrupted_checks for check in checks)
     verdict_reason = run.reason
-    if verdict_reason == "maximum request budget reached" and not any(run.unfinished.values()):
-        verdict_reason = None
+    if verdict_reason == "maximum request budget reached":
+        unfinished = set().union(*run.unfinished.values())
+        # A limit reached only during optional gateway work leaves the
+        # completed shared checks eligible for baseline comparison.
+        if not unfinished or (not gateway_identities_only(config.checks)
+                              and unfinished <= SHARED_BASELINE_EXCLUDED_WORKLOADS):
+            verdict_reason = None
     if run.memory_stop_reason and verdict_reason == run.memory_stop_reason and not memory_required_interrupted:
         verdict_reason = None
     report = RunReport(run_id=run_id, suite_version=__version__,
