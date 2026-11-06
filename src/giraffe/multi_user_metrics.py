@@ -254,6 +254,21 @@ def _variable(distribution: dict | None) -> bool:
     return len({value for value, weight in zip(values, weights) if weight > 0}) > 1
 
 
+def _uncached_input_tokens(record: RequestRecord) -> int | None:
+    total, cached = record.input_tokens, record.cached_prompt_tokens
+    if total is None or cached is None or not 0 <= cached <= total:
+        return None
+    return total - cached
+
+
+def _total_generated_tokens(record: RequestRecord) -> int | None:
+    if record.completion_tokens is not None:
+        return record.completion_tokens
+    if record.output_tokens is not None:
+        return record.output_tokens + (record.reasoning_tokens or 0)
+    return None
+
+
 def _input_shape_floors(observation, output):
     variant = "short_answer" if output == "short" else "long_output"
     return {item["size"]: item["input_tokens"] for item in observation.get("calibrations", [])
@@ -274,9 +289,21 @@ def _fairness(observation, window, users, records, criteria, health, lag, timing
     tolerance = settings.get("fairness_tolerance_percent", 10)
     limit = criteria.max_throughput_ratio
     start, end = window.get("start_ms"), window.get("end_ms")
-    reasons = []
+    phase_quality = qualify([], health, timing_threshold, ("latency_ms",), legacy_max_lag_ms=lag,
+                            phase_intervals=((start, end),) if start is not None and end is not None else ())
+    interpretation = (
+        "Median user throughput divided by worst user throughput over the common window. "
+        "Comparability tolerance applies to actual median token lengths, including total generation "
+        "and reported uncached input, and active exposure. "
+        "This measures observed delivery fairness, not a server scheduling defect."
+    )
     if len(users) < 2:
-        reasons.append("Fairness requires at least two compared users.")
+        return {"status": "not_applicable", "qualified": False, "threshold": limit,
+                "tolerance_percent": tolerance, "ratio": None, "compared_user_ids": [],
+                "eligible_user_ids": [], "overlap_user_ids": [],
+                "reasons": ["Fairness requires at least two compared users."],
+                "users": [], "timing_quality": phase_quality, "interpretation": interpretation}
+    reasons = []
     if window.get("cut_short") or start is None or end is None or end <= start:
         reasons.append("The common measurement window was not completed.")
     if window.get("drain_reason"):
@@ -292,8 +319,6 @@ def _fairness(observation, window, users, records, criteria, health, lag, timing
     if any(_variable(value) for key, value in (conversation.get("sampling") or {}).items()
            if key != "seed"):
         reasons.append("Work not comparable: independently sampled conversation plans differ.")
-    phase_quality = qualify([], health, timing_threshold, ("latency_ms",), legacy_max_lag_ms=lag,
-                            phase_intervals=((start, end),) if start is not None and end is not None else ())
     saved_delay = start is not None and end is not None and any(
         start < delay["end_ms"] and delay["start_ms"] < end
         for delay in observation.get("scheduling_delay_windows", []))
@@ -302,6 +327,7 @@ def _fairness(observation, window, users, records, criteria, health, lag, timing
     load_settings = LoadTestSettings(profile=settings.get("profile", {}),
                                     pass_criteria={"min_valid_responses": criteria.min_samples})
     measurements, streams = [], {}
+    cache_reuse = cache_unknown = False
     for user in users:
         uid = user["user_id"]
         rows = records.get((window["id"], uid), [])
@@ -318,6 +344,11 @@ def _fairness(observation, window, users, records, criteria, health, lag, timing
             notes.append("Unadmitted conversation turns prevent an equal-work comparison.")
         if any(r.input_tokens is None or r.output_tokens is None for r in work):
             notes.append("Input or output usage is missing.")
+        uncached = [_uncached_input_tokens(r) for r in samples]
+        cache_reuse |= any((r.cached_prompt_tokens or 0) > 0 for r in samples)
+        cache_unknown |= any(r.cached_prompt_tokens is None for r in samples)
+        if any(r.cached_prompt_tokens is not None and count is None for r, count in zip(samples, uncached)):
+            notes.append("Reported cached input usage is invalid.")
         if any(r.finish_reason == "stop" and r.output_tokens is not None
                and (cap := r.requested_output_tokens if r.requested_output_tokens is not None
                     else r.requested_max_tokens) is not None and r.output_tokens < cap
@@ -339,6 +370,8 @@ def _fairness(observation, window, users, records, criteria, health, lag, timing
         measurements.append({"user_id": uid, "reasons": notes, "valid_samples": len(samples),
                              "input_median_tokens": median([r.input_tokens for r in samples]),
                              "output_median_tokens": median([r.output_tokens for r in samples]),
+                             "uncached_input_median_tokens": median(uncached),
+                             "total_generated_median_tokens": median([_total_generated_tokens(r) for r in samples]),
                              "active_exposure_ms": exposure, "input_qualification": qualification})
     overlap_users = []
     for measured in measurements:
@@ -348,9 +381,15 @@ def _fairness(observation, window, users, records, criteria, health, lag, timing
             overlap_users.append(uid)
         else:
             measured["reasons"].append("No qualified streamed answer overlap with another compared user.")
-    for field, label in (("input_median_tokens", "actual median input lengths"),
-                         ("output_median_tokens", "actual median output lengths"),
-                         ("active_exposure_ms", "active exposure")):
+    comparable = [("input_median_tokens", "actual median input lengths"),
+                  ("output_median_tokens", "actual median output lengths"),
+                  ("total_generated_median_tokens", "actual median total generation lengths"),
+                  ("active_exposure_ms", "active exposure")]
+    if cache_reuse:
+        if cache_unknown:
+            reasons.append("Cached input usage is missing for some samples despite observed cache reuse.")
+        comparable.append(("uncached_input_median_tokens", "actual median uncached input lengths"))
+    for field, label in comparable:
         values = [item[field] for item in measurements if item[field] is not None]
         if values and max(values) > min(values) * (1 + tolerance / 100):
             reasons.append(f"Work not comparable: {label} differ by more than {tolerance:g}%.")
@@ -370,10 +409,7 @@ def _fairness(observation, window, users, records, criteria, health, lag, timing
     return {"status": status, "qualified": qualified, "threshold": limit, "tolerance_percent": tolerance,
             "ratio": ratio, "compared_user_ids": [user["user_id"] for user in users],
             "eligible_user_ids": eligible, "overlap_user_ids": overlap_users, "reasons": reasons,
-            "users": measurements, "timing_quality": phase_quality,
-            "interpretation": "Median user throughput divided by worst user throughput over the common window. "
-                "Comparability tolerance applies to actual median token lengths and active exposure. "
-                "This measures observed delivery fairness, not a server scheduling defect."}
+            "users": measurements, "timing_quality": phase_quality, "interpretation": interpretation}
 
 
 def _cancellation(window, records, criteria, health, lag, timing_threshold, delays):
@@ -621,7 +657,8 @@ def summarize(observation: dict[str, Any], records: list[RequestRecord], *,
         fairness = _fairness(observation, window, users, user_records, criteria, timing_health,
                              legacy_max_lag_ms, timing_threshold)
         statuses = [user["status"] for user in users]
-        if criteria.max_throughput_ratio is not None and not window.get("role"):
+        if (criteria.max_throughput_ratio is not None and not window.get("role")
+                and fairness["status"] != "not_applicable"):
             statuses.append(fairness["status"])
         window_status = _status(statuses, measured=all(status == "measured" for status in statuses))
         windows.append({**window, "users": users, "status": window_status, "fairness": fairness})
@@ -645,9 +682,13 @@ def summarize(observation: dict[str, Any], records: list[RequestRecord], *,
         if evidence:
             window["status"] = _status([window["status"], evidence["status"]],
                                       measured=window["status"] == evidence["status"] == "measured")
-    status = _status([window["status"] for window in windows if window["phase"] == "measurement"],
-                     measured=bool(all_users) and all(window["status"] == "measured" for window in windows
-                                                   if window["phase"] == "measurement"))
+    measurement_windows = [window for window in windows if window["phase"] == "measurement"]
+    statuses = [window["status"] for window in measurement_windows]
+    fairness_windows = [window for window in measurement_windows if not window.get("role")]
+    if criteria.max_throughput_ratio is not None and fairness_windows and all(
+            window["fairness"]["status"] == "not_applicable" for window in fairness_windows):
+        statuses.append("inconclusive")
+    status = _status(statuses, measured=bool(all_users) and all(value == "measured" for value in statuses))
     ranked = sorted(all_users, key=lambda user: (
         {"fail": 0, "inconclusive": 1, "measured": 2, "pass": 2}[user["status"]],
         user["output_tokens_per_second"] if user["output_tokens_per_second"] is not None else -1,

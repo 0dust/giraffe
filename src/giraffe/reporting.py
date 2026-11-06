@@ -1839,7 +1839,8 @@ def _duration_ms(value: float) -> str:
 
 
 def _badge(status: str) -> str:
-    return f'<span class="badge {_e(status)}">{_e(status)}</span>'
+    label = "Not applicable" if status == "not_applicable" else status
+    return f'<span class="badge {_e(status)}">{_e(label)}</span>'
 
 
 def _rps(value: float | None) -> str:
