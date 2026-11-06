@@ -289,11 +289,12 @@ def _same_run_limits_workload(current: dict, old: dict) -> bool:
 
 def _same_load_workload(current: dict, old: dict) -> bool:
     """Attest unchanged ordinary Load dispatch within exact source groups."""
-    # The explicit multi-user stage and its cutoff fixes leave ordinary Load dispatch unchanged.
-    # Keep it separate from sources before the final admission guard.
     revisions = (
+        # The nonce argument and explicit stage preserve the original ordinary Load path.
         ("9b694c97a39d449d8ea15b09a9aeb406bf835179c0882827685c4d7888687d36",
-         "df3b7bbf30cab87d2e8c1c6dab8819f9cfe592b181407caa7c32af4c5f720cd4"),
+         "df3b7bbf30cab87d2e8c1c6dab8819f9cfe592b181407caa7c32af4c5f720cd4",
+         "fa40b2a909d2b067529ab02bd686c61adb8a175063e481d802ad33d308ef49fa"),
+        # These interim sources also applied the post-build admission check to Load.
         ("113325dd5cffa04626cc7be7ee93bc6e9be67335531288bc329b3542a155c92a",
          "788f4c8f0b14421d5fc00f8b32c0ffcef79c04c647730767cb44b16584ed4aa4",
          "4caab6e7a9eb457a5ceddf272112c434a97c101a2c27c3943f8a4155fb71bdb0",

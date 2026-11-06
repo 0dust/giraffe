@@ -1217,14 +1217,19 @@ class MultiUserBurst(Model):
     requests: StrictInt = Field(default=5, ge=1, le=MAX_BURST_SIZE)
     spacing_seconds: float = Field(default=0, ge=0, le=MAX_STAGE_SECONDS)
 
-    def offer_offset(self, index: int) -> Fraction:
-        return Fraction(str(self.at_seconds)) + index * Fraction(str(self.spacing_seconds))
+    def offer_offset(self, index: int) -> float:
+        return float(Fraction(str(self.at_seconds)) + index * Fraction(str(self.spacing_seconds)))
 
 
 def _steady_offer_count(duration: float, activation: float, rate: float) -> int:
     # Count integer indices with activation + index / rate strictly before duration.
-    remaining = Fraction(str(duration)) - Fraction(str(activation))
-    return math.ceil(remaining * Fraction(str(rate)))
+    start = Fraction(str(activation))
+    frequency = Fraction(str(rate))
+    count = math.ceil((Fraction(str(duration)) - start) * frequency)
+    # The scheduled offset must still be inside the window after conversion to float.
+    if count > 0 and float(start + (count - 1) / frequency) >= duration:
+        return count - 1
+    return count
 
 
 class MultiUserArrivals(Model):
@@ -1281,9 +1286,8 @@ class MultiUser(Model):
                 raise ValueError("arrival and burst user IDs must exist at every population level")
             if any(at >= self.duration_seconds for at in arrivals.activations.values()):
                 raise ValueError("user activations must precede the arrival window end")
-            end = Fraction(str(self.duration_seconds))
             if any(b.at_seconds < arrivals.activations.get(b.user_id, 0)
-                   or b.offer_offset(b.requests - 1) >= end for b in arrivals.bursts):
+                   or b.offer_offset(b.requests - 1) >= self.duration_seconds for b in arrivals.bursts):
                 raise ValueError("every burst must fall after its user activation and before the window end")
             if arrivals.offer_count(self.duration_seconds, max(self.levels)) > MAX_PLANNED_ARRIVALS:
                 raise ValueError("multi-user arrival schedule exceeds the finite offer bound")

@@ -385,7 +385,7 @@ def _offer_plan(window, settings):
             for index in range(burst.requests):
                 user = users[burst.user_id]
                 offers.append({"user_id": burst.user_id, "profile": user["profile"], "cohort": user["cohort"],
-                    "offset_seconds": float(burst.offer_offset(index)),
+                    "offset_seconds": burst.offer_offset(index),
                     "origin": "burst", "burst_index": burst_index})
     priority = {user["user_id"]: random.Random(f"{settings.seed}:offer:{user['user_id']}").random()
                 for user in window["users"]}
