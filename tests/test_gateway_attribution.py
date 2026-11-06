@@ -416,7 +416,7 @@ async def test_observer_transport_echo_is_suppressed_but_shared_logs_remain(monk
         writer.close()
         await writer.wait_closed()
 
-    async def fake_request(target, client, spec):
+    async def fake_request(target, client, spec, **_):
         return RequestRecord(id=spec.identity, target=target.name, identity=spec.identity,
             fixture_id=spec.fixture_id, scenario=spec.scenario, check_ids=spec.check_ids,
             started_at="2026-11-06T00:00:00Z", status="completed", valid=True,

@@ -151,10 +151,30 @@ def _assess(records, matched, planned, *, complete, unstable=False):
     return totals
 
 
-def _client(config, headers, timeout):
-    verify = ssl.create_default_context(cafile=config.ca_bundle) if config.ca_bundle else True
-    return httpx.AsyncClient(headers=headers, verify=verify, proxy=config.proxy,
-                             timeout=timeout, follow_redirects=False)
+def _reader_tls(config):
+    return (ssl.create_default_context(cafile=config.ca_bundle) if config.ca_bundle else
+            httpx.create_ssl_context(verify=True, trust_env=True))
+
+
+def _reader_interrupted(stop, deadline):
+    return stop.is_set() or time.monotonic() >= deadline
+
+
+@asynccontextmanager
+async def _reader(config, headers, timeout, *, stop, deadline):
+    # Only certificate loading needs a worker. If setup times out, there is
+    # no HTTP client in the worker that would need to be closed afterward.
+    if _reader_interrupted(stop, deadline):
+        yield None
+        return
+    async with asyncio.timeout_at(deadline):
+        verify = await asyncio.to_thread(_reader_tls, config)
+    if _reader_interrupted(stop, deadline):
+        yield None
+        return
+    async with httpx.AsyncClient(headers=headers, verify=verify, proxy=config.proxy,
+                                 timeout=timeout, follow_redirects=False) as reader:
+        yield reader
 
 
 @asynccontextmanager
@@ -162,12 +182,12 @@ async def _spend_page(client, url, marker, start_date, end_date, page, page_size
     request = client.build_request("GET", url, params={"session_id": marker, "page": page,
         "page_size": page_size, "start_date": start_date, "end_date": end_date})
     # Building a request can cross a deadline before asyncio can deliver cancellation.
-    if stop.is_set() or time.monotonic() >= deadline:
+    if _reader_interrupted(stop, deadline):
         yield None
         return
     response = await client.send(request, stream=True)
     try:
-        yield response
+        yield None if _reader_interrupted(stop, deadline) else response
     finally:
         await response.aclose()
 
@@ -190,13 +210,13 @@ async def _reader_preflight(run, target, headers, bound):
         end_date = (current + timedelta(seconds=1)).strftime("%Y-%m-%d %H:%M:%S")
         with identity_scope(True):
             async with asyncio.timeout_at(deadline):
-                reader = await asyncio.to_thread(_client, run.config, headers, timeout)
-                async with reader:
-                    if run.stop_reason(target.name) not in {None, "maximum request budget reached"}:
+                async with _reader(run.config, headers, timeout, stop=run.stop, deadline=deadline) as reader:
+                    if reader is None or run.stop_reason(target.name) not in {None, "maximum request budget reached"}:
                         return None
                     async with _spend_page(reader, gateway.url, marker, start_date, end_date, 1, 1,
                                            stop=run.stop, deadline=deadline) as response:
-                        return response.status_code if response is not None else None
+                        status = response.status_code if response is not None else None
+                return None if _reader_interrupted(run.stop, deadline) else status
     except (httpx.HTTPError, OSError, TimeoutError, ValueError):
         return None
 
@@ -207,7 +227,7 @@ async def _pages(client, url, marker, *, start_date, end_date, max_rows, stop, d
     expected_total = None
     page_size = min(PAGE_SIZE, max_rows)
     for page in range(1, MAX_PAGES + 1):
-        if stop.is_set() or time.monotonic() >= deadline:
+        if _reader_interrupted(stop, deadline):
             return rows, False
         async with _spend_page(client, url, marker, start_date, end_date, page, page_size,
                                stop=stop, deadline=deadline) as response:
@@ -219,9 +239,13 @@ async def _pages(client, url, marker, *, start_date, end_date, max_rows, stop, d
                 return "unavailable", False
             body = bytearray()
             async for chunk in response.aiter_bytes():
+                if _reader_interrupted(stop, deadline):
+                    return rows, False
                 body.extend(chunk)
                 if len(body) > MAX_BODY_BYTES:
                     return rows, False
+            if _reader_interrupted(stop, deadline):
+                return rows, False
             try:
                 payload = json.loads(body)
             except (ValueError, UnicodeError, RecursionError):
@@ -341,7 +365,8 @@ async def execute(run, target, client, *, deferred=False):
                     max_tokens=min(16, run.config.max_output_tokens),
                     options={"stream_options": {"include_usage": True}} if run.config.stream else {},
                     workload={"gateway_run": marker})
-                record = await run.request(target, client, spec)
+                record = await run.request(target, client, spec, admission_deadline=run.deadline,
+                                           prepared_admission=True)
                 if record is not None:
                     records.append(record)
     except asyncio.CancelledError:
@@ -379,22 +404,25 @@ async def execute(run, target, client, *, deferred=False):
     try:
         with identity_scope(True):
             remaining = max(.001, min(run.config.metrics_timeout_seconds, deadline - time.monotonic()))
-            reader = await asyncio.to_thread(_client, run.config, headers, remaining)
-            async with reader:
+            async with _reader(run.config, headers, remaining, stop=run.stop, deadline=deadline) as reader:
                 for fraction in POLL_FRACTIONS:
+                    if reader is None:
+                        break
                     next_read = collection_started + collection_window * fraction
                     if (delay := next_read - time.monotonic()) > 0:
                         try:
                             await asyncio.wait_for(run.stop.wait(), timeout=delay)
                         except TimeoutError:
                             pass
-                    if time.monotonic() >= deadline or run.stop.is_set():
+                    if _reader_interrupted(run.stop, deadline):
                         break
                     attempts += 1
                     async with asyncio.timeout_at(deadline):
                         rows, complete = await _pages(reader, gateway.url, marker,
                             start_date=start_date, end_date=end_date,
                             max_rows=run.config.metrics_max_series, stop=run.stop, deadline=deadline)
+                    if _reader_interrupted(run.stop, deadline):
+                        break
                     if isinstance(rows, str):
                         assessment = _assess(records, {}, planned, complete=False)
                         assessment.update(state=rows, reason="Read-only gateway spend logs are unavailable or unsupported.")
@@ -402,33 +430,36 @@ async def execute(run, target, client, *, deferred=False):
                     matched, unrelated, invalid = _normalize(rows, marker, expected)
                     current = {(local_id, gateway_id): value for local_id, entries in matched.items()
                                for gateway_id, value in entries.items()}
-                    unstable |= invalid > 0 or any(key not in current or (value["complete"] and current[key] != value)
-                                                   for key, value in previous.items())
-                    previous = current
+                    changed = unstable or invalid > 0 or any(
+                        key not in current or (value["complete"] and current[key] != value)
+                        for key, value in previous.items())
                     # Early complete pages can predate conflicting rows from
                     # asynchronous writes. Qualify only after the final poll.
-                    settled = (attempts == len(POLL_FRACTIONS) and deadline == settle_deadline
-                               and time.monotonic() < deadline)
-                    assessment = _assess(records, matched, planned,
-                        complete=settled and complete and invalid == 0, unstable=unstable)
+                    settled = attempts == len(POLL_FRACTIONS) and deadline == settle_deadline
+                    candidate = _assess(records, matched, planned,
+                        complete=settled and complete and invalid == 0, unstable=changed)
+                    if _reader_interrupted(run.stop, deadline):
+                        break
+                    assessment, unstable, previous = candidate, changed, current
                     assessment.update(unrelated_rows=unrelated, invalid_rows=invalid,
                                       collection_complete=settled and complete, evidence_changed=unstable)
                 if run.stop.is_set():
                     run.stop_reason(target.name)
-                    assessment = _assess(records, {}, planned, complete=False)
-                    assessment.update(reason="Gateway evidence collection was interrupted.")
+                    if assessment["state"] == "unverified":
+                        assessment.update(reason="Gateway evidence collection was interrupted.")
                 elif (assessment["state"] == "unverified"
-                      and (attempts < len(POLL_FRACTIONS) or deadline < settle_deadline)):
+                      and (attempts < len(POLL_FRACTIONS) or deadline < settle_deadline
+                           or (time.monotonic() >= deadline and not assessment.get("collection_complete")))):
                     assessment.update(reason="The final spend-log read could not qualify within the run budget.")
     except asyncio.CancelledError:
         cancelled = True
-        assessment = _assess(records, {}, planned, complete=False)
-        assessment.update(reason="Gateway evidence collection was interrupted.")
+        if assessment["state"] == "unverified":
+            assessment.update(reason="Gateway evidence collection was interrupted.")
         raise
     except (httpx.HTTPError, OSError, TimeoutError, ValueError):
-        assessment = _assess(records, {}, planned, complete=False)
-        assessment.update(reason="Gateway evidence collection did not complete within its bounded window.",
-                          collection_complete=False, evidence_changed=unstable)
+        if assessment["state"] == "unverified":
+            assessment.update(reason="Gateway evidence collection did not complete within its bounded window.",
+                              collection_complete=False, evidence_changed=unstable)
     finally:
         # Secret-derived fingerprints are transient and never included in reports.
         for record in records:
@@ -440,6 +471,7 @@ async def execute(run, target, client, *, deferred=False):
                               reason="The run deadline did not leave the configured spend-log settle window after all identity probes.")
         if budget_limited and assessment["state"] == "unverified" and not cancelled and not run.stop.is_set():
             assessment.update(reason_code="budget_limited", reason=budget_reason)
+        assessment.setdefault("collection_complete", False)
         assessment.update(collection_attempts=attempts, collection_version=COLLECTION_VERSION,
             source="litellm_spend_logs_v2",
             evidence_scope="Exact generated request markers; aggregate counters and counter resets are not used.")
