@@ -39,6 +39,7 @@ the matrix can pass.
 | Response | Observation |
 | --- | --- |
 | HTTP 200 with a valid assistant answer and a `stop` or `length` finish reason | Allow |
+| HTTP 200 with a `length` finish and assistant reasoning metered at the full requested output cap | Allow |
 | HTTP 401 with a recognized LiteLLM authentication error | Deny |
 | HTTP 403 with a recognized LiteLLM model-access error | Deny |
 | Timeout, network error, 429, 5xx, redirect, unknown authentication error, malformed or incomplete response | Unverified |
@@ -55,7 +56,7 @@ Other versions or gateway error formats may remain unverified. See LiteLLM's
 [chat-completion client setup](https://docs.litellm.ai/docs/proxy/user_keys).
 
 The report shows expected versus observed decisions for every declared case,
-including cases that could not run. A valid completion for an expected-deny case
+including cases that could not run. Observed access for an expected-deny case
 fails the check. Policy observations remain separate from ordinary Endpoint
 access and performance measurements. Unconfigured checks do not stop ordinary
 shared-key tests. Safe configuration references and qualified outcomes survive

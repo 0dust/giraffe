@@ -201,6 +201,43 @@ async def test_malformed_evidence_cannot_verify_access(monkeypatch, role, finish
         ["allow", "unverified"] if error_code in (503, "503") else ["unverified", "deny"])
 
 
+@pytest.mark.parametrize("completion,reasoning,reasoning_text,observed,status", [
+    (16, 16, "deny-secret", "allow", "fail"),
+    (16, 16, None, "allow", "fail"),
+    (16, None, "deny-secret", "unverified", "inconclusive"),
+    (16, 17, None, "unverified", "inconclusive"),
+    (15, 15, None, "unverified", "inconclusive"),
+    (17, 17, None, "unverified", "inconclusive"),
+])
+async def test_reasoning_only_access_requires_metered_cap_exhaustion(
+        monkeypatch, completion, reasoning, reasoning_text, observed, status):
+    monkeypatch.setenv("ALLOW_KEY", "allow-secret")
+    monkeypatch.setenv("DENY_KEY", "deny-secret")
+
+    def handler(request):
+        if request.method != "POST":
+            return httpx.Response(404)
+        if request.headers["authorization"] == "Bearer allow-secret":
+            return httpx.Response(200, json={"choices": [{"message": {
+                "role": "assistant", "content": "OK"}, "finish_reason": "stop"}]})
+        assert json.loads(request.content)["max_tokens"] == 16
+        return httpx.Response(200, json={"choices": [{"message": {
+            "role": "assistant", "content": None, "reasoning_content": reasoning_text},
+            "finish_reason": "length"}], "usage": {"prompt_tokens": 8,
+            "completion_tokens": completion, "completion_tokens_details": {"reasoning_tokens": reasoning}}})
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
+    report = await run_suite(config(retention="all"))
+    check = next(check for check in report.checks if check.id == "gateway_access")
+    denied_case = check.metrics["gateway_access"]["cases"][1]
+    record = next(record for record in report.requests if record.id == denied_case["request_id"])
+    assert report.overall == check.status == denied_case["status"] == status
+    assert denied_case["observed"] == observed
+    assert not record.valid and record.answer_chars == 0
+    assert "deny-secret" not in report.model_dump_json()
+
+
 @pytest.mark.parametrize("anonymous", [False, True])
 async def test_distinct_custom_credentials_qualify_with_anonymous_or_custom_denial(monkeypatch, anonymous):
     monkeypatch.setenv("ALLOW_KEY", "Bearer allow-secret")

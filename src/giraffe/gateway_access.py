@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from giraffe.client import REASONING_BUDGET_ERROR
 from giraffe.identities import LITELLM_NATIVE_KEY_HEADERS, identity_headers, litellm_key_fingerprint
 from giraffe.models import CheckResult, RequestSpec
 
@@ -19,8 +20,12 @@ def observation(record):
         return "unverified", "not_run"
     if record.status == "cancelled":
         return "unverified", "request_cancelled"
-    if record.status == "completed" and record.http_status == 200 and record.valid:
-        return "allow", "valid_completion"
+    if record.status == "completed" and record.http_status == 200:
+        if record.valid:
+            return "allow", "valid_completion"
+        if (record.error == REASONING_BUDGET_ERROR
+                and record.reasoning_tokens == record.completion_tokens == record.requested_max_tokens > 0):
+            return "allow", "metered_reasoning_completion"
     evidence = record.gateway_evidence
     if (record.status == "failed" and record.error == f"HTTP {record.http_status}" and evidence
             and ((record.http_status == 401 and evidence.error_kind == "authentication")
