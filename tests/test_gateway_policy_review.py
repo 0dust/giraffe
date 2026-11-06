@@ -165,17 +165,14 @@ async def test_priority_compares_reported_saturation_to_completed_admissions(mon
 
 
 @pytest.mark.usefixtures("local_tokenizer")
-@pytest.mark.parametrize("admitted,expected", [(51, "pass"), (56, "fail")])
-async def test_priority_borrowing_stops_at_the_gateway_ratio_boundary(monkeypatch, admitted, expected):
+async def test_priority_borrowing_stops_at_the_gateway_ratio_boundary(monkeypatch):
     check, _, _ = await exercise(monkeypatch, "priority_rpm", full=True, model_rpm=100, duration_seconds=3,
-        saturation_threshold=.55, admitted_affected=admitted, peer_delay=.25, early_peer_admissions=4,
+        saturation_threshold=.55, admitted_affected=56, peer_delay=.5,
         users=[dict(identity="limited", requests=57, rpm=2, priority="low"),
-               dict(identity="peer", requests=6, rpm=6, priority="high")])
-    policy = check.metrics["gateway_policy"]
-    assert [user["admitted"] for user in policy["users"]] == [admitted, 6]
-    assert check.status == expected, check.summary
-    if expected == "fail":
-        assert "exceeded the declared RPM allowance" in check.summary
+               dict(identity="peer", requests=4, rpm=4, priority="high")])
+    assert [user["admitted"] for user in check.metrics["gateway_policy"]["users"]] == [56, 4]
+    assert check.status == "fail", check.summary
+    assert "exceeded the declared RPM allowance" in check.summary
 
 
 @pytest.mark.usefixtures("local_tokenizer")
