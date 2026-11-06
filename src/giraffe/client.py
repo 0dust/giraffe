@@ -733,8 +733,10 @@ class LLMClient:
                         if protocol not in {"http11", "http2"}:
                             return
                         if name == "send_request_body.started":
-                            # A proxy CONNECT can inherit this request's trace extension.
-                            sending_post = info["request"].method == b"POST"
+                            traced = info["request"]
+                            # CONNECT inherits the trace. An absolute-form POST
+                            # can be buffered by a forwarding proxy before the origin sees it.
+                            sending_post = traced.method == b"POST" and traced.url.target.startswith(b"/")
                         elif name == "send_request_body.complete" and sending_post:
                             record._request_body_sent_monotonic = monotonic()
                             sending_post = False
