@@ -73,15 +73,15 @@ async def test_litellm_required_utc_dates_cover_probes_and_are_stable_on_all_pag
         return spend_page(request, rows[page-1:page], total=len(rows))
     cfg, run, reads = setup(monkeypatch, observer)
     cfg.gateway_attribution.settle_seconds = .2
-    before = datetime.now(timezone.utc)
     check = await collect(cfg, run)
-    after = datetime.now(timezone.utc)
     assert check.metrics["state"] == "verified"
     assert len(reads) == 6
     bounds = {(r.url.params["start_date"], r.url.params["end_date"]) for r in reads}
     assert len(bounds) == 1
     start, end = [datetime.strptime(value, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc) for value in bounds.pop()]
-    assert start <= before <= after < end
+    assert len(run.records) == 2
+    for record in run.records:
+        assert start <= datetime.fromisoformat(record.started_at) <= datetime.fromisoformat(record.completed_at) < end
     assert (end - start).total_seconds() <= cfg.max_duration_seconds + cfg.gateway_attribution.settle_seconds + 2
 
 
