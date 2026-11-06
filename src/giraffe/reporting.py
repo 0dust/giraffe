@@ -26,7 +26,7 @@ from .caps import (MAX_HTML_PREVIEW_CHARS, MAX_HTML_JSON_PREVIEW_CHARS,
                    MAX_FAILURE_SUMMARY_CHARS)
 from .deployment import deployment_diff, fixture_hash, safe_config, sanitize
 from .report_inputs import input_ref as _input_ref
-from .multi_user_metrics import (_length_mix_differs, _total_generated_tokens, truncated_conversation_turn,
+from .multi_user_metrics import (_length_mix_differs, _total_generated_tokens, _uncached_input_tokens, truncated_conversation_turn,
                                  user_delivery_completions, user_latency)
 from .models import (CHECK_NAMES, SHAPES, CheckResult, RequestRecord, RunConfig, RunReport, overall_status, load_shape_label,
                      migrate_concurrent_load, migrate_run_limits, is_supported_schema, CURRENT_SCHEMA)
@@ -1244,6 +1244,77 @@ def _recovery_generation_work_changed(current, old, current_records, old_records
     return False
 
 
+def _user_token_work_changed(current, previous, tolerance):
+    measures = (lambda r: r.input_tokens, lambda r: r.output_tokens, _total_generated_tokens)
+    if any((record.cached_prompt_tokens or 0) > 0 for cohort in (current, previous) for record in cohort):
+        measures += (_uncached_input_tokens,)
+    for measure in measures:
+        lengths = [[measure(record) for record in cohort] for cohort in (current, previous)]
+        if any(not values or None in values for values in lengths) or _length_mix_differs(lengths, tolerance):
+            return True
+    return False
+
+
+def _compare_user_fairness(current, previous, current_records, old_records):
+    """Compare a previously accepted fairness limit on the same observed work."""
+    latest, old = current.get("fairness", {}), previous.get("fairness", {})
+    limit = old.get("threshold")
+    if (any(window.get("role") and window.get("scenario") != "arrivals" for window in (current, previous))
+            or limit is None or latest.get("threshold") != limit
+            or old.get("status") != "pass" or old.get("qualified") is not True
+            or latest.get("status") not in {"fail", "inconclusive"}):
+        return None
+
+    tolerance = old.get("tolerance_percent", 10)
+    compared = set(old.get("compared_user_ids", []))
+    comparable = (latest.get("qualified") is True and latest.get("tolerance_percent", 10) == tolerance
+                  and old.get("ratio") is not None and latest.get("ratio") is not None
+                  and len(compared) >= 2 and all(set(fairness.get(field, [])) == compared
+                      for fairness in (latest, old) for field in ("compared_user_ids", "eligible_user_ids")))
+    evidence = []
+    if comparable:
+        latest_users, old_users = ({user["user_id"]: user for user in window["users"]}
+                                   for window in (current, previous))
+        latest_samples, old_samples = ({sample["user_id"]: sample for sample in fairness["users"]}
+                                       for fairness in (latest, old))
+        for user_id in sorted(compared):
+            latest_sample, old_sample = latest_samples.get(user_id, {}), old_samples.get(user_id, {})
+            latest_exposure, old_exposure = (sample.get("active_exposure_ms") for sample in (latest_sample, old_sample))
+            if (not latest_exposure or not old_exposure
+                    or abs(latest_exposure - old_exposure)*100 > min(latest_exposure, old_exposure)*tolerance):
+                comparable = False
+                break
+            cohorts = []
+            for window, user, records, sample in (
+                    (current, latest_users.get(user_id, {}), current_records, latest_sample),
+                    (previous, old_users.get(user_id, {}), old_records, old_sample)):
+                cohort = user_delivery_completions(
+                    [records[rid] for rid in user.get("request_ids", []) if rid in records], window, user_id)
+                if not cohort or len(cohort) != sample.get("valid_samples"):
+                    comparable = False
+                    break
+                cohorts.append(cohort)
+            if not comparable:
+                break
+            if (latest_users[user_id]["profile"] != old_users[user_id]["profile"]
+                    or any(_load_work_comparison(*cohorts)) or _live_input_work_changed(*cohorts, tolerance)
+                    or _user_token_work_changed(*cohorts, tolerance)):
+                comparable = False
+                break
+            evidence.extend(record.id for record in cohorts[0])
+
+    scenario, population = current["scenario"], current["population"]
+    reason = ("Observed delivery fairness exceeded the previously accepted threshold."
+              if comparable else "Observed fairness work or overlap differs or lacks evidence.")
+    return {"check": "multi_user", "scenario": f"{scenario} / {population}", "population": population,
+            "window_id": current["id"], "metric": "fairness_acceptance", "aggregation": "selected_criteria",
+            "current": latest.get("ratio"), "baseline": old.get("ratio"), "threshold": limit,
+            "current_samples": sum(item.get("valid_samples", 0) for item in latest.get("users", [])),
+            "baseline_samples": sum(item.get("valid_samples", 0) for item in old.get("users", [])),
+            "status": "fail" if comparable else "inconclusive", "worsening": 100 if comparable else None,
+            "reason": f"Multi-user fairness at {population} users: {reason}", "evidence_ids": evidence}
+
+
 def _compare_user_delivery(report, baseline, target, reasons, threshold):
     current, previous = _user_measurements(report, target), _user_measurements(baseline, target)
     rows, incomplete = [], []
@@ -1251,10 +1322,13 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold):
         return rows, incomplete
     current_records = {record.id: record for record in report.requests if record.target == target}
     old_records = {record.id: record for record in baseline.requests if record.target == target}
+    window_pairs = {}
     for key in sorted(current.keys() | previous.keys()):
         scenario, population, profile, user_id, role, trigger, heavy_profile, cohort = key
         c_window, c = current.get(key, ({}, {}))
         b_window, b = previous.get(key, ({}, {}))
+        if c_window and b_window:
+            window_pairs[c_window["id"], b_window["id"]] = c_window, b_window
         c_rate, b_rate = c.get("output_tokens_per_second"), b.get("output_tokens_per_second")
         current_work = [current_records[rid] for rid in c.get("request_ids", []) if rid in current_records]
         old_work = [old_records[rid] for rid in b.get("request_ids", []) if rid in old_records]
@@ -1264,17 +1338,32 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold):
                                   for item in (c_scenario, b_scenario)) else None)
         current_delivery = user_delivery_completions(current_work, c_window, user_id)
         old_delivery = user_delivery_completions(old_work, b_window, user_id)
-        work_reason, mix_changed = _load_work_comparison(current_delivery, old_delivery)
-        live_work_changed = _live_input_work_changed(current_delivery, old_delivery, threshold)
+        comparable_work = current_delivery, old_delivery
+        complete = all(user.get("coverage", {}).get("status") == "complete" for user in (c, b))
+        drain_comparison = False
+        if complete and c_rate is not None and b_rate is not None and (
+                (c_rate == 0 and not current_delivery) or (b_rate == 0 and not old_delivery)):
+            # A measured zero can have no in-window completions. Match the
+            # actual admitted work only when it all finished successfully.
+            drained = tuple(user_delivery_completions(work, window, user_id, include_drain=True)
+                            for work, window in ((current_work, c_window), (old_work, b_window)))
+            if all(cohort and len(cohort) == user.get("outcomes", {}).get("attempted")
+                   for cohort, user in zip(drained, (c, b))):
+                comparable_work = drained
+                drain_comparison = True
+        work_reason, mix_changed = _load_work_comparison(*comparable_work)
+        if drain_comparison and _user_token_work_changed(*comparable_work, threshold):
+            work_reason = "Observed work including drained requests differs or lacks token evidence."
+        live_work_changed = _live_input_work_changed(*comparable_work, threshold)
         live_work_reason = ("Observed input work or live generated histories differ or lack evidence."
                             if live_work_changed else None)
         noisy_probe = scenario == "noisy_neighbors" and role == "probe"
         delivery_reason = ("Shared-window delivery includes samples without qualified heavy overlap."
-                           if noisy_probe and not scenario_reason
-                           and not (_probe_has_overlap(c_scenario, current_delivery)
-                                    and _probe_has_overlap(b_scenario, old_delivery)) else None)
-        missing = (not c or not b or c.get("coverage", {}).get("status") != "complete"
-                   or b.get("coverage", {}).get("status") != "complete"
+                           if noisy_probe and not scenario_reason and not all(
+                               _probe_has_overlap(evidence, records)
+                               for evidence, records in zip((c_scenario, b_scenario), comparable_work))
+                           else None)
+        missing = (not complete
                    or c_rate is None or b_rate is None or work_reason or mix_changed
                    or live_work_reason or scenario_reason or delivery_reason)
         label = key[:7] if role else key[:4]
@@ -1288,7 +1377,7 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold):
                "current": c_rate, "baseline": b_rate, "status": "inconclusive",
                "current_samples": len(current_delivery), "baseline_samples": len(old_delivery),
                "threshold": threshold, "change_unit": "percent",
-               "evidence_ids": [record.id for record in current_delivery],
+               "evidence_ids": [record.id for record in (current_delivery or comparable_work[0])],
                "method": "Observed completed-output delivery over matching common windows; no cross-run confidence interval."}
         if noisy_probe:
             row["timing_exposure_qualified"] = not scenario_reason and all(
@@ -1365,6 +1454,11 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold):
                 acceptance.update(status="fail", worsening=100,
                                   reason="This previously accepted user now fails its selected criteria.")
             rows.append(acceptance)
+    for c_window, b_window in window_pairs.values():
+        if row := _compare_user_fairness(c_window, b_window, current_records, old_records):
+            rows.append(row)
+            if row["status"] == "inconclusive":
+                incomplete.append(row["reason"])
     return rows, incomplete
 
 

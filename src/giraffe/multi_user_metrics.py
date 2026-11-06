@@ -63,15 +63,15 @@ def user_latency(record: RequestRecord, first: bool, *, ready: bool = True) -> f
 
 
 def user_delivery_completions(records: list[RequestRecord], window: dict[str, Any],
-                              user_id: str) -> list[RequestRecord]:
-    """Select the completed work included in this user's shared-window rate."""
+                              user_id: str, *, include_drain: bool = False) -> list[RequestRecord]:
+    """Select valid completions admitted in the window, excluding drain by default."""
     start, end = window.get("start_ms"), window.get("end_ms")
     if start is None or end is None:
         return []
     return [r for r in records if r.workload.get("user_id") == user_id
             and r.workload.get("window_id") == window["id"] and not r.intentional and _valid(r)
             and r.dispatch_ms is not None and start <= r.dispatch_ms < end
-            and r.completed_ms is not None and r.completed_ms <= end]
+            and r.completed_ms is not None and (include_drain or r.completed_ms <= end)]
 
 
 def _user_summary(user: dict[str, Any], window: dict[str, Any], records: list[RequestRecord],
