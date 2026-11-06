@@ -17,7 +17,7 @@ from contextlib import asynccontextmanager, contextmanager, nullcontext
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Literal
 
 import httpx
 
@@ -276,7 +276,8 @@ class _Run:
         self.memory_sampling_done = False
         self.rss_at_start_bytes = None
         self.memory_interrupted_checks = set()
-        self.pending_checks = {(target.name, check) for target in config.targets for check in config.checks}
+        self.pending_checks: dict[tuple[str, str], Literal["inference", "judging"]] = {
+            (target.name, check): "inference" for target in config.targets for check in config.checks}
         self.judging_pending = any(spec.scorer == "judge" for spec in self.pack_specs)
         self.counts = Counter()
         if config.max_requests is None:
@@ -435,14 +436,19 @@ class _Run:
 
     def finish_checks(self, target, checks):
         for check in checks:
-            if not (self.judging_pending and check in {"correctness", "capacity", "load"}):
-                self.pending_checks.discard((target, check))
+            key = target, check
+            if self.judging_pending and check in {"correctness", "capacity", "load"}:
+                if key in self.pending_checks:
+                    self.pending_checks[key] = "judging"
+            else:
+                self.pending_checks.pop(key, None)
 
     @contextmanager
     def gateway_limit_phase(self):
         non_inference = SHARED_BASELINE_EXCLUDED_WORKLOADS | {"gpu"}
         restart = self.observations.get(self.config.restart_target, {}).get("restart")
-        if (any(check not in non_inference for _, check in self.pending_checks)
+        if (any(check not in non_inference and phase == "inference"
+                for (_, check), phase in self.pending_checks.items())
                 or any(checks - non_inference for checks in self.unfinished.values())
                 or any(target.get("client_error") for target in self.observations.values())
                 or (self.config.restart_target and (not restart or restart["status"] != "ready"))):
@@ -1503,7 +1509,9 @@ async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attributio
             await workloads.execute(run, target, client, fixtures, defer_attribution=defer_attribution)
             run.finish_checks(target.name, enabled - {"gpu"})
     except asyncio.CancelledError:
-        run.unfinished[target.name].update(check for name, check in run.pending_checks if name == target.name)
+        gateway_deadline = run.duration_limit_scope == "gateway" and run.reason == "maximum run duration reached"
+        run.unfinished[target.name].update(check for (name, check), phase in run.pending_checks.items()
+                                           if name == target.name and (phase == "inference" or not gateway_deadline))
         raise
     except Exception as exc:
         _target_error(run, target, enabled, exc)
