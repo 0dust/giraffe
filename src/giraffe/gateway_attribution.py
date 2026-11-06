@@ -260,6 +260,7 @@ async def execute(run, target, client, *, deferred=False):
     except ValueError:
         observation.update(reason="Gateway reader or selected identity credentials are unavailable.")
         return
+    reader_status = None
     if preflight_bound := reader_preflight_bound(run.config, deferred=deferred):
         reader_status = await _reader_preflight(run, target, headers, preflight_bound)
         if reader_status in _UNSUPPORTED_READER_STATUSES:
@@ -278,11 +279,13 @@ async def execute(run, target, client, *, deferred=False):
         time_limited = not run.stop.is_set() and (
             reason == "maximum run duration reached"
             or any(record.termination_reason == "run_duration_limit" for record in records))
-        if not time_limited and not cancelled:
+        stopped_during_probes = len(records) < planned and run.stop.is_set()
+        if not time_limited and not cancelled and not stopped_during_probes:
             return False
         assessment = _assess(records, {}, planned, complete=False)
+        assessment.update(collection_attempts=0, collection_complete=False)
         if time_limited:
-            assessment.update(reason_code="time_limited", collection_attempts=0, collection_complete=False,
+            assessment.update(reason_code="time_limited",
                               reason="The run deadline interrupted the configured attribution probes.")
         else:
             assessment.update(reason="Gateway identity probes were interrupted before attribution completed.")
@@ -319,7 +322,11 @@ async def execute(run, target, client, *, deferred=False):
                       and probe_stop in {None, "maximum request budget reached"})
     budget_reason = "The request limit left too few slots for the configured attribution probes."
     if not records:
-        observation.update(state="unverified", reason="No identified requests were admitted within the run budget.", planned_requests=planned)
+        observation.update(planned_requests=planned, observed_requests=0)
+        if budget_limited and reader_status not in {None, 200}:
+            observation.update(state="unavailable", reason="Read-only gateway spend logs were unavailable during preflight.")
+            return
+        observation.update(state="unverified", reason="No identified requests were admitted within the run budget.")
         if budget_limited:
             observation.update(reason_code="budget_limited", reason=budget_reason)
         return
@@ -371,6 +378,7 @@ async def execute(run, target, client, *, deferred=False):
                     assessment.update(unrelated_rows=unrelated, invalid_rows=invalid,
                                       collection_complete=settled and complete, evidence_changed=unstable)
                 if run.stop.is_set():
+                    run.stop_reason(target.name)
                     assessment = _assess(records, {}, planned, complete=False)
                     assessment.update(reason="Gateway evidence collection was interrupted.")
                 elif (assessment["state"] == "unverified"

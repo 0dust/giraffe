@@ -89,7 +89,7 @@ def test_recovery_allows_extra_replays_of_matched_sustained_work():
 
 
 @pytest.mark.parametrize("swap_work", [False, True])
-@pytest.mark.parametrize(("slower", "limit"), [(True, 2), (False, 2), (False, None)])
+@pytest.mark.parametrize(("slower", "limit"), [("one_fixture", 2), ("all", 2), (None, 2), (None, None)])
 def test_recovery_baseline_qualifies_tokens_by_matched_work(monkeypatch, local_tokenizer, tmp_path, swap_work, slower, limit):
     import json
 
@@ -119,8 +119,10 @@ def test_recovery_baseline_qualifies_tokens_by_matched_work(monkeypatch, local_t
                 first_fixture = spec.fixture_id == "fixture-a"
                 record.output_tokens = 2 if first_fixture != (swap_work and self.changed) else 14
                 record.completion_tokens = record.output_tokens
-                if (slower and spec.workload.get("role") == "lighter" and first_fixture
-                        and (record.output_tokens == 14 if swap_work else self.changed)):
+                if spec.workload.get("role") == "lighter" and (
+                    (slower == "all" and self.changed) or (slower == "one_fixture" and first_fixture
+                        and (record.output_tokens == 14 if swap_work else self.changed))
+                ):
                     await asyncio.sleep(.06)
                     record.elapsed_ms += 60
             return record
@@ -134,7 +136,8 @@ def test_recovery_baseline_qualifies_tokens_by_matched_work(monkeypatch, local_t
     current, baseline = run_virtual(monkeypatch, replay())
     baseline_status = "measured" if limit is None else "pass"
     current_status = "fail" if slower else baseline_status
-    for report, slowdown, status in ((baseline, 1, baseline_status), (current, 2.5 if slower else 1, current_status)):
+    current_slowdown = {"one_fixture": 2.5, "all": 4, None: 1}[slower]
+    for report, slowdown, status in ((baseline, 1, baseline_status), (current, current_slowdown, current_status)):
         check = next(check for check in report.checks if check.id == "multi_user")
         users = check.metrics["multi_user"]["windows"][-1]["recovery"]["users"]
         assert len(users) == 2
@@ -150,6 +153,9 @@ def test_recovery_baseline_qualifies_tokens_by_matched_work(monkeypatch, local_t
     assert comparison["status"] == expected
     if slower:
         assert len(acceptance) == 2 and {row["status"] for row in acceptance} == {expected}
+        if slower == "all":
+            latency = [row for row in rows if row["metric"] == "latency_ms" and row.get("role") == "lighter"]
+            assert len(latency) == 2 and {row["status"] for row in latency} == {expected}
     else:
         assert not acceptance
         observed = [row for row in rows if row["metric"] == "matched_recovery_slowdown"]

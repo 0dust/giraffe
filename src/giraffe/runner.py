@@ -44,6 +44,11 @@ logger = logging.getLogger(__name__)
 # or sharing a writer between concurrent CLI invocations.
 record_sink = ContextVar("giraffe_record_sink", default=lambda record: None)
 
+
+class _DispatchRefused(Exception):
+    """The scheduled request never entered transport."""
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -605,41 +610,23 @@ class _Run:
                             condition_for(condition_scenario, spec.workload, self.config)["id"])
             if condition is None or condition["status"] != "running":
                 condition = self.start_condition(target.name, condition_scenario, spec.workload, request_parameters=request_parameters)
-            if admission_deadline is not None:
-                # Condition construction/progress may take time. Sample the
-                # dispatch boundary after that setup, before taking any budget
-                # or recording an HTTP attempt that may never be sent.
+            def admission_clock():
                 reason = self.stop_reason(target.name)
                 stopping = reason not in {None, "maximum request budget reached"}
-                started_at = _now()
-                started = time.monotonic()
-                if started >= slot_deadline or stopping:
-                    if started >= self.deadline or stopping:
+                now = time.monotonic()
+                if now >= slot_deadline or stopping:
+                    if now >= self.deadline or stopping:
                         self.mark_unfinished(target.name, _scenario_checks(spec))
-                    return None
-                if not budget_reserved and not budget_exempt and not self.reserve_offer(target.name):
-                    self.mark_unfinished(target.name, _scenario_checks(spec))
-                    return None
-                self.attempted += 1
-            if condition is not None:
-                condition["sent"] += 1
-                condition["started"] += 1
-                condition["running"] += 1
-                if condition["planned"] is not None:
-                    condition["not_sent"] = max(0, condition["planned"] - condition["sent"])
-            request_slot = self.attempted - 1
-            self.counts[target.name] += 1
-            if not readiness and not evidence_probe:
-                self.endpoint_attempt(target.name)
+                    raise _DispatchRefused
+                return now
+
+            open_loop = admission_deadline is not None and budget_reserved
+            guard_transport = open_loop and getattr(client, "_supports_dispatch_guard", False) is True
             key = (target.name, spec.scenario)
-            self.active[key] += 1
-            self.peak[key] = max(self.peak[key], self.active[key])
             global_deadline = False
             deadline = None
             intentional_deadline_applies = False
-            if admission_deadline is None:
-                started, started_at = time.monotonic(), _now()
-            token = self.inflight.start(target.name)
+            request_slot = started = started_at = token = timeout = None
             failure = None
             task = asyncio.current_task()
             cancellations = task.cancelling()
@@ -663,16 +650,8 @@ class _Run:
                 except (Exception, asyncio.CancelledError) as exc:
                     start_progress_error = exc
 
-            try:
-                if on_start:
-                    on_start()
-                if admission_deadline is not None and budget_reserved and self.progress:
-                    # An open-loop offer enters transport before yielding to
-                    # public progress. A synchronous observer cannot hold it
-                    # past the checked admission boundary before dispatch.
-                    pending_start = task.get_loop().call_soon(emit_scheduled_start)
-                else:
-                    emit_start()
+            def request_budget():
+                nonlocal timeout_override, intentional_deadline_applies, global_deadline, timeout
                 request_timeout = (spec.request_timeout_seconds if spec.request_timeout_seconds is not None
                                    else self.config.request_timeout_seconds)
                 if deadline_override is not None:
@@ -681,17 +660,78 @@ class _Run:
                 intentional_deadline_applies = timeout_override is not None and timeout_override < request_timeout
                 remaining = self.deadline - time.monotonic()
                 global_deadline = remaining <= min(request_timeout, timeout_override or request_timeout)
-                timeout = max(.001, min(request_timeout,
-                                        timeout_override or request_timeout,
-                                        self.deadline - time.monotonic()))
-                deadline = asyncio.timeout(timeout)
+                timeout = max(.001, min(request_timeout, timeout_override or request_timeout, remaining))
+                return timeout
+
+            def begin_attempt():
+                nonlocal started, started_at, request_slot, token, pending_start
+                if admission_deadline is not None:
+                    started = admission_clock()
+                    if not budget_reserved and not budget_exempt and not self.reserve_offer(target.name):
+                        self.mark_unfinished(target.name, _scenario_checks(spec))
+                        raise _DispatchRefused
+                    self.attempted += 1
+                if condition is not None:
+                    condition["sent"] += 1
+                    condition["started"] += 1
+                    condition["running"] += 1
+                    if condition["planned"] is not None:
+                        condition["not_sent"] = max(0, condition["planned"] - condition["sent"])
+                request_slot = self.attempted - 1
+                self.counts[target.name] += 1
+                if not readiness and not evidence_probe:
+                    self.endpoint_attempt(target.name)
+                self.active[key] += 1
+                self.peak[key] = max(self.peak[key], self.active[key])
+                if admission_deadline is None:
+                    started = time.monotonic()
+                started_at = _now()
+                token = self.inflight.start(target.name)
+                if on_start:
+                    on_start()
+                if open_loop and self.progress:
+                    # An open-loop offer enters transport before yielding to
+                    # public progress. A synchronous observer cannot hold it
+                    # past the checked admission boundary before dispatch.
+                    pending_start = task.get_loop().call_soon(emit_scheduled_start)
+                else:
+                    emit_start()
+                if guard_transport:
+                    deadline.reschedule(min(self.deadline, task.get_loop().time() + request_budget()))
+
+            try:
+                if guard_transport:
+                    # Keep the run bound during preparation. The transport hook
+                    # commits the attempt and starts its request timeout.
+                    admission_clock()
+                    deadline = asyncio.timeout_at(self.deadline)
+                else:
+                    begin_attempt()
+                    deadline = asyncio.timeout(request_budget())
                 async with deadline:
-                    record = await client.execute(spec, first_output_event=event)
+                    if guard_transport:
+                        record = await client.execute(spec, first_output_event=event, _before_send=begin_attempt)
+                    else:
+                        record = await client.execute(spec, first_output_event=event)
+                if token is None:
+                    # A failure during HTTP preparation is not an HTTP attempt.
+                    if task.cancelling() > cancellations:
+                        raise asyncio.CancelledError
+                    if deadline.expired():
+                        self.mark_unfinished(target.name, _scenario_checks(spec))
+                    return None
                 if deadline.expired():
                     record.status, record.valid = ("cancelled" if global_deadline else "timeout"), False
                     record.error = "maximum run duration reached" if global_deadline else (
                         "intentional request deadline" if timeout_override else "request deadline exceeded")
+            except _DispatchRefused:
+                return None
             except (asyncio.CancelledError, TimeoutError) as exc:
+                if token is None:
+                    if isinstance(exc, asyncio.CancelledError):
+                        raise
+                    self.mark_unfinished(target.name, _scenario_checks(spec))
+                    return None
                 if isinstance(exc, asyncio.CancelledError) and task.cancelling() > cancellations:
                     failure = exc
                 run_deadline_expired = global_deadline and deadline is not None and deadline.expired()
@@ -704,6 +744,8 @@ class _Run:
                     input_chars=spec.input_chars, requested_max_tokens=output_cap, stream=spec.stream,
                 )
             except Exception as exc:
+                if token is None:
+                    raise
                 if not isinstance(exc, (httpx.HTTPError, OSError)):
                     failure = exc
                 # Exception text can contain credential-bearing URLs from transports.
@@ -715,8 +757,9 @@ class _Run:
                     input_chars=spec.input_chars, requested_max_tokens=output_cap,
                 )
             finally:
-                self.active[key] -= 1
-                overlap = self.inflight.finish(target.name, token)
+                if token is not None:
+                    self.active[key] -= 1
+                    overlap = self.inflight.finish(target.name, token)
                 if pending_start is not None:
                     # An immediate transport result must still emit its start
                     # before the terminal progress event.
