@@ -92,7 +92,7 @@ def _metered_reasoning_usage(usage, record):
 
 def denial_kind(status, body):
     """Qualify only explicit LiteLLM authentication or model-access denials."""
-    from giraffe.gateway_response import parse_gateway_json
+    from giraffe.gateway_json import parse_gateway_json
 
     data = parse_gateway_json(body)
     error = data.get("error") if isinstance(data, dict) else None

@@ -199,6 +199,7 @@ _COMPANION_REVISIONS = _CONVERSATION_REVISIONS | {
     "gateway_attribution", "gateway_conversations", "gateway_shared_first", "gateway_shared_targets_first",
     "gateway_policy", "policy_conversations", "policy_shared_first", "policy_shared_targets_first",
     "gateway_access", "gateway_access_policy", "access_conversations", "access_shared_first", "access_shared_targets_first",
+    "policy_after_shared_workloads", "access_after_shared_workloads",
 }
 _CONVERSATION_BRIDGE_CHECKS = {"prefix", "sessions", "consistency"}
 _CONVERSATION_LOAD_SOURCE = "9b694c97a39d449d8ea15b09a9aeb406bf835179c0882827685c4d7888687d36"
@@ -282,6 +283,8 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str, include_load
             "gateway_shared_targets_first": "8037d490881621f37f1aef446474bc52a1ba276bcfcd174f39a14e37032dc9f0",
             "policy_shared_targets_first": "d72acf540fbf8fbd8c45d3ab76d6041054209bb45913c681df171525f8ddc158",
             "access_shared_targets_first": "16c362d1f79e5dd0b3f0601e0100ec9b19d7a512f5cee081af72594a683bf49f",
+            "access_after_shared_workloads": "2d8a82427a1c241c95e2719c8ab307513d970ba7f14c80db77201d85c35a0897",
+            "policy_after_shared_workloads": "49dcdfb6b173a93720e4e9e5a9bc54ffcea7580346d2ea0210e600e0779a03e6",
         }[revision] if any(settings.values()) else None,
         "settings": settings,
     }
@@ -304,6 +307,8 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str, include_load
             "gateway_shared_targets_first": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
             "policy_shared_targets_first": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
             "access_shared_targets_first": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
+            "access_after_shared_workloads": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
+            "policy_after_shared_workloads": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
         }[revision]
     if "concurrency" in resolved.checks:
         identity["concurrent_load_source_sha256"] = {
@@ -340,6 +345,8 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str, include_load
             "gateway_shared_targets_first": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
             "policy_shared_targets_first": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
             "access_shared_targets_first": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
+            "access_after_shared_workloads": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
+            "policy_after_shared_workloads": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
         }[revision]
     if "tools" in resolved.checks:
         from .tool_checks import resolved_tool_fixtures, resolved_tool_modes
@@ -387,21 +394,23 @@ def _same_run_limits_workload(current: dict, old: dict, *, fingerprint_key: str 
 
 def _same_load_workload(current: dict, old: dict, *, fingerprint_key: str = "workload_fixture_sha256") -> bool:
     """Attest unchanged Load dispatch within exact source-equivalence groups."""
-    # Keep the historical nonce-only change separate from current admission
-    # semantics. Only the newer group attests Load with specialist workloads.
+    revisions = ("shared_conversations", "gateway_conversations",
+                 "gateway_shared_first", "gateway_shared_targets_first",
+                 "policy_conversations", "policy_shared_first", "policy_shared_targets_first",
+                 "policy_after_shared_workloads", "access_conversations", "access_shared_first",
+                 "access_shared_targets_first", "access_after_shared_workloads")
     families = (
-        (("shared_conversations",),
-         (_CONVERSATION_LOAD_SOURCE,
-          "df3b7bbf30cab87d2e8c1c6dab8819f9cfe592b181407caa7c32af4c5f720cd4"), False),
-        (("shared_conversations", "gateway_conversations", "gateway_shared_first", "gateway_shared_targets_first",
-          "policy_conversations", "policy_shared_first", "policy_shared_targets_first",
-          "access_conversations", "access_shared_first", "access_shared_targets_first"),
-         (_COMPANION_LOAD_SOURCE,
-          "788f4c8f0b14421d5fc00f8b32c0ffcef79c04c647730767cb44b16584ed4aa4",
-          "4caab6e7a9eb457a5ceddf272112c434a97c101a2c27c3943f8a4155fb71bdb0",
-          "3c8a5f9d0154e7f174b96005258e34c925614fbbd3546e10ffb831616b7f9bdd",
-          "9f8084f595656375f3f32b0cbcdc473a5d69c06909530c1c243ac77e72481c4b",
-          "25a9937e5ce84572a64e26de759f6c97d0fd182b2620aaa91d876a2bf6669eac"), True),
+        # Explicit multi-user stages preserve ordinary Load dispatch.
+        (_CONVERSATION_LOAD_SOURCE,
+         "df3b7bbf30cab87d2e8c1c6dab8819f9cfe592b181407caa7c32af4c5f720cd4",
+         "fa40b2a909d2b067529ab02bd686c61adb8a175063e481d802ad33d308ef49fa"),
+        # Interim versions also applied a post-preparation cutoff to Load.
+        ("113325dd5cffa04626cc7be7ee93bc6e9be67335531288bc329b3542a155c92a",
+         "788f4c8f0b14421d5fc00f8b32c0ffcef79c04c647730767cb44b16584ed4aa4",
+         "4caab6e7a9eb457a5ceddf272112c434a97c101a2c27c3943f8a4155fb71bdb0",
+         "3c8a5f9d0154e7f174b96005258e34c925614fbbd3546e10ffb831616b7f9bdd",
+         "9f8084f595656375f3f32b0cbcdc473a5d69c06909530c1c243ac77e72481c4b",
+         "25a9937e5ce84572a64e26de759f6c97d0fd182b2620aaa91d876a2bf6669eac"),
     )
     matches = []
     shared = fingerprint_key == "shared_workload_fixture_sha256"
@@ -416,12 +425,9 @@ def _same_load_workload(current: dict, old: dict, *, fingerprint_key: str = "wor
         fields = _baseline_workload_fields(resolved.checks, shared=shared)
         if "load_test" not in fields:
             return False
-        load_only = fields == {"load_test"}
         recorded = manifest.get("fixture_pack", {}).get(fingerprint_key)
         attestations = set()
-        for index, (revisions, sources, allows_specialists) in enumerate(families):
-            if not load_only and not allows_specialists:
-                continue
+        for index, sources in enumerate(families):
             for revision in revisions:
                 identity = _run_limits_workload_identity(manifest, revision=revision, include_load=True, shared=shared)
                 if identity is None or not any(fixture_hash({**identity, "load_test_source_sha256": source}) == recorded
@@ -531,6 +537,9 @@ def _settings_reasons(report: RunReport, baseline: RunReport, *, details: dict[s
     current_manifest, old_manifest = manifests
     current_config = current_manifest["config"]
     old_config = old_manifest["config"]
+    excluded_checks = [SHARED_BASELINE_EXCLUDED_WORKLOADS.intersection(config.get("checks", []))
+                       for config in (current_config, old_config)]
+    shared_selection_changed = excluded_checks[0] != excluded_checks[1]
     reached = _limits_reached(report) | _limits_reached(baseline)
     for key in ("concurrency", "max_requests", "max_duration_seconds"):
         if key in reached and current_config.get(key) != old_config.get(key):
@@ -570,7 +579,8 @@ def _settings_reasons(report: RunReport, baseline: RunReport, *, details: dict[s
                 if name != "regression_percent"
             }} if isinstance(settings.get("limits"), dict) else {})}
                             if isinstance(settings, dict) else settings
-                     for check, settings in value.items()}
+                     for check, settings in value.items()
+                     if not shared_selection_changed or check not in SHARED_BASELINE_EXCLUDED_WORKLOADS}
         if key == "effective_checks" and isinstance(value, dict):
             cancellation = value.get("cancellation")
             if isinstance(cancellation, dict):
@@ -607,6 +617,8 @@ def _settings_reasons(report: RunReport, baseline: RunReport, *, details: dict[s
         return value
 
     selected = set(current_config.get("checks", [])) | set(old_config.get("checks", []))
+    if shared_selection_changed:
+        selected -= SHARED_BASELINE_EXCLUDED_WORKLOADS
     if "multi_user" in selected:
         policies = [{check.target: (check.metrics.get("multi_user", {}).get("version"),
                                    check.metrics.get("multi_user", {}).get("window_policy"))
@@ -615,8 +627,8 @@ def _settings_reasons(report: RunReport, baseline: RunReport, *, details: dict[s
         if (policies[0] != policies[1] or not policies[0]
                 or any(None in policy for policies_by_target in policies for policy in policies_by_target.values())):
             reasons.append("Multi-user summary or window policy differs or is missing; rerun a matching baseline.")
-    inactive_pack_globals = ({"context_limit", "samples", "sustained_seconds"}
-                             if all(pack_modes) and selected <= {"load", "capacity", "correctness"} else set())
+    pack_only = all(pack_modes) and selected <= {"load", "capacity", "correctness"}
+    inactive_pack_globals = {"context_limit", "samples", "sustained_seconds"} if pack_only else set()
     comparison_workloads = {**WORKLOAD_CHECKS, "concurrent_load": {"concurrency"},
                             "arrivals": {"arrivals"}, "buckets": {"buckets", "mixed"},
                             "concurrent_workloads": {"token_stress"}}
@@ -628,9 +640,14 @@ def _settings_reasons(report: RunReport, baseline: RunReport, *, details: dict[s
         if key not in old_config or key not in current_config:
             setting_reason(f"Recorded {key} is missing; comparability is unknown.",
                            "setting_missing", key)
-        elif old_config[key] != current_config[key]:
+            continue
+        current, old = current_config[key], old_config[key]
+        if key == "checks" and shared_selection_changed:
+            current, old = ([check for check in checks if check not in SHARED_BASELINE_EXCLUDED_WORKLOADS]
+                            for checks in (current, old))
+        if current != old:
             setting_reason(f"Run setting {key} differs.", "setting_differs", key,
-                           current_config[key], old_config[key])
+                           current, old)
     if any(config.get("test_options", {}).get("cancellation", {}).get("backend_verification") == "required"
            for config in (current_config, old_config)):
         cancellation_grading = [{check.target: "cancellation_results" in check.metrics
@@ -670,25 +687,39 @@ def _settings_reasons(report: RunReport, baseline: RunReport, *, details: dict[s
     if not isinstance(current_pack, dict) or not isinstance(old_pack, dict) or not current_pack or not old_pack:
         reasons.append("Fixture pack identity is missing or unknown.")
     else:
-        inactive = {"custom", "shared_workload_fixture_sha256"}
+        shared_key = "shared_workload_fixture_sha256"
+        inactive = {"custom", shared_key}
+        if shared_selection_changed and pack_only:
+            inactive.add("builtin_sha256")  # Both runs used only the recorded request pack for shared work.
         fingerprint_key = "workload_fixture_sha256"
-        # Matching full identities also support older reports whose shared
-        # fingerprints used a different set of excluded workloads.
         full = current_pack.get(fingerprint_key)
         full_match = isinstance(full, str) and bool(full) and full == old_pack.get(fingerprint_key)
-        workload_manifests = (report.manifest, baseline.manifest)
-        if not full_match:
-            workload_manifests = tuple(_with_legacy_shared_workload(manifest) for manifest in workload_manifests)
-            shared_packs = tuple(manifest["fixture_pack"] for manifest in workload_manifests)
-            if all(isinstance(pack.get("shared_workload_fixture_sha256"), str)
-                   and pack["shared_workload_fixture_sha256"] for pack in shared_packs):
-                fingerprint_key = "shared_workload_fixture_sha256"
-                current_pack, old_pack = ({**pack, "workload_fixture_sha256": pack[fingerprint_key]}
-                                          for pack in shared_packs)
-        if (_same_run_limits_workload(*workload_manifests, fingerprint_key=fingerprint_key)
-                or _same_load_workload(*workload_manifests, fingerprint_key=fingerprint_key)):
+        sources = (report.manifest, baseline.manifest)
+        if shared_selection_changed or not full_match:
+            sources = tuple(_with_legacy_shared_workload(source) for source in sources)
+            current_pack, old_pack = (source["fixture_pack"] for source in sources)
+        if shared_selection_changed:
+            # A full digest attests shared work only when no excluded check
+            # was selected in that run.
+            current_pack, old_pack = (
+                pack if excluded else {**pack, shared_key: pack.get(fingerprint_key)}
+                for pack, excluded in zip((current_pack, old_pack), excluded_checks))
+            sources = tuple({**source, "fixture_pack": pack}
+                            for source, pack in zip(sources, (current_pack, old_pack)))
+        shared_digests = [pack.get(shared_key) for pack in (current_pack, old_pack)]
+        use_shared = all(isinstance(digest, str) and digest and (
+            not shared_selection_changed or re.fullmatch(r"[0-9a-f]{64}", digest)) for digest in shared_digests)
+        has_identity = use_shared or not shared_selection_changed
+        # Older reports attest the full identity only. Keep their existing
+        # compatibility when those recorded identities still match.
+        if use_shared and (shared_selection_changed or not full_match):
+            fingerprint_key = shared_key
+            current_pack, old_pack = ({**pack, "workload_fixture_sha256": pack[fingerprint_key]}
+                                      for pack in (current_pack, old_pack))
+        if has_identity and (_same_run_limits_workload(*sources, fingerprint_key=fingerprint_key)
+                             or _same_load_workload(*sources, fingerprint_key=fingerprint_key)):
             inactive.add("workload_fixture_sha256")
-        if ({key: value for key, value in current_pack.items() if key not in inactive}
+        if (not has_identity or {key: value for key, value in current_pack.items() if key not in inactive}
                 != {key: value for key, value in old_pack.items() if key not in inactive}):
             reasons.append("Fixture pack identity differs.")
     for label, config, pack in (("Current", current_config, current_pack),
@@ -2125,8 +2156,9 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
             if current_check.id != "gateway_policy" or current_check.target != name or not current_check.required:
                 continue
             current_policy = current_check.metrics.get("gateway_policy", {})
-            old_policy = next((check.metrics.get("gateway_policy", {}) for check in baseline.checks
-                               if check.id == "gateway_policy" and check.target == name and check.required), {})
+            old_check = next((check for check in baseline.checks
+                              if check.id == "gateway_policy" and check.target == name and check.required), None)
+            old_policy = old_check.metrics.get("gateway_policy", {}) if old_check else {}
             try:
                 settings = GatewayPolicy.model_validate(config.get("gateway_policy"))
                 old_settings = GatewayPolicy.model_validate(old_config.get("gateway_policy"))
@@ -2148,10 +2180,12 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                           and current_policy.get("version") == old_policy.get("version") == POLICY_VERSION
                           and settings == old_settings
                           and settings.model_dump(mode="json") == current_policy.get("settings") == old_policy.get("settings")
+                          and old_check is not None and old_check.status == "pass"
                           and old_policy.get("qualification") == "observed")
             for user in current_policy.get("users", []):
                 previous = next((item for item in old_policy.get("users", []) if item["identity"] == user["identity"]), None)
-                status = current_check.status if compatible and previous else "inconclusive"
+                status = (current_check.status if compatible and previous and current_check.status in {"pass", "fail"}
+                          else "inconclusive")
                 rows.append({"check": "gateway_policy", "scenario": user["identity"],
                     "user_id": user["identity"], "metric": "policy_acceptance", "aggregation": "observed",
                     "status": status, "current": current_policy.get("qualification"),

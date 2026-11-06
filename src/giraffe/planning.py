@@ -55,6 +55,29 @@ def token_evidence_request_reserve(rows, *, target=None, runtime_counts=None):
     return reserve
 
 
+def recovery_later_reserves(config, *, runtime_counts_by_target=None):
+    """Reserve later fixed requests and flag work that shares sustained-load quota."""
+    later = [name for name in config.checks
+             if (name not in CORE_CHECKS or name == "load") and name != "gateway_attribution"]
+    if not later:
+        return {target.name: (0, False) for target in config.targets}
+    plan = request_plan(config.model_copy(update={"checks": later, "restart_target": None}))
+    runtime_counts_by_target = runtime_counts_by_target or {}
+    default_known = plan["known_per_target"]
+    load_reserve = plan["minimum_reserved_per_target"] - default_known
+    result = {}
+    for target in config.targets:
+        known = plan.get("known_target_counts", {}).get(target.name, default_known)
+        planned_identity = {row["id"]: _target_count(row, target.name)
+                            for row in plan["rows"] if row["id"] in {"gateway_policy", "gateway_access"}}
+        overrides = runtime_counts_by_target.get(target.name, {})
+        effective_identity = {name: overrides.get(name, count) for name, count in planned_identity.items()}
+        adjustment = sum(count - planned_identity[name] for name, count in effective_identity.items())
+        has_later_work = any(name not in effective_identity or effective_identity[name] for name in later)
+        result[target.name] = (known + load_reserve + adjustment, has_later_work)
+    return result
+
+
 def _warning_title(row):
     identifier = row["id"]
     check = {"initial": "access", "warm": "access", "context_first_batch": "context",
@@ -1113,15 +1136,17 @@ def request_plan(config: RunConfig | ConfigDraft, *,
                 kind="bounded", title="Backend cancellation verification")
     if "recovery" in selected:
         options = config.effective_check("recovery")
-        later = [name for name in config.checks
-                 if (name not in CORE_CHECKS or name == "load") and name != "gateway_attribution"]
-        later_known = request_plan(config.model_copy(update={"checks": later, "restart_target": None}))["minimum_reserved_per_target"]
-        prior = sum(row["requests_per_target"] or 0 for row in rows)
-        needed = later_known + 2 * options["samples"] + max(options["limits"]["min_samples"], options["concurrency"] * 2)
-        eligible = [quota is None or quota - prior > needed for quota in quotas.values()]
-        uncertain = config.max_requests is not None and (any(row["kind"] != "exact" for row in rows) or len(set(eligible)) > 1)
-        add("recovery_prime", int(any(eligible)), "One baseline warm-up when remaining target/run budget exceeds later fixed work, both probe batches and the minimum load batch.",
-            kind="bounded" if any(eligible) and uncertain else "exact", title="Recovery baseline warm-up")
+        later_reserves = recovery_later_reserves(config)
+        minimum_recovery = 2 * options["samples"] + max(options["limits"]["min_samples"], options["concurrency"] * 2)
+        eligible = {target: int(quota is None or quota - sum(_target_count(row, target) or 0 for row in rows)
+                                > later_reserves[target][0] + minimum_recovery)
+                    for target, quota in quotas.items()}
+        different_eligibility = len(set(eligible.values())) > 1
+        uncertain = config.max_requests is not None and (any(row["kind"] != "exact" for row in rows) or different_eligibility)
+        add("recovery_prime", max(eligible.values()), "One baseline warm-up when remaining target/run budget exceeds later fixed work, both probe batches and the minimum load batch.",
+            kind="bounded" if any(eligible.values()) and uncertain else "exact", title="Recovery baseline warm-up")
+        if different_eligibility:
+            rows[-1]["target_request_counts"] = eligible
         add("recovery_baseline", options["samples"], "Matched quiet controls before sustained load.")
         add("recovery", options["samples"], "Fixed follow-up health requests after sustained load.")
         if options["sustained_seconds"] > 0:
@@ -1203,20 +1228,6 @@ def request_plan(config: RunConfig | ConfigDraft, *,
                 "msg":"Expected scheduled Load test requests exceed the total request budget; some tests will be truncated.",
                 "values":{"expected_scheduled_requests":load_plan["expected_scheduled_requests"]*target_count,"max_requests":config.max_requests}})
         warnings.extend(w["msg"] for w in load_warnings)
-    if "gateway_policy" in selected:
-        settings = config.gateway_policy
-        if settings is None:
-            add("gateway_policy", 0, "Gateway policy unavailable: declare identities, policy and offered work.",
-                source="not configured", kind="exact")
-        elif not settings.supported:
-            add("gateway_policy", 0, "Gateway policy unavailable: selected gateway or capability is unsupported.",
-                source="unsupported capability", kind="exact")
-        else:
-            add("gateway_policy", sum(user.requests for user in settings.users),
-                "Bounded requests per declared identity; stops at policy duration or shared run limits.",
-                source="fixed identical non-streaming policy probes", kind="exact")
-            rows[-1].update(users=len(settings.users), simultaneous_limit=config.concurrency,
-                            configured_seconds=settings.duration_seconds)
     if "multi_user" in selected:
         from giraffe.multi_user import _planned_observation
         settings = config.multi_user
@@ -1271,6 +1282,21 @@ def request_plan(config: RunConfig | ConfigDraft, *,
         add("tools", count, "Tool fixtures in each selected mode. Conversation counts are upper bounds: expected calls plus one final answer; invalid or repeated calls stop a conversation early. No tools execute.",
             source="configured tool fixtures" if config.tool_checks and (config.tool_checks.fixtures or conversations) else "generated examples",
             kind="bounded" if conversations else "exact")
+
+    if "gateway_policy" in selected:
+        settings = config.gateway_policy
+        if settings is None:
+            add("gateway_policy", 0, "Gateway policy unavailable: declare identities, policy and offered work.",
+                source="not configured", kind="exact")
+        elif not settings.supported:
+            add("gateway_policy", 0, "Gateway policy unavailable: selected gateway or capability is unsupported.",
+                source="unsupported capability", kind="exact")
+        else:
+            add("gateway_policy", sum(user.requests for user in settings.users),
+                "Bounded requests per declared identity; stops at policy duration or shared run limits.",
+                source="fixed identical non-streaming policy probes", kind="exact")
+            rows[-1].update(users=len(settings.users), simultaneous_limit=config.concurrency,
+                            configured_seconds=settings.duration_seconds)
 
     if "gateway_attribution" in selected:
         counts = set(attribution_counts.values())

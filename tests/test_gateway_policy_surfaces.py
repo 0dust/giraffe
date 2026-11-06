@@ -65,6 +65,44 @@ async def test_policy_baseline_attests_source_separately_from_shared_work(monkey
     assert all(row["status"] == "inconclusive" for row in compared["targets"][0]["comparisons"])
 
 
+@pytest.mark.usefixtures("local_tokenizer")
+async def test_blocked_policy_check_cannot_establish_baseline_comparison(monkeypatch):
+    from giraffe import runner
+
+    with monkeypatch.context() as context:
+        successful_check, successful, _ = await exercise(context, full=True)
+    assert successful_check.status == "pass"
+    metrics = runner._metrics
+
+    async def fail_end_metrics(run, target, phase):
+        if phase == "end":
+            raise RuntimeError("end telemetry fixture failed")
+        return await metrics(run, target, phase)
+
+    with monkeypatch.context() as context:
+        context.setattr(runner, "_metrics", fail_end_metrics)
+        blocked_check, blocked, _ = await exercise(context, full=True)
+    assert blocked_check.status == "blocked"
+    assert blocked_check.metrics["gateway_policy"]["qualification"] == "observed"
+
+    for current, baseline in ((successful, blocked), (blocked, successful)):
+        comparison = compare_baseline(current, baseline).baseline
+        assert comparison["status"] == "inconclusive"
+        rows = comparison["targets"][0]["comparisons"]
+        assert len(rows) == 2 and all(row["status"] == "inconclusive" for row in rows)
+
+
+def test_policy_plan_follows_shared_workloads():
+    from giraffe.models import RunConfig
+    from tests.test_gateway_policy import configuration
+
+    raw = configuration().model_dump()
+    raw.update(checks=["gateway_policy", "multi_user", "sessions", "consistency", "tools"],
+               multi_user={"levels": [1]}, sessions={"modes": ["fixed"]}, consistency={})
+    rows = [row["id"] for row in request_plan(RunConfig.model_validate(raw))["rows"]]
+    assert rows == ["multi_user_1", "sessions", "consistency", "tools", "gateway_policy"]
+
+
 @pytest.mark.parametrize("mode", ["key_rpm", "priority_rpm"])
 def test_supported_policy_keeps_declared_plan(mode):
     from tests.test_gateway_policy import configuration

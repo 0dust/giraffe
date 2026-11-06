@@ -12,7 +12,7 @@ from .identities import identity_headers, litellm_key_fingerprint
 from .models import CheckResult, RequestSpec
 
 
-VERSION = 14
+VERSION = 15
 PROMPT = "Reply with exactly the word OK."
 
 
@@ -213,6 +213,7 @@ def summarize(settings, observation, records):
     outputs = [record.completion_tokens for record in successes]
     summary["comparable_actual_work"] = bool({record.identity for record in successes} == {user.identity for user in settings.users}
         and all(value is not None and value > 0 for value in inputs+outputs)
+        and all(record.reasoning_tokens is None or record.reasoning_tokens <= record.completion_tokens for record in successes)
         and len(set(inputs)) == 1 and max(outputs) <= 2*min(outputs))
     if not observation.get("isolated_run"):
         return outcome("unverified", "Policy qualification requires one target and only policy traffic, with no restart readiness probes.")

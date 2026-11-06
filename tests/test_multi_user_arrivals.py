@@ -54,18 +54,43 @@ def test_newcomer_steady_offer_at_half_open_end_is_not_scheduled(monkeypatch):
     run_virtual(monkeypatch, run())
 
 
-def test_burst_offer_at_half_open_end_is_invalid():
+def test_rational_steady_offer_rounding_to_window_end_is_not_scheduled(monkeypatch):
+    from giraffe.planning import request_plan
+
+    async def run():
+        cfg = settings(levels=[1], scenarios=["arrivals"], duration_seconds=3, profile=PROFILE,
+                       arrivals={"requests_per_second": 7 / 3})
+        row = next(row for row in request_plan(cfg)["rows"] if row["id"] == "multi_user_1")
+        assert row["scheduled_offers"] == 7
+
+        target = cfg.targets[0]
+        state = runner._Run(cfg, None, None)
+        await execute(state, target, FakeClient(target, cfg))
+        window, = state.observations[target.name]["multi_user"]["windows"]
+        assert window["offer_accounting"] == {"planned": 7, "offered": 7, "dispatched": 7,
+            "dropped_local": 0, "dropped_late": 0, "unissued": 0, "not_offered": 0}
+        assert all(offer["offset_seconds"] < 3 for offer in window["offers"])
+
+    run_virtual(monkeypatch, run())
+
+
+@pytest.mark.parametrize("start, spacing, end, longer", [
+    (.01, .03, .07, .07000000000000002),
+    (.1, .09999999999999999, .3, .30000000000000004),
+])
+def test_burst_offer_at_half_open_end_is_invalid(start, spacing, end, longer):
     from pydantic import ValidationError
 
     from giraffe.multi_user import _planned_observation
 
-    arrivals = {"bursts": [{"user_id": "user-01", "at_seconds": .01, "requests": 3, "spacing_seconds": .03}]}
+    arrivals = {"bursts": [{"user_id": "user-01", "at_seconds": start, "requests": 3, "spacing_seconds": spacing}]}
     with pytest.raises(ValidationError, match="before the window end"):
-        settings(levels=[1], scenarios=["arrivals"], duration_seconds=.07, arrivals=arrivals)
+        settings(levels=[1], scenarios=["arrivals"], duration_seconds=end, arrivals=arrivals)
 
-    cfg = settings(levels=[1], scenarios=["arrivals"], duration_seconds=.07000000000000002, arrivals=arrivals)
+    cfg = settings(levels=[1], scenarios=["arrivals"], duration_seconds=longer, arrivals=arrivals)
     window, = _planned_observation(cfg.multi_user)["windows"]
-    assert [offer["offset_seconds"] for offer in window["offers"] if offer["origin"] == "burst"] == [.01, .04, .07]
+    offsets = [offer["offset_seconds"] for offer in window["offers"] if offer["origin"] == "burst"]
+    assert len(offsets) == 3 and offsets[0] == start and offsets[-1] == end
 
 
 def test_activation_adjusted_offer_bound_accepts_valid_plan():

@@ -161,7 +161,7 @@ async def _sse_events(
 
 def _object(payload: str | bytes, *, strict_gateway_json: bool = False) -> dict[str, Any]:
     if strict_gateway_json:
-        from .gateway_response import parse_gateway_json
+        from .gateway_json import parse_gateway_json
 
         value = parse_gateway_json(payload)
         if value is None:
@@ -907,7 +907,8 @@ class LLMClient:
                             record.stream_end_ms = (at - start) * 1000
                         body = await _limited_body(response, on_read=body_read, on_body=body_received)
                         observed_at = start + record.stream_end_ms / 1000 if record.stream_end_ms is not None else time.perf_counter()
-                        receive(_object(body, strict_gateway_json=access_probe), streaming=False, observed_at=observed_at)
+                        receive(_object(body, strict_gateway_json=policy_probe or access_probe),
+                                streaming=False, observed_at=observed_at)
                         record.stream_terminated = True
                     if record.finish_reason is None:
                         raise _ProtocolError("response ended without a completion finish reason")

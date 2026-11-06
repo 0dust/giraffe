@@ -231,13 +231,28 @@ async def test_genuine_early_rejection_is_not_hidden_by_a_later_failure(monkeypa
 
 
 @pytest.mark.usefixtures("local_tokenizer")
-@pytest.mark.parametrize("behavior", ["malformed_peer", "peer_tool_call", "peer_function_call", "peer_invalid_refusal"])
+@pytest.mark.parametrize("behavior", ["malformed_peer", "peer_tool_call", "peer_function_call", "peer_invalid_refusal",
+    "peer_duplicate_error", "peer_duplicate_role", "peer_duplicate_usage"])
 async def test_malformed_assistant_reply_does_not_show_peer_continuation(monkeypatch, behavior):
     check, report, _ = await exercise(monkeypatch, behavior=behavior, full=True)
     peer = [record for record in report.requests if record.identity == "peer"]
     assert len(peer) == 8 and all(record.http_status == 200 and not record.valid for record in peer)
     assert check.metrics["gateway_policy"]["qualification"] == "unverified"
     assert not check.metrics["gateway_policy"]["peer_continuation"]
+
+
+@pytest.mark.usefixtures("local_tokenizer")
+@pytest.mark.parametrize("behavior,reasoning_tokens,expected", [
+    ("peer_inconsistent_reasoning", 128, "inconclusive"),
+    ("peer_consistent_reasoning", 1, "pass"),
+])
+async def test_policy_requires_reasoning_tokens_to_fit_completion_total(monkeypatch, behavior, reasoning_tokens, expected):
+    check, _, _ = await exercise(monkeypatch, "priority_rpm", behavior=behavior, full=True)
+    summary = check.metrics["gateway_policy"]
+    assert summary["users"][1]["completion_tokens"] == [2] * 8
+    assert summary["users"][1]["reasoning_tokens"] == [reasoning_tokens] * 8
+    assert summary["comparable_actual_work"] == (expected == "pass")
+    assert check.status == expected, check.summary
 
 
 @pytest.mark.usefixtures("local_tokenizer")

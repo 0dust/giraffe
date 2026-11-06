@@ -145,6 +145,57 @@ async def test_policy_reserves_probe_budget_only_when_credentials_can_dispatch(m
 
 
 @pytest.mark.usefixtures("local_tokenizer")
+@pytest.mark.parametrize("policy", ["absent", "unconfigured", "missing", "available"])
+async def test_recovery_reserves_only_usable_policy_work(monkeypatch, policy):
+    from tests.test_gateway_policy import configuration as configured_policy
+
+    raw = configured_policy(users=[dict(identity="limited", requests=4, rpm=2),
+                                   dict(identity="peer", requests=3, rpm=3)]).model_dump(mode="json")
+    raw.update(checks=["recovery"], stream=False, samples=2, concurrency=3, max_requests=10,
+               sustained_seconds=2, max_memory_mb=0, retention="all", limits={"min_samples": 2})
+    if policy != "absent":
+        raw["checks"].append("gateway_policy")
+    if policy in {"absent", "unconfigured"}:
+        raw["gateway_policy"] = None
+    raw["targets"][0]["api_key_env"] = "SHARED"
+    monkeypatch.setenv("SHARED", "shared-secret")
+    monkeypatch.delenv("LIMITED", raising=False)
+    monkeypatch.delenv("PEER", raising=False)
+    if policy == "available":
+        monkeypatch.setenv("LIMITED", "limited-secret")
+        monkeypatch.setenv("PEER", "peer-secret")
+    config = RunConfig.model_validate(raw)
+    sent = []
+
+    async def handler(request):
+        if request.method != "POST":
+            return httpx.Response(404)
+        sent.append(request.headers["authorization"])
+        prompt = json.loads(request.content)["messages"][0]["content"]
+        prefix = "Copy exactly, with no extra text:\n"
+        answer = prompt.removeprefix(prefix) if prompt.startswith(prefix) else "L8N2"
+        await asyncio.sleep(.025)
+        return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": answer},
+            "finish_reason": "stop"}], "usage": {"prompt_tokens": 20, "completion_tokens": max(1, len(answer.split()))}})
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
+    report = await run_suite(config)
+    recovery = next(check for check in report.checks if check.id == "recovery")
+    budget = recovery.metrics["sustained_budget"]
+    assert report.observations["request_budget_used"] == len(sent) == 10
+    if policy == "available":
+        assert budget["allowance"] == 0 and budget["reserved_later"] == 9
+        assert sent[:4] == ["Bearer shared-secret"] * 4
+        assert len([record for record in report.requests if record.identity]) == 6
+    else:
+        assert recovery.status == "pass", recovery.summary
+        assert budget["allowance"] == 6 and budget["reserved_later"] == 2
+        assert sent == ["Bearer shared-secret"] * 10
+        assert [record.scenario for record in report.requests] == ["recovery_baseline"] * 2 + ["sustained"] * 6 + ["recovery"] * 2
+
+
+@pytest.mark.usefixtures("local_tokenizer")
 @pytest.mark.parametrize("change", ["reference", "gateway"])
 async def test_unavailable_policy_does_not_block_serving_baseline(monkeypatch, change):
     from giraffe.reporting import compare_baseline

@@ -98,6 +98,8 @@ async def exercise(monkeypatch, mode="key_rpm", *, behavior="enforce", full=Fals
         if behavior == "reasoning_work" and who == "limited":
             usage = {"prompt_tokens": 8, "completion_tokens": 128,
                      "completion_tokens_details": {"reasoning_tokens": 126}}
+        if who == "peer" and behavior in {"peer_inconsistent_reasoning", "peer_consistent_reasoning"}:
+            usage["completion_tokens_details"] = {"reasoning_tokens": 128 if behavior == "peer_inconsistent_reasoning" else 1}
         group = "other-pool" if behavior == "different_pool" and who == "peer" else MODEL_POOL
         if behavior != "missing_pool":
             headers["x-litellm-model-group"] = group
@@ -110,8 +112,17 @@ async def exercise(monkeypatch, mode="key_rpm", *, behavior="enforce", full=Fals
             message.update({"malformed_peer": {"role": "user"}, "peer_tool_call": {"tool_calls": [{}]},
                             "peer_function_call": {"function_call": {}},
                             "peer_invalid_refusal": {"refusal": []}}.get(behavior, {}))
-        return httpx.Response(200, headers=headers, json={"model": "test", "choices": [{"message": message,
-            "finish_reason": "stop"}], "usage": usage})
+        payload = {"model": "test", "choices": [{"message": message, "finish_reason": "stop"}], "usage": usage}
+        if who == "peer" and behavior in {"peer_duplicate_error", "peer_duplicate_role", "peer_duplicate_usage"}:
+            body = json.dumps(payload)
+            if behavior == "peer_duplicate_error":
+                body = '{"error":{"type":"upstream_failure"},"error":null,' + body[1:]
+            elif behavior == "peer_duplicate_role":
+                body = body.replace('"role": "assistant"', '"role": "user", "role": "assistant"', 1)
+            else:
+                body = body.replace('"prompt_tokens": 8', '"prompt_tokens": null, "prompt_tokens": 8', 1)
+            return httpx.Response(200, headers={**headers, "content-type": "application/json"}, content=body)
+        return httpx.Response(200, headers=headers, json=payload)
 
     original = httpx.AsyncClient
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handle), **kw))

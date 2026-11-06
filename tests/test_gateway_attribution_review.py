@@ -14,9 +14,9 @@ from pydantic import ValidationError
 
 from giraffe.client import LLMClient
 from giraffe.gateway_attribution import MAX_BODY_BYTES, execute, result
-from giraffe.models import GatewayEvidence, RequestSpec, Sessions, TestIdentity as GatewayIdentity
+from giraffe.models import GatewayEvidence, RequestSpec, RunConfig, RunReport, Sessions, TestIdentity as GatewayIdentity
 from giraffe.planning import request_plan
-from giraffe.reporting import compare_baseline
+from giraffe.reporting import compare_baseline, write_report
 from giraffe.runner import _Run, _checks, run_suite
 from tests.test_gateway_attribution import config, immediate_spend_polls, spend_page
 
@@ -1379,7 +1379,9 @@ async def test_mixed_full_run_keeps_shared_checks_passing_with_rejected_identity
 
 
 @pytest.mark.usefixtures("local_tokenizer")
-@pytest.mark.parametrize("change", ["unused_alias", "reader", "settings", "unsupported", "unconfigured", "enabled"])
+@pytest.mark.parametrize("change", [
+    "unused_alias", "reader", "settings", "unsupported", "unconfigured", "enabled", "legacy_collection",
+])
 async def test_attribution_changes_do_not_veto_shared_baseline_evidence(monkeypatch, change):
     async def observer(request, rows):
         assert change not in {"unsupported", "unconfigured"}, "inactive attribution read gateway evidence"
@@ -1413,6 +1415,8 @@ async def test_attribution_changes_do_not_veto_shared_baseline_evidence(monkeypa
     baseline = await run_variant(False)
     current = await run_variant(True)
     assert baseline.overall == current.overall == "pass"
+    if change == "legacy_collection":
+        next(check for check in baseline.checks if check.id == "gateway_attribution").metrics["collection_version"] = 4
     target = compare_baseline(current, baseline).baseline["targets"][0]
     assert not target["reasons"]
     assert any(row["check"] == "serving" and row["metric"] == "valid_completion_rate"
@@ -1426,5 +1430,143 @@ async def test_attribution_changes_do_not_veto_shared_baseline_evidence(monkeypa
         assert attribution.required and len(attribution_rows) == 2
         expected = "pass" if change == "unused_alias" else "inconclusive"
         assert all(row["status"] == expected for row in attribution_rows)
+        if change == "legacy_collection":
+            assert all("Rerun the baseline" in row["reason"] for row in attribution_rows)
         if change == "enabled":
             assert target["status"] == "inconclusive" and "gateway_attribution" in target["summary"]
+
+
+@pytest.mark.parametrize("supported", [True, False])
+async def test_saved_baseline_compares_shared_checks_across_attribution_selection(
+        monkeypatch, local_tokenizer, tmp_path, supported):
+    async def observer(request, rows):
+        assert supported
+        return spend_page(request, rows)
+
+    async def saved_run(checks, *, samples=8):
+        with monkeypatch.context() as env:
+            cfg, _, _ = setup(env, observer)
+            immediate_spend_polls(env, cfg)
+            cfg.checks = checks
+            cfg.samples = samples
+            cfg.max_requests = 30
+            cfg.limits.min_samples = 2
+            cfg.limits.regression_percent = 100000
+            if not supported:
+                cfg.targets[0].gateway.profile = "other"
+            report = await run_suite(cfg)
+            assert report.overall == "pass"
+            path, _ = write_report(report, tmp_path)
+            return RunReport.model_validate_json(path.read_bytes())
+
+    ordinary = ["access", "serving"]
+    mixed_checks = [*ordinary, "gateway_attribution"]
+    plain = await saved_run(ordinary)
+    mixed = await saved_run(mixed_checks)
+    full_key, shared_key = "workload_fixture_sha256", "shared_workload_fixture_sha256"
+    assert plain.manifest["fixture_pack"][full_key] == mixed.manifest["fixture_pack"][shared_key]
+    assert [r.request_hash for r in plain.requests] == [r.request_hash for r in mixed.requests if r.identity is None]
+    for current, baseline in ((mixed, plain), (plain, mixed)):
+        target = compare_baseline(current, baseline).baseline["targets"][0]
+        assert target["reasons"] == []
+        assert {row["check"] for row in target["comparisons"]
+                if row["metric"] == "valid_completion_rate" and row["status"] == "pass"} == set(ordinary)
+        attribution = [row for row in target["comparisons"] if row["check"] == "gateway_attribution"]
+        if supported and current is mixed:
+            assert len(attribution) == 2 and all(row["status"] == "inconclusive" for row in attribution)
+            assert target["status"] == "inconclusive" and "gateway_attribution" in target["summary"]
+        else:
+            assert not attribution and target["status"] == "pass"
+
+    if not supported:
+        return
+    changed_checks = await saved_run(["access", "gateway_attribution"])
+    changed_settings = await saved_run(mixed_checks, samples=7)
+    for changed, reason in ((changed_checks, "Run setting checks differs."),
+                            (changed_settings, "Run setting samples differs.")):
+        target = compare_baseline(changed, plain).baseline["targets"][0]
+        assert reason in target["reasons"]
+        assert not any(row["check"] in ordinary for row in target["comparisons"])
+
+    for replacement in (None, "unknown", "a" * 64):
+        unattested = mixed.model_copy(deep=True)
+        pack = unattested.manifest["fixture_pack"]
+        if replacement is None:
+            # An actually mixed archive must not fall back to its full digest.
+            pack[full_key] = pack.pop(shared_key)
+        else:
+            pack[shared_key] = replacement
+        target = compare_baseline(plain, unattested).baseline["targets"][0]
+        assert "Fixture pack identity differs." in target["reasons"]
+        assert not target["comparisons"]
+
+    forged_plain = plain.model_copy(deep=True)
+    pack = forged_plain.manifest["fixture_pack"]
+    pack[shared_key], pack[full_key] = pack[full_key], "a" * 64
+    assert "Fixture pack identity differs." in compare_baseline(mixed, forged_plain).baseline["targets"][0]["reasons"]
+
+
+@pytest.mark.parametrize("with_builtin", [False, True])
+async def test_shared_baseline_still_requires_the_active_fixture_sources(monkeypatch, local_tokenizer, with_builtin):
+    async def observer(request, rows):
+        return spend_page(request, rows)
+
+    async def pack_run(*, attribution, prompt="Return OK."):
+        with monkeypatch.context() as env:
+            cfg, _, _ = setup(env, observer)
+            immediate_spend_polls(env, cfg)
+            checks = (["access"] if with_builtin else []) + ["correctness"]
+            if attribution:
+                checks.append("gateway_attribution")
+            cfg = RunConfig.model_validate({**cfg.model_dump(), "checks": checks, "default_concurrency": 1,
+                "max_requests": 30, "request_source": "request_pack", "request_pack": {
+                    "version": 1, "cases": [
+                        {"fixture_id": f"case_{i}", "messages": [{"role": "user", "content": prompt}],
+                         "scorer": "exact", "expected": "OK"} for i in range(2)]},
+                "limits": {**cfg.limits.model_dump(), "min_samples": 2, "regression_percent": 100000}})
+            report = await run_suite(cfg)
+            assert report.overall == "pass"
+            return report
+
+    plain, mixed = await pack_run(attribution=False), await pack_run(attribution=True)
+    builtin_key = "builtin_sha256"
+    assert (plain.manifest["fixture_pack"][builtin_key] is not None) == with_builtin
+    assert mixed.manifest["fixture_pack"][builtin_key]
+    for current, baseline in ((mixed, plain), (plain, mixed)):
+        target = compare_baseline(current, baseline).baseline["targets"][0]
+        assert target["reasons"] == []
+        assert any(row["check"] == "correctness" and row["status"] == "pass" for row in target["comparisons"])
+
+    changed_pack = await pack_run(attribution=True, prompt="Return exactly OK.")
+    assert "Request pack identity differs." in compare_baseline(plain, changed_pack).baseline["targets"][0]["reasons"]
+    if with_builtin:
+        mixed.manifest["fixture_pack"][builtin_key] = "a" * 64
+        assert "Fixture pack identity differs." in compare_baseline(plain, mixed).baseline["targets"][0]["reasons"]
+
+
+@pytest.mark.parametrize("fault", [None, "duplicate_page_member", "duplicate_metadata_member"])
+async def test_duplicate_spend_json_cannot_override_attribution_evidence(monkeypatch, local_tokenizer, fault):
+    async def observer(request, rows):
+        if fault == "duplicate_page_member":
+            page = spend_page(request, rows)
+            return httpx.Response(200, content=b'{"total_is_capped":true,"total_is_capped":false,' + page.content[1:])
+        encoded = []
+        for row in rows:
+            metadata = json.dumps(row["metadata"])
+            if fault == "duplicate_metadata_member":
+                metadata = ('{"spend_logs_metadata":{"giraffe_run":"wrong-run","giraffe_request":"wrong-id"},'
+                            + metadata[1:])
+            encoded.append({**row, "metadata": metadata})
+        return spend_page(request, encoded)
+
+    cfg, _, reads = setup(monkeypatch, observer)
+    immediate_spend_polls(monkeypatch, cfg)
+    report = await run_suite(cfg)
+    check = next(item for item in report.checks if item.id == "gateway_attribution")
+    assert len(report.requests) == 2 and all(record.valid for record in report.requests)
+    assert len(reads) == check.metrics["collection_attempts"] == 3
+    assert check.metrics["planned_requests"] == check.metrics["observed_requests"] == 2
+    assert check.status == ("inconclusive" if fault else "pass")
+    assert check.metrics["matched_requests"] == (0 if fault else 2)
+    if fault == "duplicate_metadata_member":
+        assert check.metrics["invalid_rows"] == 2
