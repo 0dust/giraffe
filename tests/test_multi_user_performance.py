@@ -1,5 +1,6 @@
 import pytest
 
+from giraffe.models import CheckResult
 from giraffe.multi_user_metrics import summarize
 from giraffe.performance import build_performance
 from tests.test_multi_user_reporting import user_report
@@ -28,6 +29,44 @@ def test_scenario_measurement_labels_preserve_condition_identity(scenarios):
         assert label == condition_for(scenario, request.workload)["label"]
         labels.append(label)
     assert len(set(labels)) == len(scenarios)
+
+
+def test_scheduled_user_and_capacity_windows_keep_separate_offer_ledgers():
+    from tests.test_multi_user_metrics import record
+
+    report = user_report()
+    user_window = "multi_user_5_arrivals"
+    for request in report.requests:
+        request.scenario = user_window
+        request.traffic_stage = 0
+        request.workload.update(window_id=user_window, scenario="arrivals", role="arrivals")
+    summary_window = report.checks[0].metrics["multi_user"]["windows"][0]
+    summary_window.update(id=user_window, scenario="arrivals", offer_accounting={
+        "planned": 48, "offered": 47, "dispatched": 40, "dropped_local": 3,
+        "dropped_late": 2, "unissued": 2, "not_offered": 1})
+    capacity_request = record("user-01", identity="capacity", scenario="traffic_stage_0",
+                              target="local", check_ids=["capacity"], traffic_stage=0, workload={})
+    report.requests.append(capacity_request)
+    report.manifest["config"]["checks"].append("capacity")
+    report.checks.append(CheckResult(id="capacity", target="local", title="Capacity", status="pass",
+        summary="Capacity completed.", metrics={"traffic_stages": [{
+            "stage_index": 0, "rate_rps": 50, "accepted": True, "dropped_local": 25,
+        }]}))
+
+    def metrics(window):
+        target = build_performance(report, window=window)["targets"][0]
+        return target["summaries"][window]["metrics"]
+
+    arrivals = metrics(f"full:{user_window}")
+    drops, = arrivals["drops"]["value"]
+    assert drops["dropped_local"] == 3
+    assert drops["dropped_late"] == 2
+    assert drops["unissued"] == 2
+    assert drops["not_offered"] == 1
+    assert arrivals["highest_acceptable_rate"]["value"] is None
+    capacity = metrics("full:traffic:check=capacity")
+    assert capacity["drops"]["value"][0]["dropped_local"] == 25
+    assert capacity["highest_acceptable_rate"]["value"] == 50
 
 
 @pytest.mark.parametrize("missing_users", [0, 1, 5])
