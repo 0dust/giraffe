@@ -379,6 +379,59 @@ def test_shared_executor_preserves_exact_persistent_user_revision_for_legacy_che
     assert "Fixture pack identity differs." in _settings_reasons(current, old)
 
 
+def exact_conversation_reports(checks):
+    config = RunConfig(targets=[{"name": "local", "url": "http://localhost", "model": "test"}],
+                       checks=checks, sessions={"sampling": {"think_time_seconds": {"values": [0, .1]}}})
+    current, old = make_report(), make_report("baseline")
+    settings = {field: getattr(config, field).model_dump(mode="json")
+                for field in ("load_test", "sessions") if workloads.WORKLOAD_CHECKS[field].intersection(checks)}
+    for report, generator, sampler in (
+        (current, "d9a9e921584262148e06b636f0e8f195b7e530fd2a69c5e98f013359cf947ede",
+         "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4"),
+        (old, "aee9ca71bc5ffd780d1574422b761e3177471a12f951a10b04322573ca062f76",
+         "2fab1370faeab7ddb91a7ae9c0e49520ee9a67e305441a0663877bb12bca24c3"),
+    ):
+        identity = {"generator_source_sha256": generator, "settings": deepcopy(settings)}
+        if "load" in checks:
+            identity["load_test_source_sha256"] = "9b694c97a39d449d8ea15b09a9aeb406bf835179c0882827685c4d7888687d36"
+        if "sessions" in checks:
+            identity["session_sampling_source_sha256"] = sampler
+        report.manifest["config"] = config.model_dump(mode="json")
+        report.manifest["fixture_pack"] = {"workload_fixture_sha256": fixture_hash(identity)}
+    return current, old
+
+
+@pytest.mark.parametrize("checks", [["load"], ["load", "sessions"], ["access", "sessions"]])
+def test_exact_conversation_predecessor_keeps_ordinary_load_and_core_companions_comparable(checks):
+    current, old = exact_conversation_reports(checks)
+    assert _settings_reasons(current, old) == []
+    assert _settings_reasons(old, current) == []
+
+
+@pytest.mark.parametrize("change", ["load_source", "load_settings"])
+def test_exact_conversation_predecessor_still_attests_load_source_and_settings(change):
+    current, old = exact_conversation_reports(["load", "sessions"])
+    identity = _run_limits_workload_identity(old.manifest, revision="persistent_users")
+    assert identity is not None
+    if change == "load_source":
+        identity["load_test_source_sha256"] = "unreviewed-load-source"
+    else:
+        old.manifest["config"]["load_test"]["schedule"]["duration_seconds"] += 1
+        identity["settings"]["load_test"] = old.manifest["config"]["load_test"]
+    old.manifest["fixture_pack"]["workload_fixture_sha256"] = fixture_hash(identity)
+    assert "Fixture pack identity differs." in _settings_reasons(current, old)
+
+
+def test_core_companion_bridge_does_not_extend_to_earlier_generator_revisions():
+    current, old = exact_conversation_reports(["access", "sessions"])
+    for report, revision in ((current, "shared_conversations"), (old, "phase2")):
+        report.manifest["config"]["sessions"]["sampling"] = None
+        identity = _run_limits_workload_identity(report.manifest, revision=revision)
+        assert identity is not None
+        report.manifest["fixture_pack"]["workload_fixture_sha256"] = fixture_hash(identity)
+    assert "Fixture pack identity differs." in _settings_reasons(current, old)
+
+
 @pytest.mark.parametrize("revision", ["persistent_users", "shared_conversations", "gateway_attribution", "gateway_conversations"])
 def test_conversation_wiring_does_not_bridge_multi_user_workloads(revision):
     configured = RunConfig(targets=[{"name": "local", "url": "http://localhost", "model": "test"}],

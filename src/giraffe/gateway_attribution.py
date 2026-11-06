@@ -298,8 +298,13 @@ async def execute(run, target, client, *, deferred=False):
         raise
     finally:
         run.finish_condition(target.name, CHECK)
+    budget_limited = (len(records) < planned and run.remaining(target.name) == 0
+                      and run.stop_reason(target.name) in {None, "maximum request budget reached"})
+    budget_reason = "The request limit left too few slots for the configured attribution probes."
     if not records:
         observation.update(state="unverified", reason="No identified requests were admitted within the run budget.", planned_requests=planned)
+        if budget_limited:
+            observation.update(reason_code="budget_limited", reason=budget_reason)
         return
     collection_started = time.monotonic()
     settle_deadline = collection_started + settings.settle_seconds
@@ -372,6 +377,8 @@ async def execute(run, target, client, *, deferred=False):
                 and (not cancelled or run.reason == "maximum run duration reached")):
             assessment.update(reason_code="time_limited",
                               reason="The run deadline did not leave the configured spend-log settle window after all identity probes.")
+        if budget_limited and assessment["state"] == "unverified" and not cancelled and not run.stop.is_set():
+            assessment.update(reason_code="budget_limited", reason=budget_reason)
         assessment.update(collection_attempts=attempts, collection_version=COLLECTION_VERSION,
             source="litellm_spend_logs_v2",
             evidence_scope="Exact generated request markers; aggregate counters and counter resets are not used.")

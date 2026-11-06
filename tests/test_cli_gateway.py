@@ -7,7 +7,7 @@ import httpx
 import pytest
 
 from giraffe.cli import main
-from tests.test_gateway_attribution import config, spend_page
+from tests.test_gateway_attribution import config, immediate_spend_polls, spend_page
 
 
 @pytest.mark.parametrize("shared", ["absent", "configured", "missing_env"])
@@ -25,6 +25,7 @@ def test_mixed_cli_retains_shared_completion_preflight(monkeypatch, tmp_path, ca
 
 def run_cli(monkeypatch, tmp_path, capsys, *, shared, mixed=False, gpu=False):
     cfg = config(stream=False)
+    immediate_spend_polls(monkeypatch, cfg)
     if shared != "absent":
         cfg.targets[0].api_key_env = "SHARED_KEY"
     if shared == "configured":
