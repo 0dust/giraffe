@@ -97,6 +97,11 @@ async def test_unavailable_policy_does_not_block_serving_baseline(monkeypatch, c
         raw["targets"][0].update(api_key_env="SHARED", test_identities={"limited": {"api_key_env": ref}})
         report = await run_suite(RunConfig.model_validate(raw))
         assert report.overall == "pass"
+        # Isolate policy compatibility from the mock transport's wall-clock timing.
+        for record in report.requests:
+            if "serving" in record.check_ids:
+                record.elapsed_ms = 10
+                record.first_output_ms = 5
         return report
 
     baseline = await run("PREVIOUS_UNUSED")
