@@ -26,7 +26,7 @@ from .caps import (MAX_HTML_PREVIEW_CHARS, MAX_HTML_JSON_PREVIEW_CHARS,
                    MAX_FAILURE_SUMMARY_CHARS)
 from .deployment import deployment_diff, fixture_hash, safe_config, sanitize
 from .report_inputs import input_ref as _input_ref
-from .multi_user_metrics import (_length_mix_differs, _total_generated_tokens, _uncached_input_tokens, truncated_conversation_turn,
+from .multi_user_metrics import (_length_mix_differs, _total_generated_tokens, _uncached_input_tokens, fairness_applies, truncated_conversation_turn,
                                  user_delivery_completions, user_latency)
 from .models import (CHECK_NAMES, CORE_CHECKS, SHAPES, SHARED_BASELINE_EXCLUDED_WORKLOADS, CheckResult, GatewayAttribution,
                      GatewayPolicy, RequestRecord, RunConfig, RunReport, overall_status, load_shape_label,
@@ -1558,7 +1558,9 @@ def _compare_user_fairness(current, previous, current_records, old_records):
     latest, old = current.get("fairness", {}), previous.get("fairness", {})
     limit = old.get("threshold")
     latest_status = latest.get("status")
-    if (any(window.get("role") and window.get("scenario") != "arrivals" for window in (current, previous))
+    recovery = current.get("scenario") == "recovery"
+    if (not all(fairness_applies(window) for window in (current, previous))
+            or (recovery and not all(item.get("acceptance_applies") is True for item in (latest, old)))
             or limit is None or latest.get("threshold") != limit
             or old.get("status") != "pass" or old.get("qualified") is not True
             or latest_status not in {"pass", "fail", "inconclusive"}):
@@ -1604,11 +1606,15 @@ def _compare_user_fairness(current, previous, current_records, old_records):
             evidence.extend(record.id for record in cohorts[0])
 
     scenario, population = current["scenario"], current["population"]
+    role = {"role": current["role"]} if recovery else {}
+    label = f"{scenario} / {population}"
+    if recovery:
+        label += f" / {current['role']}"
     status = latest_status if comparable else "inconclusive"
     reasons = {"pass": "Observed delivery fairness stayed within the previously accepted threshold.",
                "fail": "Observed delivery fairness exceeded the previously accepted threshold.",
                "inconclusive": "Observed fairness work or overlap differs or lacks evidence."}
-    return {"check": "multi_user", "scenario": f"{scenario} / {population}", "population": population,
+    return {"check": "multi_user", "scenario": label, "population": population, **role,
             "window_id": current["id"], "metric": "fairness_acceptance", "aggregation": "selected_criteria",
             "current": latest.get("ratio"), "baseline": old.get("ratio"), "threshold": limit,
             "current_samples": sum(item.get("valid_samples", 0) for item in latest.get("users", [])),
