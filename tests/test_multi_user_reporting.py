@@ -702,18 +702,24 @@ def test_new_interference_failure_survives_incomplete_peer_cancellation_baseline
                for row in compared.baseline["targets"][0]["comparisons"])
 
 
-@pytest.mark.parametrize(("heavy_input", "retain_heavy", "slowdown", "expected"), [
-    (256, True, 4.05, "fail"),
-    (512, True, 4.05, "inconclusive"),
-    (512, True, 1.5, "inconclusive"),
-    (256, False, 4.05, "inconclusive"),
+@pytest.mark.parametrize(("limit", "heavy_input", "retain_heavy", "slowdown", "expected"), [
+    (3, 256, True, 4.05, "fail"),
+    (3, 512, True, 4.05, "inconclusive"),
+    (3, 512, True, 1.5, "inconclusive"),
+    (3, 256, False, 4.05, "inconclusive"),
+    (None, 256, True, 4.05, "pass"),
+    (None, 512, True, 1.5, "inconclusive"),
+    (None, 256, False, 1.5, "inconclusive"),
 ])
-def test_interference_baseline_attributes_matched_slowdown_only_to_short_user(heavy_input, retain_heavy, slowdown, expected):
+def test_interference_baseline_attributes_matched_slowdown_only_to_short_user(
+    limit, heavy_input, retain_heavy, slowdown, expected,
+):
     from tests.test_multi_user_scenarios import matched_observation
 
     current, baseline = user_report(), user_report()
     for report in (current, baseline):
         source, requests = matched_observation()
+        source["settings"]["noisy_neighbors"]["max_slowdown"] = limit
         report.manifest["config"]["multi_user"].update(source["settings"])
         for item in requests:
             item.target = "local"
@@ -728,17 +734,39 @@ def test_interference_baseline_attributes_matched_slowdown_only_to_short_user(he
         interference = summary["windows"][1]["interference"]
         short, = interference["users"]
         assert short["slowdown"] == pytest.approx(slowdown if report is current else 1.5)
-        assert interference["status"] == ("fail" if report is current and slowdown > 3 else "pass")
+        assert short["qualified"]
+        assert interference["status"] == (
+            "measured" if limit is None else "fail" if report is current and slowdown > limit else "pass")
         report.requests = requests if report is baseline or retain_heavy else requests[:2]
         report.checks[0].metrics["multi_user"] = summary
         report.checks[0].status = report.overall = summary["status"]
 
     compared = compare_baseline(current, baseline).baseline
-    acceptance, = [row for row in compared["targets"][0]["comparisons"] if row["metric"] == "scenario_acceptance"]
-    assert acceptance["user_id"] == "user-01" and acceptance["status"] == compared["status"] == expected
-    assert acceptance["current_samples"] == acceptance["baseline_samples"] == 1
-    assert acceptance["evidence_ids"] == [item.id for item in current.requests]
-    assert compared["acceptance"]["current"] == ("fail" if slowdown > 3 else "pass")
+    target = compared["targets"][0]
+    rows = target["comparisons"]
+    assert compared["status"] == target["status"] == expected
+    assert compared["acceptance"]["current"] == ("fail" if limit is not None and slowdown > limit else "pass")
+    acceptance = [row for row in rows if row["metric"] == "scenario_acceptance"]
+    measured = [row for row in rows if row["metric"] == "matched_interference_slowdown"]
+    if limit is None:
+        assert not acceptance
+        delivery, = [row for row in rows if row["metric"] == "shared_window_output_tokens_per_second"
+                     and row["role"] == "probe" and row["user_id"] == "user-01"]
+        assert delivery["status"] == "pass"
+        if expected == "pass":
+            assert not measured
+            return
+        interference, = measured
+        assert interference["current"] == pytest.approx(slowdown) and interference["baseline"] == 1.5
+        assert interference["threshold"] is None and "worsening" not in interference
+        assert "Matched heavy" in interference["reason"]
+        assert interference["reason"] in target["reasons"]
+    else:
+        interference, = acceptance
+        assert not measured
+    assert interference["user_id"] == "user-01" and interference["status"] == expected
+    assert interference["current_samples"] == interference["baseline_samples"] == 1
+    assert interference["evidence_ids"] == [item.id for item in current.requests]
 
 
 def test_intentional_user_cancellation_is_not_an_ordinary_baseline_sample():

@@ -1400,11 +1400,11 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold):
         missing = (not complete
                    or c_rate is None or b_rate is None or work_reason or mix_changed
                    or live_work_reason or scenario_reason or delivery_reason)
-        row = {"check": "multi_user", "scenario": " / ".join(map(str, key if role else key[:4])),
-               "user_id": user_id, "population": population, "profile": profile,
-               "role": role, "trigger": trigger, "heavy_profile": heavy_profile,
-               "window_id": c_window.get("id", b_window.get("id")),
-               "metric": "shared_window_output_tokens_per_second", "aggregation": "common_window",
+        identity = {"check": "multi_user", "scenario": " / ".join(map(str, key if role else key[:4])),
+                    "user_id": user_id, "population": population, "profile": profile,
+                    "role": role, "trigger": trigger, "heavy_profile": heavy_profile,
+                    "window_id": c_window.get("id", b_window.get("id"))}
+        row = {**identity, "metric": "shared_window_output_tokens_per_second", "aggregation": "common_window",
                "current": c_rate, "baseline": b_rate, "status": "inconclusive",
                "current_samples": len(current_delivery), "baseline_samples": len(old_delivery),
                "threshold": threshold, "change_unit": "percent",
@@ -1448,6 +1448,16 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold):
                          "current_samples": c_scenario.get("matched_samples", 0),
                          "baseline_samples": b_scenario.get("matched_samples", 0), "evidence_ids": interference_ids,
                          "observed_change": None, "observed_delta": None})
+        elif short_probe and b_scenario.get("status") == "measured" and interference_reason:
+            reason = f"Multi-user {user_id} at {population} users: {interference_reason}"
+            incomplete.append(reason)
+            rows.append({**identity,
+                "metric": "matched_interference_slowdown", "status": "inconclusive", "threshold": None,
+                "current": c_scenario.get("slowdown"), "baseline": b_scenario.get("slowdown"),
+                "current_samples": c_scenario.get("matched_samples", 0),
+                "baseline_samples": b_scenario.get("matched_samples", 0),
+                "reason": reason, "evidence_ids": interference_ids,
+            })
         if (not noisy_probe and c_scenario.get("status") == "fail" and b_scenario.get("status") == "pass"
                 and not scenario_reason and not any(_load_work_comparison(current_work, old_work))):
             acceptance = {**row, "metric": "scenario_acceptance", "status": "fail",
