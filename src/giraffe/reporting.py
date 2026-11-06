@@ -1482,6 +1482,15 @@ def _user_token_work_changed(current, previous, tolerance, *, compare_visible=Tr
     return any(_measured_token_work_changed(current, previous, tolerance, measure) for measure in measures)
 
 
+def _recovery_timing_work_changed(current, previous, threshold, *, first_answer):
+    samples = [[record for record in cohort if user_latency(record, first_answer) is not None]
+               for cohort in (current, previous)]
+    # Match the relative first-answer metric: use total generated work for
+    # either criterion and visible output work for completion.
+    return (_user_token_work_changed(*samples, threshold, compare_visible=not first_answer)
+            or _matched_recovery_work_changed(*samples, threshold, compare_visible=not first_answer))
+
+
 def _compare_user_fairness(current, previous, current_records, old_records):
     """Compare a previously accepted fairness limit on the same observed work."""
     latest, old = current.get("fairness", {}), previous.get("fairness", {})
@@ -1745,20 +1754,25 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold, slot_ch
             comparable_attempts = not (attempt_reason or attempt_mix_changed or _live_input_work_changed(
                 current_attempts, old_attempts, threshold))
             failed_timing = failed_criteria & {"max_first_answer_ms", "max_completion_ms"}
+            # A pending admission has no request and cannot establish heavy overlap.
+            observed_timing_failures = [name for name in failed_timing if not noisy_probe
+                or not c["criteria"][name].get("pending_breach") or c["criteria"][name].get("missed")]
             timing_work_changed = False
-            if failed_timing and scenario in {"arrivals", "recovery"}:
+            if observed_timing_failures and scenario in {"arrivals", "recovery"}:
                 completions = [[r for r in cohort if r.status == "completed" and r.valid]
                                for cohort in (current_attempts, old_attempts)]
-                timing_work_changed = _user_token_work_changed(*completions, threshold)
+                if scenario == "recovery":
+                    timing_work_changed = all(_recovery_timing_work_changed(
+                        *completions, threshold, first_answer=name == "max_first_answer_ms")
+                        for name in observed_timing_failures)
+                else:
+                    timing_work_changed = _user_token_work_changed(*completions, threshold)
             timing_exposed = not noisy_probe or (not (scenario_reason or interference_reason)
                 and _probe_has_overlap(c_scenario, current_attempts)
                 and _probe_has_overlap(b_scenario, old_attempts))
-            # A pending admission has no request and cannot establish heavy overlap.
-            observed_timing_failure = any(not noisy_probe or not c["criteria"][name].get("pending_breach")
-                or c["criteria"][name].get("missed") for name in failed_timing)
             attempt_failure = comparable_attempts and ("max_error_percent" in failed_criteria
                 or timing_exposed and (not failed_criteria
-                    or observed_timing_failure and not timing_work_changed and not _live_input_work_changed(
+                    or observed_timing_failures and not timing_work_changed and not _live_input_work_changed(
                         current_attempts, old_attempts, threshold, compare_output=True)))
             acceptance = {**row, "metric": "user_acceptance", "current": "fail", "baseline": "pass",
                           "aggregation": "selected_criteria", "observed_change": None, "observed_delta": None,
@@ -1766,7 +1780,7 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold, slot_ch
                           "evidence_ids": [record.id for record in current_attempts]}
             if not (delivery_failure or attempt_failure):
                 detail = (interference_reason or "Timing acceptance lacks qualified heavy overlap."
-                          if noisy_probe and failed_timing and (not timing_exposed or not observed_timing_failure)
+                          if noisy_probe and failed_timing and (not timing_exposed or not observed_timing_failures)
                           else "Observed work behind timing acceptance differs or lacks evidence."
                           if timing_work_changed
                           else "Work behind the selected acceptance criteria differs or lacks evidence.")
