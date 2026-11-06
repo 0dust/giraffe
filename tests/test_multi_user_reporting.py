@@ -191,6 +191,34 @@ def test_selected_fairness_baseline_tracks_threshold_crossings_with_comparable_w
         assert result.baseline["acceptance"]["current"] == ("fail" if new_overlap else "inconclusive")
 
 
+def test_fairness_baseline_rejects_median_token_drift_even_when_mixes_overlap():
+    current, previous = user_report(), user_report()
+    current.requests = [request for request in current.requests if request.id != "user-05-0"]
+    for report, lengths in ((previous, [100]*5 + [120]*2 + [200]), (current, [100]*3 + [120]*4 + [200])):
+        settings = report.manifest["config"]["multi_user"]
+        settings["pass_criteria"]["max_throughput_ratio"] = 1.1
+        for request in report.requests:
+            request.stream = True
+            request.answer_chunks = request.answer_reads = 3
+            request.last_output_ms = 90
+            request.input_tokens = lengths[int(request.id.rsplit("-", 1)[1])]
+        source = report.observations["targets"]["local"]["multi_user"]
+        source["settings"] = settings
+        if report is current:
+            source["windows"][0]["users"][-1]["dispatched_count"] = 7
+        summary = summarize(source, report.requests)
+        report.checks[0].metrics["multi_user"] = summary
+        report.checks[0].status = report.overall = summary["status"]
+        fairness = summary["windows"][0]["fairness"]
+        assert fairness["qualified"]
+        assert [sample["input_median_tokens"] for sample in fairness["users"]] == [lengths[3]] * 5
+
+    result = compare_baseline(current, previous)
+    row = next(row for row in result.baseline["targets"][0]["comparisons"] if row["metric"] == "fairness_acceptance")
+    assert row["status"] == result.baseline["status"] == "inconclusive"
+    assert result.baseline["acceptance"] == {"baseline": "pass", "current": "fail"}
+
+
 def live_user_report():
     report = user_report()
     window = report.checks[0].metrics["multi_user"]["windows"][0]
