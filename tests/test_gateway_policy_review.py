@@ -9,7 +9,7 @@ from giraffe.gateway_policy import summarize
 from giraffe.gateway_response import response_evidence
 from giraffe.models import RunConfig
 from giraffe.runner import run_suite
-from tests.test_gateway_policy import CACHE_KEY, MODEL_POOL, configuration, exercise
+from tests.test_gateway_policy import CACHE_KEY, LIMITED_KEY_HASH, MODEL_POOL, configuration, exercise
 
 
 @pytest.mark.parametrize("mode", ["key_rpm", "priority_rpm"])
@@ -155,6 +155,56 @@ async def test_policy_admits_only_at_prepared_transport(monkeypatch, shared, sta
         assert stalled and not policy_wire
     else:
         assert observation["complete"] and len(policy_wire) == 13
+
+
+@pytest.mark.parametrize("late", [True, False])
+async def test_policy_admission_needs_completion_inside_observation(monkeypatch, late):
+    from giraffe.client import LLMClient
+    from giraffe.gateway_policy import execute, result
+    from giraffe.runner import _Run
+
+    cfg = configuration(duration_seconds=.15, users=[dict(identity="limited", requests=4, rpm=2),
+                                                        dict(identity="peer", requests=4, rpm=8)])
+    target = cfg.targets[0]
+    monkeypatch.setenv("LIMITED", "limited-secret")
+    monkeypatch.setenv("PEER", "peer-secret")
+    limited_count = 0
+    bucket_start = time.monotonic()
+
+    async def handler(request):
+        nonlocal limited_count
+        if request.headers.get("authorization") == "Bearer limited-secret":
+            limited_count += 1
+            if limited_count == 3:
+                message = (f"Rate limit exceeded for api_key: {LIMITED_KEY_HASH}. Limit type: requests. "
+                           "Current limit: 2, Remaining: 0. Limit resets at: test")
+                return httpx.Response(429, headers={"retry-after": "2"}, json={
+                    "error": {"type": "throttling_error", "code": "429", "message": message}})
+            if late and limited_count == 4:
+                # A synchronous transport segment can postpone timeout delivery
+                # until the gateway's next bucket has legitimately admitted it.
+                time.sleep(2.1)
+                assert time.monotonic() > bucket_start + 2
+        return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "OK"},
+            "finish_reason": "stop"}], "usage": {"prompt_tokens": 8, "completion_tokens": 2}})
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
+    run = _Run(cfg, None, None)
+    async with LLMClient(target, cfg, max_connections=2) as client:
+        await execute(run, target, client)
+    check = result(run, target)
+    policy = check.metrics["gateway_policy"]
+    last = [record for record in run.records if record.identity == "limited"][-1]
+    assert last.http_status == 200 and policy["users"][0]["admitted"] == 3
+    if late:
+        assert last.dispatch_ms < policy["end_ms"] < last.completed_ms
+        assert check.status == "inconclusive" and policy["qualification"] == "unverified"
+        assert not policy["complete"]
+        assert "within the observation window" in check.summary
+    else:
+        assert last.completed_ms <= policy["end_ms"]
+        assert check.status == "fail" and policy["qualification"] == "observed_failure"
 
 
 @pytest.mark.usefixtures("local_tokenizer")

@@ -12,8 +12,24 @@ from .identities import identity_headers, litellm_key_fingerprint
 from .models import CheckResult, RequestSpec
 
 
-VERSION = 13
+VERSION = 14
 PROMPT = "Reply with exactly the word OK."
+
+
+def credential_issue(settings, target):
+    # The default selects LiteLLM's native precedence, including its
+    # X-LiteLLM-API-Key override. Custom deployments declare their key header.
+    try:
+        fingerprints = [litellm_key_fingerprint(identity_headers(target, user.identity),
+                                                auth_header=settings.custom_key_header)
+                        for user in settings.users]
+    except ValueError:
+        fingerprints = []
+    if not fingerprints or not all(fingerprints):
+        return "Required policy identity credentials are unavailable."
+    if len(set(fingerprints)) != len(fingerprints):
+        return "Distinct authenticated test credentials could not be established locally."
+    return None
 
 
 async def execute(run, target, client):
@@ -34,26 +50,13 @@ async def execute(run, target, client):
     run.plan_condition(target.name, "gateway_policy", {},
                        planned=sum(user.requests for user in settings.users))
 
-    # The default selects LiteLLM's native precedence, including its
-    # X-LiteLLM-API-Key override. Custom deployments declare their key header.
-    try:
-        fingerprints = [litellm_key_fingerprint(identity_headers(target, user.identity),
-                                                auth_header=settings.custom_key_header)
-                        for user in settings.users]
-    except ValueError:
-        fingerprints = []
-    reason = None
-    if not fingerprints or not all(fingerprints):
-        reason = "Required policy identity credentials are unavailable."
-    elif len(set(fingerprints)) != len(fingerprints):
-        reason = "Distinct authenticated test credentials could not be established locally."
+    reason = credential_issue(settings, target)
     if reason:
         observation.update(credential_issue=True, stop_reason=reason, end_ms=observation["start_ms"])
         run.mark_unfinished(target.name, ["gateway_policy"])
         run.finish_condition(target.name, "gateway_policy", reason=reason)
         return
     observation["identities_distinct"] = True
-    del fingerprints
 
     async def user_loop(user):
         for sequence in range(user.requests):
@@ -93,7 +96,11 @@ async def execute(run, target, client):
             if not task.done():
                 task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-        observation["end_ms"] = min((time.monotonic()-run.start)*1000, observation["end_ms"])
+        finished = time.monotonic()
+        if finished >= end:
+            observation["complete"] = False
+            observation["stop_reason"] = observation["stop_reason"] or "Policy traffic duration reached."
+        observation["end_ms"] = min((finished-run.start)*1000, observation["end_ms"])
         observation["stop_reason"] = observation["stop_reason"] or run.stop_reason(target.name)
         if not observation["complete"]:
             run.mark_unfinished(target.name, ["gateway_policy"])
@@ -164,17 +171,28 @@ def summarize(settings, observation, records):
         return outcome("unavailable", "Selected gateway capability is unsupported.")
     if observation.get("credential_issue"):
         return outcome("unverified", observation["stop_reason"])
-    if any(record.gateway_evidence and record.gateway_evidence._response_cache_hit_reported for record in records):
-        summary["response_cache_hit_reported"] = True
-        return outcome("unverified", "Gateway reported a cached completion, so this policy probe could not verify fresh work.")
+    cached = {record.id for record in records
+              if record.gateway_evidence and record.gateway_evidence._response_cache_hit_reported}
+    summary["response_cache_hit_reported"] = bool(cached)
     if settings.capability == "priority_rpm" and any(user.priority == "default_pool" for user in settings.users):
         return outcome("unverified", "LiteLLM reserves default_pool for unreserved traffic. Use distinct named reservations.")
     if not records:
         return outcome("unexercised", "No policy traffic was dispatched.")
-    affected = [record for record in records if record.identity == settings.affected_identity]
-    peers = [record for record in records if record.identity != settings.affected_identity]
-    successes = [record for record in records if record.status == "completed" and record.valid]
-    admissions = [record for record in records if record.http_status is not None and 200 <= record.http_status < 300]
+    start, end = summary["start_ms"], summary["end_ms"]
+    # Completion bounds when the gateway might have admitted a request. A
+    # client dispatch alone cannot place that admission inside this window.
+    window_records = [record for record in records if start is not None and end is not None
+                      and record.dispatch_ms is not None and record.completed_ms is not None
+                      and start <= record.dispatch_ms <= record.completed_ms <= end]
+    incomplete_window = len(window_records) != len(records)
+    if incomplete_window:
+        summary["complete"] = False
+    if any(record.id in cached for record in window_records):
+        return outcome("unverified", "Gateway reported a cached completion, so this policy probe could not verify fresh work.")
+    affected = [record for record in window_records if record.identity == settings.affected_identity]
+    peers = [record for record in window_records if record.identity != settings.affected_identity]
+    successes = [record for record in window_records if record.status == "completed" and record.valid]
+    admissions = [record for record in window_records if record.http_status is not None and 200 <= record.http_status < 300]
     affected_admissions = [record for record in admissions if record.identity == settings.affected_identity]
     declared = next(user for user in settings.users if user.identity == settings.affected_identity)
     rejection_kind = "key_rpm" if settings.capability == "key_rpm" else "priority_pool"
@@ -184,21 +202,16 @@ def summarize(settings, observation, records):
                   and record.gateway_evidence.rate_limit_unit == "requests"]
     for rejection in recognized:
         summary["peer_continuation"] = all(any(record.identity == user.identity
-            and record.status == "completed" and record.valid
-            and record.dispatch_ms is not None and rejection.completed_ms is not None
-            and record.dispatch_ms > rejection.completed_ms and record.completed_ms is not None
-            and record.completed_ms <= observation.get("end_ms", 0)
+            and record.status == "completed" and record.valid and record.dispatch_ms > rejection.completed_ms
             for record in peers) for user in settings.users if user.identity != settings.affected_identity)
         if summary["peer_continuation"]:
             break
     summary["overlap_observed"] = any(a.status == "completed" and a.valid and b.status == "completed" and b.valid
-        and a.dispatch_ms is not None and a.completed_ms is not None
-        and b.dispatch_ms is not None and b.completed_ms is not None
         and max(a.dispatch_ms, b.dispatch_ms) < min(a.completed_ms, b.completed_ms)
         for a in affected for b in peers)
     inputs = [record.input_tokens for record in successes]
     outputs = [record.completion_tokens for record in successes]
-    summary["comparable_actual_work"] = bool(successes and all(row["completed"] for row in users)
+    summary["comparable_actual_work"] = bool({record.identity for record in successes} == {user.identity for user in settings.users}
         and all(value is not None and value > 0 for value in inputs+outputs)
         and len(set(inputs)) == 1 and max(outputs) <= 2*min(outputs))
     if not observation.get("isolated_run"):
@@ -209,12 +222,14 @@ def summarize(settings, observation, records):
         return outcome("unverified", "Policy qualification requires an operator-confirmed authoritative limiter counter.")
     if not observation.get("identities_distinct"):
         return outcome("unverified", "Distinct authenticated test credentials could not be established locally.")
+    cutoff_reason = "Policy request timing could not be established within the observation window."
     if not recognized:
+        if incomplete_window:
+            return outcome("unverified", cutoff_reason)
         if affected_rejections:
             return outcome("unverified", "Rejection does not identify the declared gateway policy.")
         return outcome("unexercised", "No attributed policy rejection was observed within offered work.")
     windows = [record.gateway_evidence.retry_after_seconds for record in recognized]
-    start, end = observation.get("start_ms"), observation.get("end_ms")
     # LiteLLM v3 reports the configured window and truncates bucket start
     # timestamps to whole seconds. A fresh bucket can reset almost 1s early.
     if (any(window is None or window <= 1 for window in windows) or len(set(windows)) != 1
@@ -326,14 +341,17 @@ def summarize(settings, observation, records):
                         if record.completed_ms is not None and record.completed_ms < first_rejection]
     if len(prior_admissions) < declared.rpm:
         # RPM can be charged before a downstream failure; its admission is unknown.
-        uncertain_prior = sum(record not in prior_admissions and record not in recognized
+        uncertain_prior = sum(record.identity == settings.affected_identity
+                              and record not in prior_admissions and record not in recognized
                               and (record.dispatch_ms is None or record.dispatch_ms < first_rejection)
-                              for record in affected)
+                              for record in records)
         if len(prior_admissions) + uncertain_prior >= declared.rpm:
             return outcome("unverified", "Prior requests with unknown admission could have consumed the declared RPM allowance.")
         return outcome("observed_failure", "Attributed rejection occurred before the declared RPM allowance was served.", "fail")
     if len(recognized) != len(affected_rejections):
         return outcome("unverified", "Affected identity received 429 responses that do not identify the declared gateway policy.")
+    if incomplete_window:
+        return outcome("unverified", cutoff_reason)
     if not summary["complete"] or any(user["cancelled"] or user["other_failures"] for user in users):
         return outcome("unverified", "Traffic was interrupted or non-policy failures left incomplete evidence.")
     if settings.capability == "priority_rpm" and admitted > declared.rpm and not rpm_only_saturation:

@@ -31,6 +31,43 @@ def test_preview_counts_offers_without_materializing_request_ledger(monkeypatch)
     assert row["scheduled_offers"] == 9
 
 
+def test_newcomer_steady_offer_at_half_open_end_is_not_scheduled(monkeypatch):
+    from giraffe.planning import request_plan
+
+    async def run():
+        asyncio.get_running_loop().now = 10_000.0
+        cfg = settings(levels=[2], scenarios=["arrivals"], duration_seconds=.33, profile=PROFILE,
+                       arrivals={"requests_per_second": 10, "activations": {"user-02": .03}})
+        row = next(row for row in request_plan(cfg)["rows"] if row["id"] == "multi_user_2")
+        assert row["scheduled_offers"] == 7
+
+        target = cfg.targets[0]
+        state = runner._Run(cfg, None, None)
+        await execute(state, target, FakeClient(target, cfg))
+        window, = state.observations[target.name]["multi_user"]["windows"]
+        assert window["offer_accounting"] == {"planned": 7, "offered": 7, "dispatched": 7,
+            "dropped_local": 0, "dropped_late": 0, "unissued": 0, "not_offered": 0}
+        assert [offer["offset_seconds"] for offer in window["offers"] if offer["user_id"] == "user-02"] == [
+            .03, .13, .23,
+        ]
+
+    run_virtual(monkeypatch, run())
+
+
+def test_burst_offer_at_half_open_end_is_invalid():
+    from pydantic import ValidationError
+
+    from giraffe.multi_user import _planned_observation
+
+    arrivals = {"bursts": [{"user_id": "user-01", "at_seconds": .01, "requests": 3, "spacing_seconds": .03}]}
+    with pytest.raises(ValidationError, match="before the window end"):
+        settings(levels=[1], scenarios=["arrivals"], duration_seconds=.07, arrivals=arrivals)
+
+    cfg = settings(levels=[1], scenarios=["arrivals"], duration_seconds=.07000000000000002, arrivals=arrivals)
+    window, = _planned_observation(cfg.multi_user)["windows"]
+    assert [offer["offset_seconds"] for offer in window["offers"] if offer["origin"] == "burst"] == [.01, .04, .07]
+
+
 def test_activation_adjusted_offer_bound_accepts_valid_plan():
     from giraffe.multi_user import _planned_observation
 
@@ -705,18 +742,20 @@ def test_transport_lane_wait_respects_backlog_discard(monkeypatch, stall):
     from giraffe.transport import HTTPClientPool
 
     async def run():
+        loop = asyncio.get_running_loop()
+        loop.now = 10_000.0
         cfg = settings(levels=[3], scenarios=["arrivals"], duration_seconds=.2, profile=PROFILE,
             arrivals={"requests_per_second": 1, "bursts": [
                 {"user_id": "user-01", "at_seconds": .01, "requests": 3, "spacing_seconds": .03},
-            ]}).model_copy(update={"stream": True})
+                {"user_id": "user-01", "at_seconds": .13, "requests": 1},
+            ]}).model_copy(update={"stream": True, "concurrency": 7})
         target = cfg.targets[0]
         events = []
         state = runner._Run(cfg, events.append, None)
-        loop = asyncio.get_running_loop()
         sent = []
 
         def stall_generator():
-            loop.now += .055
+            loop.now = state.start + .13
 
         async def respond(request):
             sent.append((loop.time() - state.start) * 1000)
@@ -735,18 +774,20 @@ def test_transport_lane_wait_respects_backlog_discard(monkeypatch, stall):
         window, = state.observations[target.name]["multi_user"]["windows"]
         steady, bursts = window["offers"][:3], window["offers"][3:]
         assert [offer["outcome"] for offer in steady] == ["dispatched"] * 3
-        assert [offer["outcome"] for offer in bursts] == ["dropped_late" if stall else "dispatched"] * 3
-        assert sent == pytest.approx([0, 0, 0] if stall else [0, 0, 0, 90, 90, 90])
+        assert [offer["outcome"] for offer in bursts] == ["dropped_late" if stall else "dispatched"] * 4
+        assert sent == pytest.approx([0, 0, 0] if stall else [0, 0, 0, 90, 90, 90, 130])
         assert len(state.records) == state.attempted == len(sent)
         assert all(record.status == "completed" and record.valid for record in state.records)
-        assert state.budget_used == 6 and state.slots.qsize() == state.max_connections
-        assert state.dropped_offers == sum(event["event"] == "offer_dropped" for event in events) == (3 if stall else 0)
+        assert state.budget_used == 7 and state.slots.qsize() == state.max_connections
+        assert state.dropped_offers == sum(event["event"] == "offer_dropped" for event in events) == (4 if stall else 0)
         assert sum(event["event"] == "request_started" for event in events) == len(sent)
-        assert window["scheduler_stalls"] == ([{"start_ms": 10, "end_ms": 130}] if stall else [])
         if stall:
-            assert [offer["scheduler_lag_ms"] for offer in bursts] == pytest.approx([120, 90, 60])
+            observation, = window["scheduler_stalls"]
+            assert observation == pytest.approx({"start_ms": 10, "end_ms": 130})
+            assert [offer["scheduler_lag_ms"] for offer in bursts] == pytest.approx([120, 90, 60, 0], abs=1e-8)
             assert all(offer["request_id"] is None for offer in bursts)
         else:
+            assert not window["scheduler_stalls"]
             assert window["peak_in_flight"] == 3
 
     run_virtual(monkeypatch, run())

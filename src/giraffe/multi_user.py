@@ -9,6 +9,7 @@ import time
 import uuid
 from collections import Counter
 from copy import deepcopy
+from fractions import Fraction
 
 from giraffe.concurrent_load import OutputProgress, calibrate
 from giraffe.load_test import _shape_sources, build_spec
@@ -368,23 +369,23 @@ def _offer_plan(window, settings):
     offers = []
     recovery = window["scenario"] == "recovery"
     rate = window["requests_per_second"]
+    period = 1 / Fraction(str(rate))
     for user in window["users"]:
         uid = user["user_id"]
         activation = 0 if recovery else settings.arrivals.activations.get(uid, 0)
         cohort = "shared" if recovery else "newcomer" if activation else "incumbent"
         user.update(cohort=cohort, activation_seconds=activation)
+        start = Fraction(str(activation))
         for index in range(_steady_offer_count(window["planned_duration_seconds"], activation, rate)):
-            offset = activation + index/rate
-            if offset < window["planned_duration_seconds"]:
-                offers.append({"user_id": uid, "profile": user["profile"], "cohort": cohort,
-                               "offset_seconds": offset, "origin": "steady"})
+            offers.append({"user_id": uid, "profile": user["profile"], "cohort": cohort,
+                           "offset_seconds": float(start + index * period), "origin": "steady"})
     if not recovery:
         users = {u["user_id"]: u for u in window["users"]}
         for burst_index, burst in enumerate(settings.arrivals.bursts):
             for index in range(burst.requests):
                 user = users[burst.user_id]
                 offers.append({"user_id": burst.user_id, "profile": user["profile"], "cohort": user["cohort"],
-                    "offset_seconds": burst.at_seconds + index*burst.spacing_seconds,
+                    "offset_seconds": float(burst.offer_offset(index)),
                     "origin": "burst", "burst_index": burst_index})
     priority = {user["user_id"]: random.Random(f"{settings.seed}:offer:{user['user_id']}").random()
                 for user in window["users"]}

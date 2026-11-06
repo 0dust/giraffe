@@ -6,6 +6,25 @@ import re
 from .models import GatewayResponseEvidence
 
 
+def parse_gateway_json(body):
+    """Read unambiguous JSON for gateway evidence."""
+    def unique_keys(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("Duplicate gateway JSON member")
+            value[key] = item
+        return value
+
+    def reject_constant(_):
+        raise ValueError("Invalid gateway JSON constant")
+
+    try:
+        return json.loads(body, object_pairs_hook=unique_keys, parse_constant=reject_constant)
+    except (ValueError, UnicodeError, RecursionError):
+        return None
+
+
 def _model_group(value):
     if (isinstance(value, str) and 0 < len(value) <= 256 and value.isprintable()
             and "," not in value and value == value.strip()):
@@ -36,10 +55,7 @@ def _saturation_evidence(suffix, header):
 def response_evidence(status, body=b"", headers=None, *, declared_priority=None, expected_key_hash=None):
     kind = None if 200 <= status < 300 else "unknown"
     if status in {401, 403}:
-        try:
-            data = json.loads(body)
-        except (ValueError, UnicodeError, RecursionError):
-            data = None
+        data = parse_gateway_json(body)
         error = data.get("error") if isinstance(data, dict) else None
         if isinstance(error, dict):
             error_type, message = error.get("type"), error.get("message", "")
@@ -79,10 +95,7 @@ def response_evidence(status, body=b"", headers=None, *, declared_priority=None,
             evidence._priority_model_group = _model_group(headers.get("x-litellm-model-group"))
         return evidence
     evidence.policy_rejection = "unknown"
-    try:
-        data = json.loads(body)
-    except (ValueError, UnicodeError, RecursionError):
-        return evidence
+    data = parse_gateway_json(body)
     error = data.get("error") if isinstance(data, dict) else None
     if not isinstance(error, dict) or error.get("type") != "throttling_error" or error.get("code") not in (429, "429"):
         return evidence
