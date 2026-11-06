@@ -473,3 +473,123 @@ def test_scheduled_request_enters_transport_before_blocking_progress(monkeypatch
         assert state.slots.qsize() == state.max_connections
 
     run_virtual(monkeypatch, run())
+
+
+@pytest.mark.parametrize(("prepare", "delay", "duration", "global_limit", "response_delay", "expected", "status"), [
+    ("hash", .2, .05, 10, 0, "unissued", None),
+    ("hash", .2, .5, 10, 0, "dropped_late", None),
+    ("hash", .2, .5, .15, 0, "unissued", None),
+    ("build", .2, .5, 10, 0, "dropped_late", None),
+    ("build", .02, .05, 10, 0, "dispatched", "completed"),
+    ("build", .08, .1, 10, .02, "dispatched", "completed"),
+    ("build", .08, .1, 10, .05, "dispatched", "timeout"),
+    ("build", .08, .1, .095, .05, "dispatched", "cancelled"),
+])
+def test_scheduled_admission_checks_real_client_preparation(
+    monkeypatch, prepare, delay, duration, global_limit, response_delay, expected, status,
+):
+    import json
+    from types import SimpleNamespace
+
+    import httpx
+
+    from giraffe import client as client_module
+
+    async def run():
+        cfg = settings(levels=[1], scenarios=["arrivals"], duration_seconds=duration,
+                       profile=PROFILE, arrivals={"requests_per_second": 1}).model_copy(
+                           update={"request_timeout_seconds": .03})
+        events, dispatches = [], []
+
+        def progress(event):
+            if event.get("user"):
+                events.append(event)
+                if event["event"] == "request_started" and not response_delay:
+                    asyncio.get_running_loop().now += .2
+
+        def hash_input(value, **kwargs):
+            if prepare == "hash" and isinstance(value, dict) and value.keys() == {"messages", "options"}:
+                asyncio.get_running_loop().now += delay
+            return json.dumps(value, **kwargs)
+
+        class HTTPClient(httpx.AsyncClient):
+            def build_request(self, *args, **kwargs):
+                request = super().build_request(*args, **kwargs)
+                if prepare == "build":
+                    asyncio.get_running_loop().now += delay
+                return request
+
+        state = runner._Run(cfg, progress, None)
+        state.deadline = state.start + global_limit
+
+        async def respond(request):
+            dispatches.append((asyncio.get_running_loop().now-state.start)*1000)
+            if response_delay:
+                await asyncio.sleep(response_delay)
+            return httpx.Response(200, text='data: {"choices":[{"delta":{"content":"1 2"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+
+        monkeypatch.setattr(client_module, "json", SimpleNamespace(**(vars(json) | {"dumps": hash_input})))
+        async with HTTPClient(transport=httpx.MockTransport(respond)) as transport:
+            client = client_module.LLMClient(cfg.targets[0], cfg)
+            client._client = transport
+            await execute(state, cfg.targets[0], client)
+        await asyncio.sleep(0)
+        window, = state.observations["service"]["multi_user"]["windows"]
+        offer, = window["offers"]
+        admitted = int(expected == "dispatched")
+        assert (offer["outcome"], window["offer_accounting"][expected]) == (expected, 1)
+        assert offer["scheduler_lag_ms"] == pytest.approx(delay*1000)
+        assert len(dispatches) == len(state.records) == state.attempted == admitted
+        assert state.budget_used == 1 and state.slots.qsize() == state.max_connections
+        assert [event["event"] for event in events] == ["request_started", "request_completed"] * admitted
+        if admitted:
+            record, = state.records
+            assert record.dispatch_ms == record.timing_start_ms == pytest.approx(dispatches[0])
+            assert record.status == status
+            response_elapsed = min(response_delay, .03, global_limit-delay)
+            assert record.completed_ms == pytest.approx(dispatches[0]+response_elapsed*1000)
+            assert offer["request_id"] == record.id
+        else:
+            assert offer["request_id"] is None
+
+    run_virtual(monkeypatch, run())
+
+
+def test_scheduled_admission_checks_lazy_http_lane_preparation(monkeypatch):
+    import httpx
+
+    from giraffe.client import LLMClient
+    from giraffe.transport import HTTPClientPool
+
+    async def run():
+        cfg = settings(levels=[2], scenarios=["arrivals"], duration_seconds=.5,
+                       profile=PROFILE, arrivals={"requests_per_second": 1})
+        state = runner._Run(cfg, None, None)
+        requests = []
+        lanes = 0
+
+        async def respond(request):
+            requests.append(request)
+            await asyncio.sleep(.02)
+            return httpx.Response(200, text='data: {"choices":[{"delta":{"content":"1 2"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+
+        def factory():
+            nonlocal lanes
+            lanes += 1
+            if lanes == 2:
+                asyncio.get_running_loop().now += .2
+            return httpx.AsyncClient(transport=httpx.MockTransport(respond))
+
+        client = LLMClient(cfg.targets[0], cfg)
+        pool = client._client = HTTPClientPool(factory, max_connections=2)
+        try:
+            await execute(state, cfg.targets[0], client)
+        finally:
+            await pool.aclose()
+        window, = state.observations["service"]["multi_user"]["windows"]
+        assert lanes == 2
+        assert len(requests) == state.attempted == len(state.records) == 1
+        assert [offer["outcome"] for offer in window["offers"]] == ["dispatched", "dropped_late"]
+        assert state.budget_used == 2 and state.slots.qsize() == state.max_connections
+
+    run_virtual(monkeypatch, run())
