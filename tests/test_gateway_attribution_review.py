@@ -407,6 +407,9 @@ async def test_unmarked_row_requires_independent_session_evidence(monkeypatch, m
         return spend_page(request, [*rows, extra])
 
     cfg, run, _ = setup(monkeypatch, observer)
+    # Classify the same rows across three reads without relying on poll timing.
+    monkeypatch.setattr("giraffe.gateway_attribution.POLL_FRACTIONS", (0, 0, 0))
+    cfg.gateway_attribution.settle_seconds = 1
     check = await collect(cfg, run)
     assert check.metrics["collection_complete"] is True
     assert check.metrics["unrelated_rows"] == (0 if same_session else 1)
