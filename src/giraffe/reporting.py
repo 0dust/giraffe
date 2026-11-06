@@ -427,6 +427,9 @@ def _settings_reasons(report: RunReport, baseline: RunReport, *, details: dict[s
     current_manifest, old_manifest = manifests
     current_config = current_manifest["config"]
     old_config = old_manifest["config"]
+    excluded_checks = [SHARED_BASELINE_EXCLUDED_WORKLOADS.intersection(config.get("checks", []))
+                       for config in (current_config, old_config)]
+    shared_selection_changed = excluded_checks[0] != excluded_checks[1]
     reached = _limits_reached(report) | _limits_reached(baseline)
     for key in ("concurrency", "max_requests", "max_duration_seconds"):
         if key in reached and current_config.get(key) != old_config.get(key):
@@ -466,7 +469,8 @@ def _settings_reasons(report: RunReport, baseline: RunReport, *, details: dict[s
                 if name != "regression_percent"
             }} if isinstance(settings.get("limits"), dict) else {})}
                             if isinstance(settings, dict) else settings
-                     for check, settings in value.items()}
+                     for check, settings in value.items()
+                     if not shared_selection_changed or check not in SHARED_BASELINE_EXCLUDED_WORKLOADS}
         if key == "effective_checks" and isinstance(value, dict):
             cancellation = value.get("cancellation")
             if isinstance(cancellation, dict):
@@ -503,6 +507,8 @@ def _settings_reasons(report: RunReport, baseline: RunReport, *, details: dict[s
         return value
 
     selected = set(current_config.get("checks", [])) | set(old_config.get("checks", []))
+    if shared_selection_changed:
+        selected -= SHARED_BASELINE_EXCLUDED_WORKLOADS
     if "multi_user" in selected:
         policies = [{check.target: (check.metrics.get("multi_user", {}).get("version"),
                                    check.metrics.get("multi_user", {}).get("window_policy"))
@@ -511,8 +517,8 @@ def _settings_reasons(report: RunReport, baseline: RunReport, *, details: dict[s
         if (policies[0] != policies[1] or not policies[0]
                 or any(None in policy for policies_by_target in policies for policy in policies_by_target.values())):
             reasons.append("Multi-user summary or window policy differs or is missing; rerun a matching baseline.")
-    inactive_pack_globals = ({"context_limit", "samples", "sustained_seconds"}
-                             if all(pack_modes) and selected <= {"load", "capacity", "correctness"} else set())
+    pack_only = all(pack_modes) and selected <= {"load", "capacity", "correctness"}
+    inactive_pack_globals = {"context_limit", "samples", "sustained_seconds"} if pack_only else set()
     comparison_workloads = {**WORKLOAD_CHECKS, "concurrent_load": {"concurrency"},
                             "arrivals": {"arrivals"}, "buckets": {"buckets", "mixed"},
                             "concurrent_workloads": {"token_stress"}}
@@ -524,9 +530,14 @@ def _settings_reasons(report: RunReport, baseline: RunReport, *, details: dict[s
         if key not in old_config or key not in current_config:
             setting_reason(f"Recorded {key} is missing; comparability is unknown.",
                            "setting_missing", key)
-        elif old_config[key] != current_config[key]:
+            continue
+        current, old = current_config[key], old_config[key]
+        if key == "checks" and shared_selection_changed:
+            current, old = ([check for check in checks if check not in SHARED_BASELINE_EXCLUDED_WORKLOADS]
+                            for checks in (current, old))
+        if current != old:
             setting_reason(f"Run setting {key} differs.", "setting_differs", key,
-                           current_config[key], old_config[key])
+                           current, old)
     if any(config.get("test_options", {}).get("cancellation", {}).get("backend_verification") == "required"
            for config in (current_config, old_config)):
         cancellation_grading = [{check.target: "cancellation_results" in check.metrics
@@ -566,19 +577,34 @@ def _settings_reasons(report: RunReport, baseline: RunReport, *, details: dict[s
     if not isinstance(current_pack, dict) or not isinstance(old_pack, dict) or not current_pack or not old_pack:
         reasons.append("Fixture pack identity is missing or unknown.")
     else:
-        inactive = {"custom", "shared_workload_fixture_sha256"}
+        shared_key = "shared_workload_fixture_sha256"
+        inactive = {"custom", shared_key}
+        if shared_selection_changed and pack_only:
+            inactive.add("builtin_sha256")  # Both runs used only the recorded request pack for shared work.
         fingerprint_key = "workload_fixture_sha256"
+        sources = (report.manifest, baseline.manifest)
+        if shared_selection_changed:
+            # A full digest attests shared work only when no excluded check
+            # was selected in that run.
+            current_pack, old_pack = (
+                pack if excluded else {**pack, shared_key: pack.get(fingerprint_key)}
+                for pack, excluded in zip((current_pack, old_pack), excluded_checks))
+            sources = tuple({**source, "fixture_pack": pack}
+                            for source, pack in zip(sources, (current_pack, old_pack)))
+        shared_digests = [pack.get(shared_key) for pack in (current_pack, old_pack)]
+        use_shared = all(isinstance(digest, str) and digest and (
+            not shared_selection_changed or re.fullmatch(r"[0-9a-f]{64}", digest)) for digest in shared_digests)
+        has_identity = use_shared or not shared_selection_changed
         # Older reports attest the full identity only. Keep their existing
         # compatibility when those recorded identities still match.
-        if all(isinstance(pack.get("shared_workload_fixture_sha256"), str)
-               and pack["shared_workload_fixture_sha256"] for pack in (current_pack, old_pack)):
-            fingerprint_key = "shared_workload_fixture_sha256"
+        if use_shared:
+            fingerprint_key = shared_key
             current_pack, old_pack = ({**pack, "workload_fixture_sha256": pack[fingerprint_key]}
                                       for pack in (current_pack, old_pack))
-        if (_same_run_limits_workload(report.manifest, baseline.manifest, fingerprint_key=fingerprint_key)
-                or _same_load_workload(report.manifest, baseline.manifest, fingerprint_key=fingerprint_key)):
+        if has_identity and (_same_run_limits_workload(*sources, fingerprint_key=fingerprint_key)
+                             or _same_load_workload(*sources, fingerprint_key=fingerprint_key)):
             inactive.add("workload_fixture_sha256")
-        if ({key: value for key, value in current_pack.items() if key not in inactive}
+        if (not has_identity or {key: value for key, value in current_pack.items() if key not in inactive}
                 != {key: value for key, value in old_pack.items() if key not in inactive}):
             reasons.append("Fixture pack identity differs.")
     for label, config, pack in (("Current", current_config, current_pack),
