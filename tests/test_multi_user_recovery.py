@@ -1,8 +1,6 @@
 """Recovery retains matched work and the slowest user's observation."""
 from copy import deepcopy
 import asyncio
-import hashlib
-import json
 
 import pytest
 
@@ -13,30 +11,40 @@ from tests.test_multi_user_metrics import record
 from tests.test_multi_user_scenarios import PROFILE
 
 
-def recovery_observation():
+def recovery_observation(*, duration=1, sustained_duration=None, lighter_rate=1, sustained_rate=4):
     cfg = settings(levels=[3], scenarios=["recovery"], profile=PROFILE, recovery={
-        "control_seconds": 1, "sustained_seconds": 1, "lighter_seconds": 1,
-        "sustained_requests_per_second": 4, "lighter_requests_per_second": 1, "max_slowdown": 2})
+        "control_seconds": duration, "sustained_seconds": sustained_duration or duration, "lighter_seconds": duration,
+        "sustained_requests_per_second": sustained_rate, "lighter_requests_per_second": lighter_rate,
+        "max_slowdown": 2})
     source = _planned_observation(cfg.multi_user)
     records = []
     for index, window in enumerate(source["windows"]):
-        window.update(start_ms=index*1000, end_ms=(index+1)*1000, planned_end_ms=(index+1)*1000,
-                      duration_seconds=1, cut_short=False, reason=None)
-        window["offer_accounting"] = {"planned": 3, "offered": 3, "dispatched": 3,
-            "dropped_local": 0, "dropped_late": 0, "unissued": 0, "not_offered": 0}
+        start = index*1000
+        planned_duration = window["planned_duration_seconds"]
+        end = start+planned_duration*1000
+        window.update(start_ms=start, end_ms=end, planned_end_ms=end,
+                      duration_seconds=planned_duration, cut_short=False, reason=None)
+        counts = {"dropped_local": 0, "dropped_late": 0, "unissued": 0, "not_offered": 0}
+        window["offer_accounting"] = dict.fromkeys(("planned", "offered", "dispatched"), len(window["offers"])) | counts
         for user in window["users"]:
             uid = user["user_id"]
+            offsets = [o["offset_seconds"] for o in window["offers"] if o["user_id"] == uid]
             delay = 300 if window["role"] == "lighter" and uid == "user-03" else 100
-            r = record(uid, identity=f"{index}-{uid}", dispatch=index*1000, end=index*1000+delay,
-                tokens=16, input_tokens=64, requested_input_tokens=64, requested_output_tokens=16,
-                first_output_ms=20, last_output_ms=delay-10, stream_end_ms=delay, stream=True,
-                answer_reads=3, answer_chunks=3, max_stream_gap_ms=20)
-            r.workload.update(window_id=window["id"], scenario="recovery", role=window["role"],
-                matched_work_sequence=1, matched_work_sha256="same", request_sequence=index+1)
-            user.update(activated_ms=index*1000, ready_count=1, dispatched_count=1, request_ids=[r.id])
-            user["offer_accounting"] = {"planned": 1, "offered": 1, "dispatched": 1,
-                "dropped_local": 0, "dropped_late": 0, "unissued": 0, "not_offered": 0}
-            records.append(r)
+            ids = []
+            for sequence, offset in enumerate(offsets, 1):
+                dispatch = start+offset*1000
+                match = (sequence-1) % window["control_work_count"] + 1
+                r = record(uid, identity=f"{index}-{uid}" + (f"-{sequence}" if sequence > 1 else ""),
+                    dispatch=dispatch, end=dispatch+delay, tokens=16, input_tokens=64,
+                    requested_input_tokens=64, requested_output_tokens=16, first_output_ms=20,
+                    last_output_ms=delay-10, stream_end_ms=delay, stream=True,
+                    answer_reads=3, answer_chunks=3, max_stream_gap_ms=20)
+                r.workload.update(window_id=window["id"], scenario="recovery", role=window["role"],
+                    matched_work_sequence=match, matched_work_sha256=f"work-{match}", request_sequence=sequence)
+                ids.append(r.id)
+                records.append(r)
+            user.update(activated_ms=start, ready_count=len(ids), dispatched_count=len(ids), request_ids=ids)
+            user["offer_accounting"] = dict.fromkeys(("planned", "offered", "dispatched"), len(ids)) | counts
     return source, records
 
 
@@ -53,33 +61,38 @@ def test_recovery_exposes_one_slow_user_when_median_recovers():
 
 @pytest.mark.parametrize("swap_lengths", [False, True])
 def test_recovery_checks_actual_lengths_of_each_replay(swap_lengths):
-    source, records = recovery_observation()
+    source, records = recovery_observation(lighter_rate=2)
     source["settings"]["pass_criteria"]["min_samples"] = 2
-    for window in source["windows"]:
-        window["offer_accounting"].update(planned=6, offered=6, dispatched=6)
-        for user in window["users"]:
-            first = next(r for r in records if r.id == user["request_ids"][0])
-            first.output_tokens = 4
-            second = first.model_copy(deep=True)
-            second.id += "-second"
-            second.dispatch_ms += 400
-            second.timing_start_ms += 400
-            second.completed_ms += 400
-            second.workload.update(matched_work_sequence=2, matched_work_sha256="second",
-                                   ready_ms=second.dispatch_ms)
-            second.output_tokens = 16
-            if swap_lengths and window["role"] == "lighter":
-                first.output_tokens, second.output_tokens = second.output_tokens, first.output_tokens
-            user["request_ids"].append(second.id)
-            user.update(ready_count=2, dispatched_count=2)
-            user["offer_accounting"].update(planned=2, offered=2, dispatched=2)
-            records.append(second)
+    for r in records:
+        token_counts = (16, 4) if swap_lengths and r.workload["role"] == "lighter" else (4, 16)
+        r.output_tokens = token_counts[r.workload["matched_work_sequence"]-1]
 
     user = summarize(source, records)["windows"][-1]["recovery"]["users"][0]
     assert user["phases"]["control"]["output_tokens"] == user["phases"]["lighter"]["output_tokens"] == 10
     assert user["status"] == ("inconclusive" if swap_lengths else "pass")
     if swap_lengths:
         assert any("matched" in reason.lower() and "token" in reason.lower() for reason in user["reasons"])
+
+
+@pytest.mark.parametrize("sustained_duration", [.5, .25])
+def test_recovery_requires_a_higher_delivered_schedule(sustained_duration):
+    source, records = recovery_observation(duration=.5, sustained_duration=sustained_duration,
+                                           lighter_rate=.5, sustained_rate=1.5)
+    assert all(window["offer_accounting"]["dispatched"] == 3 for window in source["windows"])
+    evidence = summarize(source, records)["windows"][-1]["recovery"]
+    assert evidence["status"] == "inconclusive"
+    assert any("did not exercise more load" in reason for reason in evidence["reasons"])
+
+
+@pytest.mark.parametrize("phase", ["sustained", "lighter"])
+def test_recovery_checks_reported_uncached_input_in_each_replay(phase):
+    source, records = recovery_observation()
+    for request in records:
+        request.cached_prompt_tokens = 64 if request.workload["role"] == phase else 0
+    evidence = summarize(source, records)["windows"][-1]["recovery"]
+    for user in evidence["users"]:
+        assert user["status"] == "inconclusive"
+        assert f"Actual uncached input drifted between matched control and {phase} requests." in user["reasons"]
 
 
 @pytest.mark.parametrize("phase", [0, 1, 2])
@@ -94,15 +107,19 @@ def test_recovery_missing_phase_end_is_inconclusive(phase):
 @pytest.mark.parametrize("fault", [None, "single_read", "missing_gap"])
 def test_recovery_requires_qualified_peer_streams(fault):
     source, records = recovery_observation()
-    for request, shift in zip(records[3:6], [0, 120, 60], strict=True):
+    for request in records:
+        if request.workload["role"] != "sustained":
+            continue
+        uid = request.workload["user_id"]
+        shift = {"user-01": 0, "user-02": 120, "user-03": 60}[uid]
         request.dispatch_ms += shift
         request.timing_start_ms += shift
         request.completed_ms += shift
-    peer = records[5]
-    if fault == "single_read":
-        peer.answer_reads = peer.answer_chunks = 1
-    elif fault == "missing_gap":
-        peer.max_stream_gap_ms = None
+        if uid == "user-03":
+            if fault == "single_read":
+                request.answer_reads = request.answer_chunks = 1
+            elif fault == "missing_gap":
+                request.max_stream_gap_ms = None
     evidence = summarize(source, records)["windows"][-1]["recovery"]
     for user in evidence["users"][:2]:
         assert user["status"] == ("inconclusive" if fault else "pass")
@@ -174,13 +191,16 @@ def test_http_same_users_continue_work_and_one_recovers_slowly():
             "max_slowdown": 2}).model_copy(update={"concurrency": 3,
                 "targets": [Target(name="service", model="fake-model", url=endpoint.url)]})
         state = runner._Run(cfg, None, None)
-        nonce = hashlib.sha256(b"42:3:user-03:1").hexdigest()[:32]
+        slow_prompts = set()
 
-        def delay(payload):
-            windows = state.observations["service"]["multi_user"]["windows"]
-            return .3 if windows[-1]["start_ms"] is not None and nonce in json.dumps(payload) else 0
-        endpoint.response_delay = delay
-        async with LLMClient(cfg.targets[0], cfg, max_connections=3) as client:
+        class RecoveryClient(LLMClient):
+            async def execute(self, spec, **kwargs):
+                if spec.workload.get("role") == "lighter" and spec.workload.get("user_id") == "user-03":
+                    slow_prompts.add(spec.messages[0]["content"])
+                return await super().execute(spec, **kwargs)
+
+        endpoint.response_delay = lambda payload: .3 if payload["messages"][0]["content"] in slow_prompts else 0
+        async with RecoveryClient(cfg.targets[0], cfg, max_connections=3) as client:
             await execute(state, cfg.targets[0], client)
         summary = result(state, cfg.targets[0]).metrics["multi_user"]
         windows = summary["windows"]
@@ -201,6 +221,7 @@ def test_http_same_users_continue_work_and_one_recovers_slowly():
         assert evidence["users"][0]["slowdown"] < 2, evidence
         assert evidence["users"][-1]["status"] == "fail", evidence["users"][-1]["reasons"]
         assert len(endpoint.requests) == len(state.records) == 12
+        assert len({payload["messages"][0]["content"] for payload in endpoint.requests}) == 12
 
     with FakeEndpoint(first_token_delay=.01, chunk_delay=.005) as endpoint:
         asyncio.run(run(endpoint))

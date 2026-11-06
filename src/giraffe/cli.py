@@ -1246,7 +1246,8 @@ def _print_result(report: RunReport, json_path: Path, html_path: Path | None,
             fairness = window.get("fairness")
             if fairness:
                 ratio = fairness.get("ratio")
-                print(f"    Observed delivery fairness: {fairness['status']} · "
+                status = "not applicable" if fairness["status"] == "not_applicable" else fairness["status"]
+                print(f"    Observed delivery fairness: {status} · "
                       f"median / worst ratio {ratio if ratio is not None else 'undefined'} · "
                       f"limit {fairness.get('threshold')} · "
                       f"eligible users {', '.join(fairness.get('eligible_user_ids', [])) or 'none'} / "

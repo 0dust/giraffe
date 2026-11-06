@@ -4,10 +4,11 @@ from __future__ import annotations
 import asyncio
 import time
 
+from .identities import identity_headers, litellm_key_fingerprint
 from .models import CheckResult, RequestSpec
 
 
-VERSION = 2
+VERSION = 3
 PROMPT = "Reply with exactly the word OK."
 
 
@@ -28,24 +29,26 @@ async def execute(run, target, client):
     run.plan_condition(target.name, "gateway_policy", {},
                        planned=sum(user.requests for user in settings.users))
 
-    from .identities import identity_headers
-
-    auth_header = settings.auth_header.lower()
+    # The default selects LiteLLM's native precedence, including its
+    # X-LiteLLM-API-Key override. Custom deployments declare their key header.
+    auth_header = settings.auth_header if settings.auth_header.lower() != "authorization" else None
     try:
-        credentials = [next((value for name, value in identity_headers(target, user.identity).items()
-                             if name.lower() == auth_header), "") for user in settings.users]
-        credentials = [value[7:].strip()
-                       if value.lower().startswith("bearer ") else value.strip() for value in credentials]
+        fingerprints = [litellm_key_fingerprint(identity_headers(target, user.identity), auth_header=auth_header)
+                        for user in settings.users]
     except ValueError:
-        credentials = []
-    if not credentials or not all(credentials):
+        fingerprints = []
+    reason = None
+    if not fingerprints or not all(fingerprints):
         reason = "Required policy identity credentials are unavailable."
-        observation.update(credentials_unavailable=True, stop_reason=reason, end_ms=observation["start_ms"])
+    elif len(set(fingerprints)) != len(fingerprints):
+        reason = "Distinct authenticated test credentials could not be established locally."
+    if reason:
+        observation.update(credential_issue=True, stop_reason=reason, end_ms=observation["start_ms"])
         run.mark_unfinished(target.name, ["gateway_policy"])
         run.finish_condition(target.name, "gateway_policy", reason=reason)
         return
-    observation["identities_distinct"] = len(set(credentials)) == len(credentials)
-    del credentials
+    observation["identities_distinct"] = True
+    del fingerprints
 
     async def user_loop(user):
         for sequence in range(user.requests):
@@ -127,7 +130,7 @@ def summarize(settings, observation, records):
         return outcome("unavailable", "Gateway policy is not configured; declare identities, policy and offered work.")
     if not settings.supported:
         return outcome("unavailable", "Selected gateway capability is unsupported.")
-    if observation.get("credentials_unavailable"):
+    if observation.get("credential_issue"):
         return outcome("unverified", observation["stop_reason"])
     if not records:
         return outcome("unexercised", "No policy traffic was dispatched.")

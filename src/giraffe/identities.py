@@ -8,6 +8,10 @@ import os
 
 
 identity_request = ContextVar("giraffe_identity_request", default=False)
+LITELLM_NATIVE_KEY_HEADERS = (
+    "x-litellm-api-key", "authorization", "api-key", "x-api-key",
+    "x-goog-api-key", "ocp-apim-subscription-key",
+)
 
 
 class _IdentityLogFilter(logging.Filter):
@@ -61,16 +65,21 @@ def credential_headers(identity):
     return headers
 
 
-def litellm_key_fingerprint(headers):
-    """Resolve the supported virtual-key headers using LiteLLM's precedence."""
+def litellm_key_fingerprint(headers, *, auth_header: str | None = None):
+    """Fingerprint the virtual key selected by LiteLLM's header precedence."""
     headers = {name.lower(): value for name, value in headers.items()}
-    custom_key = headers.get("x-litellm-api-key")
-    value = custom_key if custom_key is not None else headers.get("authorization", "")
-    scheme, separator, token = value.partition(" ")
-    if separator and scheme.lower() == "bearer":
-        value = token
-    elif custom_key is None:
+    custom = auth_header.lower() if auth_header else None
+    header = custom if custom in headers else next(
+        (name for name in LITELLM_NATIVE_KEY_HEADERS if headers.get(name)), None)
+    if header is None:
         return None
+    value = headers[header]
+    if header in {custom, "authorization", "x-litellm-api-key"}:
+        scheme, separator, token = value.partition(" ")
+        if separator and scheme in {"Bearer", "bearer", "Basic"}:
+            value = token
+        elif header == custom or header == "authorization":
+            return None
     if not value or any(char.isspace() for char in value):
         return None
     return hashlib.sha256(value.encode()).hexdigest()

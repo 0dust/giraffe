@@ -74,6 +74,37 @@ async def test_unavailable_policy_with_no_identities_keeps_shared_key_access(mon
     assert all("gateway_policy" not in record.check_ids for record in report.requests)
 
 
+@pytest.mark.usefixtures("local_tokenizer")
+async def test_unavailable_policy_references_do_not_block_serving_baseline(monkeypatch):
+    from giraffe.reporting import compare_baseline
+    from tests.test_gateway_policy import configuration as configured_policy
+
+    def handle(request):
+        if request.method != "POST":
+            return httpx.Response(404)
+        assert request.headers["authorization"] == "Bearer shared-secret"
+        return httpx.Response(200, json={"choices": [{"message": {"content": "OK"},
+            "finish_reason": "stop"}], "usage": {"prompt_tokens": 8, "completion_tokens": 2}})
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: original(transport=httpx.MockTransport(handle), **kwargs))
+    monkeypatch.setenv("SHARED", "shared-secret")
+
+    async def run(ref):
+        raw = configured_policy(gateway="unsupported").model_dump(mode="json")
+        raw.update(checks=["serving", "gateway_policy"], stream=False, samples=8)
+        raw["targets"][0].update(api_key_env="SHARED", test_identities={"limited": {"api_key_env": ref}})
+        report = await run_suite(RunConfig.model_validate(raw))
+        assert report.overall == "pass"
+        return report
+
+    baseline = await run("PREVIOUS_UNUSED")
+    current = await run("CURRENT_UNUSED")
+    compared = compare_baseline(current, baseline).baseline["targets"][0]
+    assert compared["status"] == "pass", compared["summary"]
+    assert any(row["check"] == "serving" and row["status"] == "pass" for row in compared["comparisons"])
+
+
 @pytest.mark.parametrize("credential", [None, " "])
 async def test_unavailable_policy_credentials_do_not_consume_requests(monkeypatch, credential):
     from tests.test_gateway_policy import configuration as configured_policy

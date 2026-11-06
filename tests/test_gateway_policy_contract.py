@@ -103,8 +103,44 @@ async def test_declared_custom_auth_header_qualifies_only_distinct_keys(monkeypa
         await execute(run, cfg.targets[0], client)
     check = result(run, cfg.targets[0])
     assert check.metrics["gateway_policy"]["qualification"] == ("unverified" if duplicate else "observed")
-    assert sum(counts.values()) == 13
+    assert sum(counts.values()) == (0 if duplicate else 13)
     assert "limited-secret" not in check.model_dump_json()
+
+
+@pytest.mark.parametrize("peer_header", ["X-LiteLLM-API-Key", "api-key"])
+async def test_default_policy_rejects_duplicate_effective_keys_before_dispatch(monkeypatch, peer_header):
+    import httpx
+    from giraffe import runner
+    from giraffe.client import LLMClient
+    from giraffe.gateway_policy import execute, result
+    from giraffe.models import RunConfig
+    from tests.test_gateway_policy import configuration
+
+    raw = configuration().model_dump(mode="json")
+    identities = raw["targets"][0]["test_identities"]
+    identities["limited"]["headers_env"]["x-litellm-api-key"] = "SAME_KEY"
+    if peer_header == "api-key":
+        identities["peer"].pop("api_key_env")
+    identities["peer"]["headers_env"][peer_header] = "SAME_KEY"
+    config = RunConfig.model_validate(raw)
+    monkeypatch.setenv("LIMITED", "front-limited")
+    monkeypatch.setenv("PEER", "front-peer")
+    monkeypatch.setenv("SAME_KEY", "same-gateway-key")
+
+    def handle(request):
+        pytest.fail(f"Duplicate effective keys must not dispatch {request.method} requests")
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handle), **kw))
+    state = runner._Run(config, None, None)
+    target = config.targets[0]
+    async with LLMClient(target, config, max_connections=2) as client:
+        await execute(state, target, client)
+    check = result(state, target)
+    assert check.status == "inconclusive"
+    assert check.metrics["gateway_policy"]["qualification"] == "unverified"
+    assert "Distinct authenticated test credentials" in check.summary
+    assert not state.records
 
 
 @pytest.mark.usefixtures("local_tokenizer")

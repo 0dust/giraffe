@@ -247,12 +247,16 @@ async def test_attribution_baseline_compares_qualified_aliases(monkeypatch, mode
 
 
 @pytest.mark.usefixtures("local_tokenizer")
-async def test_legacy_attribution_baseline_requires_a_fresh_collection(monkeypatch):
+@pytest.mark.parametrize("version", [None, 2])
+async def test_legacy_attribution_baseline_requires_a_fresh_collection(monkeypatch, version):
     from giraffe.reporting import compare_baseline
     _, report, _, _, _ = await exercise(monkeypatch, full=True)
     legacy = report.model_copy(deep=True)
     check = next(check for check in legacy.checks if check.id == "gateway_attribution")
-    check.metrics.pop("collection_version", None)
+    if version is None:
+        check.metrics.pop("collection_version", None)
+    else:
+        check.metrics["collection_version"] = version
     comparison = compare_baseline(report, legacy).baseline
     assert comparison["status"] == "inconclusive"
     rows = comparison["targets"][0]["comparisons"]
