@@ -116,11 +116,11 @@ def test_legacy_reports_do_not_gain_persistent_users(tmp_path):
 
 def test_recovery_report_export_cli_and_baseline_keep_all_phase_users(tmp_path, capsys):
     from tests.test_multi_user_recovery import recovery_observation
-    from giraffe.reporting import _user_measurements
     source, records = recovery_observation()
     report = make_report()
     for r in records:
         r.target = "local"
+        r.workload.update(population=3, cohort="shared")
     report.requests = records
     report.manifest['config'].update(checks=['multi_user'], multi_user=source['settings'])
     summary = summarize(source, records)
@@ -133,7 +133,11 @@ def test_recovery_report_export_cli_and_baseline_keep_all_phase_users(tmp_path, 
     exported = reproduction_export(report)['multi_user']['local']
     assert [w['role'] for w in exported['windows']] == ['control', 'sustained', 'lighter']
     assert exported['windows'][2]['recovery']['users'][2]['slowdown'] == 3
-    assert len(_user_measurements(report, 'local')) == 9
+    comparisons = compare_baseline(report, report).baseline["targets"][0]["comparisons"]
+    delivery = {row["scenario"] for row in comparisons if row["metric"] == "shared_window_output_tokens_per_second"}
+    timing = {row["scenario"] for row in comparisons if row["metric"] == "latency_ms"}
+    assert len(delivery) == 9 and delivery == timing
+    assert all(scenario.endswith(" / shared") for scenario in delivery)
     _print_result(report, tmp_path/'report.json', path, tmp_path, {})
     output = capsys.readouterr().out
     assert 'Matched per-user recovery: fail' in output and 'user-03: fail' in output

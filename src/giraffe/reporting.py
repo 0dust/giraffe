@@ -265,8 +265,16 @@ def _same_run_limits_workload(current: dict, old: dict) -> bool:
 
 
 def _same_load_workload(current: dict, old: dict) -> bool:
-    """Attest the optional nonce argument only for unchanged ordinary Load runs."""
-    settings = []
+    """Attest unchanged ordinary Load dispatch within exact source groups."""
+    # The explicit multi-user stage leaves ordinary Load dispatch unchanged.
+    # Keep it separate from sources before the final admission guard.
+    revisions = (
+        ("9b694c97a39d449d8ea15b09a9aeb406bf835179c0882827685c4d7888687d36",
+         "df3b7bbf30cab87d2e8c1c6dab8819f9cfe592b181407caa7c32af4c5f720cd4"),
+        ("113325dd5cffa04626cc7be7ee93bc6e9be67335531288bc329b3542a155c92a",
+         "788f4c8f0b14421d5fc00f8b32c0ffcef79c04c647730767cb44b16584ed4aa4"),
+    )
+    identities = []
     for manifest in (current, old):
         raw = manifest.get("config", {})
         if raw.get("config_version") != 2 or "load_test" not in raw:
@@ -281,13 +289,14 @@ def _same_load_workload(current: dict, old: dict) -> bool:
         load_settings = resolved.load_test.model_dump(mode="json")
         identity = {"generator_source_sha256": "d9a9e921584262148e06b636f0e8f195b7e530fd2a69c5e98f013359cf947ede",
                     "settings": {"load_test": load_settings}}
-        if not any(fixture_hash({**identity, "load_test_source_sha256": source}) ==
-                   manifest.get("fixture_pack", {}).get("workload_fixture_sha256") for source in (
-                       "9b694c97a39d449d8ea15b09a9aeb406bf835179c0882827685c4d7888687d36",
-                       "df3b7bbf30cab87d2e8c1c6dab8819f9cfe592b181407caa7c32af4c5f720cd4")):
+        fingerprint = manifest.get("fixture_pack", {}).get("workload_fixture_sha256")
+        group = next((index for index, sources in enumerate(revisions) if any(
+            fixture_hash({**identity, "load_test_source_sha256": source}) == fingerprint
+            for source in sources)), None)
+        if group is None:
             return False
-        settings.append(load_settings)
-    return settings[0] == settings[1]
+        identities.append((group, load_settings))
+    return identities[0] == identities[1]
 
 
 def _limits_reached(report: RunReport) -> set[str]:
@@ -1218,7 +1227,10 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold):
         missing = (not c or not b or c.get("coverage", {}).get("status") != "complete"
                    or b.get("coverage", {}).get("status") != "complete"
                    or c_rate is None or b_rate is None or work_reason or mix_changed or live_work_reason or scenario_reason)
-        row = {"check": "multi_user", "scenario": " / ".join(map(str, key if role else key[:4])),
+        label = key[:7] if role else key[:4]
+        if cohort:
+            label += (cohort,)
+        row = {"check": "multi_user", "scenario": " / ".join(map(str, label)),
                "user_id": user_id, "population": population, "profile": profile,
                "role": role, "trigger": trigger, "heavy_profile": heavy_profile, "cohort": cohort,
                "window_id": c_window.get("id", b_window.get("id")),
