@@ -126,6 +126,108 @@ def test_finite_access_matrix_has_exact_request_plan():
     assert not any("adaptive traffic" in warning for warning in plan["warnings"])
 
 
+async def test_access_plan_and_request_budget_follow_execution_order(monkeypatch):
+    from giraffe.planning import request_plan
+
+    monkeypatch.setenv("ALLOW_KEY", "allow-secret")
+    monkeypatch.setenv("DENY_KEY", "deny-secret")
+    raw = config(max_requests=6, retention="all").model_dump()
+    raw.update(checks=["prefix", "gateway_access"], prefix={"prefix_chars": 96, "repeats": 2, "history_turns": 2})
+    cfg = RunConfig.model_validate(raw)
+    plan = request_plan(cfg)
+    assert [(row["id"], row["requests_per_target"]) for row in plan["rows"]] == [("gateway_access", 2), ("prefix", 6)]
+    warning, = plan["request_warnings"]
+    assert warning["cut_checks"] == ["prefix"]
+    timeline = plan["time_timeline"]
+    assert timeline[0]["id"] == "gateway_access" and timeline[0]["field"] == "gateway_access.request_timeout_seconds"
+    warning, = request_plan(cfg.model_copy(update={"max_requests": 1}))["request_warnings"]
+    assert any(action["field"] == "gateway_access.cases" for action in warning["actions"])
+
+    def handler(request):
+        if request.method != "POST":
+            return httpx.Response(404)
+        if request.headers.get("authorization") == "Bearer deny-secret":
+            return httpx.Response(401, json={"error": {"type": "token_not_found_in_db"}})
+        return httpx.Response(200, json={"choices": [{"message": {
+            "role": "assistant", "content": "K7P4"}, "finish_reason": "stop"}]})
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
+    report = await run_suite(cfg)
+    assert [record.scenario for record in report.requests] == ["gateway_access"] * 2 + ["prefix_shared"] * 2 + ["prefix_independent"] * 2
+    assert next(check for check in report.checks if check.id == "gateway_access").status == "pass"
+
+
+def test_access_plan_counts_only_configured_aliases_by_target(monkeypatch):
+    from giraffe.planning import request_plan
+
+    cfg = config()
+    proxy, = cfg.targets
+    cfg.targets += [proxy.model_copy(update={"name": "missing", "test_identities": {}}),
+                    proxy.model_copy(update={"name": "partial", "test_identities": {"allowed": proxy.test_identities["allowed"]}})]
+    monkeypatch.delenv("ALLOW_KEY", raising=False)
+    monkeypatch.delenv("DENY_KEY", raising=False)
+    plan = request_plan(cfg)
+    counts = {"proxy": 2, "missing": 0, "partial": 1}
+    assert plan["planned_total"] == 3 and plan["planned_target_counts"] == counts
+    row, = plan["rows"]
+    assert row["kind"] == "exact" and row["target_request_counts"] == counts
+    assert {item["target"]: item["requests"] for item in plan["unknown_time_components"]} == {"proxy": 2, "partial": 1}
+
+
+@pytest.mark.parametrize("availability", ["missing_aliases", "missing_env", "conflicting_keys", "partial_env"])
+async def test_unavailable_access_probes_leave_shared_token_evidence_budget(monkeypatch, local_tokenizer, availability):
+    cfg = config(max_requests=5 if availability == "partial_env" else 4, retention="all")
+    cfg.checks = ["access", "generation", "gateway_access"]
+    cfg.stream = True
+    cfg.samples = cfg.limits.min_samples = 2
+    cfg.limits.min_output_tokens_per_second = 1
+    monkeypatch.delenv("ALLOW_KEY", raising=False)
+    monkeypatch.delenv("DENY_KEY", raising=False)
+    if availability == "missing_aliases":
+        cfg.targets[0].test_identities = {}
+    elif availability == "conflicting_keys":
+        monkeypatch.setenv("ALLOW_KEY", "same-secret")
+        monkeypatch.setenv("DENY_KEY", "same-secret")
+    elif availability == "partial_env":
+        monkeypatch.setenv("ALLOW_KEY", "allow-secret")
+
+    class Answer(httpx.AsyncByteStream):
+        def __init__(self, body):
+            self.body = body
+
+        async def __aiter__(self):
+            for part in ("Hello ", "there."):
+                await asyncio.sleep(.015)
+                choice = {"delta": {"content": part}}
+                if self.body.get("logprobs"):
+                    choice["logprobs"] = {"content": [{"token": part}]}
+                yield ("data: " + json.dumps({"choices": [choice]}) + "\n\n").encode()
+            yield b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+            if self.body.get("stream_options", {}).get("include_usage"):
+                yield b'data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":2}}\n\n'
+            yield b'data: [DONE]\n\n'
+
+    def handler(request):
+        if request.method != "POST":
+            return httpx.Response(404)
+        if request.headers.get("authorization") == "Bearer allow-secret":
+            return httpx.Response(200, json={"choices": [{"message": {
+                "role": "assistant", "content": "OK"}, "finish_reason": "stop"}]})
+        return httpx.Response(200, stream=Answer(json.loads(request.content)))
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
+    report = await run_suite(cfg)
+    checks = {check.id: check for check in report.checks}
+    assert checks["generation"].status == "pass"
+    assert [record.scenario for record in report.requests] == ["initial", "performance_evidence_probe", "generation", "generation"] + (
+        ["gateway_access"] if availability == "partial_env" else [])
+    rows = checks["gateway_access"].metrics["gateway_access"]["cases"]
+    assert [row["observed"] for row in rows] == ["allow" if availability == "partial_env" else "unverified", "unverified"]
+    assert rows[1]["reason"] == ("identity_conflict" if availability == "conflicting_keys" else "identity_unavailable")
+
+
 @pytest.mark.parametrize("credential", ["alias", "bearer", "litellm_header", "api_key", "custom_header", "anonymous"])
 async def test_opposite_cases_with_identical_credentials_stay_unverified(monkeypatch, credential):
     secret = "same-virtual-key"
@@ -200,6 +302,42 @@ async def test_malformed_evidence_cannot_verify_access(monkeypatch, role, finish
     assert report.overall == check.status == "inconclusive"
     assert [row["observed"] for row in check.metrics["gateway_access"]["cases"]] == (
         ["allow", "unverified"] if error_code in (503, "503") else ["unverified", "deny"])
+
+
+@pytest.mark.parametrize("ambiguous,status,body", [
+    ("allowed", 200, b'{"choices":[{"message":{"role":"user","role":"assistant","content":"OK"},"finish_reason":"stop"}]}'),
+    ("denied", 401, b'{"error":{"type":"upstream_error","type":"token_not_found_in_db"}}'),
+    ("denied", 403, b'{"error":{"type":"upstream_error"},"error":{"type":"key_model_access_denied"}}'),
+])
+async def test_duplicate_response_keys_do_not_qualify_gateway_access(monkeypatch, ambiguous, status, body):
+    monkeypatch.setenv("ALLOW_KEY", "allowed")
+    monkeypatch.setenv("DENY_KEY", "denied")
+
+    def handler(request):
+        if request.method != "POST":
+            return httpx.Response(404)
+        auth = request.headers.get("authorization")
+        if auth == "Bearer " + ambiguous:
+            return httpx.Response(status, content=body)
+        if auth == "Bearer denied":
+            return httpx.Response(401, json={"error": {"type": "token_not_found_in_db"}})
+        # Ordinary completion handling remains permissive about repeated keys.
+        if not auth:
+            return httpx.Response(200, content=b'{"choices":[{"message":{"role":"assistant","content":null,'
+                                              b'"content":"OK"},"finish_reason":"stop"}]}')
+        return httpx.Response(200, json={"choices": [{"message": {
+            "role": "assistant", "content": "OK"}, "finish_reason": "stop"}]})
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
+    cfg = config()
+    cfg.checks = ["access", "gateway_access"]
+    report = await run_suite(cfg)
+    checks = {check.id: check for check in report.checks}
+    assert checks["access"].status == "pass"
+    assert checks["gateway_access"].status == "inconclusive"
+    rows = checks["gateway_access"].metrics["gateway_access"]["cases"]
+    assert [row["observed"] for row in rows] == (["unverified", "deny"] if ambiguous == "allowed" else ["allow", "unverified"])
 
 
 @pytest.mark.parametrize("message,finish,error,observed", [
@@ -446,7 +584,7 @@ async def test_access_denial_rules_do_not_change_policy_evidence(monkeypatch, lo
     assert check.status == "pass"
     baseline = report.model_copy(deep=True)
     # A passing quota run saved on the immediate policy predecessor, before gateway access.
-    baseline.manifest["gateway_policy_source_sha256"] = "f406afadc0dadc85815aeb242fbf23c8cfcd06f040e106fd1973ec21026fd04a"
+    baseline.manifest["gateway_policy_source_sha256"] = "6066ed7ee2986f972bfeeabc96d10219bcbc3d2d042cf8b9e1fd530a459ffeb4"
     assert compare_baseline(report, baseline).baseline["status"] == "pass"
 
 

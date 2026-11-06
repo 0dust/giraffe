@@ -14,6 +14,7 @@ from typing import Any
 
 from giraffe.caps import MAX_TOKEN_EVIDENCE_PROBE_ATTEMPTS
 from giraffe.fixtures import builtin_fixtures
+from giraffe.gateway_access import configured_probe_count as configured_access_probe_count
 from giraffe.gateway_attribution import (POLL_FRACTIONS, configured_probe_count,
                                          deferred_for_shared_targets, reader_preflight_bound)
 from giraffe.concurrent_load import prompt_overhead
@@ -177,6 +178,7 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
         return {"capacity": "traffic.duration_seconds", "arrivals": "arrivals.requests",
                 "sessions": "sessions", "consistency": "consistency", "tools": "tool_checks",
                 "prefix": "prefix", "sessions_wait": "sessions.delay_seconds",
+                "gateway_access": "gateway_access.request_timeout_seconds",
                 "gateway_attribution": "request_timeout_seconds"}.get(check, "test_options." + check)
 
     def unknown(target, row, count, timeout, bound):
@@ -522,7 +524,6 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
             if name == "gateway_access":
                 settings = config.gateway_access
                 timeout = settings.request_timeout_seconds if settings else 0
-                count = row["requests_per_target"] or 0
                 unknown(target.name, row, count, timeout, count * timeout)
                 continue
             if name.startswith("multi_user_"):
@@ -1132,6 +1133,16 @@ def request_plan(config: RunConfig | ConfigDraft, *,
     if "arrivals" in selected:
         add("arrivals", config.arrivals.requests,
             f"{config.arrivals.requests} scheduled offers; the pending queue and Limits can leave some undispatched.")
+    if "gateway_access" in selected:
+        access_counts = {target.name: configured_access_probe_count(config, target) for target in config.targets}
+        counts = set(access_counts.values())
+        count = next(iter(counts)) if len(counts) == 1 else None
+        add("gateway_access", count,
+            "At most one serial request per declared case with a configured identity. "
+            "Both allow and deny evidence are required for a complete policy observation.",
+            source="declared LiteLLM access cases")
+        if count is None:
+            rows[-1]["target_request_counts"] = access_counts
     if "prefix" in selected:
         settings = config.prefix
         context_limit = config.effective_check("prefix")["context_limit"]
@@ -1192,13 +1203,6 @@ def request_plan(config: RunConfig | ConfigDraft, *,
                 "msg":"Expected scheduled Load test requests exceed the total request budget; some tests will be truncated.",
                 "values":{"expected_scheduled_requests":load_plan["expected_scheduled_requests"]*target_count,"max_requests":config.max_requests}})
         warnings.extend(w["msg"] for w in load_warnings)
-    if "gateway_access" in selected:
-        settings = config.gateway_access
-        count = len(settings.cases) if settings and settings.profile == "litellm" else 0
-        add("gateway_access", count,
-            "One serial request per declared access case; missing identities and unsupported profiles send no traffic. "
-            "Both allow and deny evidence are required for a complete policy observation.",
-            source="declared LiteLLM access cases", kind="exact")
     if "gateway_policy" in selected:
         settings = config.gateway_policy
         if settings is None:
@@ -1346,6 +1350,8 @@ def request_plan(config: RunConfig | ConfigDraft, *,
             return "load_test.schedule.duration_seconds"
         if identifier.startswith("pack_"):
             return "request_pack.cases"
+        if identifier == "gateway_access":
+            return "gateway_access.cases"
         if identifier in {"arrivals", "prefix", "sessions", "consistency", "gateway_attribution"}:
             return identifier
         if identifier == "tools":

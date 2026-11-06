@@ -25,6 +25,13 @@ def configured_cases(config):
     return settings.cases if settings else []
 
 
+def configured_probe_count(config, target):
+    settings = config.gateway_access
+    if "gateway_access" not in config.checks or settings is None or settings.profile != "litellm":
+        return 0
+    return sum(case.identity in target.test_identities for case in settings.cases)
+
+
 def credential_digest(headers: dict[str, str]) -> bytes:
     """Bind a probe to its qualified header values without retaining them."""
     return hashlib.sha256(json.dumps(headers, sort_keys=True).encode()).digest()
@@ -85,10 +92,9 @@ def _metered_reasoning_usage(usage, record):
 
 def denial_kind(status, body):
     """Qualify only explicit LiteLLM authentication or model-access denials."""
-    try:
-        data = json.loads(body)
-    except (ValueError, RecursionError):
-        return "unknown"
+    from giraffe.gateway_response import parse_gateway_json
+
+    data = parse_gateway_json(body)
     error = data.get("error") if isinstance(data, dict) else None
     if not isinstance(error, dict):
         return "unknown"
@@ -168,6 +174,15 @@ def _qualify_identities(target, rows, auth_header):
             for row in cases:
                 row["reason"] = "identity_conflict"
     return digests
+
+
+def eligible_probe_count(config, target):
+    if not configured_probe_count(config, target):
+        return 0
+    settings = config.gateway_access
+    rows = [_row(case) for case in settings.cases]
+    _qualify_identities(target, rows, settings.auth_header)
+    return sum(row["reason"] == "not_run" for row in rows)
 
 
 def _cutoff_reason(run, target):

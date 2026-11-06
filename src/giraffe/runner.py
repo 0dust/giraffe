@@ -308,10 +308,13 @@ class _Run:
                     "max_series": config.metrics_max_series, "collection_gaps_seconds": []})
 
     def token_evidence_reserve(self, target):
+        from .gateway_access import eligible_probe_count
         from .gateway_policy import credential_issue
         from .planning import token_evidence_request_reserve
 
         runtime_counts = {}
+        if "gateway_access" in self.config.checks:
+            runtime_counts["gateway_access"] = eligible_probe_count(self.config, target)
         policy = self.config.gateway_policy
         if "gateway_policy" in self.config.checks and policy and policy.supported and credential_issue(policy, target):
             runtime_counts["gateway_policy"] = 0
