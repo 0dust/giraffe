@@ -265,13 +265,13 @@ def evaluate_scale_down(settings: ScaleDownConfig, evidence: ScaleDownEvidence,
                              key=lambda i: i.sequence, default=None) if transition_fact else None
     baseline_topology = (baseline_inventory is not None and len(baseline_inventory.replicas) >= 2
                          and replica_id in baseline_inventory.replicas)
-    if not baseline_topology:
+    if transition_fact is not None and not baseline_topology:
         shared.append("Baseline inventory does not establish at least two replica incarnations.")
     by_id = {r.id: r for r in records if r.target == settings.target}
     baseline = [by_id[i] for i in dict.fromkeys(evidence.baseline_request_ids) if i in by_id
                 and transition and by_id[i].completed_ms is not None and by_id[i].completed_ms <= transition[0]]
     baseline_violations, baseline_missing, _ = _request_outcome(baseline, limits, evidence, settings.min_baseline_samples, strict_errors=False)
-    if baseline_violations or baseline_missing:
+    if transition is not None and (baseline_violations or baseline_missing):
         shared.append("Baseline service did not establish the configured successful samples.")
     admissions = [e for e in selected if e.kind == "request_admitted"]
     completions = {}
@@ -420,7 +420,7 @@ def evaluate_scale_down(settings: ScaleDownConfig, evidence: ScaleDownEvidence,
     results = {"continuity": continuity, "drain": backend, "capacity": capacity}
     status = "fail" if any(r.status == "fail" for r in results.values()) else "inconclusive" if any(r.status == "inconclusive" for r in results.values()) else "pass"
     return CheckResult(id="scale_down", target=settings.target, title="Scale-down continuity", status=status,
-                       summary="; ".join(f"{name}: {result.status}" for name, result in results.items()),
+                       summary=f"Continuity: {continuity.status}; drain: {backend.status}; capacity: {capacity.status}.",
                        metrics={"schema_version": 1, "results": {key: result.model_dump(mode="json") for key, result in results.items()}},
                        evidence_ids=list(dict.fromkeys([*(r.id for r in cohort + draining + post), *(e.event_id for e in selected)])))
 

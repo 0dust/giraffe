@@ -57,6 +57,23 @@ def test_complete_graceful_evidence_passes_each_result():
     assert "long" in result.metrics["results"]["continuity"]["request_ids"]
 
 
+def test_unobserved_removal_does_not_cascade_into_baseline_limitations():
+    settings, evidence, records = scenario()
+    for snapshot in evidence["snapshots"]:
+        snapshot["export"]["events"] = [event for event in snapshot["export"]["events"]
+                                         if event["kind"] not in {"drain_effective", "replica_terminated"}]
+    result = evaluate(settings, evidence, records)
+    assert statuses(result) == dict(continuity="inconclusive", drain="inconclusive", capacity="inconclusive")
+    for subresult in result.metrics["results"].values():
+        assert "No unique new drain or process-termination fact identifies the removed replica incarnation." in subresult["limitations"]
+        assert "Baseline inventory does not establish at least two replica incarnations." not in subresult["limitations"]
+        assert "Baseline service did not establish the configured successful samples." not in subresult["limitations"]
+
+
+def test_overall_summary_has_sentence_punctuation():
+    assert evaluate(*scenario()).summary == "Continuity: pass; drain: pass; capacity: pass."
+
+
 @pytest.mark.parametrize("conflict", ["client", "midstream"])
 def test_attribution_conflict_prevents_drain_pass(conflict):
     settings, evidence, records = scenario()

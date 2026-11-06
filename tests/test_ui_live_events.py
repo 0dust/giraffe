@@ -3,6 +3,79 @@
 from tests.test_ui_navigation import run_browser_script
 
 
+def test_scale_down_results_separate_limitations_and_format_evidence_times():
+    run_browser_script(r"""
+const page=browser();await page.run('init()');
+await page.run(`
+const id='0123456789abcdef0123456789abcdef';
+const check={target:'local',metrics:{results:{
+  continuity:{status:'fail',summary:'Original interrupted. Missing overlap. Missing timing.',limitations:['Missing overlap.','Missing timing.'],request_ids:[id]},
+  drain:{status:'inconclusive',summary:'Missing coverage.',limitations:['Missing coverage.']},
+  capacity:{status:'pass',summary:'Capacity met the configured criteria.'}
+}}};
+const evidence={marker:{event_id:'operator',source:'browser'},marker_received_ms:123.456,marker_accepted_ms:124.567,
+  armed_ms:100.234,post_started_ms:400.567,post_ended_ms:1400.891,
+  snapshots:[{export:{source:'router',clock_id:'clock',events:[{event_id:'drain',kind:'drain_effective',sequence:4,time_ms:200.456,replica_id:'b'}]}}]};
+const report={observations:{targets:{local:{scale_down:evidence}}},requests:[{id,target:'local',check_ids:['scale_down']}]};
+const html=renderScaleDownResults(check,report);
+assert(html.startsWith('<div class="scale-down-results">'));assert(html.endsWith('</div>'));
+const rows=html.split('<section class="check-detail-head">').slice(1).map(row=>row.split('</section>')[0]);
+for(const sentence of ['Missing overlap.','Missing timing.'])assert.equal(rows[0].split(sentence).length-1,1);
+assert(rows[0].includes('<p>Original interrupted.</p>'));assert(rows[0].includes('<p class="hint">Also unverified:</p>'));
+assert.equal(rows[1].split('Missing coverage.').length-1,1);assert(!rows[1].includes('<p>Missing coverage.</p>'));
+assert(rows[1].includes('<p class="hint">Not established:</p>'));
+assert(rows[2].includes('<p>Capacity met the configured criteria.</p>'));
+assert(html.includes('class="request-table-scroll"'));assert(html.includes('data-request="'+id+'"'));
+for(const [label,value] of [['runner receipt ',123.456],['accepted ',124.567],['armed ',100.234],['source time ',200.456]])assert(html.includes(label+ms(value)));
+assert(html.includes(ms(400.567)+'–'+ms(1400.891)));
+for(const key of ['marker_received_ms','marker_accepted_ms','armed_ms','post_started_ms','post_ended_ms'])evidence[key]=null;
+evidence.snapshots[0].export.events[0].time_ms=null;
+const unknown=renderScaleDownResults(check,report);
+for(const text of ['runner receipt unknown','accepted unknown','armed unknown','post window unknown–unknown','source time unknown'])assert(unknown.includes(text));
+`);
+""")
+
+
+def test_scale_down_control_uses_short_state_copy_and_existing_info_help():
+    run_browser_script(r"""
+const page=browser();await page.run('init()');
+await page.run(`
+const detail={id:'live',state:'running',scale_down_control:{target:'local',nonce:'fresh'}};
+const help='Only real answer streams arm this scenario. Remove the replica externally. A marker is not backend confirmation; final results require lifecycle evidence and sufficient overlap.';
+const cases=[['baseline',false,'Waiting for an active answer stream before arming.'],
+  ['waiting_for_output',false,'Waiting for an active answer stream before arming.'],
+  ['armed',false,'Armed: mark the removal, then remove the replica externally.'],
+  ['observing',true,'Marker accepted. Remove the replica if you have not already; Giraffe is waiting for backend lifecycle evidence.'],
+  ['finalizing',true,'Marker accepted. Remove the replica if you have not already; Giraffe is waiting for backend lifecycle evidence.'],
+  ['finalizing',false,'Collecting final evidence.'],['finished',true,'Finished. See the results below.']];
+for(const [phase,accepted,message] of cases){
+  detail.scale_down_control={...detail.scale_down_control,phase,acknowledgment:accepted?{accepted:true}:null};
+  const html=renderScaleDownControl(detail);
+  assert(html.includes('<p>'+message+'</p>'));
+  assert(html.includes(infoHelp('scale_down_control_help','About scale-down marking',help)));
+  assert.equal(html.includes('data-action="mark-scale-down"'),phase==='armed'&&!accepted);
+  assert(html.includes(accepted?'Accepted: Removal marker recorded.':'No marker accepted.'));
+}
+detail.scale_down_control={...detail.scale_down_control,phase:'armed',acknowledgment:null};
+assert(renderScaleDownControl({...detail,stoppable:false}).includes('This run is owned by a standalone CLI process.'));
+`);
+""")
+
+
+def test_scale_down_plan_summary_uses_singular_long_stream():
+    run_browser_script(r"""
+const page=browser();await page.run('init()');
+await page.run(`
+state.bootstrap.config_schema={$defs:{ScaleDownConfig:{properties:{}}}};
+for(const count of [1,2]){
+  const config={targets:[{name:'local'}],scale_down:{long_cohort_size:count}};
+  const summary=effectiveCheckSummary({id:'scale_down'},config);
+  assert(summary.includes(count===1?'1 long stream ·':'2 long streams ·'));
+}
+`);
+""")
+
+
 def test_live_deltas_keep_detail_identity_cursor_windows_and_condition_updates():
     run_browser_script(r"""
 const page=browser();await page.run('init()');

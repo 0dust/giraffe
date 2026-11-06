@@ -129,6 +129,24 @@ def test_cli_rejects_historical_run_without_publishing(tmp_path, capsys):
     assert not (tmp_path / ".scale-down-event.json").exists()
 
 
+@pytest.mark.parametrize("output_format", ["text", "json"])
+def test_cli_marking_ui_run_explains_browser_control(tmp_path, capsys, output_format):
+    from giraffe.cli import main
+    active_directory(tmp_path)
+    message = ("This run directory has no CLI scale-down control. For a run started from the UI, "
+               "use Mark removal in the browser or POST /api/runs/<run-id>/scale-down/event.")
+    assert main(["mark-scale-down", str(tmp_path), "--event-id", "remove",
+                 "--output-format", output_format]) == 4
+    output = capsys.readouterr()
+    if output_format == "text":
+        assert output.err == f"giraffe: {message}\n" and output.out == ""
+    else:
+        assert output.err == ""
+        assert json.loads(output.out) == dict(kind="mark-scale-down", outcome="error", exit_code=4,
+            errors=[dict(loc=[], message=message, type="ValueError")])
+    assert not (tmp_path / ".scale-down-event.json").exists()
+
+
 @pytest.mark.parametrize("wait", ["-1", "nan", "inf", "61"])
 def test_cli_wait_is_bounded(tmp_path, wait, capsys):
     from giraffe.cli import main

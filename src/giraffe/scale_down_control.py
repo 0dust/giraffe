@@ -157,7 +157,11 @@ def submit_marker(directory: Path, *, event_id: str, replica_id: str | None = No
     if not math.isfinite(wait_seconds) or not 0 <= wait_seconds <= 60:
         raise ValueError("wait-seconds must be finite and between 0 and 60")
     directory = Path(directory)
-    status = _read(directory / STATUS_FILE, MAX_STATUS_BYTES)
+    try:
+        status = _read(directory / STATUS_FILE, MAX_STATUS_BYTES)
+    except FileNotFoundError:
+        raise ValueError("This run directory has no CLI scale-down control. For a run started from the UI, "
+                         "use Mark removal in the browser or POST /api/runs/<run-id>/scale-down/event.") from None
     marker = ScaleDownMarker(event_id=event_id, nonce=status["nonce"], target=status["target"],
                              replica_id=replica_id, source=source, operator_at=operator_at).model_dump(mode="json")
     if result := _existing_ack(status, marker):
