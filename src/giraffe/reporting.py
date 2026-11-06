@@ -181,9 +181,9 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str) -> dict | No
             # requests are unchanged across these exact generator revisions.
             unchanged_checks.add("prefix")
         if revision in _CONVERSATION_REVISIONS:
-            # Ordinary core dispatch and the separate Load sources are the
-            # same on both sides of the shared conversation refactor.
-            unchanged_checks.update(CORE_CHECKS)
+            # Core and Tool calling dispatch are unchanged in this refactor.
+            # Load also has a separate source digest below.
+            unchanged_checks.update(CORE_CHECKS, {"tools"})
         if not set(resolved.checks) <= unchanged_checks:
             return None  # Load generators changed; attest unchanged specialists only.
     sampled_sessions = "sessions" in resolved.checks and resolved.sessions and resolved.sessions.sampling is not None
@@ -249,11 +249,12 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str) -> dict | No
         }[revision]
     if "tools" in resolved.checks:
         from .tool_checks import resolved_tool_fixtures, resolved_tool_modes
+        tool_conversation_revisions = _CONVERSATION_REVISIONS | {"phase3", "review26", "caps26"}
         identity["resolved_tool_checks"] = {
             "fixtures": [fixture.model_dump(mode="json") for fixture in resolved_tool_fixtures(resolved)],
             "modes": resolved_tool_modes(resolved),
             **({"conversations": [fixture.model_dump(mode="json") for fixture in resolved.tool_checks.conversations],
-                "conversation_source_sha256": ("4080132330b5ceb3d7e0b824bb26244a73967d81ae6b467441600e45c483eb48" if revision in {"phase3", "review26", "caps26"} else
+                "conversation_source_sha256": ("4080132330b5ceb3d7e0b824bb26244a73967d81ae6b467441600e45c483eb48" if revision in tool_conversation_revisions else
                                                "283d1eb18bb852ca0132a2d4a8c63e49bc7155614603e74740dd80afe8189714")}
                if resolved.tool_checks and resolved.tool_checks.conversations else {}),
         }
@@ -1474,11 +1475,11 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold):
         label = key[:7] if role else key[:4]
         if cohort:
             label += (cohort,)
-        row = {"check": "multi_user", "scenario": " / ".join(map(str, label)),
-               "user_id": user_id, "population": population, "profile": profile,
-               "role": role, "trigger": trigger, "heavy_profile": heavy_profile, "cohort": cohort,
-               "window_id": c_window.get("id", b_window.get("id")),
-               "metric": "shared_window_output_tokens_per_second", "aggregation": "common_window",
+        identity = {"check": "multi_user", "scenario": " / ".join(map(str, label)),
+                    "user_id": user_id, "population": population, "profile": profile,
+                    "role": role, "trigger": trigger, "heavy_profile": heavy_profile, "cohort": cohort,
+                    "window_id": c_window.get("id", b_window.get("id"))}
+        row = {**identity, "metric": "shared_window_output_tokens_per_second", "aggregation": "common_window",
                "current": c_rate, "baseline": b_rate, "status": "inconclusive",
                "current_samples": len(current_delivery), "baseline_samples": len(old_delivery),
                "threshold": threshold, "change_unit": "percent",
@@ -1522,6 +1523,16 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold):
                          "current_samples": c_scenario.get("matched_samples", 0),
                          "baseline_samples": b_scenario.get("matched_samples", 0), "evidence_ids": interference_ids,
                          "observed_change": None, "observed_delta": None})
+        elif short_probe and b_scenario.get("status") == "measured" and interference_reason:
+            reason = f"Multi-user {user_id} at {population} users: {interference_reason}"
+            incomplete.append(reason)
+            rows.append({**identity,
+                "metric": "matched_interference_slowdown", "status": "inconclusive", "threshold": None,
+                "current": c_scenario.get("slowdown"), "baseline": b_scenario.get("slowdown"),
+                "current_samples": c_scenario.get("matched_samples", 0),
+                "baseline_samples": b_scenario.get("matched_samples", 0),
+                "reason": reason, "evidence_ids": interference_ids,
+            })
         if (not noisy_probe and c_scenario.get("status") == "fail" and b_scenario.get("status") == "pass"
                 and not scenario_reason and not any(_load_work_comparison(current_work, old_work))):
             acceptance = {**row, "metric": "scenario_acceptance", "status": "fail",
