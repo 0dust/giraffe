@@ -4,13 +4,14 @@ from __future__ import annotations
 import asyncio
 from bisect import bisect_left
 from decimal import Decimal
+from math import ceil, floor
 import time
 
 from .identities import identity_headers, litellm_key_fingerprint
 from .models import CheckResult, RequestSpec
 
 
-VERSION = 9
+VERSION = 10
 PROMPT = "Reply with exactly the word OK."
 
 
@@ -23,7 +24,8 @@ async def execute(run, target, client):
     observation = {"version": VERSION, "settings": settings.model_dump(mode="json"),
         "start_ms": (start-run.start)*1000, "end_ms": (end-run.start)*1000,
         "complete": False, "stop_reason": None, "offered": {user.identity: 0 for user in settings.users}}
-    observation["isolated_run"] = set(run.config.checks) == {"gateway_policy"} and len(run.config.targets) == 1
+    observation["isolated_run"] = (set(run.config.checks) == {"gateway_policy"}
+                                   and len(run.config.targets) == 1 and run.config.restart_target is None)
     run.observations[target.name]["gateway_policy"] = observation
     if not settings.supported:
         observation["stop_reason"] = "Selected gateway capability is unsupported."
@@ -104,6 +106,16 @@ def _completed_before_dispatch(admissions, record):
                for other in admissions)
 
 
+def _least_reported_rpm_count(reported, model_rpm, minimum, maximum):
+    # Match LiteLLM's float percent formatting at the rounding boundaries.
+    formats = [(f".{-value.as_tuple().exponent}%", f"{value}%") for value in reported]
+    for count in range(minimum, maximum + 1):
+        saturation = count / model_rpm
+        if all(format(saturation, precision) == printed for precision, printed in formats):
+            return count
+    return None
+
+
 def summarize(settings, observation, records):
     users = []
     for user in settings.users if settings else []:
@@ -180,7 +192,9 @@ def summarize(settings, observation, records):
     summary["comparable_actual_work"] = bool(successes and all(row["completed"] for row in users)
         and all(value is not None and value > 0 for value in inputs+outputs)
         and len(set(inputs)) == 1 and max(outputs) <= 2*min(outputs))
-    if settings.window_state == "unknown" or not settings.gateway_version or not observation.get("isolated_run"):
+    if not observation.get("isolated_run"):
+        return outcome("unverified", "Policy qualification requires one target and only policy traffic, with no restart readiness probes.")
+    if settings.window_state == "unknown" or not settings.gateway_version:
         return outcome("unverified", "Gateway version or isolated fresh single-target policy window is unknown.")
     if settings.window_state != "isolated_fresh_single_counter":
         return outcome("unverified", "Policy qualification requires an operator-confirmed authoritative limiter counter.")
@@ -222,15 +236,32 @@ def summarize(settings, observation, records):
         crossing = bisect_left(range(settings.model_rpm + 1), settings.saturation_threshold,
                                key=lambda count: count / settings.model_rpm)
         threshold_percent = Decimal(str(settings.saturation_threshold)) * 100
+        strict_evidence_missing = "Strict-mode evidence does not establish the declared saturation threshold."
+        rejected_ids = {record.id for record in recognized}
         for rejection in recognized:
             bounds = rejection.gateway_evidence._saturation_bounds
+            if bounds is None or bounds[1] < threshold_percent:
+                return outcome("unverified", strict_evidence_missing)
             completed = _completed_before_dispatch(admissions, rejection)
-            if bounds is None or bounds[1] < threshold_percent or (
-                bounds[0] < threshold_percent and completed < crossing
-            ):
-                return outcome("unverified", "Strict-mode evidence does not establish the declared saturation threshold.")
             if completed * 100 > bounds[1] * settings.model_rpm:
                 return outcome("unverified", "Reported saturation contradicts completed admissions in the isolated window.")
+            if rejection.gateway_evidence._model_tpm_unconfigured:
+                # A recognized priority rejection changes neither counter. Other
+                # failures may have been charged before the gateway replied.
+                possible = sum(record.id not in rejected_ids and (
+                    record.dispatch_ms is None or rejection.completed_ms is None
+                    or record.dispatch_ms <= rejection.completed_ms
+                ) for record in records)
+                minimum_count = max(completed, ceil(bounds[0] * settings.model_rpm / 100))
+                maximum_count = min(possible, floor(bounds[1] * settings.model_rpm / 100))
+                least_matching = _least_reported_rpm_count(rejection.gateway_evidence._reported_saturation,
+                                                          settings.model_rpm, minimum_count, maximum_count)
+                if least_matching is None:
+                    return outcome("unverified", "Reported saturation cannot match any possible model RPM count in the isolated window.")
+                if least_matching < crossing:
+                    return outcome("unverified", strict_evidence_missing)
+            elif bounds[0] < threshold_percent and completed < crossing:
+                return outcome("unverified", strict_evidence_missing)
         if len(admissions) > settings.model_rpm:
             return outcome("observed_failure", "Total admitted requests exceeded the declared model RPM in the isolated window.", "fail")
         allowance = max(allowance, crossing)

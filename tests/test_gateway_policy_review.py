@@ -64,6 +64,19 @@ async def test_policy_requires_operator_confirmed_counter_scope(monkeypatch, mod
     assert "operator-confirmed authoritative limiter counter" in check.summary
 
 
+@pytest.mark.usefixtures("local_tokenizer")
+@pytest.mark.parametrize("mode", ["key_rpm", "priority_rpm"])
+async def test_restart_readiness_makes_policy_window_unverified(monkeypatch, mode):
+    check, report, _ = await exercise(monkeypatch, mode, full=True, restart=True)
+    readiness = [record for record in report.requests if record.scenario == "readiness"]
+    assert len(readiness) == 1 and readiness[0].identity is None and readiness[0].valid
+    policy = check.metrics["gateway_policy"]
+    assert [user["admitted"] for user in policy["users"]] == [1, 8]
+    assert policy["users"][0]["rejected"] == 4
+    assert check.status == "inconclusive" and policy["qualification"] == "unverified"
+    assert "no restart readiness probes" in check.summary
+
+
 async def test_genuine_early_rejection_is_not_hidden_by_a_later_failure(monkeypatch):
     _, run, _ = await exercise(monkeypatch, behavior="early")
     last = [record for record in run.records if record.identity == "limited"][-1]
@@ -178,17 +191,44 @@ async def test_priority_borrowing_stops_at_the_gateway_ratio_boundary(monkeypatc
 @pytest.mark.usefixtures("local_tokenizer")
 @pytest.mark.parametrize("header,threshold,expected", [
     ("61.54%", .6152, "pass"), ("61.54%", .61539, "inconclusive"),
-    (None, .6152, "inconclusive"), ("61.50%", .6152, "inconclusive"),
+    (None, .6152, "pass"), ("61.50%", .6152, "inconclusive"),
     ("62.00%", .6152, "inconclusive"), ("61.54%, 90.00%", .6152, "inconclusive"),
 ])
-async def test_priority_uses_consistent_finer_saturation_evidence(monkeypatch, header, threshold, expected):
+async def test_priority_checks_rounded_saturation_at_an_rpm_boundary(monkeypatch, header, threshold, expected):
     check, _, _ = await exercise(monkeypatch, "priority_rpm", full=True, model_rpm=13,
-        saturation_threshold=threshold, rejection_saturation=61.5, saturation_header=header,
-        users=[dict(identity="limited", requests=5, rpm=2, priority="low"),
+        saturation_threshold=threshold, rejection_saturation=61.5, saturation_header=header, early_peer_admissions=6,
+        users=[dict(identity="limited", requests=3, rpm=2, priority="low"),
                dict(identity="peer", requests=8, rpm=8, priority="high")])
     assert check.status == expected, check.summary
     if expected == "inconclusive":
-        assert "Strict-mode evidence" in check.summary
+        assert "saturation" in check.summary
+
+
+@pytest.mark.usefixtures("local_tokenizer")
+@pytest.mark.parametrize("reported,expected", [(90.0, "inconclusive"), (25.0, "inconclusive"), (20.0, "pass")])
+async def test_priority_rejects_saturation_without_a_feasible_rpm_count(monkeypatch, reported, expected):
+    check, report, _ = await exercise(monkeypatch, "priority_rpm", full=True, saturation_threshold=.2,
+        rejection_saturation=reported, peer_delay=.2,
+        users=[dict(identity="limited", requests=3, rpm=2, priority="low"),
+               dict(identity="peer", requests=5, rpm=8, priority="high")])
+    rejection = next(record for record in report.requests if record.http_status == 429)
+    assert sum(record.http_status == 200 and record.completed_ms < rejection.dispatch_ms
+               for record in report.requests) == 2
+    assert check.status == expected, check.summary
+    if expected == "inconclusive":
+        assert "cannot match any possible model RPM count" in check.summary
+
+
+@pytest.mark.usefixtures("local_tokenizer")
+@pytest.mark.parametrize("reported,expected", [(0.1, "pass"), (0.2, "inconclusive")])
+async def test_priority_matches_gateway_formatting_at_rounding_ties(monkeypatch, reported, expected):
+    check, _, _ = await exercise(monkeypatch, "priority_rpm", full=True, model_rpm=2000, saturation_threshold=.0015,
+        rejection_saturation=reported, saturation_header="0.15%", early_peer_admissions=1, peer_delay=.075,
+        users=[dict(identity="limited", requests=3, rpm=2, priority="low"),
+               dict(identity="peer", requests=5, rpm=8, priority="high")])
+    assert check.status == expected, check.summary
+    if expected == "inconclusive":
+        assert "cannot match any possible model RPM count" in check.summary
 
 
 @pytest.mark.usefixtures("local_tokenizer")
