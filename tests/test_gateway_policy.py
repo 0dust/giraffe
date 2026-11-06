@@ -353,7 +353,7 @@ assert.match(comparison,/Policy evidence/);assert.doesNotMatch(comparison,/Media
 def test_parser_never_persists_raw_rate_limit_identity():
     from giraffe.gateway_response import response_evidence
     body = json.dumps({"error": {"type": "throttling_error", "code": "429", "message":
-        f"Rate limit exceeded for api_key: {LIMITED_KEY_HASH}. Limit type: requests. Current limit: 2, Remaining: 0. Limit resets at: now"}}).encode()
+        f"Rate limit exceeded for api_key: {LIMITED_KEY_HASH}. Limit type: requests. Current limit: 2, Remaining: 0. Limit resets at: 2026-01-01 00:00:00 UTC"}}).encode()
     assert response_evidence(429, body).policy_rejection == "unknown"
     evidence = response_evidence(429, body, expected_key_hash=LIMITED_KEY_HASH)
     assert evidence.policy_rejection == "key_rpm"

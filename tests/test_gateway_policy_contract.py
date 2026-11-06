@@ -73,7 +73,7 @@ def test_allowlisted_priority_limit_has_version_provenance():
 ])
 def test_duplicate_error_types_do_not_attest_gateway_policy(status, error_type, expected):
     message = (f"Rate limit exceeded for api_key: {LIMITED_KEY_HASH}. Limit type: requests. "
-               "Current limit: 2, Remaining: 0. Limit resets at: now")
+               "Current limit: 2, Remaining: 0. Limit resets at: 2026-01-01 00:00:00 UTC")
     body = f'"type":"{error_type}","code":{status},"message":"{message}"'
     clear = ('{"error":{' + body + '}}').encode()
     duplicate = ('{"error":{"type":"auth_provider_unavailable",' + body + '}}').encode()
@@ -112,7 +112,7 @@ async def test_declared_custom_auth_header_qualifies_only_distinct_keys(monkeypa
         if identity == "limited" and counts[identity] > 2:
             return httpx.Response(429, headers={"retry-after": "60"}, json={"error": {
                 "type": "throttling_error", "code": "429", "message":
-                f"Rate limit exceeded for api_key: {LIMITED_KEY_HASH}. Limit type: requests. Current limit: 2, Remaining: 0. Limit resets at: now"}})
+                f"Rate limit exceeded for api_key: {LIMITED_KEY_HASH}. Limit type: requests. Current limit: 2, Remaining: 0. Limit resets at: 2026-01-01 00:00:00 UTC"}})
         return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "OK"}, "finish_reason": "stop"}],
             "usage": {"prompt_tokens": 8, "completion_tokens": 2}})
 
