@@ -24,12 +24,14 @@ request for that case. Never put resolved credentials in a configuration file.
 
 The check supports up to 16 cases, a maximum 60-second deadline per request, and
 an output cap of at most 128 tokens. Shared run limits also apply. A complete
-matrix needs at least one expected allow and one expected deny. Every case must
-produce qualified evidence before the matrix can pass.
+matrix needs at least one expected allow and one expected deny. Cases with
+opposite expectations must use distinct credentials. Conflicting cases send no
+request and remain unverified. Every case must produce qualified evidence before
+the matrix can pass.
 
 | Response | Observation |
 | --- | --- |
-| HTTP 200 with a complete, valid chat answer | Allow |
+| HTTP 200 with a valid assistant answer and a `stop` or `length` finish reason | Allow |
 | HTTP 401 with a recognized LiteLLM authentication error | Deny |
 | HTTP 403 with a recognized LiteLLM model-access error | Deny |
 | Timeout, network error, 429, 5xx, redirect, unknown authentication error, malformed or incomplete response | Unverified |
@@ -39,9 +41,9 @@ Recognized 401 types are `token_not_found_in_db` and `expired_key`. Generic
 authentication backend failure.
 Recognized 403 types are `key_model_access_denied`, `team_model_access_denied`,
 `user_model_access_denied`, `org_model_access_denied`, and
-`project_model_access_denied`. Types must match their HTTP status; provider
-exception markers leave the response unverified. Other versions or gateway error
-formats may remain unverified. See LiteLLM's
+`project_model_access_denied`. The type and any explicit error code must match
+the HTTP status. Provider exception markers leave the response unverified.
+Other versions or gateway error formats may remain unverified. See LiteLLM's
 [error reference](https://docs.litellm.ai/docs/proxy/error_reference) and
 [chat-completion client setup](https://docs.litellm.ai/docs/proxy/user_keys).
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from giraffe.identities import identity_headers
+from giraffe.identities import identity_headers, litellm_key_fingerprint
 from giraffe.models import CheckResult, RequestSpec
 
 
@@ -41,6 +41,26 @@ def _record_case(row, record):
                http_status=record.http_status, request_id=record.id)
 
 
+def _qualify_identities(target, rows):
+    by_credentials = {}
+    for row in rows:
+        try:
+            headers = identity_headers(target, row["identity"])
+        except ValueError:
+            row["reason"] = "identity_unavailable"
+            continue
+        # Reuse LiteLLM virtual-key precedence. Preserve custom headers and
+        # explicit anonymous identities when the standard key is absent.
+        credential = litellm_key_fingerprint(headers) or tuple(sorted(
+            (name.lower(), value) for name, value in headers.items() if name.lower() != "accept"))
+        by_credentials.setdefault(credential, []).append(row)
+
+    for cases in by_credentials.values():
+        if {row["expected"] for row in cases} == {"allow", "deny"}:
+            for row in cases:
+                row["reason"] = "identity_conflict"
+
+
 async def execute(run, target, client):
     settings = run.config.gateway_access
     rows = [_row(case) for case in configured_cases(run.config)]
@@ -49,11 +69,9 @@ async def execute(run, target, client):
         for row in rows:
             row["reason"] = "unsupported_profile"
         return
+    _qualify_identities(target, rows)
     for case, row in zip(settings.cases, rows):
-        try:
-            identity_headers(target, case.identity)
-        except ValueError:
-            row["reason"] = "identity_unavailable"
+        if row["reason"] != "not_run":
             continue
         if not run.allowed(target.name):
             row["reason"] = "run_budget_or_stop"

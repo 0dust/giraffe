@@ -41,11 +41,11 @@ async def test_policy_matrix_uses_evidence_not_failed_requests(monkeypatch, stat
     def handler(req):
         seen.append(req)
         if req.headers["authorization"] == "Bearer allow-secret":
-            return httpx.Response(200, json={"choices": [{"message": {"content": "OK"}, "finish_reason": "stop"}]})
+            return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "OK"}, "finish_reason": "stop"}]})
         if status is None:
             raise httpx.ConnectError("deny-secret")
         if status == 200:
-            return httpx.Response(200, json={"choices": [{"message": {"content": body}, "finish_reason": "stop"}]})
+            return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": body}, "finish_reason": "stop"}]})
         return httpx.Response(status, json={"error": {"type": error_type, "message": body or "deny-secret"}})
 
     original = httpx.AsyncClient
@@ -91,7 +91,7 @@ async def test_full_runner_keeps_policy_separate_and_preserves_exports(monkeypat
         calls.append(req)
         if req.headers.get("authorization") == "Bearer sensitive-deny-value":
             return httpx.Response(401, json={"error": {"type": "token_not_found_in_db", "message": "sensitive-deny-value"}})
-        return httpx.Response(200, json={"choices": [{"message": {"content": "sensitive-allow-value"}, "finish_reason": "stop"}]})
+        return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "sensitive-allow-value"}, "finish_reason": "stop"}]})
     original = httpx.AsyncClient
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
     cfg = config(retention="all")
@@ -154,7 +154,7 @@ async def test_baseline_compares_qualified_access_cases(monkeypatch, mode, expec
             return httpx.Response(404)
         if req.headers["authorization"] == "Bearer deny-secret" and deny_status != 200:
             return httpx.Response(deny_status, json={"error": {"type": "token_not_found_in_db"}})
-        return httpx.Response(200, json={"choices": [{"message": {"content": "OK"}, "finish_reason": "stop"}]})
+        return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "OK"}, "finish_reason": "stop"}]})
 
     original = httpx.AsyncClient
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
@@ -191,7 +191,7 @@ async def test_incomplete_matrix_never_passes(monkeypatch, change):
     cfg = RunConfig.model_validate({**config().model_dump(), **change})
     original = httpx.AsyncClient
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(
-        lambda req: httpx.Response(200, json={"choices": [{"message": {"content": "OK"}, "finish_reason": "stop"}]})), **kw))
+        lambda req: httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "OK"}, "finish_reason": "stop"}]})), **kw))
     state = _Run(cfg, None, None)
     async with LLMClient(cfg.targets[0], cfg) as client:
         await execute(state, cfg.targets[0], client)
@@ -211,7 +211,7 @@ async def test_policy_denials_and_missing_configuration_do_not_fail_shared_key_a
             return httpx.Response(404)
         if req.headers.get("authorization") == "Bearer deny-secret":
             return httpx.Response(401, json={"error": {"type": "token_not_found_in_db"}})
-        return httpx.Response(200, json={"choices": [{"message": {"content": "OK"}, "finish_reason": "stop"}]})
+        return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "OK"}, "finish_reason": "stop"}]})
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
     report = await run_suite(cfg)
     assert report.overall == "pass" and report.abort_reason is None

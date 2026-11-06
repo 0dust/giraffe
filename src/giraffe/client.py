@@ -412,6 +412,7 @@ class LLMClient:
         )
         selected_headers = None
         attribution = spec.identity is not None and "gateway_attribution" in spec.check_ids
+        access_probe = spec.identity is not None and "gateway_access" in spec.check_ids
         if spec.identity is not None:
             from .identities import identity_headers
             try:
@@ -583,6 +584,9 @@ class LLMClient:
             content = choice.get("delta" if streaming else "message")
             if not isinstance(content, dict):
                 raise _ProtocolError("response is missing assistant content")
+            if access_probe and (content.get("role") != "assistant"
+                                 or choice.get("finish_reason") not in ("stop", "length")):
+                raise _ProtocolError("gateway access probe requires a completed assistant answer")
             if conversation:
                 if content.get("role", "assistant") != "assistant":
                     raise _ProtocolError("conversation response must have assistant role")

@@ -14,8 +14,8 @@ from tests.test_gateway_access import config
 
 async def test_cancelled_probe_retains_case_evidence_in_saved_reports(monkeypatch, tmp_path):
     cfg = config(retention="all")
-    cfg.targets[0].test_identities = {name: identity.model_copy(update={"api_key_env": None})
-                                    for name, identity in cfg.targets[0].test_identities.items()}
+    cfg.targets[0].test_identities["allowed"].api_key_env = None
+    monkeypatch.setenv("DENY_KEY", "deny-secret")
     entered = asyncio.Event()
 
     async def handler(request):
@@ -98,7 +98,7 @@ async def test_malformed_credentials_leave_budget_for_valid_case(monkeypatch, cr
 
     def handler(request):
         calls.append(request)
-        return httpx.Response(200, json={"choices": [{"message": {"content": "OK"}, "finish_reason": "stop"}]})
+        return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "OK"}, "finish_reason": "stop"}]})
 
     original = httpx.AsyncClient
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
@@ -122,3 +122,105 @@ def test_finite_access_matrix_has_exact_request_plan():
     row = next(row for row in plan["rows"] if row["id"] == "gateway_access")
     assert row["kind"] == "exact" and row["requests_per_target"] == 2
     assert not any("adaptive traffic" in warning for warning in plan["warnings"])
+
+
+@pytest.mark.parametrize("credential", ["alias", "bearer", "litellm_header", "custom_header", "anonymous"])
+async def test_opposite_cases_with_identical_credentials_stay_unverified(monkeypatch, credential):
+    secret = "same-virtual-key"
+    monkeypatch.setenv("ALLOW_KEY", secret)
+    monkeypatch.setenv("DENY_KEY", secret)
+    monkeypatch.setenv("AUTH_HEADER", "bearer " + secret)
+    cfg = config(retention="all")
+    cases = cfg.gateway_access.cases
+    identities = cfg.targets[0].test_identities
+    if credential == "alias":
+        cases[1].identity = cases[0].identity
+    elif credential in {"bearer", "litellm_header"}:
+        header = "authorization" if credential == "bearer" else "X-LiteLLM-API-Key"
+        identities["denied"] = identities["denied"].model_copy(
+            update={"api_key_env": None, "headers_env": {header: "AUTH_HEADER"}})
+    elif credential == "custom_header":
+        for alias, header in (("allowed", "X-Proxy-Key"), ("denied", "x-proxy-key")):
+            identities[alias] = identities[alias].model_copy(
+                update={"api_key_env": None, "headers_env": {header: "AUTH_HEADER"}})
+    elif credential == "anonymous":
+        for alias in identities:
+            identities[alias] = identities[alias].model_copy(update={"api_key_env": None})
+
+    calls = []
+
+    def handler(request):
+        if request.method != "POST":
+            return httpx.Response(404)
+        calls.append(request)
+        if len(calls) == 1:
+            return httpx.Response(200, json={"choices": [{
+                "message": {"role": "assistant", "content": "OK"}, "finish_reason": "stop"}]})
+        return httpx.Response(401, json={"error": {"type": "token_not_found_in_db", "code": "401"}})
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
+    report = await run_suite(cfg)
+    check = next(check for check in report.checks if check.id == "gateway_access")
+    assert report.overall == check.status == "inconclusive"
+    assert [row["reason"] for row in check.metrics["gateway_access"]["cases"]] == ["identity_conflict"] * 2
+    assert not calls and not report.requests
+    assert secret not in report.model_dump_json()
+
+
+@pytest.mark.parametrize("role,finish,error_code", [
+    ("user", "stop", "401"),
+    (None, "stop", "401"),
+    ("assistant", "nonsense", "401"),
+    ("assistant", "stop", 503),
+    ("assistant", "stop", "503"),
+])
+async def test_malformed_evidence_cannot_verify_access(monkeypatch, role, finish, error_code):
+    monkeypatch.setenv("ALLOW_KEY", "allow-secret")
+    monkeypatch.setenv("DENY_KEY", "deny-secret")
+
+    def handler(request):
+        if request.method != "POST":
+            return httpx.Response(404)
+        if request.headers["authorization"] == "Bearer deny-secret":
+            return httpx.Response(401, json={"error": {"type": "token_not_found_in_db", "code": error_code}})
+        message = {"content": "OK"}
+        if role is not None:
+            message["role"] = role
+        return httpx.Response(200, json={"choices": [{"message": message, "finish_reason": finish}]})
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
+    report = await run_suite(config(retention="all"))
+    check = next(check for check in report.checks if check.id == "gateway_access")
+    assert report.overall == check.status == "inconclusive"
+    assert [row["observed"] for row in check.metrics["gateway_access"]["cases"]] == (
+        ["allow", "unverified"] if error_code in (503, "503") else ["unverified", "deny"])
+
+
+@pytest.mark.parametrize("anonymous", [False, True])
+async def test_distinct_custom_credentials_qualify_with_anonymous_or_custom_denial(monkeypatch, anonymous):
+    monkeypatch.setenv("ALLOW_KEY", "allow-secret")
+    monkeypatch.setenv("DENY_KEY", "deny-secret")
+    values = config().model_dump()
+    values["targets"][0]["test_identities"] = {
+        "allowed": {"headers_env": {"X-Proxy-Key": "ALLOW_KEY"}},
+        "denied": {} if anonymous else {"headers_env": {"x-proxy-key": "DENY_KEY"}},
+    }
+    sent = []
+
+    def handler(request):
+        if request.method != "POST":
+            return httpx.Response(404)
+        key = request.headers.get("x-proxy-key")
+        sent.append(key)
+        if key == "allow-secret":
+            return httpx.Response(200, json={"choices": [{
+                "message": {"role": "assistant", "content": "OK"}, "finish_reason": "length"}]})
+        return httpx.Response(403, json={"error": {"type": "key_model_access_denied", "code": 403}})
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
+    report = await run_suite(RunConfig.model_validate(values))
+    assert report.overall == "pass"
+    assert sent == ["allow-secret", None if anonymous else "deny-secret"]
