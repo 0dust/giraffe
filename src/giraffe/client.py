@@ -397,10 +397,11 @@ class LLMClient:
     ) -> RequestRecord:
         from .identities import identity_scope
         with identity_scope(spec.identity is not None):
-            return await self._execute(spec, first_output_event=first_output_event)
+            return await self._execute(spec, first_output_event=first_output_event, _before_send=_before_send)
 
     async def _execute(
         self, spec: RequestSpec, *, first_output_event: asyncio.Event | None = None,
+        _before_send: Callable[[], None] | None = None,
     ) -> RequestRecord:
         if self._client is None:
             raise RuntimeError("Use LLMClient as an async context manager")
