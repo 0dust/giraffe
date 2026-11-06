@@ -720,7 +720,7 @@ async def execute(run, target, client):
 
 
 def result(run, target):
-    from giraffe.multi_user_metrics import summarize
+    from giraffe.multi_user_metrics import fairness_applies, summarize
     from giraffe.overlap import scheduling_delay_windows
 
     observation = run.observations[target.name].get("multi_user")
@@ -749,12 +749,13 @@ def result(run, target):
             worst = summary["worst_user"]
             messages.append(f"{summary['failed_user_windows']} user measurements failed; "
                             f"{worst['user_id']} at {worst['population']} users: " + " ".join(worst["reasons"]))
-        fairness_failures = [window["fairness"] for window in summary["windows"]
-                             if (not window.get("role") or window.get("scenario") == "arrivals")
+        fairness_failures = [window for window in summary["windows"]
+                             if fairness_applies(window)
                              and window.get("fairness", {}).get("status") == "fail"]
         if fairness_failures:
             messages.append("Observed delivery fairness failed. " + " ".join(
-                reason for evidence in fairness_failures for reason in evidence["reasons"]))
+                (f"Recovery {window['role']} phase. " if window.get("scenario") == "recovery" else "")
+                + " ".join(window["fairness"]["reasons"]) for window in fairness_failures))
         interference_failures = [user for window in summary["windows"]
                                  for user in window.get("interference", {}).get("users", []) if user["status"] == "fail"]
         if interference_failures:
