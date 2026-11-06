@@ -317,14 +317,16 @@ assert.match(effectiveCheckSummary(check,config),/Not configured/);
 
 
 @pytest.mark.usefixtures("local_tokenizer")
-@pytest.mark.parametrize("case", ["unsupported", "missing_credentials", "multi_target"])
+@pytest.mark.parametrize("case", [
+    "unsupported", "missing_credentials", "supported_at_cap", "shared_truncated", "multi_target",
+])
 async def test_optional_policy_preserves_shared_traffic_at_run_limits(monkeypatch, case):
     from tests.test_gateway_policy import configuration as configured_policy
 
     raw = configured_policy(gateway="unsupported" if case == "unsupported" else "litellm",
                             duration_seconds=.8).model_dump(mode="json")
     raw.update(checks=["serving", "gateway_policy"], stream=False, samples=2, max_memory_mb=0,
-               max_requests=3 if case != "multi_target" else None, max_duration_seconds=2,
+               max_requests={"shared_truncated": 2, "multi_target": None}.get(case, 3), max_duration_seconds=2,
                retention="all", limits={"min_samples": 2})
     raw["targets"][0]["api_key_env"] = "SHARED"
     monkeypatch.setenv("SHARED", "shared-secret")
@@ -332,6 +334,7 @@ async def test_optional_policy_preserves_shared_traffic_at_run_limits(monkeypatc
     monkeypatch.delenv("PEER", raising=False)
     if case == "multi_target":
         raw["targets"].append(dict(raw["targets"][0], name="second", url="http://second"))
+    if case in {"multi_target", "supported_at_cap", "shared_truncated"}:
         monkeypatch.setenv("LIMITED", "limited-secret")
         monkeypatch.setenv("PEER", "peer-secret")
     config = RunConfig.model_validate(raw)
@@ -353,6 +356,11 @@ async def test_optional_policy_preserves_shared_traffic_at_run_limits(monkeypatc
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handle), **kw))
     report = await run_suite(config, stop_event=stop)
     serving = [check for check in report.checks if check.id == "serving"]
+    if case == "shared_truncated":
+        assert sent == [("proxy", "Bearer shared-secret")] * 2
+        assert report.abort_reason == "maximum request budget reached"
+        assert serving[0].status == "inconclusive"
+        return
     assert all(check.status == "pass" for check in serving)
     if case == "multi_target":
         assert sent[:6] == [("proxy", "Bearer shared-secret")] * 3 + [("second", "Bearer shared-secret")] * 3
@@ -368,9 +376,16 @@ async def test_optional_policy_preserves_shared_traffic_at_run_limits(monkeypatc
         policy = next(check for check in report.checks if check.id == "gateway_policy")
         assert policy.metrics["gateway_policy"]["qualification"] == (
             "unavailable" if case == "unsupported" else "unverified")
-        if case == "unsupported":
+        if case in {"unsupported", "supported_at_cap"}:
             from giraffe.reporting import compare_baseline
 
             compared = compare_baseline(report, report.model_copy(deep=True)).baseline
-            assert compared["status"] == "pass"
-            assert any(row["status"] == "pass" for row in compared["targets"][0]["comparisons"])
+            target = compared["targets"][0]
+            assert any(row["check"] == "serving" and row["status"] == "pass" for row in target["comparisons"])
+            if case == "unsupported":
+                assert compared["status"] == "pass"
+            else:
+                assert "no slots" in policy.summary
+                assert report.limits_reached == ["max_requests"]
+                assert all(row["status"] == "inconclusive" for row in target["comparisons"]
+                           if row["check"] == "gateway_policy")

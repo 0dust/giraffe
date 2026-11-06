@@ -99,6 +99,8 @@ def response_evidence(status, body=b"", headers=None, *, declared_priority=None,
         return evidence
     key = re.fullmatch(r"Rate limit exceeded for api_key: ([0-9a-f]{64})\. Limit type: requests\. Current limit: ([0-9]{1,12}), Remaining: ([0-9]{1,12})\. Limit resets at: [^\r\n]{1,128}", message)
     if key and key[1] == expected_key_hash:
+        if headers.get("rate_limit_type") not in (None, "requests"):
+            return evidence
         evidence.error_kind, evidence.policy_rejection = "rate_limit", "key_rpm"
         evidence.rate_limit_unit = "requests"
         evidence.request_limit, evidence.request_remaining = int(key[2]), int(key[3])

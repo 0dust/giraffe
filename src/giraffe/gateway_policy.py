@@ -12,7 +12,7 @@ from .identities import gateway_identities_only, identity_headers, litellm_key_f
 from .models import CheckResult, RequestSpec
 
 
-VERSION = 16
+VERSION = 17
 PROMPT = "Reply with exactly the word OK."
 
 
@@ -62,6 +62,15 @@ async def execute(run, target, client):
         run.finish_condition(target.name, "gateway_policy", reason=reason)
         return
     observation["identities_distinct"] = True
+    if (not gateway_identities_only(run.config.checks) and run.remaining(target.name) == 0
+            and run.stop_reason(target.name) in (None, "maximum request budget reached")):
+        # A completed shared workload can legitimately use the entire quota.
+        # An unsent optional probe does not interrupt that workload.
+        run.limits_reached.add("max_requests")
+        reason = "The request limit left no slots for the configured gateway policy probes."
+        observation.update(budget_limited=True, stop_reason=reason, end_ms=observation["start_ms"])
+        run.finish_condition(target.name, "gateway_policy", reason=reason)
+        return
 
     async def user_loop(user):
         for sequence in range(user.requests):
@@ -176,7 +185,7 @@ def summarize(settings, observation, records):
         return outcome("unavailable", "Selected gateway capability is unsupported.")
     if observation.get("execution_error"):
         return outcome("unverified", observation["execution_error"])
-    if observation.get("credential_issue"):
+    if observation.get("credential_issue") or observation.get("budget_limited"):
         return outcome("unverified", observation["stop_reason"])
     cached = {record.id for record in records
               if record.gateway_evidence and record.gateway_evidence._response_cache_hit_reported}
@@ -253,6 +262,10 @@ def summarize(settings, observation, records):
         evidence = [record.gateway_evidence for record in recognized]
         if any(item.model_rpm != settings.model_rpm or item.priority_matches is not True for item in evidence):
             return outcome("unverified", "Priority tier or model RPM evidence does not match the declaration.")
+        tpm_configs = {(item._model_tpm, item._model_tpm_unconfigured) for item in evidence}
+        if len(tpm_configs) != 1:
+            return outcome("unverified", "Model TPM configuration differs between rejections in the isolated window.")
+        model_tpm, rpm_only_saturation = tpm_configs.pop()
         if not summary["overlap_observed"] or not summary["comparable_actual_work"]:
             return outcome("unverified", "Comparable actual token work and overlapping requests are required for priority observations.")
         if any(record.gateway_evidence is None or record.gateway_evidence.priority_matches is not True for record in admissions):
@@ -293,35 +306,29 @@ def summarize(settings, observation, records):
             if minimum_saturation > bounds[1]:
                 return outcome("unverified", "Reported saturation contradicts earlier limiter evidence in the isolated window.")
             reported = rejection.gateway_evidence._reported_saturation
-            model_tpm = rejection.gateway_evidence._model_tpm
             # A recognized priority rejection changes neither counter. Other
             # failures may have been charged before the gateway replied.
-            possible = [record for record in records if record.id not in rejected_ids
-                        and (record.dispatch_ms is None or rejection.completed_ms is None
-                             or record.dispatch_ms <= rejection.completed_ms)]
+            possible = sum(record.id not in rejected_ids and (
+                record.dispatch_ms is None or rejection.completed_ms is None
+                or record.dispatch_ms <= rejection.completed_ms
+            ) for record in records)
             minimum_count = ceil(minimum_saturation * settings.model_rpm / 100)
-            maximum_count = min(len(possible), floor(bounds[1] * settings.model_rpm / 100))
+            maximum_count = min(possible, floor(bounds[1] * settings.model_rpm / 100))
             least_matching_rpm = _least_reported_count(reported, settings.model_rpm, minimum_count, maximum_count)
-            # LiteLLM reports the greater of RPM and TPM saturation. Its
-            # token count starts at zero and is charged after a success. Count
-            # even possible later completions for a conservative upper bound.
-            charges = [record.gateway_evidence._tpm_charge_upper
-                       if record.status == "completed" and record.valid and record.gateway_evidence else None
-                       for record in possible]
-            bounded_tpm = model_tpm is not None and all(charge is not None for charge in charges)
-            token_max = min(sum(charges), model_tpm) if bounded_tpm else model_tpm
-            tpm_may_explain = (not rejection.gateway_evidence._model_tpm_unconfigured
-                               and (token_max is None or _least_reported_count(reported, model_tpm, 0, token_max) is not None))
-            if not tpm_may_explain:
-                if least_matching_rpm is None:
-                    return outcome("unverified", "Reported saturation cannot match any possible model RPM count in the isolated window.")
+            if least_matching_rpm is None:
+                return outcome("unverified", "Reported saturation cannot match any possible model RPM count in the isolated window.")
+            # LiteLLM reports the larger of the RPM and TPM ratios. If TPM
+            # could produce that number, the printed value cannot prove the
+            # RPM counter crossed the threshold. Use observed admissions.
+            rpm_reading = (rpm_only_saturation or model_tpm is not None
+                           and _least_reported_count(reported, model_tpm, 0, model_tpm) is None)
+            if rpm_reading:
                 if least_matching_rpm < crossing:
                     return outcome("unverified", strict_evidence_missing)
                 minimum_rpm = least_matching_rpm
                 minimum_saturation = Fraction(least_matching_rpm * 100, settings.model_rpm)
-            elif minimum_rpm < crossing and (minimum_saturation < threshold_percent
-                    or not bounded_tpm and (least_matching_rpm is None or least_matching_rpm < crossing)):
-                return outcome("unverified", strict_evidence_missing)
+            elif minimum_rpm < crossing:
+                return outcome("unverified", "Reported saturation may reflect TPM, and observed RPM admissions do not establish strict mode.")
             if rejection.completed_ms is not None:
                 earlier_readings.append((rejection.completed_ms, minimum_rpm, minimum_saturation))
         if len(admissions) > settings.model_rpm:
@@ -343,7 +350,6 @@ def summarize(settings, observation, records):
         return outcome("observed_failure", "A request dispatched after strict priority pool exhaustion was admitted in the same window.", "fail")
     borrowing_uncertain = False
     if settings.capability == "priority_rpm":
-        rpm_only_saturation = all(item._model_tpm_unconfigured for item in evidence)
         # Each identity dispatches serially, so only admissions beyond its
         # reservation depend on whether the shared pool had reached saturation.
         for record in affected_admissions[declared.rpm:]:
