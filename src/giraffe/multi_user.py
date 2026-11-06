@@ -7,6 +7,7 @@ import json
 import math
 import random
 import time
+import uuid
 from copy import deepcopy
 
 from giraffe.concurrent_load import OutputProgress, calibrate
@@ -18,8 +19,16 @@ from giraffe.traffic import run_stage
 WINDOW_POLICY = "completed-output-v1"
 
 
-def _matched_work_sha256(spec):
-    return hashlib.sha256(json.dumps({"messages": spec.messages, "options": spec.options,
+def _matched_work_sha256(spec, *, nonce=None):
+    messages = spec.messages
+    if nonce and messages:
+        first = messages[0]
+        content = first.get("content")
+        prefix = f"Request {nonce}."
+        # Remove only the generated cache-busting prefix from the identity.
+        if isinstance(content, str) and content.startswith(prefix):
+            messages = [{**first, "content": content[len(prefix):]}, *messages[1:]]
+    return hashlib.sha256(json.dumps({"messages": messages, "options": spec.options,
         "max_tokens": spec.max_tokens, "requested_input_tokens": spec.requested_input_tokens,
         "scorer": spec.scorer, "expected": spec.expected}, sort_keys=True).encode()).hexdigest()
 
@@ -85,10 +94,13 @@ async def run_window(run, target, client, settings, load_settings, calibration, 
         return [uid for uid, progress in active.items() if uid not in window.get("heavy_user_ids", [])
                 and (not progress.first if window.get("trigger") == "before_output" else progress.chunks >= 2)]
 
-    async def wait_for_trigger():
+    def cancellation_peers():
+        return [uid for uid, progress in active.items() if progress.first]
+
+    async def wait_for_trigger(eligible_peers):
         while not closed and time.monotonic() < cutoff:
             changed.clear()
-            if trigger_peers():
+            if eligible_peers():
                 return True
             try:
                 await asyncio.wait_for(changed.wait(), max(.0001, cutoff - time.monotonic()))
@@ -128,7 +140,7 @@ async def run_window(run, target, client, settings, load_settings, calibration, 
         sequence, conversation_sequence = 0, 0
         preceding_pause = 0
 
-        async def send(spec, finalize=None):
+        async def send(spec, finalize=None, *, nonce=None):
             nonlocal sequence
             if closed or time.monotonic() >= cutoff:
                 return None
@@ -142,67 +154,64 @@ async def run_window(run, target, client, settings, load_settings, calibration, 
             if window.get("role"):
                 spec.workload.update(role=window["role"], matched_work_sequence=sequence,
                     trigger=window.get("trigger"), heavy_profile=window.get("heavy_profile"),
-                    matched_work_sha256=_matched_work_sha256(spec))
+                    matched_work_sha256=_matched_work_sha256(spec, nonce=nonce))
                 sequences[user["user_id"]] = sequences.get(user["user_id"], 0) + 1
                 spec.workload["request_sequence"] = sequences[user["user_id"]]
             selected = window.get("selected_user_id") == user["user_id"] and window["phase"] == "measurement"
+            cancel_first = selected and sequence == 1
             if selected:
-                spec.workload["cancellation_role"] = "selected" if sequence == 1 else "followup"
-                if sequence == 1:
+                spec.workload["cancellation_role"] = "selected" if cancel_first else "followup"
+                if cancel_first:
                     spec.cancel_after_chunks = settings.cancellation.cancel_after_chunks
             progress = OutputProgress(changed)
-            if selected and sequence == 1:
-                while not closed and time.monotonic() < cutoff:
-                    changed.clear()
-                    if any(peer.first for peer in active.values()):
-                        break
-                    try:
-                        await asyncio.wait_for(changed.wait(), max(.0001, cutoff-time.monotonic()))
-                    except TimeoutError:
-                        return None
             heavy = window.get("role") == "probe" and user["user_id"] in window.get("heavy_user_ids", [])
-            if heavy and not await wait_for_trigger():
-                return None
+            eligible_peers = cancellation_peers if cancel_first else trigger_peers if heavy else None
             if settings.conversations:
                 spec.scenario = scenario
                 spec.workload["conversation_sequence"] = conversation_sequence
-            if closed or time.monotonic() >= cutoff:
-                return None
-            # Scenario coordination precedes eligibility for shared admission.
-            ready = _relative(run)
-            user["ready_count"] += 1
-            user["pending_ready_ms"] = ready
-            spec.workload["ready_ms"] = ready
-            async with run.slot(False, cutoff) as admitted:
-                if not admitted or closed or time.monotonic() >= cutoff:
-                    return None
-                if not run.allowed(target.name):
-                    close(run.stop_reason(target.name) or "target request allowance exhausted")
-                    return None
-                peers = trigger_peers() if heavy else []
-                if heavy and not peers:
-                    return None
 
-                def dispatched():
-                    user["dispatched_count"] += 1
-                    user["pending_ready_ms"] = None
-                    active[user["user_id"]] = progress
-                    if heavy:
-                        spec.workload.update(trigger=window["trigger"], trigger_ms=_relative(run),
-                                             trigger_peer_ids=peers)
-                    changed.set()
+            def dispatched():
+                user["dispatched_count"] += 1
+                user["pending_ready_ms"] = None
+                active[user["user_id"]] = progress
+                if heavy:
+                    spec.workload.update(trigger=window["trigger"], trigger_ms=_relative(run),
+                                         trigger_peer_ids=peers)
+                changed.set()
 
-                def finalized(record):
-                    if finalize:
-                        finalize(record)
-                    user["request_ids"].append(record.id)
+            def finalized(record):
+                if finalize:
+                    finalize(record)
+                user["request_ids"].append(record.id)
 
-                try:
-                    return await run.request(target, client, spec, slot_reserved=True, admission_deadline=cutoff,
-                                             event=progress, on_start=dispatched, finalize_record=finalized)
-                finally:
-                    active.pop(user["user_id"], None)
-                    changed.set()
+            while not closed and time.monotonic() < cutoff:
+                if eligible_peers and not await wait_for_trigger(eligible_peers):
+                    return None
+                if closed or time.monotonic() >= cutoff:
+                    return None
+                # Scenario coordination precedes eligibility for shared admission.
+                ready = _relative(run)
+                user["ready_count"] += 1
+                user["pending_ready_ms"] = ready
+                spec.workload["ready_ms"] = ready
+                async with run.slot(False, cutoff) as admitted:
+                    if not admitted or closed or time.monotonic() >= cutoff:
+                        return None
+                    if not run.allowed(target.name):
+                        close(run.stop_reason(target.name) or "target request allowance exhausted")
+                        return None
+                    peers = eligible_peers() if eligible_peers else []
+                    if eligible_peers and not peers:
+                        # Eligibility expired while queued. Release the slot and
+                        # wait for a new peer without carrying over admission delay.
+                        user["pending_ready_ms"] = None
+                        continue
+                    try:
+                        return await run.request(target, client, spec, slot_reserved=True, admission_deadline=cutoff,
+                                                 event=progress, on_start=dispatched, finalize_record=finalized)
+                    finally:
+                        active.pop(user["user_id"], None)
+                        changed.set()
 
         while not closed and time.monotonic() < cutoff:
             if not run.allowed(target.name):
@@ -236,11 +245,11 @@ async def run_window(run, target, client, settings, load_settings, calibration, 
                 point = {"id": scenario, "type": "combinations", "workload": "combinations",
                          "pattern": "concurrent", "level": window["population"], "rate": None,
                          "bursts": False, "source": "primary", "_source_index": sequence}
+                nonce = uuid.uuid4().hex if window.get("role") else None
                 spec = build_spec(run, load_settings, point, user["profile"], calibration,
                                   frozen_sources=(sources_by_profile or {}).get(user["profile"]),
-                                  nonce=hashlib.sha256(f"{settings.seed}:{window['population']}:{user['user_id']}:{sequence}".encode()).hexdigest()[:32]
-                                  if window.get("role") else None)
-                record = await send(spec)
+                                  nonce=nonce)
+                record = await send(spec, nonce=nonce)
                 if record is None and time.monotonic() >= cutoff:
                     break
                 pause_sequence = sequence

@@ -466,6 +466,24 @@ def test_missing_usage_on_late_work_keeps_delivery_known_but_fairness_unqualifie
     assert any('usage' in reason for reason in fairness(result)['reasons'])
 
 
+@pytest.mark.parametrize('input_tokens,expected', [
+    ([100, 100, 200, 100, 200, 100], 'inconclusive'),
+    ([100, 200, 100, 100, 200, 200], 'pass'),
+])
+def test_fairness_compares_actual_lengths_of_counted_completions(input_tokens, expected):
+    records = fairness_records((3, 3))
+    for request, tokens in zip(records, input_tokens):
+        request.input_tokens = tokens
+    source = fairness_observation(records)
+    source['windows'][0].update(end_ms=4500, planned_end_ms=4500,
+                                duration_seconds=4.5, planned_duration_seconds=4.5)
+    result = summarize(source, records)
+    assert row(result)['late_completed'] == row(result, 'user-02')['late_completed'] == 1
+    measured = fairness(result)
+    assert measured['ratio'] == 1
+    assert measured['status'] == expected
+
+
 def test_overlap_of_a_users_own_requests_does_not_prove_peer_overlap():
     records = fairness_records((2, 1))
     records[1].dispatch_ms = records[1].timing_start_ms = 0
