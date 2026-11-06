@@ -1515,7 +1515,7 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                         row["load_point"] = load_point
                     if check == "multi_user":
                         row.update({key: point_records[0].workload.get(key)
-                                    for key in ("user_id", "population", "profile", "window_id", "role", "trigger", "heavy_profile")})
+                                    for key in ("user_id", "population", "profile", "window_id", "role", "trigger", "heavy_profile", "cohort")})
                         row["timing_origin"] = "user_ready"
                     rows.append(row)
         target_reasons.extend(user_reasons)
