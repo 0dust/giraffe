@@ -715,11 +715,17 @@ def _input_work_changed(current, old, threshold):
             and abs(current_input - old_input)*100/old_input > threshold)
 
 
+def _token_lengths_changed(lengths, threshold):
+    if any(not values or None in values for values in lengths):
+        return True
+    medians = [median(values) for values in lengths]
+    return max(medians) > min(medians) * (1 + threshold / 100) or _length_mix_differs(lengths, threshold)
+
+
 def _total_generation_work_changed(current, old, threshold):
     lengths = [[_total_generated_tokens(r) for r in records if r.status == "completed" and r.valid]
                for records in (current, old)]
-    return (any(not values or None in values for values in lengths)
-            or _length_mix_differs(lengths, threshold))
+    return _token_lengths_changed(lengths, threshold)
 
 
 def _live_input_work_changed(current, old, threshold, *, compare_output=False):
@@ -1277,10 +1283,7 @@ def _user_token_work_changed(current, previous, tolerance):
         measures += (_uncached_input_tokens,)
     for measure in measures:
         lengths = [[measure(record) for record in cohort] for cohort in (current, previous)]
-        if any(not values or None in values for values in lengths):
-            return True
-        medians = [median(values) for values in lengths]
-        if max(medians) > min(medians) * (1 + tolerance / 100) or _length_mix_differs(lengths, tolerance):
+        if _token_lengths_changed(lengths, tolerance):
             return True
     return False
 
@@ -1677,9 +1680,14 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                     current_samples, old_samples = current_records, old_records
                     current_output, old_output = current_work, old_work
                     metric_input_changed, metric_output_changed = input_work_changed, different_work
+                    metric_work_reason, metric_mix_changed = None, mix_changed
                     generation_work_changed = False
                     if scheduled_user and metric in TIMING_METRICS:
                         current_samples, old_samples = current_timing[metric], old_timing[metric]
+                        if current_samples and old_samples:
+                            metric_work_reason, metric_mix_changed = _load_work_comparison(current_samples, old_samples)
+                        else:
+                            metric_mix_changed = False
                         current_output, old_output = _output_work(current_samples), _output_work(old_samples)
                         metric_input_changed = _input_work_changed(current_samples, old_samples, threshold)
                         metric_output_changed = _different_output_work(current_output, old_output, threshold)
@@ -1701,7 +1709,9 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                              f"median {old_output['reported_output_tokens_p50']} → {current_output['reported_output_tokens_p50']} tokens "
                              f"and {old_output['output_chars_p50']} → {current_output['output_chars_p50']} characters. "
                              "These timings include different amounts of generated work; this does not establish a speed improvement or regression.")
-                    if mix_changed:
+                    if metric_work_reason:
+                        warn("requested_work_changed", metric_work_reason)
+                    if metric_mix_changed:
                         warn("request_mix_changed", "Request work identity shares differ by more than 10 percentage points; observed aggregate values reflect different request mixes.")
                     if metric in TIMING_METRICS:
                         if unqualified_user_probe:
