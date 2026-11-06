@@ -66,7 +66,7 @@ async def execute(run, target, client):
             and run.stop_reason(target.name) in (None, "maximum request budget reached")):
         # A completed shared workload can legitimately use the entire quota.
         # An unsent optional probe does not interrupt that workload.
-        run.limits_reached.add("max_requests")
+        run.mark_request_limit(gateway_probe=True)
         reason = "The request limit left no slots for the configured gateway policy probes."
         observation.update(budget_limited=True, stop_reason=reason, end_ms=observation["start_ms"])
         run.finish_condition(target.name, "gateway_policy", reason=reason)
@@ -74,7 +74,7 @@ async def execute(run, target, client):
 
     async def user_loop(user):
         for sequence in range(user.requests):
-            if time.monotonic() >= end or not run.allowed(target.name):
+            if time.monotonic() >= end or not run.allowed(target.name, gateway_probe=True):
                 return
             ready_ms = (time.monotonic()-run.start)*1000
             spec = RequestSpec(fixture_id="gateway-policy-v1", scenario="gateway_policy",

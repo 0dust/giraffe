@@ -372,6 +372,7 @@ async def test_optional_policy_preserves_shared_traffic_at_run_limits(monkeypatc
         assert sent == [("proxy", "Bearer shared-secret")] * 2
         assert report.abort_reason == "maximum request budget reached"
         assert serving[0].status == "inconclusive"
+        assert "shared" in report.observations["request_limit_scopes"]
         return
     assert all(check.status == "pass" for check in serving)
     if case in {"multi_target", "target_partial"}:
@@ -385,6 +386,7 @@ async def test_optional_policy_preserves_shared_traffic_at_run_limits(monkeypatc
         if case == "target_partial":
             assert report.abort_reason is None
             assert report.limits_reached == ["max_requests"]
+            assert report.observations["request_limit_scopes"] == ["gateway"]
             assert report.observations["request_budget_used"] == len(sent) == 7
             summary = policy.metrics["gateway_policy"]
             assert sum(user["dispatched"] for user in summary["users"]) == 1
@@ -412,5 +414,6 @@ async def test_optional_policy_preserves_shared_traffic_at_run_limits(monkeypatc
                 if case == "supported_at_cap":
                     assert "no slots" in policy.summary
                 assert report.limits_reached == ["max_requests"]
+                assert report.observations["request_limit_scopes"] == ["gateway"]
                 assert all(row["status"] == "inconclusive" for row in target["comparisons"]
                            if row["check"] == "gateway_policy")
