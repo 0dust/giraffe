@@ -93,11 +93,13 @@ def _comparison_config(value: dict) -> dict:
     checks = config.get("checks")
     options = config.get("request_options")
     if (isinstance(checks, list) and "gateway_access" in checks
-            and all(check in ("gateway_access", "gpu") for check in checks)
+            and all(check in ("gateway_access", "gpu")
+                    or (check in ("gateway_attribution", "gateway_policy") and config.get(check) is None)
+                    for check in checks)
             and not config.get("restart_target") and isinstance(options, dict)):
         from .gateway_access import _TOOL_OPTIONS
 
-        # Access probes discard these options. GPU telemetry sends no inference.
+        # Access discards these options. Telemetry and unconfigured probes send no inference.
         config["request_options"] = {key: value for key, value in options.items() if key not in _TOOL_OPTIONS}
     if isinstance(config.get("limits"), dict):
         config["limits"].pop("regression_percent", None)

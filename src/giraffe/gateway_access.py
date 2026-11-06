@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 
@@ -9,6 +10,7 @@ from giraffe.models import CheckResult, RequestSpec
 
 
 EVIDENCE_VERSION = 2
+IDENTITY_CHANGED = "Test identity credentials changed after access preflight."
 _TOOL_OPTIONS = ("tools", "tool_choice", "parallel_tool_calls", "functions", "function_call")
 QUALIFICATION = ("Only the declared identities and endpoint/model were exercised. "
                  "These fixtures do not certify tenant isolation or comprehensive gateway security.")
@@ -17,6 +19,11 @@ QUALIFICATION = ("Only the declared identities and endpoint/model were exercised
 def configured_cases(config):
     settings = config.gateway_access
     return settings.cases if settings else []
+
+
+def credential_digest(headers: dict[str, str]) -> bytes:
+    """Bind a probe to its qualified header values without retaining them."""
+    return hashlib.sha256(json.dumps(headers, sort_keys=True).encode()).digest()
 
 
 def assistant_reply(message, finish_reason):
@@ -62,6 +69,8 @@ def observation(record):
         return "unverified", "not_run"
     if record.status == "cancelled":
         return "unverified", "request_cancelled"
+    if record.error == IDENTITY_CHANGED:
+        return "unverified", "identity_changed"
     if record.status == "completed" and record.http_status == 200:
         if record.valid:
             return "allow", "valid_completion"
@@ -93,6 +102,7 @@ def _record_case(row, record):
 
 def _qualify_identities(target, rows, auth_header):
     by_credentials = {}
+    digests = {}
     for row in rows:
         try:
             headers = identity_headers(target, row["identity"])
@@ -107,12 +117,14 @@ def _qualify_identities(target, rows, auth_header):
         if credential is None and names:
             row["reason"] = "auth_header_unverified"
             continue
+        digests[row["name"]] = credential_digest(headers)
         by_credentials.setdefault(credential, []).append(row)
 
     for cases in by_credentials.values():
         if {row["expected"] for row in cases} == {"allow", "deny"}:
             for row in cases:
                 row["reason"] = "identity_conflict"
+    return digests
 
 
 async def execute(run, target, client):
@@ -123,7 +135,7 @@ async def execute(run, target, client):
         for row in rows:
             row["reason"] = "unsupported_profile"
         return
-    _qualify_identities(target, rows, settings.auth_header)
+    digests = _qualify_identities(target, rows, settings.auth_header)
     for case, row in zip(settings.cases, rows):
         if row["reason"] != "not_run":
             continue
@@ -137,6 +149,7 @@ async def execute(run, target, client):
             max_tokens=settings.max_output_tokens,
             request_timeout_seconds=settings.request_timeout_seconds,
             workload={"case": case.name, "expected": case.expected})
+        spec._gateway_access_credential_digest = digests.pop(case.name)
         await run.request(target, client, spec, finalize_record=lambda record: _record_case(row, record))
 
 

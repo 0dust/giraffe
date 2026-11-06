@@ -2689,6 +2689,7 @@ class ConfigDraft(RunConfig):
 
 
 class RequestSpec(Model):
+    _gateway_access_credential_digest: bytes | None = PrivateAttr(default=None)
     identity: str | None = Field(default=None, pattern=r"^[A-Za-z][A-Za-z0-9_-]{0,63}$",
         description="Explicit gateway probe identity. Probes retain numeric response evidence, not response text.")
     condition_id: str | None = None

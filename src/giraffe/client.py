@@ -424,6 +424,12 @@ class LLMClient:
             except ValueError:
                 record.error = "Test identity credentials are unavailable."
                 return record
+            if access_probe:
+                from .gateway_access import IDENTITY_CHANGED, credential_digest
+
+                if credential_digest(selected_headers) != spec._gateway_access_credential_digest:
+                    record.error = IDENTITY_CHANGED
+                    return record
             if attribution:
                 from .identities import litellm_key_fingerprint
 
