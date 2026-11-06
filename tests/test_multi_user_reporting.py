@@ -278,6 +278,60 @@ def test_selected_fairness_baseline_tracks_threshold_crossings_with_comparable_w
         assert result.baseline["acceptance"]["current"] == ("fail" if new_overlap else "inconclusive")
 
 
+def test_recovery_fairness_baseline_requires_applied_threshold_and_keeps_phase_identity():
+    from tests.test_multi_user_recovery import recovery_observation
+
+    def report(*, slow=False, incomplete_schedule=False):
+        source, records = recovery_observation(lighter_rate=2, sustained_rate=4)
+        source["settings"]["pass_criteria"]["max_throughput_ratio"] = 1.5
+        if incomplete_schedule:
+            source["windows"][1]["offer_accounting"]["planned"] += 1
+        result = user_report()
+        target = result.manifest["config"]["targets"][0]["name"]
+        result.manifest["config"]["multi_user"] = source["settings"]
+        for request in records:
+            request.target = target
+            request.workload["population"] = 3
+            role = request.workload["role"]
+            if role == "lighter":
+                request.completed_ms = request.dispatch_ms + 100
+                request.elapsed_ms = request.stream_end_ms = 100
+                request.last_output_ms = 90
+            if (slow and role == "sustained" and request.workload["user_id"] == "user-03"
+                    and request.dispatch_ms > 1000):
+                request.completed_ms = 2100
+                request.elapsed_ms = 2100 - request.dispatch_ms
+        summary = summarize(source, records)
+        result.requests = records
+        result.checks[0].status = result.overall = summary["status"]
+        result.checks[0].metrics["multi_user"] = summary
+        result.observations = {"targets": {target: {"multi_user": {**source, "summary": summary}}}}
+        return result
+
+    current, previous = report(slow=True), report()
+    assert (current.overall, previous.overall) == ("fail", "pass")
+    result = compare_baseline(current, previous)
+    rows = [row for row in result.baseline["targets"][0]["comparisons"] if row["metric"] == "fairness_acceptance"]
+    assert {row["role"]: row["status"] for row in rows} == {"control": "pass", "sustained": "fail", "lighter": "pass"}
+    sustained = next(row for row in rows if row["role"] == "sustained")
+    assert sustained["current"] == 4
+    assert sustained["window_id"] == "multi_user_3_recovery_sustained"
+    assert sustained["scenario"] == "recovery / 3 / sustained"
+    assert len(sustained["evidence_ids"]) == sustained["current_samples"] == 9
+
+    incomplete = compare_baseline(report(incomplete_schedule=True), previous)
+    sustained = next(row for row in incomplete.baseline["targets"][0]["comparisons"]
+                     if row["metric"] == "fairness_acceptance" and row["role"] == "sustained")
+    assert sustained["status"] == "inconclusive"
+
+    for window in previous.checks[0].metrics["multi_user"]["windows"]:
+        window["fairness"].pop("acceptance_applies")
+    previous.checks[0].status = previous.overall = "inconclusive"
+    legacy = compare_baseline(current, previous)
+    assert legacy.baseline["acceptance"]["baseline"] == "inconclusive"
+    assert all(row["metric"] != "fairness_acceptance" for row in legacy.baseline["targets"][0]["comparisons"])
+
+
 @pytest.mark.parametrize(("drop_request", "changed_work", "expected"), [
     (True, True, "inconclusive"),
     (False, True, "inconclusive"),
