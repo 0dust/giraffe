@@ -744,7 +744,7 @@ def test_http_noisy_neighbors_replay_short_work_and_observe_injected_slowdown(tr
     class ContendedEndpoint(FakeEndpoint):
         @property
         def chunk_delay(self):
-            return .006 if self.active > 1 else .001
+            return .012 if self.active > 1 else .001
 
         @chunk_delay.setter
         def chunk_delay(self, value):
@@ -755,7 +755,9 @@ def test_http_noisy_neighbors_replay_short_work_and_observe_injected_slowdown(tr
             return " ".join([answer, *(str(i) for i in range(budget))])
 
     async def run(endpoint):
-        cfg = settings(levels=[2], duration_seconds=.5, scenarios=["noisy_neighbors"], profile=PROFILE,
+        # Several matched pairs keep one delayed control from dominating the median.
+        cfg = settings(levels=[2], duration_seconds=1.5, scenarios=["noisy_neighbors"], profile=PROFILE,
+            pass_criteria={"min_samples": 3},
             noisy_neighbors={"heavy_user_ids": ["user-02"], "heavy_profiles": [profile],
                              "triggers": [trigger], "max_slowdown": 1.1}).model_copy(update={
                 "targets": [Target(name="service", model="fake-model", url=endpoint.url)]})
@@ -770,7 +772,7 @@ def test_http_noisy_neighbors_replay_short_work_and_observe_injected_slowdown(tr
         assert all(r.timing_start_ms <= r.request_body_sent_ms <= r.completed_ms for r in completed_probes)
         evidence = result(state, cfg.targets[0]).metrics["multi_user"]["windows"][1]["interference"]
         user, = evidence["users"]
-        assert user["matched_samples"] >= 1, evidence
+        assert user["matched_samples"] >= 3, evidence
         assert user["slowdown"] > 1.1, evidence
         assert evidence["status"] == "fail", user["reasons"]
         assert user["heavy_request_ids"]
