@@ -198,12 +198,14 @@ def live_user_report():
     for user in window["users"]:
         user["profile"] = "conversation:chat"
     for request in report.requests:
-        turn = int(request.id.rsplit("-", 1)[1]) % 2
+        conversation, turn = divmod(int(request.id.rsplit("-", 1)[1]), 2)
         request.workload.update(mode="live", profile="conversation:chat", turn_id=turn,
+                                conversation_sequence=conversation+1, task_type="exact_repeat",
                                 scenario="repeated_conversations")
         request.fixture_id = f"session_live_turn{turn}"
-        request.request_hash = f"same-turn-{turn}"
+        request.request_hash = f"conversation-{conversation}-turn-{turn}"
         request.finish_reason = "stop"
+        request.score = True
     return report
 
 
@@ -229,10 +231,14 @@ def test_live_user_baseline_requires_comparable_history_and_input_usage(changed_
     assert "live generated histories" in rates[-1]["reason"]
 
 
-def test_same_live_history_mix_can_report_a_real_throughput_regression():
+@pytest.mark.parametrize(("extra_input_tokens", "expected"), [(100, "fail"), (400, "inconclusive")])
+def test_live_history_repetitions_compare_when_the_extra_work_is_comparable(extra_input_tokens, expected):
     current, previous = live_user_report(), live_user_report()
     user = current.checks[0].metrics["multi_user"]["windows"][0]["users"][-1]
     unserved = set(user["request_ids"][4:])
+    for request in previous.requests:
+        if request.id in unserved:
+            request.input_tokens = extra_input_tokens
     current.requests = [request for request in current.requests if request.id not in unserved]
     user["request_ids"] = user["request_ids"][:4]
     user["outcomes"]["valid_completed"] = 4
@@ -240,8 +246,41 @@ def test_same_live_history_mix_can_report_a_real_throughput_regression():
     result = compare_baseline(current, previous)
     row = next(row for row in result.baseline["targets"][0]["comparisons"]
                if row.get("user_id") == "user-05" and row["metric"] == "shared_window_output_tokens_per_second")
-    assert row["status"] == result.baseline["status"] == "fail"
+    assert row["status"] == result.baseline["status"] == expected
     assert row["current"] == 40 and row["baseline"] == 80
+
+
+def test_changed_live_history_cannot_establish_a_relative_acceptance_regression():
+    current, previous = live_user_report(), live_user_report()
+    for report in (current, previous):
+        settings = report.manifest["config"]["multi_user"]["pass_criteria"]
+        settings["max_completion_ms"] = 300
+        source = report.observations["targets"]["local"]["multi_user"]
+        source["settings"]["pass_criteria"] = settings
+        source["windows"][0]["scenario"] = "repeated_conversations"
+        for user in source["windows"][0]["users"]:
+            user["profile"] = "conversation:chat"
+        for request in report.requests:
+            if request.id == "user-05-7":
+                request.dispatch_ms = request.timing_start_ms = request.workload["ready_ms"] = 9900
+                request.elapsed_ms = 200 if report is previous else 500
+                request.completed_ms = request.dispatch_ms + request.elapsed_ms
+                if report is current:
+                    request.request_hash = "different-late-history"
+                    request.input_tokens = 400
+        summary = summarize(source, report.requests)
+        report.checks[0].metrics["multi_user"] = summary
+        report.checks[0].status = report.overall = summary["status"]
+
+    result = compare_baseline(current, previous)
+    rows = result.baseline["targets"][0]["comparisons"]
+    assert result.baseline["acceptance"] == {"baseline": "pass", "current": "fail"}
+    assert result.baseline["status"] == "inconclusive"
+    acceptance = next(row for row in rows if row.get("user_id") == "user-05" and row["metric"] == "user_acceptance")
+    assert acceptance["status"] == "inconclusive"
+    rate = next(row for row in rows if row.get("user_id") == "user-05"
+                and row["metric"] == "shared_window_output_tokens_per_second")
+    assert rate["status"] == "pass"
 
 
 @pytest.mark.parametrize(("current_long_index", "expected"), [(5, "inconclusive"), (None, "pass")])
@@ -465,6 +504,34 @@ def test_unqualified_scenario_cannot_pass_baseline_with_complete_user_delivery()
     compared = compare_baseline(report, report)
     assert compared.baseline["status"] == "inconclusive"
     assert any("scenario" in reason.lower() for reason in compared.baseline["targets"][0]["reasons"])
+
+
+@pytest.mark.parametrize("exposure", ["missing", "partial", "complete"])
+def test_probe_timing_regression_requires_heavy_overlap_in_both_runs(exposure):
+    current, baseline = scenario_report(), scenario_report()
+    for report in (current, baseline):
+        windows = report.checks[0].metrics["multi_user"]["windows"]
+        windows.pop()  # Compare the noisy-neighbor probe on its own.
+        evidence = windows[0]["interference"]
+        has_overlap = report is baseline or exposure != "missing"
+        if has_overlap:
+            evidence.update(status="pass", qualified=True, reasons=[])
+            user_requests = [item.id for item in report.requests if item.workload["user_id"] == "user-01"]
+            matched_requests = user_requests[:1] if report is current and exposure == "partial" else user_requests
+            evidence["users"][0].update(status="pass", qualified=True, reasons=[], probe_request_ids=matched_requests)
+        for item in report.requests:
+            item.workload.update(scenario="noisy_neighbors", role="probe",
+                                 trigger="during_stream", heavy_profile="long_short",
+                                 population=windows[0]["population"])
+            if report is current and item.workload["user_id"] == "user-01":
+                item.completed_ms += 100
+
+    compared = compare_baseline(current, baseline)
+    row = next(row for row in compared.baseline["targets"][0]["comparisons"]
+               if row["metric"] == "latency_ms" and row.get("user_id") == "user-01")
+    assert row["current"] == 200 and row["baseline"] == 100
+    assert row["status"] == ("fail" if exposure == "complete" else "inconclusive")
+    assert compared.baseline["status"] == {"missing": "inconclusive", "partial": "pass", "complete": "fail"}[exposure]
 
 
 def test_new_interference_failure_survives_incomplete_peer_cancellation_baseline():
