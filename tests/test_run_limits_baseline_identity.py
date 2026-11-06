@@ -46,14 +46,18 @@ def test_ordinary_load_baseline_survives_optional_nonce_builder_argument(additio
 
 
 @pytest.mark.parametrize("additional_checks", [[], ["access"]], ids=["load", "access-and-load"])
-def test_ordinary_load_baseline_survives_explicit_multi_user_stage(additional_checks):
+@pytest.mark.parametrize("old_source", [
+    "113325dd5cffa04626cc7be7ee93bc6e9be67335531288bc329b3542a155c92a",
+    "788f4c8f0b14421d5fc00f8b32c0ffcef79c04c647730767cb44b16584ed4aa4",
+], ids=["before-explicit-stage", "before-cutoff-fix"])
+def test_ordinary_load_baseline_survives_explicit_multi_user_stage(additional_checks, old_source):
     current, old, settings = load_reports()
     for report in (current, old):
         report.manifest["config"]["checks"].extend(additional_checks)
     old.manifest["fixture_pack"]["workload_fixture_sha256"] = fixture_hash({
         "generator_source_sha256": "d9a9e921584262148e06b636f0e8f195b7e530fd2a69c5e98f013359cf947ede",
         "settings": settings,
-        "load_test_source_sha256": "113325dd5cffa04626cc7be7ee93bc6e9be67335531288bc329b3542a155c92a",
+        "load_test_source_sha256": old_source,
     })
     assert current.manifest["fixture_pack"] != old.manifest["fixture_pack"]
     assert _settings_reasons(current, old) == []

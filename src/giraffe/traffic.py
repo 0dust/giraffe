@@ -269,6 +269,8 @@ async def run_stage(
         rate=None if schedule_pattern == "bursts" else rate_rps,
     )
     stage_end = started_at + traffic.duration_seconds
+    stage_cutoff = min(stage_end, deadline)
+    explicit = isinstance(traffic, ExplicitTrafficStage)
     sending_finished_at = None
     offer_lags_ms = [None] * len(schedule)
     outcomes = ["not_offered"] * len(schedule)
@@ -307,6 +309,23 @@ async def run_stage(
             stalls.append((offset, now - started_at))
         return offset <= discard_through
 
+    def blocked_offer(offset: float, now: float, *, refused: bool = False) -> str | None:
+        if explicit:
+            if interruption() is not None:
+                return "not_offered"
+            refused = refused or now >= stage_end
+        if refused:
+            # A closed window takes precedence when it precedes the lag limit.
+            # The public ledger keeps reserved offers that did not dispatch.
+            late = (started_at+offset+traffic.scheduler_lag_tolerance_ms/1000 < stage_cutoff
+                    and (explicit or interruption() is None) and missed_arrival(offset, now))
+            return "dropped_late" if late else "not_offered"
+        return "dropped_late" if missed_arrival(offset, now) else None
+
+    def sending_end() -> float:
+        now = time.monotonic()
+        return max(started_at, min(now, stage_cutoff)) if explicit else now
+
     def drop(index: int, outcome: str):
         outcomes[index] = outcome
         if index not in dropped_indices:
@@ -341,8 +360,8 @@ async def run_stage(
         dispatched = time.monotonic()
         lag_ms = max(0.0, (dispatched - started_at - offset) * 1000)
         offer_lags_ms[index] = lag_ms
-        if missed_arrival(offset, dispatched):
-            drop(index, "dropped_late")
+        if outcome := blocked_offer(offset, dispatched):
+            drop(index, outcome)
             return
         outcomes[index] = "started"
         try:
@@ -354,18 +373,14 @@ async def run_stage(
             ready = time.monotonic()
             lag_ms = max(0.0, (ready - started_at - offset) * 1000)
             offer_lags_ms[index] = lag_ms
-            if missed_arrival(offset, ready):
-                drop(index, "dropped_late")
+            if outcome := blocked_offer(offset, ready):
+                drop(index, outcome)
                 return
             record = await execute(spec, lambda record: annotate(index, kind, offset, lag_ms, record))
             if record is None:
                 refused = time.monotonic()
                 offer_lags_ms[index] = max(0.0, (refused-started_at-offset)*1000)
-                # A final admission check may reject setup that crossed the lag
-                # limit. Earlier window expiry or an explicit stop stays unissued.
-                late = (started_at+offset+traffic.scheduler_lag_tolerance_ms/1000 < min(stage_end, deadline)
-                        and interruption() is None and missed_arrival(offset, refused))
-                drop(index, "dropped_late" if late else "not_offered")
+                drop(index, blocked_offer(offset, refused, refused=True) or "not_offered")
                 return
             records.append((index, record))
         except asyncio.CancelledError as exc:
@@ -400,8 +415,8 @@ async def run_stage(
                     break
                 now = time.monotonic()
                 offer_lags_ms[index] = max(0, (now - started_at - offset) * 1000)
-                if missed_arrival(offset, now):
-                    drop(index, "dropped_late")
+                if outcome := blocked_offer(offset, now):
+                    drop(index, outcome)
                     continue
                 active = sum(not task.done() for task in tasks)
                 if active >= traffic.max_in_flight or not try_acquire():
@@ -420,7 +435,7 @@ async def run_stage(
                     reasons.append(reason)
                     interrupted = True
 
-        sending_finished_at = time.monotonic()
+        sending_finished_at = sending_end()
         intent.begin_drain(sending_finished_at)
         drain_deadline = (deadline if traffic.drain_timeout_seconds is None else
                           min(deadline, sending_finished_at + traffic.drain_timeout_seconds))
@@ -440,7 +455,7 @@ async def run_stage(
         interrupted = True
     finally:
         if sending_finished_at is None:
-            sending_finished_at = time.monotonic()
+            sending_finished_at = sending_end()
         intent.begin_drain(sending_finished_at)
         # Copy: task completion callbacks remove tasks from the live set.
         pending = list(tasks)
