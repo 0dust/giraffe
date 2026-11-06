@@ -355,6 +355,36 @@ def test_equal_cache_and_reasoning_usage_can_still_qualify():
     assert [user["total_generated_median_tokens"] for user in measured["users"]] == [200, 200]
 
 
+def test_normally_finished_conversations_can_qualify_below_the_output_cap():
+    records = fairness_records()
+    for request in records:
+        request.workload["session_id"] = "conversation-" + request.workload["user_id"]
+        request.finish_reason = "stop"
+        request.requested_output_tokens = None
+        request.requested_max_tokens = 32
+        request.output_tokens = request.completion_tokens = 4
+        request.score = True
+    source = fairness_observation(records)
+    for user in source["windows"][0]["users"]:
+        user["profile"] = "conversation:exact_repeat"
+    measured = fairness(summarize(source, records))
+    assert measured["status"] == "pass"
+    assert measured["ratio"] == 1
+
+
+def test_equal_medians_do_not_hide_visible_work_replaced_by_reasoning():
+    records = fairness_records((5, 5))
+    for request, output in zip(records, [100]*8 + [10, 10]):
+        request.output_tokens = output
+        request.completion_tokens = 100
+        request.reasoning_tokens = 100 - output
+    measured = fairness(summarize(fairness_observation(records), records))
+    assert measured["status"] == "inconclusive"
+    assert measured["ratio"] == pytest.approx(1.28125)
+    assert [user["output_median_tokens"] for user in measured["users"]] == [100, 100]
+    assert any("output lengths" in reason and "mix" in reason for reason in measured["reasons"])
+
+
 def test_single_user_baseline_contributes_per_user_acceptance_but_not_fairness():
     records = fairness_records()
     source = fairness_observation(records)

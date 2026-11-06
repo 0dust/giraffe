@@ -239,12 +239,13 @@ def test_reasoning_chunks_trigger_selected_cancellation_and_preserve_observation
     run_virtual(monkeypatch, run())
 
 
-@pytest.mark.parametrize("reasoning_delay", [.01, .09])
-def test_before_output_rechecks_generation_when_a_slot_opens(monkeypatch, reasoning_delay):
+@pytest.mark.parametrize(("reasoning_delay", "hold_slot"), [(.01, .01), (.09, .01), (.01, .3)])
+def test_before_output_rechecks_generation_when_a_slot_opens(monkeypatch, reasoning_delay, hold_slot):
     import httpx
     from giraffe.client import LLMClient
     from giraffe.models import LoadTestSettings
     from giraffe.multi_user import run_window
+    from giraffe.multi_user_metrics import summarize
     from tests.test_review26_phase4_accuracy import run_virtual
 
     class Stream(httpx.AsyncByteStream):
@@ -259,7 +260,7 @@ def test_before_output_rechecks_generation_when_a_slot_opens(monkeypatch, reason
             else:
                 await asyncio.sleep(.03)
             yield b'data: {"choices":[{"delta":{"content":"K7P4"}}]}\n\n'
-            await asyncio.sleep(.01)
+            await asyncio.sleep(hold_slot)
             yield b'data: {"choices":[{"delta":{"content":" 42"},"finish_reason":"length"}]}\n\n'
             yield b'data: [DONE]\n\n'
 
@@ -267,7 +268,8 @@ def test_before_output_rechecks_generation_when_a_slot_opens(monkeypatch, reason
         cfg = settings(levels=[3], duration_seconds=.25, think_time_seconds={"values": [1]},
             profile=PROFILE, scenarios=["noisy_neighbors"], noisy_neighbors={
                 "heavy_user_ids": ["user-03"], "heavy_profiles": ["long_short"],
-                "triggers": ["before_output"]}).model_copy(update={"concurrency": 2})
+                "triggers": ["before_output"]},
+            pass_criteria={"max_first_answer_ms": 70}).model_copy(update={"concurrency": 2})
         target = cfg.targets[0]
         state = runner._Run(cfg, None, None)
         client = LLMClient(target, cfg, max_connections=2)
@@ -278,7 +280,8 @@ def test_before_output_rechecks_generation_when_a_slot_opens(monkeypatch, reason
             requests += 1
             return httpx.Response(200, stream=Stream(reasoning=requests == 2))
 
-        window = _planned_observation(cfg.multi_user)["windows"][-1]
+        observation = _planned_observation(cfg.multi_user)
+        window = observation["windows"][-1]
         calibration = {(size, "short_answer"): {"filler_chars": 100} for size in ("short", "long")}
         async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as transport:
             client._client = transport
@@ -291,7 +294,14 @@ def test_before_output_rechecks_generation_when_a_slot_opens(monkeypatch, reason
         first_generation = reasoning.timing_start_ms + reasoning.first_reasoning_ms
         first_answer = reasoning.timing_start_ms + reasoning.first_output_ms
         first_slot_open = records["user-01"].completed_ms
-        if reasoning_delay == .01:
+        if hold_slot == .3:
+            assert first_generation < first_answer < window["end_ms"] < first_slot_open
+            assert requests == 2
+            heavy = summarize(observation, state.records)["windows"][-1]["users"][-1]
+            assert heavy["user_id"] == "user-03"
+            assert heavy["pending_wait"] is None
+            assert heavy["status"] == "inconclusive"
+        elif reasoning_delay == .01:
             assert first_generation < first_slot_open <= first_answer
             assert "user-03" not in records
         else:
@@ -351,6 +361,16 @@ def test_matched_interference_requires_actual_trigger_and_lengths(trigger, profi
     assert user["control_request_ids"] == [records[0].id]
     assert user["probe_request_ids"] == [records[1].id]
     assert user["heavy_request_ids"] == [records[2].id]
+
+
+def test_fairness_threshold_requires_an_eligible_window():
+    from giraffe.multi_user_metrics import summarize
+
+    source, records = matched_observation()
+    source["settings"]["pass_criteria"]["max_throughput_ratio"] = 1
+    summary = summarize(source, records)
+    assert summary["windows"][1]["interference"]["status"] == "pass"
+    assert summary["status"] == "inconclusive"
 
 
 @pytest.mark.parametrize("field", ["first_token_ms", "first_reasoning_ms"])
@@ -574,6 +594,37 @@ def test_cancellation_followup_does_not_substitute_for_peer_overlap(delayed):
     assert evidence["peer_continuation"]["status"] == "inconclusive"
     assert result["status"] == "inconclusive"
     assert source == original
+
+
+def test_failed_cancellation_followup_is_named_when_both_users_pass():
+    from tests.test_multi_user_metrics import observation
+
+    cancelled = record("user-01", identity="cancelled", status="cancelled", valid=False, intentional=True,
+        end=100, answer_chunks=2, generation_chunks=2, termination_reason="generation_chunk_limit",
+        client_cancelled_ms=90, client_cancelled_at_ns=1, finish_reason=None)
+    cancelled.workload["cancellation_role"] = "selected"
+    followup = record("user-01", identity="followup", dispatch=200, end=300)
+    failed = record("user-01", identity="failed", dispatch=350, end=500, status="failed", valid=False)
+    for item in (followup, failed):
+        item.workload["cancellation_role"] = "followup"
+    peer = record("user-02", identity="peer", end=400, stream=True, answer_reads=2,
+                  answer_chunks=2, last_output_ms=200)
+    records = [cancelled, followup, failed, peer]
+    source = observation(records, criteria={"max_error_percent": 50})
+    source["windows"][0].update(scenario="cancellation", selected_user_id="user-01", role="cancellation")
+    cfg = settings(levels=[2], scenarios=["cancellation"], cancellation={"user_id": "user-01"})
+    target = cfg.targets[0]
+    state = runner._Run(cfg, None, None)
+    state.records.extend(records)
+    state.observations[target.name]["multi_user"] = source
+
+    check = result(state, target)
+    assert check.status == "fail"
+    assert check.metrics["multi_user"]["failed_user_windows"] == 0
+    evidence = check.metrics["multi_user"]["windows"][0]["cancellation"]
+    assert evidence["cancellation"]["status"] == evidence["peer_continuation"]["status"] == "pass"
+    assert evidence["followup"]["status"] == "fail"
+    assert check.summary == "Same-user cancellation follow-up failed for user-01."
 
 
 def test_http_global_stop_cancels_all_users_and_retains_partial_once():
