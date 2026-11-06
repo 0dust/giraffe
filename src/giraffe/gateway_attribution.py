@@ -260,9 +260,28 @@ async def execute(run, target, client, *, deferred=False):
     except ValueError:
         observation.update(reason="Gateway reader or selected identity credentials are unavailable.")
         return
+    planned = settings.samples * len(settings.identities)
     reader_status = None
     if preflight_bound := reader_preflight_bound(run.config, deferred=deferred):
-        reader_status = await _reader_preflight(run, target, headers, preflight_bound)
+        def report_preflight_stop(reason):
+            observation.update(state="unverified", planned_requests=planned, observed_requests=0,
+                               collection_attempts=0, collection_complete=False,
+                               reason="Gateway spend-log reader preflight was interrupted.")
+            if reason == "maximum run duration reached" and not run.stop.is_set():
+                observation.update(reason_code="time_limited",
+                                   reason="The run deadline interrupted the gateway spend-log reader preflight.")
+            elif reason == "cancelled by user":
+                observation.update(reason="The user stopped the run during the gateway spend-log reader preflight.")
+
+        try:
+            reader_status = await _reader_preflight(run, target, headers, preflight_bound)
+        except asyncio.CancelledError:
+            report_preflight_stop(run.stop_reason(target.name))
+            raise
+        preflight_stop = run.stop_reason(target.name)
+        if preflight_stop not in {None, "maximum request budget reached"}:
+            report_preflight_stop(preflight_stop)
+            return
         if reader_status in _UNSUPPORTED_READER_STATUSES:
             observation.update(state="unsupported", reason="Read-only gateway spend logs are unsupported.",
                                planned_requests=0, observed_requests=0)
@@ -273,7 +292,6 @@ async def execute(run, target, client, *, deferred=False):
     marker = "giraffe-" + uuid.uuid4().hex
     start_date = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     records = []
-    planned = settings.samples * len(settings.identities)
 
     def report_probe_stop(reason, *, cancelled=False):
         time_limited = not run.stop.is_set() and (
