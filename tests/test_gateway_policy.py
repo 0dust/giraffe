@@ -35,7 +35,7 @@ def configuration(mode="key_rpm", **changes):
 async def exercise(monkeypatch, mode="key_rpm", *, behavior="enforce", full=False,
                    admitted_affected=None, rejection_saturation=None, saturation_header=None, peer_delay=.01,
                    early_peer_admissions=None, restart=False, model_tpm="not configured",
-                   rejection_unit=None, **settings):
+                   rejection_unit=None, key_reset="2026-01-01 00:00:00 UTC", **settings):
     monkeypatch.setenv("LIMITED", "limited-secret")
     monkeypatch.setenv("PEER", "peer-secret")
     if behavior == "duplicate_credentials":
@@ -85,7 +85,7 @@ async def exercise(monkeypatch, mode="key_rpm", *, behavior="enforce", full=Fals
                        f"Model TPM: {tpm_field}, Model RPM: {cfg.gateway_policy.model_rpm}, Remaining: 0, "
                        f"Model saturation: {saturation}"
                        if mode == "priority_rpm" else
-                       f"Rate limit exceeded for api_key: {subject}. Limit type: requests. Current limit: 2, Remaining: 0. Limit resets at: 2026-01-01")
+                       f"Rate limit exceeded for api_key: {subject}. Limit type: requests. Current limit: 2, Remaining: 0. Limit resets at: {key_reset}")
             if behavior == "unknown" or (behavior == "mixed_rejections" and counts[who] > threshold + 1):
                 message = "OpenAIException: provider rate limit"
             if behavior == "contradictory_pool":

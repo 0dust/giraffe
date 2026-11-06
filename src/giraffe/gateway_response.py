@@ -1,4 +1,5 @@
 """Allowlisted LiteLLM response evidence; raw errors never leave this parser."""
+from datetime import datetime
 from decimal import Decimal
 import re
 
@@ -6,6 +7,8 @@ from .gateway_json import parse_gateway_json
 from .models import GatewayResponseEvidence
 
 
+_LIMITER_VERSION_HEADER = "x-litellm-rate-limiter-version"
+_KEY_RESET_FORMAT = "%Y-%m-%d %H:%M:%S UTC"
 _SCOPED_LIMIT_HEADERS = {
     "api_key_rpm": "x-ratelimit-api_key-limit-requests",
     "model_rpm": "x-ratelimit-model_saturation_check-limit-requests",
@@ -29,6 +32,28 @@ _CAPACITY_REJECTION = re.compile(
 
 def _bounded_limit(value):
     return int(value) if isinstance(value, str) and re.fullmatch(r"[0-9]{1,12}", value) else None
+
+
+def _scoped_remaining_matches(headers, scope, unit, expected, *, clamp=False):
+    name = f"x-ratelimit-{scope}-remaining-{unit}"
+    if name not in headers:
+        return True
+    value = headers[name]
+    if not isinstance(value, str) or not re.fullmatch(r"-?[0-9]{1,12}", value):
+        return False
+    remaining = int(value)
+    return (max(0, remaining) if clamp else remaining) == expected
+
+
+def _key_reset_matches(headers, reported_reset):
+    if "reset_at" not in headers:
+        return True
+    if headers["reset_at"] != reported_reset:
+        return False
+    try:
+        return datetime.strptime(reported_reset, _KEY_RESET_FORMAT).strftime(_KEY_RESET_FORMAT) == reported_reset
+    except ValueError:
+        return False
 
 
 def _model_group(value):
@@ -85,7 +110,7 @@ def response_evidence(status, body=b"", headers=None, *, declared_priority=None,
             setattr(evidence, field, value)
     evidence._scoped_limits = {scope: _bounded_limit(headers[name])
                                for scope, name in _SCOPED_LIMIT_HEADERS.items() if name in headers}
-    if headers.get("x-litellm-rate-limiter-version") == "v3":
+    if headers.get(_LIMITER_VERSION_HEADER) == "v3":
         evidence.limiter_version = "v3"
         evidence.priority_request_limit = evidence._scoped_limits.get("priority_rpm")
     retry = headers.get("retry-after")
@@ -99,6 +124,8 @@ def response_evidence(status, body=b"", headers=None, *, declared_priority=None,
             evidence._priority_model_group = _model_group(headers.get("x-litellm-model-group"))
         return evidence
     evidence.policy_rejection = "unknown"
+    if _LIMITER_VERSION_HEADER in headers and evidence.limiter_version is None:
+        return evidence
     data = parse_gateway_json(body)
     error = data.get("error") if isinstance(data, dict) else None
     if not isinstance(error, dict) or error.get("type") != "throttling_error" or error.get("code") not in (429, "429"):
@@ -106,20 +133,26 @@ def response_evidence(status, body=b"", headers=None, *, declared_priority=None,
     message = error.get("message")
     if not isinstance(message, str) or len(message) > 8192 or re.search(r"\b\w+Exception\b", message):
         return evidence
-    key = re.fullmatch(r"Rate limit exceeded for api_key: ([0-9a-f]{64})\. Limit type: requests\. Current limit: ([0-9]{1,12}), Remaining: ([0-9]{1,12})\. Limit resets at: [^\r\n]{1,128}", message)
+    key = re.fullmatch(r"Rate limit exceeded for api_key: ([0-9a-f]{64})\. Limit type: requests\. Current limit: ([0-9]{1,12}), Remaining: ([0-9]{1,12})\. Limit resets at: (?P<reset>[^\r\n]{1,128})", message)
     if key and key[1] == expected_key_hash:
-        if headers.get("rate_limit_type") not in (None, "requests"):
+        remaining = int(key[3])
+        if (headers.get("rate_limit_type") not in (None, "requests")
+                or not _scoped_remaining_matches(headers, "api_key", "requests", remaining, clamp=True)
+                or not _key_reset_matches(headers, key["reset"])):
             return evidence
         evidence.error_kind, evidence.policy_rejection = "rate_limit", "key_rpm"
         evidence.rate_limit_unit = "requests"
-        evidence.request_limit, evidence.request_remaining = int(key[2]), int(key[3])
+        evidence.request_limit, evidence.request_remaining = int(key[2]), remaining
     elif match := _PRIORITY_REJECTION.fullmatch(message) or _CAPACITY_REJECTION.fullmatch(message):
-        if headers.get("rate_limit_type") not in (None, match["unit"]):
+        priority_pool = match.re is _PRIORITY_REJECTION
+        scope = "priority_model" if priority_pool else "model_saturation_check"
+        if (headers.get("rate_limit_type") not in (None, match["unit"])
+                or not _scoped_remaining_matches(headers, scope, match["unit"], 0)):
             return evidence
         evidence.error_kind = "rate_limit"
-        evidence.policy_rejection = "priority_pool" if match.re is _PRIORITY_REJECTION else "model_capacity"
+        evidence.policy_rejection = "priority_pool" if priority_pool else "model_capacity"
         evidence.rate_limit_unit, evidence.model_rpm = match["unit"], int(match["rpm"])
-        if (match.re is _PRIORITY_REJECTION and no_reported_fallback
+        if (priority_pool and no_reported_fallback
                 and headers.get("x-litellm-model-group") in (None, match["model"])):
             evidence._priority_model_group = _model_group(match["model"])
         if declared_priority:
