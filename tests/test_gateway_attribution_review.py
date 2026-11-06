@@ -132,6 +132,26 @@ async def test_changed_total_between_pages_is_incomplete(monkeypatch):
     assert check.metrics["collection_complete"] is False
 
 
+@pytest.mark.parametrize("recovers", [False, True])
+async def test_overlapping_spend_pages_cannot_hide_a_missing_row(monkeypatch, recovers):
+    monkeypatch.setattr("giraffe.gateway_attribution.PAGE_SIZE", 3)
+    polls = 0
+
+    async def observer(request, rows):
+        nonlocal polls
+        if request.url.params["page"] == "1":
+            polls += 1
+            return spend_page(request, [*rows, {"request_id": "unrelated"}], total=4)
+        extra_id = "distinct" if recovers and polls > 1 else "unrelated"
+        return spend_page(request, [{"request_id": extra_id}], total=4)
+
+    cfg, run, _ = setup(monkeypatch, observer)
+    check = await collect(cfg, run)
+    assert check.metrics["collection_complete"] is recovers
+    assert check.metrics["state"] == ("verified" if recovers else "unverified")
+    assert check.metrics["matched_requests"] == (2 if recovers else 0)
+
+
 async def test_late_logs_are_read_in_final_part_of_settle_window(monkeypatch):
     started = None
     times = []

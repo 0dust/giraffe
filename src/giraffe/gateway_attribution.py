@@ -16,6 +16,7 @@ from .models import CheckResult, RequestSpec
 
 
 CHECK = "gateway_attribution"
+COLLECTION_VERSION = 2
 MAX_BODY_BYTES = 4 * 1024 * 1024
 MAX_PAGES = 8
 PAGE_SIZE = 128
@@ -129,6 +130,7 @@ def _client(config, headers, timeout):
 
 async def _pages(client, url, marker, *, start_date, end_date, max_rows, stop):
     rows = []
+    row_ids = set()
     expected_total = None
     page_size = min(PAGE_SIZE, max_rows)
     for page in range(1, MAX_PAGES + 1):
@@ -163,6 +165,12 @@ async def _pages(client, url, marker, *, start_date, end_date, max_rows, stop):
                 return rows, False
             if len(data) != min(page_size, total - len(rows)):
                 return rows, False
+            # Offset pages can overlap when the result changes between reads.
+            for row in data:
+                row_id = row.get("request_id") if isinstance(row, dict) else None
+                if not isinstance(row_id, str) or not row_id or row_id in row_ids:
+                    return rows, False
+                row_ids.add(row_id)
             expected_total = total
             rows.extend(data)
             if len(rows) == total:
@@ -280,7 +288,8 @@ async def execute(run, target, client):
         # Secret-derived fingerprints are transient and never included in reports.
         for record in records:
             record._gateway_key_hash = None
-        assessment.update(collection_attempts=attempts, source="litellm_spend_logs_v2",
+        assessment.update(collection_attempts=attempts, collection_version=COLLECTION_VERSION,
+            source="litellm_spend_logs_v2",
             evidence_scope="Exact generated request markers; aggregate counters and counter resets are not used.")
         run.observations[target.name][CHECK] = assessment
 

@@ -3039,7 +3039,7 @@ function resultGuidance(report) {
 // Report navigation is scoped to this visit. Polls never override an explicit tab choice.
 let reportView={id:null,tab:null,explicit:false,wasLive:false,terminalSwitch:false,performance:null,target:null,window:null,error:'',pending:false,sequence:0,lastFetch:0};
 const reportSections=[['overview','Performance overview',null],['timing','Request timing',null],['throughput','Throughput & capacity','throughput_capacity'],['delivery','Load delivery','delivery'],['outcomes','Outcomes & quality','outcomes'],['tokens','Workload & tokens','token_accounting'],['effects','Conversations & workload effects','conversations'],['server','Server observations','server'],['baseline','Baseline comparison','baseline']];
-const comparisonSections=[['answers','Answers & correctness'],['timing','Response timing'],['delivery','Request completion']];
+const comparisonSections=[['answers','Answers & correctness'],['timing','Response timing'],['delivery','Request completion'],['gateway-attribution-outcomes','Gateway attribution outcomes']];
 const reportResultSections=[['comparison','Baseline comparison'],['acceptance','Pass / fail','comparison'],['load-acceptance','Tested load acceptance','comparison'],...comparisonSections.map(([id,label])=>[id,label,'comparison']),['checks','Checks & evidence'],['configuration','Run configuration'],['requests','All requests'],['resources','Peak memory (RAM)']];
 function reportRoute(hash=typeof location==='undefined'?'':location.hash) {
   const request=hash.match(/^#runs\/([^/]+)\/requests\/([^/]+)$/);
@@ -3805,6 +3805,7 @@ function comparisonOutputs(target) {
   return rows;
 }
 function comparisonChange(row) {
+  if(row.aggregation==='observed')return row.status==='inconclusive'?'Not comparable':row.current===row.baseline?'Same outcome':'Outcome changed';
   if(row.current==null||row.baseline==null)return 'Not measured';
   const delta=row.current-row.baseline;
   if(delta===0)return 'No change';
@@ -3814,12 +3815,12 @@ function comparisonChange(row) {
   return `${percent>0?'+':''}${number(percent,1)}%`;
 }
 function comparisonMetricLabel(row) {
-  return ({correctness_rate:'Correct answers',valid_completion_rate:'Completed valid responses',error_rate:'Request errors',latency_ms:'Full response time',first_output_ms:'First useful output',max_stream_gap_ms:'Longest pause per response',output_tokens_per_second:'Output rate, including initial wait',generation_tokens_per_second:'Generation pace',output_tokens:'Answer length · tokens',output_chars:'Answer length · characters'})[row.metric]||human(row.metric);
+  return ({attribution_outcome:'Attribution outcome',correctness_rate:'Correct answers',valid_completion_rate:'Completed valid responses',error_rate:'Request errors',latency_ms:'Full response time',first_output_ms:'First useful output',max_stream_gap_ms:'Longest pause per response',output_tokens_per_second:'Output rate, including initial wait',generation_tokens_per_second:'Generation pace',output_tokens:'Answer length · tokens',output_chars:'Answer length · characters'})[row.metric]||human(row.metric);
 }
 function comparisonWarnings(row) {
   return row.warnings?.length?row.warnings.map(w=>w.message):row.status==='inconclusive'?[row.reason||'Insufficient evidence to interpret this change.']:[];
 }
-function comparisonCategory(row){return ['correctness_rate','output_tokens','output_chars'].includes(row.metric)?'answers':['valid_completion_rate','error_rate'].includes(row.metric)?'delivery':'timing';}
+function comparisonCategory(row){if(row.metric==='attribution_outcome')return 'gateway-attribution-outcomes';return ['correctness_rate','output_tokens','output_chars'].includes(row.metric)?'answers':['valid_completion_rate','error_rate'].includes(row.metric)?'delivery':'timing';}
 function comparisonWarningSummary(row) {
   const notes=[];
   for(const warning of row.warnings||[]){
@@ -3839,14 +3840,14 @@ function comparisonWarningSummary(row) {
 function comparisonTable(rows) {
   return `<div class="comparison-values">${rows.map(row=>{
     const warnings=comparisonWarnings(row),shortWarnings=comparisonWarningSummary(row),commonWindow=row.aggregation==='common_window';
-    const aggregation=commonWindow?'Common window':row.aggregation==='mean'?'Rate':'Median';
+    const aggregation=row.aggregation==='observed'?'Observed outcome':commonWindow?'Common window':row.aggregation==='mean'?'Rate':'Median';
     const label=commonWindow?(row.status==='fail'?'Observed decrease':warnings.length?'Warning':'Observed'):row.descriptive?'Observed':row.status==='fail'?'Regression detected':warnings.length?'Warning':'No material regression';
     return `<article class="comparison-measurement" data-metric="${escape(row.metric)}"><div class="comparison-measurement-heading"><h4>${escape(comparisonMetricLabel(row))}</h4><small>${aggregation} · ${escape(label)}</small></div><dl class="comparison-value-grid"><div><dt>Baseline</dt><dd>${comparisonValue(row,row.baseline)}</dd><small>n=${number(row.baseline_samples)}</small></div><div><dt>Current</dt><dd>${comparisonValue(row,row.current)}</dd><small>n=${number(row.current_samples)}</small></div><div><dt>Change</dt><dd>${comparisonChange(row)}</dd></div></dl>${commonWindow&&row.method?`<p class="hint">${escape(row.method)}</p>`:''}${warnings.length?`<div class="comparison-brief-warning">${shortWarnings.map(w=>`<p>${escape(w)}</p>`).join('')}<details class="comparison-support"><summary>Why this warning?</summary><ul>${warnings.map(w=>`<li>${escape(w)}</li>`).join('')}</ul></details></div>`:''}${row.worsening_interval_95?`<details class="comparison-statistics"><summary>Statistical details</summary><p>95% interval for worsening: ${row.worsening_interval_95.map(v=>number(v,1)).join(' to ')} ${row.change_unit==='percentage_points'?'percentage points':'%'}. Threshold: ${number(row.threshold,1)} ${row.change_unit==='percentage_points'?'percentage points':'%'}. Warnings still apply.</p></details>`:''}</article>`;
   }).join('')}</div>`;
 }
 function comparisonCohort(row){return row.load_point?['source','type','workload','shape','pattern','level','rate','bursts','phase','role'].map(name=>row.load_point[name]):row.scenario;}
 function comparisonGroup(id,rows) {
-  const row=rows[0],label=row?.load_point?comparisonLoadLabel(row.load_point):scenarioLabel(row);
+  const row=rows[0],label=row?.load_point?comparisonLoadLabel(row.load_point):row?.scenario_label||scenarioLabel(row);
   return `<div class="comparison-check-group" data-comparison-group="${escape(id)}"><p class="comparison-group-heading hint">${escape(row?.targetName||'')} · ${escape(catalogTitle(id))} · ${escape(label)}</p>${comparisonTable(rows)}</div>`;
 }
 

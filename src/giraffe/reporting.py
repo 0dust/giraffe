@@ -27,7 +27,7 @@ from .caps import (MAX_HTML_PREVIEW_CHARS, MAX_HTML_JSON_PREVIEW_CHARS,
 from .deployment import deployment_diff, fixture_hash, safe_config, sanitize
 from .report_inputs import input_ref as _input_ref
 from .multi_user_metrics import user_latency
-from .models import (CHECK_NAMES, SHAPES, CheckResult, RequestRecord, RunConfig, RunReport, overall_status, load_shape_label,
+from .models import (CHECK_NAMES, SHAPES, CheckResult, GatewayAttribution, RequestRecord, RunConfig, RunReport, overall_status, load_shape_label,
                      migrate_concurrent_load, migrate_run_limits, is_supported_schema, CURRENT_SCHEMA)
 from .stats import median, percentile
 from .storage import DEFAULT_LIMITS, format_size, fsync_directory, update_metadata, write_metadata
@@ -1213,6 +1213,67 @@ def _acceptance_status(report: RunReport) -> str:
         memory_limit_interrupted=any(check.required and (check.target, check.id) in interrupted for check in checks))
 
 
+def _compare_gateway_attribution(report, baseline, target, compatible):
+    from .gateway_attribution import CHECK, COLLECTION_VERSION
+
+    config = report.manifest.get("config", {})
+    if CHECK not in config.get("checks", []):
+        return []
+    try:
+        settings = GatewayAttribution.model_validate(config.get(CHECK))
+    except ValidationError:
+        return []
+
+    def check_for(run):
+        return next((check for check in run.checks if check.id == CHECK and check.target == target
+                     and check.required), None)
+
+    def outcome(metrics, alias):
+        matching = [row for row in metrics.get("identities", []) if row.get("identity") == alias]
+        row = matching[0] if len(matching) == 1 else {}
+        if (metrics.get("collection_version") != COLLECTION_VERSION
+                or metrics.get("collection_complete") is not True or metrics.get("evidence_changed") is not False):
+            return "unverified", 0, row
+        matched, mismatched, unverified = (row.get(key) for key in
+            ("matched_requests", "mismatched_requests", "unverified_requests"))
+        counts = (matched, mismatched, unverified)
+        if (not all(type(count) is int and 0 <= count <= settings.samples for count in counts)
+                or sum(counts) != row.get("observed_requests") or sum(counts) > settings.samples):
+            return "unverified", 0, row
+        if mismatched:
+            return "mismatch", matched + mismatched, row
+        return ("verified" if matched == settings.samples else "unverified"), matched, row
+
+    current_check, baseline_check = check_for(report), check_for(baseline)
+    if current_check is None:
+        return []
+    previous = baseline_check.metrics if baseline_check else {}
+    rows = []
+    for alias in settings.identities:
+        current, current_samples, evidence = outcome(current_check.metrics, alias)
+        old, baseline_samples, _ = outcome(previous, alias)
+        status = "inconclusive"
+        if not compatible:
+            reason = "Run settings or target identity references differ."
+        elif previous.get("collection_version") != COLLECTION_VERSION:
+            reason = "Rerun the baseline with complete spend-log pagination evidence."
+        elif not baseline_check or baseline_check.status != "pass" or old != "verified":
+            reason = "The baseline lacks complete verified attribution for the selected identities."
+        elif current == "unverified":
+            reason = "Current attribution is incomplete for this identity."
+        else:
+            status = "fail" if current == "mismatch" else "pass"
+            reason = ("A previously verified identity now has a gateway identity or token mismatch."
+                      if status == "fail" else "The identity and final token counts still match.")
+        rows.append({"check": CHECK, "scenario": alias, "scenario_label": alias,
+                     "metric": "attribution_outcome", "aggregation": "observed",
+                     "current": current, "baseline": old, "status": status, "reason": reason,
+                     "current_samples": current_samples, "baseline_samples": baseline_samples,
+                     "worsening": 100 if status == "fail" else 0,
+                     "evidence_ids": evidence.get("request_ids", [])})
+    return rows
+
+
 def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
     """Return a new report with explicit baseline evidence; never mutate or promote a baseline."""
     result = report.model_copy(deep=True)
@@ -1242,7 +1303,8 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                   "Rates use percentage points; timing and output rate use relative percent. "
                   "Output token rate is end-to-end server-reported output tokens / elapsed seconds. "
                   "Intervals describe within-run variation, not cross-run environmental stability. "
-                  "Per-user shared-window delivery compares observed common-window rates without a confidence interval.",
+                  "Per-user shared-window delivery compares observed common-window rates without a confidence interval. "
+                  "Gateway attribution compares qualified identity and token outcomes without a confidence interval.",
     }
     for target in targets or [{"name": "unknown"}]:
         name = target["name"]
@@ -1282,7 +1344,7 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                         "baseline_agreement": old_bucket.get("agreement_rate"),
                         "comparable": not target_reasons,
                         "interpretation": "Repeatability and task correctness are separate. Different answers alone do not prove regression."})
-        rows = []
+        rows = _compare_gateway_attribution(report, baseline, name, not target_reasons)
         user_rows, user_reasons = _compare_user_delivery(report, baseline, name, target_reasons, threshold)
         rows.extend(user_rows)
         # Optional observations and checks without inference/acceptance cohorts
@@ -1465,6 +1527,8 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
             covered.add("capacity")
         if any(row["status"] in {"pass", "fail"} for row in (load_tests or {}).get("points", [])):
             covered.add("load")
+        if any(row["check"] == "gateway_attribution" and row["status"] == "inconclusive" for row in rows):
+            covered.discard("gateway_attribution")
         missing_checks = sorted(selected_checks - covered)
         traffic_failures = [row for row in (traffic or {}).get("stages", []) if row["status"] == "fail"]
         load_failures = [row for row in (load_tests or {}).get("points", []) if row["status"] == "fail"]
@@ -1513,7 +1577,7 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
             summary += " " + load_tests["reason"]
         if excluded:
             summary += f" {excluded} metric(s) not comparable (low samples, undefined values or uncertain attribution); see comparison details."
-        if status == "inconclusive" and missing_checks:
+        if status == "inconclusive" and set(missing_checks) - {"gateway_attribution"}:
             summary += (f" To conclude, collect at least {minimum} measured samples per metric in both the current and baseline runs,"
                         " using the same workload and settings; rerun longer if variation remains uncertain.")
         entry = {"target": name, "status": status, "summary": summary, "reasons": target_reasons,
@@ -2456,7 +2520,10 @@ def _baseline_table_html(baseline: dict[str, Any], report: RunReport | None = No
                 return f"{number * 100:.1f}%" if rate else _number(number)
 
             change = "—"
-            if isinstance(before, (int, float)) and isinstance(after, (int, float)):
+            if row.get("aggregation") == "observed":
+                change = ("Not comparable" if row.get("status") == "inconclusive" else
+                          "Same outcome" if before == after else "Outcome changed")
+            elif isinstance(before, (int, float)) and isinstance(after, (int, float)):
                 if rate:
                     change = f"{(after - before) * 100:+.1f} pp"
                 elif before:
