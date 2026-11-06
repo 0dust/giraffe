@@ -12,7 +12,7 @@ from .identities import identity_headers, litellm_key_fingerprint
 from .models import CheckResult, RequestSpec
 
 
-VERSION = 12
+VERSION = 13
 PROMPT = "Reply with exactly the word OK."
 
 
@@ -72,7 +72,7 @@ async def execute(run, target, client):
                 observation["offered"][user.identity] += 1
 
             record = await run.request(target, client, spec, admission_deadline=end,
-                                       on_start=dispatched)
+                                       prepared_admission=True, on_start=dispatched)
             if record is None:
                 return
             if sequence+1 < user.requests:

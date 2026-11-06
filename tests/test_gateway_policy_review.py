@@ -1,5 +1,6 @@
 """Policy verdicts distinguish response success from gateway admission evidence."""
 import asyncio
+import time
 
 import httpx
 import pytest
@@ -62,6 +63,98 @@ async def test_policy_requires_operator_confirmed_counter_scope(monkeypatch, mod
     assert check.status == "inconclusive"
     assert check.metrics["gateway_policy"]["qualification"] == "unverified"
     assert "operator-confirmed authoritative limiter counter" in check.summary
+
+
+@pytest.mark.usefixtures("local_tokenizer")
+@pytest.mark.parametrize("shared,stall", [
+    (False, "build"), (True, "build"), (True, "lease"), (True, "progress"), (True, None),
+])
+async def test_policy_admits_only_at_prepared_transport(monkeypatch, shared, stall):
+    from giraffe.runner import _Run
+    from giraffe.transport import HTTPClientPool
+
+    config = configuration(duration_seconds=.15 if stall is not None else 2)
+    if shared:
+        config.checks = ["serving", "gateway_policy"]
+    config.samples = 2
+    config.stream = False
+    config.targets[0].api_key_env = "SHARED"
+    for name in ("SHARED", "LIMITED", "PEER"):
+        monkeypatch.setenv(name, name.lower())
+    wire, events, runs = [], [], []
+    stalled = False
+
+    def stall_once(kind):
+        nonlocal stalled
+        if stall == kind and not stalled:
+            stalled = True
+            time.sleep(.25)
+
+    def progress(event):
+        if event["scenario"] == "gateway_policy" and event["event"] in {"request_started", "request_completed"}:
+            events.append((event["event"], event["request_slot"], time.monotonic()))
+            if event["event"] == "request_started":
+                stall_once("progress")
+
+    async def handler(request):
+        if request.method != "POST":
+            return httpx.Response(404)
+        wire.append((request.headers["authorization"], time.monotonic()))
+        return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "OK"},
+            "finish_reason": "stop"}], "usage": {"prompt_tokens": 8, "completion_tokens": 2}})
+
+    class Transport(httpx.AsyncClient):
+        def build_request(self, method, url, **kwargs):
+            if "cache" in (kwargs.get("json") or {}):
+                stall_once("build")
+            return super().build_request(method, url, **kwargs)
+
+    send = HTTPClientPool.send
+
+    async def delayed_lease(self, request, **kwargs):
+        if stall != "lease" or stalled or request.headers.get("authorization") == "Bearer shared":
+            return await send(self, request, **kwargs)
+        acquire = self._slots.acquire
+
+        async def slow_acquire():
+            await acquire()
+            stall_once("lease")
+
+        with monkeypatch.context() as lease_patch:
+            lease_patch.setattr(self._slots, "acquire", slow_acquire)
+            return await send(self, request, **kwargs)
+
+    init = _Run.__init__
+
+    def capture_run(self, *args, **kwargs):
+        init(self, *args, **kwargs)
+        runs.append(self)
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: Transport(transport=httpx.MockTransport(handler), **kw))
+    monkeypatch.setattr(HTTPClientPool, "send", delayed_lease)
+    monkeypatch.setattr(_Run, "__init__", capture_run)
+    report = await run_suite(config, progress=progress)
+    run, = runs
+    observation = report.observations["targets"]["proxy"]["gateway_policy"]
+    shared_wire = [credential for credential, _ in wire if credential == "Bearer shared"]
+    policy_wire = [at for credential, at in wire if credential != "Bearer shared"]
+    policy_records = [record for record in report.requests if record.identity is not None]
+    assert len(shared_wire) == (3 if shared else 0)
+    assert len(policy_wire) == len(policy_records) == sum(observation["offered"].values())
+    assert run.attempted == report.observations["request_budget_used"] == len(wire)
+    assert run.slots.qsize() == run.max_connections
+    assert all((at - run.start)*1000 < observation["end_ms"] for at in policy_wire)
+    starts = {slot: at for event, slot, at in events if event == "request_started"}
+    completions = {slot: at for event, slot, at in events if event == "request_completed"}
+    assert starts.keys() == completions.keys()
+    assert len(starts) == len(policy_wire)
+    assert all(starts[slot] <= completions[slot] for slot in starts)
+    if stall == "progress":
+        assert stalled and policy_wire and min(policy_wire) <= min(starts.values())
+    elif stall is not None:
+        assert stalled and not policy_wire
+    else:
+        assert observation["complete"] and len(policy_wire) == 13
 
 
 @pytest.mark.usefixtures("local_tokenizer")
