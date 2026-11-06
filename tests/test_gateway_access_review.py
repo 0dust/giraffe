@@ -175,6 +175,100 @@ def test_access_plan_counts_only_configured_aliases_by_target(monkeypatch):
     assert {item["target"]: item["requests"] for item in plan["unknown_time_components"]} == {"proxy": 2, "partial": 1}
 
 
+def _mock_recovery_gateway(monkeypatch):
+    async def handler(request):
+        if request.method != "POST":
+            return httpx.Response(404)
+        auth = request.headers.get("authorization")
+        if auth and int(auth[-1]) % 2:
+            return httpx.Response(401, json={"error": {"type": "token_not_found_in_db"}})
+        prompt = json.loads(request.content)["messages"][0]["content"]
+        if auth:
+            answer = "OK"
+        elif prompt.startswith("Notes:"):
+            answer = "L8N2"
+        else:
+            answer = prompt.partition("\n")[2] or "OK"
+        await asyncio.sleep(.025)
+        return httpx.Response(200, json={"choices": [{"message": {
+            "role": "assistant", "content": answer}, "finish_reason": "stop"}]})
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
+
+
+async def test_recovery_reserves_access_cases_on_the_target_that_can_send_them(monkeypatch, local_tokenizer):
+    from giraffe.planning import request_plan
+
+    raw = config(max_requests=16, retention="all").model_dump()
+    raw.update(checks=["recovery", "gateway_access"], test_options={"recovery": {
+        "samples": 1, "concurrency": 1, "sustained_seconds": .5}}, limits={"min_samples": 2})
+    ready = raw["targets"][0]
+    ready.update(name="ready", test_identities={f"key{i}": {"api_key_env": f"RECOVERY_KEY_{i}"} for i in range(6)})
+    raw["targets"].append({"name": "empty", "url": "http://empty/v1", "model": "test"})
+    raw["gateway_access"]["cases"] = [
+        {"name": f"case{i}", "identity": f"key{i}", "expected": "deny" if i % 2 else "allow"} for i in range(6)]
+    for i in range(6):
+        monkeypatch.setenv(f"RECOVERY_KEY_{i}", f"testkey-{i}")
+    cfg = RunConfig.model_validate(raw)
+    _mock_recovery_gateway(monkeypatch)
+    report = await run_suite(cfg)
+    checks = {(check.target, check.id): check for check in report.checks}
+    assert checks["ready", "gateway_access"].status == "pass"
+    assert checks["empty", "gateway_access"].status == "inconclusive"
+    assert [record.scenario for record in report.requests if record.target == "ready"] == (
+        ["recovery_baseline", "recovery"] + ["gateway_access"] * 6)
+    assert [record.scenario for record in report.requests if record.target == "empty"] == (
+        ["recovery_prime", "recovery_baseline"] + ["sustained"] * 5 + ["recovery"])
+    targets = report.observations["targets"]
+    assert targets["ready"]["sustained_budget"]["reserved_later"] == 7
+    assert targets["ready"]["sustained_budget"]["allowance"] == 0
+    assert targets["empty"]["sustained_budget"]["allowance"] == 5
+    plan = request_plan(cfg)
+    prime = next(row for row in plan["rows"] if row["id"] == "recovery_prime")
+    assert prime["target_request_counts"] == {"ready": 0, "empty": 1}
+    assert not any(warning["kind"] == "incomplete_coverage" for warning in plan["request_warnings"])
+
+
+@pytest.mark.parametrize("configured", [False, True])
+async def test_unavailable_access_does_not_halve_recovery_budget(monkeypatch, local_tokenizer, configured):
+    cfg = config(max_requests=6, retention="all")
+    cfg.checks = ["recovery", "gateway_access"]
+    cfg = RunConfig.model_validate({**cfg.model_dump(), "test_options": {"recovery": {
+        "samples": 1, "concurrency": 1, "sustained_seconds": .5}}, "limits": {"min_samples": 3}})
+    if not configured:
+        cfg.gateway_access = None
+    monkeypatch.delenv("ALLOW_KEY", raising=False)
+    monkeypatch.delenv("DENY_KEY", raising=False)
+    _mock_recovery_gateway(monkeypatch)
+    report = await run_suite(cfg)
+    checks = {check.id: check for check in report.checks}
+    assert checks["recovery"].status == "pass"
+    assert checks["gateway_access"].status == "inconclusive"
+    assert not any(record.identity for record in report.requests)
+    budget = report.observations["targets"]["proxy"]["sustained_budget"]
+    assert budget["reserved_later"] == 1 and budget["allowance"] == 3
+
+
+async def test_unavailable_access_preserves_the_cap_for_other_adaptive_work(monkeypatch, local_tokenizer):
+    from giraffe.planning import request_plan
+
+    raw = config(max_requests=6, retention="all").model_dump()
+    raw.update(checks=["recovery", "gateway_access", "sessions"], gateway_access=None,
+               sessions={"profile": "performance", "modes": ["live"], "workloads": [
+                   {"name": "chat", "turns": ["First", "Second"]}]},
+               test_options={"recovery": {"samples": 1, "concurrency": 1, "sustained_seconds": .5}},
+               limits={"min_samples": 3})
+    cfg = RunConfig.model_validate(raw)
+    session_row = next(row for row in request_plan(cfg)["rows"] if row["id"] == "sessions")
+    assert session_row["requests_per_target"] is None
+    _mock_recovery_gateway(monkeypatch)
+    report = await run_suite(cfg)
+    budget = report.observations["targets"]["proxy"]["sustained_budget"]
+    assert budget["reserved_later"] == 1 and budget["allowance"] == 2
+    assert any(record.scenario.startswith("session_") for record in report.requests)
+
+
 @pytest.mark.parametrize("availability", ["missing_aliases", "missing_env", "conflicting_keys", "partial_env"])
 async def test_unavailable_access_probes_leave_shared_token_evidence_budget(monkeypatch, local_tokenizer, availability):
     cfg = config(max_requests=5 if availability == "partial_env" else 4, retention="all")
@@ -584,7 +678,7 @@ async def test_access_denial_rules_do_not_change_policy_evidence(monkeypatch, lo
     assert check.status == "pass"
     baseline = report.model_copy(deep=True)
     # A passing quota run saved on the immediate policy predecessor, before gateway access.
-    baseline.manifest["gateway_policy_source_sha256"] = "6066ed7ee2986f972bfeeabc96d10219bcbc3d2d042cf8b9e1fd530a459ffeb4"
+    baseline.manifest["gateway_policy_source_sha256"] = "bb91e6e6e5ccc833f4ae9aa24da222fa43a693ca7e56fb6ead903a8d5c6cea8a"
     assert compare_baseline(report, baseline).baseline["status"] == "pass"
 
 
