@@ -179,8 +179,9 @@ async def _reader(config, headers, timeout, *, stop, deadline):
 
 @asynccontextmanager
 async def _spend_page(client, url, marker, start_date, end_date, page, page_size, *, stop, deadline):
-    request = client.build_request("GET", url, params={"session_id": marker, "page": page,
-        "page_size": page_size, "start_date": start_date, "end_date": end_date})
+    request = client.build_request("GET", url, headers={"Accept-Encoding": "identity"},
+        params={"session_id": marker, "page": page, "page_size": page_size,
+                "start_date": start_date, "end_date": end_date})
     # Building a request can cross a deadline before asyncio can deliver cancellation.
     if _reader_interrupted(stop, deadline):
         yield None
@@ -217,6 +218,8 @@ async def _reader_preflight(run, target, headers, bound):
                                            stop=run.stop, deadline=deadline) as response:
                         status = response.status_code if response is not None else None
                 return None if _reader_interrupted(run.stop, deadline) else status
+    except httpx.InvalidURL:
+        return "invalid_url"
     except (httpx.HTTPError, OSError, TimeoutError, ValueError):
         return None
 
@@ -237,13 +240,14 @@ async def _pages(client, url, marker, *, start_date, end_date, max_rows, stop, d
                 return "unsupported", False
             if response.status_code != 200:
                 return "unavailable", False
+            # HTTPX decodes compressed chunks before the body size can be checked.
+            if response.headers.get("content-encoding", "identity").strip().lower() != "identity":
+                return rows, False
             body = bytearray()
             async for chunk in response.aiter_bytes():
-                if _reader_interrupted(stop, deadline):
+                if _reader_interrupted(stop, deadline) or len(body) + len(chunk) > MAX_BODY_BYTES:
                     return rows, False
                 body.extend(chunk)
-                if len(body) > MAX_BODY_BYTES:
-                    return rows, False
             if _reader_interrupted(stop, deadline):
                 return rows, False
             try:
@@ -323,6 +327,11 @@ async def execute(run, target, client, *, deferred=False):
         preflight_stop = run.stop_reason(target.name)
         if preflight_stop not in {None, "maximum request budget reached"}:
             report_preflight_stop(preflight_stop)
+            return
+        if reader_status == "invalid_url":
+            observation.update(reason="Read-only gateway spend-log reader URL is invalid.",
+                               planned_requests=planned, observed_requests=0,
+                               collection_attempts=0, collection_complete=False)
             return
         if reader_status in _UNSUPPORTED_READER_STATUSES:
             observation.update(state="unsupported", reason="Read-only gateway spend logs are unsupported.",
@@ -456,6 +465,8 @@ async def execute(run, target, client, *, deferred=False):
         if assessment["state"] == "unverified":
             assessment.update(reason="Gateway evidence collection was interrupted.")
         raise
+    except httpx.InvalidURL:
+        assessment.update(state="unavailable", reason="Read-only gateway spend-log reader URL is invalid.")
     except (httpx.HTTPError, OSError, TimeoutError, ValueError):
         if assessment["state"] == "unverified":
             assessment.update(reason="Gateway evidence collection did not complete within its bounded window.",

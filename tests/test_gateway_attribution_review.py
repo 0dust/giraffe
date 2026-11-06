@@ -1,6 +1,7 @@
 """Protocol and lifecycle regressions found by independent gateway review."""
 import asyncio
 from datetime import datetime, timezone
+import gzip
 import hashlib
 import json
 import re
@@ -9,10 +10,11 @@ import time
 
 import httpx
 import pytest
+from pydantic import ValidationError
 
 from giraffe.client import LLMClient
-from giraffe.gateway_attribution import execute, result
-from giraffe.models import RequestSpec, Sessions, TestIdentity as GatewayIdentity
+from giraffe.gateway_attribution import MAX_BODY_BYTES, execute, result
+from giraffe.models import GatewayEvidence, RequestSpec, Sessions, TestIdentity as GatewayIdentity
 from giraffe.planning import request_plan
 from giraffe.reporting import compare_baseline
 from giraffe.runner import _Run, _checks, run_suite
@@ -157,6 +159,73 @@ async def test_mixed_run_distinguishes_unsupported_reader_from_denied_reader(mon
     assert reads and attribution.metrics["observed_requests"] == (0 if status == 404 else 2)
     assert attribution.metrics["state"] == state and attribution.status == "inconclusive"
     assert attribution.required is required and report.overall == overall
+
+
+@pytest.mark.parametrize("port", ["bad", "65536", "0"])
+def test_gateway_evidence_rejects_invalid_ports(port):
+    with pytest.raises(ValidationError, match="gateway evidence URL must have a valid port"):
+        GatewayEvidence(url=f"http://proxy:{port}/spend/logs/v2", api_key_env="OBSERVER")
+
+
+@pytest.mark.parametrize("origin", ["https://proxy", "http://proxy:8080", "http://[::1]:65535"])
+def test_gateway_evidence_preserves_valid_archived_urls(origin):
+    url = origin + "/spend/logs/v2"
+    evidence = GatewayEvidence(url=url, api_key_env="OBSERVER")
+    assert GatewayEvidence.model_validate_json(evidence.model_dump_json()).url == url
+
+
+@pytest.mark.parametrize("cap,marked", [(1, 0), (10, 0), (None, 2)])
+async def test_invalid_gateway_reader_url_does_not_block_shared_access(monkeypatch, local_tokenizer, cap, marked):
+    async def observer(request, rows):
+        return spend_page(request, rows)
+
+    cfg, _, reads = setup(monkeypatch, observer)
+    immediate_spend_polls(monkeypatch, cfg)
+    cfg.checks = ["access", "gateway_attribution"]
+    cfg.max_requests = cap
+    # Unvalidated model updates can still reach the runtime reader.
+    cfg.targets[0].gateway = cfg.targets[0].gateway.model_copy(update={"url": "http://proxy:bad/spend/logs/v2"})
+
+    report = await run_suite(cfg)
+    checks = {check.id: check for check in report.checks}
+    assert report.overall == "inconclusive" and report.abort_reason is None
+    assert checks["access"].status == "pass" and report.requests[0].valid
+    attribution = checks["gateway_attribution"]
+    assert attribution.status == "inconclusive" and attribution.required
+    assert attribution.metrics["state"] == "unavailable"
+    assert attribution.metrics["planned_requests"] == 2 and attribution.metrics["observed_requests"] == marked
+    assert "reader URL is invalid" in attribution.finding_summary and ":bad" not in attribution.finding_summary
+    assert attribution.remediation["action"] == "review_check"
+    assert not reads and [record.identity for record in report.requests] == [None, *["alice", "bob"][:marked]]
+
+
+@pytest.mark.parametrize("status,state,polls", [(200, "unverified", 3), (403, "unavailable", 1),
+                                                (404, "unsupported", 1)])
+async def test_gateway_reader_never_reads_compressed_spend_bodies(monkeypatch, local_tokenizer, status, state, polls):
+    compressed = gzip.compress(b"x" * (MAX_BODY_BYTES + 1))
+    opened, closed = [], []
+
+    class GzipBody(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            opened.append(self)
+            yield compressed
+
+        async def aclose(self):
+            closed.append(self)
+
+    async def observer(request, rows):
+        return httpx.Response(status, headers={"content-encoding": "gzip"}, stream=GzipBody())
+
+    cfg, _, reads = setup(monkeypatch, observer)
+    immediate_spend_polls(monkeypatch, cfg)
+
+    report = await run_suite(cfg)
+    check = next(item for item in report.checks if item.id == "gateway_attribution")
+    assert not opened and len(closed) == len(reads) == polls
+    assert {request.headers["accept-encoding"] for request in reads} == {"identity"}
+    assert check.status == "inconclusive" and check.metrics["state"] == state
+    assert check.metrics["observed_requests"] == 2 and not check.metrics["collection_complete"]
+    assert len(report.requests) == 2 and all(record.valid for record in report.requests)
 
 
 @pytest.mark.parametrize("status,cap,state,planned,observed,read_count", [

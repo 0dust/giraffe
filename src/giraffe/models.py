@@ -1406,6 +1406,12 @@ class GatewayEvidence(TestIdentity):
                 or any((parsed.username, parsed.password, parsed.query, parsed.fragment))
                 or any(char.isspace() for char in value)):
             raise ValueError("gateway evidence URL must be http(s) without credentials, query or fragment")
+        try:
+            valid_port = parsed.port != 0
+        except ValueError:
+            valid_port = False
+        if not valid_port:
+            raise ValueError("gateway evidence URL must have a valid port")
         return value
 
 
