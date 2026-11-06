@@ -16,7 +16,7 @@ from giraffe.models import RequestSpec, Sessions, TestIdentity as GatewayIdentit
 from giraffe.planning import request_plan
 from giraffe.reporting import compare_baseline
 from giraffe.runner import _Run, _checks, run_suite
-from tests.test_gateway_attribution import config, spend_page
+from tests.test_gateway_attribution import config, immediate_spend_polls, spend_page
 
 
 def setup(monkeypatch, observer, *, rejected=None):
@@ -55,6 +55,44 @@ def setup(monkeypatch, observer, *, rejected=None):
     original = httpx.AsyncClient
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
     return cfg, run, reads
+
+
+def streamed_gateway(monkeypatch, *, rejected_attempts=0, reject_marked_logprobs=False):
+    for ref in ("ALICE", "BOB", "OBSERVER"):
+        monkeypatch.setenv(ref, "secret-" + ref)
+    cfg = config(stream=True, request_timeout_seconds=.3)
+    immediate_spend_polls(monkeypatch, cfg)
+    rows, posts = [], []
+    compatibility_attempts = 0
+
+    def handler(request):
+        nonlocal compatibility_attempts
+        if request.method == "GET":
+            return spend_page(request, rows) if request.url.path == "/spend/logs/v2" else httpx.Response(404)
+        body = json.loads(request.content)
+        marker = request.headers.get("x-litellm-trace-id")
+        posts.append((bool(marker), body))
+        if marker:
+            if reject_marked_logprobs and body.get("logprobs"):
+                return httpx.Response(400, json={"error": {"param": "logprobs"}})
+            key = request.headers["authorization"].removeprefix("Bearer ")
+            rows.append({"request_id": str(len(rows)), "session_id": marker,
+                         "metadata": {"spend_logs_metadata": json.loads(request.headers["x-litellm-spend-logs-metadata"])},
+                         "api_key": hashlib.sha256(key.encode()).hexdigest(), "prompt_tokens": 3,
+                         "completion_tokens": 5, "total_tokens": 8, "status": "success"})
+        elif body["max_tokens"] == 1:
+            compatibility_attempts += 1
+            if compatibility_attempts <= rejected_attempts:
+                # A gateway can repeatedly reject a known parameter after its first rejection.
+                return httpx.Response(400, json={"error": {"param": "logprobs"}})
+        return httpx.Response(200, text=(
+            'data: {"choices":[{"delta":{"content":"OK"},"logprobs":{"content":[{"token":"OK"}]}}]}\n\n'
+            'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+            'data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":5}}\n\ndata: [DONE]\n\n'))
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
+    return cfg, posts
 
 
 async def collect(cfg, run):
@@ -320,6 +358,63 @@ async def test_attribution_does_not_reserve_shared_token_evidence_slot(monkeypat
     assert sum(r.scenario == "performance_evidence_probe" for r in report.requests) == 1
 
 
+@pytest.mark.parametrize("cap,rejections,setup_attempts,marked_count", [
+    (1, 0, 0, 0), (2, 0, 0, 1), (3, 0, 1, 1), (4, 0, 1, 2), (5, 2, 3, 1), (6, 2, 3, 2),
+])
+async def test_attribution_request_limit_covers_earlier_streamed_setup(
+        monkeypatch, local_tokenizer, cap, rejections, setup_attempts, marked_count):
+    cfg, _ = streamed_gateway(monkeypatch, rejected_attempts=rejections)
+    cfg.checks = ["access", "gateway_attribution"]
+    cfg.max_requests = cap
+    plan = request_plan(cfg)
+    assert plan["planned_total"] == plan["known_total"] == plan["required_request_limit"] == 3
+    assert plan["attribution_request_limit"] == 6
+    if cap < 6:
+        warning, = plan["request_warnings"]
+        assert warning["cut_checks"] == ["gateway_attribution"]
+        assert warning["actions"][0]["value"] == 6
+        assert "up to 3 streamed compatibility attempts" in warning["msg"]
+    else:
+        assert not plan["request_warnings"]
+
+    report = await run_suite(cfg)
+    checks = {check.id: check for check in report.checks}
+    assert checks["access"].status == "pass"
+    check = checks["gateway_attribution"]
+    assert [record.scenario for record in report.requests] == (
+        ["initial"] + ["performance_evidence_probe"] * setup_attempts + ["gateway_attribution"] * marked_count)
+    assert check.metrics["matched_requests"] == marked_count
+    if marked_count == 2:
+        assert check.status == "pass"
+    else:
+        assert check.status == "inconclusive" and check.metrics["reason_code"] == "budget_limited"
+        assert check.remediation == {"action": "set_limit", "limit": "max_requests", "minimum": 6}
+        assert "--max-requests) to at least 6" in check.summary
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+async def test_marked_requests_do_not_inherit_shared_logprobs(monkeypatch, local_tokenizer, explicit):
+    cfg, posts = streamed_gateway(monkeypatch, reject_marked_logprobs=not explicit)
+    cfg.checks = ["access", "serving", "gateway_attribution"]
+    cfg.samples = 1
+    if explicit:
+        cfg.request_options = {"logprobs": True, "top_logprobs": 1}
+
+    report = await run_suite(cfg)
+    check = next(item for item in report.checks if item.id == "gateway_attribution")
+    assert check.status == "pass"
+    assert report.observations["targets"]["proxy"]["token_evidence"]["logprobs"] == "supported"
+    assert any(body.get("logprobs") is True for marked, body in posts if not marked and body["max_tokens"] != 1)
+    marked_payloads = [body for marked, body in posts if marked]
+    assert len(marked_payloads) == 2
+    for body in marked_payloads:
+        assert body["stream_options"] == {"include_usage": True}
+        if explicit:
+            assert body["logprobs"] is True and body["top_logprobs"] == 1
+        else:
+            assert "logprobs" not in body and "top_logprobs" not in body
+
+
 async def test_attribution_does_not_reserve_requests_from_recovery(monkeypatch, local_tokenizer):
     from tests.test_runner import FakeClient
 
@@ -342,14 +437,18 @@ async def test_attribution_does_not_reserve_requests_from_recovery(monkeypatch, 
     assert not any(record.identity for record in report.requests)
 
 
-def test_plan_does_not_reserve_attribution_on_unsupported_targets():
-    cfg = config()
+@pytest.mark.parametrize("stream,coverage_limit", [(False, 5), (True, 11)])
+def test_plan_does_not_reserve_attribution_on_unsupported_targets(stream, coverage_limit):
+    cfg = config(stream=stream)
+    isolated = request_plan(cfg)
+    assert isolated["required_request_limit"] == 2 and "attribution_request_limit" not in isolated
     supported = cfg.targets[0]
     unsupported = supported.model_copy(update={"name": "other",
         "gateway": supported.gateway.model_copy(update={"profile": "unsupported"})})
     cfg.targets = [unsupported]
     plan = request_plan(cfg)
     assert plan["planned_total"] == plan["minimum_reserved_per_target"] == 0
+    assert "attribution_request_limit" not in plan
 
     cfg.targets = [supported, unsupported]
     cfg.checks = ["access", "gateway_attribution"]
@@ -366,11 +465,26 @@ def test_plan_does_not_reserve_attribution_on_unsupported_targets():
     warning, = plan["request_warnings"]
     assert warning["kind"] == "incomplete_coverage" and warning["cut_checks"] == ["gateway_attribution"]
     assert warning["msg"].startswith("proxy:")
-    assert warning["actions"][0]["value"] == 5
+    assert warning["actions"][0]["value"] == coverage_limit
+    if stream:
+        assert plan["attribution_request_limit"] == coverage_limit
 
     # Equal total work needs a larger cap when the high-count endpoint gets its remainder last.
     cfg.targets.reverse()
-    assert request_plan(cfg)["required_request_limit"] == 6
+    reversed_plan = request_plan(cfg)
+    assert reversed_plan["required_request_limit"] == 6
+    if stream:
+        assert reversed_plan["attribution_request_limit"] == 12
+
+
+def test_attribution_fits_below_the_streamed_compatibility_floor():
+    cfg = config(stream=True)
+    cfg.checks = ["access", "gateway_attribution"]
+    cfg.gateway_attribution.identities = ["alice"]
+    cfg.max_requests = 2
+    plan = request_plan(cfg)
+    assert plan["required_request_limit"] == 2
+    assert "attribution_request_limit" not in plan and not plan["request_warnings"]
 
 
 @pytest.mark.parametrize("fault", ["reused_id", "wrong_session", "missing_id", "unknown_local"])

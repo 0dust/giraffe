@@ -2172,6 +2172,8 @@ def _budget_remediation(config, check_id):
     planned = plan["required_request_limit"] or max(
         plan["known_total"], (plan["conservative_requests_per_target"]
                               - plan["adaptive_estimates"].get("concurrency", 0)) * len(config.targets))
+    if check_id == "gateway_attribution":
+        planned = max(planned, plan.get("attribution_request_limit", 0))
     return {"action": "set_limit", "limit": "max_requests",
             "minimum": max(planned, (config.max_requests or 0) + 1)}
 
@@ -2411,6 +2413,8 @@ def _verdict_summary(check, config, records, budget):
                      if config.max_duration_seconds is not None else "") + budget)
     elif check.id == "gateway_attribution" and reason == "time_limited":
         remedy = _deadline_guidance(config).rstrip(".")
+    elif check.id == "gateway_attribution" and reason == "budget_limited":
+        remedy = f"raise max_requests (or --max-requests) to at least {check.remediation['minimum']} and rerun the configured attribution probes"
     elif any(word in text for word in ("run budget", "run deadline", "no applicable")):
         remedy = budget + (" Allow more max_duration_seconds (or --max-duration) if the run deadline stops traffic"
                           if config.max_duration_seconds is not None else "")
