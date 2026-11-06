@@ -6,7 +6,7 @@ from giraffe.gateway_policy import summarize
 from giraffe.gateway_response import response_evidence
 from giraffe.models import RunConfig
 from giraffe.runner import run_suite
-from tests.test_gateway_policy import MODEL_POOL, configuration, exercise
+from tests.test_gateway_policy import CACHE_KEY, MODEL_POOL, configuration, exercise
 
 
 @pytest.mark.parametrize("mode", ["key_rpm", "priority_rpm"])
@@ -113,3 +113,56 @@ async def test_malformed_secondary_header_is_rejected_before_admission(monkeypat
     assert all(user["dispatched"] == 0 for user in check.metrics["gateway_policy"]["users"])
     assert not report.requests
     assert "malformed-secondary-secret" not in report.model_dump_json()
+
+
+@pytest.mark.usefixtures("local_tokenizer")
+@pytest.mark.parametrize("mode", ["key_rpm", "priority_rpm"])
+async def test_cached_completions_leave_policy_unverified(monkeypatch, mode):
+    check, report, sent = await exercise(monkeypatch, mode, behavior="cached_response", full=True)
+    assert len(sent) == 13
+    assert sum(record.valid for record in report.requests) == 10
+    policy = check.metrics["gateway_policy"]
+    assert check.status == "inconclusive" and policy["qualification"] == "unverified"
+    assert policy["response_cache_hit_reported"] is True
+    assert not policy["comparable_actual_work"] and not policy["peer_continuation"]
+    assert "reported a cached completion" in check.summary
+    assert CACHE_KEY not in report.model_dump_json()
+
+
+@pytest.mark.usefixtures("local_tokenizer")
+@pytest.mark.parametrize("mode,expected", [("key_rpm", "pass"), ("priority_rpm", "inconclusive")])
+async def test_default_pool_label_cannot_establish_distinct_priority_reservations(monkeypatch, mode, expected):
+    check, _, _ = await exercise(monkeypatch, mode, full=True,
+        users=[dict(identity="limited", requests=5, rpm=2, priority="low"),
+               dict(identity="peer", requests=5, rpm=8, priority="default_pool")])
+    assert [user["admitted"] for user in check.metrics["gateway_policy"]["users"]] == [2, 5]
+    assert check.status == expected
+    if mode == "priority_rpm":
+        assert check.metrics["gateway_policy"]["qualification"] == "unverified"
+        assert "reserves default_pool" in check.summary
+
+
+@pytest.mark.usefixtures("local_tokenizer")
+@pytest.mark.parametrize("reported,expected", [(55.0, "pass"), (54.9, "inconclusive")])
+async def test_priority_compares_reported_saturation_at_the_exact_threshold(monkeypatch, reported, expected):
+    check, _, _ = await exercise(monkeypatch, "priority_rpm", full=True, model_rpm=20,
+        saturation_threshold=.55, rejection_saturation=reported,
+        users=[dict(identity="limited", requests=5, rpm=2, priority="low"),
+               dict(identity="peer", requests=10, rpm=18, priority="high")])
+    assert check.status == expected, check.summary
+    if expected == "inconclusive":
+        assert "strict-mode evidence" in check.summary
+
+
+@pytest.mark.usefixtures("local_tokenizer")
+@pytest.mark.parametrize("admitted,expected", [(55, "pass"), (56, "fail")])
+async def test_priority_borrowing_stops_at_the_gateway_ratio_boundary(monkeypatch, admitted, expected):
+    check, _, _ = await exercise(monkeypatch, "priority_rpm", full=True, model_rpm=100, duration_seconds=3,
+        saturation_threshold=.55, rejection_saturation=56.0, admitted_affected=admitted, peer_delay=.04,
+        users=[dict(identity="limited", requests=57, rpm=2, priority="low"),
+               dict(identity="peer", requests=28, rpm=28, priority="high")])
+    policy = check.metrics["gateway_policy"]
+    assert [user["admitted"] for user in policy["users"]] == [admitted, 28]
+    assert check.status == expected, check.summary
+    if expected == "fail":
+        assert "exceeded the declared RPM allowance" in check.summary

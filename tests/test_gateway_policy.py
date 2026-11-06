@@ -14,6 +14,7 @@ from giraffe import runner
 LIMITED_KEY_HASH = hashlib.sha256(b"limited-secret").hexdigest()
 PEER_KEY_HASH = hashlib.sha256(b"peer-secret").hexdigest()
 MODEL_POOL = "routed-test-pool"
+CACHE_KEY = "opaque-cache-value-must-not-be-retained"
 
 
 def configuration(mode="key_rpm", **changes):
@@ -30,7 +31,8 @@ def configuration(mode="key_rpm", **changes):
         max_duration_seconds=5, request_timeout_seconds=1)
 
 
-async def exercise(monkeypatch, mode="key_rpm", *, behavior="enforce", full=False, **settings):
+async def exercise(monkeypatch, mode="key_rpm", *, behavior="enforce", full=False,
+                   admitted_affected=None, rejection_saturation=50.0, peer_delay=.01, **settings):
     monkeypatch.setenv("LIMITED", "limited-secret")
     monkeypatch.setenv("PEER", "peer-secret")
     if behavior == "duplicate_credentials":
@@ -44,19 +46,23 @@ async def exercise(monkeypatch, mode="key_rpm", *, behavior="enforce", full=Fals
         who = {"Bearer limited-secret": "limited", "Bearer peer-secret": "peer"}.get(request.headers.get("authorization"))
         if who is None:
             return httpx.Response(401, json={"error": {"type": "authentication_error"}})
+        assert json.loads(request.content)["cache"] == {"no-cache": True, "no-store": True}
         counts[who] += 1
         seen.append(who)
-        await asyncio.sleep(.01)
-        priority = "low" if who == "limited" else "high"
+        await asyncio.sleep(.01 if who == "limited" else peer_delay)
+        user = next(user for user in cfg.gateway_policy.users if user.identity == who)
+        priority = user.priority or "default"
         headers = {"x-ratelimit-limit-requests": "2" if who == "limited" else "8",
                    "x-litellm-priority": priority, "retry-after": "1" if behavior == "short_bucket_reset" else "60",
                    "x-litellm-rate-limiter-version": "v3",
-                   "x-ratelimit-priority_model-limit-requests": str(next(user.rpm for user in cfg.gateway_policy.users if user.identity == who))}
-        threshold = 3 if behavior == "overadmit" else 1 if behavior == "early" else 2
+                   "x-ratelimit-priority_model-limit-requests": str(user.rpm)}
+        threshold = admitted_affected if admitted_affected is not None else {"overadmit": 3, "early": 1}.get(behavior, 2)
         bucket_reset = behavior == "short_bucket_reset" and counts[who] == 5
         if who == "limited" and counts[who] > threshold and behavior != "ignore" and not bucket_reset:
             subject = PEER_KEY_HASH if behavior == "wrong_subject" else LIMITED_KEY_HASH
-            message = (f"Priority-based rate limit exceeded. Model: {MODEL_POOL}, Priority: low, Rate limit type: requests, Model TPM: not configured, Model RPM: 10, Remaining: 0, Model saturation: 50%"
+            message = (f"Priority-based rate limit exceeded. Model: {MODEL_POOL}, Priority: {priority}, Rate limit type: requests, "
+                       f"Model TPM: not configured, Model RPM: {cfg.gateway_policy.model_rpm}, Remaining: 0, "
+                       f"Model saturation: {rejection_saturation}%"
                        if mode == "priority_rpm" else
                        f"Rate limit exceeded for api_key: {subject}. Limit type: requests. Current limit: 2, Remaining: 0. Limit resets at: 2026-01-01")
             if behavior == "unknown" or (behavior == "mixed_rejections" and counts[who] > threshold + 1):
@@ -76,6 +82,8 @@ async def exercise(monkeypatch, mode="key_rpm", *, behavior="enforce", full=Fals
             headers["x-litellm-model-group"] = group
         if behavior == "fallback_pool" and who == "peer":
             headers["x-litellm-attempted-fallbacks"] = "1"
+        if behavior == "cached_response":
+            headers["x-litellm-cache-key"] = CACHE_KEY
         role = "user" if behavior == "malformed_peer" and who == "peer" else "assistant"
         return httpx.Response(200, headers=headers, json={"model": "test", "choices": [{"message": {
             "role": role, "content": "OK"}, "finish_reason": "stop"}], "usage": usage})
@@ -84,6 +92,8 @@ async def exercise(monkeypatch, mode="key_rpm", *, behavior="enforce", full=Fals
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handle), **kw))
     from giraffe.gateway_policy import execute, result
     cfg = configuration(mode, **settings)
+    if behavior == "cached_response":
+        cfg.request_options = {"cache": {"no-cache": False, "no-store": False, "use-cache": True}}
     if full:
         cfg.targets[0].api_key_env = "UNUSED_SHARED_CREDENTIAL"
         monkeypatch.delenv("UNUSED_SHARED_CREDENTIAL", raising=False)

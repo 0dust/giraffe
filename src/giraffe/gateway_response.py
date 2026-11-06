@@ -33,6 +33,7 @@ def response_evidence(status, body=b"", headers=None, *, declared_priority=None,
                     kind = "model_access"
     evidence = GatewayResponseEvidence(error_kind=kind)
     headers = headers or {}
+    evidence._response_cache_hit_reported = 200 <= status < 300 and "x-litellm-cache-key" in headers
     for name, field in (("x-ratelimit-limit-requests", "request_limit"),
                         ("x-ratelimit-remaining-requests", "request_remaining"),
                         ("x-ratelimit-limit-tokens", "token_limit"),
