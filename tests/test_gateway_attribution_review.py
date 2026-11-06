@@ -19,7 +19,7 @@ from giraffe.runner import _Run, _checks, run_suite
 from tests.test_gateway_attribution import config, immediate_spend_polls, spend_page
 
 
-def setup(monkeypatch, observer, *, rejected=None):
+def setup(monkeypatch, observer, *, rejected=None, before_marked=None):
     for ref in ("ALICE", "BOB", "OBSERVER", "SHARED"):
         monkeypatch.setenv(ref, "secret-" + ref)
     cfg = config(stream=False)
@@ -45,6 +45,8 @@ def setup(monkeypatch, observer, *, rejected=None):
                                       b'"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":5}}')
             return httpx.Response(401, json={"error": {"type": "expired_key"}})
         if "x-litellm-spend-logs-metadata" in request.headers:
+            if before_marked:
+                await before_marked(key)
             rows.append({"request_id": str(len(rows)), "session_id": request.headers["x-litellm-trace-id"],
                 "metadata": {"spend_logs_metadata": json.loads(request.headers["x-litellm-spend-logs-metadata"])},
                 "api_key": hashlib.sha256(key.encode()).hexdigest(), "prompt_tokens": 3,
@@ -626,6 +628,7 @@ async def test_final_read_timeout_does_not_reuse_early_complete_evidence(monkeyp
     assert polls == 3 and check.metrics["collection_complete"] is False
     assert check.metrics["state"] == "unverified"
     assert check.metrics["matched_requests"] == 0 and check.metrics["unverified_requests"] == 2
+    assert "bounded window" in check.metrics["reason"] and "reason_code" not in check.metrics
 
 
 async def test_shortened_collection_window_keeps_complete_pages_unverified(monkeypatch):
@@ -663,9 +666,76 @@ async def test_duration_plan_and_remedy_cover_spend_log_settle(monkeypatch, loca
     check = next(item for item in report.checks if item.id == "gateway_attribution")
     assert check.status == "inconclusive"
     assert check.metrics["reason_code"] == "time_limited"
+    assert "spend-log settle window" in check.metrics["reason"]
     assert check.remediation == {"action": "set_limit", "limit": "max_duration", "minimum": 2}
     assert "--max-duration" in check.summary
     assert "max_requests" not in check.summary
+
+
+@pytest.mark.parametrize("cap,interruption", [(10, "transport"), (None, "transport"),
+                                               (None, "dispatch"), (None, "user")])
+async def test_interrupted_attribution_probes_retain_partial_evidence(monkeypatch, local_tokenizer, cap, interruption):
+    stop = asyncio.Event()
+
+    async def observer(request, rows):
+        return spend_page(request, rows)
+
+    async def before_marked(key):
+        if key == "secret-BOB":
+            if interruption == "user":
+                stop.set()
+            await asyncio.Event().wait()
+
+    def progress(event):
+        if (interruption == "dispatch" and event["scenario"] == "gateway_attribution"
+                and event["event"] == "request_completed"):
+            time.sleep(.55)
+
+    cfg, _, reads = setup(monkeypatch, observer, before_marked=before_marked)
+    cfg.max_requests = cap
+    cfg.max_duration_seconds = 5 if interruption == "user" else .5
+    cfg.request_timeout_seconds = 1
+    cfg.gateway_attribution.samples = 2
+    cfg.gateway_attribution.settle_seconds = .25
+
+    report = await run_suite(cfg, progress=progress, stop_event=stop)
+    check = next(item for item in report.checks if item.id == "gateway_attribution")
+    expected_count = 1 if interruption == "dispatch" else 2
+    assert check.status == "inconclusive"
+    assert check.metrics["planned_requests"] == 4
+    assert check.metrics["observed_requests"] == check.metrics["unverified_requests"] == expected_count
+    assert check.metrics["matched_requests"] == 0 and not reads
+    assert check.evidence_ids == [record.id for record in report.requests]
+    assert report.requests[0].identity == "alice" and report.requests[0].valid
+    if interruption == "user":
+        assert report.abort_reason == "cancelled by user"
+        assert report.requests[1].termination_reason == "user_stop"
+        assert "reason_code" not in check.metrics and check.remediation.get("limit") != "max_duration"
+    else:
+        assert report.abort_reason == "maximum run duration reached"
+        if interruption == "transport":
+            assert report.requests[1].identity == "bob" and report.requests[1].termination_reason == "run_duration_limit"
+        assert check.metrics["reason_code"] == "time_limited"
+        assert check.metrics["collection_attempts"] == 0
+        assert "interrupted the configured attribution probes" in check.finding_summary
+        assert check.remediation == {"action": "set_limit", "limit": "max_duration", "minimum": 5}
+        assert "--max-duration" in check.summary and "max_requests" not in check.summary
+
+
+async def test_partial_probe_budget_does_not_hide_observed_mismatch(monkeypatch, local_tokenizer):
+    async def observer(request, rows):
+        return spend_page(request, [{**rows[0], "completion_tokens": 9, "total_tokens": 12}])
+
+    cfg, _, _ = setup(monkeypatch, observer)
+    immediate_spend_polls(monkeypatch, cfg)
+    cfg.max_requests = 1
+
+    report = await run_suite(cfg)
+    check = next(item for item in report.checks if item.id == "gateway_attribution")
+    assert check.status == "fail" and check.metrics["state"] == "mismatch"
+    assert check.metrics["observed_requests"] == check.metrics["mismatched_requests"] == 1
+    assert check.metrics["planned_requests"] == 2
+    assert "reason_code" not in check.metrics
 
 
 async def test_duration_remedy_covers_restart_and_attribution(monkeypatch, local_tokenizer):

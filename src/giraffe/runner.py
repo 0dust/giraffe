@@ -666,14 +666,13 @@ class _Run:
             try:
                 if on_start:
                     on_start()
-                if self.progress:
-                    if admission_deadline is not None and budget_reserved:
-                        # An open-loop offer enters transport before yielding to
-                        # public progress. A synchronous observer cannot hold it
-                        # past the checked admission boundary before dispatch.
-                        pending_start = task.get_loop().call_soon(emit_scheduled_start)
-                    else:
-                        emit_start()
+                if admission_deadline is not None and budget_reserved and self.progress:
+                    # An open-loop offer enters transport before yielding to
+                    # public progress. A synchronous observer cannot hold it
+                    # past the checked admission boundary before dispatch.
+                    pending_start = task.get_loop().call_soon(emit_scheduled_start)
+                else:
+                    emit_start()
                 request_timeout = (spec.request_timeout_seconds if spec.request_timeout_seconds is not None
                                    else self.config.request_timeout_seconds)
                 if deadline_override is not None:
@@ -2164,7 +2163,8 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
             check.summary = check.finding_summary + " " + budget
             continue
         if interrupted and run.reason == "maximum run duration reached" and check.id not in {"load", "recovery"}:
-            check.finding_summary = "Run deadline reached before this check finished."
+            if check.id != "gateway_attribution" or check.metrics.get("reason_code") != "time_limited":
+                check.finding_summary = "Run deadline reached before this check finished."
             check.remediation = _deadline_remediation(run.config)
             check.summary = check.finding_summary + " " + _deadline_guidance(run.config)
             continue

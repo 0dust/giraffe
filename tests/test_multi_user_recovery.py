@@ -88,6 +88,67 @@ def test_recovery_allows_extra_replays_of_matched_sustained_work():
     assert user["status"] == "pass"
 
 
+@pytest.mark.parametrize("swap_work", [False, True])
+def test_recovery_baseline_qualifies_tokens_by_matched_work(monkeypatch, local_tokenizer, tmp_path, swap_work):
+    import json
+
+    from giraffe import runner
+    from giraffe.reporting import compare_baseline
+    from tests.test_review26_phase4_accuracy import run_virtual
+    from tests.test_runner import FakeClient
+
+    fixtures = tmp_path / "fixtures.json"
+    fixtures.write_text(json.dumps([
+        {"fixture_id": f"fixture-{letter}", "scorer": "none", "max_tokens": 32,
+         "messages": [{"role": "user", "content": letter * 128}]}
+        for letter in "ab"
+    ]))
+    cfg = settings(levels=[2], scenarios=["recovery"], profile=PROFILE, recovery={
+        "control_seconds": 1, "sustained_seconds": 1, "lighter_seconds": 1,
+        "lighter_requests_per_second": 4, "sustained_requests_per_second": 8, "max_slowdown": 2,
+    }).model_copy(update={"custom_fixtures": str(fixtures)})
+
+    class Observed(FakeClient):
+        delay = .02
+        changed = False
+
+        async def execute(self, spec, **kwargs):
+            record = await super().execute(spec, **kwargs)
+            if "multi_user" in spec.check_ids:
+                first_fixture = spec.fixture_id == "fixture-a"
+                record.output_tokens = 2 if first_fixture != (swap_work and self.changed) else 14
+                record.completion_tokens = record.output_tokens
+                if (spec.workload.get("role") == "lighter" and first_fixture
+                        and (record.output_tokens == 14 if swap_work else self.changed)):
+                    await asyncio.sleep(.06)
+                    record.elapsed_ms += 60
+            return record
+
+    async def replay():
+        baseline = await runner.run_suite(cfg)
+        Observed.changed = True
+        return await runner.run_suite(cfg), baseline
+
+    monkeypatch.setattr(runner, "LLMClient", Observed)
+    current, baseline = run_virtual(monkeypatch, replay())
+    for report, slowdown, status in ((baseline, 1, "pass"), (current, 2.5, "fail")):
+        check = next(check for check in report.checks if check.id == "multi_user")
+        users = check.metrics["multi_user"]["windows"][-1]["recovery"]["users"]
+        assert len(users) == 2
+        assert {user["status"] for user in users} == {status}
+        assert [user["slowdown"] for user in users] == pytest.approx([slowdown, slowdown])
+        assert all(phase["output_tokens"] == 8 for user in users for phase in user["phases"].values())
+
+    comparison = compare_baseline(current, baseline).baseline
+    rows = comparison["targets"][0]["comparisons"]
+    acceptance = [row for row in rows if row["metric"] == "scenario_acceptance"]
+    delivery = [row for row in rows if row["metric"] == "shared_window_output_tokens_per_second"]
+    expected = "inconclusive" if swap_work else "fail"
+    assert len(acceptance) == 2 and {row["status"] for row in acceptance} == {expected}
+    assert len(delivery) == 6 and all(row["status"] == "pass" and row["current"] == row["baseline"] for row in delivery)
+    assert comparison["status"] == expected
+
+
 @pytest.mark.parametrize("drift_phase", ["lighter", "sustained"])
 def test_recovery_qualifies_total_generation_separately_from_visible_output(drift_phase):
     source, records = recovery_observation()

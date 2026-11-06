@@ -226,7 +226,7 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str, include_load
         checks = set(resolved.checks)
         if shared:
             checks -= SHARED_BASELINE_EXCLUDED_WORKLOADS
-        if not checks <= _CONVERSATION_BRIDGE_CHECKS.union(CORE_CHECKS):
+        if not checks <= _CONVERSATION_BRIDGE_CHECKS.union(CORE_CHECKS, {"tools"}):
             return None
     if revision in {"issue45", "issue95", "issue95_pauses", "issue95_pause_evidence"} | _COMPANION_REVISIONS:
         unchanged_fields = {"sessions", "consistency"}
@@ -234,6 +234,8 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str, include_load
             # Optional user/gateway dispatch changed the shared file; these
             # specialist requests are unchanged at these exact revisions.
             unchanged_fields.add("prefix")
+        if revision in _COMPANION_REVISIONS:
+            unchanged_fields.update(_baseline_workload_fields({"tools"}, shared=shared))
         if include_load or exact_conversation:
             unchanged_fields.add("load_test")
         # Legacy concurrency has a separate source and needs its own attested revision.
@@ -339,11 +341,12 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str, include_load
         }[revision]
     if "tools" in resolved.checks:
         from .tool_checks import resolved_tool_fixtures, resolved_tool_modes
+        tool_conversation_revisions = _COMPANION_REVISIONS | {"phase3", "review26", "caps26"}
         identity["resolved_tool_checks"] = {
             "fixtures": [fixture.model_dump(mode="json") for fixture in resolved_tool_fixtures(resolved)],
             "modes": resolved_tool_modes(resolved),
             **({"conversations": [fixture.model_dump(mode="json") for fixture in resolved.tool_checks.conversations],
-                "conversation_source_sha256": ("4080132330b5ceb3d7e0b824bb26244a73967d81ae6b467441600e45c483eb48" if revision in {"phase3", "review26", "caps26"} else
+                "conversation_source_sha256": ("4080132330b5ceb3d7e0b824bb26244a73967d81ae6b467441600e45c483eb48" if revision in tool_conversation_revisions else
                                                "283d1eb18bb852ca0132a2d4a8c63e49bc7155614603e74740dd80afe8189714")}
                if resolved.tool_checks and resolved.tool_checks.conversations else {}),
         }
@@ -854,24 +857,18 @@ def _input_work_changed(current, old, threshold):
             and abs(current_input - old_input)*100/old_input > threshold)
 
 
-def _token_lengths_changed(lengths, threshold):
+def _measured_token_work_changed(current, old, threshold, measure):
+    lengths = [[measure(record) for record in cohort] for cohort in (current, old)]
     if any(not values or None in values for values in lengths):
         return True
     medians = [median(values) for values in lengths]
     return max(medians) > min(medians) * (1 + threshold / 100) or _length_mix_differs(lengths, threshold)
 
 
-def _total_generation_work_changed(current, old, threshold):
-    lengths = [[_total_generated_tokens(r) for r in records if r.status == "completed" and r.valid]
-               for records in (current, old)]
-    return _token_lengths_changed(lengths, threshold)
-
-
 def _uncached_input_work_changed(current, old, threshold):
-    cohorts = (current, old)
-    if not any((r.cached_prompt_tokens or 0) > 0 for cohort in cohorts for r in cohort):
+    if not any((r.cached_prompt_tokens or 0) > 0 for cohort in (current, old) for r in cohort):
         return False
-    return _token_lengths_changed([[_uncached_input_tokens(r) for r in cohort] for cohort in cohorts], threshold)
+    return _measured_token_work_changed(current, old, threshold, _uncached_input_tokens)
 
 
 def _live_input_work_changed(current, old, threshold, *, compare_output=False):
@@ -1437,26 +1434,34 @@ def _probe_has_overlap(evidence: dict, records: list[RequestRecord]) -> bool:
 def _recovery_work_changed(current, old, current_records, old_records, threshold):
     for phase in ("control", "sustained", "lighter"):
         field = f"{phase}_request_ids"
-        cohorts = []
+        cohorts, matched = [], []
         for evidence, records in ((current, current_records), (old, old_records)):
             ids = evidence.get(field, [])
             if not ids or any(rid not in records for rid in ids):
                 return True
-            cohorts.append([records[rid] for rid in ids])
-        latest_work, old_work = (Counter((r.workload.get("matched_work_sequence"), r.workload.get("matched_work_sha256"))
-                                         for r in cohort) for cohort in cohorts)
-        if latest_work != old_work or _user_token_work_changed(*cohorts, threshold):
+            cohort = [records[rid] for rid in ids]
+            by_work = defaultdict(list)
+            for record in cohort:
+                sequence = record.workload.get("matched_work_sequence")
+                digest = record.workload.get("matched_work_sha256")
+                if sequence is None or not digest or record.status != "completed" or not record.valid:
+                    return True
+                by_work[sequence, digest].append(record)
+            cohorts.append(cohort)
+            matched.append(by_work)
+        latest_work, old_work = matched
+        if (latest_work.keys() != old_work.keys() or _user_token_work_changed(*cohorts, threshold)
+                or any(len(records) != len(old_work[identity])
+                       or _user_token_work_changed(records, old_work[identity], threshold)
+                       for identity, records in latest_work.items())):
             return True
     return False
 
 
 def _user_token_work_changed(current, previous, tolerance):
     measures = (lambda r: r.input_tokens, lambda r: r.output_tokens, _total_generated_tokens)
-    for measure in measures:
-        lengths = [[measure(record) for record in cohort] for cohort in (current, previous)]
-        if _token_lengths_changed(lengths, tolerance):
-            return True
-    return _uncached_input_work_changed(current, previous, tolerance)
+    return (any(_measured_token_work_changed(current, previous, tolerance, measure) for measure in measures)
+            or _uncached_input_work_changed(current, previous, tolerance))
 
 
 def _compare_user_fairness(current, previous, current_records, old_records):
@@ -1590,11 +1595,11 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold):
         label = key[:7] if role else key[:4]
         if cohort:
             label += (cohort,)
-        row = {"check": "multi_user", "scenario": " / ".join(map(str, label)),
-               "user_id": user_id, "population": population, "profile": profile,
-               "role": role, "trigger": trigger, "heavy_profile": heavy_profile, "cohort": cohort,
-               "window_id": c_window.get("id", b_window.get("id")),
-               "metric": "shared_window_output_tokens_per_second", "aggregation": "common_window",
+        identity = {"check": "multi_user", "scenario": " / ".join(map(str, label)),
+                    "user_id": user_id, "population": population, "profile": profile,
+                    "role": role, "trigger": trigger, "heavy_profile": heavy_profile, "cohort": cohort,
+                    "window_id": c_window.get("id", b_window.get("id"))}
+        row = {**identity, "metric": "shared_window_output_tokens_per_second", "aggregation": "common_window",
                "current": c_rate, "baseline": b_rate, "status": "inconclusive",
                "current_samples": len(current_delivery), "baseline_samples": len(old_delivery),
                "threshold": threshold, "change_unit": "percent",
@@ -1638,6 +1643,16 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold):
                          "current_samples": c_scenario.get("matched_samples", 0),
                          "baseline_samples": b_scenario.get("matched_samples", 0), "evidence_ids": interference_ids,
                          "observed_change": None, "observed_delta": None})
+        elif short_probe and b_scenario.get("status") == "measured" and interference_reason:
+            reason = f"Multi-user {user_id} at {population} users: {interference_reason}"
+            incomplete.append(reason)
+            rows.append({**identity,
+                "metric": "matched_interference_slowdown", "status": "inconclusive", "threshold": None,
+                "current": c_scenario.get("slowdown"), "baseline": b_scenario.get("slowdown"),
+                "current_samples": c_scenario.get("matched_samples", 0),
+                "baseline_samples": b_scenario.get("matched_samples", 0),
+                "reason": reason, "evidence_ids": interference_ids,
+            })
         if (not noisy_probe and c_scenario.get("status") == "fail" and b_scenario.get("status") == "pass"
                 and not scenario_reason and not any(_load_work_comparison(current_work, old_work))):
             acceptance = {**row, "metric": "scenario_acceptance", "status": "fail",
@@ -2087,7 +2102,7 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                     current_output, old_output = current_work, old_work
                     metric_input_changed, metric_output_changed = input_work_changed, different_work
                     metric_work_reason, metric_mix_changed = None, mix_changed
-                    generation_work_changed = False
+                    generation_work_changed = visible_work_changed = False
                     if scheduled_user and metric in TIMING_METRICS:
                         current_samples, old_samples = current_timing[metric], old_timing[metric]
                         if current_samples and old_samples:
@@ -2095,10 +2110,16 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                         else:
                             metric_mix_changed = False
                         current_output, old_output = _output_work(current_samples), _output_work(old_samples)
-                        metric_input_changed = (_input_work_changed(current_samples, old_samples, threshold)
+                        metric_input_changed = (_measured_token_work_changed(current_samples, old_samples, threshold,
+                                                                             lambda r: r.input_tokens)
                                                 or _uncached_input_work_changed(current_samples, old_samples, threshold))
                         metric_output_changed = _different_output_work(current_output, old_output, threshold)
-                        generation_work_changed = _total_generation_work_changed(current_samples, old_samples, threshold)
+                        generation_work_changed = _measured_token_work_changed(
+                            current_samples, old_samples, threshold, _total_generated_tokens)
+                        # Visible tokens after the first answer affect completion
+                        # and streaming work without changing the first-answer boundary.
+                        visible_work_changed = metric != "first_output_ms" and _measured_token_work_changed(
+                            current_samples, old_samples, threshold, lambda r: r.output_tokens)
                     warnings = []
                     initial_uncertainty = row["reason"] if row["status"] == "inconclusive" else None
                     def warn(code, message, *, preserve_failure=False):
@@ -2106,9 +2127,12 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                         if not preserve_failure or row["status"] != "fail":
                             row["status"] = "inconclusive"
                     if (metric_input_changed or live_inputs_differ) and metric in TIMING_METRICS:
-                        warn("input_work_changed", "Observed input work or live generated histories differ; timing is not like-for-like.")
+                        warn("input_work_changed", "Observed input work differs or lacks evidence; timing requires comparable input work."
+                             if scheduled_user else "Observed input work or live generated histories differ; timing is not like-for-like.")
                     if generation_work_changed and metric in TIMING_METRICS:
                         warn("output_work_changed", "Observed total generation differs or lacks evidence; timing requires comparable generated work.")
+                    elif visible_work_changed:
+                        warn("output_work_changed", "Observed visible output differs or lacks evidence; timing requires comparable generated work.")
                     elif live_output_differs and metric in TIMING_METRICS:
                         warn("output_work_changed", "Observed generated work differs at matching live conversation turns; timing is not like-for-like.")
                     elif metric_output_changed and metric in {"latency_ms", "max_stream_gap_ms", "output_tokens_per_second", "generation_tokens_per_second"}:

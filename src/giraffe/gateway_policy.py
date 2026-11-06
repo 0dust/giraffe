@@ -4,14 +4,15 @@ from __future__ import annotations
 import asyncio
 from bisect import bisect_left
 from decimal import Decimal
-from math import ceil, floor
+from fractions import Fraction
+from math import ceil, floor, inf
 import time
 
 from .identities import identity_headers, litellm_key_fingerprint
 from .models import CheckResult, RequestSpec
 
 
-VERSION = 10
+VERSION = 11
 PROMPT = "Reply with exactly the word OK."
 
 
@@ -99,10 +100,11 @@ async def execute(run, target, client):
         run.finish_condition(target.name, "gateway_policy", reason=observation["stop_reason"])
 
 
-def _completed_before_dispatch(admissions, record):
+def _completed_before_dispatch(admissions, record, *, after_ms=None):
     if record.dispatch_ms is None:
         return 0
     return sum(other is not record and other.completed_ms is not None and other.completed_ms < record.dispatch_ms
+               and (after_ms is None or other.dispatch_ms is not None and after_ms < other.dispatch_ms)
                for other in admissions)
 
 
@@ -238,13 +240,26 @@ def summarize(settings, observation, records):
         threshold_percent = Decimal(str(settings.saturation_threshold)) * 100
         strict_evidence_missing = "Strict-mode evidence does not establish the declared saturation threshold."
         rejected_ids = {record.id for record in recognized}
-        for rejection in recognized:
+        earlier_readings = []
+        ordered_rejections = sorted(recognized, key=lambda record: record.completed_ms if record.completed_ms is not None else inf)
+        for rejection in ordered_rejections:
             bounds = rejection.gateway_evidence._saturation_bounds
             if bounds is None or bounds[1] < threshold_percent:
                 return outcome("unverified", strict_evidence_missing)
             completed = _completed_before_dispatch(admissions, rejection)
             if completed * 100 > bounds[1] * settings.model_rpm:
                 return outcome("unverified", "Reported saturation contradicts completed admissions in the isolated window.")
+            # Both counters are nondecreasing in this window. Count only
+            # admissions whose entire request fell between two known readings.
+            preceding = [reading for reading in earlier_readings
+                         if rejection.dispatch_ms is not None and reading[0] < rejection.dispatch_ms]
+            prior_rpm_floor = max((count + _completed_before_dispatch(admissions, rejection, after_ms=finished)
+                                   for finished, count, _ in preceding), default=0)
+            minimum_rpm = max(completed, prior_rpm_floor)
+            minimum_saturation = max(Fraction(bounds[0]), Fraction(minimum_rpm * 100, settings.model_rpm),
+                                     max((saturation for _, _, saturation in preceding), default=0))
+            if minimum_saturation > bounds[1]:
+                return outcome("unverified", "Reported saturation contradicts earlier limiter evidence in the isolated window.")
             if rejection.gateway_evidence._model_tpm_unconfigured:
                 # A recognized priority rejection changes neither counter. Other
                 # failures may have been charged before the gateway replied.
@@ -252,7 +267,7 @@ def summarize(settings, observation, records):
                     record.dispatch_ms is None or rejection.completed_ms is None
                     or record.dispatch_ms <= rejection.completed_ms
                 ) for record in records)
-                minimum_count = max(completed, ceil(bounds[0] * settings.model_rpm / 100))
+                minimum_count = ceil(minimum_saturation * settings.model_rpm / 100)
                 maximum_count = min(possible, floor(bounds[1] * settings.model_rpm / 100))
                 least_matching = _least_reported_rpm_count(rejection.gateway_evidence._reported_saturation,
                                                           settings.model_rpm, minimum_count, maximum_count)
@@ -260,8 +275,12 @@ def summarize(settings, observation, records):
                     return outcome("unverified", "Reported saturation cannot match any possible model RPM count in the isolated window.")
                 if least_matching < crossing:
                     return outcome("unverified", strict_evidence_missing)
-            elif bounds[0] < threshold_percent and completed < crossing:
+                minimum_rpm = least_matching
+                minimum_saturation = Fraction(least_matching * 100, settings.model_rpm)
+            elif minimum_saturation < threshold_percent and minimum_rpm < crossing:
                 return outcome("unverified", strict_evidence_missing)
+            if rejection.completed_ms is not None:
+                earlier_readings.append((rejection.completed_ms, minimum_rpm, minimum_saturation))
         if len(admissions) > settings.model_rpm:
             return outcome("observed_failure", "Total admitted requests exceeded the declared model RPM in the isolated window.", "fail")
         allowance = max(allowance, crossing)
