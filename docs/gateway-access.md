@@ -17,7 +17,7 @@ does not create keys, revoke keys, change privileges, or call administrative
 gateway endpoints. Each case makes one inference request and may incur the
 endpoint's normal inference cost. Access probes use a fixed prompt and the
 declared model and output cap. They omit suite-level request options and set
-LiteLLM's `disable_fallbacks` option so another model cannot satisfy the probe.
+LiteLLM's `disable_fallbacks` option to request routing to that model group alone.
 
 Identities may include `headers_env`, mapping header names to environment variable
 names. They replace the endpoint's credentials completely. An explicit empty
