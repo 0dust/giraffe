@@ -113,7 +113,6 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
     duration_estimates, duration_runs = {}, {}
     selected = set(config.checks)
     quotas = _request_quotas(config)
-    evidence_reserve = token_evidence_request_reserve(rows)
     shared_attribution = (not gateway_identities_only(selected)
                           and any(configured_probe_count(config, target) for target in config.targets))
     defer_attribution = deferred_for_shared_targets(config)
@@ -469,6 +468,7 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
             # The ordinary initial request consumes quota; readiness is exempt.
             # Optional streamed evidence uses spare quota and shares one timeout across retries.
             quota = quotas[target.name]
+            evidence_reserve = token_evidence_request_reserve(rows, target=target.name)
             if quota is None or quota - initial_count > max(1, evidence_reserve - initial_count):
                 setup(target.name, "performance_evidence_probe", "Streamed token and usage compatibility",
                       "request_timeout_seconds", config.request_timeout_seconds)
@@ -1409,7 +1409,6 @@ def request_plan(config: RunConfig | ConfigDraft, *,
 
     compatibility_quotas = {}
     if config.stream and any(attribution_counts.values()):
-        shared_reserve = token_evidence_request_reserve(rows)
         gateway_only = gateway_identities_only(selected)
         for target in config.targets:
             restart = config.restart_target == target.name
@@ -1418,6 +1417,7 @@ def request_plan(config: RunConfig | ConfigDraft, *,
                 continue
             if gateway_only and not restart:
                 continue
+            shared_reserve = token_evidence_request_reserve(rows, target=target.name)
             initial_count = int(initial and not restart)
             shared_and_marked = max(coverage_counts[target.name], shared_reserve + probes)
             count = shared_and_marked - int(initial and restart)

@@ -15,7 +15,6 @@ _IDENTITY_FAILURE_REASONS = {
     IDENTITY_CHANGED: "identity_changed",
     "Test identity credentials are unavailable.": "identity_unavailable",
 }
-_TOOL_OPTIONS = ("tools", "tool_choice", "parallel_tool_calls", "functions", "function_call")
 QUALIFICATION = ("Only the declared identities and endpoint/model were exercised. "
                  "These fixtures do not certify tenant isolation or comprehensive gateway security.")
 
@@ -121,6 +120,8 @@ def observation(record):
         return "unverified", "request_cancelled"
     if reason := _IDENTITY_FAILURE_REASONS.get(record.error):
         return "unverified", reason
+    if record._gateway_access_fallback_reported:
+        return "unverified", "fallback_reported"
     if record.status == "completed" and record.http_status == 200:
         if record.valid:
             return "allow", "valid_completion"
@@ -214,7 +215,7 @@ async def execute(run, target, client):
             spec = RequestSpec(fixture_id="gateway-access-" + case.name,
                 scenario="gateway_access", check_ids=["gateway_access"], identity=case.identity,
                 messages=[{"role": "user", "content": "Reply with OK."}], stream=False,
-                options=dict.fromkeys(_TOOL_OPTIONS),
+                options={"disable_fallbacks": True},
                 max_tokens=settings.max_output_tokens,
                 request_timeout_seconds=settings.request_timeout_seconds,
                 workload={"case": case.name, "expected": case.expected})

@@ -87,7 +87,7 @@ def _groups(records: list[RequestRecord], target: str) -> dict[tuple[str, str], 
     return groups
 
 
-def _uses_shared_tool_options(config: dict, check: str) -> bool:
+def _uses_shared_request_options(config: dict, check: str) -> bool:
     if check in ("gateway_access", "gpu"):
         return False
     if check not in ("gateway_attribution", "gateway_policy"):
@@ -116,11 +116,9 @@ def _comparison_config(value: dict) -> dict:
     options = config.get("request_options")
     if (isinstance(checks, list) and "gateway_access" in checks
             and not config.get("restart_target") and isinstance(options, dict)
-            and not any(_uses_shared_tool_options(config, check) for check in checks)):
-        from .gateway_access import _TOOL_OPTIONS
-
-        # Access discards these options. Telemetry and unavailable probes send no inference.
-        config["request_options"] = {key: value for key, value in options.items() if key not in _TOOL_OPTIONS}
+            and not any(_uses_shared_request_options(config, check) for check in checks)):
+        # Access sends a fixed probe. Telemetry and unavailable probes send no inference.
+        config["request_options"] = {}
     if isinstance(config.get("limits"), dict):
         config["limits"].pop("regression_percent", None)
         for field in ("first_output_ms", "stream_gap_ms"):

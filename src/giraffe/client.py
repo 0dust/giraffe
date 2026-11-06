@@ -458,8 +458,9 @@ class LLMClient:
                 selected_headers["x-litellm-trace-id"] = spec.workload["gateway_run"]
                 selected_headers["x-litellm-spend-logs-metadata"] = json.dumps({
                     "giraffe_run": spec.workload["gateway_run"], "giraffe_request": record.id})
+        options = spec.options if access_probe else self.config.request_options | spec.options
         payload = {
-            key: value for key, value in (self.config.request_options | spec.options).items()
+            key: value for key, value in options.items()
             if key not in _RESERVED_OPTIONS and value is not None
         }
         payload.update(model=self.target.model, messages=spec.messages, stream=stream,
@@ -807,6 +808,9 @@ class LLMClient:
                 events = None
                 try:
                     record.http_status = response.status_code
+                    if access_probe:
+                        record._gateway_access_fallback_reported = response.headers.get(
+                            "x-litellm-attempted-fallbacks") not in (None, "0")
                     if spec.identity is not None:
                         from .gateway_response import response_evidence
                         record.gateway_evidence = response_evidence(response.status_code, headers=response.headers,

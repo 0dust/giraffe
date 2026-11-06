@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import time
 
@@ -173,6 +174,100 @@ def test_access_plan_counts_only_configured_aliases_by_target(monkeypatch):
     row, = plan["rows"]
     assert row["kind"] == "exact" and row["target_request_counts"] == counts
     assert {item["target"]: item["requests"] for item in plan["unknown_time_components"]} == {"proxy": 2, "partial": 1}
+
+
+def _mixed_access_attribution_config(check):
+    raw = config(retention="all", samples=2, request_timeout_seconds=2, max_memory_mb=0).model_dump()
+    raw.update(stream=True, checks=["access", check, "gateway_access", "gateway_attribution"],
+               gateway_attribution={"identities": ["allowed"], "samples": 1, "settle_seconds": .1})
+    raw["targets"][0]["gateway"] = {"profile": "litellm", "url": "http://reader", "api_key_env": "READER_KEY"}
+    raw["targets"].append({"name": "shared", "url": "http://shared/v1", "model": "test"})
+    return raw
+
+
+def test_access_plan_timeline_reserves_compatible_requests_per_target():
+    from giraffe.planning import request_plan
+
+    raw = _mixed_access_attribution_config("generation")
+    raw.update(max_requests=9, max_duration_seconds=5)
+    plan = request_plan(RunConfig.model_validate(raw))
+    assert plan["target_quotas"] == {"proxy": 5, "shared": 4}
+    assert [item["target"] for item in plan["time_timeline"]
+            if item["id"] == "performance_evidence_probe"] == ["shared"]
+    assert all(component["target"] == "shared" for warning in plan["time_warnings"]
+               for component in warning["components"] if component["id"] == "performance_evidence_probe")
+
+
+@pytest.mark.parametrize("cap", [18, 19])
+async def test_access_plan_attribution_limit_covers_target_scoped_compatibility(monkeypatch, local_tokenizer, cap):
+    from giraffe.planning import request_plan
+    from giraffe.tool_checks import default_tool_fixture
+    from tests.test_gateway_attribution import immediate_spend_polls, spend_page
+    from tests.test_tool_conversations import fixture
+
+    monkeypatch.setenv("ALLOW_KEY", "allow-secret")
+    monkeypatch.setenv("DENY_KEY", "deny-secret")
+    monkeypatch.setenv("READER_KEY", "reader-secret")
+    raw = _mixed_access_attribution_config("tools")
+    raw.update(max_requests=cap, tool_checks={"fixtures": [default_tool_fixture()], "conversations": [fixture()],
+                                            "modes": ["complete"]})
+    cfg = RunConfig.model_validate(raw)
+    immediate_spend_polls(monkeypatch, cfg)
+    rows = []
+    compatibility = {target.name: 0 for target in cfg.targets}
+
+    def handler(request):
+        if request.method != "POST":
+            return spend_page(request, rows) if request.url.host == "reader" else httpx.Response(404)
+        payload = json.loads(request.content)
+        usage = {"prompt_tokens": 3, "completion_tokens": 5}
+        if marker := request.headers.get("x-litellm-trace-id"):
+            rows.append({"request_id": str(len(rows)), "session_id": marker, "status": "success",
+                "metadata": {"spend_logs_metadata": json.loads(request.headers["x-litellm-spend-logs-metadata"])},
+                "api_key": hashlib.sha256(b"allow-secret").hexdigest(), "total_tokens": 8, **usage})
+        elif payload["max_tokens"] == 1:
+            compatibility[request.url.host] += 1
+            if compatibility[request.url.host] <= 2:
+                return httpx.Response(400, json={"error": {"param": "logprobs"}})
+        elif request.headers.get("authorization") == "Bearer deny-secret":
+            return httpx.Response(401, json={"error": {"type": "token_not_found_in_db"}})
+        if payload["stream"]:
+            return httpx.Response(200, text=(
+                'data: {"choices":[{"delta":{"content":"OK"},"logprobs":{"content":[{"token":"OK"}]}}]}\n\n'
+                'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+                'data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":5}}\n\n'
+                'data: [DONE]\n\n'))
+        messages = payload["messages"]
+        message, finish = {"role": "assistant", "content": "OK"}, "stop"
+        if messages[-1]["role"] == "tool":
+            message["content"] = messages[-1]["content"]
+        elif payload.get("tools"):
+            city = "Warsaw" if messages[0]["content"].startswith("Check Warsaw") else "Delhi"
+            message["tool_calls"] = [{"id": "call_1", "type": "function", "function": {
+                "name": payload["tools"][0]["function"]["name"], "arguments": json.dumps({"city": city})}}]
+            finish = "tool_calls"
+        return httpx.Response(200, json={"choices": [{"message": message, "finish_reason": finish}], "usage": usage})
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
+    plan = request_plan(cfg)
+    assert plan["attribution_request_limit"] == 19
+    warnings = [warning for warning in plan["request_warnings"] if warning["kind"] == "incomplete_coverage"]
+    if cap == 18:
+        warning, = warnings
+        assert warning["cut_checks"] == ["gateway_attribution"] and warning["actions"][0]["value"] == 19
+    else:
+        assert not warnings
+    report = await run_suite(cfg)
+    assert compatibility["proxy"] == 3
+    checks = {check.id: check for check in report.checks if check.target == "proxy"}
+    assert checks["gateway_access"].status == checks["tools"].status == "pass"
+    attribution = checks["gateway_attribution"]
+    if cap == 18:
+        assert attribution.status == "inconclusive" and attribution.metrics["reason_code"] == "budget_limited"
+        assert attribution.remediation["minimum"] == 19
+    else:
+        assert attribution.status == "pass" and attribution.metrics["matched_requests"] == 1
 
 
 def _mock_recovery_gateway(monkeypatch):
@@ -501,7 +596,71 @@ async def test_access_requires_tool_free_completions(monkeypatch, message, finis
     assert "deny-secret" not in report.model_dump_json()
 
 
-@pytest.mark.parametrize("other_check,setup,uses_tool_options", [
+async def test_access_probes_only_the_declared_model(monkeypatch):
+    monkeypatch.setenv("ALLOW_KEY", "allow-secret")
+    monkeypatch.setenv("DENY_KEY", "deny-secret")
+    requests = []
+
+    def handler(request):
+        if request.method != "POST":
+            return httpx.Response(404)
+        payload = json.loads(request.content)
+        authorization = request.headers["authorization"]
+        requests.append((authorization, payload))
+        # Both keys can use the declared model. Only the first key can use the fallback.
+        grants = {"test", "backup"} if authorization == "Bearer allow-secret" else {"test"}
+        if not {payload["model"], *payload.get("fallbacks", [])} <= grants:
+            return httpx.Response(403, json={"error": {"type": "key_model_access_denied", "param": "model"}})
+        return httpx.Response(200, json={"model": "upstream-model", "choices": [{
+            "message": {"role": "assistant", "content": "OK"}, "finish_reason": "stop"}]})
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
+    cfg = config(request_options={"fallbacks": ["backup"], "disable_fallbacks": False, "temperature": 0.3})
+    cfg.gateway_access.max_output_tokens = 16
+    report = await run_suite(cfg)
+    cases = next(check for check in report.checks if check.id == "gateway_access").metrics["gateway_access"]["cases"]
+    assert report.overall == "fail"
+    assert [case["observed"] for case in cases] == ["allow", "allow"]
+    payload = {"model": "test", "messages": [{"role": "user", "content": "Reply with OK."}],
+               "stream": False, "max_tokens": 16, "n": 1, "disable_fallbacks": True}
+    assert requests == [("Bearer allow-secret", payload), ("Bearer deny-secret", payload)]
+
+
+@pytest.mark.parametrize("status,count,observed", [
+    (200, "0", "allow"),
+    (200, "1", "unverified"),
+    (200, "0, 1", "unverified"),
+    (403, "1", "unverified"),
+])
+async def test_access_cannot_qualify_response_with_reported_fallback(monkeypatch, status, count, observed):
+    monkeypatch.setenv("ALLOW_KEY", "allow-secret")
+    monkeypatch.setenv("DENY_KEY", "deny-secret")
+
+    def handler(request):
+        if request.method != "POST":
+            return httpx.Response(404)
+        if request.headers["authorization"] == "Bearer deny-secret":
+            return httpx.Response(401, json={"error": {"type": "token_not_found_in_db"}})
+        if status == 403:
+            body = {"error": {"type": "key_model_access_denied"}}
+        else:
+            body = {"model": "upstream-model", "choices": [{
+                "message": {"role": "assistant", "content": "OK"}, "finish_reason": "stop"}]}
+        return httpx.Response(status, headers={"x-litellm-attempted-fallbacks": count}, json=body)
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
+    report = await run_suite(config())
+    cases = next(check for check in report.checks if check.id == "gateway_access").metrics["gateway_access"]["cases"]
+    assert cases[0]["observed"] == observed
+    if observed == "unverified":
+        assert cases[0]["reason"] == "fallback_reported"
+    assert cases[1]["observed"] == "deny"
+    assert report.overall == ("pass" if observed == "allow" else "inconclusive")
+
+
+@pytest.mark.parametrize("other_check,setup,uses_shared_options", [
     (None, None, False),
     ("gateway_attribution", None, False),
     ("gateway_attribution", "no_reader", False),
@@ -511,12 +670,13 @@ async def test_access_requires_tool_free_completions(monkeypatch, message, finis
     ("gateway_policy", "unsupported", False),
     ("serving", None, True),
 ])
-async def test_access_baseline_matches_transmitted_request_options(monkeypatch, other_check, setup, uses_tool_options):
+async def test_access_baseline_matches_transmitted_request_options(monkeypatch, other_check, setup, uses_shared_options):
     monkeypatch.setenv("ALLOW_KEY", "allow-secret")
     monkeypatch.setenv("DENY_KEY", "deny-secret")
     inherited = {"tools": [{"type": "function", "function": {"name": "unexpected"}}],
                  "tool_choice": "required", "parallel_tool_calls": True,
-                 "functions": [{"name": "legacy"}], "function_call": "auto"}
+                 "functions": [{"name": "legacy"}], "function_call": "auto",
+                 "fallbacks": ["backup"], "reasoning_effort": "medium", "temperature": 0.4}
     payloads = []
 
     def handler(request):
@@ -552,30 +712,23 @@ async def test_access_baseline_matches_transmitted_request_options(monkeypatch, 
         assert len(probes) == 2
         return report, probes
 
-    baseline, original_probes = await run_with({**inherited, "temperature": 0.4})
+    baseline, original_probes = await run_with(inherited)
     assert all(not inherited.keys() & json.loads(body).keys() for body in original_probes.values())
     if other_check == "serving":
         shared = [json.loads(body) for auth, body in payloads if auth is None]
-        assert shared and all(inherited.keys() <= payload.keys() for payload in shared)
+        assert shared and all(all(payload.get(key) == value for key, value in inherited.items()) for payload in shared)
     else:
         assert len(payloads) == 2
 
-    current, probes = await run_with({"temperature": 0.4})
+    current, probes = await run_with({"temperature": 0.7})
     assert probes == original_probes
     comparison = compare_baseline(current, baseline).baseline["targets"][0]
-    if uses_tool_options:
+    if uses_shared_options:
         assert comparison["status"] == "inconclusive"
         assert "Run setting request_options differs." in comparison["reasons"]
     else:
         assert comparison["status"] == "pass"
         assert [row["status"] for row in comparison["comparisons"] if row["check"] == "gateway_access"] == ["pass", "pass"]
-
-    changed, probes = await run_with({"temperature": 0.7})
-    assert probes != original_probes
-    assert all(json.loads(body)["temperature"] == 0.7 for body in probes.values())
-    comparison = compare_baseline(changed, baseline).baseline["targets"][0]
-    assert comparison["status"] == "inconclusive"
-    assert "Run setting request_options differs." in comparison["reasons"]
 
 
 @pytest.mark.parametrize("limit,case_reason,abort_reason", [
