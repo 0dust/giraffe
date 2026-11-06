@@ -266,6 +266,9 @@ custom headers and ignores ambient cookies; `{}` explicitly means anonymous.
 Missing references never fall back to the shared key. Identity probes retain
 numeric response evidence, not answer text or arbitrary server identifiers.
 Ordinary requests continue to use the target's shared credentials.
+On marked probes, Giraffe reserves the `x-litellm-trace-id`, `x-litellm-session-id`, and
+`x-litellm-spend-logs-metadata` headers and the `litellm_session_id` body field for
+generated correlation markers.
 
 The LiteLLM reader sends a bounded UTC date window covering the probes and
 settle period on every page. The adapter requires generated request metadata, the matching session

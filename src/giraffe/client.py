@@ -249,7 +249,8 @@ class LLMClient:
     reports_response_activity = True
     _supports_dispatch_guard = True
 
-    def __init__(self, target: Target, config: RunConfig, *, max_connections: int | None = None):
+    def __init__(self, target: Target, config: RunConfig, *, max_connections: int | None = None,
+                 _tls_context: ssl.SSLContext | None = None):
         self.target = target
         self.config = config
         if max_connections is None:
@@ -260,7 +261,7 @@ class LLMClient:
         self.max_connections = max_connections
         self.logprob_budget = LogprobBudget()
         self._client: httpx.AsyncClient | HTTPClientPool | None = None
-        self._tls_context: ssl.SSLContext | None = None
+        self._tls_context = _tls_context
         self._stream_drains: set[asyncio.Task[None]] = set()
         self.on_response = None
         self._evidence_fields = {"logprobs", "stream_options"}
@@ -327,10 +328,12 @@ class LLMClient:
         # HTTPX loads TLS certificates even for HTTP endpoints. Keep that
         # synchronous setup away from concurrent inference and the heartbeat.
         headers = self._request_headers()
-        verify = (ssl.create_default_context(cafile=self.config.ca_bundle)
-                  if self.config.ca_bundle else
-                  httpx.create_ssl_context(verify=True, trust_env=True))
-        self._tls_context = verify
+        verify = self._tls_context
+        if verify is None:
+            verify = (ssl.create_default_context(cafile=self.config.ca_bundle)
+                      if self.config.ca_bundle else
+                      httpx.create_ssl_context(verify=True, trust_env=True))
+            self._tls_context = verify
         if self.target.test_identities:
             from .identities import IdentityCookieJar
             cookies = IdentityCookieJar()
@@ -375,6 +378,7 @@ class LLMClient:
             if self._client is not None:
                 await self._client.aclose()
                 self._client = None
+                self._tls_context = None
 
     @staticmethod
     async def _drain_stream(
@@ -456,6 +460,7 @@ class LLMClient:
                 record._gateway_key_hash = litellm_key_fingerprint(selected_headers)
                 selected_headers = dict(httpx.Headers(selected_headers))
                 selected_headers["x-litellm-trace-id"] = spec.workload["gateway_run"]
+                selected_headers["x-litellm-session-id"] = spec.workload["gateway_run"]
                 selected_headers["x-litellm-spend-logs-metadata"] = json.dumps({
                     "giraffe_run": spec.workload["gateway_run"], "giraffe_request": record.id})
         payload = {
