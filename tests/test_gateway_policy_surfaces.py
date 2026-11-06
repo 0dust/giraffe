@@ -42,7 +42,7 @@ async def test_matching_legacy_policy_summaries_do_not_establish_a_baseline(monk
     assert check.status == "pass"
     assert compare_baseline(report, report.model_copy(deep=True)).baseline["status"] == "pass"
 
-    check.metrics["gateway_policy"]["version"] = 4
+    check.metrics["gateway_policy"]["version"] = 5
     compared = compare_baseline(report, report.model_copy(deep=True)).baseline
     assert compared["status"] == "inconclusive"
     assert all(row["status"] == "inconclusive" for row in compared["targets"][0]["comparisons"])

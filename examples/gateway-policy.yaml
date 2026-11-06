@@ -26,4 +26,4 @@ gateway_policy:
   duration_seconds: 15
   interval_seconds: 0.1
   max_output_tokens: 16
-  window_state: unknown # Change only after confirming an isolated fresh window.
+  window_state: unknown # Use isolated_fresh_single_counter after verifying both conditions.

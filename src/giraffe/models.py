@@ -1120,7 +1120,7 @@ class GatewayPolicy(Model):
     duration_seconds: float = Field(default=15, gt=0, le=55)
     interval_seconds: float = Field(default=.1, ge=.001, le=10)
     max_output_tokens: StrictInt = Field(default=16, ge=1, le=256)
-    window_state: Literal["unknown", "isolated_fresh"] = "unknown"
+    window_state: Literal["unknown", "isolated_fresh", "isolated_fresh_single_counter"] = "unknown"
     model_rpm: StrictInt | None = Field(default=None, ge=1, le=1000000)
     saturation_threshold: float | None = Field(default=None, ge=0, le=1)
     saturation_cache_seconds: float | None = Field(default=None, ge=0, le=60)
