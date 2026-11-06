@@ -302,7 +302,7 @@ def _fairness(observation, window, users, records, criteria, health, lag, timing
                       if item.get("variant") == variant and item.get("status") == "calibrated"
                       and item.get("reason_code") == "minimum_prompt_length"
                       and item.get("token_count_scope") != "builtin_reference" and item.get("input_tokens") is not None}
-            qualification = input_qualification(load_settings, size, work, floors=floors)
+            qualification = input_qualification(load_settings, size, samples, floors=floors)
             if not qualification["qualified"]:
                 notes.append("Input shape not qualified: " + qualification["reason"])
         activated = user.get("activated_ms")
@@ -314,8 +314,8 @@ def _fairness(observation, window, users, records, criteria, health, lag, timing
         streams[uid] = [r.model_copy(update={"stream_end_ms": r.last_output_ms}) for r in samples
                         if r.stream and r.answer_reads >= 2 and r.answer_chunks >= 2]
         measurements.append({"user_id": uid, "reasons": notes, "valid_samples": len(samples),
-                             "input_median_tokens": median([r.input_tokens for r in work]),
-                             "output_median_tokens": median([r.output_tokens for r in work]),
+                             "input_median_tokens": median([r.input_tokens for r in samples]),
+                             "output_median_tokens": median([r.output_tokens for r in samples]),
                              "active_exposure_ms": exposure, "input_qualification": qualification})
     overlap_users = []
     for measured in measurements:
