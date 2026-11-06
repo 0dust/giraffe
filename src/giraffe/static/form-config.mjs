@@ -647,37 +647,32 @@ function validIdentityReferences(value) {
   });
 }
 
-export function configureGatewayAccess(source, values, {allowInvalid=false,includeInactive=true,draft=null,limits={}}={}) {
+export function configureGatewayAccess(source, values, {allowInvalid=false,draft=null}={}) {
   const config=structuredClone(source),selected=config.checks?.includes('gateway_access');
-  if((!selected&&!includeInactive)||typeof config.gateway_access?.cases==='string')config.gateway_access=null;
+  if(!selected)config.gateway_access=null;
   if(!values.has('gateway_access_rendered'))return config;
-  if(selected||includeInactive){
+  if(draft||selected){
     const raw=Object.fromEntries(['profile','cases','auth_header','request_timeout_seconds','max_output_tokens']
       .map(key=>[key,String(values.get('gateway_access_'+key) || '')]));
-    let cases;
-    try {
-      cases=raw.cases.split('\n').map(line=>line.trim()).filter(Boolean).map(line=>{
-        const parts=line.split(/\s+/);
-        if(parts.length!==3||!['allow','deny'].includes(parts[2]))throw new Error('Enter a case name, identity alias and allow or deny on each line.');
-        return {name:parts[0],identity:parts[1],expected:parts[2]};
-      });
-    }catch(error){
-      if(selected&&!allowInvalid)throw error;
-      cases=raw.cases;
+    if(draft){
+      // Only the selected validation path promotes raw Access fields into the payload.
+      draft.settings=raw;
+      config.gateway_access=null;
+    }else{
+      let cases;
+      try{
+        cases=raw.cases.split('\n').map(line=>line.trim()).filter(Boolean).map(line=>{
+          const parts=line.split(/\s+/);
+          if(parts.length!==3||!['allow','deny'].includes(parts[2]))throw new Error('Enter a case name, identity alias and allow or deny on each line.');
+          return {name:parts[0],identity:parts[1],expected:parts[2]};
+        });
+      }catch(error){
+        if(!allowInvalid)throw error;
+        cases=raw.cases;
+      }
+      config.gateway_access={profile:raw.profile||'unknown',cases,auth_header:raw.auth_header.trim()||null,
+        request_timeout_seconds:Number(raw.request_timeout_seconds),max_output_tokens:Number(raw.max_output_tokens)};
     }
-    const settings={profile:raw.profile||'unknown',cases,auth_header:raw.auth_header.trim()||null,
-      request_timeout_seconds:Number(raw.request_timeout_seconds),max_output_tokens:Number(raw.max_output_tokens)};
-    const validNumber=(candidate,key)=>{
-      const bound=limits['gateway_access.'+key] || {}, value=candidate[key];
-      return Number.isFinite(value)&&value>(bound.exclusiveMinimum??0)&&value>=(bound.minimum??0)&&
-        value<=(bound.maximum??Infinity)&&(bound.type!=='integer'||Number.isInteger(value));
-    };
-    const validDraft=candidate=>Array.isArray(candidate?.cases)&&validNumber(candidate,'request_timeout_seconds')&&
-      validNumber(candidate,'max_output_tokens');
-    if((draft||!selected)&&!validDraft(settings)){
-      if(draft)draft.settings=raw;
-      if(!validDraft(config.gateway_access))config.gateway_access=null;
-    }else config.gateway_access=settings;
   }
   config.targets.forEach((target,index)=>{
     const key='gateway_access_identities_'+index;

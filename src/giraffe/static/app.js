@@ -1199,7 +1199,7 @@ function runLimitIssues(config) {
 }
 function localSettingErrors(config=null) {
   if(hasJsonChanges())return [];
-  try {config ||= readForm(true,{includeInactiveGatewayAccess:false}).config;return [...loadTestIssues(config,loadFormDefaults(),state.bootstrap.limits),...runLimitIssues(config).filter(issue=>issue.blocking!==false),...positiveBoundErrors(config,state.bootstrap.limits,state.bootstrap.cap_explanations).filter(issue=>!issue.fields?.some(path=>path.startsWith('load_test.')))];}catch{return [];}
+  try {config ||= readForm(true).config;return [...loadTestIssues(config,loadFormDefaults(),state.bootstrap.limits),...runLimitIssues(config).filter(issue=>issue.blocking!==false),...positiveBoundErrors(config,state.bootstrap.limits,state.bootstrap.cap_explanations).filter(issue=>!issue.fields?.some(path=>path.startsWith('load_test.')))];}catch{return [];}
 }
 function localSettingWarnings() {
   if(hasJsonChanges())return [];
@@ -1883,10 +1883,18 @@ function renderConcurrentResults(metrics) {
   }).join('');
 }
 
+function gatewayAccessCaseLines(cases) {
+  return typeof cases==='string'?cases:(cases||[]).map(row=>`${row.name} ${row.identity} ${row.expected}`).join('\n');
+}
+function omitInactiveGatewayAccess(config,draft) {
+  if(config.checks?.includes('gateway_access')||config.gateway_access==null)return config;
+  draft.settings ??= {...config.gateway_access,cases:gatewayAccessCaseLines(config.gateway_access.cases)};
+  return {...config,gateway_access:null};
+}
 function renderGatewayAccessEditor(config) {
   const draft=state.gatewayAccessDraft || {};
   const s={profile:'unknown',cases:[],request_timeout_seconds:10,max_output_tokens:16,...config.gateway_access,...draft.settings};
-  const cases=typeof s.cases==='string'?s.cases:(s.cases||[]).map(row=>`${row.name} ${row.identity} ${row.expected}`).join('\n');
+  const cases=gatewayAccessCaseLines(s.cases);
   const identityText=(target,index)=>draft.identities?.[index] ?? (typeof target.test_identities==='string'?target.test_identities:JSON.stringify(target.test_identities||{},null,2));
   return `<div data-gateway-access-settings><input type="hidden" name="gateway_access_rendered" value="1"><p>Uses each configured endpoint and model. Supply both an allowed and a denied case; only these declared cases are verified.</p>${selectField('gateway_access_profile','Gateway profile',[...new Set(['unknown','litellm',s.profile])].map(value=>`<option value="${escape(value)}" ${s.profile===value?'selected':''}>${escape(value==='litellm'?'LiteLLM':value==='unknown'?'Not configured':value+' (unsupported)')}</option>`).join(''))}${field('gateway_access_auth_header','LiteLLM custom key header (optional)',s.auth_header??'',{hint:'Use the header name configured on LiteLLM. Leave blank for the default key headers.'})}${textField('gateway_access_cases','Declared cases',cases,{hint:'One line: case name, identity alias, allow or deny. Example: valid allowed allow. Maximum 16 cases.'})}<div class="fields">${field('gateway_access_request_timeout_seconds','Timeout per case (seconds)',s.request_timeout_seconds,{type:'number',step:'any',required:true})}${field('gateway_access_max_output_tokens','Output cap per case (tokens)',s.max_output_tokens,{type:'number',step:1,required:true})}</div>${config.targets.map((target,index)=>textField('gateway_access_identities_'+index,'Environment references · '+target.name,identityText(target,index),{hint:'Existing test identities only. Example: {"allowed":{"api_key_env":"ALLOW_KEY"},"denied":{"api_key_env":"DENY_KEY"}}. Optional headers_env maps header names to environment variable names. Never paste key values. An empty identity object explicitly sends no authentication.'})).join('')}<p class="hint">No keys or permissions are changed. Network failures and unsupported gateway responses cannot confirm a denial. These fixtures do not certify tenant isolation.</p></div>`;
 }
@@ -2530,7 +2538,7 @@ async function refreshRequestPreview(snapshot,{draft=false}={}) {
   assertAppliedConfig();
   if(state.planTimer!==null){clearTimeout(state.planTimer);state.planTimer=null;}
   const version=state.routeVersion,revision=state.configRevision,sequence=++state.previewSequence;
-  const payload=readForm(true,{includeInactiveGatewayAccess:false}),config=clone(snapshot || payload.config);
+  const payload=readForm(true),config=clone(snapshot || payload.config);
   if(payload.mode==='cold-start')config.restart_target=payload.restart_target;
   state.requestPreview={...state.requestPreview,status:'pending',revision,route:version};renderRequestPreview();
   try{
@@ -2903,7 +2911,7 @@ function renderNew(preset=inferSetupPreset(state.config,{limits:state.bootstrap?
   if(state.jsonDraft===null){state.jsonDraft=JSON.stringify(portableConfig(readForm(true)),null,2);state.jsonBase=state.jsonDraft;$('#config-editor').value=state.jsonDraft;}
   syncTestControls();updateBounds();updateRestart();syncConfigView();syncPackControls();renderRequestPreview();syncSetupStep();renderModelDiscovery();watchPlanViewport();scheduleTokenizerSelection({immediate:true});renderTokenizerSelection();
 }
-function readForm(allowEmpty=false,{includeInactiveGatewayAccess=allowEmpty,gatewayAccessDraft=null}={}) {
+function readForm(allowEmpty=false,{gatewayAccessDraft=null}={}) {
   const form=$('#new-run-form'),data=new FormData(form);let config=clone(state.config);
   // Disabled editors still retain their values when a test is unchecked.
   for(const input of form.querySelectorAll('[data-test-editor] input, [data-test-editor] select, [data-test-editor] textarea')){if(input.type==='radio'&&!input.checked)continue;data.set(input.name,input.type==='checkbox'?(input.checked?'on':'off'):input.value);}
@@ -2928,7 +2936,7 @@ function readForm(allowEmpty=false,{includeInactiveGatewayAccess=allowEmpty,gate
   config=configureProfiles(config,data,state.bootstrap.profile_defaults || {},{allowInvalid:allowEmpty,limits:state.bootstrap.limits});
   config=configureSessions(config,data,state.bootstrap.session_workloads.defaults,{allowInvalid:allowEmpty});
   config=configureMultiUser(config,data,state.bootstrap.multi_user?.defaults,{allowInvalid:allowEmpty});
-  config=configureGatewayAccess(config,data,{allowInvalid:allowEmpty,includeInactive:includeInactiveGatewayAccess,draft:gatewayAccessDraft,limits:state.bootstrap.limits});
+  config=configureGatewayAccess(config,data,{allowInvalid:allowEmpty,draft:gatewayAccessDraft});
   config=configureGatewayPolicy(config,data,{allowInvalid:allowEmpty});
   config.restart_target=null;
   return {config,baseline_id:data.get('baseline_id') || null,mode:data.get('mode') || 'normal',restart_target:data.get('mode')==='cold-start'?data.get('restart_target'):null};
@@ -2991,7 +2999,6 @@ async function startRun(event) {
     if(version!==state.routeVersion)return;
     $('#start-run').textContent='Checking input preparation…';
     const result=await api('/api/runs',{method:'POST',body:JSON.stringify({...payload,migration_notes:[...(state.migrationNotes || [])],api_keys:sessionAPIKeys(payload.config)})});state.config=clone(payload.config);state.config.targets[0].tokenizer=draft.targets[0].tokenizer;
-    if(!draft.checks.includes('gateway_access'))state.config.gateway_access=draft.gateway_access;
     state.gatewayAccessDraft=gatewayAccessDraft;
     if(draft.request_source==='request_pack'&&!draft.request_pack&&!draft.checks.some(id=>['correctness','load'].includes(id)))state.config.request_source=draft.request_source;
     setActive(result.id);if(version===state.routeVersion)location.hash=linkRun(result.id);
@@ -4172,7 +4179,8 @@ async function startNewRun(){
   const version=state.routeVersion,revision=state.configRevision;
   if($('#new-run-form'))captureFormDraft();
   try{
-    const result=await api('/api/config/draft',{method:'POST',body:JSON.stringify(state.config || state.bootstrap.config)});
+    const config=omitInactiveGatewayAccess(state.config || state.bootstrap.config,state.gatewayAccessDraft ||= {});
+    const result=await api('/api/config/draft',{method:'POST',body:JSON.stringify(config)});
     if(version!==state.routeVersion||revision!==state.configRevision)return;
     state.config=result.config;replaceMigrationNotes(result.migration_notes);
   }catch(error){toast(error.message);return;}
@@ -4205,9 +4213,10 @@ async function restoreDraft() {
     const draft=JSON.parse(sessionStorage.getItem('giraffe-draft-v1'));
     const legacy=draft?.config?.config_version==null;
     if(draft&&draft.config?.targets?.length&&(legacy||sameConfig(draft.bootstrap,state.bootstrap.config))){
-      let config=draft.config,notes=[];
+      const gatewayAccessDraft=draft.gatewayAccessDraft || {};
+      let config=omitInactiveGatewayAccess(draft.config,gatewayAccessDraft),notes=[];
       if(legacy){const result=await api('/api/config/draft',{method:'POST',body:JSON.stringify(config)});config=result.config;notes=result.migration_notes || [];}
-      state.config=config;state.gatewayAccessDraft=draft.gatewayAccessDraft || {};state.dismissedMigrationNotes=draft.dismissedMigrationNotes || [];
+      state.config=config;state.gatewayAccessDraft=gatewayAccessDraft;state.dismissedMigrationNotes=draft.dismissedMigrationNotes || [];
       state.migrationNotes=[...new Set([...(draft.migrationNotes || []),...state.dismissedMigrationNotes,...notes])];
     }else sessionStorage.removeItem('giraffe-draft-v1');
   }catch{}
