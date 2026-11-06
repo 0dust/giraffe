@@ -1177,14 +1177,16 @@ def _compare_user_fairness(current, previous, current_records, old_records):
     """Compare a previously accepted fairness limit on the same observed work."""
     latest, old = current.get("fairness", {}), previous.get("fairness", {})
     limit = old.get("threshold")
+    latest_status = latest.get("status")
     if (current.get("role") or previous.get("role") or limit is None or latest.get("threshold") != limit
             or old.get("status") != "pass" or old.get("qualified") is not True
-            or latest.get("status") not in {"fail", "inconclusive"}):
+            or latest_status not in {"pass", "fail", "inconclusive"}):
         return None
 
     tolerance = old.get("tolerance_percent", 10)
     compared = set(old.get("compared_user_ids", []))
-    comparable = (latest.get("qualified") is True and latest.get("tolerance_percent", 10) == tolerance
+    comparable = (latest_status in {"pass", "fail"} and latest.get("qualified") is True
+                  and latest.get("tolerance_percent", 10) == tolerance
                   and old.get("ratio") is not None and latest.get("ratio") is not None
                   and len(compared) >= 2 and all(set(fairness.get(field, [])) == compared
                       for fairness in (latest, old) for field in ("compared_user_ids", "eligible_user_ids")))
@@ -1221,15 +1223,17 @@ def _compare_user_fairness(current, previous, current_records, old_records):
             evidence.extend(record.id for record in cohorts[0])
 
     scenario, population = current["scenario"], current["population"]
-    reason = ("Observed delivery fairness exceeded the previously accepted threshold."
-              if comparable else "Observed fairness work or overlap differs or lacks evidence.")
+    status = latest_status if comparable else "inconclusive"
+    reasons = {"pass": "Observed delivery fairness stayed within the previously accepted threshold.",
+               "fail": "Observed delivery fairness exceeded the previously accepted threshold.",
+               "inconclusive": "Observed fairness work or overlap differs or lacks evidence."}
     return {"check": "multi_user", "scenario": f"{scenario} / {population}", "population": population,
             "window_id": current["id"], "metric": "fairness_acceptance", "aggregation": "selected_criteria",
             "current": latest.get("ratio"), "baseline": old.get("ratio"), "threshold": limit,
             "current_samples": sum(item.get("valid_samples", 0) for item in latest.get("users", [])),
             "baseline_samples": sum(item.get("valid_samples", 0) for item in old.get("users", [])),
-            "status": "fail" if comparable else "inconclusive", "worsening": 100 if comparable else None,
-            "reason": f"Multi-user fairness at {population} users: {reason}", "evidence_ids": evidence}
+            "status": status, "worsening": {"pass": 0, "fail": 100}.get(status),
+            "reason": f"Multi-user fairness at {population} users: {reasons[status]}", "evidence_ids": evidence}
 
 
 def _compare_user_delivery(report, baseline, target, reasons, threshold):
