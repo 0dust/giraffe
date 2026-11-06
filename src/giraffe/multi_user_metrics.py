@@ -64,6 +64,9 @@ def _user_summary(user: dict[str, Any], window: dict[str, Any], records: list[Re
     completed = [r for r in attempts if r.status == "completed"]
     errors = [r for r in attempts if _error(r)]
     cancelled = [r for r in attempts if r.status == "cancelled"]
+    terminal_failures = {r.id for r in errors + cancelled}
+    unadmitted_turn = any(item.get("stopped_before_cutoff") and terminal_failures.isdisjoint(item["turns"])
+                          for item in user.get("conversations", []))
     eligible = [r for r in valid if r.dispatch_ms < end and r.completed_ms is not None and r.completed_ms <= end]
     unclassified = [r for r in valid if r.completed_ms is None]
     late = [r for r in valid if r.completed_ms is not None and r.completed_ms > end]
@@ -99,6 +102,8 @@ def _user_summary(user: dict[str, Any], window: dict[str, Any], records: list[Re
         incomplete.append("The common measurement window was not completed.")
     if window.get("drain_reason") or cancelled or missing_terminal:
         incomplete.append("Some admitted work has incomplete terminal coverage.")
+    if unadmitted_turn:
+        incomplete.append("Some required conversation turns were not admitted before the window closed.")
     reasons = []
     selected = {}
     for name, first, metric in (("max_first_answer_ms", True, "first_output_ms"),
@@ -157,7 +162,7 @@ def _user_summary(user: dict[str, Any], window: dict[str, Any], records: list[Re
             reasons.append(f"Observed request error rate exceeds {criteria.max_error_percent:g}%.")
     if criteria.min_output_tokens_per_second is not None:
         interrupted = bool(window.get("cut_short") or window.get("drain_reason")
-                           or cancelled or missing_terminal)
+                           or cancelled or missing_terminal or unadmitted_turn)
         failed = (bool(attempts) and not interrupted and rate is not None
                   and rate < criteria.min_output_tokens_per_second)
         selected["min_output_tokens_per_second"] = {
@@ -222,6 +227,7 @@ def _user_summary(user: dict[str, Any], window: dict[str, Any], records: list[Re
             "pending_wait": pending, "timing_quality": quality, "criteria": selected,
             "coverage": {"status": "unexercised" if not attempts else "partial" if coverage_reasons else "complete",
                          "reasons": coverage_reasons, "valid_samples": len(valid),
+                         "unadmitted_conversation_turn": unadmitted_turn,
                          "required_samples": criteria.min_samples,
                          "missing_first_answer_count": sum(value is None for value in ready_first),
                          "missing_completion_count": sum(value is None for value in ready_completion),
@@ -299,6 +305,8 @@ def _fairness(observation, window, users, records, criteria, health, lag, timing
             notes.append(f"Only {len(samples)} valid in-window samples; {criteria.min_samples} required.")
         if user["outcomes"]["errors"] or user["outcomes"]["cancelled"] or user["outcomes"]["missing_terminal"]:
             notes.append("Failed or incomplete requests prevent an equal-work comparison.")
+        if user["coverage"]["unadmitted_conversation_turn"]:
+            notes.append("Unadmitted conversation turns prevent an equal-work comparison.")
         if any(r.input_tokens is None or r.output_tokens is None for r in work):
             notes.append("Input or output usage is missing.")
         if any(r.finish_reason == "stop" and r.output_tokens is not None

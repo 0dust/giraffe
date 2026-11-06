@@ -232,9 +232,10 @@ assert.match(markup,/conversation-one/);assert.match(markup,/failed turn/);asser
 ''', configuration())
 
 
-def test_unchanged_multi_user_form_preserves_live_first_mode_order():
+def test_unchanged_multi_user_form_preserves_mode_order_and_dormant_tasks():
     config = RunConfig.model_validate({**configuration().model_dump(),
-        'multi_user': {'levels': [2], 'conversations': {'modes': ['live', 'fixed']}}})
+        'multi_user': {'levels': [2], 'conversations': {'modes': ['live', 'fixed'],
+            'workloads': [{'name': 'draft', 'turns': ['Draft prompt', 'Draft follow-up']}]}}})
     result = browser_logic(r'''
 const markup=renderMultiUserEditor(config);
 const options=markup.match(/<select[^>]*name="multi_user_conversation_modes"[^>]*>(.*?)<\/select>/)[1];
@@ -244,7 +245,9 @@ values.set('multi_user_conversation_profile','correctness');
 values.set('multi_user_conversation_modes',mode);
 console.log(JSON.stringify(configureMultiUser(config,values,bootstrap.multi_user.defaults)));
 ''', config)
-    assert RunConfig.model_validate(result).multi_user.conversations.modes == ['live', 'fixed']
+    saved = RunConfig.model_validate(result).multi_user.conversations
+    assert saved.modes == ['live', 'fixed']
+    assert saved.workloads == config.multi_user.conversations.workloads
 
 
 def test_unchanged_multi_user_form_preserves_multiline_recall_prompts():

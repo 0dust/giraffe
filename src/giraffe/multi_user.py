@@ -235,6 +235,8 @@ async def run_window(run, target, client, settings, load_settings, calibration, 
                 except asyncio.CancelledError:
                     user["conversations"][-1]["stop_reason"] = "conversation interrupted"
                     raise
+                if item["completed_turns"] < item["planned_turns"] and not closed and time.monotonic() < cutoff:
+                    item["stopped_before_cutoff"] = True
                 if not item["turns"]:
                     user["stop_reason"] = item["stop_reason"]
                     break
