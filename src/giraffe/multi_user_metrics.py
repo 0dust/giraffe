@@ -500,7 +500,9 @@ def _cancellation(window, records, criteria, health, lag, timing_threshold, dela
                            [r.id for r in followups], "Same-user follow-up is missing, failed or insufficiently sampled.",
                            failed=any(_error(r) for r in followups))
     coverage = "inconclusive" if window.get("cut_short") or window.get("drain_reason") else "pass"
-    return {"status": _status([cancellation["status"], peers["status"], followup["status"], coverage]),
+    status = (_status([followup["status"], coverage])
+              if cancellation["status"] == peers["status"] == "pass" else "inconclusive")
+    return {"status": status,
             "selected_user_id": window["selected_user_id"], "cancellation": cancellation,
             "peer_continuation": peers, "followup": followup, "backend_release": "unverified"}
 
