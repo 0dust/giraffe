@@ -26,7 +26,7 @@ def credential_digest(headers: dict[str, str]) -> bytes:
     return hashlib.sha256(json.dumps(headers, sort_keys=True).encode()).digest()
 
 
-def assistant_reply(message, finish_reason):
+def assistant_reply(message, finish_reason, usage, record):
     """Validate the fields used to qualify a plain assistant completion."""
     if message.get("role") != "assistant" or finish_reason not in ("stop", "length"):
         raise _ProtocolError("gateway access probe requires a completed assistant answer")
@@ -35,21 +35,36 @@ def assistant_reply(message, finish_reason):
     answer = _text(message.get("content"))
     reasoning = _text(message.get("reasoning_content"))
     alternate_reasoning = _text(message.get("reasoning"))
-    refusal = _text(message.get("refusal"))
-    return answer, reasoning or alternate_reasoning, finish_reason == "stop" and bool(refusal.strip())
+    has_refusal = bool(_text(message.get("refusal")).strip())
+    metered_reasoning = (finish_reason == "length" and not has_refusal and message.get("audio") is None
+                         and _metered_reasoning_usage(usage, record))
+    return answer, reasoning or alternate_reasoning, finish_reason == "stop" and has_refusal, metered_reasoning
 
 
-def metered_reasoning_usage(usage, record):
+def _metered_reasoning_usage(usage, record):
     """Require the output cap to be accounted for entirely by reasoning."""
     completion = record.completion_tokens
     if not isinstance(usage, dict) or not (record.reasoning_tokens == completion == record.requested_max_tokens > 0):
         return False
+    prompt = record.input_tokens
+    if "prompt_tokens" in usage and prompt is None:
+        return False
     if "total_tokens" in usage:
         total = _token_count(usage["total_tokens"])
-        prompt = record.input_tokens
-        if (total is None or total < completion or ("prompt_tokens" in usage and prompt is None)
-                or (prompt is not None and total != prompt + completion)):
+        if total is None or total < completion or (prompt is not None and total != prompt + completion):
             return False
+        prompt = total - completion
+    prompt_details = usage.get("prompt_tokens_details")
+    if prompt_details is not None:
+        if not isinstance(prompt_details, dict):
+            return False
+        # Cached tokens may also be counted in a modality, so bound each field independently.
+        for field in ("audio_tokens", "cache_write_tokens", "cached_tokens", "image_tokens", "text_tokens"):
+            if (value := prompt_details.get(field)) is None:
+                continue
+            count = _token_count(value)
+            if count is None or (prompt is not None and count > prompt):
+                return False
     details = usage["completion_tokens_details"]
     return all(details.get(field) is None or _token_count(details[field]) == 0 for field in (
         "accepted_prediction_tokens", "rejected_prediction_tokens", "audio_tokens", "text_tokens",

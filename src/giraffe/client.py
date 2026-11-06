@@ -620,11 +620,11 @@ class LLMClient:
                 for field in ("reasoning_content", "reasoning", "refusal"):
                     _text(content.get(field))
             if access_probe:
-                from .gateway_access import assistant_reply, metered_reasoning_usage
+                from .gateway_access import assistant_reply
 
-                finish_reason = choice.get("finish_reason")
-                answer, reasoning, record._gateway_access_refusal = assistant_reply(content, finish_reason)
-                record._gateway_access_metered_reasoning = finish_reason == "length" and metered_reasoning_usage(usage, record)
+                answer, reasoning, record._gateway_access_refusal, record._gateway_access_metered_reasoning = (
+                    assistant_reply(content, choice.get("finish_reason"), usage, record)
+                )
             else:
                 answer = _text(content.get("content"))
             if logprob_collector is not None:

@@ -390,19 +390,39 @@ async def test_access_denial_rules_do_not_change_policy_evidence(monkeypatch, lo
     assert compare_baseline(report, baseline).baseline["status"] == "pass"
 
 
-@pytest.mark.parametrize("completion,reasoning,reasoning_text,extra_usage,extra_details,observed", [
-    (16, 16, "deny-secret", {}, {}, "allow"),
-    (16, 16, None, {}, {}, "allow"),
-    (16, 16, None, {"total_tokens": 24}, {"accepted_prediction_tokens": 0, "audio_tokens": None}, "allow"),
-    (16, 16, None, {"total_tokens": 8}, {}, "unverified"),
-    (16, 16, None, {"total_tokens": 24}, {"accepted_prediction_tokens": 2}, "unverified"),
-    (16, None, "deny-secret", {}, {}, "unverified"),
-    (16, 17, None, {}, {}, "unverified"),
-    (15, 15, None, {}, {}, "unverified"),
-    (17, 17, None, {}, {}, "unverified"),
+@pytest.mark.parametrize("usage,message,observed", [
+    pytest.param({}, {"reasoning_content": "deny-secret"}, "allow", id="reasoning-text"),
+    pytest.param({}, {}, "allow", id="sparse-usage"),
+    pytest.param({"prompt_tokens": 8, "total_tokens": 24, "prompt_tokens_details": {
+        "cached_tokens": 8, "text_tokens": 8, "audio_tokens": None}, "completion_tokens_details": {
+        "reasoning_tokens": 16, "accepted_prediction_tokens": 0, "audio_tokens": None}},
+        {"audio": None, "refusal": ""}, "allow", id="coherent-complete-usage"),
+    pytest.param({"prompt_tokens_details": None}, {}, "allow", id="null-optional-prompt-details"),
+    pytest.param({"total_tokens": 24, "prompt_tokens_details": {"cached_tokens": 8}},
+        {}, "allow", id="implied-prompt-count"),
+    pytest.param({"prompt_tokens": 8, "total_tokens": 8}, {}, "unverified", id="inconsistent-total"),
+    pytest.param({"prompt_tokens": 8, "total_tokens": 24, "completion_tokens_details": {
+        "reasoning_tokens": 16, "accepted_prediction_tokens": 2}}, {}, "unverified", id="competing-completion-count"),
+    pytest.param({"completion_tokens_details": {"reasoning_tokens": None}},
+        {"reasoning_content": "deny-secret"}, "unverified", id="no-reasoning-count"),
+    pytest.param({"completion_tokens_details": {"reasoning_tokens": 17}}, {}, "unverified", id="reasoning-over-cap"),
+    pytest.param({"completion_tokens": 15, "completion_tokens_details": {"reasoning_tokens": 15}},
+        {}, "unverified", id="output-below-cap"),
+    pytest.param({"completion_tokens": 17, "completion_tokens_details": {"reasoning_tokens": 17}},
+        {}, "unverified", id="output-over-cap"),
+    pytest.param({"prompt_tokens": "invalid"}, {}, "unverified", id="malformed-prompt-count"),
+    pytest.param({"prompt_tokens": None}, {}, "unverified", id="null-prompt-count"),
+    pytest.param({"prompt_tokens": 8, "total_tokens": 24, "prompt_tokens_details": {"cached_tokens": 1000}},
+        {}, "unverified", id="cached-over-prompt-count"),
+    pytest.param({"total_tokens": 24, "prompt_tokens_details": {"cached_tokens": 9}},
+        {}, "unverified", id="cached-over-implied-prompt-count"),
+    pytest.param({"prompt_tokens_details": {"text_tokens": False}}, {}, "unverified", id="malformed-prompt-detail"),
+    pytest.param({"prompt_tokens_details": []}, {}, "unverified", id="malformed-prompt-breakdown"),
+    pytest.param({}, {"refusal": "deny-secret"}, "unverified", id="unfinished-refusal"),
+    pytest.param({}, {"audio": {"id": "audio", "data": "AA==", "transcript": "deny-secret", "expires_at": 42}},
+        "unverified", id="audio-output"),
 ])
-async def test_reasoning_only_access_requires_metered_cap_exhaustion(
-        monkeypatch, completion, reasoning, reasoning_text, extra_usage, extra_details, observed):
+async def test_reasoning_only_access_requires_metered_cap_exhaustion(monkeypatch, usage, message, observed):
     monkeypatch.setenv("ALLOW_KEY", "allow-secret")
     monkeypatch.setenv("DENY_KEY", "deny-secret")
 
@@ -415,10 +435,8 @@ async def test_reasoning_only_access_requires_metered_cap_exhaustion(
                 "usage": {"prompt_tokens": 8, "completion_tokens": 1, "total_tokens": 8}})
         assert json.loads(request.content)["max_tokens"] == 16
         return httpx.Response(200, json={"choices": [{"message": {
-            "role": "assistant", "content": None, "reasoning_content": reasoning_text},
-            "finish_reason": "length"}], "usage": {"prompt_tokens": 8,
-            "completion_tokens": completion, **extra_usage,
-            "completion_tokens_details": {"reasoning_tokens": reasoning, **extra_details}}})
+            "role": "assistant", "content": None, **message}, "finish_reason": "length"}],
+            "usage": {"completion_tokens": 16, "completion_tokens_details": {"reasoning_tokens": 16}, **usage}})
 
     original = httpx.AsyncClient
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
