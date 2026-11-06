@@ -1641,6 +1641,66 @@ async def test_changed_request_cap_only_blocks_comparison_when_shared_work_was_c
     assert any("max_requests differs" in reason for reason in archived["reasons"])
 
 
+async def test_serving_comparison_qualifies_actual_stream_options_after_compatibility_probe(
+        monkeypatch, local_tokenizer, tmp_path):
+    client_class = httpx.AsyncClient
+    original_send = client_class.send
+
+    async def send(client, request, **kwargs):
+        if request.method == "POST" and "x-litellm-trace-id" not in request.headers:
+            if not json.loads(request.content).get("logprobs"):
+                await asyncio.sleep(.13)
+        return await original_send(client, request, **kwargs)
+
+    async def saved_run(cap, rejections, checks, expected_options):
+        with monkeypatch.context() as env:
+            cfg, posts = streamed_gateway(env, rejected_attempts=rejections)
+            cfg.checks = checks
+            cfg.samples = cfg.limits.min_samples = 2
+            cfg.max_requests = cap
+            env.setattr(client_class, "send", send)
+            report = await run_suite(cfg)
+            assert next(check for check in report.checks if check.id == "serving").status == "pass"
+            wire_options = [(body.get("logprobs") is True, body.get("stream_options", {}).get("include_usage") is True)
+                            for marked, body in posts if not marked][-2:]
+            assert wire_options == [expected_options] * 2
+            path, _ = write_report(report, tmp_path)
+            saved = RunReport.model_validate_json(path.read_bytes())
+            for record in saved.requests:
+                if record.scenario == "warm":
+                    evidence = record.workload["token_evidence"]
+                    assert (evidence["requested_logprobs"], evidence["requested_usage"]) == expected_options
+            return saved
+
+    ordinary = ["serving"]
+    mixed = ["serving", "gateway_attribution"]
+    baseline = await saved_run(6, 0, ordinary, (True, True))
+    changed_runs = (await saved_run(3, 0, mixed, (False, False)),
+                    await saved_run(6, 1, mixed, (False, True)))
+
+    def warm_rows(current, previous):
+        target = compare_baseline(current, previous).baseline["targets"][0]
+        assert not target["reasons"] and target["status"] != "fail"
+        return {row["metric"]: row for row in target["comparisons"]
+                if row["check"] == "serving" and row["scenario"] == "warm"}
+
+    for changed in changed_runs:
+        rows = warm_rows(changed, baseline)
+        latency = rows["latency_ms"]
+        assert latency["current"] > latency["baseline"] + 100
+        assert latency["status"] == "inconclusive"
+        assert any(warning["code"] == "stream_options_changed" for warning in latency["warnings"])
+        assert rows["valid_completion_rate"]["status"] == "pass"
+
+    # Old uncapped/no-probe reports may lack these flags. Matching request hashes
+    # still attest the same payload when comparing with a new report.
+    unchanged = changed_runs[0]
+    archive = unchanged.model_copy(deep=True)
+    for record in archive.requests:
+        record.workload.pop("token_evidence", None)
+    assert warm_rows(unchanged, archive)["latency_ms"]["status"] == "pass"
+
+
 @pytest.mark.parametrize("with_builtin", [False, True])
 async def test_shared_baseline_still_requires_the_active_fixture_sources(monkeypatch, local_tokenizer, with_builtin):
     async def observer(request, rows):
