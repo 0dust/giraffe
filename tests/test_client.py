@@ -751,7 +751,7 @@ async def test_response_activity_requires_body_including_comments_and_partial_ss
     assert record.output == "" and record.chunks == 0
     assert len(activity) == 3  # Only raw body reads, before SSE parsing.
     assert record.response_body_bytes > 0
-    assert not record.workload
+    assert set(record.workload) == {"token_evidence"}
     assert not no_response_failure(record)
     assert transport.closed
 
