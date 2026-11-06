@@ -319,7 +319,7 @@ assert.match(effectiveCheckSummary(check,config),/Not configured/);
 @pytest.mark.usefixtures("local_tokenizer")
 @pytest.mark.parametrize("case", [
     "unsupported", "missing_credentials", "supported_at_cap", "supported_partial",
-    "shared_truncated", "standalone_truncated", "multi_target",
+    "shared_truncated", "standalone_truncated", "multi_target", "target_partial",
 ])
 async def test_optional_policy_preserves_shared_traffic_at_run_limits(monkeypatch, case):
     from tests.test_gateway_policy import configuration as configured_policy
@@ -329,13 +329,17 @@ async def test_optional_policy_preserves_shared_traffic_at_run_limits(monkeypatc
     raw.update(checks=["gateway_policy"] if case == "standalone_truncated" else ["serving", "gateway_policy"],
                stream=False, samples=2, max_memory_mb=0, max_duration_seconds=2, retention="all",
                max_requests={"supported_partial": 4, "shared_truncated": 2, "standalone_truncated": 1,
-                             "multi_target": None}.get(case, 3), limits={"min_samples": 2})
+                             "multi_target": None, "target_partial": 8}.get(case, 3), limits={"min_samples": 2})
     raw["targets"][0]["api_key_env"] = "SHARED"
     monkeypatch.setenv("SHARED", "shared-secret")
     monkeypatch.delenv("LIMITED", raising=False)
     monkeypatch.delenv("PEER", raising=False)
-    if case == "multi_target":
-        raw["targets"].append(dict(raw["targets"][0], name="second", url="http://second"))
+    if case in {"multi_target", "target_partial"}:
+        second = dict(raw["targets"][0], name="second", url="http://second")
+        if case == "target_partial":
+            monkeypatch.delenv("UNAVAILABLE_PEER", raising=False)
+            second["test_identities"] = {**second["test_identities"], "peer": {"api_key_env": "UNAVAILABLE_PEER"}}
+        raw["targets"].append(second)
     if case not in {"unsupported", "missing_credentials"}:
         monkeypatch.setenv("LIMITED", "limited-secret")
         monkeypatch.setenv("PEER", "peer-secret")
@@ -370,7 +374,7 @@ async def test_optional_policy_preserves_shared_traffic_at_run_limits(monkeypatc
         assert serving[0].status == "inconclusive"
         return
     assert all(check.status == "pass" for check in serving)
-    if case == "multi_target":
+    if case in {"multi_target", "target_partial"}:
         assert sent[:6] == [("proxy", "Bearer shared-secret")] * 3 + [("second", "Bearer shared-secret")] * 3
         assert len(sent) > 6 and sent[6][1] != "Bearer shared-secret"
         timeline = request_plan(config)["time_timeline"]
@@ -378,6 +382,15 @@ async def test_optional_policy_preserves_shared_traffic_at_run_limits(monkeypatc
             ("proxy", "initial"), ("proxy", "warm"), ("second", "initial"), ("second", "warm"),
             ("proxy", "gateway_policy"), ("second", "gateway_policy"),
         ]
+        if case == "target_partial":
+            assert report.abort_reason is None
+            assert report.limits_reached == ["max_requests"]
+            assert report.observations["request_budget_used"] == len(sent) == 7
+            summary = policy.metrics["gateway_policy"]
+            assert sum(user["dispatched"] for user in summary["users"]) == 1
+            assert summary["qualification"] == "unverified"
+            assert summary["stop_reason"] == "The target request limit interrupted the configured gateway policy probes."
+            assert summary["stop_reason"] in policy.summary
     else:
         assert sent[:3] == [("proxy", "Bearer shared-secret")] * 3
         assert report.abort_reason is None

@@ -626,3 +626,63 @@ async def test_key_rejection_unit_header_agrees_with_body_when_present(monkeypat
     assert check.metrics["gateway_policy"]["peer_continuation"] == (expected == "pass")
     if unit == "tokens":
         assert "does not identify" in check.summary
+
+
+@pytest.mark.usefixtures("local_tokenizer")
+@pytest.mark.parametrize("mode,status,scope,value,model_tpm,expected", [
+    ("priority_rpm", 200, "model_saturation_check-limit-requests", "10", "not configured", "pass"),
+    ("priority_rpm", 200, "model_saturation_check-limit-requests", "100", "not configured", "inconclusive"),
+    ("priority_rpm", 200, "model_saturation_check-limit-requests", "10, 10", "not configured", "inconclusive"),
+    ("priority_rpm", 200, "model_saturation_check-limit-tokens", "100", "not configured", "inconclusive"),
+    ("priority_rpm", 200, "model_saturation_check-limit-tokens", "", "not configured", "inconclusive"),
+    ("priority_rpm", 200, "model_saturation_check-limit-tokens", "100", "100", "pass"),
+    ("priority_rpm", 429, "model_saturation_check-limit-tokens", "200", "100", "inconclusive"),
+    ("priority_rpm", 429, "priority_model-limit-requests", "2", "not configured", "pass"),
+    ("priority_rpm", 429, "priority_model-limit-requests", "3", "not configured", "inconclusive"),
+    ("key_rpm", 200, "api_key-limit-requests", "2", "not configured", "pass"),
+    ("key_rpm", 200, "api_key-limit-requests", "3", "not configured", "inconclusive"),
+    ("key_rpm", 429, "api_key-limit-requests", "garbage", "not configured", "inconclusive"),
+])
+async def test_gateway_policy_requires_consistent_scoped_limits(
+        monkeypatch, mode, status, scope, value, model_tpm, expected):
+    transport = httpx.MockTransport
+
+    def add_scoped_limit(handler):
+        async def response(request):
+            result = await handler(request)
+            if result.status_code == status and (mode == "priority_rpm"
+                    or request.headers["authorization"] == "Bearer limited-secret"):
+                result.headers[f"x-ratelimit-{scope}"] = value
+            return result
+
+        return transport(response)
+
+    monkeypatch.setattr(httpx, "MockTransport", add_scoped_limit)
+    check, _, _ = await exercise(monkeypatch, mode, full=True, model_tpm=model_tpm)
+    assert check.metrics["gateway_policy"]["peer_continuation"]
+    assert check.status == expected, check.summary
+
+
+@pytest.mark.usefixtures("local_tokenizer")
+@pytest.mark.parametrize("priority,expected", [(None, "pass"), ("low", "pass"), ("high" * 17, "inconclusive")])
+async def test_present_priority_rejection_header_must_agree_with_body(monkeypatch, priority, expected):
+    transport = httpx.MockTransport
+
+    def replace_header(handler):
+        async def response(request):
+            result = await handler(request)
+            if result.status_code == 429:
+                if priority is None:
+                    result.headers.pop("x-litellm-priority")
+                else:
+                    result.headers["x-litellm-priority"] = priority
+            return result
+
+        return transport(response)
+
+    monkeypatch.setattr(httpx, "MockTransport", replace_header)
+    check, report, _ = await exercise(monkeypatch, "priority_rpm", full=True)
+    assert check.status == expected, check.summary
+    if expected == "inconclusive":
+        assert priority not in report.model_dump_json()
+        assert "Priority tier" in check.summary

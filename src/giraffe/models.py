@@ -2778,6 +2778,7 @@ class GatewayResponseEvidence(PersistedModel):
     _reported_saturation: tuple[Decimal, ...] = PrivateAttr(default=())
     _model_tpm_unconfigured: bool = PrivateAttr(default=False)
     _model_tpm: int | None = PrivateAttr(default=None)
+    _scoped_limits: dict[str, int | None] = PrivateAttr(default_factory=dict)
     error_kind: Literal["authentication", "model_access", "rate_limit", "unknown"] | None = None
     policy_rejection: Literal["key_rpm", "priority_pool", "model_capacity", "unknown"] | None = None
     request_limit: int | None = Field(default=None, ge=0)

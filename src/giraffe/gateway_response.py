@@ -6,6 +6,13 @@ from .gateway_json import parse_gateway_json
 from .models import GatewayResponseEvidence
 
 
+_SCOPED_LIMIT_HEADERS = {
+    "api_key_rpm": "x-ratelimit-api_key-limit-requests",
+    "model_rpm": "x-ratelimit-model_saturation_check-limit-requests",
+    "model_tpm": "x-ratelimit-model_saturation_check-limit-tokens",
+    "priority_rpm": "x-ratelimit-priority_model-limit-requests",
+}
+
 _DYNAMIC_FIELDS = (r", Rate limit type: (?P<unit>requests|tokens), "
                    r"Model TPM: (?P<tpm>not configured|[1-9][0-9]{0,11}), "
                    r"Model RPM: (?P<rpm>[0-9]{1,12}), Remaining: 0")
@@ -18,6 +25,10 @@ _CAPACITY_REJECTION = re.compile(
     r"Model capacity reached for (?P<model>[^,\r\n]{1,256})\. "
     r"Priority: (?P<tier>[^,\r\n]{1,64})" + _DYNAMIC_FIELDS
 )
+
+
+def _bounded_limit(value):
+    return int(value) if isinstance(value, str) and re.fullmatch(r"[0-9]{1,12}", value) else None
 
 
 def _model_group(value):
@@ -70,20 +81,18 @@ def response_evidence(status, body=b"", headers=None, *, declared_priority=None,
                         ("x-ratelimit-remaining-requests", "request_remaining"),
                         ("x-ratelimit-limit-tokens", "token_limit"),
                         ("x-ratelimit-remaining-tokens", "token_remaining")):
-        value = headers.get(name)
-        if isinstance(value, str) and re.fullmatch(r"[0-9]{1,12}", value):
-            setattr(evidence, field, int(value))
+        if (value := _bounded_limit(headers.get(name))) is not None:
+            setattr(evidence, field, value)
+    evidence._scoped_limits = {scope: _bounded_limit(headers[name])
+                               for scope, name in _SCOPED_LIMIT_HEADERS.items() if name in headers}
     if headers.get("x-litellm-rate-limiter-version") == "v3":
         evidence.limiter_version = "v3"
-        limit = headers.get("x-ratelimit-priority_model-limit-requests")
-        if isinstance(limit, str) and re.fullmatch(r"[0-9]{1,12}", limit):
-            evidence.priority_request_limit = int(limit)
+        evidence.priority_request_limit = evidence._scoped_limits.get("priority_rpm")
     retry = headers.get("retry-after")
     if isinstance(retry, str) and re.fullmatch(r"[0-9]{1,8}(?:\.[0-9]{1,6})?", retry):
         evidence.retry_after_seconds = float(retry)
-    tier = headers.get("x-litellm-priority")
-    if declared_priority and isinstance(tier, str) and len(tier) <= 64:
-        evidence.priority_matches = tier == declared_priority
+    if declared_priority and "x-litellm-priority" in headers:
+        evidence.priority_matches = headers["x-litellm-priority"] == declared_priority
     no_reported_fallback = headers.get("x-litellm-attempted-fallbacks") in (None, "0")
     if status != 429:
         if 200 <= status < 300 and evidence.priority_request_limit is not None and no_reported_fallback:
