@@ -1176,12 +1176,11 @@ def _user_scenario_evidence(window: dict, user_id: str) -> dict:
     return {}
 
 
-def _probe_timing_has_overlap(evidence: dict, records: list[RequestRecord]) -> bool:
+def _probe_has_overlap(evidence: dict, records: list[RequestRecord]) -> bool:
     exposed = set(evidence.get("probe_request_ids", []))
     # The fallback for a heavy user describes the whole probe window.
     exposed.update(rid for user in evidence.get("users", []) for rid in user.get("heavy_request_ids", []))
-    return bool(exposed) and all(record.id in exposed for record in records
-                                 if record.status == "completed" and record.valid)
+    return bool(records) and all(record.id in exposed for record in records)
 
 
 def _compare_user_delivery(report, baseline, target, reasons, threshold):
@@ -1203,14 +1202,20 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold):
         scenario_reason = ("Scenario evidence is missing or unqualified in the current run or baseline."
                            if any(item and (not item.get("qualified") or item.get("status") == "inconclusive")
                                   for item in (c_scenario, b_scenario)) else None)
-        live_work_changed = _live_input_work_changed(
-            user_delivery_completions(current_work, c_window, user_id),
-            user_delivery_completions(old_work, b_window, user_id), threshold)
+        current_delivery = user_delivery_completions(current_work, c_window, user_id)
+        old_delivery = user_delivery_completions(old_work, b_window, user_id)
+        live_work_changed = _live_input_work_changed(current_delivery, old_delivery, threshold)
         live_work_reason = ("Observed input work or live generated histories differ or lack evidence."
                             if live_work_changed else None)
+        noisy_probe = scenario == "noisy_neighbors" and role == "probe"
+        delivery_reason = ("Shared-window delivery includes samples without qualified heavy overlap."
+                           if noisy_probe and not scenario_reason
+                           and not (_probe_has_overlap(c_scenario, current_delivery)
+                                    and _probe_has_overlap(b_scenario, old_delivery)) else None)
         missing = (not c or not b or c.get("coverage", {}).get("status") != "complete"
                    or b.get("coverage", {}).get("status") != "complete"
-                   or c_rate is None or b_rate is None or work_reason or mix_changed or live_work_reason or scenario_reason)
+                   or c_rate is None or b_rate is None or work_reason or mix_changed
+                   or live_work_reason or scenario_reason or delivery_reason)
         row = {"check": "multi_user", "scenario": " / ".join(map(str, key if role else key[:4])),
                "user_id": user_id, "population": population, "profile": profile,
                "role": role, "trigger": trigger, "heavy_profile": heavy_profile,
@@ -1221,13 +1226,13 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold):
                "baseline_samples": b.get("outcomes", {}).get("valid_completed", 0),
                "threshold": threshold, "change_unit": "percent", "evidence_ids": c.get("request_ids", []),
                "method": "Observed completed-output delivery over matching common windows; no cross-run confidence interval."}
-        if scenario == "noisy_neighbors" and role == "probe":
-            row["timing_exposure_qualified"] = (not scenario_reason
-                                                and _probe_timing_has_overlap(c_scenario, current_work)
-                                                and _probe_timing_has_overlap(b_scenario, old_work))
+        if noisy_probe:
+            row["timing_exposure_qualified"] = not scenario_reason and all(
+                _probe_has_overlap(evidence, [r for r in records if r.status == "completed" and r.valid])
+                for evidence, records in ((c_scenario, current_work), (b_scenario, old_work)))
         if missing:
             detail = (work_reason or "Requested work proportions differ." if mix_changed or work_reason else
-                      live_work_reason or scenario_reason or "Missing or incomplete shared-window coverage.")
+                      live_work_reason or scenario_reason or delivery_reason or "Missing or incomplete shared-window coverage.")
             message = f"Multi-user {user_id} at {population} users: {detail}"
             row["reason"] = message
             incomplete.append(message)
