@@ -32,6 +32,8 @@ def setup(monkeypatch, observer, *, rejected=None):
         if key == "secret-ALICE" and rejected:
             if rejected == "connection":
                 raise httpx.ConnectError("unreachable", request=request)
+            if rejected == "deep_json":
+                return httpx.Response(401, content=b'{"error":' + b'[' * 2000 + b'0' + b']' * 2000 + b'}')
             return httpx.Response(401, json={"error": {"type": "expired_key"}})
         if "x-litellm-spend-logs-metadata" in request.headers:
             rows.append({"request_id": str(len(rows)), "session_id": request.headers["x-litellm-trace-id"],
@@ -107,6 +109,24 @@ async def test_ambiguous_correlated_rows_cannot_verify(monkeypatch, fault):
     assert check.metrics["state"] == "unverified"
     assert check.metrics["matched_requests"] == 0
     assert check.metrics["completion_tokens"] == 0
+
+
+@pytest.mark.parametrize("metadata", [None, "{", {"spend_logs_metadata": {"giraffe_run": "different-run"}}])
+@pytest.mark.parametrize("same_session", [False, True])
+async def test_unmarked_row_requires_independent_session_evidence(monkeypatch, metadata, same_session):
+    async def observer(request, rows):
+        extra = {**rows[0], "request_id": "unclassified", "metadata": metadata,
+                 "api_key": "0" * 64, "completion_tokens": 9, "total_tokens": 12}
+        if not same_session:
+            extra["session_id"] = "unrelated-session"
+        return spend_page(request, [*rows, extra])
+
+    cfg, run, _ = setup(monkeypatch, observer)
+    check = await collect(cfg, run)
+    assert check.metrics["collection_complete"] is True
+    assert check.metrics["unrelated_rows"] == (0 if same_session else 1)
+    assert check.metrics["invalid_rows"] == (1 if same_session else 0)
+    assert check.metrics["state"] == ("unverified" if same_session else "verified")
 
 
 @pytest.mark.parametrize("capped", [False, True])
@@ -267,11 +287,12 @@ async def test_runner_fallback_records_keep_selected_identity_and_health_isolati
 
 
 @pytest.mark.usefixtures("local_tokenizer")
-async def test_mixed_full_run_keeps_shared_checks_passing_with_expired_identity(monkeypatch):
+@pytest.mark.parametrize("rejected,evidence", [("expired", "authentication"), ("deep_json", "unknown")])
+async def test_mixed_full_run_keeps_shared_checks_passing_with_rejected_identity(monkeypatch, rejected, evidence):
     from giraffe.runner import run_suite
     async def observer(request, rows):
         return spend_page(request, rows)
-    cfg, _, _ = setup(monkeypatch, observer, rejected="expired")
+    cfg, _, _ = setup(monkeypatch, observer, rejected=rejected)
     cfg.checks = ["access", "serving", "gateway_attribution"]
     cfg.stop_after_errors = 1
     cfg.limits.min_samples = 2
@@ -282,3 +303,6 @@ async def test_mixed_full_run_keeps_shared_checks_passing_with_expired_identity(
     assert checks["gateway_attribution"].status == "inconclusive"
     assert len([record for record in report.requests if record.identity is not None]) == 2
     assert all(record.http_status == 200 for record in report.requests if record.identity is None)
+    probe = next(record for record in report.requests if record.identity == "alice")
+    assert probe.http_status == 401
+    assert probe.gateway_evidence.error_kind == evidence

@@ -1268,7 +1268,7 @@ def _compare_gateway_attribution(report, baseline, target, compatible):
         if not compatible:
             reason = "Run settings or target identity references differ."
         elif previous.get("collection_version") != COLLECTION_VERSION:
-            reason = "Rerun the baseline with complete spend-log pagination evidence."
+            reason = "Rerun the baseline with complete spend-log attribution evidence."
         elif not baseline_check or baseline_check.status != "pass" or old != "verified":
             reason = "The baseline lacks complete verified attribution for the selected identities."
         elif current == "unverified":
@@ -1975,7 +1975,8 @@ def _duration_ms(value: float) -> str:
 
 
 def _badge(status: str) -> str:
-    return f'<span class="badge {_e(status)}">{_e(status)}</span>'
+    label = "Not applicable" if status == "not_applicable" else status
+    return f'<span class="badge {_e(status)}">{_e(label)}</span>'
 
 
 def _rps(value: float | None) -> str:
