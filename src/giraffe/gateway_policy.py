@@ -8,7 +8,7 @@ from .identities import identity_headers, litellm_key_fingerprint
 from .models import CheckResult, RequestSpec
 
 
-VERSION = 5
+VERSION = 6
 PROMPT = "Reply with exactly the word OK."
 
 
@@ -137,8 +137,8 @@ def summarize(settings, observation, records):
     affected = [record for record in records if record.identity == settings.affected_identity]
     peers = [record for record in records if record.identity != settings.affected_identity]
     successes = [record for record in records if record.status == "completed" and record.valid]
-    affected_admissions = [record for record in affected
-                           if record.http_status is not None and 200 <= record.http_status < 300]
+    admissions = [record for record in records if record.http_status is not None and 200 <= record.http_status < 300]
+    affected_admissions = [record for record in admissions if record.identity == settings.affected_identity]
     declared = next(user for user in settings.users if user.identity == settings.affected_identity)
     rejection_kind = "key_rpm" if settings.capability == "key_rpm" else "priority_pool"
     affected_rejections = [record for record in affected if record.http_status == 429]
@@ -164,8 +164,10 @@ def summarize(settings, observation, records):
     summary["comparable_actual_work"] = bool(successes and all(row["completed"] for row in users)
         and all(value is not None and value > 0 for value in inputs+outputs)
         and len(set(inputs)) == 1 and max(outputs) <= 2*min(outputs))
-    if settings.window_state != "isolated_fresh" or not settings.gateway_version or not observation.get("isolated_run"):
+    if settings.window_state == "unknown" or not settings.gateway_version or not observation.get("isolated_run"):
         return outcome("unverified", "Gateway version or isolated fresh single-target policy window is unknown.")
+    if settings.window_state != "isolated_fresh_single_counter":
+        return outcome("unverified", "Policy qualification requires an operator-confirmed authoritative limiter counter.")
     if not observation.get("identities_distinct"):
         return outcome("unverified", "Distinct authenticated test credentials could not be established locally.")
     if not recognized:
@@ -190,7 +192,6 @@ def summarize(settings, observation, records):
             return outcome("unverified", "Priority tier, model RPM or strict-mode evidence does not match the declaration.")
         if not summary["overlap_observed"] or not summary["comparable_actual_work"]:
             return outcome("unverified", "Comparable actual token work and overlapping requests are required for priority observations.")
-        admissions = [*affected_admissions, *(record for record in successes if record.identity != settings.affected_identity)]
         if any(record.gateway_evidence is None or record.gateway_evidence.priority_matches is not True for record in admissions):
             return outcome("unverified", "Successful responses do not confirm each declared priority tier.")
         groups = {record.gateway_evidence._priority_model_group if record.gateway_evidence else None
@@ -202,6 +203,8 @@ def summarize(settings, observation, records):
                or record.gateway_evidence.priority_request_limit != reservations[record.identity]
                for record in admissions):
             return outcome("unverified", "Scoped v3 priority RPM limits are missing or differ from the declared reservations.")
+        if len(admissions) > settings.model_rpm:
+            return outcome("observed_failure", "Total admitted requests exceeded the declared model RPM in the isolated window.", "fail")
     elif any(record.gateway_evidence.request_limit != declared.rpm or record.gateway_evidence.request_remaining != 0 for record in recognized):
         return outcome("unverified", "Gateway key limit differs from the declared RPM.")
     admitted = len(affected_admissions)

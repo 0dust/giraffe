@@ -58,3 +58,13 @@ assert.match(html,/Observed outcome/);
 assert.match(html,/Outcome changed/);
 assert.doesNotMatch(html,/Median|NaN/);
 ''')
+
+
+def test_gateway_plan_shows_named_target_counts():
+    browser_logic(r'''
+const row={id:'gateway_attribution',title:'Gateway attribution',kind:'exact',requests_per_target:null,
+  target_request_counts:{'proxy<script>':2,other:0}};
+assert.equal(planRowCount(row),'proxy&lt;script&gt;: 2 · other: 0');
+assert.match(renderFlightPlan({rows:[row]}),/proxy&lt;script&gt;: 2 · other: 0/);
+assert.doesNotMatch(renderFlightPlan({rows:[row]}),/Adaptive|<script>/);
+''')

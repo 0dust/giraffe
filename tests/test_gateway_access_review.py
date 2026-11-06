@@ -238,11 +238,11 @@ async def test_access_requires_valid_assistant_text_fields(monkeypatch, message,
 async def test_access_denial_rules_do_not_change_policy_evidence(monkeypatch, local_tokenizer):
     from tests.test_gateway_policy import exercise
 
-    check, report, _ = await exercise(monkeypatch, full=True)
+    check, report, _ = await exercise(monkeypatch, full=True, window_state="isolated_fresh_single_counter")
     assert check.status == "pass"
     baseline = report.model_copy(deep=True)
     # A passing quota run saved on the immediate policy predecessor, before gateway access.
-    baseline.manifest["gateway_policy_source_sha256"] = "82df9b4081bec328704711293588bf7020c23e2a9fddf36ff70f6bad57f8c12d"
+    baseline.manifest["gateway_policy_source_sha256"] = "c8c702436eff1db423667c796dee172a08075b70c04a309261af63144817cb41"
     assert compare_baseline(report, baseline).baseline["status"] == "pass"
 
 

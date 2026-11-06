@@ -18,7 +18,7 @@ MODEL_POOL = "routed-test-pool"
 
 def configuration(mode="key_rpm", **changes):
     policy = dict(capability=mode, affected_identity="limited", duration_seconds=2,
-                  interval_seconds=.005, window_state="isolated_fresh", gateway_version="1.109.0",
+                  interval_seconds=.005, window_state="isolated_fresh_single_counter", gateway_version="1.109.0",
                   users=[dict(identity="limited", requests=5, rpm=2, priority="low"),
                          dict(identity="peer", requests=8, rpm=8, priority="high")])
     if mode == "priority_rpm":
@@ -250,8 +250,10 @@ def test_policy_reports_exports_ui_and_baseline(tmp_path, capsys, monkeypatch):
     saved_policy = next(item for item in json.loads(json_path.read_text())["checks"]
                         if item["id"] == "gateway_policy")
     assert saved_policy["metrics"]["gateway_policy"]["users"][0]["rejected"] == 3
+    assert saved_policy["metrics"]["gateway_policy"]["settings"]["window_state"] == "isolated_fresh_single_counter"
     exported = reproduction_export(report)
     assert exported["gateway_policy"]["proxy"]["settings"]["capability"] == "priority_rpm"
+    assert exported["gateway_policy"]["proxy"]["settings"]["window_state"] == "isolated_fresh_single_counter"
     assert "limited-secret" not in json.dumps(exported)
     _print_result(report, json_path, html_path, tmp_path, {})
     assert "limited: 2 admitted, 3 rejected" in capsys.readouterr().out
@@ -269,11 +271,14 @@ def test_policy_reports_exports_ui_and_baseline(tmp_path, capsys, monkeypatch):
 const check=bootstrap.checks.find(c=>c.id==='gateway_policy');
 const markup=renderTestCard(check,config);
 assert.match(markup,/gateway_policy_users/);
+assert.match(markup,/value="isolated_fresh_single_counter" selected/);
 const values=new FormData();values.set('gateway_policy_rendered','1');
 values.set('gateway_policy_users','limited, 6, 2, low\npeer, 8, 8, high');
+values.set('gateway_policy_window_state','isolated_fresh_single_counter');
 const changed=configureGatewayPolicy(config,values);
 assert.equal(changed.gateway_policy.users[0].requests,6);
 assert.equal(changed.gateway_policy.model_rpm,10);
+assert.equal(changed.gateway_policy.window_state,'isolated_fresh_single_counter');
 const result=renderGatewayPolicyResults(policy);
 assert.match(result,/limited/);assert.match(result,/observed/);
 assert.match(result,/Actual input tokens/);assert.doesNotMatch(result,/limited-secret/);

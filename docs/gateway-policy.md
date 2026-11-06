@@ -10,6 +10,8 @@ Each identity has a finite request cap, with a maximum of 100 requests. The traf
 
 `window_state: isolated_fresh` declares that the operator established an unused policy window and excluded other traffic consuming these limits. Giraffe does not establish or reset that state. Leave it `unknown` when it cannot be established. Run this check alone with exactly one target. Other selected checks or targets can consume the same key or model bucket, even when model names differ, and therefore leave policy qualification unverified. Request caps and local duration bounds apply even when window state is unknown.
 
+`window_state: isolated_fresh_single_counter` adds the operator confirmation that all probes use one authoritative counter for the tested limits throughout the fresh window. Establish this with one serving worker, or verify that every worker handling the probes shares a backing store such as Redis without local fallback or counter resets during the test. The gateway URL, model group and rate limit headers alone cannot establish this deployment property. Both policy modes require this confirmation for a verdict. With `isolated_fresh` alone, results remain unverified. See [LiteLLM production guidance on Redis](https://docs.litellm.ai/docs/proxy/prod#redis).
+
 ## Dynamic priority reservations
 
 Use `capability: priority_rpm` only when the existing gateway runs LiteLLM's Enterprise `dynamic_rate_limiter_v3` with RPM reservations. For the example, replace the policy block with:
@@ -29,12 +31,12 @@ gateway_policy:
   duration_seconds: 15
   interval_seconds: 0.1
   max_output_tokens: 16
-  window_state: unknown
+  window_state: unknown # Use isolated_fresh_single_counter after verifying both conditions.
 ```
 
 Here `rpm` denotes each tier's existing reserved share. Tier labels must match the gateway's resolved key or team priority. The example assumes the gateway already has these settings; Giraffe sends no priority override. Nonzero saturation caching leaves enforcement unverified because gateway nodes may see different saturation states. Below a positive saturation threshold, idle capacity can be borrowed; the check allows that documented initial borrowing before judging excess admission.
 
-Priority qualification requires the gateway's specific priority-pool rejection, matching resolved tiers and model RPM, each tier's matching `x-ratelimit-priority_model-limit-requests` with `x-litellm-rate-limiter-version: v3` on successful responses, strict-mode saturation evidence, actual input/total completion token usage, and overlapping requests. Successful responses must identify the same routed model group in `x-litellm-model-group` as the group named by the priority rejection. Missing or conflicting groups and reported fallbacks leave the result unverified. Group values are compared in memory and discarded from reports. Actual input counts must match; actual total completion lengths, including reasoning tokens, must be positive and within a factor of two. Answer-only and reasoning counts remain available separately. Different workloads or missing usage remain unverified. Client-observed request overlap establishes concurrent offered work, not internal queue overlap. Response-time differences never establish priority enforcement. Scheduler queue priorities and TPM reservations are not supported by this check.
+Priority qualification requires the gateway's specific priority-pool rejection, matching resolved tiers and model RPM, each tier's matching `x-ratelimit-priority_model-limit-requests` with `x-litellm-rate-limiter-version: v3` on successful responses, strict-mode saturation evidence, actual input/total completion token usage, and overlapping requests. Successful responses must identify the same routed model group in `x-litellm-model-group` as the group named by the priority rejection. Missing or conflicting groups and reported fallbacks leave the result unverified. Group values are compared in memory and discarded from reports. Aggregate admissions across identities must also stay within the declared model RPM, including any borrowing before saturation. Actual input counts must match; actual total completion lengths, including reasoning tokens, must be positive and within a factor of two. Answer-only and reasoning counts remain available separately. Different workloads or missing usage remain unverified. Client-observed request overlap establishes concurrent offered work, not internal queue overlap. Response-time differences never establish priority enforcement. Scheduler queue priorities and TPM reservations are not supported by this check.
 
 ## Reading results
 

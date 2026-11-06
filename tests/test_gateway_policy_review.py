@@ -36,10 +36,29 @@ async def test_strict_priority_rejection_precludes_later_borrowing(monkeypatch):
     assert result["status"] == "fail"
 
 
-async def test_priority_borrowing_before_strict_exhaustion_remains_observed(monkeypatch):
-    check, _, _ = await exercise(monkeypatch, "priority_rpm", behavior="overadmit", saturation_threshold=.5)
-    assert check.metrics["gateway_policy"]["qualification"] == "observed"
-    assert check.status == "pass"
+@pytest.mark.usefixtures("local_tokenizer")
+@pytest.mark.parametrize("peer_requests,expected", [(7, "pass"), (8, "fail")])
+async def test_priority_borrowing_cannot_exceed_aggregate_model_rpm(monkeypatch, peer_requests, expected):
+    check, _, _ = await exercise(monkeypatch, "priority_rpm", behavior="overadmit", saturation_threshold=.5, full=True,
+        users=[dict(identity="limited", requests=5, rpm=2, priority="low"),
+               dict(identity="peer", requests=peer_requests, rpm=8, priority="high")])
+    policy = check.metrics["gateway_policy"]
+    assert [user["admitted"] for user in policy["users"]] == [3, peer_requests]
+    assert check.status == expected
+    if expected == "fail":
+        assert "exceeded the declared model RPM" in check.summary
+
+
+@pytest.mark.usefixtures("local_tokenizer")
+@pytest.mark.parametrize("mode", ["key_rpm", "priority_rpm"])
+@pytest.mark.parametrize("behavior", ["enforce", "overadmit"])
+async def test_policy_requires_operator_confirmed_counter_scope(monkeypatch, mode, behavior):
+    check, _, seen = await exercise(monkeypatch, mode, behavior=behavior, saturation_threshold=.5,
+        window_state="isolated_fresh", full=True)
+    assert len(seen) == 13
+    assert check.status == "inconclusive"
+    assert check.metrics["gateway_policy"]["qualification"] == "unverified"
+    assert "operator-confirmed authoritative limiter counter" in check.summary
 
 
 async def test_genuine_early_rejection_is_not_hidden_by_a_later_failure(monkeypatch):
