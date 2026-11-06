@@ -336,6 +336,7 @@ def matched_observation(trigger="during_stream", heavy_profile="long_short"):
                 requested_input_tokens=256 if heavy and heavy_profile.startswith("long") else 64,
                 requested_output_tokens=32 if heavy and heavy_profile.endswith("long") else 16,
                 max_stream_gap_ms=50 if offset else 20)
+            item.request_body_sent_ms = dispatch
             item.workload.update(window_id=window["id"], profile=user["profile"], role=window["role"],
                                  matched_work_sequence=1, matched_work_sha256="same", think_time_seconds=0,
                                  request_sequence=1+offset//1000)
@@ -391,6 +392,19 @@ def test_interference_requires_heavy_prefill_overlap_before_reasoning_starts():
     # The competitor starts reasoning in less than the minimum overlap time.
     # Waiting until its first answer would count reasoning as prefill.
     records[2].first_reasoning_ms = .5
+    user, = summarize(source, records)["windows"][1]["interference"]["users"]
+    assert user["status"] == "inconclusive"
+    assert user["matched_samples"] == 0
+
+
+@pytest.mark.parametrize("sent", [None, 1200, 1205])
+def test_before_output_requires_heavy_upload_before_short_generation(sent):
+    from giraffe.multi_user_metrics import summarize
+
+    source, records = matched_observation("before_output")
+    # Heavy runner admission was before the short user's first output at 1200,
+    # but its connection lease or upload may have delayed the actual send.
+    records[2].request_body_sent_ms = sent
     user, = summarize(source, records)["windows"][1]["interference"]["users"]
     assert user["status"] == "inconclusive"
     assert user["matched_samples"] == 0
@@ -484,6 +498,7 @@ def test_equal_medians_do_not_hide_incomparable_matched_pairs():
         item.dispatch_ms += 500
         item.completed_ms += 500
         item.timing_start_ms += 500
+        item.request_body_sent_ms += 500
         item.workload["ready_ms"] += 500
         item.workload["matched_work_sequence"] = 2
         if "trigger_ms" in item.workload:
@@ -742,6 +757,8 @@ def test_http_noisy_neighbors_replay_short_work_and_observe_injected_slowdown(tr
         probes = [r for r in state.records if r.workload.get("role") == "probe" and r.workload["user_id"] == "user-01"]
         assert probes and all(r.workload["matched_work_sha256"] == controls[r.workload["matched_work_sequence"]].workload["matched_work_sha256"] for r in probes)
         assert probes[0].workload["request_sequence"] > probes[0].workload["matched_work_sequence"]
+        completed_probes = [r for r in state.records if r.workload.get("role") == "probe" and r.valid]
+        assert all(r.timing_start_ms <= r.request_body_sent_ms <= r.completed_ms for r in completed_probes)
         evidence = result(state, cfg.targets[0]).metrics["multi_user"]["windows"][1]["interference"]
         user, = evidence["users"]
         assert user["matched_samples"] >= 1, evidence

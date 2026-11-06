@@ -39,6 +39,26 @@ def test_activation_adjusted_offer_bound_accepts_valid_plan():
     assert window["scheduled_offers"] == 60000
 
 
+def test_activation_adjusted_offer_bound_is_used_during_execution(monkeypatch):
+    async def run():
+        cfg = settings(levels=[2], scenarios=["arrivals"], duration_seconds=101, profile=PROFILE,
+            arrivals={"requests_per_second": 1000, "activations": {"user-01": 100, "user-02": 100}}
+        ).model_copy(update={"max_duration_seconds": 110})
+        state = runner._Run(cfg, None, None)
+        target = cfg.targets[0]
+        await execute(state, target, FakeClient(target, cfg))
+        window, = state.observations[target.name]["multi_user"]["windows"]
+        accounting = window["offer_accounting"]
+        assert accounting["planned"] == accounting["offered"] == 2000
+        assert accounting["not_offered"] == 0
+        assert accounting["dispatched"] == len(state.records) > 0
+        assert accounting["dispatched"] + accounting["dropped_local"] == 2000
+        assert {record.workload["user_id"] for record in state.records} == {"user-01", "user-02"}
+        assert not window["cut_short"]
+
+    run_virtual(monkeypatch, run())
+
+
 def test_aggregate_offer_bound_rejects_large_plan_before_allocation(monkeypatch):
     from giraffe import multi_user
     from giraffe.models import RunConfig
