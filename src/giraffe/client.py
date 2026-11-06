@@ -159,11 +159,18 @@ async def _sse_events(
         raise _ProtocolError("unterminated SSE event at end of response")
 
 
-def _object(payload: str | bytes) -> dict[str, Any]:
-    try:
-        value = json.loads(payload)
-    except (ValueError, RecursionError) as exc:
-        raise _ProtocolError("malformed JSON in response") from exc
+def _object(payload: str | bytes, *, strict_gateway_json: bool = False) -> dict[str, Any]:
+    if strict_gateway_json:
+        from .gateway_response import parse_gateway_json
+
+        value = parse_gateway_json(payload)
+        if value is None:
+            raise _ProtocolError("malformed JSON in response")
+    else:
+        try:
+            value = json.loads(payload)
+        except (ValueError, RecursionError) as exc:
+            raise _ProtocolError("malformed JSON in response") from exc
     if not isinstance(value, dict):
         raise _ProtocolError("response must contain a JSON object")
     if value.get("error") is not None:
@@ -881,7 +888,7 @@ class LLMClient:
                             record.stream_end_ms = (at - start) * 1000
                         body = await _limited_body(response, on_read=body_read, on_body=body_received)
                         observed_at = start + record.stream_end_ms / 1000 if record.stream_end_ms is not None else time.perf_counter()
-                        receive(_object(body), streaming=False, observed_at=observed_at)
+                        receive(_object(body, strict_gateway_json=policy_probe), streaming=False, observed_at=observed_at)
                         record.stream_terminated = True
                     if record.finish_reason is None:
                         raise _ProtocolError("response ended without a completion finish reason")

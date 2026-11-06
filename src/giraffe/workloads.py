@@ -520,10 +520,10 @@ async def execute(run, target, client, fixtures, *, defer_attribution=False):
         ("prefix", prefixes),
         ("load_test", load_test),
         ("multi_user", multi_user),
-        ("gateway_policy", gateway_policy),
         ("sessions", sessions),
         ("consistency", consistency),
         ("tool_calling", tools),
+        ("gateway_policy", gateway_policy),
         ("gateway_attribution", gateway_attribution),
     ):
         if defer_attribution and field == "gateway_attribution":

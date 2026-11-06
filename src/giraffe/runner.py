@@ -307,15 +307,20 @@ class _Run:
                     "max_samples": config.metrics_max_samples,
                     "max_series": config.metrics_max_series, "collection_gaps_seconds": []})
 
-    def token_evidence_reserve(self, target):
+    def runtime_gateway_request_counts(self, target):
         from .gateway_policy import credential_issue
-        from .planning import token_evidence_request_reserve
 
         runtime_counts = {}
         policy = self.config.gateway_policy
         if "gateway_policy" in self.config.checks and policy and policy.supported and credential_issue(policy, target):
             runtime_counts["gateway_policy"] = 0
-        return token_evidence_request_reserve(self.request_plan_rows, target=target.name, runtime_counts=runtime_counts)
+        return runtime_counts
+
+    def token_evidence_reserve(self, target):
+        from .planning import token_evidence_request_reserve
+
+        return token_evidence_request_reserve(self.request_plan_rows, target=target.name,
+                                              runtime_counts=self.runtime_gateway_request_counts(target))
 
     def _condition(self, target, scenario, workload=None, *, request_parameters=None):
         condition = condition_for(scenario, workload or {}, self.config, request_parameters=request_parameters)
@@ -1377,16 +1382,16 @@ async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attributio
             if "recovery" in enabled:
                 effective = _check_config(config, "recovery")
                 probe_specs = builtin_fixtures(effective, check_id="recovery")["sustained"]
-                from .planning import request_plan
-                later = [name for name in config.checks
-                         if (name not in CORE_CHECKS or name == "load") and name != "gateway_attribution"]
-                later_plan = request_plan(config.model_copy(update={"checks": later, "restart_target": None}))
+                from .planning import recovery_later_reserves
+                later_reserve, has_later_work = recovery_later_reserves(
+                    config, runtime_counts_by_target={target.name: run.runtime_gateway_request_counts(target)},
+                )[target.name]
                 if "cancellation" in enabled and not run.stop_reason(target.name):
                     cleanup = config.effective_check("cancellation")["cleanup_seconds"]
                     await asyncio.sleep(max(0, min(5, cleanup, run.deadline - time.monotonic())))
                 remaining = run.remaining(target.name)
                 if remaining is None or remaining > (
-                        later_plan["minimum_reserved_per_target"] + 2 * effective.samples
+                        later_reserve + 2 * effective.samples
                         + max(effective.limits.min_samples, effective.concurrency*2)):
                     # Uncounted warm-up so the baseline is not the probe fixture's cold first use.
                     await run.request(target, client, probe_specs[0].model_copy(update={
@@ -1394,10 +1399,10 @@ async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attributio
                 await run.group(target, client, probe_specs, "recovery_baseline",
                                 count=effective.samples, checks=["recovery"])
                 remaining = run.remaining(target.name)
-                reserved = later_plan["minimum_reserved_per_target"] + effective.samples
+                reserved = later_reserve + effective.samples
                 # Preserve later fixed work and probes; cap the remaining share
                 # only when another selected check still needs request budget.
-                allowance = (max(0, min(remaining // 2 if later else remaining, remaining-reserved))
+                allowance = (max(0, min(remaining // 2 if has_later_work else remaining, remaining-reserved))
                              if remaining is not None else None)
                 run.observations[target.name]["sustained_budget"] = {
                     "allowance": allowance, "reserved_later": reserved,

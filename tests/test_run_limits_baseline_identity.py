@@ -235,7 +235,8 @@ def test_unchanged_text_generator_has_reviewed_identity_table_entry():
                            checks=["consistency"])
     manifest = {"config": configured.model_dump(mode="json")}
     attestations = [_run_limits_workload_identity(manifest, revision=revision)
-                    for revision in ("gateway_shared_first", "gateway_shared_targets_first", "policy_shared_first", "policy_shared_targets_first")]
+                    for revision in ("gateway_shared_first", "gateway_shared_targets_first", "policy_shared_first",
+                                     "policy_shared_targets_first", "policy_after_shared_workloads")]
     actual = hashlib.sha256(Path(workloads.__file__).read_bytes()).hexdigest()
     assert any(identity and identity["generator_source_sha256"] == actual for identity in attestations), (
         "generator_source_sha256 changed: review request-level compatibility and update/extend "

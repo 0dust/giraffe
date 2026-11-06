@@ -22,6 +22,7 @@ GATEWAY_GENERATORS = (
     "8037d490881621f37f1aef446474bc52a1ba276bcfcd174f39a14e37032dc9f0",
     "60eac0571375a103c1ebe7b23c3107b9814ceb0c002797736c55a6248a168f86",
     "d72acf540fbf8fbd8c45d3ab76d6041054209bb45913c681df171525f8ddc158",
+    "49dcdfb6b173a93720e4e9e5a9bc54ffcea7580346d2ea0210e600e0779a03e6",
 )
 CURRENT_LOAD_SOURCE = "25a9937e5ce84572a64e26de759f6c97d0fd182b2620aaa91d876a2bf6669eac"
 
@@ -83,6 +84,47 @@ async def test_completed_load_survives_only_known_gateway_dispatch_changes(monke
         changed.manifest["fixture_pack"]["workload_fixture_sha256"] = fixture_hash(altered)
         assert "Fixture pack identity differs." in _settings_reasons(current, changed), change
         assert "Fixture pack identity differs." in _settings_reasons(changed, current), change
+
+
+@pytest.mark.usefixtures("local_tokenizer")
+async def test_policy_does_not_spend_load_reserve_for_sessions_and_tools(monkeypatch):
+    raw = config().model_dump()
+    raw.update(checks=["load", "sessions", "tools", "gateway_policy"], stream=False, retention="all", max_requests=6,
+               sessions={"sessions": 1, "modes": ["fixed"], "turns": ["Name", "Recall"]}, limits={"min_samples": 2})
+    raw["gateway_policy"] = {"affected_identity": "limited", "users": [
+        {"identity": "limited", "requests": 3, "rpm": 2}, {"identity": "peer", "requests": 3, "rpm": 3}]}
+    raw["targets"][0].update(api_key_env="SHARED", test_identities={
+        "limited": {"api_key_env": "LIMITED"}, "peer": {"api_key_env": "PEER"}})
+    cfg = RunConfig.model_validate(raw)
+    for name in ("SHARED", "LIMITED", "PEER"):
+        monkeypatch.setenv(name, name.lower() + "-key")
+    wire = []
+
+    async def handler(request):
+        if request.method != "POST":
+            return httpx.Response(404)
+        auth = request.headers["authorization"]
+        wire.append(auth)
+        if auth != "Bearer shared-key":
+            return httpx.Response(404)
+        await asyncio.sleep(.005)
+        payload = json.loads(request.content)
+        marker = re.search(r"Session_\d+_fixed", payload["messages"][0]["content"])
+        message = {"role": "assistant", "content": marker[0] if marker else "K7P4"}
+        finish = "stop"
+        if payload.get("tools"):
+            message.update(content="", tool_calls=[{"type": "function", "id": "call_1", "function": {
+                "name": payload["tools"][0]["function"]["name"], "arguments": json.dumps({"city": "Delhi"})}}])
+            finish = "tool_calls"
+        return httpx.Response(200, json={"choices": [{"message": message, "finish_reason": finish}],
+                                        "usage": {"prompt_tokens": 128, "completion_tokens": 4}})
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
+    report = await runner.run_suite(cfg)
+    assert wire == ["Bearer shared-key"] * 6
+    assert [record.scenario for record in report.requests][-3:] == ["session_fixed_turn0", "session_fixed_turn1", "tools_auto_complete"]
+    assert next(check for check in report.checks if check.id == "tools").status == "pass"
 
 
 @pytest.mark.parametrize("checks", [

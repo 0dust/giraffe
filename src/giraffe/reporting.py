@@ -167,6 +167,7 @@ _CONVERSATION_REVISIONS = {"persistent_users", "shared_conversations"}
 _COMPANION_REVISIONS = _CONVERSATION_REVISIONS | {
     "gateway_attribution", "gateway_conversations", "gateway_shared_first", "gateway_shared_targets_first",
     "gateway_policy", "policy_conversations", "policy_shared_first", "policy_shared_targets_first",
+    "policy_after_shared_workloads",
 }
 _CONVERSATION_BRIDGE_CHECKS = {"prefix", "sessions", "consistency"}
 _CONVERSATION_LOAD_SOURCE = "9b694c97a39d449d8ea15b09a9aeb406bf835179c0882827685c4d7888687d36"
@@ -243,6 +244,7 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str, include_load
             "policy_shared_first": "60eac0571375a103c1ebe7b23c3107b9814ceb0c002797736c55a6248a168f86",
             "gateway_shared_targets_first": "8037d490881621f37f1aef446474bc52a1ba276bcfcd174f39a14e37032dc9f0",
             "policy_shared_targets_first": "d72acf540fbf8fbd8c45d3ab76d6041054209bb45913c681df171525f8ddc158",
+            "policy_after_shared_workloads": "49dcdfb6b173a93720e4e9e5a9bc54ffcea7580346d2ea0210e600e0779a03e6",
         }[revision] if any(settings.values()) else None,
         "settings": settings,
     }
@@ -260,6 +262,7 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str, include_load
             "policy_shared_first": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
             "gateway_shared_targets_first": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
             "policy_shared_targets_first": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
+            "policy_after_shared_workloads": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
         }[revision]
     if "concurrency" in resolved.checks:
         identity["concurrent_load_source_sha256"] = {
@@ -291,6 +294,7 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str, include_load
             "policy_shared_first": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
             "gateway_shared_targets_first": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
             "policy_shared_targets_first": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
+            "policy_after_shared_workloads": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
         }[revision]
     if "tools" in resolved.checks:
         from .tool_checks import resolved_tool_fixtures, resolved_tool_modes
@@ -345,7 +349,7 @@ def _same_load_workload(current: dict, old: dict, *, fingerprint_key: str = "wor
          (_CONVERSATION_LOAD_SOURCE,
           "df3b7bbf30cab87d2e8c1c6dab8819f9cfe592b181407caa7c32af4c5f720cd4"), False),
         (("shared_conversations", "gateway_conversations", "gateway_shared_first", "gateway_shared_targets_first",
-          "policy_conversations", "policy_shared_first", "policy_shared_targets_first"),
+          "policy_conversations", "policy_shared_first", "policy_shared_targets_first", "policy_after_shared_workloads"),
          ("113325dd5cffa04626cc7be7ee93bc6e9be67335531288bc329b3542a155c92a",
           "788f4c8f0b14421d5fc00f8b32c0ffcef79c04c647730767cb44b16584ed4aa4",
           "4caab6e7a9eb457a5ceddf272112c434a97c101a2c27c3943f8a4155fb71bdb0",
@@ -1949,8 +1953,9 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
             if current_check.id != "gateway_policy" or current_check.target != name or not current_check.required:
                 continue
             current_policy = current_check.metrics.get("gateway_policy", {})
-            old_policy = next((check.metrics.get("gateway_policy", {}) for check in baseline.checks
-                               if check.id == "gateway_policy" and check.target == name and check.required), {})
+            old_check = next((check for check in baseline.checks
+                              if check.id == "gateway_policy" and check.target == name and check.required), None)
+            old_policy = old_check.metrics.get("gateway_policy", {}) if old_check else {}
             try:
                 settings = GatewayPolicy.model_validate(config.get("gateway_policy"))
                 old_settings = GatewayPolicy.model_validate(old_config.get("gateway_policy"))
@@ -1972,10 +1977,12 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                           and current_policy.get("version") == old_policy.get("version") == POLICY_VERSION
                           and settings == old_settings
                           and settings.model_dump(mode="json") == current_policy.get("settings") == old_policy.get("settings")
+                          and old_check is not None and old_check.status == "pass"
                           and old_policy.get("qualification") == "observed")
             for user in current_policy.get("users", []):
                 previous = next((item for item in old_policy.get("users", []) if item["identity"] == user["identity"]), None)
-                status = current_check.status if compatible and previous else "inconclusive"
+                status = (current_check.status if compatible and previous and current_check.status in {"pass", "fail"}
+                          else "inconclusive")
                 rows.append({"check": "gateway_policy", "scenario": user["identity"],
                     "user_id": user["identity"], "metric": "policy_acceptance", "aggregation": "observed",
                     "status": status, "current": current_policy.get("qualification"),
