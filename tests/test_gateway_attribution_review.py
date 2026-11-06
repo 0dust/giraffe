@@ -1668,8 +1668,7 @@ async def test_serving_comparison_qualifies_actual_stream_options_after_compatib
             saved = RunReport.model_validate_json(path.read_bytes())
             for record in saved.requests:
                 if record.scenario == "warm":
-                    evidence = record.workload["token_evidence"]
-                    assert (evidence["requested_logprobs"], evidence["requested_usage"]) == expected_options
+                    assert (record.requested_stream_logprobs, record.requested_stream_usage) == expected_options
             return saved
 
     ordinary = ["serving"]
@@ -1697,6 +1696,7 @@ async def test_serving_comparison_qualifies_actual_stream_options_after_compatib
     unchanged = changed_runs[0]
     archive = unchanged.model_copy(deep=True)
     for record in archive.requests:
+        record.requested_stream_logprobs = record.requested_stream_usage = None
         record.workload.pop("token_evidence", None)
     assert warm_rows(unchanged, archive)["latency_ms"]["status"] == "pass"
 

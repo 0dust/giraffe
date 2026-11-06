@@ -126,12 +126,12 @@ def test_load_acceptance_qualifies_only_the_point_with_changed_stream_options():
     baseline.manifest["config"]["limits"]["min_samples"] = 2
     for record in baseline.requests:
         record.stream = True
-        record.workload["token_evidence"] = {"requested_logprobs": True, "requested_usage": True}
+        record.requested_stream_logprobs = record.requested_stream_usage = True
     current = baseline.model_copy(deep=True)
     point = lose_rate(current)
     for record in current.requests:
         if record.id in point["request_ids"]:
-            record.workload["token_evidence"]["requested_logprobs"] = False
+            record.requested_stream_logprobs = False
             record.arrival_elapsed_ms = 130
 
     target = compare_baseline(current, baseline).baseline["targets"][0]
