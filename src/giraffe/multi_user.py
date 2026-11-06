@@ -412,7 +412,10 @@ async def run_arrival_window(run, target, client, settings, load_settings, calib
                  "pattern": "constant", "level": window["population"], "rate": window["requests_per_second"],
                  "bursts": offer["origin"] == "burst", "source": "primary",
                  "_source_index": offer["matched_work_sequence"]-1}
-        nonce = hashlib.sha256(f"{settings.seed}:{window['population']}:{offer['user_id']}:{offer['matched_work_sequence']}".encode()).hexdigest()[:32]
+        recovery = window["scenario"] == "recovery"
+        nonce = (uuid.uuid4().hex if recovery else hashlib.sha256(
+            f"{settings.seed}:{window['population']}:{offer['user_id']}:{offer['matched_work_sequence']}".encode()
+        ).hexdigest()[:32])
         spec = build_spec(run, load_settings, point, offer["profile"], calibration,
                           frozen_sources=sources_by_profile.get(offer["profile"]), nonce=nonce)
         spec.load_point = None
@@ -421,7 +424,7 @@ async def run_arrival_window(run, target, client, settings, load_settings, calib
         spec.workload.update(offer_index=index, population=window["population"], scenario=window["scenario"],
             phase=window["phase"], role=window["role"], window_id=window["id"],
             activation_seconds=users[offer["user_id"]]["activation_seconds"],
-            matched_work_sha256=_matched_work_sha256(spec))
+            matched_work_sha256=_matched_work_sha256(spec, nonce=nonce if recovery else None))
         return spec
 
     lag_tolerance_ms = 100

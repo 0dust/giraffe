@@ -590,19 +590,29 @@ def _recovery(observation, window, control, sustained, user_records, criteria, h
     load_settings = LoadTestSettings(profile=settings.get("profile", {}),
                                     pass_criteria={"min_valid_responses": criteria.min_samples})
     shared = []
+    delivered = {}
     for phase in (control, sustained, window):
         if not phase or phase.get("cut_short") or phase.get("drain_reason") or phase.get("start_ms") is None or phase.get("end_ms") is None:
             shared.append("Control, sustained or lighter window has incomplete coverage.")
             continue
         counts = phase.get("offer_accounting", {})
-        if not counts or any(counts.get(outcome, 0) for outcome in _UNDISPATCHED_OFFERS):
-            shared.append("The generator did not deliver the configured phase schedule.")
         start, end = phase["start_ms"], phase["end_ms"]
+        dispatched = counts.get("dispatched", 0)
+        if (not dispatched or end <= start or dispatched != counts.get("planned")
+                or any(counts.get(outcome, 0) for outcome in _UNDISPATCHED_OFFERS)):
+            shared.append("The generator did not deliver the configured phase schedule.")
+        else:
+            # Qualified recovery windows delivered every offer in their finite plan.
+            delivered[phase["role"]] = dispatched / phase["planned_duration_seconds"]
         if (qualify([], health, timing_threshold, ("latency_ms", "max_stream_gap_ms"),
                 legacy_max_lag_ms=lag, phase_intervals=((start, end),))["status"] != "qualified"
                 or any(start < high and low < end for low, high in delays.windows)
                 or phase.get("scheduler_stalls")):
             shared.append("Client scheduling delay affects recovery timing.")
+    if len(delivered) == 3 and (
+            sustained["offer_accounting"]["dispatched"] <= sustained["population"]
+            or delivered["sustained"] <= max(delivered["control"], delivered["lighter"])):
+        shared.append("The delivered sustained schedule did not exercise more load than the control and lighter schedules.")
     sustained_records = [r for user in (sustained or {}).get("users", [])
                          for r in user_records.get((sustained["id"], user["user_id"]), [])]
     sustained_end = (sustained or {}).get("end_ms")
@@ -638,6 +648,15 @@ def _recovery(observation, window, control, sustained, user_records, criteria, h
         stress = [r for r in sustained_records if r.workload.get("user_id") == uid and _valid(r)
                   and r.completed_ms is not None and (sustained or {}).get("end_ms") is not None
                   and r.completed_ms <= sustained["end_ms"]]
+        for phase, rows in (("lighter", [b for _, b in pairs]), ("sustained", stress)):
+            for replay in rows:
+                baseline = controls.get(replay.workload.get("matched_work_sequence"))
+                if baseline is None:
+                    continue
+                if (baseline.input_tokens is not None and replay.input_tokens is not None
+                        and not _comparable_uncached_input(baseline, replay, tolerance)):
+                    notes.append(f"Actual uncached input drifted between matched control and {phase} requests.")
+                    break
         if len(stress) < criteria.min_samples or max_evidenced_overlap(
                 [r for r in sustained_streams if r.workload.get("user_id") == uid],
                 [r for r in sustained_streams if r.workload.get("user_id") != uid], delays) < 2:
