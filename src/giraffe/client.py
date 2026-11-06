@@ -161,7 +161,7 @@ async def _sse_events(
 
 def _object(payload: str | bytes, *, strict_gateway_json: bool = False) -> dict[str, Any]:
     if strict_gateway_json:
-        from .gateway_response import parse_gateway_json
+        from .gateway_json import parse_gateway_json
 
         value = parse_gateway_json(payload)
         if value is None:

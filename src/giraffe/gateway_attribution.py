@@ -5,20 +5,20 @@ import asyncio
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-import json
 import ssl
 import time
 import uuid
 
 import httpx
 
+from .gateway_json import parse_gateway_json
 from .identities import (credential_headers, gateway_identities_only, identity_headers,
                          identity_scope, litellm_key_fingerprint)
 from .models import CheckResult, RequestSpec
 
 
 CHECK = "gateway_attribution"
-COLLECTION_VERSION = 4
+COLLECTION_VERSION = 5
 MAX_BODY_BYTES = 4 * 1024 * 1024
 MAX_PAGES = 8
 PAGE_SIZE = 128
@@ -66,10 +66,7 @@ def _normalize(rows, marker, expected):
             continue
         metadata = row.get("metadata")
         if isinstance(metadata, str):
-            try:
-                metadata = json.loads(metadata)
-            except (ValueError, UnicodeError, RecursionError):
-                metadata = None
+            metadata = parse_gateway_json(metadata)
         tags = metadata.get("spend_logs_metadata") if isinstance(metadata, dict) else None
         same_session = row.get("session_id") == marker
         if not isinstance(tags, dict) or tags.get("giraffe_run") != marker:
@@ -250,10 +247,7 @@ async def _pages(client, url, marker, *, start_date, end_date, max_rows, stop, d
                 body.extend(chunk)
             if _reader_interrupted(stop, deadline):
                 return rows, False
-            try:
-                payload = json.loads(body)
-            except (ValueError, UnicodeError, RecursionError):
-                return rows, False
+            payload = parse_gateway_json(body)
             if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
                 return rows, False
             data = payload["data"]
