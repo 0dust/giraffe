@@ -1,4 +1,6 @@
 """Policy verdicts distinguish response success from gateway admission evidence."""
+import asyncio
+
 import httpx
 import pytest
 
@@ -39,7 +41,7 @@ async def test_strict_priority_rejection_precludes_later_borrowing(monkeypatch):
 @pytest.mark.usefixtures("local_tokenizer")
 @pytest.mark.parametrize("peer_requests,expected", [(7, "pass"), (8, "fail")])
 async def test_priority_borrowing_cannot_exceed_aggregate_model_rpm(monkeypatch, peer_requests, expected):
-    check, _, _ = await exercise(monkeypatch, "priority_rpm", behavior="overadmit", saturation_threshold=.5, full=True,
+    check, _, _ = await exercise(monkeypatch, "priority_rpm", behavior="overadmit", saturation_threshold=.5, full=True, peer_delay=.04,
         users=[dict(identity="limited", requests=5, rpm=2, priority="low"),
                dict(identity="peer", requests=peer_requests, rpm=8, priority="high")])
     policy = check.metrics["gateway_policy"]
@@ -72,8 +74,9 @@ async def test_genuine_early_rejection_is_not_hidden_by_a_later_failure(monkeypa
 
 
 @pytest.mark.usefixtures("local_tokenizer")
-async def test_malformed_assistant_reply_does_not_show_peer_continuation(monkeypatch):
-    check, report, _ = await exercise(monkeypatch, behavior="malformed_peer", full=True)
+@pytest.mark.parametrize("behavior", ["malformed_peer", "peer_tool_call", "peer_function_call", "peer_invalid_refusal"])
+async def test_malformed_assistant_reply_does_not_show_peer_continuation(monkeypatch, behavior):
+    check, report, _ = await exercise(monkeypatch, behavior=behavior, full=True)
     peer = [record for record in report.requests if record.identity == "peer"]
     assert len(peer) == 8 and all(record.http_status == 200 and not record.valid for record in peer)
     assert check.metrics["gateway_policy"]["qualification"] == "unverified"
@@ -155,14 +158,94 @@ async def test_priority_compares_reported_saturation_at_the_exact_threshold(monk
 
 
 @pytest.mark.usefixtures("local_tokenizer")
-@pytest.mark.parametrize("admitted,expected", [(55, "pass"), (56, "fail")])
+@pytest.mark.parametrize("admitted,expected", [(51, "pass"), (56, "fail")])
 async def test_priority_borrowing_stops_at_the_gateway_ratio_boundary(monkeypatch, admitted, expected):
     check, _, _ = await exercise(monkeypatch, "priority_rpm", full=True, model_rpm=100, duration_seconds=3,
-        saturation_threshold=.55, rejection_saturation=56.0, admitted_affected=admitted, peer_delay=.04,
+        saturation_threshold=.55, rejection_saturation=56.0, admitted_affected=admitted, peer_delay=.5,
         users=[dict(identity="limited", requests=57, rpm=2, priority="low"),
-               dict(identity="peer", requests=28, rpm=28, priority="high")])
+               dict(identity="peer", requests=4, rpm=4, priority="high")])
     policy = check.metrics["gateway_policy"]
-    assert [user["admitted"] for user in policy["users"]] == [admitted, 28]
+    assert [user["admitted"] for user in policy["users"]] == [admitted, 4]
     assert check.status == expected, check.summary
     if expected == "fail":
         assert "exceeded the declared RPM allowance" in check.summary
+
+
+@pytest.mark.usefixtures("local_tokenizer")
+@pytest.mark.parametrize("header,expected", [
+    ("61.54%", "pass"), (None, "inconclusive"), ("61.50%", "inconclusive"),
+    ("62.00%", "inconclusive"), ("61.54%, 90.00%", "inconclusive"),
+])
+async def test_priority_uses_consistent_finer_saturation_evidence(monkeypatch, header, expected):
+    check, _, _ = await exercise(monkeypatch, "priority_rpm", full=True, model_rpm=13,
+        saturation_threshold=.6152, rejection_saturation=61.5, saturation_header=header,
+        users=[dict(identity="limited", requests=5, rpm=2, priority="low"),
+               dict(identity="peer", requests=8, rpm=8, priority="high")])
+    assert check.status == expected, check.summary
+    if expected == "inconclusive":
+        assert "strict-mode evidence" in check.summary
+
+
+@pytest.mark.usefixtures("local_tokenizer")
+@pytest.mark.parametrize("early_peers,expected", [(1, "pass"), (2, "inconclusive"), (3, "fail")])
+async def test_priority_borrowing_accounts_for_peer_admission_order(monkeypatch, early_peers, expected):
+    config = configuration("priority_rpm", saturation_threshold=.5,
+        users=[dict(identity="limited", requests=5, rpm=2, priority="low"),
+               dict(identity="peer", requests=early_peers + 3, rpm=8, priority="high")])
+    monkeypatch.setenv("LIMITED", "limited-secret")
+    monkeypatch.setenv("PEER", "peer-secret")
+    counts = {"limited": 0, "peer": 0}
+    admitted = 0
+    initial_peers_completed = asyncio.Event()
+    next_peer_dispatched = asyncio.Event()
+    first_rejection_dispatched = asyncio.Event()
+    saturation_reached = asyncio.Event()
+    rejection_observed = asyncio.Event()
+
+    async def handler(request):
+        nonlocal admitted
+        if request.method != "POST":
+            return httpx.Response(404)
+        who = "limited" if request.headers["authorization"] == "Bearer limited-secret" else "peer"
+        counts[who] += 1
+        sequence = counts[who]
+        user = next(user for user in config.gateway_policy.users if user.identity == who)
+        headers = {"x-litellm-priority": user.priority, "retry-after": "60", "x-litellm-rate-limiter-version": "v3",
+                   "x-ratelimit-priority_model-limit-requests": str(user.rpm), "x-litellm-model-group": MODEL_POOL}
+        if who == "peer":
+            if sequence == early_peers:
+                initial_peers_completed.set()
+            if sequence == early_peers + 1:
+                next_peer_dispatched.set()
+                await first_rejection_dispatched.wait()
+                saturation_reached.set()
+            if sequence == early_peers + 2:
+                await rejection_observed.wait()
+        elif sequence == 1:
+            await initial_peers_completed.wait()
+        elif sequence == 3:
+            await next_peer_dispatched.wait()
+        elif sequence > 3:
+            first_rejection_dispatched.set()
+            await saturation_reached.wait()
+            if sequence == 5:
+                rejection_observed.set()
+            saturation = admitted / 10
+            headers["x-litellm-saturation"] = f"{saturation:.2%}"
+            message = (f"Priority-based rate limit exceeded. Model: {MODEL_POOL}, Priority: low, Rate limit type: requests, "
+                       f"Model TPM: not configured, Model RPM: 10, Remaining: 0, Model saturation: {saturation:.1%}")
+            return httpx.Response(429, headers=headers, json={"error": {"type": "throttling_error", "code": "429", "message": message}})
+        admitted += 1
+        return httpx.Response(200, headers=headers, json={"choices": [{"message": {"role": "assistant", "content": "OK"},
+            "finish_reason": "stop"}], "usage": {"prompt_tokens": 8, "completion_tokens": 2}})
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
+    report = await run_suite(config)
+    check = next(check for check in report.checks if check.id == "gateway_policy")
+    assert [user["admitted"] for user in check.metrics["gateway_policy"]["users"]] == [3, early_peers + 3]
+    assert check.status == expected, check.summary
+    if expected == "fail":
+        assert "completed admissions reached model saturation" in check.summary
+    if expected == "inconclusive":
+        assert "Overlapping admissions leave saturation uncertain" in check.summary

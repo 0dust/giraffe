@@ -1,4 +1,5 @@
 """Allowlisted LiteLLM response evidence; raw errors never leave this parser."""
+from decimal import Decimal
 import json
 import re
 
@@ -10,6 +11,23 @@ def _model_group(value):
             and "," not in value and value == value.strip()):
         return value
     return None
+
+
+def _saturation_percent(message, header):
+    match = re.search(r", Model saturation: ([0-9]{1,3}(?:\.[0-9]{1,6})?)%$", message)
+    if not match or (body := Decimal(match[1])) > 100:
+        return None
+    if header is None:
+        return float(body)
+    match = re.fullmatch(r"([0-9]{1,3}\.[0-9]{2})%", header) if isinstance(header, str) else None
+    if not match or (precise := Decimal(match[1])) > 100:
+        return None
+    # The limiter formats the same value separately in the body and header.
+    # Compare rounding intervals to handle values on a decimal boundary.
+    body_places = body.as_tuple().exponent
+    if abs(body - precise) >= Decimal(5).scaleb(body_places - 1) + Decimal("0.005"):
+        return None
+    return float(precise if body_places > -2 else body)
 
 
 def response_evidence(status, body=b"", headers=None, *, declared_priority=None, expected_key_hash=None):
@@ -89,9 +107,5 @@ def response_evidence(status, body=b"", headers=None, *, declared_priority=None,
             if tier_match:
                 matches = tier_match[1] == declared_priority
                 evidence.priority_matches = matches if evidence.priority_matches is None else matches and evidence.priority_matches
-        saturation = re.search(r", Model saturation: ([0-9]{1,3}(?:\.[0-9]{1,6})?)%$", message)
-        if saturation:
-            value = float(saturation[1])
-            if value <= 100:
-                evidence.saturation_percent = value
+        evidence.saturation_percent = _saturation_percent(message, headers.get("x-litellm-saturation"))
     return evidence

@@ -156,6 +156,11 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
         timeline.append({**item, "kind": "unknown", "field": time_field(row["id"]),
                          "low_seconds": 0, "high_seconds": bound})
 
+    def setup(target, identifier, title, field, timeout):
+        # Setup consumes the run deadline and stays outside the traffic estimate.
+        timeline.append({"id": identifier, "title": title, "target": target, "kind": "setup",
+                         "field": field, "low_seconds": 0, "high_seconds": timeout, "wait": True})
+
     @lru_cache(maxsize=256)
     def batch_moments(distributions):
         # For a gather, P(max <= x) = product(F_i(x)). Integrate its
@@ -392,6 +397,7 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
         ordered[after_context:after_context] = pack_rows
     for target in config.targets:
         has_observations = bool((observations or {}).get(target.name))
+        restarting = config.restart_target == target.name and bool(target.restart_command)
         for row in ordered:
             name = row["id"]
             count = _target_count(row, target.name)
@@ -405,16 +411,18 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
                      "recovery_prime": "recovery", "recovery_baseline": "recovery",
                      "limits.stop_control": "cancellation", "backend_cancellation": "cancellation",
                      "sustained": "recovery"}.get(name, name)
-            if name in {"initial", "restart_readiness"}:
-                # Setup stays outside the headline. Initial inference still
-                # consumes the shared deadline, so budget remedies reserve its
-                # full effective timeout before the selected traffic starts.
-                if name == "initial":
-                    timeline.append({"id": name, "title": "Initial connection allowance", "target": target.name,
-                                     "kind": "setup", "field": "test_options.access.request_timeout_seconds"
-                                     if "access" in selected else "test_options.serving.request_timeout_seconds",
-                                     "low_seconds": 0, "high_seconds": config.effective_initial()["request_timeout_seconds"],
-                                     "wait": True})
+            if name == "initial":
+                if not restarting:
+                    setup(target.name, name, "Initial connection allowance", "test_options.access.request_timeout_seconds"
+                          if "access" in selected else "test_options.serving.request_timeout_seconds",
+                          config.effective_initial()["request_timeout_seconds"])
+                continue
+            if name == "restart_readiness":
+                if restarting:
+                    setup(target.name, "restart_hook", "Restart hook", "request_timeout_seconds",
+                          config.request_timeout_seconds)
+                    # Health polling and its inference probe share this timeout.
+                    setup(target.name, name, row["title"], "readiness_timeout_seconds", config.readiness_timeout_seconds)
                 continue
             if name == "gateway_attribution":
                 settings = config.gateway_attribution
@@ -846,9 +854,12 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
             risk_components = [item for item in timeline if item["kind"] in {"setup", "unknown"}
                                and (item["high_seconds"] is None or item["high_seconds"] > 0)]
             for item in risk_components:
-                if item["kind"] == "setup":
+                if item["id"] == "initial":
                     reasons.append(f"{CHECK_NAMES['access']} for {item['target']} may wait up to {item['high_seconds']:,g} s "
                                    "if the server is slow to respond; this allowance shares the time limit and is excluded from the estimated duration.")
+                elif item["kind"] == "setup":
+                    reasons.append(f"{item['title']} for {item['target']} may take up to {item['high_seconds']:,g} s; "
+                                   "this allowance shares the time limit and is excluded from the estimated duration.")
                 elif item.get("id") == "sessions_wait" and item.get("reason"):
                     reasons.append(f"{item['target']} · conversation pauses can add up to {item['high_seconds']:,g} s. " + item["reason"])
                 elif item["high_seconds"] is not None:
