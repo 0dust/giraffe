@@ -1,5 +1,6 @@
 """Protocol and lifecycle regressions found by independent gateway review."""
 import asyncio
+from collections import Counter
 from datetime import datetime, timezone
 import gzip
 import hashlib
@@ -1862,6 +1863,78 @@ async def test_gateway_deadline_preserves_completed_judged_inference(
         target, = compared["targets"]
         assert any("run was aborted" in reason for reason in target["reasons"])
         assert not any(row["check"] in {"serving", "correctness"} for row in target["comparisons"])
+
+
+@pytest.mark.parametrize("targets,active_outage", [(1, False), (2, False), (1, True), (2, True)])
+async def test_spend_reader_does_not_extend_shared_endpoint_watchdog(
+        monkeypatch, local_tokenizer, tmp_path, targets, active_outage):
+    client_class = httpx.AsyncClient
+    original_send = client_class.send
+    outage = "proxy" if targets == 1 else "second"
+
+    async def saved_run(*, mixed):
+        delayed_reader = False
+        shared = Counter()
+        events = []
+
+        async def observer(request, rows):
+            nonlocal delayed_reader
+            if not delayed_reader:
+                delayed_reader = True
+                await asyncio.sleep(.45)
+            return spend_page(request, rows)
+
+        async def send(client, request, **kwargs):
+            if request.method == "POST" and "x-litellm-trace-id" not in request.headers:
+                host = request.url.host
+                shared[host] += 1
+                if shared[host] == 4:
+                    if active_outage and host == outage:
+                        await asyncio.sleep(.45)
+                    raise httpx.ConnectError("controlled final shared failure", request=request)
+            return await original_send(client, request, **kwargs)
+
+        with monkeypatch.context() as env:
+            cfg, _, reads = setup(env, observer)
+            immediate_spend_polls(env, cfg)
+            if targets == 2:
+                first = cfg.targets[0]
+                cfg.targets.append(first.model_copy(update={"name": "second", "url": "http://second/v1",
+                    "gateway": first.gateway.model_copy(update={"url": "http://second/spend/logs/v2"})}))
+            cfg.checks = ["serving"] + (["gateway_attribution"] if mixed else [])
+            cfg.samples = 3
+            cfg.limits.min_samples = 2
+            cfg.limits.max_error_rate = .5
+            cfg.unresponsive_after_failures = 1
+            cfg.unresponsive_for_seconds = .3
+            cfg.metrics_timeout_seconds = 1
+            cfg.max_requests = None
+            env.setattr(client_class, "send", send)
+            report = await run_suite(cfg, progress=events.append)
+            path, _ = write_report(report, tmp_path)
+            return RunReport.model_validate_json(path.read_bytes()), reads, events
+
+    baseline, _, _ = await saved_run(mixed=False)
+    current, reads, events = await saved_run(mixed=True)
+    expected_aborts = {outage} if active_outage else set()
+    for report in (current, baseline):
+        assert set(report.observations["target_abort_reasons"]) == expected_aborts
+        for check in (check for check in report.checks if check.id == "serving"):
+            assert check.status == ("inconclusive" if check.target in expected_aborts else "pass")
+        assert all(target["endpoint_health"]["consecutive_failures"] == 1
+                   and len(target["endpoint_health"]["failure_request_ids"]) == 1
+                   for target in report.observations["targets"].values())
+    assert {event["target"] for event in events if event["event"] == "target_stopping"} == expected_aborts
+    observed = {request.url.host for request in reads}
+    assert observed == set(current.observations["targets"]) - expected_aborts
+    if not active_outage:
+        assert current.abort_reason is None
+        assert all(check.status == "pass" for check in current.checks if check.id == "gateway_attribution")
+        for target in compare_baseline(current, baseline).baseline["targets"]:
+            assert not target["reasons"]
+            warm_rate = next(row for row in target["comparisons"] if row["check"] == "serving"
+                             and row["scenario"] == "warm" and row["metric"] == "valid_completion_rate")
+            assert warm_rate["current"] == warm_rate["baseline"] == pytest.approx(2 / 3)
 
 
 @pytest.mark.parametrize("with_builtin", [False, True])
