@@ -508,11 +508,17 @@ class LLMClient:
                     payload["logprobs"] = True
                     payload.setdefault("top_logprobs", 0)
         record.workload = dict(spec.workload)
-        if not probing and not attribution and (stream or self._evidence_probe_attempts):
+        requested_logprobs = payload.get("logprobs") is True
+        stream_options = payload.get("stream_options")
+        requested_usage = isinstance(stream_options, dict) and stream_options.get("include_usage") is True
+        if stream and not probing and not attribution:
+            record.requested_stream_logprobs = requested_logprobs
+            record.requested_stream_usage = requested_usage
+        if not probing and not attribution and self._evidence_probe_attempts:
             record.workload["token_evidence"] = dict(self.token_evidence)
             evidence = record.workload["token_evidence"]
-            evidence["requested_logprobs"] = payload.get("logprobs") is True
-            evidence["requested_usage"] = isinstance(payload.get("stream_options"), dict) and payload["stream_options"].get("include_usage") is True
+            evidence["requested_logprobs"] = requested_logprobs
+            evidence["requested_usage"] = requested_usage
             if not stream:
                 evidence["logprobs"] = "non_streamed"
             if stream and not evidence["requested_logprobs"] and evidence["logprobs"] == "supported":

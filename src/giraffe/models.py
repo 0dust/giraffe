@@ -2807,12 +2807,11 @@ class RequestRecord(PersistedModel):
     gateway_evidence: GatewayResponseEvidence | None = None
 
     @model_serializer(mode="wrap")
-    def serialize_optional_identity(self, handler):
+    def serialize_optional_evidence(self, handler):
         result = handler(self)
-        if self.identity is None:
-            result.pop("identity", None)
-        if self.gateway_evidence is None:
-            result.pop("gateway_evidence", None)
+        for name in ("identity", "gateway_evidence", "requested_stream_logprobs", "requested_stream_usage"):
+            if getattr(self, name) is None:
+                result.pop(name, None)
         return result
     _timing_started_monotonic: float | None = PrivateAttr(default=None)
     _gateway_key_hash: str | None = PrivateAttr(default=None)
@@ -2908,6 +2907,8 @@ class RequestRecord(PersistedModel):
     requested_input_tokens: int | None = None
     requested_output_tokens: int | None = None
     workload: dict[str, Any] = Field(default_factory=dict)
+    requested_stream_logprobs: StrictBool | None = None
+    requested_stream_usage: StrictBool | None = None
     answer_hash: str | None = None
     request_hash: str | None = None
     history_hash: str | None = None

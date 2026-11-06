@@ -743,6 +743,8 @@ def _stream_options_reason(current: list[RequestRecord], old: list[RequestRecord
         return None
 
     def signature(record):
+        if record.requested_stream_logprobs is not None and record.requested_stream_usage is not None:
+            return record.requested_stream_logprobs, record.requested_stream_usage
         evidence = record.workload.get("token_evidence")
         if isinstance(evidence, dict):
             options = evidence.get("requested_logprobs"), evidence.get("requested_usage")
