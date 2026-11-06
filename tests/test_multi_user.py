@@ -439,6 +439,36 @@ def test_user_starts_fresh_conversations_after_completion_or_failure(monkeypatch
     run_virtual(monkeypatch, scenario())
 
 
+@pytest.mark.parametrize('history_rejected', [False, True])
+def test_conversation_acceptance_distinguishes_history_rejection_from_cutoff(monkeypatch, history_rejected):
+    from giraffe.multi_user import execute, result
+
+    async def scenario():
+        cfg = settings(levels=[1], duration_seconds=.019, think_time_seconds={'values': [0]},
+            conversations={'modes': ['fixed'],
+                'turns': ['Remember the original name.', 'x' * 600 if history_rejected else 'Repeat the name.']})
+        state = runner._Run(cfg, None, None)
+        await execute(state, cfg.targets[0], FakeClient(cfg.targets[0], cfg))
+
+        check = result(state, cfg.targets[0])
+        window = check.metrics['multi_user']['windows'][0]
+        user = window['users'][0]
+        assert not window['cut_short']
+        assert user['outcomes']['errors'] == 0
+        if history_rejected:
+            assert all(item['completed_turns'] == 1 for item in user['conversations'])
+            assert any('history admission ceiling' in item['stop_reason'] for item in user['conversations'])
+            assert check.status == 'inconclusive'
+            assert user['coverage']['status'] == 'partial'
+        else:
+            assert any(item['completed_turns'] == 2 for item in user['conversations'])
+            assert user['conversations'][-1]['completed_turns'] == 1
+            assert check.status == 'pass'
+            assert user['coverage']['status'] == 'complete'
+
+    run_virtual(monkeypatch, scenario())
+
+
 @pytest.mark.parametrize('mode', ['fixed', 'live'])
 @pytest.mark.parametrize('retention', ['all', 'none'])
 async def test_http_conversations_keep_history_and_retained_links(mode, retention, tmp_path):
