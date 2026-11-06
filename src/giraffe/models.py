@@ -1127,6 +1127,10 @@ class GatewayPolicy(Model):
     def supported(self) -> bool:
         return self.gateway == "litellm" and self.capability in {"key_rpm", "priority_rpm"}
 
+    @property
+    def custom_key_header(self) -> str | None:
+        return None if self.auth_header.lower() == "authorization" else self.auth_header
+
     @model_validator(mode="after")
     def valid_policy(self):
         aliases = [user.identity for user in self.users]

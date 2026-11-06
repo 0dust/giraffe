@@ -735,8 +735,17 @@ class LLMClient:
                     if not 200 <= response.status_code < 300:
                         error_body = await _limited_body(response, on_body=body_received)
                         if spec.identity is not None:
+                            expected_key_hash = None
+                            policy = self.config.gateway_policy
+                            if (response.status_code == 429 and "gateway_policy" in spec.check_ids
+                                    and policy is not None and policy.capability == "key_rpm"):
+                                from .identities import litellm_key_fingerprint
+
+                                expected_key_hash = litellm_key_fingerprint(
+                                    request.headers, auth_header=policy.custom_key_header,
+                                )
                             record.gateway_evidence = response_evidence(response.status_code, error_body, response.headers,
-                                declared_priority=spec.workload.get("declared_priority"))
+                                declared_priority=spec.workload.get("declared_priority"), expected_key_hash=expected_key_hash)
                         if spec.scenario == "connection" and response.status_code in {400, 404, 422}:
                             # Keep only the classification, never arbitrary server error text.
                             body = error_body.decode("utf-8", errors="replace").lower()

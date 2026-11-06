@@ -8,7 +8,7 @@ from .identities import identity_headers, litellm_key_fingerprint
 from .models import CheckResult, RequestSpec
 
 
-VERSION = 3
+VERSION = 4
 PROMPT = "Reply with exactly the word OK."
 
 
@@ -31,9 +31,9 @@ async def execute(run, target, client):
 
     # The default selects LiteLLM's native precedence, including its
     # X-LiteLLM-API-Key override. Custom deployments declare their key header.
-    auth_header = settings.auth_header if settings.auth_header.lower() != "authorization" else None
     try:
-        fingerprints = [litellm_key_fingerprint(identity_headers(target, user.identity), auth_header=auth_header)
+        fingerprints = [litellm_key_fingerprint(identity_headers(target, user.identity),
+                                                auth_header=settings.custom_key_header)
                         for user in settings.users]
     except ValueError:
         fingerprints = []
@@ -172,9 +172,11 @@ def summarize(settings, observation, records):
         return outcome("unexercised", "No attributed policy rejection was observed within offered work.")
     windows = [record.gateway_evidence.retry_after_seconds for record in recognized]
     start, end = observation.get("start_ms"), observation.get("end_ms")
-    if (any(window is None or window <= 0 for window in windows) or len(set(windows)) != 1
-            or start is None or end is None or end < start or end - start >= windows[0]*1000):
-        return outcome("unverified", "Effective policy window is missing, conflicting or crossed by this observation.")
+    # LiteLLM v3 reports the configured window and truncates bucket start
+    # timestamps to whole seconds. A fresh bucket can reset almost 1s early.
+    if (any(window is None or window <= 1 for window in windows) or len(set(windows)) != 1
+            or start is None or end is None or end < start or end - start >= (windows[0] - 1)*1000):
+        return outcome("unverified", "Cannot establish a single policy window from Retry-After and the observation duration.")
     summary["effective_window_seconds"] = windows[0]
     if settings.capability == "priority_rpm":
         if settings.saturation_cache_seconds != 0:

@@ -1,5 +1,6 @@
 """Gateway policy conclusions require attributed evidence and bounded peer work."""
 import asyncio
+import hashlib
 import json
 
 import httpx
@@ -8,6 +9,10 @@ import pytest
 from giraffe.client import LLMClient
 from giraffe.models import RunConfig, Target
 from giraffe import runner
+
+
+LIMITED_KEY_HASH = hashlib.sha256(b"limited-secret").hexdigest()
+PEER_KEY_HASH = hashlib.sha256(b"peer-secret").hexdigest()
 
 
 def configuration(mode="key_rpm", **changes):
@@ -43,14 +48,16 @@ async def exercise(monkeypatch, mode="key_rpm", *, behavior="enforce", full=Fals
         await asyncio.sleep(.01)
         priority = "low" if who == "limited" else "high"
         headers = {"x-ratelimit-limit-requests": "2" if who == "limited" else "8",
-                   "x-litellm-priority": priority, "retry-after": "60",
+                   "x-litellm-priority": priority, "retry-after": "1" if behavior == "short_bucket_reset" else "60",
                    "x-litellm-rate-limiter-version": "v3",
                    "x-ratelimit-priority_model-limit-requests": str(next(user.rpm for user in cfg.gateway_policy.users if user.identity == who))}
         threshold = 3 if behavior == "overadmit" else 1 if behavior == "early" else 2
-        if who == "limited" and counts[who] > threshold and behavior != "ignore":
+        bucket_reset = behavior == "short_bucket_reset" and counts[who] == 5
+        if who == "limited" and counts[who] > threshold and behavior != "ignore" and not bucket_reset:
+            subject = PEER_KEY_HASH if behavior == "wrong_subject" else LIMITED_KEY_HASH
             message = ("Priority-based rate limit exceeded. Model: test, Priority: low, Rate limit type: requests, Model TPM: not configured, Model RPM: 10, Remaining: 0, Model saturation: 50%"
                        if mode == "priority_rpm" else
-                       "Rate limit exceeded for api_key: private-hash. Limit type: requests. Current limit: 2, Remaining: 0. Limit resets at: 2026-01-01")
+                       f"Rate limit exceeded for api_key: {subject}. Limit type: requests. Current limit: 2, Remaining: 0. Limit resets at: 2026-01-01")
             if behavior == "unknown" or (behavior == "mixed_rejections" and counts[who] > threshold + 1):
                 message = "OpenAIException: provider rate limit"
             return httpx.Response(429, headers=headers, json={"error": {
@@ -89,7 +96,7 @@ async def test_full_runner_keeps_policy_verdict_and_does_not_send_shared_setup(m
     assert all(record.identity in {"limited", "peer"} for record in report.requests)
     assert len(report.requests) == 13
     assert "limited-secret" not in report.model_dump_json()
-    assert "private-hash" not in report.model_dump_json()
+    assert LIMITED_KEY_HASH not in report.model_dump_json()
 
 
 @pytest.mark.parametrize("mode", ["key_rpm", "priority_rpm"])
@@ -104,7 +111,27 @@ async def test_policy_enforcement_preserves_rejections_and_peer_continuation(mon
     assert len(seen) == 13 == len(state.records)
     assert state.slots.qsize() == 2
     assert "limited-secret" not in check.model_dump_json()
-    assert "private-hash" not in check.model_dump_json()
+    assert LIMITED_KEY_HASH not in check.model_dump_json()
+
+
+async def test_wrong_key_subject_cannot_verify_quota(monkeypatch):
+    check, state, _ = await exercise(monkeypatch, behavior="wrong_subject")
+    summary = check.metrics["gateway_policy"]
+    assert check.status == "inconclusive"
+    assert summary["qualification"] == "unverified"
+    assert summary["users"][0]["rejected"] == 3
+    assert not summary["peer_continuation"]
+    assert PEER_KEY_HASH not in check.model_dump_json()
+    assert all(PEER_KEY_HASH not in record.model_dump_json() for record in state.records)
+
+
+async def test_one_second_bucket_can_reset_during_subsecond_observation(monkeypatch):
+    check, state, _ = await exercise(monkeypatch, behavior="short_bucket_reset")
+    summary = check.metrics["gateway_policy"]
+    assert [record.http_status for record in state.records if record.identity == "limited"] == [200, 200, 429, 429, 200]
+    assert summary["peer_continuation"]
+    assert check.status == "inconclusive"
+    assert summary["qualification"] == "unverified"
 
 
 @pytest.mark.parametrize("mode", ["key_rpm", "priority_rpm"])
@@ -250,11 +277,12 @@ assert.match(comparison,/Policy evidence/);assert.doesNotMatch(comparison,/Media
 def test_parser_never_persists_raw_rate_limit_identity():
     from giraffe.gateway_response import response_evidence
     body = json.dumps({"error": {"type": "throttling_error", "code": "429", "message":
-        "Rate limit exceeded for api_key: secret-hash. Limit type: requests. Current limit: 2, Remaining: 0. Limit resets at: now"}}).encode()
-    evidence = response_evidence(429, body)
+        f"Rate limit exceeded for api_key: {LIMITED_KEY_HASH}. Limit type: requests. Current limit: 2, Remaining: 0. Limit resets at: now"}}).encode()
+    assert response_evidence(429, body).policy_rejection == "unknown"
+    evidence = response_evidence(429, body, expected_key_hash=LIMITED_KEY_HASH)
     assert evidence.policy_rejection == "key_rpm"
     assert evidence.request_limit == 2
-    assert "secret-hash" not in evidence.model_dump_json()
+    assert LIMITED_KEY_HASH not in evidence.model_dump_json()
 
 
 @pytest.mark.parametrize("body", [b'[]', b'{"error":[]}', b'{"error":{"type":[],"code":[]}}', b'['*1200+b']'*1200])
