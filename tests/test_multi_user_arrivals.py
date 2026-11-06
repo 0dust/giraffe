@@ -73,7 +73,8 @@ def test_aggregate_offer_bound_counts_targets_and_accepts_exact_limit(monkeypatc
 
 
 @pytest.mark.parametrize("case,expected", [
-    ("equal", "pass"), ("slow", "fail"), ("newcomer", "inconclusive"), ("burst", "inconclusive"),
+    ("equal", "pass"), ("unused_think_time", "pass"), ("slow", "fail"),
+    ("newcomer", "inconclusive"), ("burst", "inconclusive"),
     ("unequal_local_drops", "inconclusive"), ("equal_local_drops", "inconclusive"),
     ("measure_only", "measured"),
 ])
@@ -91,7 +92,8 @@ def test_selected_arrival_fairness_controls_window_and_overall_verdict(case, exp
     if case == "measure_only":
         criteria.update(max_throughput_ratio=None, max_error_percent=None)
     cfg = settings(levels=[2], scenarios=["arrivals"], duration_seconds=10, profile=PROFILE,
-                   arrivals=arrivals, pass_criteria=criteria)
+                   arrivals=arrivals, pass_criteria=criteria,
+                   think_time_seconds={"values": [0, .2] if case == "unused_think_time" else [0]})
     source = _planned_observation(cfg.multi_user)
     window, = source["windows"]
     window.update(start_ms=0, end_ms=10000, planned_end_ms=10000, duration_seconds=10,
@@ -119,7 +121,7 @@ def test_selected_arrival_fairness_controls_window_and_overall_verdict(case, exp
     summary = summarize(source, records)
     measured = summary["windows"][0]["fairness"]
     assert measured["status"] == expected
-    assert measured["qualified"] == (case in {"equal", "slow", "measure_only"})
+    assert measured["qualified"] == (case in {"equal", "unused_think_time", "slow", "measure_only"})
     if case == "slow":
         assert measured["ratio"] == 2.5
     if case in {"newcomer", "burst"}:

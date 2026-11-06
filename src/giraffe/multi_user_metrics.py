@@ -318,11 +318,12 @@ def _fairness(observation, window, users, records, criteria, health, lag, timing
         reasons.append("The measurement has incomplete drain coverage.")
     if len({user["profile"] for user in users}) > 1:
         reasons.append("Work not comparable: assigned profiles differ.")
-    plans = [user.get("think_time_plan", settings.get("think_time_seconds", {"values": [0]}))
-             for user in users]
-    if plans and (any(plan != plans[0] for plan in plans[1:])
-                  or any(_variable(plan) and not plan.get("seed_key") for plan in plans)):
-        reasons.append("Work not comparable: users have different or unverified think-time plans.")
+    if window.get("scenario") not in {"arrivals", "recovery"}:
+        plans = [user.get("think_time_plan", settings.get("think_time_seconds", {"values": [0]}))
+                 for user in users]
+        if plans and (any(plan != plans[0] for plan in plans[1:])
+                      or any(_variable(plan) and not plan.get("seed_key") for plan in plans)):
+            reasons.append("Work not comparable: users have different or unverified think-time plans.")
     conversation = settings.get("conversations") or {}
     if any(_variable(value) for key, value in (conversation.get("sampling") or {}).items()
            if key != "seed"):
@@ -689,34 +690,37 @@ def _recovery(observation, window, control, sustained, user_records, criteria, h
         notes = list(shared)
         before = user_records.get(((control or {}).get("id"), uid), [])
         after = user_records.get((window["id"], uid), [])
-        controls = {r.workload.get("matched_work_sequence"): r for r in before if _valid(r)}
-        pairs = [(controls.get(r.workload.get("matched_work_sequence")), r) for r in after if _valid(r)]
-        pairs = [(a, b) for a, b in pairs if a is not None and a.completed_ms is not None and b.completed_ms is not None
-                 and (control or {}).get("end_ms") is not None and window.get("end_ms") is not None
-                 and a.completed_ms <= control["end_ms"] and b.completed_ms <= window["end_ms"]]
+        control_end = (control or {}).get("end_ms")
+        lighter_end = window.get("end_ms")
+        controls = {r.workload["matched_work_sequence"]: r for r in before
+                    if _valid(r) and r.workload.get("matched_work_sequence") is not None
+                    and r.completed_ms is not None and control_end is not None and r.completed_ms <= control_end}
+        pairs = [(baseline, r) for r in after if _valid(r)
+                 and r.completed_ms is not None and lighter_end is not None and r.completed_ms <= lighter_end
+                 and (baseline := controls.get(r.workload.get("matched_work_sequence"))) is not None]
         if len({a.id for a, _ in pairs}) < criteria.min_samples or len(pairs) != len(after):
             notes.append("Recovery lacks sufficient matched completed control samples.")
-        if any(not b.workload.get("matched_work_sha256")
-               or a.workload.get("matched_work_sha256") != b.workload["matched_work_sha256"] for a, b in pairs):
-            notes.append("Matched control and recovery work differs.")
-        if any(not _comparable_tokens(a, b, tolerance)
-               for before_request, after_request in pairs
-               for a, b in ((before_request.input_tokens, after_request.input_tokens),
-                            (before_request.output_tokens, after_request.output_tokens))
-               if a is not None and b is not None):
-            notes.append("Actual token lengths drifted between matched control and lighter requests.")
         stress = [r for r in sustained_records if r.workload.get("user_id") == uid and _valid(r)
-                  and r.completed_ms is not None and (sustained or {}).get("end_ms") is not None
-                  and r.completed_ms <= sustained["end_ms"]]
-        for phase, rows in (("lighter", [b for _, b in pairs]), ("sustained", stress)):
-            for replay in rows:
-                baseline = controls.get(replay.workload.get("matched_work_sequence"))
-                if baseline is None:
-                    continue
-                if (baseline.input_tokens is not None and replay.input_tokens is not None
-                        and not _comparable_uncached_input(baseline, replay, tolerance)):
-                    notes.append(f"Actual uncached input drifted between matched control and {phase} requests.")
-                    break
+                  and r.completed_ms is not None and sustained_end is not None and r.completed_ms <= sustained_end]
+        stress_pairs = [(baseline, r) for r in stress
+                        if (baseline := controls.get(r.workload.get("matched_work_sequence"))) is not None]
+        if len(stress_pairs) != len(stress):
+            notes.append("Sustained work lacks a matched completed control sample.")
+        for phase, matched in (("lighter", pairs), ("sustained", stress_pairs)):
+            if any(not replay.workload.get("matched_work_sha256")
+                   or baseline.workload.get("matched_work_sha256") != replay.workload["matched_work_sha256"]
+                   for baseline, replay in matched):
+                notes.append(f"Matched control and {phase} logical work differs.")
+            if any(not _comparable_tokens(a, b, tolerance)
+                   for baseline, replay in matched
+                   for a, b in ((baseline.input_tokens, replay.input_tokens),
+                                (baseline.output_tokens, replay.output_tokens),
+                                (_total_generated_tokens(baseline), _total_generated_tokens(replay)))):
+                notes.append(f"Actual token lengths drifted between matched control and {phase} requests.")
+            if any(baseline.input_tokens is not None and replay.input_tokens is not None
+                   and not _comparable_uncached_input(baseline, replay, tolerance)
+                   for baseline, replay in matched):
+                notes.append(f"Actual uncached input drifted between matched control and {phase} requests.")
         if len(stress) < criteria.min_samples or max_evidenced_overlap(
                 [r for r in sustained_streams if r.workload.get("user_id") == uid],
                 [r for r in sustained_streams if r.workload.get("user_id") != uid], delays) < 2:
@@ -740,11 +744,6 @@ def _recovery(observation, window, control, sustained, user_records, criteria, h
                 "completion_ms": median([user_latency(r, False) for r in rows]),
                 "first_answer_ms": median([user_latency(r, True) for r in rows]),
                 "stream_gap_ms": median([r.max_stream_gap_ms for r in rows])}
-        for phase in ("lighter", "sustained"):
-            for metric in ("input_tokens", "output_tokens"):
-                a, b = values["control"][metric], values[phase][metric]
-                if a is None or b is None or max(a, b) > min(a, b)*(1+tolerance):
-                    notes.append("Actual per-user token lengths drifted between phases.")
         base, current = values["control"]["completion_ms"], values["lighter"]["completion_ms"]
         slowdown = current/base if base and current is not None else None
         if slowdown is None:
