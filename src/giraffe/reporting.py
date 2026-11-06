@@ -297,7 +297,8 @@ def _same_load_workload(current: dict, old: dict) -> bool:
         ("113325dd5cffa04626cc7be7ee93bc6e9be67335531288bc329b3542a155c92a",
          "788f4c8f0b14421d5fc00f8b32c0ffcef79c04c647730767cb44b16584ed4aa4",
          "4caab6e7a9eb457a5ceddf272112c434a97c101a2c27c3943f8a4155fb71bdb0",
-         "3c8a5f9d0154e7f174b96005258e34c925614fbbd3546e10ffb831616b7f9bdd"),
+         "3c8a5f9d0154e7f174b96005258e34c925614fbbd3546e10ffb831616b7f9bdd",
+         "9f8084f595656375f3f32b0cbcdc473a5d69c06909530c1c243ac77e72481c4b"),
     )
     identities = []
     for manifest in (current, old):
