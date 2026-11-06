@@ -1225,7 +1225,10 @@ def _user_token_work_changed(current, previous, tolerance):
         measures += (_uncached_input_tokens,)
     for measure in measures:
         lengths = [[measure(record) for record in cohort] for cohort in (current, previous)]
-        if any(not values or None in values for values in lengths) or _length_mix_differs(lengths, tolerance):
+        if any(not values or None in values for values in lengths):
+            return True
+        medians = [median(values) for values in lengths]
+        if max(medians) > min(medians) * (1 + tolerance / 100) or _length_mix_differs(lengths, tolerance):
             return True
     return False
 
