@@ -14,7 +14,7 @@ from fractions import Fraction
 from giraffe.concurrent_load import OutputProgress, calibrate
 from giraffe.load_test import _shape_sources, build_spec
 from giraffe.models import (
-    CheckResult, LoadTestSettings, Limits, _steady_offer_count, required_concurrency,
+    CheckResult, LoadTestSettings, Limits, _steady_offer_count, scheduled_multi_user_slots,
 )
 from giraffe.traffic import ExplicitTrafficStage, run_stage
 
@@ -507,7 +507,7 @@ async def run_arrival_window(run, target, client, settings, load_settings, calib
     # The shared scheduler observes one interval. Expand it at the actual
     # sending boundary for plans with activations or separate burst offers.
     stage_rows = [] if staged_arrivals else transitions
-    max_in_flight = required_concurrency(run.config)["by_check"]["multi_user"]
+    max_in_flight = scheduled_multi_user_slots(run.config)
     evidence = await run_stage(traffic=ExplicitTrafficStage(duration_seconds=window["planned_duration_seconds"],
         max_in_flight=max_in_flight,
         scheduler_lag_tolerance_ms=lag_tolerance_ms),

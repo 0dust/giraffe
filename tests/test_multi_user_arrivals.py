@@ -265,6 +265,47 @@ def test_other_check_transport_pool_does_not_raise_user_admission_limit(monkeypa
     run_virtual(monkeypatch, run())
 
 
+@pytest.mark.parametrize("ceiling", [None, 4])
+def test_mixed_arrivals_and_closed_loop_keep_their_own_slot_requirements(
+        monkeypatch, local_tokenizer, tmp_path, ceiling):
+    import json
+
+    from giraffe.models import RunConfig, required_concurrency
+
+    fixtures = tmp_path / "fixtures.json"
+    fixtures.write_text(json.dumps([
+        {"fixture_id": "fixture-a", "scorer": "none", "max_tokens": 2,
+         "messages": [{"role": "user", "content": "x" * 256}]}
+    ]))
+
+    class Endpoint(FakeClient):
+        delay = .08
+
+    async def run():
+        results = []
+        for scenarios in (["repeated_requests"], ["arrivals", "repeated_requests"]):
+            base = settings(levels=[8], scenarios=scenarios, duration_seconds=1, profile=PROFILE,
+                            arrivals={"requests_per_second": 1},
+                            pass_criteria={"min_output_tokens_per_second": 16})
+            cfg = RunConfig.model_validate({**base.model_dump(mode="json"), "concurrency": ceiling,
+                                           "default_concurrency": 4, "custom_fixtures": str(fixtures)})
+            assert required_concurrency(cfg)["by_check"]["multi_user"] == 8
+            report = await runner.run_suite(cfg)
+            windows = next(check for check in report.checks if check.id == "multi_user").metrics["multi_user"]["windows"]
+            if "arrivals" in scenarios:
+                arrivals = windows[0]
+                assert arrivals["max_in_flight"] == arrivals["peak_in_flight"] == 4
+                assert arrivals["slot_limit_reached"] and arrivals["offer_accounting"]["dropped_local"] == 4
+            results.append(windows[-1])
+        for closed in results:
+            assert closed["scenario"] == "repeated_requests"
+            assert closed["status"] == ("pass" if ceiling is None else "fail")
+            assert {user["output_tokens_per_second"] for user in closed["users"]} == {22 if ceiling is None else 12}
+
+    monkeypatch.setattr(runner, "LLMClient", Endpoint)
+    run_virtual(monkeypatch, run())
+
+
 @pytest.mark.parametrize("budget", [None, 3])
 def test_user_offers_reconcile_busy_slots_and_budget(monkeypatch, budget):
     async def run():
