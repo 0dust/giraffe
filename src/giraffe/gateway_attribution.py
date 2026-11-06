@@ -16,7 +16,7 @@ from .models import CheckResult, RequestSpec
 
 
 CHECK = "gateway_attribution"
-COLLECTION_VERSION = 2
+COLLECTION_VERSION = 3
 MAX_BODY_BYTES = 4 * 1024 * 1024
 MAX_PAGES = 8
 PAGE_SIZE = 128
@@ -48,13 +48,19 @@ def _normalize(rows, marker, expected):
             except (ValueError, UnicodeError, RecursionError):
                 metadata = None
         tags = metadata.get("spend_logs_metadata") if isinstance(metadata, dict) else None
+        same_session = row.get("session_id") == marker
         if not isinstance(tags, dict) or tags.get("giraffe_run") != marker:
-            unrelated += 1
+            # LiteLLM can share a session ID across child calls. Without a
+            # matching request marker, a row in this session is ambiguous.
+            if same_session:
+                invalid += 1
+            else:
+                unrelated += 1
             continue
         local_id = tags.get("giraffe_request")
         gateway_id = row.get("request_id")
         if (not isinstance(local_id, str) or local_id not in expected
-                or row.get("session_id") != marker
+                or not same_session
                 or not isinstance(gateway_id, str) or not 0 < len(gateway_id) <= 256):
             invalid += 1
             continue
