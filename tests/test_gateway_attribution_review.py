@@ -171,8 +171,8 @@ async def test_attribution_preserves_shared_sessions_and_uses_spare_budget(monke
     assert attribution.metrics["state"] == ("verified" if reader == "verified" else "unsupported")
     assert attribution.required is (reader == "verified")
     assert report.overall == "pass"
-    assert traffic[:cap - (0 if reader == "unsupported" else 2) + 1] == (
-        ["shared"] * (5 if reader == "unsupported" else 6) + ["reader"])
+    shared_count = 5 if reader == "unsupported" else 6
+    assert traffic[:shared_count + 1] == ["shared"] * shared_count + ["reader"]
     assert traffic.count("identity") == (0 if reader == "unsupported" else 2)
 
 
@@ -215,6 +215,28 @@ async def test_attribution_waits_for_all_shared_targets(monkeypatch, local_token
     else:
         assert attribution.metrics["state"] == "unsupported" and not attribution.required
         assert report.overall == "pass"
+
+
+async def test_deferred_attribution_uses_only_selected_identities(monkeypatch, local_tokenizer):
+    async def observer(request, rows):
+        return spend_page(request, rows)
+
+    cfg, _, reads = setup(monkeypatch, observer)
+    cfg.checks = ["access", "gateway_attribution"]
+    cfg.gateway_attribution.settle_seconds = .2
+    cfg.targets[0].api_key_env = "SHARED"
+    cfg.targets.append(cfg.targets[0].model_copy(update={
+        "name": "second", "url": "http://second/v1", "gateway": None,
+    }))
+    report = await run_suite(cfg)
+    assert report.overall == "pass"
+    assert [(record.target, record.identity) for record in report.requests] == [
+        ("proxy", None), ("second", None), ("proxy", "alice"), ("proxy", "bob"),
+    ]
+    check = next(check for check in report.checks
+                 if check.target == "proxy" and check.id == "gateway_attribution")
+    assert check.metrics["state"] == "verified"
+    assert len(reads) == 4
 
 
 async def test_attribution_does_not_reserve_shared_token_evidence_slot(monkeypatch, local_tokenizer):
