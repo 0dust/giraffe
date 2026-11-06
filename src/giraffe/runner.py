@@ -613,10 +613,12 @@ class _Run:
                 # Condition construction/progress may take time. Sample the
                 # dispatch boundary after that setup, before taking any budget
                 # or recording an HTTP attempt that may never be sent.
+                reason = self.stop_reason(target.name)
+                stopping = reason not in {None, "maximum request budget reached"}
                 started_at = _now()
                 started = time.monotonic()
-                if started >= slot_deadline:
-                    if started >= self.deadline:
+                if started >= slot_deadline or stopping:
+                    if started >= self.deadline or stopping:
                         self.mark_unfinished(target.name, _scenario_checks(spec))
                     return None
                 if not budget_reserved and not budget_exempt and not self.reserve_offer(target.name):
@@ -645,15 +647,37 @@ class _Run:
             failure = None
             task = asyncio.current_task()
             cancellations = task.cancelling()
-            try:
-                if on_start:
-                    on_start()
+            pending_start = None
+            start_progress_error = None
+            completed_before_progress = None
+
+            def emit_start():
                 self.emit("request_started", target.name, spec.scenario,
                           request_slot=request_slot, fixture_id=spec.fixture_id,
                           **({"user": {key: spec.workload[key] for key in ("user_id", "population", "profile", "window_id", "phase", "request_sequence", "session_id", "turn_id", "conversation_sequence", "role", "matched_work_sequence", "trigger", "heavy_profile", "cancellation_role", "cohort", "origin", "work_sequence", "activation_seconds") if key in spec.workload}} if "multi_user" in spec.check_ids else {}),
                           input_chars=request_parameters["input_chars"], requested_max_tokens=output_cap,
                           requested_input_tokens=spec.requested_input_tokens,
                           condition_id=condition_id, condition_summary=dict(condition) if condition else None)
+
+            def emit_scheduled_start():
+                nonlocal pending_start, start_progress_error
+                pending_start = None
+                try:
+                    emit_start()
+                except (Exception, asyncio.CancelledError) as exc:
+                    start_progress_error = exc
+
+            try:
+                if on_start:
+                    on_start()
+                if self.progress:
+                    if admission_deadline is not None and budget_reserved:
+                        # An open-loop offer enters transport before yielding to
+                        # public progress. A synchronous observer cannot hold it
+                        # past the checked admission boundary before dispatch.
+                        pending_start = task.get_loop().call_soon(emit_scheduled_start)
+                    else:
+                        emit_start()
                 request_timeout = (spec.request_timeout_seconds if spec.request_timeout_seconds is not None
                                    else self.config.request_timeout_seconds)
                 if deadline_override is not None:
@@ -698,17 +722,24 @@ class _Run:
             finally:
                 self.active[key] -= 1
                 overlap = self.inflight.finish(target.name, token)
+                if pending_start is not None:
+                    # An immediate transport result must still emit its start
+                    # before the terminal progress event.
+                    completed_before_progress = _now(), (time.monotonic()-self.start)*1000
+                    pending_start.cancel()
+                    emit_scheduled_start()
             # The transport catches cancellation to preserve partial output. Restore
             # propagation here, after completing the record and its live condition.
             if task.cancelling() > cancellations and failure is None:
                 failure = asyncio.CancelledError()
                 record.status, record.valid = "cancelled", False
+            failure = failure or start_progress_error
             if isinstance(failure, asyncio.CancelledError):
                 failure.giraffe_record = record
             # A transport may catch cancellation to preserve partial streamed output.
             if time.monotonic() >= self.deadline and record.status == "cancelled":
                 record.error = "maximum run duration reached"
-            record.completed_at = _now()
+            record.completed_at = completed_before_progress[0] if completed_before_progress else _now()
             record.request_timeout_seconds = spec.request_timeout_seconds or self.config.request_timeout_seconds
             if record.status in {"timeout", "cancelled"}:
                 try:
@@ -751,7 +782,8 @@ class _Run:
                 if record._timing_started_monotonic is not None else record.dispatch_ms)
             if record._request_body_sent_monotonic is not None:
                 record.request_body_sent_ms = (record._request_body_sent_monotonic - self.start) * 1000
-            record.completed_ms = (time.monotonic()-self.start)*1000
+            record.completed_ms = (completed_before_progress[1] if completed_before_progress
+                                   else (time.monotonic()-self.start)*1000)
             record.workload = {**spec.workload, **record.workload}
             record.load_point = dict(spec.load_point) if spec.load_point else None
             record.requested_input_tokens = spec.requested_input_tokens

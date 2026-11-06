@@ -116,6 +116,7 @@ def test_full_multi_user_window_binds_only_matching_baseline_cohorts(scenario, r
     (2, "all", "fail"), (14, "all", "inconclusive"),
     (2, "lighter", "fail"), (14, "lighter", "inconclusive"),
     (14, "lighter-work", "inconclusive"),
+    (14, "visible", "inconclusive"), (14, "uncached", "inconclusive"),
 ])
 def test_scheduled_user_timing_requires_comparable_total_generation(monkeypatch, local_tokenizer, generated, scope, expected):
     import asyncio
@@ -136,7 +137,7 @@ def test_scheduled_user_timing_requires_comparable_total_generation(monkeypatch,
 
     class Observed(FakeClient):
         delay = .02
-        completion_tokens = 2
+        completion_tokens = 14 if scope in {"visible", "uncached"} else 2
         slower = False
 
         async def execute(self, spec, **kwargs):
@@ -144,7 +145,11 @@ def test_scheduled_user_timing_requires_comparable_total_generation(monkeypatch,
             if "multi_user" in spec.check_ids:
                 lighter = spec.workload.get("role") == "lighter"
                 record.completion_tokens = self.completion_tokens if scope != "lighter-work" or lighter else 2
-                record.reasoning_tokens = record.completion_tokens - 2
+                if scope == "visible" and self.slower:
+                    record.output_tokens = 4
+                if scope == "uncached":
+                    record.cached_prompt_tokens = 32 if self.slower else 0
+                record.reasoning_tokens = record.completion_tokens - record.output_tokens
                 if self.slower and lighter_only and lighter:
                     await asyncio.sleep(.04)
                     record.elapsed_ms += 40
@@ -190,7 +195,8 @@ def test_scheduled_user_timing_requires_comparable_total_generation(monkeypatch,
         assert [row["baseline"] for row in completion] == pytest.approx([20, 20])
         assert [row["current"] for row in completion] == pytest.approx([60, 60] if slower else [20, 20])
         delivery = metrics["baseline_throughput"]["value"]
-        assert len(delivery) == 2 and all(row["current"] == row["baseline"] for row in delivery)
+        assert len(delivery) == 2 and {row["status"] for row in delivery} == {"pass"}
+        assert all(row["current"] == row["baseline"] * (2 if scope == "visible" else 1) for row in delivery)
 
 
 @pytest.mark.parametrize(("change", "expected_warning"), [
@@ -260,7 +266,8 @@ def test_scheduled_stream_gap_qualifies_its_own_samples(monkeypatch, local_token
     assert {row["status"] for row in comparisons if row["metric"] == "latency_ms"} == {"pass"}
 
 
-def test_scheduled_user_timing_qualifies_median_total_generation(monkeypatch, local_tokenizer):
+@pytest.mark.parametrize("work", ["generation", "uncached"])
+def test_scheduled_user_timing_and_acceptance_qualify_observed_work(monkeypatch, local_tokenizer, work):
     from giraffe import runner
     from giraffe.reporting import compare_baseline
     from tests.test_multi_user import settings
@@ -278,8 +285,11 @@ def test_scheduled_user_timing_qualifies_median_total_generation(monkeypatch, lo
         async def execute(self, spec, **kwargs):
             record = await super().execute(spec, **kwargs)
             if "multi_user" in spec.check_ids:
-                record.completion_tokens = 2 if spec.workload["request_sequence"] <= self.short_samples else 14
-                record.reasoning_tokens = record.completion_tokens - 2
+                if work == "generation":
+                    record.completion_tokens = 2 if spec.workload["request_sequence"] <= self.short_samples else 14
+                    record.reasoning_tokens = record.completion_tokens - 2
+                else:
+                    record.cached_prompt_tokens = 32 if self.short_samples == 7 else 0
             return record
 
     async def replay():
@@ -300,7 +310,8 @@ def test_scheduled_user_timing_qualifies_median_total_generation(monkeypatch, lo
     for row in completion:
         assert (row["current"], row["baseline"]) == pytest.approx((60, 20))
         assert row["status"] == "inconclusive"
-        assert [warning["code"] for warning in row["warnings"]] == ["output_work_changed"]
+        warning = "output_work_changed" if work == "generation" else "input_work_changed"
+        assert [item["code"] for item in row["warnings"]] == [warning]
     assert {row["status"] for row in acceptance} == {"inconclusive"}
     assert {row["status"] for row in delivery} == {"pass"}
 
