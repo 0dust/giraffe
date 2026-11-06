@@ -584,6 +584,12 @@ class LLMClient:
                 record.input_tokens = _token_count(usage.get("prompt_tokens"))
                 record.completion_tokens = _token_count(usage.get("completion_tokens"))
                 record.output_tokens = record.completion_tokens
+                if policy_probe and record.gateway_evidence is not None:
+                    total_tokens = _token_count(usage.get("total_tokens"))
+                    if (record.input_tokens is not None and record.completion_tokens is not None
+                            and total_tokens == record.input_tokens + record.completion_tokens):
+                        # LiteLLM may charge input, output, or total usage after success.
+                        record.gateway_evidence._tpm_charge_upper = total_tokens
                 cached = usage.get("prompt_tokens_details")
                 if isinstance(cached, dict):
                     record.cached_prompt_tokens = _token_count(cached.get("cached_tokens"))

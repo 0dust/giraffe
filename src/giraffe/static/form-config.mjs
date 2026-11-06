@@ -290,7 +290,7 @@ export function gatewayPolicySettings(config) {
   return {auth_header:'Authorization',gateway:'litellm',capability:'key_rpm',gateway_version:null,affected_identity:'limited',
     users:[{identity:'limited',requests:5,rpm:2,priority:null},{identity:'peer',requests:8,rpm:8,priority:null}],
     duration_seconds:15,interval_seconds:.1,max_output_tokens:16,window_state:'unknown',
-    model_rpm:null,saturation_threshold:null,saturation_cache_seconds:null,...structuredClone(config.gateway_policy || {})};
+    model_rpm:null,saturation_threshold:null,saturation_cache_seconds:null,named_reservations_confirmed:false,...structuredClone(config.gateway_policy || {})};
 }
 
 export function configureGatewayPolicy(source, values, {allowInvalid=false}={}) {
@@ -303,6 +303,7 @@ export function configureGatewayPolicy(source, values, {allowInvalid=false}={}) 
   for(const name of ['duration_seconds','interval_seconds','max_output_tokens','model_rpm','saturation_threshold','saturation_cache_seconds']){
     if(values.has('gateway_policy_'+name))settings[name]=numeric(values.get('gateway_policy_'+name),name,allowInvalid);
   }
+  if(values.has('gateway_policy_named_reservations_confirmed'))settings.named_reservations_confirmed=values.get('gateway_policy_named_reservations_confirmed')==='true';
   if(values.has('gateway_policy_users')){
     settings.users=String(values.get('gateway_policy_users')).split('\n').filter(row=>row.trim()).map(row=>{
       const [identity,requests,rpm,priority,...extra]=row.split(',').map(value=>value.trim());

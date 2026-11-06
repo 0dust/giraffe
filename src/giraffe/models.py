@@ -1125,6 +1125,7 @@ class GatewayPolicy(Model):
     model_rpm: StrictInt | None = Field(default=None, ge=1, le=1000000)
     saturation_threshold: float | None = Field(default=None, ge=0, le=1)
     saturation_cache_seconds: float | None = Field(default=None, ge=0, le=60)
+    named_reservations_confirmed: StrictBool = False
 
     @property
     def supported(self) -> bool:
@@ -2777,6 +2778,7 @@ class GatewayResponseEvidence(PersistedModel):
     _reported_saturation: tuple[Decimal, ...] = PrivateAttr(default=())
     _model_tpm_unconfigured: bool = PrivateAttr(default=False)
     _model_tpm: int | None = PrivateAttr(default=None)
+    _tpm_charge_upper: int | None = PrivateAttr(default=None)
     error_kind: Literal["authentication", "model_access", "rate_limit", "unknown"] | None = None
     policy_rejection: Literal["key_rpm", "priority_pool", "model_capacity", "unknown"] | None = None
     request_limit: int | None = Field(default=None, ge=0)

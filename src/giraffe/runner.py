@@ -1190,10 +1190,12 @@ def _identity_only_target(target):
     return identity_target
 
 
-async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attribution=False):
+async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attribution=False, defer_policy=False):
     config, enabled = run.config, set(run.config.checks)
     if defer_attribution:
         enabled.discard("gateway_attribution")
+    if defer_policy:
+        enabled.discard("gateway_policy")
     telemetry_task = None
     telemetry_stop = asyncio.Event()
     from giraffe import deployment, telemetry, workloads
@@ -1460,7 +1462,8 @@ async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attributio
                 await run.group(target, client, probe_specs, "recovery",
                                 count=effective.samples, checks=["recovery"])
             run.finish_checks(target.name, {"recovery"})
-            await workloads.execute(run, target, client, fixtures, defer_attribution=defer_attribution)
+            await workloads.execute(run, target, client, fixtures, defer_attribution=defer_attribution,
+                                    defer_policy=defer_policy)
             run.finish_checks(target.name, enabled - {"gpu"})
     except asyncio.CancelledError:
         run.unfinished[target.name].update(check for name, check in run.pending_checks if name == target.name)
@@ -1521,6 +1524,36 @@ async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attributio
             raise
         except Exception as exc:
             _target_error(run, target, enabled, exc)
+
+
+async def _deferred_policy(run, target):
+    from .gateway_policy import execute
+
+    check = "gateway_policy"
+    observations = run.observations[target.name]
+    reason = run.stop_reason(target.name)
+    if (reason and reason != "maximum request budget reached" or observations.get("client_error")):
+        run.mark_unfinished(target.name, {check})
+        return
+    restart = observations["restart"]
+    if run.config.restart_target == target.name and (not restart or restart["status"] != "ready"):
+        run.finish_checks(target.name, {check})
+        return
+    run.emit("scenario_started", target.name, check)
+    try:
+        async with LLMClient(_identity_only_target(target), run.config,
+                             max_connections=run.connection_limits[target.name]) as client:
+            await execute(run, target, client)
+    except asyncio.CancelledError:
+        run.mark_unfinished(target.name, {check})
+        raise
+    except Exception as exc:
+        logger.error("Internal gateway policy error (%s)", type(exc).__name__)
+        observations.setdefault(check, {}).update(
+            execution_error="Gateway policy could not complete.")
+    finally:
+        run.finish_checks(target.name, {check})
+        run.emit("scenario_finished", target.name, check)
 
 
 async def _deferred_attribution(run, target):
@@ -2656,13 +2689,24 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
     consume_samples()
 
     from .gateway_attribution import deferred_for_shared_targets
+    from .gateway_policy import deferred_for_shared_targets as defer_gateway_policy
+
     defer_attribution = deferred_for_shared_targets(config)
+    defer_policy = defer_gateway_policy(config)
 
     async def shared_target(target):
+        deferred = {}
         if defer_attribution:
-            await _target(run, target, fixtures, defer_attribution=True)
-        else:
-            await _target(run, target, fixtures)
+            deferred["defer_attribution"] = True
+        if defer_policy:
+            deferred["defer_policy"] = True
+        await _target(run, target, fixtures, **deferred)
+
+    async def check_policy(target):
+        await _deferred_policy(run, target)
+
+    async def attribute(target):
+        await _deferred_attribution(run, target)
 
     async def target_task(target, execute):
         task = asyncio.create_task(execute(target))
@@ -2684,11 +2728,13 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
 
         return [asyncio.create_task(sequential())]
 
-    async def shared_then_attribution():
-        async def attribute(target):
-            await _deferred_attribution(run, target)
-
-        for execute in (shared_target, attribute):
+    async def shared_then_gateway():
+        phases = [shared_target]
+        if defer_policy:
+            phases.append(check_policy)
+        if defer_attribution:
+            phases.append(attribute)
+        for execute in phases:
             phase = start_targets(execute)
             try:
                 await asyncio.gather(*phase)
@@ -2698,7 +2744,7 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
                         task.cancel()
                 await asyncio.gather(*phase, return_exceptions=True)
 
-    tasks = ([asyncio.create_task(shared_then_attribution())] if defer_attribution
+    tasks = ([asyncio.create_task(shared_then_gateway())] if defer_attribution or defer_policy
              else start_targets(shared_target))
     monitor = asyncio.create_task(run.monitor(tasks))
     try:

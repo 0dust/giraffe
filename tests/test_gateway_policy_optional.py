@@ -314,3 +314,63 @@ assert.equal(result.gateway_policy,undefined);
 const check=bootstrap.checks.find(c=>c.id==='gateway_policy');
 assert.match(effectiveCheckSummary(check,config),/Not configured/);
 ''', configuration())
+
+
+@pytest.mark.usefixtures("local_tokenizer")
+@pytest.mark.parametrize("case", ["unsupported", "missing_credentials", "multi_target"])
+async def test_optional_policy_preserves_shared_traffic_at_run_limits(monkeypatch, case):
+    from tests.test_gateway_policy import configuration as configured_policy
+
+    raw = configured_policy(gateway="unsupported" if case == "unsupported" else "litellm",
+                            duration_seconds=.8).model_dump(mode="json")
+    raw.update(checks=["serving", "gateway_policy"], stream=False, samples=2, max_memory_mb=0,
+               max_requests=3 if case != "multi_target" else None, max_duration_seconds=2,
+               retention="all", limits={"min_samples": 2})
+    raw["targets"][0]["api_key_env"] = "SHARED"
+    monkeypatch.setenv("SHARED", "shared-secret")
+    monkeypatch.delenv("LIMITED", raising=False)
+    monkeypatch.delenv("PEER", raising=False)
+    if case == "multi_target":
+        raw["targets"].append(dict(raw["targets"][0], name="second", url="http://second"))
+        monkeypatch.setenv("LIMITED", "limited-secret")
+        monkeypatch.setenv("PEER", "peer-secret")
+    config = RunConfig.model_validate(raw)
+    sent = []
+    stop = asyncio.Event()
+
+    async def handle(request):
+        if request.method != "POST":
+            return httpx.Response(404)
+        auth = request.headers["authorization"]
+        sent.append((request.url.host, auth))
+        if auth != "Bearer shared-secret":
+            stop.set()
+            await asyncio.sleep(.8)
+        return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "OK"},
+            "finish_reason": "stop"}], "usage": {"prompt_tokens": 8, "completion_tokens": 2}})
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handle), **kw))
+    report = await run_suite(config, stop_event=stop)
+    serving = [check for check in report.checks if check.id == "serving"]
+    assert all(check.status == "pass" for check in serving)
+    if case == "multi_target":
+        assert sent[:6] == [("proxy", "Bearer shared-secret")] * 3 + [("second", "Bearer shared-secret")] * 3
+        assert len(sent) > 6 and sent[6][1] != "Bearer shared-secret"
+        timeline = request_plan(config)["time_timeline"]
+        assert [(row["target"], row["id"]) for row in timeline] == [
+            ("proxy", "initial"), ("proxy", "warm"), ("second", "initial"), ("second", "warm"),
+            ("proxy", "gateway_policy"), ("second", "gateway_policy"),
+        ]
+    else:
+        assert sent == [("proxy", "Bearer shared-secret")] * 3
+        assert report.abort_reason is None
+        policy = next(check for check in report.checks if check.id == "gateway_policy")
+        assert policy.metrics["gateway_policy"]["qualification"] == (
+            "unavailable" if case == "unsupported" else "unverified")
+        if case == "unsupported":
+            from giraffe.reporting import compare_baseline
+
+            compared = compare_baseline(report, report.model_copy(deep=True)).baseline
+            assert compared["status"] == "pass"
+            assert any(row["status"] == "pass" for row in compared["targets"][0]["comparisons"])

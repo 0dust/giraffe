@@ -167,7 +167,7 @@ _CONVERSATION_REVISIONS = {"persistent_users", "shared_conversations"}
 _COMPANION_REVISIONS = _CONVERSATION_REVISIONS | {
     "gateway_attribution", "gateway_conversations", "gateway_shared_first", "gateway_shared_targets_first",
     "gateway_policy", "policy_conversations", "policy_shared_first", "policy_shared_targets_first",
-    "policy_after_shared_workloads",
+    "policy_after_shared_workloads", "policy_after_all_shared_targets",
 }
 _CONVERSATION_BRIDGE_CHECKS = {"prefix", "sessions", "consistency"}
 _CONVERSATION_LOAD_SOURCE = "9b694c97a39d449d8ea15b09a9aeb406bf835179c0882827685c4d7888687d36"
@@ -245,6 +245,7 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str, include_load
             "gateway_shared_targets_first": "8037d490881621f37f1aef446474bc52a1ba276bcfcd174f39a14e37032dc9f0",
             "policy_shared_targets_first": "d72acf540fbf8fbd8c45d3ab76d6041054209bb45913c681df171525f8ddc158",
             "policy_after_shared_workloads": "49dcdfb6b173a93720e4e9e5a9bc54ffcea7580346d2ea0210e600e0779a03e6",
+            "policy_after_all_shared_targets": "e4ddc7a7e8563f9ab3bba2fc42ad0232ee924c65f67d92dafd89c21025d202d0",
         }[revision] if any(settings.values()) else None,
         "settings": settings,
     }
@@ -263,6 +264,7 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str, include_load
             "gateway_shared_targets_first": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
             "policy_shared_targets_first": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
             "policy_after_shared_workloads": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
+            "policy_after_all_shared_targets": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
         }[revision]
     if "concurrency" in resolved.checks:
         identity["concurrent_load_source_sha256"] = {
@@ -295,6 +297,7 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str, include_load
             "gateway_shared_targets_first": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
             "policy_shared_targets_first": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
             "policy_after_shared_workloads": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
+            "policy_after_all_shared_targets": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
         }[revision]
     if "tools" in resolved.checks:
         from .tool_checks import resolved_tool_fixtures, resolved_tool_modes
@@ -345,7 +348,7 @@ def _same_load_workload(current: dict, old: dict, *, fingerprint_key: str = "wor
     revisions = ("shared_conversations", "gateway_conversations",
                  "gateway_shared_first", "gateway_shared_targets_first",
                  "policy_conversations", "policy_shared_first", "policy_shared_targets_first",
-                 "policy_after_shared_workloads")
+                 "policy_after_shared_workloads", "policy_after_all_shared_targets")
     families = (
         # Explicit multi-user stages preserve ordinary Load dispatch.
         (_CONVERSATION_LOAD_SOURCE,

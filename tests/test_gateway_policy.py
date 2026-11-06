@@ -24,7 +24,7 @@ def configuration(mode="key_rpm", **changes):
                   users=[dict(identity="limited", requests=5, rpm=2, priority="low"),
                          dict(identity="peer", requests=8, rpm=8, priority="high")])
     if mode == "priority_rpm":
-        policy.update(model_rpm=10, saturation_threshold=0, saturation_cache_seconds=0)
+        policy.update(model_rpm=10, saturation_threshold=0, saturation_cache_seconds=0, named_reservations_confirmed=True)
     policy.update(changes)
     return RunConfig(targets=[Target(name="proxy", url="http://proxy", model="test",
         test_identities={"limited": {"api_key_env": "LIMITED"}, "peer": {"api_key_env": "PEER"}})],
@@ -34,7 +34,7 @@ def configuration(mode="key_rpm", **changes):
 
 async def exercise(monkeypatch, mode="key_rpm", *, behavior="enforce", full=False,
                    admitted_affected=None, rejection_saturation=None, saturation_header=None, peer_delay=.01,
-                   early_peer_admissions=None, restart=False, **settings):
+                   early_peer_admissions=None, restart=False, model_tpm="not configured", **settings):
     monkeypatch.setenv("LIMITED", "limited-secret")
     monkeypatch.setenv("PEER", "peer-secret")
     if behavior == "duplicate_credentials":
@@ -78,8 +78,9 @@ async def exercise(monkeypatch, mode="key_rpm", *, behavior="enforce", full=Fals
             subject = PEER_KEY_HASH if behavior == "wrong_subject" else LIMITED_KEY_HASH
             model_rpm = cfg.gateway_policy.model_rpm
             saturation = (f"{admitted / model_rpm:.1%}" if rejection_saturation is None else f"{rejection_saturation}%") if model_rpm else ""
-            message = (f"Priority-based rate limit exceeded. Model: {MODEL_POOL}, Priority: {priority}, Rate limit type: requests, "
-                       f"Model TPM: not configured, Model RPM: {cfg.gateway_policy.model_rpm}, Remaining: 0, "
+            tier_field = "low, Priority: high" if behavior == "contradictory_priority" else priority
+            message = (f"Priority-based rate limit exceeded. Model: {MODEL_POOL}, Priority: {tier_field}, Rate limit type: requests, "
+                       f"Model TPM: {model_tpm}, Model RPM: {cfg.gateway_policy.model_rpm}, Remaining: 0, "
                        f"Model saturation: {saturation}"
                        if mode == "priority_rpm" else
                        f"Rate limit exceeded for api_key: {subject}. Limit type: requests. Current limit: 2, Remaining: 0. Limit resets at: 2026-01-01")
@@ -92,14 +93,18 @@ async def exercise(monkeypatch, mode="key_rpm", *, behavior="enforce", full=Fals
             return httpx.Response(429, headers=headers, json={"error": {
                 "type": "throttling_error", "code": "429", "message": message}})
         admitted += 1
-        usage = {"prompt_tokens": 8, "completion_tokens": 2}
+        usage = {"prompt_tokens": 8, "completion_tokens": 2, "total_tokens": 10}
+        if behavior == "missing_total":
+            usage.pop("total_tokens")
         if behavior == "missing_usage":
             usage = {}
         if behavior == "reasoning_work" and who == "limited":
             usage = {"prompt_tokens": 8, "completion_tokens": 128,
                      "completion_tokens_details": {"reasoning_tokens": 126}}
-        if who == "peer" and behavior in {"peer_inconsistent_reasoning", "peer_consistent_reasoning"}:
-            usage["completion_tokens_details"] = {"reasoning_tokens": 128 if behavior == "peer_inconsistent_reasoning" else 1}
+        if who == "peer" and behavior in {"peer_inconsistent_reasoning", "peer_zero_answer_tokens", "peer_consistent_reasoning"}:
+            usage["completion_tokens_details"] = {"reasoning_tokens": {
+                "peer_inconsistent_reasoning": 128, "peer_zero_answer_tokens": 2,
+                "peer_consistent_reasoning": 1}[behavior]}
         group = "other-pool" if behavior == "different_pool" and who == "peer" else MODEL_POOL
         if behavior != "missing_pool":
             headers["x-litellm-model-group"] = group
@@ -325,13 +330,16 @@ const check=bootstrap.checks.find(c=>c.id==='gateway_policy');
 const markup=renderTestCard(check,config);
 assert.match(markup,/gateway_policy_users/);
 assert.match(markup,/value="isolated_fresh_single_counter" selected/);
+assert.match(markup,/name="gateway_policy_named_reservations_confirmed"/);
 const values=new FormData();values.set('gateway_policy_rendered','1');
 values.set('gateway_policy_users','limited, 6, 2, low\npeer, 8, 8, high');
 values.set('gateway_policy_window_state','isolated_fresh_single_counter');
+values.set('gateway_policy_named_reservations_confirmed','false');
 const changed=configureGatewayPolicy(config,values);
 assert.equal(changed.gateway_policy.users[0].requests,6);
 assert.equal(changed.gateway_policy.model_rpm,10);
 assert.equal(changed.gateway_policy.window_state,'isolated_fresh_single_counter');
+assert.equal(changed.gateway_policy.named_reservations_confirmed,false);
 const result=renderGatewayPolicyResults(policy);
 assert.match(result,/limited/);assert.match(result,/observed/);
 assert.match(result,/Actual input tokens/);assert.doesNotMatch(result,/limited-secret/);

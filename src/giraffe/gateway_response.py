@@ -6,6 +6,20 @@ from .gateway_json import parse_gateway_json
 from .models import GatewayResponseEvidence
 
 
+_DYNAMIC_FIELDS = (r", Rate limit type: (?P<unit>requests|tokens), "
+                   r"Model TPM: (?P<tpm>not configured|[1-9][0-9]{0,11}), "
+                   r"Model RPM: (?P<rpm>[0-9]{1,12}), Remaining: 0")
+_PRIORITY_REJECTION = re.compile(
+    r"Priority-based rate limit exceeded\. Model: (?P<model>[^,\r\n]{1,256}), "
+    r"Priority: (?P<tier>[^,\r\n]{1,64})" + _DYNAMIC_FIELDS
+    + r"(?P<saturation>, Model saturation: [0-9]{1,3}\.[0-9]%)"
+)
+_CAPACITY_REJECTION = re.compile(
+    r"Model capacity reached for (?P<model>[^,\r\n]{1,256})\. "
+    r"Priority: (?P<tier>[^,\r\n]{1,64})" + _DYNAMIC_FIELDS
+)
+
+
 def _model_group(value):
     if (isinstance(value, str) and 0 < len(value) <= 256 and value.isprintable()
             and "," not in value and value == value.strip()):
@@ -88,28 +102,23 @@ def response_evidence(status, body=b"", headers=None, *, declared_priority=None,
         evidence.error_kind, evidence.policy_rejection = "rate_limit", "key_rpm"
         evidence.rate_limit_unit = "requests"
         evidence.request_limit, evidence.request_remaining = int(key[2]), int(key[3])
-    elif message.startswith(("Priority-based rate limit exceeded. Model: ", "Model capacity reached for ")):
-        unit = re.search(r", Rate limit type: (requests|tokens),", message)
-        rpm = re.search(r", Model RPM: ([0-9]{1,12}), Remaining: 0(?=,|$)", message)
-        if not unit or not rpm:
+    elif match := _PRIORITY_REJECTION.fullmatch(message) or _CAPACITY_REJECTION.fullmatch(message):
+        if headers.get("rate_limit_type") not in (None, match["unit"]):
             return evidence
         evidence.error_kind = "rate_limit"
-        evidence.policy_rejection = "priority_pool" if message.startswith("Priority-based") else "model_capacity"
-        evidence.rate_limit_unit, evidence.model_rpm = unit[1], int(rpm[1])
-        model = re.match(r"Priority-based rate limit exceeded\. Model: ([^,]{1,256}), Priority: ", message)
-        if model and no_reported_fallback and headers.get("x-litellm-model-group") in (None, model[1]):
-            evidence._priority_model_group = _model_group(model[1])
+        evidence.policy_rejection = "priority_pool" if match.re is _PRIORITY_REJECTION else "model_capacity"
+        evidence.rate_limit_unit, evidence.model_rpm = match["unit"], int(match["rpm"])
+        if (match.re is _PRIORITY_REJECTION and no_reported_fallback
+                and headers.get("x-litellm-model-group") in (None, match["model"])):
+            evidence._priority_model_group = _model_group(match["model"])
         if declared_priority:
-            tier_match = re.search(r", Priority: ([^,\r\n]{1,64}),", message)
-            if tier_match:
-                matches = tier_match[1] == declared_priority
-                evidence.priority_matches = matches if evidence.priority_matches is None else matches and evidence.priority_matches
-        tpm_field = message[unit.end():rpm.start()]
-        evidence._model_tpm_unconfigured = tpm_field == " Model TPM: not configured"
-        if tpm := re.fullmatch(r" Model TPM: ([1-9][0-9]{0,11})", tpm_field):
-            evidence._model_tpm = int(tpm[1])
+            evidence.priority_matches = (match["tier"] == declared_priority
+                                         and evidence.priority_matches is not False)
+        evidence._model_tpm_unconfigured = match["tpm"] == "not configured"
+        if not evidence._model_tpm_unconfigured:
+            evidence._model_tpm = int(match["tpm"])
         evidence._reported_saturation, evidence._saturation_bounds = _saturation_evidence(
-            message[rpm.end():], headers.get("x-litellm-saturation"))
+            match.groupdict().get("saturation", ""), headers.get("x-litellm-saturation"))
         if evidence._reported_saturation:
             evidence.saturation_percent = float(min(evidence._reported_saturation, key=lambda value: value.as_tuple().exponent))
     return evidence
