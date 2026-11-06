@@ -577,12 +577,77 @@ async def test_duration_remedy_covers_restart_and_attribution(monkeypatch, local
     assert "at least 5 seconds" in check.summary
 
 
+@pytest.mark.parametrize("restart,cap,minimum", [(False, 3.9, 5), (True, 5.9, 7)])
+async def test_duration_remedy_includes_streamed_compatibility(monkeypatch, local_tokenizer, restart, cap, minimum):
+    for ref in ("ALICE", "BOB", "OBSERVER"):
+        monkeypatch.setenv(ref, "secret-" + ref)
+    rows = []
+
+    async def handler(request):
+        if request.method == "GET":
+            if request.url.path == "/v1/models":
+                await asyncio.sleep(2.27)
+                return httpx.Response(200)
+            return spend_page(request, rows) if request.url.path == "/spend/logs/v2" else httpx.Response(404)
+        body = json.loads(request.content)
+        if marker := request.headers.get("x-litellm-trace-id"):
+            key = request.headers["authorization"].removeprefix("Bearer ")
+            rows.append({"request_id": str(len(rows)), "session_id": marker,
+                "metadata": {"spend_logs_metadata": json.loads(request.headers["x-litellm-spend-logs-metadata"])},
+                "api_key": hashlib.sha256(key.encode()).hexdigest(), "prompt_tokens": 3,
+                "completion_tokens": 5, "total_tokens": 8, "status": "success"})
+        delay = .9
+        if restart:
+            delay = .88 if marker or body.get("max_tokens") == 1 else .03
+        await asyncio.sleep(delay)
+        return httpx.Response(200, content=(b'data: {"choices":[{"delta":{"content":"OK"}}]}\n\n'
+            b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+            b'data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":5}}\n\ndata: [DONE]\n\n'))
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
+    cfg = config(stream=True, request_timeout_seconds=1, readiness_timeout_seconds=2.4)
+    if restart:
+        cfg.restart_target = "proxy"
+        cfg.targets[0].restart_command = [sys.executable, "-c", "import time; time.sleep(.87)"]
+    else:
+        cfg.checks = ["access", "gateway_attribution"]
+        cfg.max_requests = None
+    cfg.gateway_attribution.settle_seconds = .6
+    cfg.max_duration_seconds = cap
+
+    report = await run_suite(cfg)
+    if restart:
+        assert report.observations["targets"]["proxy"]["restart"]["status"] == "ready"
+    assert [r.scenario for r in report.requests] == ["readiness" if restart else "initial",
+                                                    "performance_evidence_probe", "gateway_attribution", "gateway_attribution"]
+    check = next(item for item in report.checks if item.id == "gateway_attribution")
+    assert check.metrics["reason_code"] == "time_limited"
+    assert check.remediation == {"action": "set_limit", "limit": "max_duration", "minimum": minimum}
+
+
+@pytest.mark.parametrize("cap,eligible", [(None, True), (2, False), (3, True)])
+def test_shared_compatibility_allowance_respects_quota_after_initial_request(cap, eligible):
+    cfg = config(stream=True)
+    cfg.checks = ["access", "gateway_attribution"]
+    cfg.max_requests = cap
+    planned = request_plan(cfg)
+    assert any(item["id"] == "performance_evidence_probe" for item in planned["time_timeline"]) is eligible
+
+    access_only = request_plan(cfg.model_copy(update={"checks": ["access"]}))
+    assert [item["id"] for item in access_only["time_timeline"]] == ["initial"]
+    cfg.targets[0].gateway = None
+    unsupported = request_plan(cfg)
+    assert [item["id"] for item in unsupported["time_timeline"]] == ["initial"]
+
+
 @pytest.mark.parametrize("overlap", [False, True])
 def test_duration_plan_keeps_attribution_after_all_shared_work(overlap):
     from tests.test_run_limits_phase4_planning import observations
 
     cfg = config()
     cfg.checks = ["correctness", "gateway_attribution"]
+    cfg.max_requests = None
     cfg.gateway_attribution.settle_seconds = 1
     cfg.metrics_timeout_seconds = .2
     cfg.overlap_models = overlap
@@ -597,7 +662,8 @@ def test_duration_plan_keeps_attribution_after_all_shared_work(overlap):
     preflight = next(item for item in plan["time_components"] if item["id"] == "gateway_attribution_preflight")
     assert preflight["target"] == "proxy" and preflight["high_seconds"] == .2
     assert [(item["target"], item["id"]) for item in plan["time_timeline"]] == [
-        ("proxy", "correctness"), ("second", "correctness"), ("proxy", "gateway_attribution_preflight"),
+        ("proxy", "performance_evidence_probe"), ("proxy", "correctness"),
+        ("second", "performance_evidence_probe"), ("second", "correctness"), ("proxy", "gateway_attribution_preflight"),
         ("proxy", "gateway_attribution"), ("proxy", "gateway_attribution_settle"),
     ]
     warning = next(item for item in plan["time_warnings"] if item["kind"] == "incomplete_coverage")

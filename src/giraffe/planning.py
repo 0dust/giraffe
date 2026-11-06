@@ -16,6 +16,7 @@ from giraffe.fixtures import builtin_fixtures
 from giraffe.gateway_attribution import (POLL_FRACTIONS, configured_probe_count,
                                          deferred_for_shared_targets, reader_preflight_bound)
 from giraffe.concurrent_load import prompt_overhead
+from giraffe.identities import gateway_identities_only
 from giraffe.logprob_workload import corpus_width, sample_count
 from giraffe.load_test import context_window, calibration_keys, load_time_plan, minimum_reservation, test_points, point_shapes, settings_sets, saved_shape_warnings
 from giraffe.models import CATALOGUE_NAMES, CHECK_NAMES, CHECK_OPTION_FIELDS, CORE_CHECKS, MAX_PLANNED_ARRIVALS, ConfigDraft, RunConfig, required_concurrency
@@ -26,6 +27,20 @@ from giraffe.tool_checks import resolved_tool_fixtures, resolved_tool_modes
 
 def _target_count(row, target):
     return row.get("target_request_counts", {}).get(target, row["requests_per_target"])
+
+
+def _request_quotas(config):
+    if config.max_requests is None:
+        return {target.name: None for target in config.targets}
+    base, extra = divmod(config.max_requests, len(config.targets))
+    return {target.name: base + (index < extra) for index, target in enumerate(config.targets)}
+
+
+def token_evidence_request_reserve(rows):
+    # Optional evidence probes must leave room for finite shared work, including
+    # bounded tool conversations that are excluded from the known request total.
+    return sum(row["requests_per_target"] or row.get("known_scheduled_requests", 0)
+               for row in rows if row["id"] != "gateway_attribution")
 
 
 def _warning_title(row):
@@ -62,6 +77,10 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
     observation_notes = []
     duration_estimates, duration_runs = {}, {}
     selected = set(config.checks)
+    quotas = _request_quotas(config)
+    evidence_reserve = token_evidence_request_reserve(rows)
+    shared_attribution = (not gateway_identities_only(selected)
+                          and any(configured_probe_count(config, target) for target in config.targets))
     defer_attribution = deferred_for_shared_targets(config)
     attribution_steps = {"gateway_attribution", "gateway_attribution_preflight", "gateway_attribution_settle"}
     requirements = required_concurrency(config)
@@ -395,9 +414,28 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
         ordered = [row for row in ordered if row["id"] not in {"pack_control", "pack_loaded"}]
         after_context = next(index for index, row in enumerate(ordered) if row["id"] == "context") + 1
         ordered[after_context:after_context] = pack_rows
+    has_initial = any(row["id"] == "initial" for row in ordered)
     for target in config.targets:
         has_observations = bool((observations or {}).get(target.name))
-        restarting = config.restart_target == target.name and bool(target.restart_command)
+        restart_requested = config.restart_target == target.name
+        restarting = restart_requested and bool(target.restart_command)
+        initial_count = int(has_initial and not restarting)
+        if restarting:
+            setup(target.name, "restart_hook", "Restart hook", "request_timeout_seconds", config.request_timeout_seconds)
+            # Health polling and its inference probe share this timeout.
+            setup(target.name, "restart_readiness", "Restart readiness", "readiness_timeout_seconds",
+                  config.readiness_timeout_seconds)
+        elif initial_count:
+            setup(target.name, "initial", "Initial connection allowance", "test_options.access.request_timeout_seconds"
+                  if "access" in selected else "test_options.serving.request_timeout_seconds",
+                  config.effective_initial()["request_timeout_seconds"])
+        if config.stream and (restarting or (shared_attribution and not restart_requested)):
+            # The ordinary initial request consumes quota; readiness is exempt.
+            # Optional streamed evidence uses spare quota and shares one timeout across retries.
+            quota = quotas[target.name]
+            if quota is None or quota - initial_count > max(1, evidence_reserve - initial_count):
+                setup(target.name, "performance_evidence_probe", "Streamed token and usage compatibility",
+                      "request_timeout_seconds", config.request_timeout_seconds)
         for row in ordered:
             name = row["id"]
             count = _target_count(row, target.name)
@@ -411,18 +449,7 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
                      "recovery_prime": "recovery", "recovery_baseline": "recovery",
                      "limits.stop_control": "cancellation", "backend_cancellation": "cancellation",
                      "sustained": "recovery"}.get(name, name)
-            if name == "initial":
-                if not restarting:
-                    setup(target.name, name, "Initial connection allowance", "test_options.access.request_timeout_seconds"
-                          if "access" in selected else "test_options.serving.request_timeout_seconds",
-                          config.effective_initial()["request_timeout_seconds"])
-                continue
-            if name == "restart_readiness":
-                if restarting:
-                    setup(target.name, "restart_hook", "Restart hook", "request_timeout_seconds",
-                          config.request_timeout_seconds)
-                    # Health polling and its inference probe share this timeout.
-                    setup(target.name, name, row["title"], "readiness_timeout_seconds", config.readiness_timeout_seconds)
+            if name in {"initial", "restart_readiness"}:
                 continue
             if name == "gateway_attribution":
                 settings = config.gateway_attribution
@@ -906,12 +933,7 @@ def request_plan(config: RunConfig | ConfigDraft, *,
     warnings: list[str] = []
     target_count = len(config.targets)
     attribution_counts = {target.name: configured_probe_count(config, target) for target in config.targets}
-    if config.max_requests is None:
-        quotas = {target.name: None for target in config.targets}
-    else:
-        base, extra = divmod(config.max_requests, target_count)
-        quotas = {target.name: base + (index < extra)
-                  for index, target in enumerate(config.targets)}
+    quotas = _request_quotas(config)
     concurrency_warnings = config.concurrency_notices()
     capacity_warnings = []
     if "capacity" in selected:

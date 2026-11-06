@@ -193,8 +193,13 @@ def test_scheduled_user_timing_requires_comparable_total_generation(monkeypatch,
         assert len(delivery) == 2 and all(row["current"] == row["baseline"] for row in delivery)
 
 
-@pytest.mark.parametrize(("swap_generation", "expected"), [(False, "fail"), (True, "inconclusive")])
-def test_scheduled_stream_gap_qualifies_its_own_generation_samples(monkeypatch, local_tokenizer, swap_generation, expected):
+@pytest.mark.parametrize(("change", "expected_warning"), [
+    ("timing", None), ("generation", "output_work_changed"),
+    ("fixture", "requested_work_changed"), ("mix", "request_mix_changed"),
+])
+def test_scheduled_stream_gap_qualifies_its_own_samples(monkeypatch, local_tokenizer, tmp_path, change, expected_warning):
+    import json
+
     from giraffe import runner
     from giraffe.reporting import compare_baseline
     from tests.test_multi_user import settings
@@ -202,8 +207,14 @@ def test_scheduled_stream_gap_qualifies_its_own_generation_samples(monkeypatch, 
     from tests.test_review26_phase4_accuracy import run_virtual
     from tests.test_runner import FakeClient
 
+    path = tmp_path / "fixtures.json"
+    path.write_text(json.dumps([
+        {"fixture_id": f"fixture-{letter}", "scorer": "none", "max_tokens": 32,
+         "messages": [{"role": "user", "content": letter * 128}]}
+        for letter in "ab"
+    ]))
     cfg = settings(levels=[2], scenarios=["arrivals"], duration_seconds=1, profile=PROFILE,
-                   arrivals={"requests_per_second": 8})
+                   arrivals={"requests_per_second": 8}).model_copy(update={"custom_fixtures": str(path)})
 
     class Observed(FakeClient):
         changed = False
@@ -212,8 +223,11 @@ def test_scheduled_stream_gap_qualifies_its_own_generation_samples(monkeypatch, 
         async def execute(self, spec, **kwargs):
             record = await super().execute(spec, **kwargs)
             if "multi_user" in spec.check_ids:
-                has_gap = bool(spec.workload["request_sequence"] % 2)
-                with_reasoning = has_gap if self.changed and swap_generation else not has_gap
+                sequence = spec.workload["request_sequence"]
+                has_gap = spec.fixture_id == ("fixture-b" if self.changed and change in {"fixture", "mix"} else "fixture-a")
+                if change == "mix" and sequence in {1, 2}:
+                    has_gap = not has_gap
+                with_reasoning = change == "generation" and has_gap == self.changed
                 record.completion_tokens = 14 if with_reasoning else 2
                 record.reasoning_tokens = record.completion_tokens - 2
                 if has_gap:
@@ -237,11 +251,58 @@ def test_scheduled_stream_gap_qualifies_its_own_generation_samples(monkeypatch, 
     gaps = [row for row in comparisons if row["metric"] == "max_stream_gap_ms"]
     assert len(gaps) == 2
     for row in gaps:
+        expected = "inconclusive" if expected_warning else "fail"
         assert (row["current"], row["baseline"], row["status"]) == (18, 2, expected)
+        assert [warning["code"] for warning in row["warnings"]] == ([expected_warning] if expected_warning else [])
         assert row["current_samples"] == 4
         assert row["evidence_ids"] == [record.id for record in current.requests
             if record.workload.get("user_id") == row["user_id"] and record.max_stream_gap_ms is not None]
     assert {row["status"] for row in comparisons if row["metric"] == "latency_ms"} == {"pass"}
+
+
+def test_scheduled_user_timing_qualifies_median_total_generation(monkeypatch, local_tokenizer):
+    from giraffe import runner
+    from giraffe.reporting import compare_baseline
+    from tests.test_multi_user import settings
+    from tests.test_multi_user_scenarios import PROFILE
+    from tests.test_review26_phase4_accuracy import run_virtual
+    from tests.test_runner import FakeClient
+
+    cfg = settings(levels=[2], scenarios=["arrivals"], duration_seconds=1, profile=PROFILE,
+                   arrivals={"requests_per_second": 15}, pass_criteria={"max_completion_ms": 40})
+
+    class Observed(FakeClient):
+        delay = .02
+        short_samples = 8
+
+        async def execute(self, spec, **kwargs):
+            record = await super().execute(spec, **kwargs)
+            if "multi_user" in spec.check_ids:
+                record.completion_tokens = 2 if spec.workload["request_sequence"] <= self.short_samples else 14
+                record.reasoning_tokens = record.completion_tokens - 2
+            return record
+
+    async def replay():
+        baseline = await runner.run_suite(cfg)
+        Observed.delay = .06
+        Observed.short_samples = 7
+        return await runner.run_suite(cfg), baseline
+
+    monkeypatch.setattr(runner, "LLMClient", Observed)
+    current, baseline = run_virtual(monkeypatch, replay())
+    compared = compare_baseline(current, baseline)
+    assert compared.baseline["status"] == "inconclusive"
+    rows = compared.baseline["targets"][0]["comparisons"]
+    completion = [row for row in rows if row["metric"] == "latency_ms"]
+    acceptance = [row for row in rows if row["metric"] == "user_acceptance"]
+    delivery = [row for row in rows if row["metric"] == "shared_window_output_tokens_per_second"]
+    assert len(completion) == len(acceptance) == len(delivery) == 2
+    for row in completion:
+        assert (row["current"], row["baseline"]) == pytest.approx((60, 20))
+        assert row["status"] == "inconclusive"
+        assert [warning["code"] for warning in row["warnings"]] == ["output_work_changed"]
+    assert {row["status"] for row in acceptance} == {"inconclusive"}
+    assert {row["status"] for row in delivery} == {"pass"}
 
 
 def test_scheduled_user_and_capacity_windows_keep_separate_offer_ledgers():

@@ -286,12 +286,8 @@ class _Run:
         self.conditions = {}
         from .conditions import planned_conditions
         self.planned_condition_ids = {(row["target"], row["condition_id"]) for row in planned_conditions(config)}
-        from .planning import request_plan
-        # Optional evidence probes must not displace finite planned work,
-        # including bounded tool conversations that are excluded from "known".
-        self.planned_request_reserve_per_target = sum(
-            row["requests_per_target"] or row.get("known_scheduled_requests", 0)
-            for row in request_plan(config)["rows"] if row["id"] != "gateway_attribution")
+        from .planning import request_plan, token_evidence_request_reserve
+        self.planned_request_reserve_per_target = token_evidence_request_reserve(request_plan(config)["rows"])
         self.endpoint_health = {t.name: {"first_attempt_seconds": None, "last_response_seconds": None,
             "consecutive_failures": 0, "failure_request_ids": [], "abort_reason": None} for t in config.targets}
         self.target_tasks = {}
