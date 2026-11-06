@@ -347,7 +347,8 @@ def _same_load_workload(current: dict, old: dict, *, fingerprint_key: str = "wor
         (("shared_conversations", "gateway_conversations", "gateway_shared_first", "gateway_shared_targets_first",
           "policy_conversations", "policy_shared_first", "policy_shared_targets_first"),
          ("113325dd5cffa04626cc7be7ee93bc6e9be67335531288bc329b3542a155c92a",
-          "788f4c8f0b14421d5fc00f8b32c0ffcef79c04c647730767cb44b16584ed4aa4"), True),
+          "788f4c8f0b14421d5fc00f8b32c0ffcef79c04c647730767cb44b16584ed4aa4",
+          "4caab6e7a9eb457a5ceddf272112c434a97c101a2c27c3943f8a4155fb71bdb0"), True),
     )
     matches = []
     shared = fingerprint_key == "shared_workload_fixture_sha256"
@@ -1374,7 +1375,7 @@ def _compare_interference_work(current, old, user_id, current_records, old_recor
         retained_ids.extend(record.id for record in cohorts[0])
         if not complete:
             reasons.append(f"Matched {role} request evidence is incomplete.")
-        elif any(_load_work_comparison(*cohorts)) or _user_token_work_changed(*cohorts, tolerance):
+        elif _interference_role_work_changed(*cohorts, tolerance):
             reasons.append(f"Matched {role} work differs or lacks observed token evidence.")
     if not reasons:
         exposure = [_interference_exposure(evidence, records)
@@ -1383,7 +1384,51 @@ def _compare_interference_work(current, old, user_id, current_records, old_recor
             reasons.append("Matched heavy exposure per probe is missing or incomplete.")
         elif _heavy_work_per_probe_changed(exposure, tolerance):
             reasons.append("Matched heavy exposure per matched probe differs between runs.")
+        elif reason := _compare_interference_groups(
+                (current, current_records, exposure[0]), (old, old_records, exposure[1]), tolerance):
+            reasons.append(reason)
     return list(dict.fromkeys(retained_ids)), " ".join(reasons) or None
+
+
+def _interference_role_work_changed(current, old, tolerance):
+    return any(_load_work_comparison(current, old)) or _user_token_work_changed(current, old, tolerance)
+
+
+def _interference_groups(evidence, records, exposure):
+    groups = defaultdict(list)
+    for control_id, probe_id, heavy in zip(evidence["control_request_ids"], evidence["probe_request_ids"], exposure):
+        control, probe = records[control_id], records[probe_id]
+        identity = probe.workload.get("matched_work_sha256")
+        if not isinstance(identity, str) or not identity or control.workload.get("matched_work_sha256") != identity:
+            return None
+        groups[identity].append((control, probe, heavy))
+    return groups
+
+
+def _compare_interference_groups(current, old, tolerance):
+    latest, previous = _interference_groups(*current), _interference_groups(*old)
+    if latest is None or previous is None:
+        return "Matched logical short work evidence is missing or inconsistent."
+    current_count = sum(len(pairs) for pairs in latest.values())
+    old_count = sum(len(pairs) for pairs in previous.values())
+    if latest.keys() != previous.keys() or any(
+            abs(Fraction(len(pairs), current_count) - Fraction(len(previous[identity]), old_count)) > tolerance / 100
+            for identity, pairs in latest.items()):
+        return "Matched logical short work or its proportions differ between runs."
+    if len(latest) == 1:
+        return None  # The aggregate checks covered the only logical work group.
+
+    for identity, pairs in latest.items():
+        current_controls, current_probes, current_heavy = zip(*pairs)
+        old_controls, old_probes, old_heavy = zip(*previous[identity])
+        for role, cohorts in (("control", (current_controls, old_controls)), ("probe", (current_probes, old_probes))):
+            if _interference_role_work_changed(*cohorts, tolerance):
+                return f"Matched {role} work differs for the same logical short work."
+        heavy_cohorts = [[record for group in run for record in group] for run in (current_heavy, old_heavy)]
+        if (_interference_role_work_changed(*heavy_cohorts, tolerance)
+                or _heavy_work_per_probe_changed((current_heavy, old_heavy), tolerance)):
+            return "Matched heavy exposure per matched probe differs for the same logical short work."
+    return None
 
 
 def _interference_exposure(evidence, records):

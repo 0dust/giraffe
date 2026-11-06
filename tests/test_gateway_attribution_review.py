@@ -194,6 +194,61 @@ async def test_mixed_attribution_retains_known_reader_state_at_exhausted_quota(
         assert "max_requests" not in attribution.summary
 
 
+@pytest.mark.parametrize("wait_for_monitor", [False, True])
+async def test_manual_stop_during_attribution_preflight_preserves_configured_probes(
+        monkeypatch, local_tokenizer, wait_for_monitor):
+    stop = asyncio.Event()
+
+    async def observer(request, rows):
+        stop.set()
+        if wait_for_monitor:
+            await asyncio.sleep(.2)
+        return httpx.Response(404)
+
+    cfg, _, reads = setup(monkeypatch, observer)
+    cfg.checks = ["access", "gateway_attribution"]
+    cfg.max_requests = 1
+    cfg.gateway_attribution.settle_seconds = .5
+
+    report = await run_suite(cfg, stop_event=stop)
+    checks = {check.id: check for check in report.checks}
+    check = checks["gateway_attribution"]
+    assert report.abort_reason == "cancelled by user" and report.overall == "inconclusive"
+    assert checks["access"].status == "pass"
+    assert check.status == "inconclusive" and check.required
+    assert check.metrics["state"] == "unverified"
+    assert check.metrics["planned_requests"] == 2 and check.metrics["observed_requests"] == 0
+    assert check.metrics["collection_attempts"] == 0 and len(reads) == 1
+    assert "reader preflight" in check.finding_summary and "user" in check.finding_summary
+    assert "reason_code" not in check.metrics and check.remediation["action"] == "review_check"
+    assert len(report.requests) == 1 and report.requests[0].identity is None
+
+
+async def test_run_deadline_during_attribution_preflight_preserves_configured_probes(monkeypatch, local_tokenizer):
+    async def observer(request, rows):
+        # A synchronous transport delay can cross the run deadline before the monitor resumes.
+        time.sleep(.55)
+        return httpx.Response(404)
+
+    cfg, _, reads = setup(monkeypatch, observer)
+    cfg.checks = ["access", "gateway_attribution"]
+    cfg.max_duration_seconds = .5
+    cfg.request_timeout_seconds = .15
+    cfg.gateway_attribution.settle_seconds = .4
+
+    report = await run_suite(cfg)
+    checks = {check.id: check for check in report.checks}
+    check = checks["gateway_attribution"]
+    assert report.abort_reason == "maximum run duration reached" and checks["access"].status == "pass"
+    assert check.status == "inconclusive" and check.required
+    assert check.metrics["state"] == "unverified" and check.metrics["reason_code"] == "time_limited"
+    assert check.metrics["planned_requests"] == 2 and check.metrics["observed_requests"] == 0
+    assert check.metrics["collection_attempts"] == 0 and len(reads) == 1
+    assert "reader preflight" in check.finding_summary
+    assert check.remediation == {"action": "set_limit", "limit": "max_duration", "minimum": 2}
+    assert len(report.requests) == 1 and report.requests[0].identity is None
+
+
 @pytest.mark.parametrize("reader,cap", [("unsupported", 5), ("verified", 8), ("later_unsupported", 8)])
 async def test_attribution_preserves_shared_sessions_and_uses_spare_budget(monkeypatch, local_tokenizer, reader, cap):
     cfg = config(stream=True)

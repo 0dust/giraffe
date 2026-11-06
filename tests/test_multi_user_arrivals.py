@@ -275,7 +275,9 @@ def test_http_single_user_burst_overlaps_under_global_cap():
             await execute(state, cfg.targets[0], client)
         assert 2 <= endpoint.peak_active <= 3
         window, = state.observations["service"]["multi_user"]["windows"]
-        assert window["peak_in_flight"] == 3
+        observed_peak = max(sum(record.dispatch_ms <= start.dispatch_ms < record.completed_ms
+                                for record in state.records) for start in state.records)
+        assert 2 <= window["peak_in_flight"] == observed_peak <= 3
         assert window["offer_accounting"]["planned"] == 4
         assert sum(window["offer_accounting"][key] for key in
                    ("dispatched", "dropped_local", "dropped_late", "unissued", "not_offered")) == 4
@@ -372,14 +374,16 @@ def test_invalid_user_or_out_of_window_schedule_rejected(changes):
     (.06, .05, None, "unissued"), (.2, .05, None, "unissued"),
     (.2, .5, "deadline", "unissued"),
 ])
-def test_final_admission_rechecks_condition_setup_delay(monkeypatch, delay, duration, stop, expected):
+@pytest.mark.parametrize("preparation", ["spec", "condition"])
+def test_admission_classifies_delays_consistently_during_preparation(monkeypatch, delay, duration, stop, expected, preparation):
+    from giraffe import multi_user
+
     async def run():
         cfg = settings(levels=[1], scenarios=["arrivals"], duration_seconds=duration,
                        profile=PROFILE, arrivals={"requests_per_second": 1})
         state = runner._Run(cfg, None, None)
         if stop == "deadline":
             state.deadline = state.start + .15
-        condition = state._condition
         calls = []
 
         class SpyClient(FakeClient):
@@ -387,21 +391,35 @@ def test_final_admission_rechecks_condition_setup_delay(monkeypatch, delay, dura
                 calls.append(spec.workload["offer_index"])
                 return await super().execute(spec, **kwargs)
 
-        def delayed(*args, **kwargs):
-            value = condition(*args, **kwargs)
-            if kwargs.get("request_parameters") is not None:
-                asyncio.get_running_loop().now += delay
-            return value
+        if preparation == "spec":
+            work_hash = multi_user._matched_work_sha256
 
-        monkeypatch.setattr(state, "_condition", delayed)
+            def delayed(*args, **kwargs):
+                value = work_hash(*args, **kwargs)
+                asyncio.get_running_loop().now += delay
+                return value
+
+            monkeypatch.setattr(multi_user, "_matched_work_sha256", delayed)
+        else:
+            condition = state._condition
+
+            def delayed(*args, **kwargs):
+                value = condition(*args, **kwargs)
+                if kwargs.get("request_parameters") is not None:
+                    asyncio.get_running_loop().now += delay
+                return value
+
+            monkeypatch.setattr(state, "_condition", delayed)
+
         await execute(state, cfg.targets[0], SpyClient(cfg.targets[0], cfg))
         await asyncio.sleep(0)  # Run the scheduler's queued slot-release callback.
         window, = state.observations["service"]["multi_user"]["windows"]
         offer, = window["offers"]
         assert offer["outcome"] == expected
         assert offer["scheduler_lag_ms"] == pytest.approx(delay*1000)
-        assert len(calls) == len(state.records) == state.attempted == int(expected == "dispatched")
+        assert len(calls) == len(state.records) == state.attempted == window["peak_in_flight"] == int(expected == "dispatched")
         assert window["offer_accounting"][expected] == 1
+        assert state.budget_used == 1
         assert state.slots.qsize() == state.max_connections
     run_virtual(monkeypatch, run())
 
