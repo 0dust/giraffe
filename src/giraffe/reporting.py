@@ -1326,9 +1326,6 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
         saturated_runs = [label for label, run in (("Current", report), ("Baseline", baseline))
                           if _generator_saturated(run, name)]
         old_target = old_targets.get(name)
-        if (old_target is not None and "gateway_policy" in config.get("checks", [])
-                and target.get("test_identities") != old_target.get("test_identities")):
-            target_reasons.append("Gateway policy identity references differ; runs are not comparable.")
         if (old_target is not None and "gateway_attribution" in report.manifest.get("config", {}).get("checks", [])
                 and any(target.get(key) != old_target.get(key) for key in ("test_identities", "gateway"))):
             target_reasons.append("Gateway identity references or evidence configuration differs; attribution runs are not comparable.")
@@ -1367,7 +1364,11 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
             current_policy = current_check.metrics.get("gateway_policy", {})
             old_policy = next((check.metrics.get("gateway_policy", {}) for check in baseline.checks
                                if check.id == "gateway_policy" and check.target == name), {})
-            compatible = (not target_reasons and current_policy.get("version") == old_policy.get("version")
+            current_refs = target.get("test_identities") or {}
+            old_refs = (old_target or {}).get("test_identities") or {}
+            refs_match = all(current_refs.get(user["identity"]) == old_refs.get(user["identity"])
+                             for user in current_policy.get("users", []))
+            compatible = (not target_reasons and refs_match and current_policy.get("version") == old_policy.get("version")
                           and current_policy.get("settings") == old_policy.get("settings")
                           and old_policy.get("qualification") == "observed")
             for user in current_policy.get("users", []):
@@ -1382,7 +1383,7 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                     "qualification": current_policy.get("qualification"), "threshold": 0,
                     "worsening": 100 if status == "fail" else 0,
                     "reason": current_check.summary if compatible and previous else
-                              "Policy settings, summary version or qualified passing baseline do not match.",
+                              "Policy identity references, settings, summary version or qualified passing baseline do not match.",
                     "evidence_ids": user["request_ids"]})
         user_rows, user_reasons = _compare_user_delivery(report, baseline, name, target_reasons, threshold)
         rows.extend(user_rows)

@@ -133,10 +133,11 @@ async def test_unknown_window_cannot_certify_priority(monkeypatch):
 
 
 async def test_two_aliases_with_one_credential_are_unverified(monkeypatch):
-    check, _, _ = await exercise(monkeypatch, behavior="duplicate_credentials")
+    check, state, seen = await exercise(monkeypatch, behavior="duplicate_credentials")
     assert check.status == "inconclusive"
     assert check.metrics["gateway_policy"]["qualification"] == "unverified"
     assert not check.metrics["gateway_policy"]["identities_distinct"]
+    assert not state.records and not seen
 
 
 async def test_priority_cached_saturation_is_unverified(monkeypatch):
