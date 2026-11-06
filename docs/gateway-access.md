@@ -45,11 +45,12 @@ the matrix can pass.
 | HTTP 200 with a `length` finish and assistant reasoning metered at the full requested output cap | Allow |
 | HTTP 401 with a recognized LiteLLM authentication error | Deny |
 | HTTP 403 with a recognized LiteLLM model-access error | Deny |
-| Timeout, network error, 429, 5xx, redirect, unknown authentication error, reported fallback, tool call, malformed or incomplete response | Unverified |
+| Timeout, network error, 429, 5xx, redirect, unknown authentication error, reported fallback or different routed model group, tool call, malformed or incomplete response | Unverified |
 
-Recognized 401 types are `token_not_found_in_db` and `expired_key`. Generic
-`auth_error` responses remain unverified because they can indicate an
-authentication backend failure.
+Recognized 401 types are `token_not_found_in_db` and `expired_key`. An explicit
+empty identity can also qualify when LiteLLM returns its exact missing-key
+`auth_error`. Other generic `auth_error` responses remain unverified because they
+can indicate an authentication backend failure.
 Recognized 403 types are `key_model_access_denied`, `team_model_access_denied`,
 `user_model_access_denied`, `org_model_access_denied`, and
 `project_model_access_denied`. The type and any explicit error code must match

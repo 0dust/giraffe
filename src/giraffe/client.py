@@ -457,7 +457,7 @@ class LLMClient:
                 record.error = "Test identity credentials are unavailable."
                 return record
             if access_probe:
-                from .gateway_access import IDENTITY_CHANGED, credential_digest
+                from .gateway_access import IDENTITY_CHANGED, credential_digest, denial_kind, routing_issue
 
                 if credential_digest(selected_headers) != spec._gateway_access_credential_digest:
                     record.error = IDENTITY_CHANGED
@@ -825,8 +825,7 @@ class LLMClient:
                 try:
                     record.http_status = response.status_code
                     if access_probe:
-                        record._gateway_access_fallback_reported = response.headers.get(
-                            "x-litellm-attempted-fallbacks") not in (None, "0")
+                        record._gateway_access_routing_issue = routing_issue(response.headers, payload["model"])
                     if spec.identity is not None:
                         from .gateway_response import response_evidence
                         record.gateway_evidence = response_evidence(response.status_code, headers=response.headers,
@@ -837,9 +836,11 @@ class LLMClient:
                     if not 200 <= response.status_code < 300:
                         error_body = await _limited_body(response, on_body=body_received)
                         if access_probe and response.status_code in (401, 403):
-                            from .gateway_access import denial_kind
-
-                            record.gateway_evidence.error_kind = denial_kind(response.status_code, error_body)
+                            custom_header = self.config.gateway_access.auth_header
+                            anonymous = (selected_headers.keys() == {"Accept"}
+                                         and (custom_header is None or custom_header not in request.headers))
+                            record.gateway_evidence.error_kind = denial_kind(
+                                response.status_code, error_body, anonymous=anonymous)
                         elif spec.identity is not None:
                             expected_key_hash = None
                             policy = self.config.gateway_policy

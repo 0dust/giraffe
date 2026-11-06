@@ -157,6 +157,7 @@ async def test_access_plan_and_request_budget_follow_execution_order(monkeypatch
     report = await run_suite(cfg)
     assert [record.scenario for record in report.requests] == ["gateway_access"] * 2 + ["prefix_shared"] * 2 + ["prefix_independent"] * 2
     assert next(check for check in report.checks if check.id == "gateway_access").status == "pass"
+    assert report.abort_reason == "maximum request budget reached"
 
 
 def test_access_plan_counts_only_configured_aliases_by_target(monkeypatch):
@@ -627,13 +628,16 @@ async def test_access_probes_only_the_declared_model(monkeypatch):
     assert requests == [("Bearer allow-secret", payload), ("Bearer deny-secret", payload)]
 
 
-@pytest.mark.parametrize("status,count,observed", [
-    (200, "0", "allow"),
-    (200, "1", "unverified"),
-    (200, "0, 1", "unverified"),
-    (403, "1", "unverified"),
+@pytest.mark.parametrize("status,count,group,reason", [
+    (200, "0", None, "valid_completion"),
+    (200, "0", "test", "valid_completion"),
+    (200, "1", None, "fallback_reported"),
+    (200, "0, 1", None, "fallback_reported"),
+    (403, "1", None, "fallback_reported"),
+    (200, "0", "internal-backup", "model_group_mismatch"),
+    (403, None, "internal-backup", "model_group_mismatch"),
 ])
-async def test_access_cannot_qualify_response_with_reported_fallback(monkeypatch, status, count, observed):
+async def test_access_requires_evidence_for_the_declared_model_group(monkeypatch, status, count, group, reason):
     monkeypatch.setenv("ALLOW_KEY", "allow-secret")
     monkeypatch.setenv("DENY_KEY", "deny-secret")
 
@@ -647,17 +651,20 @@ async def test_access_cannot_qualify_response_with_reported_fallback(monkeypatch
         else:
             body = {"model": "upstream-model", "choices": [{
                 "message": {"role": "assistant", "content": "OK"}, "finish_reason": "stop"}]}
-        return httpx.Response(status, headers={"x-litellm-attempted-fallbacks": count}, json=body)
+        headers = {key: value for key, value in {
+            "x-litellm-attempted-fallbacks": count, "x-litellm-model-group": group}.items() if value is not None}
+        return httpx.Response(status, headers=headers, json=body)
 
     original = httpx.AsyncClient
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
-    report = await run_suite(config())
+    report = await run_suite(config(retention="all"))
     cases = next(check for check in report.checks if check.id == "gateway_access").metrics["gateway_access"]["cases"]
+    observed = "allow" if reason == "valid_completion" else "unverified"
     assert cases[0]["observed"] == observed
-    if observed == "unverified":
-        assert cases[0]["reason"] == "fallback_reported"
+    assert cases[0]["reason"] == reason
     assert cases[1]["observed"] == "deny"
     assert report.overall == ("pass" if observed == "allow" else "inconclusive")
+    assert "internal-backup" not in report.model_dump_json()
 
 
 @pytest.mark.parametrize("other_check,setup,uses_shared_options", [
@@ -783,6 +790,48 @@ async def test_access_only_counts_requests_admitted_to_transport(monkeypatch, li
     assert [event["fixture_id"] for event in events if event["event"] == "request_started"] == ["gateway-access-valid"]
 
 
+@pytest.mark.parametrize("cap", [3, 4])
+async def test_access_quota_cutoff_preserves_completed_serving_comparison(monkeypatch, cap):
+    monkeypatch.setenv("ALLOW_KEY", "allow-secret")
+    monkeypatch.setenv("DENY_KEY", "deny-secret")
+    calls = []
+
+    def handler(request):
+        if request.method != "POST":
+            return httpx.Response(404)
+        calls.append(request.headers.get("authorization"))
+        return httpx.Response(200, json={"choices": [{"message": {
+            "role": "assistant", "content": "OK"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 8, "completion_tokens": 2}})
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
+    cfg = config(retention="all", max_requests=cap, samples=2, limits={"min_samples": 2})
+    cfg.checks = ["serving", "gateway_access"]
+    baseline = await run_suite(cfg.model_copy(update={"checks": ["serving"]}))
+    current = await run_suite(cfg)
+    assert baseline.overall == "pass" and current.overall == "inconclusive"
+    assert calls == [None] * 6 + ["Bearer allow-secret"] * (cap - 3)
+    assert current.observations["request_budget_used"] == cap
+    assert current.abort_reason is None and "max_requests" in current.limits_reached
+    checks = {check.id: check for check in current.checks}
+    assert checks["serving"].status == "pass"
+    assert checks["gateway_access"].required and checks["gateway_access"].status == "inconclusive"
+    allowed, denied = checks["gateway_access"].metrics["gateway_access"]["cases"]
+    budget_exhausted = ("unverified", "request_budget_exhausted", None)
+    assert (denied["observed"], denied["reason"], denied["request_id"]) == budget_exhausted
+    if cap == 3:
+        assert (allowed["observed"], allowed["reason"], allowed["request_id"]) == budget_exhausted
+    else:
+        assert allowed["observed"] == "allow" and allowed["request_id"]
+    for report in (baseline, current):
+        for record in report.requests:
+            record.elapsed_ms = 10
+            record.first_output_ms = 5
+    comparison = compare_baseline(current, baseline).baseline["targets"][0]
+    assert any(row["check"] == "serving" and row["status"] == "pass" for row in comparison["comparisons"])
+
+
 @pytest.mark.parametrize("replacement,reason", [("allow-secret", "identity_changed"), (None, "identity_unavailable")])
 async def test_rotated_credential_does_not_observe_another_access_identity(monkeypatch, replacement, reason):
     monkeypatch.setenv("ALLOW_KEY", "allow-secret")
@@ -831,7 +880,7 @@ async def test_access_denial_rules_do_not_change_policy_evidence(monkeypatch, lo
     assert check.status == "pass"
     baseline = report.model_copy(deep=True)
     # A passing quota run saved on the immediate policy predecessor, before gateway access.
-    baseline.manifest["gateway_policy_source_sha256"] = "d064d0137e6efb4caedabd80a7f687fe8414acc22cd87870f39b0ad7613d1e19"
+    baseline.manifest["gateway_policy_source_sha256"] = "4f81244d2c774764d6d24739f966ba32c69c4f90c41c68d19fbb6fc1dafdf440"
     assert compare_baseline(report, baseline).baseline["status"] == "pass"
 
 
@@ -934,6 +983,43 @@ async def test_distinct_custom_credentials_qualify_with_anonymous_or_custom_deni
     report = await run_suite(RunConfig.model_validate(values))
     assert report.overall == "pass"
     assert sent == ["Bearer allow-secret", None if anonymous else "Bearer deny-secret"]
+
+
+@pytest.mark.parametrize("anonymous,message,param,observed", [
+    (True, "Authentication Error, No api key passed in.", None, "deny"),
+    (False, "Authentication Error, No api key passed in.", None, "unverified"),
+    (True, "Authentication Error, No api key passed in.", "authorization", "unverified"),
+    (True, "Authentication Error, authentication backend connection refused", None, "unverified"),
+])
+async def test_only_explicit_anonymous_access_qualifies_litellm_missing_key(monkeypatch, anonymous, message, param, observed):
+    monkeypatch.setenv("ALLOW_KEY", "allow-secret")
+    monkeypatch.setenv("DENY_KEY", "deny-secret")
+    monkeypatch.setenv("SHARED_KEY", "shared-secret")
+    raw = config().model_dump()
+    raw["targets"][0]["api_key_env"] = "SHARED_KEY"
+    if anonymous:
+        raw["targets"][0]["test_identities"]["denied"] = {}
+    credentials = []
+
+    def handler(request):
+        if request.method != "POST":
+            return httpx.Response(404)
+        key = request.headers.get("authorization")
+        credentials.append(key)
+        if key == "Bearer allow-secret":
+            return httpx.Response(200, json={"choices": [{
+                "message": {"role": "assistant", "content": "OK"}, "finish_reason": "stop"}]})
+        return httpx.Response(401, json={"error": {
+            "type": "auth_error", "message": message, "param": param, "code": "401"}})
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
+    report = await run_suite(RunConfig.model_validate(raw))
+    check = next(check for check in report.checks if check.id == "gateway_access")
+    denied = check.metrics["gateway_access"]["cases"][1]
+    assert credentials == ["Bearer allow-secret", None if anonymous else "Bearer deny-secret"]
+    assert denied["observed"] == observed
+    assert report.overall == ("pass" if observed == "deny" else "inconclusive")
 
 
 @pytest.mark.parametrize("auth_header,shared_gateway_key,expected_reason", [

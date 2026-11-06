@@ -89,7 +89,15 @@ def _metered_reasoning_usage(usage, record):
     ))
 
 
-def denial_kind(status, body):
+def routing_issue(headers, model):
+    if headers.get("x-litellm-attempted-fallbacks") not in (None, "0"):
+        return "fallback_reported"
+    if headers.get("x-litellm-model-group") not in (None, model):
+        return "model_group_mismatch"
+    return None
+
+
+def denial_kind(status, body, *, anonymous=False):
     """Qualify only explicit LiteLLM authentication or model-access denials."""
     from giraffe.gateway_json import parse_gateway_json
 
@@ -103,8 +111,12 @@ def denial_kind(status, body):
             or re.search(r"\b\w+Exception\b", message)
             or type(code) not in (int, str) or code not in (status, str(status))):
         return "unknown"
-    if status == 401 and error_type in {"token_not_found_in_db", "expired_key"}:
-        return "authentication"
+    if status == 401:
+        if error_type in {"token_not_found_in_db", "expired_key"}:
+            return "authentication"
+        if (anonymous and error_type == "auth_error" and error.get("param") is None
+                and message == "Authentication Error, No api key passed in."):
+            return "authentication"
     if status == 403 and error_type in {
         "key_model_access_denied", "team_model_access_denied", "user_model_access_denied",
         "org_model_access_denied", "project_model_access_denied",
@@ -120,8 +132,8 @@ def observation(record):
         return "unverified", "request_cancelled"
     if reason := _IDENTITY_FAILURE_REASONS.get(record.error):
         return "unverified", reason
-    if record._gateway_access_fallback_reported:
-        return "unverified", "fallback_reported"
+    if record._gateway_access_routing_issue:
+        return "unverified", record._gateway_access_routing_issue
     if record.status == "completed" and record.http_status == 200:
         if record.valid:
             return "allow", "valid_completion"
