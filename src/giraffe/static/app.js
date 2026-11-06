@@ -1926,8 +1926,9 @@ function renderMultiUserScenarioResults(window) {
   const links=ids=>(ids||[]).map(id=>`<button type="button" class="text-button" data-request="${escape(id)}">${escape(id)}</button>`).join(' ');
   let markup='';
   if(window.offer_accounting){
-    const counts=window.offer_accounting;
-    markup+=`<h5>Scheduled and achieved traffic</h5><p>${Object.entries(counts).map(([key,value])=>escape(human(key))+': '+number(value)).join(' · ')}. Peak in flight: ${number(window.peak_in_flight)}.</p><p class="hint">Planned = offered + not offered. Offered = dispatched + local drops + late drops + unissued. Local admission is not server queue time.</p><div class="metric-table" tabindex="0" role="region" aria-label="User offer accounting"><table><thead><tr><th>User / cohort</th><th>Scheduled / observed activation</th><th>Offer accounting</th></tr></thead><tbody>${(window.users||[]).map(user=>`<tr><th>${escape(user.user_id)} / ${escape(user.cohort)}</th><td>${ms(user.scheduled_activation_ms)} / ${ms(user.activated_ms)}</td><td>${Object.entries(user.offer_accounting||{}).map(([key,value])=>escape(human(key))+': '+number(value)).join(' · ')}</td></tr>`).join('')}</tbody></table></div>`;
+    const counts=window.offer_accounting,bursts=window.burst_offer_accounting;
+    const burstSummary=bursts?`<p>Burst offers: ${Object.entries(bursts).map(([key,value])=>escape(human(key))+': '+number(value)).join(' · ')}.</p>`:'';
+    markup+=`<h5>Scheduled and achieved traffic</h5><p>${Object.entries(counts).map(([key,value])=>escape(human(key))+': '+number(value)).join(' · ')}. Peak in flight: ${number(window.peak_in_flight)}.</p>${burstSummary}<p class="hint">Planned = offered + not offered. Offered = dispatched + local drops + late drops + unissued. Local admission is not server queue time.</p><div class="metric-table" tabindex="0" role="region" aria-label="User offer accounting"><table><thead><tr><th>User / cohort</th><th>Scheduled / observed activation</th><th>Offer accounting</th></tr></thead><tbody>${(window.users||[]).map(user=>`<tr><th>${escape(user.user_id)} / ${escape(user.cohort)}</th><td>${ms(user.scheduled_activation_ms)} / ${ms(user.activated_ms)}</td><td>${Object.entries(user.offer_accounting||{}).map(([key,value])=>escape(human(key))+': '+number(value)).join(' · ')}</td></tr>`).join('')}</tbody></table></div>`;
   }
   if(window.recovery){
     markup+=`<h5>Matched per-user recovery ${badge(window.recovery.status)}</h5><div class="metric-table" tabindex="0" role="region" aria-label="Per-user recovery"><table><thead><tr><th>User / qualification</th><th>Matched samples / slowdown</th><th>Control → lighter completion</th><th>Actual work / requests</th></tr></thead><tbody>${window.recovery.users.map(user=>`<tr><th>${escape(user.user_id)} ${badge(user.status)}<small>${escape(user.reasons.join(' '))}</small></th><td>${number(user.matched_samples)} / ${user.slowdown==null?'Unknown':number(user.slowdown,2)+'×'}</td><td>${ms(user.phases.control.completion_ms)} → ${ms(user.phases.lighter.completion_ms)}</td><td><details><summary>Work and request evidence</summary><pre>${escape(JSON.stringify(user.phases,null,2))}</pre><p>Control: ${links(user.control_request_ids)}</p><p>Sustained: ${links(user.sustained_request_ids)}</p><p>Lighter: ${links(user.lighter_request_ids)}</p></details></td></tr>`).join('')}</tbody></table></div>`;
@@ -3072,7 +3073,7 @@ function resultGuidance(report) {
 // Report navigation is scoped to this visit. Polls never override an explicit tab choice.
 let reportView={id:null,tab:null,explicit:false,wasLive:false,terminalSwitch:false,performance:null,target:null,window:null,error:'',pending:false,sequence:0,lastFetch:0};
 const reportSections=[['overview','Performance overview',null],['timing','Request timing',null],['throughput','Throughput & capacity','throughput_capacity'],['delivery','Load delivery','delivery'],['outcomes','Outcomes & quality','outcomes'],['tokens','Workload & tokens','token_accounting'],['effects','Conversations & workload effects','conversations'],['server','Server observations','server'],['baseline','Baseline comparison','baseline']];
-const comparisonSections=[['answers','Answers & correctness'],['timing','Response timing'],['delivery','Request completion'],['gateway-access-decisions','Gateway access decisions']];
+const comparisonSections=[['answers','Answers & correctness'],['timing','Response timing'],['delivery','Request completion'],['gateway-access-decisions','Gateway access decisions'],['gateway-attribution-outcomes','Gateway attribution outcomes']];
 const reportResultSections=[['comparison','Baseline comparison'],['acceptance','Pass / fail','comparison'],['load-acceptance','Tested load acceptance','comparison'],...comparisonSections.map(([id,label])=>[id,label,'comparison']),['checks','Checks & evidence'],['configuration','Run configuration'],['requests','All requests'],['resources','Peak memory (RAM)']];
 function reportRoute(hash=typeof location==='undefined'?'':location.hash) {
   const request=hash.match(/^#runs\/([^/]+)\/requests\/([^/]+)$/);
@@ -3843,6 +3844,7 @@ function comparisonOutputs(target) {
   return rows;
 }
 function comparisonChange(row) {
+  if(row.metric==='attribution_outcome')return row.status==='inconclusive'?'Not comparable':row.current===row.baseline?'Same outcome':'Outcome changed';
   if(row.metric==='policy_acceptance')return row.current===row.baseline?'Same qualification':'Qualification changed';
   if(row.current==null||row.baseline==null)return 'Not measured';
   const delta=row.current-row.baseline;
@@ -3853,12 +3855,12 @@ function comparisonChange(row) {
   return `${percent>0?'+':''}${number(percent,1)}%`;
 }
 function comparisonMetricLabel(row) {
-  return ({correctness_rate:'Correct answers',valid_completion_rate:'Completed valid responses',error_rate:'Request errors',latency_ms:'Full response time',first_output_ms:'First useful output',max_stream_gap_ms:'Longest pause per response',output_tokens_per_second:'Output rate, including initial wait',generation_tokens_per_second:'Generation pace',output_tokens:'Answer length · tokens',output_chars:'Answer length · characters'})[row.metric]||human(row.metric);
+  return ({attribution_outcome:'Attribution outcome',correctness_rate:'Correct answers',valid_completion_rate:'Completed valid responses',error_rate:'Request errors',latency_ms:'Full response time',first_output_ms:'First useful output',max_stream_gap_ms:'Longest pause per response',output_tokens_per_second:'Output rate, including initial wait',generation_tokens_per_second:'Generation pace',output_tokens:'Answer length · tokens',output_chars:'Answer length · characters'})[row.metric]||human(row.metric);
 }
 function comparisonWarnings(row) {
   return row.warnings?.length?row.warnings.map(w=>w.message):row.status==='inconclusive'?[row.reason||'Insufficient evidence to interpret this change.']:[];
 }
-function comparisonCategory(row){return row.check==='gateway_access'?'gateway-access-decisions':['correctness_rate','output_tokens','output_chars'].includes(row.metric)?'answers':['valid_completion_rate','error_rate'].includes(row.metric)?'delivery':'timing';}
+function comparisonCategory(row){if(row.metric==='attribution_outcome')return 'gateway-attribution-outcomes';return row.check==='gateway_access'?'gateway-access-decisions':['correctness_rate','output_tokens','output_chars'].includes(row.metric)?'answers':['valid_completion_rate','error_rate'].includes(row.metric)?'delivery':'timing';}
 function comparisonWarningSummary(row) {
   const notes=[];
   for(const warning of row.warnings||[]){
@@ -3878,7 +3880,7 @@ function comparisonWarningSummary(row) {
 function comparisonTable(rows) {
   return `<div class="comparison-values">${rows.map(row=>{
     const warnings=comparisonWarnings(row),shortWarnings=comparisonWarningSummary(row),commonWindow=row.aggregation==='common_window';
-    const aggregation=commonWindow?'Common window':row.aggregation==='observed'?'Policy evidence':row.aggregation==='mean'?'Rate':'Median';
+    const aggregation=commonWindow?'Common window':row.aggregation==='observed'?(row.metric==='attribution_outcome'?'Observed outcome':'Policy evidence'):row.aggregation==='mean'?'Rate':'Median';
     let label;
     if(row.aggregation==='observed')label=row.status==='fail'?'Observed failure':warnings.length?'Unverified':'Observed';
     else if(commonWindow)label=row.status==='fail'?'Observed decrease':warnings.length?'Warning':'Observed';

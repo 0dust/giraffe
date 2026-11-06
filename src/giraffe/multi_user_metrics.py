@@ -65,6 +65,9 @@ def _user_summary(user: dict[str, Any], window: dict[str, Any], records: list[Re
     completed = [r for r in attempts if r.status == "completed"]
     errors = [r for r in attempts if _error(r)]
     cancelled = [r for r in attempts if r.status == "cancelled"]
+    terminal_failures = {r.id for r in errors + cancelled}
+    unadmitted_turn = any(item.get("stopped_before_cutoff") and terminal_failures.isdisjoint(item["turns"])
+                          for item in user.get("conversations", []))
     eligible = [r for r in valid if r.dispatch_ms < end and r.completed_ms is not None and r.completed_ms <= end]
     unclassified = [r for r in valid if r.completed_ms is None]
     late = [r for r in valid if r.completed_ms is not None and r.completed_ms > end]
@@ -100,6 +103,8 @@ def _user_summary(user: dict[str, Any], window: dict[str, Any], records: list[Re
         incomplete.append("The common measurement window was not completed.")
     if window.get("drain_reason") or cancelled or missing_terminal:
         incomplete.append("Some admitted work has incomplete terminal coverage.")
+    if unadmitted_turn:
+        incomplete.append("Some required conversation turns were not admitted before the window closed.")
     reasons = []
     selected = {}
     for name, first, metric in (("max_first_answer_ms", True, "first_output_ms"),
@@ -158,7 +163,7 @@ def _user_summary(user: dict[str, Any], window: dict[str, Any], records: list[Re
             reasons.append(f"Observed request error rate exceeds {criteria.max_error_percent:g}%.")
     if criteria.min_output_tokens_per_second is not None:
         interrupted = bool(window.get("cut_short") or window.get("drain_reason")
-                           or cancelled or missing_terminal)
+                           or cancelled or missing_terminal or unadmitted_turn)
         failed = (bool(attempts) and not interrupted and rate is not None
                   and rate < criteria.min_output_tokens_per_second)
         selected["min_output_tokens_per_second"] = {
@@ -223,6 +228,7 @@ def _user_summary(user: dict[str, Any], window: dict[str, Any], records: list[Re
             "pending_wait": pending, "timing_quality": quality, "criteria": selected,
             "coverage": {"status": "unexercised" if not attempts else "partial" if coverage_reasons else "complete",
                          "reasons": coverage_reasons, "valid_samples": len(valid),
+                         "unadmitted_conversation_turn": unadmitted_turn,
                          "required_samples": criteria.min_samples,
                          "missing_first_answer_count": sum(value is None for value in ready_first),
                          "missing_completion_count": sum(value is None for value in ready_completion),
@@ -240,15 +246,18 @@ def _variable(distribution: dict | None) -> bool:
     return len({value for value, weight in zip(values, weights) if weight > 0}) > 1
 
 
+def _input_shape_floors(observation, output):
+    variant = "short_answer" if output == "short" else "long_output"
+    return {item["size"]: item["input_tokens"] for item in observation.get("calibrations", [])
+            if item.get("variant") == variant and item.get("status") == "calibrated"
+            and item.get("reason_code") == "minimum_prompt_length"
+            and item.get("token_count_scope") != "builtin_reference" and item.get("input_tokens") is not None}
+
+
 def _input_shape(observation, settings, profile, records):
     from .load_test import input_qualification
     size, output = profile.split("_")
-    variant = "short_answer" if output == "short" else "long_output"
-    floors = {item["size"]: item["input_tokens"] for item in observation.get("calibrations", [])
-              if item.get("variant") == variant and item.get("status") == "calibrated"
-              and item.get("reason_code") == "minimum_prompt_length"
-              and item.get("token_count_scope") != "builtin_reference" and item.get("input_tokens") is not None}
-    return input_qualification(settings, size, records, floors=floors)
+    return input_qualification(settings, size, records, floors=_input_shape_floors(observation, output))
 
 
 def _fairness(observation, window, users, records, criteria, health, lag, timing_threshold):
@@ -304,6 +313,8 @@ def _fairness(observation, window, users, records, criteria, health, lag, timing
             notes.append(f"Only {len(samples)} valid in-window samples; {criteria.min_samples} required.")
         if user["outcomes"]["errors"] or user["outcomes"]["cancelled"] or user["outcomes"]["missing_terminal"]:
             notes.append("Failed or incomplete requests prevent an equal-work comparison.")
+        if user["coverage"]["unadmitted_conversation_turn"]:
+            notes.append("Unadmitted conversation turns prevent an equal-work comparison.")
         if any(r.input_tokens is None or r.output_tokens is None for r in work):
             notes.append("Input or output usage is missing.")
         if any(r.finish_reason == "stop" and r.output_tokens is not None
@@ -365,13 +376,15 @@ def _fairness(observation, window, users, records, criteria, health, lag, timing
 
 
 def _cancellation(window, records, criteria, health, lag, timing_threshold, delays):
-    selected = [r for r in records if r.workload.get("cancellation_role") == "selected"]
-    cancelled = [r for r in selected if r.status == "cancelled" and r.intentional
+    triggered = [r for r in records if r.workload.get("cancellation_role") == "selected"
+                 and r.status == "cancelled" and r.intentional and r.termination_reason == "generation_chunk_limit"
+                 and r.generation_chunks > 0 and r.finish_reason is None
                  and r.client_cancelled_ms is not None and r.client_cancelled_at_ns is not None
-                 and r.timing_start_ms is not None and r.finish_reason is None and r.answer_chunks > 0
-                 and r.first_output_ms is not None and r.first_output_ms <= r.client_cancelled_ms <= r.elapsed_ms
-                 and qualify([r], health, timing_threshold, ("latency_ms",), legacy_max_lag_ms=lag)["status"] == "qualified"]
-    peer_ids, followups = set(), []
+                 and 0 <= r.client_cancelled_ms <= r.elapsed_ms]
+    cancelled = [r for r in triggered if r.timing_start_ms is not None
+                 and qualify([r], health, timing_threshold, ("latency_ms",),
+                             legacy_max_lag_ms=lag)["status"] == "qualified"]
+    peer_ids = set()
     for record in cancelled:
         at = record.timing_start_ms + record.client_cancelled_ms
         for peer in records:
@@ -382,10 +395,10 @@ def _cancellation(window, records, criteria, health, lag, timing_threshold, dela
                     and qualify([peer], health, timing_threshold, ("latency_ms", "max_stream_gap_ms"),
                                 legacy_max_lag_ms=lag)["status"] == "qualified"):
                 peer_ids.add(peer.id)
-        followups.extend(r for r in records if r.workload.get("cancellation_role") == "followup"
-                         and r.workload.get("user_id") == window["selected_user_id"]
-                         and record.completed_ms is not None and r.dispatch_ms is not None
-                         and r.dispatch_ms >= record.completed_ms)
+    followups = [r for r in records if r.workload.get("cancellation_role") == "followup"
+                 and r.workload.get("user_id") == window["selected_user_id"] and r.dispatch_ms is not None
+                 and any(record.completed_ms is not None and r.dispatch_ms >= record.completed_ms
+                         for record in triggered)]
 
     def observation(ok, ids, reason, *, failed=False):
         return {"status": "fail" if failed else "pass" if ok else "inconclusive",
@@ -420,11 +433,18 @@ def _comparable_uncached_input(control, probe, tolerance):
 
 def _interference(observation, window, control, user_records, criteria, health, lag, timing_threshold, delays):
     """Compare the same logical short work, retaining the exposure that exercised it."""
+    from .load_test import input_class_bounds
+
     settings = observation.get("settings", {})
     tolerance = settings.get("fairness_tolerance_percent", 10) / 100
     limit = settings.get("noisy_neighbors", {}).get("max_slowdown")
     load_settings = LoadTestSettings(profile=settings.get("profile", {}),
                                     pass_criteria={"min_valid_responses": criteria.min_samples})
+    heavy_input, heavy_output = window["heavy_profile"].split("_")
+    min_uncached = None
+    if heavy_input == "long":
+        min_uncached, _ = input_class_bounds(load_settings, heavy_input,
+                                             floors=_input_shape_floors(observation, heavy_output))
     heavy = [r for uid in window["heavy_user_ids"] for r in user_records.get((window["id"], uid), [])]
     reasons = []
     for phase in (control, window):
@@ -490,10 +510,14 @@ def _interference(observation, window, control, user_records, criteria, health, 
                 overlap_span = span if window["heavy_profile"].endswith("_long") else short_span
                 if not _overlap(overlap_span, heavy_span, delays):
                     continue
-                if (window["heavy_profile"].startswith("long_") and competitor.input_tokens
-                        and (competitor.cached_prompt_tokens or 0) > competitor.input_tokens / 2):
-                    excluded.add("More than half the long competitor input was cached.")
-                    continue
+                if min_uncached is not None and competitor.cached_prompt_tokens is not None:
+                    total, cached = competitor.input_tokens, competitor.cached_prompt_tokens
+                    if total is None or not 0 <= cached <= total or total - cached < min_uncached:
+                        excluded.add("Reported cache usage does not establish long uncached competitor input.")
+                        continue
+                    if cached > total / 2:
+                        excluded.add("More than half the long competitor input was cached.")
+                        continue
                 matches.append(competitor)
             if matches:
                 pairs.append((baseline, probe))

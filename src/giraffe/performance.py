@@ -501,7 +501,10 @@ def _window_summary(report, target, window, records, series, observation):
     put("sampled_concurrency", list(dict.fromkeys(row["intended_concurrency"] for row in transitions if row.get("intended_concurrency") is not None and row.get("kind") != "drain")) or None,
         "Sampled concurrency", "requests", "Recorded schedule transitions only")
     rates = list(dict.fromkeys(row["intended_rate_rps"] for row in transitions if row.get("intended_rate_rps") is not None and row.get("kind") != "drain"))
-    put("offered_rate", rates or None, "Offered / scheduled arrival rate", "req/s", "Recorded arrival scheduler transitions; distinct from intended concurrency", state="measured" if rates else "not_applicable")
+    with_bursts = any(row.get("pattern") == "steady_with_bursts" for row in transitions)
+    put("offered_rate", rates or None, "Scheduled steady arrival rate" if with_bursts else "Offered / scheduled arrival rate",
+        "req/s", "Burst offers are counted separately in the Multi-user results" if with_bursts else
+        "Recorded arrival scheduler transitions; distinct from intended concurrency", state="measured" if rates else "not_applicable")
     _bind_existing(report, target, window, population, observation, put)
     _server_rows(report, target, window, observation, put, metrics)
     _baseline_rows(report, target, window, population, put)
@@ -565,7 +568,15 @@ def _bind_existing(report, target, window, records, observation, put):
         delivery = [{key: s.get(key) for key in ("stage_index", "scheduled", "started", "dispatched", "dropped_local", "dropped_late", "local_drops", "late_drops", "not_offered", "reasons")}
                     for s in stages]
     elif user_window.get("offer_accounting") and (window["kind"] == "full" or not window.get("includes_drain")):
-        delivery = [{"id": cohort, **user_window["offer_accounting"]}]
+        offers = user_window.get("offers")
+        if window["kind"] == "stage" and offers is not None:
+            from .multi_user import _offer_counts
+            left, right = window["start_ms"], window["end_ms"]
+            counts = _offer_counts([offer for offer in offers if offer.get("scheduled_ms") is not None
+                                    and left <= offer["scheduled_ms"] < right])
+        else:
+            counts = user_window["offer_accounting"]
+        delivery = [{"id": cohort, **counts}]
     else:
         delivery = None
     put("drops", delivery, "Local drops / late drops / not offered", "requests", "Existing scoped scheduler ledger; unsent work is not an endpoint error",
@@ -829,8 +840,9 @@ def _baseline_rows(report, target, window, records, put):
 
     # Existing comparisons already carry sample/shape/timing qualifications.
     comparisons = [r for r in entry.get("comparisons", []) if matches(r)]
+    capacity_stage_ids = {record.traffic_stage for record in records if "capacity" in record.check_ids}
     traffic = [row for index, row in enumerate(entry.get("traffic_capacity", {}).get("stages", []))
-               if index in {record.traffic_stage for record in records} and row.get("status") in {"pass", "fail"}]
+               if index in capacity_stage_ids and row.get("status") in {"pass", "fail"}]
     mapping = (("baseline_throughput", "Throughput change", {"output_tokens_per_second"}),
                ("baseline_timing", "Latency / first-output change", {"latency_ms", "first_output_ms", "max_stream_gap_ms"}),
                ("baseline_generation", "Generation pace change", {"generation_tokens_per_second"}),

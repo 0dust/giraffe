@@ -67,9 +67,11 @@ async def exercise(monkeypatch, mode="match", *, stream=True, full=False, missin
                 return spend_page(req, [*rows, {**rows[0], "request_id": "retry"}])
             if mode == "truncated":
                 return spend_page(req, rows, total_is_capped=True)
+            if mode == "one_missing":
+                return spend_page(req, rows[:1])
             if mode == "missing_advertised_row":
                 return spend_page(req, rows, total=3)
-            return spend_page(req, [*rows, *rows[:1], {"request_id": "other"}])
+            return spend_page(req, [*rows, {"request_id": "other"}])
         requests.append(req)
         marker = json.loads(req.headers["x-litellm-spend-logs-metadata"])
         key = req.headers.get("x-litellm-api-key", req.headers.get("authorization", ""))
@@ -221,6 +223,42 @@ async def test_complete_runner_reports_and_exports_safe_identity_samples(monkeyp
     assert any("identity references" in reason for reason in baseline.baseline["targets"][0]["reasons"])
 
 
+@pytest.mark.usefixtures("local_tokenizer")
+@pytest.mark.parametrize("mode,expected_status,expected_outcomes", [
+    ("match", "pass", {"alice": ("verified", "pass"), "bob": ("verified", "pass")}),
+    ("wrong_tokens", "fail", {"alice": ("mismatch", "fail"), "bob": ("mismatch", "fail")}),
+    ("one_missing", "inconclusive", {"alice": ("verified", "pass"), "bob": ("unverified", "inconclusive")}),
+])
+async def test_attribution_baseline_compares_qualified_aliases(monkeypatch, mode, expected_status, expected_outcomes):
+    from giraffe.reporting import compare_baseline
+    with monkeypatch.context() as env:
+        _, baseline, _, _, _ = await exercise(env, full=True)
+    with monkeypatch.context() as env:
+        _, report, _, _, _ = await exercise(env, mode, full=True)
+    compared = compare_baseline(report, baseline)
+    assert compared.baseline["status"] == expected_status
+    target = compared.baseline["targets"][0]
+    rows = target["comparisons"]
+    assert {row["scenario"]: (row["current"], row["status"]) for row in rows} == expected_outcomes
+    assert all(row["baseline"] == "verified" and row["baseline_samples"] == 1 for row in rows)
+    assert "collect at least" not in target["summary"]
+    serialized = json.dumps(compared.baseline)
+    assert "secret-" not in serialized and hashlib.sha256(b"secret-ALICE").hexdigest() not in serialized
+
+
+@pytest.mark.usefixtures("local_tokenizer")
+async def test_legacy_attribution_baseline_requires_a_fresh_collection(monkeypatch):
+    from giraffe.reporting import compare_baseline
+    _, report, _, _, _ = await exercise(monkeypatch, full=True)
+    legacy = report.model_copy(deep=True)
+    check = next(check for check in legacy.checks if check.id == "gateway_attribution")
+    check.metrics.pop("collection_version", None)
+    comparison = compare_baseline(report, legacy).baseline
+    assert comparison["status"] == "inconclusive"
+    rows = comparison["targets"][0]["comparisons"]
+    assert len(rows) == 2 and all("Rerun" in row["reason"] for row in rows)
+
+
 @pytest.mark.parametrize("profile,state", [(None, "unavailable"), ("other", "unsupported")])
 async def test_missing_gateway_never_sends_inference(profile, state):
     from giraffe.gateway_attribution import execute, result
@@ -264,12 +302,12 @@ async def test_reader_pages_individually_and_never_follows_redirects(monkeypatch
     def handler(req):
         seen.append(req)
         page = int(req.url.params["page"])
-        return spend_page(req, [{"page": page}], total=2)
+        return spend_page(req, [{"request_id": str(page)}], total=2)
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler), follow_redirects=False) as client:
         rows, complete = await _pages(client, "http://proxy/spend/logs/v2", "marker", max_rows=4, stop=asyncio.Event(),
                                      start_date="2026-11-06 00:00:00", end_date="2026-11-06 00:00:10")
-    assert rows == [{"page": 1}, {"page": 2}] and complete
+    assert rows == [{"request_id": "1"}, {"request_id": "2"}] and complete
     assert [req.url.params["page"] for req in seen] == ["1", "2"]
     assert all(req.url.params["session_id"] == "marker" and req.method == "GET" for req in seen)
     async with httpx.AsyncClient(transport=httpx.MockTransport(lambda req: httpx.Response(302,
@@ -290,7 +328,7 @@ async def test_reader_pages_individually_and_never_follows_redirects(monkeypatch
 ])
 async def test_reader_limits_and_malformed_pages_are_incomplete(overrides):
     from giraffe.gateway_attribution import _pages
-    transport = httpx.MockTransport(lambda req: spend_page(req, [{"row": 1}], **overrides))
+    transport = httpx.MockTransport(lambda req: spend_page(req, [{"request_id": "one"}], **overrides))
     async with httpx.AsyncClient(transport=transport) as client:
         _, complete = await _pages(client, "http://proxy/spend/logs/v2", "marker", max_rows=2, stop=asyncio.Event(),
                                   start_date="2026-11-06 00:00:00", end_date="2026-11-06 00:00:10")

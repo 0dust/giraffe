@@ -8,11 +8,14 @@ import math
 import random
 import time
 import uuid
+from collections import Counter
 from copy import deepcopy
 
 from giraffe.concurrent_load import OutputProgress, calibrate
 from giraffe.load_test import _shape_sources, build_spec
-from giraffe.models import CheckResult, LoadTestSettings, Limits, TrafficConfig, required_concurrency
+from giraffe.models import (
+    CheckResult, LoadTestSettings, Limits, TrafficConfig, _steady_offer_count, required_concurrency,
+)
 from giraffe.traffic import run_stage
 
 
@@ -237,6 +240,8 @@ async def run_window(run, target, client, settings, load_settings, calibration, 
                 except asyncio.CancelledError:
                     user["conversations"][-1]["stop_reason"] = "conversation interrupted"
                     raise
+                if item["completed_turns"] < item["planned_turns"] and not closed and time.monotonic() < cutoff:
+                    item["stopped_before_cutoff"] = True
                 if not item["turns"]:
                     user["stop_reason"] = item["stop_reason"]
                     break
@@ -314,11 +319,6 @@ async def run_window(run, target, client, settings, load_settings, calibration, 
                              reason=window["reason"])
 
 
-def _steady_offer_count(duration, activation, rate):
-    count = math.ceil((duration-activation)*rate)
-    return count - int(count > 0 and activation+(count-1)/rate >= duration)
-
-
 def _offer_plan(window, settings):
     offers = []
     recovery = window["scenario"] == "recovery"
@@ -355,10 +355,32 @@ def _offer_counts(offers):
                ("dispatched", "dropped_local", "dropped_late", "unissued", "not_offered")}}
 
 
+def _arrival_transitions(sending, activations, per_user_rate, planned_seconds):
+    start = sending["start_ms"]
+    end = min(sending["end_ms"], start + planned_seconds*1000)
+    active = activations[0]
+    left = start
+    for offset, count in sorted(activations.items()):
+        if not offset:
+            continue
+        at = start + offset*1000
+        if at >= end:
+            break
+        yield {**sending, "start_ms": left, "end_ms": at, "intended_rate_rps": active*per_user_rate}
+        left = at
+        active += count
+    if left < end:
+        yield {**sending, "start_ms": left, "end_ms": end, "intended_rate_rps": active*per_user_rate}
+
+
 async def run_arrival_window(run, target, client, settings, load_settings, calibration, window, *,
                              sources_by_profile, sequences):
     offers = window["offers"]
     users = {u["user_id"]: u for u in window["users"]}
+    activations = Counter(user["activation_seconds"] for user in users.values())
+    bursts = [offer for offer in offers if offer["origin"] == "burst"]
+    staged_arrivals = bool(bursts or any(activations))
+    per_user_rate = window["requests_per_second"]
     offered = 0
     work_counts = {}
     for offer in offers:
@@ -415,6 +437,9 @@ async def run_arrival_window(run, target, client, settings, load_settings, calib
 
         def finished(record):
             annotate(record)
+            # This schedule uses its own window ID and offer ledger.
+            record.traffic_stage = None
+            record.traffic_rate_rps = None
             offer["request_id"] = record.id
             user["request_ids"].append(record.id)
 
@@ -434,16 +459,25 @@ async def run_arrival_window(run, target, client, settings, load_settings, calib
     run.start_condition(target.name, window["id"], planned=len(offers))
     window.update(start_ms=_relative(run), end_ms=_relative(run)+window["planned_duration_seconds"]*1000,
                   planned_end_ms=_relative(run)+window["planned_duration_seconds"]*1000, reason=None)
+    transitions = run.observations[target.name].setdefault("schedule_transitions", [])
+    # The shared scheduler observes one interval. Expand it at the actual
+    # sending boundary for plans with activations or separate burst offers.
+    stage_rows = [] if staged_arrivals else transitions
     evidence = await run_stage(traffic=TrafficConfig(duration_seconds=window["planned_duration_seconds"],
-        rates=[window["requests_per_second"]], max_in_flight=required_concurrency(run.config)["by_check"]["multi_user"],
-        scheduler_lag_tolerance_ms=lag_tolerance_ms, drain_timeout_seconds=None), rate_rps=window["requests_per_second"]*window["population"],
+        rates=[per_user_rate], max_in_flight=required_concurrency(run.config)["by_check"]["multi_user"],
+        scheduler_lag_tolerance_ms=lag_tolerance_ms, drain_timeout_seconds=None),
+        rate_rps=per_user_rate*activations[0],
         stage_index=0, fixtures={}, execute=send, reserve_offer=reserve, try_acquire=run.try_acquire_slot,
         release=run.release_slot, stop_reason=stop, deadline=run.deadline, limits=Limits(),
         schedule_override=[(o["offset_seconds"], o["profile"]) for o in offers], spec_factory=build,
         check_id="multi_user", scenario=window["id"], run_start=run.start, return_evidence=True,
         on_drop=lambda: run.drop_offer(target.name, window["id"]),
-        schedule_observations=run.observations[target.name].setdefault("schedule_transitions", []),
-        schedule_stage_id=window["id"], schedule_label=window["role"], schedule_pattern="constant")
+        schedule_observations=stage_rows, schedule_stage_id=window["id"],
+        schedule_label=window["role"], schedule_pattern="steady_with_bursts" if bursts else "constant")
+    if staged_arrivals:
+        sending, drain = stage_rows
+        transitions.extend(_arrival_transitions(sending, activations, per_user_rate, window["planned_duration_seconds"]))
+        transitions.append(drain)
     start = _relative(run, evidence.started_monotonic)
     end = start + evidence.sending_seconds*1000
     for index, offer in enumerate(offers):
@@ -461,6 +495,8 @@ async def run_arrival_window(run, target, client, settings, load_settings, calib
         dispatched_requests_per_second=sum(o["dispatched"] for o in offers)/evidence.sending_seconds
             if evidence.sending_seconds else None,
         scheduler_stalls=[{"start_ms": start+a*1000, "end_ms": start+b*1000} for a, b in evidence.stalls])
+    if bursts:
+        window["burst_offer_accounting"] = _offer_counts(bursts)
     offers_by_user = {user["user_id"]: [] for user in window["users"]}
     for offer in offers:
         offers_by_user[offer["user_id"]].append(offer)
@@ -543,11 +579,10 @@ def _planned_observation(settings, *, include_offers=True):
     for window in windows:
         if window["scenario"] in {"arrivals", "recovery"} and window["phase"] == "measurement":
             arrivals = window["scenario"] == "arrivals"
-            window["scheduled_offers"] = sum(_steady_offer_count(window["planned_duration_seconds"],
-                settings.arrivals.activations.get(user["user_id"], 0) if arrivals else 0,
-                window["requests_per_second"]) for user in window["users"])
-            if arrivals:
-                window["scheduled_offers"] += sum(burst.requests for burst in settings.arrivals.bursts)
+            duration = window["planned_duration_seconds"]
+            level = window["population"]
+            window["scheduled_offers"] = (settings.arrivals.offer_count(duration, level) if arrivals else
+                _steady_offer_count(duration, 0, window["requests_per_second"])*level)
             if include_offers:
                 window["offers"] = _offer_plan(window, settings)
                 window["offer_accounting"] = _offer_counts(window["offers"])

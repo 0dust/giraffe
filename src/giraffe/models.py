@@ -1133,6 +1133,8 @@ class GatewayPolicy(Model):
         aliases = [user.identity for user in self.users]
         if len(set(aliases)) != len(aliases) or self.affected_identity not in aliases:
             raise ValueError("Policy users must be distinct and include the affected identity")
+        if not self.supported:
+            return self
         if any(user.requests > user.rpm for user in self.users if user.identity != self.affected_identity):
             raise ValueError("Peer offered request caps must stay within their declared RPM")
         if self.capability == "priority_rpm":
@@ -1266,10 +1268,21 @@ class MultiUserBurst(Model):
     spacing_seconds: float = Field(default=0, ge=0, le=MAX_STAGE_SECONDS)
 
 
+def _steady_offer_count(duration: float, activation: float, rate: float) -> int:
+    # Match the scheduler's half-open window at floating-point boundaries.
+    count = math.ceil((duration-activation)*rate)
+    return count - int(count > 0 and activation+(count-1)/rate >= duration)
+
+
 class MultiUserArrivals(Model):
     requests_per_second: float = Field(default=1, gt=0, le=1000)
     activations: dict[str, Annotated[float, Field(ge=0, le=MAX_STAGE_SECONDS)]] = Field(default_factory=dict, max_length=32)
     bursts: list[MultiUserBurst] = Field(default_factory=list, max_length=32)
+
+    def offer_count(self, duration: float, population: int) -> int:
+        steady = sum(_steady_offer_count(duration, self.activations.get(f"user-{index + 1:02d}", 0),
+                                        self.requests_per_second) for index in range(population))
+        return steady + sum(burst.requests for burst in self.bursts)
 
 
 class MultiUserRecovery(Model):
@@ -1318,7 +1331,7 @@ class MultiUser(Model):
             if any(b.at_seconds < arrivals.activations.get(b.user_id, 0)
                    or b.at_seconds + (b.requests-1)*b.spacing_seconds >= self.duration_seconds for b in arrivals.bursts):
                 raise ValueError("every burst must fall after its user activation and before the window end")
-            if math.ceil(self.duration_seconds * arrivals.requests_per_second) * max(self.levels) + sum(b.requests for b in arrivals.bursts) > MAX_PLANNED_ARRIVALS:
+            if arrivals.offer_count(self.duration_seconds, max(self.levels)) > MAX_PLANNED_ARRIVALS:
                 raise ValueError("multi-user arrival schedule exceeds the finite offer bound")
         if "recovery" in self.scenarios:
             recovery = self.recovery

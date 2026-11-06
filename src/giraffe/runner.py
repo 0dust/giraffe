@@ -1495,7 +1495,8 @@ def _pack_results(run: _Run, target: Target) -> dict:
     delays = scheduling_delay_windows(run)
     for case, spec in zip(cases, run.pack_specs, strict=True):
         loaded = [r for r in run.records if r.target == target.name and r.fixture_id == spec.fixture_id
-                  and (r.traffic_stage is not None or r.scenario == "pack_loaded" or bool(r.load_point))]
+                  and (r.scenario == "pack_loaded" or bool(r.load_point)
+                       or ("capacity" in r.check_ids and r.traffic_stage is not None))]
         stats = _stats(loaded)
         accuracy = stats["correct"] / stats["scored"] if stats["scored"] else None
         failed = accuracy is not None and accuracy < limits.min_correctness
@@ -1545,7 +1546,7 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
         records = [r for r in ordinary if check_id in r.check_ids]
         if check_id == "correctness" and run.pack_specs:
             records = [r for r in all_records if r.scenario in {"pack_control", "pack_loaded"}
-                       or r.traffic_stage is not None or bool(r.load_point)]
+                       or bool(r.load_point) or ("capacity" in r.check_ids and r.traffic_stage is not None)]
             limits = limits.model_copy(update={"min_samples": 1})
         if check_id == "capacity":
             records = [r for r in records if r.traffic_stage is not None]

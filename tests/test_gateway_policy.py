@@ -184,6 +184,9 @@ async def test_duration_cancels_work_and_releases_every_slot(monkeypatch):
 async def test_request_budget_bounds_all_identities(monkeypatch):
     from giraffe.gateway_policy import execute, result
     from tests.test_runner import FakeClient
+
+    monkeypatch.setenv("LIMITED", "limited-secret")
+    monkeypatch.setenv("PEER", "peer-secret")
     cfg = configuration().model_copy(update={"max_requests": 2})
     state = runner._Run(cfg, None, None)
     await execute(state, cfg.targets[0], FakeClient(cfg.targets[0], cfg))

@@ -25,19 +25,27 @@ async def execute(run, target, client):
     if not settings.supported:
         observation["stop_reason"] = "Selected gateway capability is unsupported."
         return
-    from .identities import identity_headers
-    try:
-        credentials = [next((value for name, value in identity_headers(target, user.identity).items()
-                             if name.lower() == settings.auth_header.lower()), None) for user in settings.users]
-        credentials = [value[7:].strip()
-                       if value and value.lower().startswith("bearer ") else value.strip() if value else None for value in credentials]
-        observation["identities_distinct"] = (all(credentials)
-                                               and len(set(credentials)) == len(credentials))
-        del credentials
-    except ValueError:
-        observation["identities_distinct"] = False
     run.plan_condition(target.name, "gateway_policy", {},
                        planned=sum(user.requests for user in settings.users))
+
+    from .identities import identity_headers
+
+    auth_header = settings.auth_header.lower()
+    try:
+        credentials = [next((value for name, value in identity_headers(target, user.identity).items()
+                             if name.lower() == auth_header), "") for user in settings.users]
+        credentials = [value[7:].strip()
+                       if value.lower().startswith("bearer ") else value.strip() for value in credentials]
+    except ValueError:
+        credentials = []
+    if not credentials or not all(credentials):
+        reason = "Required policy identity credentials are unavailable."
+        observation.update(credentials_unavailable=True, stop_reason=reason, end_ms=observation["start_ms"])
+        run.mark_unfinished(target.name, ["gateway_policy"])
+        run.finish_condition(target.name, "gateway_policy", reason=reason)
+        return
+    observation["identities_distinct"] = len(set(credentials)) == len(credentials)
+    del credentials
 
     async def user_loop(user):
         for sequence in range(user.requests):
@@ -119,6 +127,8 @@ def summarize(settings, observation, records):
         return outcome("unavailable", "Gateway policy is not configured; declare identities, policy and offered work.")
     if not settings.supported:
         return outcome("unavailable", "Selected gateway capability is unsupported.")
+    if observation.get("credentials_unavailable"):
+        return outcome("unverified", observation["stop_reason"])
     if not records:
         return outcome("unexercised", "No policy traffic was dispatched.")
     affected = [record for record in records if record.identity == settings.affected_identity]
@@ -228,4 +238,5 @@ def result(run, target):
     summary = summarize(run.config.gateway_policy, observation, records)
     return CheckResult(id="gateway_policy", title="Gateway quotas & priorities", target=target.name,
         status=summary["status"], summary=" ".join(summary["reasons"]), metrics={"gateway_policy": summary},
+        required=summary["qualification"] != "unavailable" or run.config.checks == ["gateway_policy"],
         evidence_ids=[record.id for record in records])
