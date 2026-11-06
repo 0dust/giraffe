@@ -206,7 +206,10 @@ async def run_stage(
     rate_rps: float,
     stage_index: int,
     fixtures: dict[str, list[RequestSpec]],
-    execute: Callable[[RequestSpec, Callable[[RequestRecord], None]], Awaitable[RequestRecord | None]],
+    execute: (
+        Callable[[RequestSpec, Callable[[RequestRecord], None]], Awaitable[RequestRecord | None]]
+        | Callable[[RequestSpec, Callable[[RequestRecord], None], Callable[[], bool]], Awaitable[RequestRecord | None]]
+    ),
     reserve_offer: Callable[[], bool],
     try_acquire: Callable[[], bool],
     release: Callable[[], None],
@@ -228,7 +231,6 @@ async def run_stage(
     schedule_stage_id: str | None = None,
     schedule_label: str | None = None,
     schedule_pattern: str | None = None,
-    admission_closed: asyncio.Event | None = None,
 ) -> dict:
     """Run one stage; callbacks own shared run budgets and global admission slots.
 
@@ -237,9 +239,9 @@ async def run_stage(
     calls its second argument to annotate the terminal record before persisting
     or returning it. It must finish promptly after cancellation, returning that record or
     attaching it as ``giraffe_record`` to the propagated CancelledError.
+    Explicit stages also pass an eligibility check to call before transport dispatch.
     ``on_drop`` reports reserved offers that never dispatch, including tasks
     cancelled before starting; unreserved schedule entries are not drops.
-    ``admission_closed`` signals the end of sending to requests still preparing.
     """
     if traffic.max_in_flight is None:
         raise ValueError("resolve traffic.max_in_flight against the global bound first")
@@ -302,7 +304,9 @@ async def run_stage(
 
     def missed_arrival(offset: float, now: float) -> bool:
         nonlocal discard_through
-        if (now - started_at - offset) * 1000 > traffic.scheduler_lag_tolerance_ms:
+        late = (now > started_at + offset + traffic.scheduler_lag_tolerance_ms / 1000
+                if explicit else (now - started_at - offset) * 1000 > traffic.scheduler_lag_tolerance_ms)
+        if late:
             # Discard the entire already-due backlog after an excessive stall,
             # rather than replaying it in a catch-up burst. Close Poisson
             # arrivals within the explicit tolerance are legitimate clusters;
@@ -332,8 +336,6 @@ async def run_stage(
         if sending_finished_at is None:
             now = time.monotonic()
             sending_finished_at = max(started_at, min(now, stage_cutoff)) if explicit else now
-            if admission_closed is not None:
-                admission_closed.set()
             intent.begin_drain(sending_finished_at)
         return sending_finished_at
 
@@ -387,11 +389,28 @@ async def run_stage(
             if outcome := blocked_offer(offset, ready):
                 drop(index, outcome)
                 return
-            record = await execute(spec, lambda record: annotate(index, kind, offset, lag_ms, record))
+            def annotate_record(record):
+                annotate(index, kind, offset, lag_ms, record)
+
+            refusal = None
+            if explicit:
+                def check_admission():
+                    nonlocal refusal
+                    now = time.monotonic()
+                    refusal = blocked_offer(offset, now)
+                    if refusal is not None:
+                        offer_lags_ms[index] = max(0.0, (now - started_at - offset) * 1000)
+                    return refusal is None
+
+                record = await execute(spec, annotate_record, check_admission)
+            else:
+                record = await execute(spec, annotate_record)
             if record is None:
-                refused = time.monotonic()
-                offer_lags_ms[index] = max(0.0, (refused-started_at-offset)*1000)
-                drop(index, blocked_offer(offset, refused, refused=True) or "not_offered")
+                if refusal is None:
+                    refused = time.monotonic()
+                    offer_lags_ms[index] = max(0.0, (refused-started_at-offset)*1000)
+                    refusal = blocked_offer(offset, refused, refused=True)
+                drop(index, refusal or "not_offered")
                 return
             records.append((index, record))
         except asyncio.CancelledError as exc:

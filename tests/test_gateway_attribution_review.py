@@ -255,12 +255,12 @@ async def test_stop_while_building_spend_reader_sends_no_get(monkeypatch, local_
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
-    original = gateway_attribution._client
+    original = gateway_attribution._reader_tls
 
-    def build_reader(*args):
-        reader = original(*args)
+    def load_tls(cfg):
+        verify = original(cfg)
         loop.call_soon_threadsafe(stop.set)
-        return reader
+        return verify
 
     async def observer(request, rows):
         return spend_page(request, rows)
@@ -270,7 +270,7 @@ async def test_stop_while_building_spend_reader_sends_no_get(monkeypatch, local_
         cfg.checks = ["access", "gateway_attribution"]
         cfg.max_requests = 1
     cfg.gateway_attribution.settle_seconds = .5
-    monkeypatch.setattr(gateway_attribution, "_client", build_reader)
+    monkeypatch.setattr(gateway_attribution, "_reader_tls", load_tls)
 
     report = await run_suite(cfg, stop_event=stop)
     check = next(item for item in report.checks if item.id == "gateway_attribution")
@@ -280,6 +280,31 @@ async def test_stop_while_building_spend_reader_sends_no_get(monkeypatch, local_
     assert check.metrics["collection_attempts"] == 0
     assert ("reader preflight" if preflight else "evidence collection") in check.finding_summary
     assert len(report.requests) == (1 if preflight else 2)
+
+
+async def test_collection_bounds_reader_setup_by_settle_window(monkeypatch, local_tokenizer):
+    from giraffe import gateway_attribution
+
+    def load_tls(cfg):
+        # Slower than the full settle window. No HTTP client has been allocated.
+        time.sleep(.6)
+        return True
+
+    async def observer(request, rows):
+        return spend_page(request, rows)
+
+    cfg, _, reads = setup(monkeypatch, observer)
+    cfg.gateway_attribution.settle_seconds = .05
+    monkeypatch.setattr(gateway_attribution, "_reader_tls", load_tls)
+
+    started = time.monotonic()
+    report = await run_suite(cfg)
+    assert time.monotonic() - started < .6
+    check = next(item for item in report.checks if item.id == "gateway_attribution")
+    assert report.abort_reason is None and not reads
+    assert len(report.requests) == 2 and all(record.valid for record in report.requests)
+    assert check.metrics["state"] == "unverified" and not check.metrics["collection_complete"]
+    assert check.metrics["collection_attempts"] == 0 and "bounded window" in check.finding_summary
 
 
 @pytest.mark.parametrize("duration,delay,reason", [(.5, .55, "time_limited"), (10, .12, "budget_limited")])
@@ -313,6 +338,59 @@ async def test_preflight_rechecks_deadline_after_building_get(monkeypatch, local
         assert check.remediation["limit"] == "max_duration"
     else:
         assert check.remediation["limit"] == "max_requests"
+
+
+async def test_preflight_discards_unsupported_status_received_after_its_cutoff(monkeypatch, local_tokenizer):
+    async def observer(request, rows):
+        time.sleep(.12)
+        return httpx.Response(404)
+
+    cfg, _, reads = setup(monkeypatch, observer)
+    cfg.checks = ["access", "gateway_attribution"]
+    cfg.max_requests = 1
+    cfg.gateway_attribution.settle_seconds = .05
+
+    report = await run_suite(cfg)
+    check = next(item for item in report.checks if item.id == "gateway_attribution")
+    assert report.abort_reason is None and check.required
+    assert check.metrics["state"] == "unverified" and check.metrics["reason_code"] == "budget_limited"
+    assert check.metrics["planned_requests"] == 2 and check.metrics["observed_requests"] == 0
+    assert len(reads) == len(report.requests) == 1
+
+
+@pytest.mark.parametrize("interruption", ["settle", "duration", "user"])
+async def test_collection_discards_late_status_and_retains_prior_read(
+        monkeypatch, local_tokenizer, interruption):
+    stop = asyncio.Event()
+    polls = 0
+
+    async def observer(request, rows):
+        nonlocal polls
+        polls += 1
+        if polls == 1:
+            return spend_page(request, [*rows, {"request_id": "unrelated"}])
+        if interruption == "user":
+            stop.set()
+        else:
+            time.sleep(.30)
+        return httpx.Response(404)
+
+    cfg, _, reads = setup(monkeypatch, observer)
+    immediate_spend_polls(monkeypatch, cfg)
+    if interruption == "duration":
+        cfg.max_duration_seconds = .25
+    if interruption == "settle":
+        cfg.gateway_attribution.settle_seconds = .25
+
+    report = await run_suite(cfg, stop_event=stop)
+    check = next(item for item in report.checks if item.id == "gateway_attribution")
+    assert len(report.requests) == 2 and all(record.valid for record in report.requests)
+    assert len(reads) == check.metrics["collection_attempts"] == 2
+    assert check.metrics["state"] == "unverified" and not check.metrics["collection_complete"]
+    assert check.metrics["unrelated_rows"] == 1 and check.metrics["matched_requests"] == 0
+    assert check.metrics.get("reason_code") == ("time_limited" if interruption == "duration" else None)
+    assert report.abort_reason == {"settle": None, "duration": "maximum run duration reached",
+                                   "user": "cancelled by user"}[interruption]
 
 
 @pytest.mark.parametrize("duration,settle,reason", [(.25, .5, "time_limited"), (10, .25, None)])
@@ -900,6 +978,50 @@ async def test_interrupted_attribution_probes_retain_partial_evidence(monkeypatc
         assert "interrupted the configured attribution probes" in check.finding_summary
         assert check.remediation == {"action": "set_limit", "limit": "max_duration", "minimum": 5}
         assert "--max-duration" in check.summary and "max_requests" not in check.summary
+
+
+@pytest.mark.parametrize("interruption", ["duration", "user"])
+async def test_marked_inference_rechecks_run_admission_after_building_request(
+        monkeypatch, local_tokenizer, interruption):
+    stop = asyncio.Event()
+    original = httpx.AsyncClient.build_request
+    marked_builds, sent_keys, progress_events = [], [], []
+
+    def build_request(self, *args, **kwargs):
+        request = original(self, *args, **kwargs)
+        if request.method == "POST" and request.url.path == "/v1/chat/completions":
+            marked_builds.append(request)
+            if len(marked_builds) == 2:
+                if interruption == "user":
+                    stop.set()
+                else:
+                    time.sleep(.35)
+        return request
+
+    async def before_marked(key):
+        sent_keys.append(key)
+
+    async def observer(request, rows):
+        return spend_page(request, rows)
+
+    monkeypatch.setattr(httpx.AsyncClient, "build_request", build_request)
+    cfg, _, reads = setup(monkeypatch, observer, before_marked=before_marked)
+    cfg.max_duration_seconds = .30 if interruption == "duration" else 5
+
+    report = await run_suite(cfg, progress=progress_events.append, stop_event=stop)
+    check = next(item for item in report.checks if item.id == "gateway_attribution")
+    assert len(marked_builds) == 2 and sent_keys == ["secret-ALICE"] and not reads
+    assert [r.identity for r in report.requests] == ["alice"] and report.requests[0].valid
+    assert len([e for e in progress_events if e["event"] == "request_started"]) == 1
+    assert check.evidence_ids == [report.requests[0].id]
+    assert check.metrics["planned_requests"] == 2 and check.metrics["observed_requests"] == 1
+    assert check.metrics["collection_attempts"] == 0 and check.status == "inconclusive"
+    if interruption == "duration":
+        assert report.abort_reason == "maximum run duration reached"
+        assert check.metrics["reason_code"] == "time_limited" and check.remediation["limit"] == "max_duration"
+    else:
+        assert report.abort_reason == "cancelled by user" and "reason_code" not in check.metrics
+        assert "identity probes" in check.finding_summary
 
 
 async def test_partial_probe_budget_does_not_hide_observed_mismatch(monkeypatch, local_tokenizer):
