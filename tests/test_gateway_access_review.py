@@ -464,6 +464,11 @@ async def test_access_baseline_scopes_settings_and_identity_references_to_its_ca
         raw["targets"][0]["test_identities"]["unused"] = {"api_key_env": unused_ref}
         report = await run_suite(RunConfig.model_validate(raw))
         assert report.overall == "pass"
+        # Compare access settings independently of the mock transport's Serving speed.
+        for record in report.requests:
+            if "serving" in record.check_ids:
+                record.elapsed_ms = 10
+                record.first_output_ms = 5
         return report
 
     baseline = await run_with("BASELINE_UNUSED", 16)
