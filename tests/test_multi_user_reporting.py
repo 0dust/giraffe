@@ -679,6 +679,61 @@ def test_new_interference_failure_survives_incomplete_peer_cancellation_baseline
                for row in compared.baseline["targets"][0]["comparisons"])
 
 
+def test_interference_baseline_attributes_matched_slowdown_only_to_short_user():
+    from tests.test_multi_user_scenarios import matched_observation
+
+    current, baseline = user_report(), user_report()
+    for report in (current, baseline):
+        source, requests = matched_observation()
+        for item in requests:
+            item.target = "local"
+            window = next(window for window in source["windows"] if window["id"] == item.workload["window_id"])
+            item.workload.update(scenario=window["scenario"], trigger=window["trigger"],
+                                 heavy_profile=window["heavy_profile"], population=window["population"])
+        if report is current:
+            requests[1].completed_ms = requests[1].workload["ready_ms"] + 810
+            requests[1].elapsed_ms = requests[1].completed_ms - requests[1].dispatch_ms
+        summary = summarize(source, requests)
+        interference = summary["windows"][1]["interference"]
+        short, = interference["users"]
+        assert short["slowdown"] == pytest.approx(4.05 if report is current else 1.5)
+        assert interference["status"] == ("fail" if report is current else "pass")
+        report.requests = requests
+        report.checks[0].metrics["multi_user"] = summary
+
+    compared = compare_baseline(current, baseline).baseline
+    acceptance, = [row for row in compared["targets"][0]["comparisons"] if row["metric"] == "scenario_acceptance"]
+    assert acceptance["user_id"] == "user-01" and acceptance["status"] == "fail"
+    assert acceptance["current_samples"] == acceptance["baseline_samples"] == 1
+    assert acceptance["evidence_ids"] == [item.id for item in current.requests]
+
+
+def test_intentional_user_cancellation_is_not_an_ordinary_baseline_sample():
+    report = scenario_report()
+    window = report.checks[0].metrics["multi_user"]["windows"][-1]
+    report.checks[0].metrics["multi_user"]["windows"] = [window]
+    window["users"] = [window["users"][1]]
+    report.requests = [item for item in report.requests if item.workload["user_id"] == "user-02"][:5]
+    for item in report.requests:
+        item.workload.update(scenario="cancellation", role="cancellation", window_id=window["id"],
+                             population=window["population"], cancellation_role="followup")
+    cancelled = report.requests[0]
+    cancelled.status, cancelled.valid, cancelled.intentional = "cancelled", False, True
+    cancelled.termination_reason = "generation_chunk_limit"
+    cancelled.workload["cancellation_role"] = "selected"
+    window["users"][0].update(request_ids=[item.id for item in report.requests], output_tokens_per_second=40)
+
+    compared = compare_baseline(report, report).baseline
+    rows = {row["metric"]: row for row in compared["targets"][0]["comparisons"] if row.get("user_id") == "user-02"}
+    for metric, value in (("valid_completion_rate", 1), ("error_rate", 0)):
+        assert rows[metric]["current"] == rows[metric]["baseline"] == value
+        assert rows[metric]["current_samples"] == rows[metric]["baseline_samples"] == 4
+        assert rows[metric]["status"] == "inconclusive"
+        assert cancelled.id not in rows[metric]["evidence_ids"]
+    exported_window, = reproduction_export(report)["multi_user"]["local"]["windows"]
+    assert exported_window["cancellation"]["cancellation"]["request_ids"] == [cancelled.id]
+
+
 @pytest.mark.parametrize("qualified", [True, False])
 def test_failed_followup_baseline_is_scoped_to_selected_user_with_scenario_evidence(qualified):
     current, baseline = scenario_report(), scenario_report()

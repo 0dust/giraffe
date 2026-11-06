@@ -64,7 +64,8 @@ def _groups(records: list[RequestRecord], target: str) -> dict[tuple[str, str], 
                     continue  # Setup calibration is not a workload result group.
                 scenario = record.scenario
                 if check == "multi_user":
-                    if record.workload.get("phase") != "measurement" or not record.workload.get("user_id"):
+                    if (record.intentional or record.workload.get("phase") != "measurement"
+                            or not record.workload.get("user_id")):
                         continue
                     scenario = " / ".join(str(record.workload.get(key, "unknown"))
                         for key in ("scenario", "population", "profile", "user_id"))
@@ -1212,6 +1213,14 @@ def _cancellation_evidence_ids(evidence: dict, records: dict[str, RequestRecord]
                               for rid in evidence.get(name, {}).get("request_ids", []) if rid in records))
 
 
+def _interference_evidence_ids(evidence: dict, user_id: str, records: dict[str, RequestRecord]) -> list[str]:
+    if evidence.get("user_id") != user_id:
+        return []
+    cohorts = [[rid for rid in evidence.get(field, []) if rid in records]
+               for field in ("control_request_ids", "probe_request_ids", "heavy_request_ids")]
+    return list(dict.fromkeys(rid for cohort in cohorts for rid in cohort)) if all(cohorts) else []
+
+
 def _probe_has_overlap(evidence: dict, records: list[RequestRecord]) -> bool:
     exposed = set(evidence.get("probe_request_ids", []))
     # The fallback for a heavy user describes the whole probe window.
@@ -1385,7 +1394,15 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold):
                 old_evidence = _cancellation_evidence_ids(b_scenario, old_records)
                 acceptance.update(evidence_ids=current_evidence, current_samples=len(current_evidence),
                                   baseline_samples=len(old_evidence))
-            rows.append(acceptance)
+            if noisy_probe:
+                current_evidence = _interference_evidence_ids(c_scenario, user_id, current_records)
+                old_evidence = _interference_evidence_ids(b_scenario, user_id, old_records)
+                if current_evidence and old_evidence:
+                    acceptance.update(evidence_ids=current_evidence, current_samples=c_scenario.get("matched_samples"),
+                                      baseline_samples=b_scenario.get("matched_samples"))
+                    rows.append(acceptance)
+            else:
+                rows.append(acceptance)
         if c.get("status") == "fail" and b.get("status") == "pass":
             # Acceptance also includes attempts that drain after delivery closes.
             current_attempts = [record for record in current_work if not record.intentional]
