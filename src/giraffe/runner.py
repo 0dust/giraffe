@@ -2161,7 +2161,9 @@ def _deadline_remediation(config):
     action = {"action": "set_limit", "limit": "max_duration"}
     if (all(item["id"] == "gateway_attribution" for item in plan["unknown_time_components"])
             and high is not None and math.isfinite(high)):
-        action["minimum"] = math.ceil(high)
+        minimum = math.ceil(high)
+        if minimum > (config.max_duration_seconds or 0):
+            action["minimum"] = minimum
     return action
 
 

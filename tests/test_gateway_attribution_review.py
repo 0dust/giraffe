@@ -551,6 +551,32 @@ async def test_duration_plan_and_remedy_cover_spend_log_settle(monkeypatch, loca
     assert "max_requests" not in check.summary
 
 
+async def test_duration_remedy_covers_restart_and_attribution(monkeypatch, local_tokenizer):
+    async def observer(request, rows):
+        return spend_page(request, rows)
+
+    async def ready(self, deadline):
+        await asyncio.sleep(2.28)
+        return True
+
+    cfg, _, reads = setup(monkeypatch, observer)
+    monkeypatch.setattr(LLMClient, "ready", ready)
+    cfg.targets[0].restart_command = [sys.executable, "-c", "pass"]
+    cfg.restart_target = "proxy"
+    cfg.readiness_timeout_seconds = 2.7
+    cfg.max_duration_seconds = 3
+    cfg.request_timeout_seconds = .15
+    cfg.gateway_attribution.settle_seconds = 1
+
+    report = await run_suite(cfg)
+    assert report.observations["targets"]["proxy"]["restart"]["status"] == "ready"
+    assert reads and len(report.requests) == 3  # Readiness and two attribution probes.
+    check = next(item for item in report.checks if item.id == "gateway_attribution")
+    assert check.metrics["reason_code"] == "time_limited"
+    assert check.remediation == {"action": "set_limit", "limit": "max_duration", "minimum": 5}
+    assert "at least 5 seconds" in check.summary
+
+
 @pytest.mark.parametrize("overlap", [False, True])
 def test_duration_plan_keeps_attribution_after_all_shared_work(overlap):
     from tests.test_run_limits_phase4_planning import observations
