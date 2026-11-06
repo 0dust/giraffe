@@ -30,6 +30,15 @@ def test_preview_counts_offers_without_materializing_request_ledger(monkeypatch)
     assert row["scheduled_offers"] == 9
 
 
+def test_activation_adjusted_offer_bound_accepts_valid_plan():
+    from giraffe.multi_user import _planned_observation
+
+    cfg = settings(levels=[4], scenarios=["arrivals"], duration_seconds=1500, arrivals={
+        "requests_per_second": 20, "activations": {f"user-0{i}": 1000 for i in range(2, 5)}})
+    window, = _planned_observation(cfg.multi_user, include_offers=False)["windows"]
+    assert window["scheduled_offers"] == 60000
+
+
 def test_aggregate_offer_bound_rejects_large_plan_before_allocation(monkeypatch):
     from giraffe import multi_user
     from giraffe.models import RunConfig
@@ -186,6 +195,45 @@ def test_user_offers_reconcile_busy_slots_and_budget(monkeypatch, budget):
         if budget:
             assert accounting["offered"] == budget and accounting["not_offered"] == 6
         assert result(state, cfg.targets[0]).metrics["multi_user"]["windows"][0]["fairness"]["status"] != "pass"
+    run_virtual(monkeypatch, run())
+
+
+def test_arrival_schedule_reports_steady_activation_stages_and_burst_offers(monkeypatch):
+    from giraffe.models import RunReport
+    from giraffe.performance import build_performance
+
+    async def run():
+        cfg = arrival_settings().model_copy(update={"concurrency": 8})
+        state = runner._Run(cfg, None, None)
+        target = cfg.targets[0]
+        await execute(state, target, FakeClient(target, cfg))
+        observation = state.observations[target.name]
+        first, second, drain = observation["schedule_transitions"]
+        assert first["end_ms"] == second["start_ms"]
+        assert first["end_ms"] - first["start_ms"] == pytest.approx(100)
+        assert second["end_ms"] - second["start_ms"] == pytest.approx(100)
+        assert [first["intended_rate_rps"], second["intended_rate_rps"]] == [20, 40]
+        assert drain["kind"] == "drain"
+        assert all(row.traffic_stage is None and row.traffic_rate_rps is None for row in state.records)
+        check = result(state, target)
+        window, = check.metrics["multi_user"]["windows"]
+        assert window["scheduled_offers"] == 9
+        assert window["planned_requests_per_second"] == 45
+        assert window["burst_offer_accounting"]["planned"] == 3
+        assert window["burst_offer_accounting"]["dispatched"] == 3
+
+        report = RunReport(run_id="arrivals", suite_version="test", overall=check.status,
+                           started_at="2026-01-01T00:00:00Z", finished_at="2026-01-01T00:00:01Z",
+                           manifest={"config": cfg.model_dump(mode="json")}, requests=state.records,
+                           checks=[check], observations={"targets": {target.name: observation}})
+        view = build_performance(report)["targets"][0]
+        metrics = view["summaries"][view["default_window"]]["metrics"]
+        assert metrics["offered_rate"]["value"] == [20, 40]
+        assert metrics["offered_rate"]["label"] == "Scheduled steady arrival rate"
+        stage, *_ = [entry for entry in view["windows"] if entry["kind"] == "stage" and not entry["includes_drain"]]
+        stage_metrics = build_performance(report, window=stage["id"])["targets"][0]["summaries"][stage["id"]]["metrics"]
+        assert stage_metrics["drops"]["value"][0]["planned"] == 5
+
     run_virtual(monkeypatch, run())
 
 

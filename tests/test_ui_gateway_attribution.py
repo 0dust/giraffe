@@ -43,3 +43,18 @@ for(const state of ['not_selected','unavailable','unsupported','unverified','mis
  c.metrics.state=state;assert.match(renderCheck(c,report([c])),new RegExp(escape(human(state))));
 }
 ''')
+
+
+def test_attribution_baseline_uses_categorical_outcomes():
+    run_render_checks(r'''
+const rows=[{check:'gateway_attribution',metric:'attribution_outcome',scenario:'alice',
+ scenario_label:'alice',aggregation:'observed',baseline:'verified',current:'mismatch',
+ baseline_samples:1,current_samples:1,status:'fail'}];
+const result={...report([]),baseline:{run_id:'reference',targets:[{target:'local',comparisons:rows}]}};
+const html=renderComparison(result);
+assert.match(html,/Gateway attribution outcomes/);
+assert.match(html,/alice/);
+assert.match(html,/Observed outcome/);
+assert.match(html,/Outcome changed/);
+assert.doesNotMatch(html,/Median|NaN/);
+''')
