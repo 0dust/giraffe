@@ -11,7 +11,7 @@ import uuid
 
 import httpx
 
-from .identities import credential_headers, identity_headers, identity_scope
+from .identities import credential_headers, identity_headers, identity_scope, litellm_key_fingerprint
 from .models import CheckResult, RequestSpec
 
 
@@ -97,6 +97,7 @@ def _assess(records, matched, planned, *, complete, unstable=False):
         row["request_ids"].append(record.id)
         observations = list(matched.get(record.id, {}).values())
         good = (complete and not unstable and record.status == "completed" and record.valid
+                and (not record.stream or record._gateway_terminal_usage)
                 and record._gateway_key_hash and _number(record.input_tokens) and _number(record.completion_tokens)
                 and len(observations) == 1 and observations[0]["complete"])
         if not good:
@@ -128,12 +129,13 @@ def _client(config, headers, timeout):
 
 async def _pages(client, url, marker, *, start_date, end_date, max_rows, stop):
     rows = []
-    pagination = None
+    expected_total = None
+    page_size = min(PAGE_SIZE, max_rows)
     for page in range(1, MAX_PAGES + 1):
         if stop.is_set():
             return rows, False
         async with client.stream("GET", url, params={"session_id": marker, "page": page,
-                "page_size": min(PAGE_SIZE, max_rows), "start_date": start_date, "end_date": end_date}) as response:
+                "page_size": page_size, "start_date": start_date, "end_date": end_date}) as response:
             if response.status_code in {404, 405, 501}:
                 return "unsupported", False
             if response.status_code != 200:
@@ -150,20 +152,20 @@ async def _pages(client, url, marker, *, start_date, end_date, max_rows, stop):
             if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
                 return rows, False
             data = payload["data"]
-            pages, capped = payload.get("total_pages"), payload.get("total_is_capped", False)
-            if type(pages) is not int or pages < 0 or type(capped) is not bool:
+            total = payload.get("total")
+            if (payload.get("total_is_capped", False) is not False
+                    or type(total) is not int or not 0 <= total <= max_rows
+                    or expected_total is not None and total != expected_total):
                 return rows, False
-            if pagination is not None and pagination != (pages, capped):
+            pages = (total + page_size - 1) // page_size
+            if any(type(payload.get(key)) is not int or payload[key] != expected
+                   for key, expected in (("page", page), ("page_size", page_size), ("total_pages", pages))):
                 return rows, False
-            pagination = (pages, capped)
-            if len(rows) + len(data) > max_rows:
+            if len(data) != min(page_size, total - len(rows)):
                 return rows, False
+            expected_total = total
             rows.extend(data)
-            if not data:
-                return rows, page > pages or (page == 1 and pages <= 1)
-            if pages == 0:
-                return rows, False
-            if not capped and page >= pages:
+            if len(rows) == total:
                 return rows, True
     return rows, False
 
@@ -181,8 +183,15 @@ async def execute(run, target, client):
     # but its credential is never taken from an inference identity.
     try:
         headers = credential_headers(gateway)
+        fingerprints = set()
         for alias in settings.identities:
-            identity_headers(target, alias)
+            fingerprint = litellm_key_fingerprint(identity_headers(target, alias))
+            if fingerprint is None:
+                continue
+            if fingerprint in fingerprints:
+                observation.update(state="unverified", reason="Selected aliases must resolve to distinct LiteLLM keys.")
+                return
+            fingerprints.add(fingerprint)
     except ValueError:
         observation.update(reason="Gateway reader or selected identity credentials are unavailable.")
         return

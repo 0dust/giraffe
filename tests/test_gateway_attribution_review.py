@@ -12,7 +12,7 @@ from giraffe.client import LLMClient
 from giraffe.gateway_attribution import execute, result
 from giraffe.models import RequestSpec
 from giraffe.runner import _Run, _checks
-from tests.test_gateway_attribution import config
+from tests.test_gateway_attribution import config, spend_page
 
 
 def setup(monkeypatch, observer, *, rejected=None):
@@ -24,6 +24,8 @@ def setup(monkeypatch, observer, *, rejected=None):
 
     async def handler(request):
         if request.method == "GET":
+            if request.url.path != "/spend/logs/v2":
+                return httpx.Response(404)
             reads.append(request)
             return await observer(request, rows)
         key = request.headers.get("authorization", "").removeprefix("Bearer ")
@@ -51,12 +53,13 @@ async def collect(cfg, run):
 
 
 async def test_litellm_required_utc_dates_cover_probes_and_are_stable_on_all_pages(monkeypatch):
+    monkeypatch.setattr("giraffe.gateway_attribution.PAGE_SIZE", 1)
     # LiteLLM fca3d4f: public v2 requires both bounds in UTC second precision.
     async def observer(request, rows):
         if not all(request.url.params.get(key) for key in ("start_date", "end_date")):
             return httpx.Response(400)
         page = int(request.url.params["page"])
-        return httpx.Response(200, json={"data": rows[page-1:page], "total_pages": 2})
+        return spend_page(request, rows[page-1:page], total=len(rows))
     cfg, run, reads = setup(monkeypatch, observer)
     before = datetime.now(timezone.utc)
     check = await collect(cfg, run)
@@ -98,7 +101,7 @@ async def test_ambiguous_correlated_rows_cannot_verify(monkeypatch, fault):
             else:
                 extra["metadata"]["spend_logs_metadata"]["giraffe_request"] = "unknown-request"
             data.append(extra)
-        return httpx.Response(200, json={"data": data, "total_pages": 1})
+        return spend_page(request, data)
     cfg, run, _ = setup(monkeypatch, observer)
     check = await collect(cfg, run)
     assert check.metrics["state"] == "unverified"
@@ -108,9 +111,21 @@ async def test_ambiguous_correlated_rows_cannot_verify(monkeypatch, fault):
 
 @pytest.mark.parametrize("capped", [False, True])
 async def test_empty_page_before_advertised_end_is_incomplete(monkeypatch, capped):
+    monkeypatch.setattr("giraffe.gateway_attribution.PAGE_SIZE", 2)
     async def observer(request, rows):
         page = int(request.url.params["page"])
-        return httpx.Response(200, json={"data": rows if page == 1 else [], "total_pages": 3, "total_is_capped": capped})
+        return spend_page(request, rows if page == 1 else [], total=5, total_is_capped=capped)
+    cfg, run, _ = setup(monkeypatch, observer)
+    check = await collect(cfg, run)
+    assert check.metrics["state"] == "unverified"
+    assert check.metrics["collection_complete"] is False
+
+
+async def test_changed_total_between_pages_is_incomplete(monkeypatch):
+    monkeypatch.setattr("giraffe.gateway_attribution.PAGE_SIZE", 1)
+    async def observer(request, rows):
+        page = int(request.url.params["page"])
+        return spend_page(request, rows[page-1:page], total=2 if page == 1 else 3)
     cfg, run, _ = setup(monkeypatch, observer)
     check = await collect(cfg, run)
     assert check.metrics["state"] == "unverified"
@@ -125,7 +140,7 @@ async def test_late_logs_are_read_in_final_part_of_settle_window(monkeypatch):
         now = time.monotonic()
         started = now if started is None else started
         times.append(now-started)
-        return httpx.Response(200, json={"data": rows if now-started >= .28 else [], "total_pages": 1})
+        return spend_page(request, rows if now-started >= .28 else [])
     cfg, run, _ = setup(monkeypatch, observer)
     cfg.gateway_attribution.settle_seconds = .4
     check = await collect(cfg, run)
@@ -155,7 +170,7 @@ async def test_cancelling_reader_keeps_probe_counts_and_clears_transient_hashes(
 @pytest.mark.parametrize("rejected", ["expired", "connection"])
 async def test_identity_failure_does_not_change_shared_health_or_stop_other_work(monkeypatch, rejected):
     async def observer(request, rows):
-        return httpx.Response(200, json={"data": rows, "total_pages": 1})
+        return spend_page(request, rows)
     cfg, run, _ = setup(monkeypatch, observer, rejected=rejected)
     cfg.checks = ["access", "serving", "gateway_attribution"]
     cfg.stop_after_errors = cfg.unresponsive_after_failures = 1
@@ -182,6 +197,8 @@ async def test_identity_failure_does_not_change_shared_health_or_stop_other_work
 
 @pytest.mark.parametrize("across_polls", [False, True])
 async def test_changing_unexpected_owner_is_unverified_and_fingerprints_stay_transient(monkeypatch, across_polls):
+    if across_polls:
+        monkeypatch.setattr("giraffe.gateway_attribution.PAGE_SIZE", 1)
     polls = 0
     async def observer(request, rows):
         nonlocal polls
@@ -191,10 +208,11 @@ async def test_changing_unexpected_owner_is_unverified_and_fingerprints_stay_tra
         data = json.loads(json.dumps(rows))
         data[0]["api_key"] = "0" * 64 if polls == 1 else "1" * 64
         if across_polls and polls == 1:
-            return httpx.Response(200, json={"data": data[:1] if page == 1 else [], "total_pages": 2})
-        if not across_polls:
-            data.append({**data[0], "api_key": "1" * 64})
-        return httpx.Response(200, json={"data": data, "total_pages": 1})
+            return spend_page(request, data[:1] if page == 1 else [], total=2)
+        if across_polls:
+            return spend_page(request, data[page-1:page], total=2)
+        data.append({**data[0], "api_key": "1" * 64})
+        return spend_page(request, data)
     cfg, run, _ = setup(monkeypatch, observer)
     check = await collect(cfg, run)
     assert check.metrics["state"] == "unverified"
@@ -202,13 +220,14 @@ async def test_changing_unexpected_owner_is_unverified_and_fingerprints_stay_tra
     assert "0" * 64 not in serialized and "1" * 64 not in serialized
 
 
-async def test_capped_collection_can_end_empty_beyond_advertised_minimum(monkeypatch):
+async def test_capped_collection_cannot_verify_even_when_all_probes_are_present(monkeypatch):
     async def observer(request, rows):
-        return httpx.Response(200, json={"data": rows if request.url.params["page"] == "1" else [],
-                                         "total_pages": 1, "total_is_capped": True})
+        return spend_page(request, rows, total_is_capped=True)
     cfg, run, reads = setup(monkeypatch, observer)
     check = await collect(cfg, run)
-    assert check.metrics["state"] == "verified" and len(reads) == 2
+    assert check.metrics["state"] == "unverified"
+    assert check.metrics["collection_complete"] is False
+    assert all(r.url.params["page"] == "1" for r in reads)
 
 
 @pytest.mark.parametrize("failure", [TimeoutError, httpx.ConnectError])
@@ -231,7 +250,7 @@ async def test_runner_fallback_records_keep_selected_identity_and_health_isolati
 async def test_mixed_full_run_keeps_shared_checks_passing_with_expired_identity(monkeypatch):
     from giraffe.runner import run_suite
     async def observer(request, rows):
-        return httpx.Response(200, json={"data": rows, "total_pages": 1})
+        return spend_page(request, rows)
     cfg, _, _ = setup(monkeypatch, observer, rejected="expired")
     cfg.checks = ["access", "serving", "gateway_attribution"]
     cfg.stop_after_errors = 1
