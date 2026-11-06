@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import re
+import sys
 import time
 
 import httpx
@@ -237,6 +238,43 @@ async def test_deferred_attribution_uses_only_selected_identities(monkeypatch, l
                  if check.target == "proxy" and check.id == "gateway_attribution")
     assert check.metrics["state"] == "verified"
     assert len(reads) == 4
+
+
+@pytest.mark.parametrize("restart", ["missing", "failed", "unready", "ready"])
+async def test_deferred_attribution_obeys_restart_readiness(monkeypatch, local_tokenizer, restart):
+    async def observer(request, rows):
+        return spend_page(request, [row for row in rows if row["session_id"] == request.url.params["session_id"]])
+
+    async def ready(self, deadline):
+        return restart == "ready"
+
+    cfg, _, reads = setup(monkeypatch, observer)
+    cfg.checks = ["access", "gateway_attribution"]
+    cfg.restart_target = "proxy"
+    cfg.readiness_timeout_seconds = .05
+    cfg.gateway_attribution.settle_seconds = .2
+    first = cfg.targets[0]
+    if restart != "missing":
+        first.restart_command = [sys.executable, "-c", f"raise SystemExit({int(restart == 'failed')})"]
+    cfg.targets.append(first.model_copy(update={"name": "second", "url": "http://second/v1",
+        "gateway": first.gateway.model_copy(update={"url": "http://second/spend/logs/v2"})}))
+    monkeypatch.setattr(LLMClient, "ready", ready)
+
+    report = await run_suite(cfg)
+    checks = {(check.target, check.id): check for check in report.checks}
+    assert checks["second", "access"].status == checks["second", "gateway_attribution"].status == "pass"
+    assert {record.identity for record in report.requests if record.target == "second"} == {None, "alice", "bob"}
+    proxy_attribution = checks["proxy", "gateway_attribution"]
+    if restart == "ready":
+        assert checks["proxy", "access"].status == proxy_attribution.status == "pass"
+        assert any(request.url.host == "proxy" for request in reads)
+        assert [record.identity for record in report.requests if record.target == "proxy"] == [None, "alice", "bob"]
+    else:
+        assert checks["proxy", "access"].status == "blocked"
+        assert proxy_attribution.metrics["state"] == "unverified"
+        assert "readiness" in proxy_attribution.summary
+        assert {request.url.host for request in reads} == {"second"}
+        assert {record.target for record in report.requests} == {"second"}
 
 
 async def test_attribution_does_not_reserve_shared_token_evidence_slot(monkeypatch, local_tokenizer):
@@ -483,6 +521,62 @@ async def test_shortened_collection_window_keeps_complete_pages_unverified(monke
     check = await collect(cfg, run)
     assert reads and check.metrics["collection_complete"] is False
     assert check.metrics["state"] == "unverified" and check.metrics["unverified_requests"] == 2
+
+
+async def test_duration_plan_and_remedy_cover_spend_log_settle(monkeypatch, local_tokenizer):
+    async def observer(request, rows):
+        return spend_page(request, rows)
+
+    cfg, _, reads = setup(monkeypatch, observer)
+    cfg.max_duration_seconds = .25
+    cfg.request_timeout_seconds = .02
+    cfg.gateway_attribution.settle_seconds = 1
+
+    plan = request_plan(cfg)
+    assert plan["estimated_low_seconds"] == .85
+    assert plan["estimated_high_seconds"] == 1
+    assert plan["budget_high_seconds"] == pytest.approx(1.04)
+    assert not plan["errors"]
+    warning = next(item for item in plan["time_warnings"] if item["kind"] == "incomplete_coverage")
+    assert warning["cut_checks"] == ["proxy · Gateway spend-log settle"]
+    assert warning["actions"][0]["field"] == "max_duration_seconds"
+
+    report = await run_suite(cfg)
+    assert reads and len(report.requests) == 2
+    check = next(item for item in report.checks if item.id == "gateway_attribution")
+    assert check.status == "inconclusive"
+    assert check.metrics["reason_code"] == "time_limited"
+    assert check.remediation == {"action": "set_limit", "limit": "max_duration", "minimum": 2}
+    assert "--max-duration" in check.summary
+    assert "max_requests" not in check.summary
+
+
+@pytest.mark.parametrize("overlap", [False, True])
+def test_duration_plan_keeps_attribution_after_all_shared_work(overlap):
+    from tests.test_run_limits_phase4_planning import observations
+
+    cfg = config()
+    cfg.checks = ["correctness", "gateway_attribution"]
+    cfg.gateway_attribution.settle_seconds = 1
+    cfg.metrics_timeout_seconds = .2
+    cfg.overlap_models = overlap
+    cfg.targets.append(cfg.targets[0].model_copy(update={"name": "second", "gateway": None}))
+    measured = observations(cfg, p50=100, p90=100)
+    measured["second"] = observations(cfg, p50=2000, p90=2000)["second"]
+    shared = request_plan(cfg.model_copy(update={"checks": ["correctness"]}), observations=measured)
+    cfg.max_duration_seconds = shared["estimated_high_seconds"] + .5
+
+    plan = request_plan(cfg, observations=measured)
+    assert plan["estimated_high_seconds"] == pytest.approx(shared["estimated_high_seconds"] + 1.2, abs=.001)
+    preflight = next(item for item in plan["time_components"] if item["id"] == "gateway_attribution_preflight")
+    assert preflight["target"] == "proxy" and preflight["high_seconds"] == .2
+    assert [(item["target"], item["id"]) for item in plan["time_timeline"]] == [
+        ("proxy", "correctness"), ("second", "correctness"), ("proxy", "gateway_attribution_preflight"),
+        ("proxy", "gateway_attribution"), ("proxy", "gateway_attribution_settle"),
+    ]
+    warning = next(item for item in plan["time_warnings"] if item["kind"] == "incomplete_coverage")
+    assert warning["cut_checks"] == ["proxy · Gateway spend-log settle"]
+    assert not plan["errors"]
 
 
 async def test_cancelling_reader_keeps_probe_counts_and_clears_transient_hashes(monkeypatch):
