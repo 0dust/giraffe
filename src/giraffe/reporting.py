@@ -399,7 +399,8 @@ def _same_load_workload(current: dict, old: dict, *, fingerprint_key: str = "wor
          (_COMPANION_LOAD_SOURCE,
           "788f4c8f0b14421d5fc00f8b32c0ffcef79c04c647730767cb44b16584ed4aa4",
           "4caab6e7a9eb457a5ceddf272112c434a97c101a2c27c3943f8a4155fb71bdb0",
-          "3c8a5f9d0154e7f174b96005258e34c925614fbbd3546e10ffb831616b7f9bdd"), True),
+          "3c8a5f9d0154e7f174b96005258e34c925614fbbd3546e10ffb831616b7f9bdd",
+          "9f8084f595656375f3f32b0cbcdc473a5d69c06909530c1c243ac77e72481c4b"), True),
     )
     matches = []
     shared = fingerprint_key == "shared_workload_fixture_sha256"

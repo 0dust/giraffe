@@ -4,7 +4,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import math
 import random
 import time
 import uuid
@@ -474,9 +473,8 @@ async def run_arrival_window(run, target, client, settings, load_settings, calib
         return spec
 
     lag_tolerance_ms = 100
-    admission_closed = asyncio.Event()
 
-    async def send(spec, annotate):
+    async def send(spec, annotate, check_admission):
         offer = offers[spec.workload["offer_index"]]
         user = users[offer["user_id"]]
         spec.workload["ready_ms"] = spec.workload["scheduled_ms"]
@@ -493,14 +491,8 @@ async def run_arrival_window(run, target, client, settings, load_settings, calib
             offer["request_id"] = record.id
             user["request_ids"].append(record.id)
 
-        scheduled = run.start + spec.workload["scheduled_ms"]/1000
-        window_end = scheduled-offer["offset_seconds"]+window["planned_duration_seconds"]
-        # The runner checks this again after condition setup. Exactly the
-        # tolerated lag remains eligible; only greater lag closes admission.
-        lag_deadline = math.nextafter(scheduled+lag_tolerance_ms/1000, math.inf)
         return await run.request(target, client, spec, slot_reserved=True, budget_reserved=True,
-                                 admission_deadline=min(window_end, lag_deadline),
-                                 admission_check=lambda: not admission_closed.is_set(),
+                                 admission_deadline=run.deadline, admission_check=check_admission,
                                  on_start=started, finalize_record=finished)
 
     def stop():
@@ -524,8 +516,7 @@ async def run_arrival_window(run, target, client, settings, load_settings, calib
         check_id="multi_user", scenario=window["id"], run_start=run.start, return_evidence=True,
         on_drop=lambda: run.drop_offer(target.name, window["id"]),
         schedule_observations=stage_rows, schedule_stage_id=window["id"],
-        schedule_label=window["role"], schedule_pattern="steady_with_bursts" if bursts else "constant",
-        admission_closed=admission_closed)
+        schedule_label=window["role"], schedule_pattern="steady_with_bursts" if bursts else "constant")
     if staged_arrivals:
         sending, drain = stage_rows
         transitions.extend(_arrival_transitions(sending, activations, per_user_rate, window["planned_duration_seconds"]))

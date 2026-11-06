@@ -1,6 +1,7 @@
 """Finite user offers reconcile independently from endpoint attempts."""
 import asyncio
 
+import httpx
 import pytest
 
 from giraffe import runner
@@ -613,29 +614,31 @@ def test_scheduled_admission_checks_lazy_http_lane_preparation(monkeypatch):
     run_virtual(monkeypatch, run())
 
 
+class _CompletedSSETail(httpx.AsyncByteStream):
+    def __init__(self, hold, output_delay=0):
+        self.hold = hold
+        self.output_delay = output_delay
+
+    async def __aiter__(self):
+        if self.output_delay:
+            await asyncio.sleep(self.output_delay)
+        yield b'data: {"choices":[{"delta":{"content":"K7P4"}}]}\n\n'
+        yield b'data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":128,"completion_tokens":4}}\n\n'
+        yield b'data: [DONE]\n\n'
+        await asyncio.sleep(self.hold)
+        yield b': transport tail\n\n'
+
+
 @pytest.mark.parametrize(("scenario", "tail", "dispatches"), [
     ("arrivals", .03, [0, 30]),
     ("arrivals", .06, [0]),
     ("repeated_requests", .085, [0]),
 ])
 def test_transport_lane_wait_respects_actual_user_sending_end(monkeypatch, scenario, tail, dispatches):
-    import httpx
-
     from giraffe.client import LLMClient
     from giraffe.models import RunReport
     from giraffe.performance import build_performance
     from giraffe.transport import HTTPClientPool
-
-    class Stream(httpx.AsyncByteStream):
-        def __init__(self, hold):
-            self.hold = hold
-
-        async def __aiter__(self):
-            yield b'data: {"choices":[{"delta":{"content":"K7P4"}}]}\n\n'
-            yield b'data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":128,"completion_tokens":4}}\n\n'
-            yield b'data: [DONE]\n\n'
-            await asyncio.sleep(self.hold)
-            yield b': transport tail\n\n'
 
     async def run():
         scheduled = scenario == "arrivals"
@@ -649,7 +652,7 @@ def test_transport_lane_wait_respects_actual_user_sending_end(monkeypatch, scena
 
         async def respond(request):
             sent.append((asyncio.get_running_loop().time() - state.start) * 1000)
-            return httpx.Response(200, stream=Stream(tail if len(sent) == 1 else 0))
+            return httpx.Response(200, stream=_CompletedSSETail(tail if len(sent) == 1 else 0))
 
         client = LLMClient(target, cfg)
         client._client = HTTPClientPool(lambda: httpx.AsyncClient(transport=httpx.MockTransport(respond)), 1)
@@ -692,5 +695,58 @@ def test_transport_lane_wait_respects_actual_user_sending_end(monkeypatch, scena
             user, = window["users"]
             assert user["dispatched_count"] == 1 and user["ready_count"] == 2
             assert user["pending_observed_ms"] == window["end_ms"]
+
+    run_virtual(monkeypatch, run())
+
+
+@pytest.mark.parametrize("stall", [False, True])
+def test_transport_lane_wait_respects_backlog_discard(monkeypatch, stall):
+    from giraffe.client import LLMClient
+    from giraffe.transport import HTTPClientPool
+
+    async def run():
+        cfg = settings(levels=[3], scenarios=["arrivals"], duration_seconds=.2, profile=PROFILE,
+            arrivals={"requests_per_second": 1, "bursts": [
+                {"user_id": "user-01", "at_seconds": .01, "requests": 3, "spacing_seconds": .03},
+            ]}).model_copy(update={"stream": True})
+        target = cfg.targets[0]
+        events = []
+        state = runner._Run(cfg, events.append, None)
+        loop = asyncio.get_running_loop()
+        sent = []
+
+        def stall_generator():
+            loop.now += .055
+
+        async def respond(request):
+            sent.append((loop.time() - state.start) * 1000)
+            stream = _CompletedSSETail(.09) if len(sent) <= 3 else _CompletedSSETail(0, output_delay=.005)
+            return httpx.Response(200, stream=stream)
+
+        client = LLMClient(target, cfg)
+        client._client = HTTPClientPool(lambda: httpx.AsyncClient(transport=httpx.MockTransport(respond)), 3)
+        if stall:
+            loop.call_later(.075, stall_generator)
+        try:
+            await execute(state, target, client)
+        finally:
+            await client.__aexit__(None, None, None)
+
+        window, = state.observations[target.name]["multi_user"]["windows"]
+        steady, bursts = window["offers"][:3], window["offers"][3:]
+        assert [offer["outcome"] for offer in steady] == ["dispatched"] * 3
+        assert [offer["outcome"] for offer in bursts] == ["dropped_late" if stall else "dispatched"] * 3
+        assert sent == pytest.approx([0, 0, 0] if stall else [0, 0, 0, 90, 90, 90])
+        assert len(state.records) == state.attempted == len(sent)
+        assert all(record.status == "completed" and record.valid for record in state.records)
+        assert state.budget_used == 6 and state.slots.qsize() == state.max_connections
+        assert state.dropped_offers == sum(event["event"] == "offer_dropped" for event in events) == (3 if stall else 0)
+        assert sum(event["event"] == "request_started" for event in events) == len(sent)
+        assert window["scheduler_stalls"] == ([{"start_ms": 10, "end_ms": 130}] if stall else [])
+        if stall:
+            assert [offer["scheduler_lag_ms"] for offer in bursts] == pytest.approx([120, 90, 60])
+            assert all(offer["request_id"] is None for offer in bursts)
+        else:
+            assert window["peak_in_flight"] == 3
 
     run_virtual(monkeypatch, run())
