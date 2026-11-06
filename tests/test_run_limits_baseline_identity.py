@@ -210,7 +210,7 @@ def test_source_bridge_requires_an_explicitly_attested_generator_revision(monkey
 def test_unchanged_text_generator_has_reviewed_identity_table_entry():
     configured = RunConfig(targets=[{"name": "local", "url": "http://localhost", "model": "test"}],
                            checks=["consistency"])
-    identity = _run_limits_workload_identity({"config": configured.model_dump(mode="json")}, revision="gateway_conversations")
+    identity = _run_limits_workload_identity({"config": configured.model_dump(mode="json")}, revision="gateway_shared_first")
     actual = {
         "generator_source_sha256": hashlib.sha256(Path(workloads.__file__).read_bytes()).hexdigest(),
     }

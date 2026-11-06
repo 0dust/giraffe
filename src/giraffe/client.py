@@ -39,6 +39,7 @@ _MAX_OUTPUT_EVENTS = 4096
 # Reuse completed HTTP/1.1 streams without waiting on servers that never send EOF.
 _STREAM_DRAIN_SECONDS = 0.1
 _REASONING_TAG = re.compile(r"<(/?)(think|thinking|reasoning)>", re.IGNORECASE)
+_SURROGATE = re.compile(r"[\ud800-\udfff]")
 REASONING_BUDGET_ERROR = "reasoning exhausted the output budget before an answer"
 
 
@@ -168,6 +169,8 @@ def _text(value: Any) -> str:
         return ""
     if not isinstance(value, str):
         raise _ProtocolError("response content must be text")
+    if not value.isascii() and _SURROGATE.search(value):
+        raise _ProtocolError("response text contains invalid Unicode")
     return value
 
 

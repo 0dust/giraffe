@@ -21,6 +21,15 @@ MAX_BODY_BYTES = 4 * 1024 * 1024
 MAX_PAGES = 8
 PAGE_SIZE = 128
 POLL_FRACTIONS = (0, .425, .85)
+_UNSUPPORTED_READER_STATUSES = {404, 405, 501}
+
+
+def configured_probe_count(config, target):
+    settings, gateway = config.gateway_attribution, target.gateway
+    if (CHECK in config.checks and settings and gateway and gateway.profile == "litellm"
+            and all(alias in target.test_identities for alias in settings.identities)):
+        return settings.samples * len(settings.identities)
+    return 0
 
 
 def _state(state, reason, **details):
@@ -135,6 +144,43 @@ def _client(config, headers, timeout):
                              timeout=timeout, follow_redirects=False)
 
 
+def _spend_page(client, url, marker, start_date, end_date, page, page_size):
+    return client.stream("GET", url, params={"session_id": marker, "page": page,
+        "page_size": page_size, "start_date": start_date, "end_date": end_date})
+
+
+async def preflight_unsupported_reader(run, target):
+    """Detect unsupported readers before spending remaining inference budget."""
+    gateway = target.gateway
+    now = time.monotonic()
+    stop_reason = run.stop_reason(target.name)
+    if stop_reason and stop_reason != "maximum request budget reached":
+        return False
+    timeout = min(run.config.gateway_attribution.settle_seconds, run.config.metrics_timeout_seconds,
+                  (run.deadline - now) / 2)
+    if timeout <= 0:
+        return False
+    try:
+        headers = credential_headers(gateway)
+        marker = "giraffe-" + uuid.uuid4().hex
+        current = datetime.now(timezone.utc)
+        start_date = current.strftime("%Y-%m-%d %H:%M:%S")
+        end_date = (current + timedelta(seconds=1)).strftime("%Y-%m-%d %H:%M:%S")
+        with identity_scope(True):
+            async with asyncio.timeout_at(now + timeout):
+                reader = await asyncio.to_thread(_client, run.config, headers, timeout)
+                async with reader:
+                    async with _spend_page(reader, gateway.url, marker, start_date, end_date, 1, 1) as response:
+                        unsupported = response.status_code in _UNSUPPORTED_READER_STATUSES
+    except (httpx.HTTPError, OSError, TimeoutError, ValueError):
+        return False
+    if unsupported:
+        run.observations[target.name][CHECK] = _state(
+            "unsupported", "Read-only gateway spend logs are unsupported.",
+            planned_requests=0, observed_requests=0)
+    return unsupported
+
+
 async def _pages(client, url, marker, *, start_date, end_date, max_rows, stop):
     rows = []
     row_ids = set()
@@ -143,9 +189,8 @@ async def _pages(client, url, marker, *, start_date, end_date, max_rows, stop):
     for page in range(1, MAX_PAGES + 1):
         if stop.is_set():
             return rows, False
-        async with client.stream("GET", url, params={"session_id": marker, "page": page,
-                "page_size": page_size, "start_date": start_date, "end_date": end_date}) as response:
-            if response.status_code in {404, 405, 501}:
+        async with _spend_page(client, url, marker, start_date, end_date, page, page_size) as response:
+            if response.status_code in _UNSUPPORTED_READER_STATUSES:
                 return "unsupported", False
             if response.status_code != 200:
                 return "unavailable", False
@@ -210,6 +255,9 @@ async def execute(run, target, client):
     except ValueError:
         observation.update(reason="Gateway reader or selected identity credentials are unavailable.")
         return
+    if run.config.max_requests is not None and len(run.config.checks) > 1:
+        if await preflight_unsupported_reader(run, target):
+            return
     marker = "giraffe-" + uuid.uuid4().hex
     start_date = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     records = []

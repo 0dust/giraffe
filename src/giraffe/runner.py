@@ -291,7 +291,7 @@ class _Run:
         # including bounded tool conversations that are excluded from "known".
         self.planned_request_reserve_per_target = sum(
             row["requests_per_target"] or row.get("known_scheduled_requests", 0)
-            for row in request_plan(config)["rows"])
+            for row in request_plan(config)["rows"] if row["id"] != "gateway_attribution")
         self.endpoint_health = {t.name: {"first_attempt_seconds": None, "last_response_seconds": None,
             "consecutive_failures": 0, "failure_request_ids": [], "abort_reason": None} for t in config.targets}
         self.target_tasks = {}
@@ -1169,6 +1169,8 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                     await run.group(target, client, initial_specs, "initial", count=1)
             run.finish_checks(target.name, {"access"})
             if config.stream and not gateway_only and hasattr(client, "token_evidence_probe"):
+                from .gateway_attribution import configured_probe_count
+                attribution_reserve = configured_probe_count(config, target)
                 # A one-token inference can still have a slow first response.
                 # Share one configured timeout across compatibility retries.
                 probe_end = min(run.deadline, time.monotonic() + config.request_timeout_seconds)
@@ -1177,7 +1179,8 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                 probe_count = 0
                 while (run.allowed(target.name) and time.monotonic() < probe_end
                        and (run.remaining(target.name) is None or run.remaining(target.name) > max(
-                           1, run.planned_request_reserve_per_target - (run.budget_counts[target.name] - probe_count)))):
+                           1, run.planned_request_reserve_per_target + attribution_reserve
+                           - (run.budget_counts[target.name] - probe_count)))):
                     spec = client.token_evidence_probe()
                     if spec is None:
                         break
@@ -1281,7 +1284,8 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                 effective = _check_config(config, "recovery")
                 probe_specs = builtin_fixtures(effective, check_id="recovery")["sustained"]
                 from .planning import request_plan
-                later = [name for name in config.checks if name not in CORE_CHECKS or name == "load"]
+                later = [name for name in config.checks
+                         if (name not in CORE_CHECKS or name == "load") and name != "gateway_attribution"]
                 later_plan = request_plan(config.model_copy(update={"checks": later, "restart_target": None}))
                 if "cancellation" in enabled and not run.stop_reason(target.name):
                     cleanup = config.effective_check("cancellation")["cleanup_seconds"]
