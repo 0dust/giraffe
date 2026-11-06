@@ -89,6 +89,15 @@ def _comparison_config(value: dict) -> dict:
     """Normalize saved config I/O without changing the recorded workload identity."""
     config, _ = migrate_run_limits(deepcopy(value))
     config, _ = migrate_concurrent_load(config)
+    checks = config.get("checks")
+    options = config.get("request_options")
+    if (isinstance(checks, list) and "gateway_access" in checks
+            and all(check in ("gateway_access", "gpu") for check in checks)
+            and not config.get("restart_target") and isinstance(options, dict)):
+        from .gateway_access import _TOOL_OPTIONS
+
+        # Access probes discard these options. GPU telemetry sends no inference.
+        config["request_options"] = {key: value for key, value in options.items() if key not in _TOOL_OPTIONS}
     if isinstance(config.get("limits"), dict):
         config["limits"].pop("regression_percent", None)
         for field in ("first_output_ms", "stream_gap_ms"):

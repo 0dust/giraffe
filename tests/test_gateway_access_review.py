@@ -268,7 +268,8 @@ async def test_access_requires_tool_free_completions(monkeypatch, message, finis
     assert "deny-secret" not in report.model_dump_json()
 
 
-async def test_access_does_not_send_inherited_tool_options(monkeypatch):
+@pytest.mark.parametrize("with_serving", [False, True])
+async def test_access_baseline_matches_transmitted_request_options(monkeypatch, with_serving):
     monkeypatch.setenv("ALLOW_KEY", "allow-secret")
     monkeypatch.setenv("DENY_KEY", "deny-secret")
     inherited = {"tools": [{"type": "function", "function": {"name": "unexpected"}}],
@@ -279,18 +280,49 @@ async def test_access_does_not_send_inherited_tool_options(monkeypatch):
     def handler(request):
         if request.method != "POST":
             return httpx.Response(404)
-        payloads.append(json.loads(request.content))
-        if request.headers["authorization"] == "Bearer deny-secret":
+        authorization = request.headers.get("authorization")
+        payloads.append((authorization, request.content))
+        if authorization == "Bearer deny-secret":
             return httpx.Response(401, json={"error": {"type": "token_not_found_in_db"}})
         return httpx.Response(200, json={"choices": [{"message": {
             "role": "assistant", "content": "OK"}, "finish_reason": "stop"}]})
 
     original = httpx.AsyncClient
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
-    report = await run_suite(config(request_options={**inherited, "temperature": 0.4}))
-    assert report.overall == "pass"
-    assert len(payloads) == 2
-    assert all(payload["temperature"] == 0.4 and not inherited.keys() & payload.keys() for payload in payloads)
+
+    async def run_with(options):
+        payloads.clear()
+        raw = config(request_options=options).model_dump()
+        if with_serving:
+            raw["checks"].append("serving")
+        report = await run_suite(RunConfig.model_validate(raw))
+        assert report.overall == "pass"
+        probes = {auth: body for auth, body in payloads if auth is not None}
+        assert len(probes) == 2
+        return report, probes
+
+    baseline, original_probes = await run_with({**inherited, "temperature": 0.4})
+    assert all(not inherited.keys() & json.loads(body).keys() for body in original_probes.values())
+    if with_serving:
+        shared = [json.loads(body) for auth, body in payloads if auth is None]
+        assert shared and all(inherited.keys() <= payload.keys() for payload in shared)
+
+    current, probes = await run_with({"temperature": 0.4})
+    assert probes == original_probes
+    comparison = compare_baseline(current, baseline).baseline["targets"][0]
+    if with_serving:
+        assert comparison["status"] == "inconclusive"
+        assert "Run setting request_options differs." in comparison["reasons"]
+    else:
+        assert comparison["status"] == "pass"
+        assert [row["status"] for row in comparison["comparisons"] if row["check"] == "gateway_access"] == ["pass", "pass"]
+
+    changed, probes = await run_with({"temperature": 0.7})
+    assert probes != original_probes
+    assert all(json.loads(body)["temperature"] == 0.7 for body in probes.values())
+    comparison = compare_baseline(changed, baseline).baseline["targets"][0]
+    assert comparison["status"] == "inconclusive"
+    assert "Run setting request_options differs." in comparison["reasons"]
 
 
 async def test_access_denial_rules_do_not_change_policy_evidence(monkeypatch, local_tokenizer):
