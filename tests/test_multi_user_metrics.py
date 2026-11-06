@@ -328,6 +328,58 @@ def test_equal_work_fairness_counts_the_slowest_user(counts, expected, ratio):
     assert source == before
 
 
+@pytest.mark.parametrize(("first", "second", "reason"), [
+    ({"cached_prompt_tokens": 100}, {"cached_prompt_tokens": 0}, "uncached input"),
+    ({"cached_prompt_tokens": 100}, {}, "Cached input usage is missing"),
+    ({"cached_prompt_tokens": 101}, {"cached_prompt_tokens": 0}, "cached input usage is invalid"),
+    ({"completion_tokens": 100, "reasoning_tokens": 0},
+     {"completion_tokens": 200, "reasoning_tokens": 100}, "total generation"),
+])
+def test_fairness_keeps_visible_output_rate_but_qualifies_effective_work(first, second, reason):
+    records = [r.model_copy(update=first if r.workload["user_id"] == "user-01" else second)
+               for r in fairness_records((4, 2))]
+    result = summarize(fairness_observation(records), records)
+    measured = fairness(result)
+    assert measured["status"] == result["status"] == "inconclusive"
+    assert measured["ratio"] == 1.5
+    assert [u["output_tokens_per_second"] for u in result["windows"][0]["users"]] == [40, 20]
+    assert any(reason in text for text in measured["reasons"])
+
+
+def test_equal_cache_and_reasoning_usage_can_still_qualify():
+    records = [r.model_copy(update={"cached_prompt_tokens": 50, "completion_tokens": 200,
+                                    "reasoning_tokens": 100}) for r in fairness_records()]
+    measured = fairness(summarize(fairness_observation(records), records))
+    assert measured["status"] == "pass"
+    assert [user["uncached_input_median_tokens"] for user in measured["users"]] == [50, 50]
+    assert [user["total_generated_median_tokens"] for user in measured["users"]] == [200, 200]
+
+
+def test_single_user_baseline_contributes_per_user_acceptance_but_not_fairness():
+    records = fairness_records()
+    source = fairness_observation(records)
+    source["settings"]["pass_criteria"]["max_completion_ms"] = 1500
+    solo_records = [r.model_copy(update={"id": "solo", "workload": {
+        **r.workload, "window_id": "multi_user_1_measurement", "population": 1}}) for r in records[:1]]
+    solo = observation(solo_records, users=("user-01",))
+    solo_window = solo["windows"][0]
+    solo_window["id"] = "multi_user_1_measurement"
+    solo["settings"] = source["settings"]
+    solo_result = summarize(solo, solo_records)
+    assert solo_result["status"] == "inconclusive"
+    assert solo_result["windows"][0]["status"] == "pass"
+    assert fairness(solo_result)["status"] == "not_applicable"
+    assert fairness(solo_result)["ratio"] is None
+
+    source["windows"].insert(0, solo_window)
+    mixed = summarize(source, solo_records + records)
+    assert mixed["status"] == "pass"
+    assert [w["fairness"]["status"] for w in mixed["windows"]] == ["not_applicable", "pass"]
+
+    solo_records[0].completed_ms = 1600
+    assert summarize(source, solo_records + records)["status"] == "fail"
+
+
 @pytest.mark.parametrize('change,reason', [
     ('think_plan', 'think'), ('actual_input', 'input'), ('actual_output', 'output'),
     ('early_eos', 'ended'), ('missing_input', 'usage'), ('missing_output', 'usage'),

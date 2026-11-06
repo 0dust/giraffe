@@ -174,7 +174,10 @@ def test_finite_user_request_comparisons_keep_phase_and_cohort():
         r.workload['cohort'] = 'shared'
     groups = _groups(records, 'service')
     assert len(groups) == 9
-    assert all(len(rows) == 1 for rows in groups.values())
+    for rows in groups.values():
+        role = rows[0].workload["role"]
+        assert all(row.workload["role"] == role for row in rows)
+        assert len(rows) == (4 if role == "sustained" else 1)
     assert all('shared' in scenario for check, scenario in groups)
     assert {r.workload['role'] for rows in groups.values() for r in rows} == {'control', 'sustained', 'lighter'}
 
