@@ -49,7 +49,8 @@ def test_ordinary_load_baseline_survives_optional_nonce_builder_argument(additio
 @pytest.mark.parametrize("old_source", [
     "113325dd5cffa04626cc7be7ee93bc6e9be67335531288bc329b3542a155c92a",
     "788f4c8f0b14421d5fc00f8b32c0ffcef79c04c647730767cb44b16584ed4aa4",
-], ids=["before-explicit-stage", "before-cutoff-fix"])
+    "4caab6e7a9eb457a5ceddf272112c434a97c101a2c27c3943f8a4155fb71bdb0",
+], ids=["before-explicit-stage", "before-cutoff-fix", "before-sending-close-guard"])
 def test_ordinary_load_baseline_survives_explicit_multi_user_stage(additional_checks, old_source):
     current, old, settings = load_reports()
     for report in (current, old):

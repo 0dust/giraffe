@@ -112,6 +112,75 @@ def test_peer_lost_while_waiting_for_slot_does_not_dispatch_or_leave_pending_wai
     run_virtual(monkeypatch, run())
 
 
+def test_peer_trigger_is_refreshed_after_waiting_for_http_lane(monkeypatch):
+    import httpx
+
+    from giraffe.client import LLMClient
+    from giraffe.models import LoadTestSettings
+    from giraffe.multi_user import run_window
+    from giraffe.transport import HTTPClientPool
+    from tests.test_review26_phase4_accuracy import run_virtual
+
+    class Stream(httpx.AsyncByteStream):
+        def __init__(self, output_delay, tail):
+            self.output_delay = output_delay
+            self.tail = tail
+
+        async def __aiter__(self):
+            await asyncio.sleep(self.output_delay)
+            yield b'data: {"choices":[{"delta":{"content":"K7P4"}}]}\n\n'
+            yield b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+            yield b'data: [DONE]\n\n'
+            await asyncio.sleep(self.tail)
+            yield b': transport tail\n\n'
+
+    async def run():
+        cfg = settings(levels=[2], duration_seconds=.075, profile=PROFILE,
+            scenarios=["noisy_neighbors"], noisy_neighbors={"heavy_user_ids": ["user-02"],
+                "heavy_profiles": ["long_short"], "triggers": ["before_output"]}).model_copy(
+                    update={"concurrency": 2, "stream": True})
+        target = cfg.targets[0]
+        state = runner._Run(cfg, None, None)
+        sent = []
+
+        async def respond(request):
+            if request.method == "GET":
+                return httpx.Response(200, stream=Stream(0, 0))
+            sent.append(asyncio.get_running_loop().time())
+            return httpx.Response(200, stream=Stream(.01, .03) if len(sent) == 1 else Stream(.05, 0))
+
+        client = LLMClient(target, cfg)
+        pool = client._client = HTTPClientPool(lambda: httpx.AsyncClient(transport=httpx.MockTransport(respond)), 2)
+        # Keep one lane occupied while the initial trigger expires and the peer restarts.
+        held = await pool.send(pool.build_request("GET", target.url), stream=True)
+
+        async def release_lane():
+            await asyncio.sleep(.055)
+            await held.aclose()
+
+        release = asyncio.create_task(release_lane())
+        window = _planned_observation(cfg.multi_user)["windows"][-1]
+        calibration = {(size, "short_answer"): {"filler_chars": 100} for size in ("short", "long")}
+        try:
+            await run_window(state, target, client, cfg.multi_user,
+                             LoadTestSettings(profile=cfg.multi_user.profile), calibration, window)
+        finally:
+            await release
+            await client.__aexit__(None, None, None)
+
+        assert sent == pytest.approx([0, .04, .055])
+        assert len(state.records) == state.attempted == state.budget_used == 3
+        assert state.slots.qsize() == 2
+        heavy, = [record for record in state.records if record.workload["user_id"] == "user-02"]
+        assert heavy.dispatch_ms == heavy.workload["trigger_ms"] == pytest.approx(55)
+        assert heavy.workload["trigger_peer_ids"] == ["user-01"]
+        assert heavy.workload["matched_work_sequence"] == heavy.workload["request_sequence"] == 1
+        assert window["users"][1]["ready_count"] == 2
+        assert window["users"][1]["dispatched_count"] == 1
+
+    run_virtual(monkeypatch, run())
+
+
 def test_matched_generated_work_does_not_repeat_prefixes_across_windows(monkeypatch):
     from giraffe.models import LoadTestSettings
     from giraffe.multi_user import run_window

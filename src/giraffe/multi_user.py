@@ -200,6 +200,19 @@ async def run_window(run, target, client, settings, load_settings, calibration, 
                 spec.scenario = scenario
                 spec.workload["conversation_sequence"] = conversation_sequence
 
+            def check_admission():
+                nonlocal peers, trigger_expired
+                if closed or time.monotonic() >= cutoff:
+                    return False
+                if eligible_peers:
+                    peers = eligible_peers()
+                    if not peers or user["pending_ready_ms"] is None:
+                        # An expired trigger cannot carry admission wait into a new opportunity.
+                        user["pending_ready_ms"] = None
+                        trigger_expired = True
+                        return False
+                return True
+
             def dispatched():
                 user["dispatched_count"] += 1
                 user["pending_ready_ms"] = None
@@ -227,6 +240,8 @@ async def run_window(run, target, client, settings, load_settings, calibration, 
                 spec.workload["ready_ms"] = ready
                 if eligible_peers:
                     trigger_waiters[user["user_id"]] = user
+                peers = []
+                trigger_expired = False
                 try:
                     async with run.slot(False, cutoff) as admitted:
                         if not admitted or closed or time.monotonic() >= cutoff:
@@ -234,14 +249,12 @@ async def run_window(run, target, client, settings, load_settings, calibration, 
                         if not run.allowed(target.name):
                             close(run.stop_reason(target.name) or "target request allowance exhausted")
                             return None
-                        peers = eligible_peers() if eligible_peers else []
-                        if eligible_peers and (not peers or user["pending_ready_ms"] is None):
-                            # An expired trigger cannot carry admission wait into a new opportunity.
-                            user["pending_ready_ms"] = None
-                            continue
                         try:
-                            return await run.request(target, client, spec, slot_reserved=True, admission_deadline=cutoff,
-                                                     event=progress, on_start=dispatched, finalize_record=finalized)
+                            record = await run.request(target, client, spec, slot_reserved=True,
+                                admission_deadline=cutoff, prepared_admission=True, admission_check=check_admission,
+                                event=progress, on_start=dispatched, finalize_record=finalized)
+                            if not trigger_expired:
+                                return record
                         finally:
                             active.pop(user["user_id"], None)
                             expire_trigger_admissions()
@@ -461,6 +474,7 @@ async def run_arrival_window(run, target, client, settings, load_settings, calib
         return spec
 
     lag_tolerance_ms = 100
+    admission_closed = asyncio.Event()
 
     async def send(spec, annotate):
         offer = offers[spec.workload["offer_index"]]
@@ -486,6 +500,7 @@ async def run_arrival_window(run, target, client, settings, load_settings, calib
         lag_deadline = math.nextafter(scheduled+lag_tolerance_ms/1000, math.inf)
         return await run.request(target, client, spec, slot_reserved=True, budget_reserved=True,
                                  admission_deadline=min(window_end, lag_deadline),
+                                 admission_check=lambda: not admission_closed.is_set(),
                                  on_start=started, finalize_record=finished)
 
     def stop():
@@ -509,7 +524,8 @@ async def run_arrival_window(run, target, client, settings, load_settings, calib
         check_id="multi_user", scenario=window["id"], run_start=run.start, return_evidence=True,
         on_drop=lambda: run.drop_offer(target.name, window["id"]),
         schedule_observations=stage_rows, schedule_stage_id=window["id"],
-        schedule_label=window["role"], schedule_pattern="steady_with_bursts" if bursts else "constant")
+        schedule_label=window["role"], schedule_pattern="steady_with_bursts" if bursts else "constant",
+        admission_closed=admission_closed)
     if staged_arrivals:
         sending, drain = stage_rows
         transitions.extend(_arrival_transitions(sending, activations, per_user_rate, window["planned_duration_seconds"]))

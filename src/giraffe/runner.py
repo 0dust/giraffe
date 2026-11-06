@@ -571,13 +571,17 @@ class _Run:
                 self.release_slot()
 
     async def request(self, target, client, spec, event=None, on_start=None, timeout_override=None,
-                      *, slot_reserved=False, budget_reserved=False, deadline_override=None, admission_deadline=None, budget_exempt=False, evaluate_record=None, finalize_record=None, request_parameters=None):
+                      *, slot_reserved=False, budget_reserved=False, deadline_override=None,
+                      admission_deadline=None, prepared_admission=False, admission_check=None,
+                      budget_exempt=False, evaluate_record=None, finalize_record=None, request_parameters=None):
         """Complete a request and persist its terminal evidence once.
 
         ``finalize_record`` synchronously adds scheduler-owned measurements before
         the evidence snapshot, including cancellation and postprocessing failures.
         ``admission_deadline`` closes dispatch only; admitted requests retain
         their ordinary timeout, unlike ``deadline_override``.
+        With ``prepared_admission``, HTTP preparation precedes admission and progress.
+        ``admission_check`` checks caller-owned eligibility before committing an attempt.
         """
         check_ids = [name for name in spec.check_ids if name in self.config.checks
                      and (not _stress(spec.scenario) or name not in {"access", "serving", "first_output", "generation"})
@@ -622,10 +626,12 @@ class _Run:
                     if now >= self.deadline or stopping:
                         self.mark_unfinished(target.name, _scenario_checks(spec))
                     raise _DispatchRefused
+                if admission_check is not None and not admission_check():
+                    raise _DispatchRefused
                 return now
 
-            open_loop = admission_deadline is not None and budget_reserved
-            guard_transport = open_loop and getattr(client, "_supports_dispatch_guard", False) is True
+            guard_admission = admission_deadline is not None and (budget_reserved or prepared_admission)
+            guard_transport = guard_admission and getattr(client, "_supports_dispatch_guard", False) is True
             key = (target.name, spec.scenario)
             global_deadline = False
             deadline = None
@@ -693,8 +699,8 @@ class _Run:
                 token = self.inflight.start(target.name)
                 if on_start:
                     on_start()
-                if open_loop and self.progress:
-                    # An open-loop offer enters transport before yielding to
+                if guard_admission and self.progress:
+                    # An admitted request enters transport before yielding to
                     # public progress. A synchronous observer cannot hold it
                     # past the checked admission boundary before dispatch.
                     pending_start = task.get_loop().call_soon(emit_scheduled_start)
