@@ -666,14 +666,13 @@ class _Run:
             try:
                 if on_start:
                     on_start()
-                if self.progress:
-                    if admission_deadline is not None and budget_reserved:
-                        # An open-loop offer enters transport before yielding to
-                        # public progress. A synchronous observer cannot hold it
-                        # past the checked admission boundary before dispatch.
-                        pending_start = task.get_loop().call_soon(emit_scheduled_start)
-                    else:
-                        emit_start()
+                if admission_deadline is not None and budget_reserved and self.progress:
+                    # An open-loop offer enters transport before yielding to
+                    # public progress. A synchronous observer cannot hold it
+                    # past the checked admission boundary before dispatch.
+                    pending_start = task.get_loop().call_soon(emit_scheduled_start)
+                else:
+                    emit_start()
                 request_timeout = (spec.request_timeout_seconds if spec.request_timeout_seconds is not None
                                    else self.config.request_timeout_seconds)
                 if deadline_override is not None:

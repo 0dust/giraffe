@@ -368,23 +368,39 @@ def test_shared_executor_preserves_exact_persistent_user_revision_for_legacy_che
     assert "Fixture pack identity differs." in _settings_reasons(current, old)
 
 
-def exact_conversation_reports(checks):
+def exact_conversation_reports(checks, **options):
     config = RunConfig(targets=[{"name": "local", "url": "http://localhost", "model": "test"}],
-                       checks=checks, sessions={"sampling": {"think_time_seconds": {"values": [0, .1]}}})
+                       checks=checks, sessions={"sampling": {"think_time_seconds": {"values": [0, .1]}}},
+                       **options)
     current, old = make_report(), make_report("baseline")
-    settings = {field: getattr(config, field).model_dump(mode="json")
-                for field in ("load_test", "sessions") if workloads.WORKLOAD_CHECKS[field].intersection(checks)}
+    settings = {}
+    for field, active_checks in workloads.WORKLOAD_CHECKS.items():
+        if active_checks.intersection(checks):
+            value = getattr(config, field)
+            settings[field] = value.model_dump(mode="json") if hasattr(value, "model_dump") else value
     for report, generator, sampler in (
         (current, "d9a9e921584262148e06b636f0e8f195b7e530fd2a69c5e98f013359cf947ede",
          "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4"),
         (old, "aee9ca71bc5ffd780d1574422b761e3177471a12f951a10b04322573ca062f76",
          "2fab1370faeab7ddb91a7ae9c0e49520ee9a67e305441a0663877bb12bca24c3"),
     ):
-        identity = {"generator_source_sha256": generator, "settings": deepcopy(settings)}
+        identity = {"generator_source_sha256": generator if any(settings.values()) else None,
+                    "settings": deepcopy(settings)}
         if "load" in checks:
             identity["load_test_source_sha256"] = "9b694c97a39d449d8ea15b09a9aeb406bf835179c0882827685c4d7888687d36"
         if "sessions" in checks:
             identity["session_sampling_source_sha256"] = sampler
+        if "tools" in checks:
+            from giraffe.tool_checks import resolved_tool_fixtures, resolved_tool_modes
+            from giraffe.tool_conversations import SOURCE_SHA256
+
+            tools = identity["resolved_tool_checks"] = {
+                "fixtures": [fixture.model_dump(mode="json") for fixture in resolved_tool_fixtures(config)],
+                "modes": resolved_tool_modes(config),
+            }
+            if config.tool_checks and config.tool_checks.conversations:
+                tools.update(conversations=[fixture.model_dump(mode="json") for fixture in config.tool_checks.conversations],
+                             conversation_source_sha256=SOURCE_SHA256)
         report.manifest["config"] = config.model_dump(mode="json")
         report.manifest["fixture_pack"] = {"workload_fixture_sha256": fixture_hash(identity)}
     return current, old
@@ -395,6 +411,35 @@ def test_exact_conversation_predecessor_keeps_ordinary_load_and_core_companions_
     current, old = exact_conversation_reports(checks)
     assert _settings_reasons(current, old) == []
     assert _settings_reasons(old, current) == []
+
+
+@pytest.mark.parametrize("checks", [["tools"], ["tools", "access"], ["tools", "sessions"]])
+def test_exact_conversation_predecessor_keeps_tool_workloads_comparable(checks):
+    current, old = exact_conversation_reports(checks)
+    assert _settings_reasons(current, old) == []
+    assert _settings_reasons(old, current) == []
+
+
+@pytest.mark.parametrize("change", [None, "modes", "conversation_source", "earlier_generator"])
+def test_exact_conversation_predecessor_attests_tool_conversation_identity(change):
+    from giraffe.tool_checks import default_tool_fixture
+    from tests.test_tool_conversations import fixture
+
+    tool_checks = {"fixtures": [default_tool_fixture()], "conversations": [fixture()], "modes": ["complete"]}
+    current, old = exact_conversation_reports(["tools"], tool_checks=tool_checks)
+    if change is None:
+        assert _settings_reasons(current, old) == []
+        return
+    if change == "modes":
+        _, old = exact_conversation_reports(["tools"], tool_checks={**tool_checks, "modes": ["stream"]})
+    else:
+        identity = _run_limits_workload_identity(old.manifest,
+            revision="phase3" if change == "earlier_generator" else "persistent_users")
+        assert identity is not None
+        if change == "conversation_source":
+            identity["resolved_tool_checks"]["conversation_source_sha256"] = "unreviewed-tool-conversation-source"
+        old.manifest["fixture_pack"]["workload_fixture_sha256"] = fixture_hash(identity)
+    assert "Fixture pack identity differs." in _settings_reasons(current, old)
 
 
 @pytest.mark.parametrize("change", ["load_source", "load_settings"])
