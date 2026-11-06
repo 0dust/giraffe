@@ -28,6 +28,13 @@ def _target_count(row, target):
     return row.get("target_request_counts", {}).get(target, row["requests_per_target"])
 
 
+def token_evidence_request_reserve(rows):
+    # Optional evidence probes must leave room for finite shared work, including
+    # bounded tool conversations that are excluded from the known request total.
+    return sum(row["requests_per_target"] or row.get("known_scheduled_requests", 0)
+               for row in rows if row["id"] != "gateway_attribution")
+
+
 def _warning_title(row):
     identifier = row["id"]
     check = {"initial": "access", "warm": "access", "context_first_batch": "context",
@@ -53,7 +60,8 @@ def _steady_count(rate: float, duration: float) -> int:
     return min(count, MAX_PLANNED_ARRIVALS)
 
 
-def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], observations=None) -> dict[str, Any]:
+def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], observations=None, *,
+               quotas: dict[str, int | None]) -> dict[str, Any]:
     """Describe known traffic time separately from requests at unknown speed."""
     from giraffe.latency import calibrated_context_fixtures, comparable_latency, input_bucket
 
@@ -62,6 +70,7 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
     observation_notes = []
     duration_estimates, duration_runs = {}, {}
     selected = set(config.checks)
+    evidence_reserve = max(1, token_evidence_request_reserve(rows))
     defer_attribution = deferred_for_shared_targets(config)
     attribution_steps = {"gateway_attribution", "gateway_attribution_preflight", "gateway_attribution_settle"}
     requirements = required_concurrency(config)
@@ -423,6 +432,12 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
                           config.request_timeout_seconds)
                     # Health polling and its inference probe share this timeout.
                     setup(target.name, name, row["title"], "readiness_timeout_seconds", config.readiness_timeout_seconds)
+                    # Readiness is budget-exempt. Optional streamed evidence
+                    # uses spare quota and shares one timeout across retries.
+                    quota = quotas[target.name]
+                    if config.stream and (quota is None or quota > evidence_reserve):
+                        setup(target.name, "performance_evidence_probe", "Streamed token and usage compatibility",
+                              "request_timeout_seconds", config.request_timeout_seconds)
                 continue
             if name == "gateway_attribution":
                 settings = config.gateway_attribution
@@ -1362,7 +1377,7 @@ def request_plan(config: RunConfig | ConfigDraft, *,
         warnings = [item for item in warnings if item not in {notice["msg"] for notice in notices}]
         warnings.append(combined["msg"])
     request_warnings = grouped
-    timing = _time_plan(config, rows, observations)
+    timing = _time_plan(config, rows, observations, quotas=quotas)
     warnings.extend(notice["msg"] for notice in timing["time_warnings"] if notice["msg"] not in warnings)
     for notice in [*concurrency_warnings, *load_warnings, *capacity_warnings,
                    *request_warnings, *timing["time_warnings"]]:

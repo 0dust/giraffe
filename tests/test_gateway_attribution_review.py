@@ -577,6 +577,45 @@ async def test_duration_remedy_covers_restart_and_attribution(monkeypatch, local
     assert "at least 5 seconds" in check.summary
 
 
+async def test_duration_remedy_includes_streamed_restart_compatibility(monkeypatch, local_tokenizer):
+    for ref in ("ALICE", "BOB", "OBSERVER"):
+        monkeypatch.setenv(ref, "secret-" + ref)
+    rows = []
+
+    async def handler(request):
+        if request.method == "GET":
+            if request.url.path == "/v1/models":
+                await asyncio.sleep(2.27)
+                return httpx.Response(200)
+            return spend_page(request, rows) if request.url.path == "/spend/logs/v2" else httpx.Response(404)
+        body = json.loads(request.content)
+        if marker := request.headers.get("x-litellm-trace-id"):
+            key = request.headers["authorization"].removeprefix("Bearer ")
+            rows.append({"request_id": str(len(rows)), "session_id": marker,
+                "metadata": {"spend_logs_metadata": json.loads(request.headers["x-litellm-spend-logs-metadata"])},
+                "api_key": hashlib.sha256(key.encode()).hexdigest(), "prompt_tokens": 3,
+                "completion_tokens": 5, "total_tokens": 8, "status": "success"})
+        await asyncio.sleep(.88 if marker or body.get("max_tokens") == 1 else .03)
+        return httpx.Response(200, content=(b'data: {"choices":[{"delta":{"content":"OK"}}]}\n\n'
+            b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+            b'data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":5}}\n\ndata: [DONE]\n\n'))
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
+    cfg = config(stream=True, restart_target="proxy", request_timeout_seconds=1, readiness_timeout_seconds=2.4)
+    cfg.targets[0].restart_command = [sys.executable, "-c", "import time; time.sleep(.87)"]
+    cfg.gateway_attribution.settle_seconds = .6
+    cfg.max_duration_seconds = 5.9
+
+    report = await run_suite(cfg)
+    assert report.observations["targets"]["proxy"]["restart"]["status"] == "ready"
+    assert [r.scenario for r in report.requests] == ["readiness", "performance_evidence_probe",
+                                                    "gateway_attribution", "gateway_attribution"]
+    check = next(item for item in report.checks if item.id == "gateway_attribution")
+    assert check.metrics["reason_code"] == "time_limited"
+    assert check.remediation == {"action": "set_limit", "limit": "max_duration", "minimum": 7}
+
+
 @pytest.mark.parametrize("overlap", [False, True])
 def test_duration_plan_keeps_attribution_after_all_shared_work(overlap):
     from tests.test_run_limits_phase4_planning import observations
