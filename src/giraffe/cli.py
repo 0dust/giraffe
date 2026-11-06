@@ -1181,6 +1181,8 @@ def _print_result(report: RunReport, json_path: Path, html_path: Path | None,
                 print("    " + " · ".join(str(window[key]) for key in ("scenario", "role", "trigger", "heavy_profile") if window.get(key)))
             if counts := window.get("offer_accounting"):
                 print("    Scheduled and achieved traffic: " + " · ".join(f"{key}: {value}" for key, value in counts.items()))
+                if bursts := window.get("burst_offer_accounting"):
+                    print("    Burst offers: " + " · ".join(f"{key}: {value}" for key, value in bursts.items()))
                 for user in window["users"]:
                     print(f"      {user['user_id']} / {user.get('cohort')} · scheduled/observed activation "
                           f"{user.get('scheduled_activation_ms')} / {user.get('activated_ms')} ms · "
