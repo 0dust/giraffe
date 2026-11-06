@@ -1535,6 +1535,7 @@ def _compare_user_fairness(current, previous, current_records, old_records):
     limit = old.get("threshold")
     latest_status = latest.get("status")
     recovery = current.get("scenario") == "recovery"
+    scheduled = recovery or current.get("scenario") == "arrivals"
     if (not all(fairness_applies(window) for window in (current, previous))
             or (recovery and not all(item.get("acceptance_applies") is True for item in (latest, old)))
             or limit is None or latest.get("threshold") != limit
@@ -1562,16 +1563,21 @@ def _compare_user_fairness(current, previous, current_records, old_records):
                     or abs(latest_exposure - old_exposure)*100 > min(latest_exposure, old_exposure)*tolerance):
                 comparable = False
                 break
-            cohorts = []
+            cohorts, delivery_cohorts = [], []
             for window, user, records, sample in (
                     (current, latest_users.get(user_id, {}), current_records, latest_sample),
                     (previous, old_users.get(user_id, {}), old_records, old_sample)):
-                cohort = user_delivery_completions(
-                    [records[rid] for rid in user.get("request_ids", []) if rid in records], window, user_id)
-                if not cohort or len(cohort) != sample.get("valid_samples"):
+                requests = [records[rid] for rid in user.get("request_ids", []) if rid in records]
+                delivery = user_delivery_completions(requests, window, user_id)
+                if not delivery or len(delivery) != sample.get("valid_samples"):
+                    comparable = False
+                    break
+                cohort = user_delivery_completions(requests, window, user_id, include_drain=True) if scheduled else delivery
+                if scheduled and len(cohort) != sample.get("work_samples"):
                     comparable = False
                     break
                 cohorts.append(cohort)
+                delivery_cohorts.append(delivery)
             if not comparable:
                 break
             if (latest_users[user_id]["profile"] != old_users[user_id]["profile"]
@@ -1579,7 +1585,7 @@ def _compare_user_fairness(current, previous, current_records, old_records):
                     or _user_token_work_changed(*cohorts, tolerance)):
                 comparable = False
                 break
-            evidence.extend(record.id for record in cohorts[0])
+            evidence.extend(record.id for record in delivery_cohorts[0])
 
     scenario, population = current["scenario"], current["population"]
     role = {"role": current["role"]} if recovery else {}
