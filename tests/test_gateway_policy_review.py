@@ -242,6 +242,9 @@ async def test_priority_matches_gateway_formatting_at_rounding_ties(monkeypatch,
     ((25.0, 25.0), False, None, "pass"),
     ((37.5, 25.0), False, "80", "inconclusive"),
     ((25.0, 25.0), False, "80", "pass"),
+    ((30.0, 30.0), True, "81", "inconclusive"),
+    ((30.3, 30.3), True, "66", "pass"),
+    ((30.0, 30.0), True, "081", "pass"),
 ])
 async def test_priority_rejections_share_one_counter_history(monkeypatch, reported, middle_charge, model_tpm, expected):
     from giraffe.runner import _Run
@@ -274,9 +277,11 @@ async def test_priority_rejections_share_one_counter_history(monkeypatch, report
             peer_started.set()
             await second_rejected.wait()
         if who == "limited" and sequence >= 3:
+            saturation = reported[sequence - 3]
+            headers["x-litellm-saturation"] = f"{saturation:.2f}%"
             tpm = f"Model TPM: {model_tpm}, " if model_tpm is not None else ""
             message = (f"Priority-based rate limit exceeded. Model: {MODEL_POOL}, Priority: low, Rate limit type: requests, "
-                       f"{tpm}Model RPM: 10, Remaining: 0, Model saturation: {reported[sequence - 3]}%")
+                       f"{tpm}Model RPM: 10, Remaining: 0, Model saturation: {saturation:.1f}%")
             return httpx.Response(429, headers=headers, json={"error": {"type": "throttling_error", "code": "429", "message": message}})
         return httpx.Response(200, headers=headers, json={"choices": [{"message": {"role": "assistant", "content": "OK"},
             "finish_reason": "stop"}], "usage": {"prompt_tokens": 8, "completion_tokens": 2}})

@@ -110,8 +110,10 @@ def response_evidence(status, body=b"", headers=None, *, declared_priority=None,
             if tier_match:
                 matches = tier_match[1] == declared_priority
                 evidence.priority_matches = matches if evidence.priority_matches is None else matches and evidence.priority_matches
-        # Only the canonical TPM field between the rate type and RPM fields can prove absence.
-        evidence._model_tpm_unconfigured = message[unit.end():rpm.start()] == " Model TPM: not configured"
+        tpm_field = message[unit.end():rpm.start()]
+        evidence._model_tpm_unconfigured = tpm_field == " Model TPM: not configured"
+        if tpm := re.fullmatch(r" Model TPM: ([1-9][0-9]{0,11})", tpm_field):
+            evidence._model_tpm = int(tpm[1])
         evidence._reported_saturation, evidence._saturation_bounds = _saturation_evidence(
             message[rpm.end():], headers.get("x-litellm-saturation"))
         if evidence._reported_saturation:

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import asyncio
-from bisect import bisect_left
+from bisect import bisect_left, bisect_right
 from decimal import Decimal
 from fractions import Fraction
 from math import ceil, floor, inf
@@ -12,7 +12,7 @@ from .identities import identity_headers, litellm_key_fingerprint
 from .models import CheckResult, RequestSpec
 
 
-VERSION = 11
+VERSION = 12
 PROMPT = "Reply with exactly the word OK."
 
 
@@ -108,14 +108,21 @@ def _completed_before_dispatch(admissions, record, *, after_ms=None):
                for other in admissions)
 
 
-def _least_reported_rpm_count(reported, model_rpm, minimum, maximum):
-    # Match LiteLLM's float percent formatting at the rounding boundaries.
-    formats = [(f".{-value.as_tuple().exponent}%", f"{value}%") for value in reported]
-    for count in range(minimum, maximum + 1):
-        saturation = count / model_rpm
-        if all(format(saturation, precision) == printed for precision, printed in formats):
-            return count
-    return None
+def _least_reported_count(reported, limit, minimum, maximum):
+    # Match LiteLLM's float percent formatting without scanning a whole TPM cap.
+    candidates = range(minimum, maximum + 1)
+    for printed in reported:
+        precision = f".{-printed.as_tuple().exponent}%"
+
+        def rounded(count):
+            return Decimal(format(count / limit, precision)[:-1])
+
+        first = bisect_left(candidates, printed, key=rounded)
+        last = bisect_right(candidates, printed, lo=first, key=rounded)
+        candidates = candidates[first:last]
+        if not candidates:
+            return None
+    return candidates[0] if candidates else None
 
 
 def summarize(settings, observation, records):
@@ -260,7 +267,12 @@ def summarize(settings, observation, records):
                                      max((saturation for _, _, saturation in preceding), default=0))
             if minimum_saturation > bounds[1]:
                 return outcome("unverified", "Reported saturation contradicts earlier limiter evidence in the isolated window.")
-            if rejection.gateway_evidence._model_tpm_unconfigured:
+            reported = rejection.gateway_evidence._reported_saturation
+            model_tpm = rejection.gateway_evidence._model_tpm
+            # LiteLLM reports the greater of RPM and TPM saturation. If no
+            # integer token count produces the reading, it must reflect RPM.
+            if (rejection.gateway_evidence._model_tpm_unconfigured or model_tpm is not None
+                    and _least_reported_count(reported, model_tpm, 0, model_tpm) is None):
                 # A recognized priority rejection changes neither counter. Other
                 # failures may have been charged before the gateway replied.
                 possible = sum(record.id not in rejected_ids and (
@@ -269,8 +281,7 @@ def summarize(settings, observation, records):
                 ) for record in records)
                 minimum_count = ceil(minimum_saturation * settings.model_rpm / 100)
                 maximum_count = min(possible, floor(bounds[1] * settings.model_rpm / 100))
-                least_matching = _least_reported_rpm_count(rejection.gateway_evidence._reported_saturation,
-                                                          settings.model_rpm, minimum_count, maximum_count)
+                least_matching = _least_reported_count(reported, settings.model_rpm, minimum_count, maximum_count)
                 if least_matching is None:
                     return outcome("unverified", "Reported saturation cannot match any possible model RPM count in the isolated window.")
                 if least_matching < crossing:
