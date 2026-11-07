@@ -811,6 +811,21 @@ def _live_input_work_changed(current, old, threshold, *, compare_output=False):
     return False
 
 
+def _fixed_generation_work_changed(current, old, threshold):
+    # Fixed fixtures identify logical turns across repetitions. Compare known
+    # totals for each turn so heavier and lighter turns cannot cancel out.
+    cohorts = []
+    for records in (current, old):
+        turns = defaultdict(list)
+        for record in records:
+            if record.workload.get("session_id") and record.workload.get("mode") == "fixed":
+                turns[record.fixture_id].append(_total_generated_tokens(record))
+        cohorts.append(turns)
+    latest, previous = cohorts
+    return any(_length_mix_differs([latest[turn], previous[turn]], threshold)
+               for turn in latest.keys() & previous.keys())
+
+
 def _load_not_delivered(point):
     # A higher-priority failure can own reason_code despite missing concurrency.
     # The flag applies only to concurrent points; older reports may omit it.
@@ -1661,8 +1676,9 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold):
                 or c["criteria"][name].get("missed") for name in failed_timing)
             attempt_failure = comparable_attempts and ("max_error_percent" in failed_criteria
                 or timing_exposed and (not failed_criteria
-                    or observed_timing_failure and not _live_input_work_changed(
-                        current_attempts, old_attempts, threshold, compare_output=True)))
+                    or observed_timing_failure and not (
+                        _live_input_work_changed(current_attempts, old_attempts, threshold, compare_output=True)
+                        or _fixed_generation_work_changed(current_attempts, old_attempts, threshold))))
             acceptance = {**row, "metric": "user_acceptance", "current": "fail", "baseline": "pass",
                           "aggregation": "selected_criteria", "observed_change": None, "observed_delta": None,
                           "current_samples": len(current_attempts), "baseline_samples": len(old_attempts),
@@ -1870,6 +1886,7 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                     metric_work_reason, metric_mix_changed = None, mix_changed
                     metric_input_changed, metric_output_changed = input_work_changed, different_work
                     metric_live_inputs, metric_live_output = live_inputs_differ, live_output_differs
+                    metric_fixed_output = False
                     if measured_conversation:
                         current_samples, old_samples = current_timing[metric], old_timing[metric]
                         metric_work_reason, metric_mix_changed = (
@@ -1882,6 +1899,7 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                         metric_live_inputs = _live_input_work_changed(current_samples, old_samples, threshold)
                         metric_live_output = (not metric_live_inputs and _live_input_work_changed(
                             current_samples, old_samples, threshold, compare_output=True))
+                        metric_fixed_output = _fixed_generation_work_changed(current_samples, old_samples, threshold)
                     warnings = []
                     initial_uncertainty = row["reason"] if row["status"] == "inconclusive" else None
                     def warn(code, message, *, preserve_failure=False):
@@ -1892,6 +1910,8 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                         warn("input_work_changed", "Observed input work or live generated histories differ; timing is not like-for-like.")
                     if metric_live_output and metric in TIMING_METRICS:
                         warn("output_work_changed", "Observed generated work differs at matching live conversation turns; timing is not like-for-like.")
+                    elif metric_fixed_output:
+                        warn("output_work_changed", "Observed total generation differs at matching fixed conversation turns. Timing requires comparable generated work.")
                     elif metric_output_changed and metric in {"latency_ms", "max_stream_gap_ms", "output_tokens_per_second", "generation_tokens_per_second"}:
                         warn("output_work_changed", "Actual generated output lengths differ materially: "
                              f"median {old_output['reported_output_tokens_p50']} → {current_output['reported_output_tokens_p50']} tokens "
