@@ -41,13 +41,14 @@ CHECK_NAMES = {
     "prefix": "Prefix cache",
     "sessions": "Multi-turn sessions",
     "multi_user": "Multi-user",
+    "gateway_policy": "Gateway quotas & priorities",
     "gateway_attribution": "Gateway usage attribution",
     "consistency": "Answer consistency",
     "tools": "Tool calling",
 }
 CATALOGUE_NAMES = INTERNAL_CHECK_NAMES = CHECK_NAMES
 # These checks compare their own declared workload and evidence.
-SHARED_BASELINE_EXCLUDED_WORKLOADS = frozenset({"gateway_attribution"})
+SHARED_BASELINE_EXCLUDED_WORKLOADS = frozenset({"gateway_attribution", "gateway_policy"})
 CORE_CHECKS = ("access", "serving", "first_output", "generation", "load", "context",
                "correctness", "json", "cancellation", "recovery", "gpu")
 DEFAULT_CHECKS = ("access", "serving", "correctness", "first_output")
@@ -883,6 +884,8 @@ def required_concurrency(config) -> dict[str, Any]:
                 peak = max(config.multi_user.levels)
             if scenarios & scheduled:
                 peak = max(peak, scheduled_multi_user_slots(config))
+        elif check == "gateway_policy":
+            peak = len(config.gateway_policy.users) if config.gateway_policy and config.gateway_policy.supported else 0
         elif check == "sessions":
             peak = min(config.sessions.concurrency, config.sessions.sessions)
         elif check == "consistency":
@@ -1107,6 +1110,57 @@ class MultiUserCriteria(Model):
     min_output_tokens_per_second: float | None = Field(default=None, gt=0)
     max_throughput_ratio: float | None = Field(default=None, ge=1)
     min_samples: StrictInt = Field(default=1, ge=1)
+
+
+class GatewayPolicyUser(Model):
+    identity: str = Field(pattern=r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
+    requests: StrictInt = Field(ge=1, le=100)
+    rpm: StrictInt = Field(ge=1, le=1000000)
+    priority: str | None = Field(default=None, pattern=r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
+
+
+class GatewayPolicy(Model):
+    auth_header: str = Field(default="Authorization", pattern=r"^[A-Za-z][A-Za-z0-9-]{0,63}$")
+    gateway: str = Field(default="litellm", min_length=1, max_length=64)
+    capability: str = Field(default="key_rpm", min_length=1, max_length=64)
+    gateway_version: str | None = Field(default=None, max_length=64)
+    affected_identity: str = Field(pattern=r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
+    users: list[GatewayPolicyUser] = Field(min_length=2, max_length=8)
+    duration_seconds: float = Field(default=15, gt=0, le=55)
+    interval_seconds: float = Field(default=.1, ge=.001, le=10)
+    max_output_tokens: StrictInt = Field(default=16, ge=1, le=256)
+    window_state: Literal["unknown", "isolated_fresh", "isolated_fresh_single_counter"] = "unknown"
+    model_rpm: StrictInt | None = Field(default=None, ge=1, le=1000000)
+    saturation_threshold: float | None = Field(default=None, ge=0, le=1)
+    saturation_cache_seconds: float | None = Field(default=None, ge=0, le=60)
+    named_reservations_confirmed: StrictBool = False
+
+    @property
+    def supported(self) -> bool:
+        return self.gateway == "litellm" and self.capability in {"key_rpm", "priority_rpm"}
+
+    @property
+    def custom_key_header(self) -> str | None:
+        return None if self.auth_header.lower() == "authorization" else self.auth_header
+
+    @model_validator(mode="after")
+    def valid_policy(self):
+        aliases = [user.identity for user in self.users]
+        if len(set(aliases)) != len(aliases) or self.affected_identity not in aliases:
+            raise ValueError("Policy users must be distinct and include the affected identity")
+        if not self.supported:
+            return self
+        if any(user.requests > user.rpm for user in self.users if user.identity != self.affected_identity):
+            raise ValueError("Peer offered request caps must stay within their declared RPM")
+        if self.capability == "priority_rpm":
+            tiers = [user.priority for user in self.users]
+            if None in tiers or len(set(tiers)) != len(tiers):
+                raise ValueError("Priority probes require a distinct declared tier for each identity")
+            if any(value is None for value in (self.model_rpm, self.saturation_threshold, self.saturation_cache_seconds)):
+                raise ValueError("Declare model RPM, saturation threshold and saturation cache seconds")
+            if sum(user.rpm for user in self.users) > self.model_rpm:
+                raise ValueError("Reserved RPM shares must not exceed model RPM")
+        return self
 
 
 class SessionSampling(Model):
@@ -2204,6 +2258,7 @@ class RunConfig(Model):
     _concurrency_warnings: list[dict[str, Any]] = PrivateAttr(default_factory=list)
     sessions: Sessions | None = None
     multi_user: MultiUser | None = None
+    gateway_policy: GatewayPolicy | None = None
     gateway_attribution: GatewayAttribution | None = None
     consistency: Consistency | None = None
     tool_calling: bool = False
@@ -2260,6 +2315,10 @@ class RunConfig(Model):
 
     @model_validator(mode="after")
     def validate_run(self) -> RunConfig:
+        if "gateway_policy" in self.checks and self.gateway_policy is not None and self.gateway_policy.supported:
+            for target in self.targets:
+                if any(user.identity not in target.test_identities for user in self.gateway_policy.users):
+                    raise ValueError("Every policy identity must be configured in each target's test_identities")
         if self.request_source == "request_pack":
             self.validate_request_pack_presence()
             if self.custom_fixtures:
@@ -2561,6 +2620,8 @@ class RunConfig(Model):
             result.pop("default_concurrency", None)
         if self.gateway_attribution is None:
             result.pop("gateway_attribution", None)
+        if self.gateway_policy is None:
+            result.pop("gateway_policy", None)
         return result
 
     @field_serializer("limits")
@@ -2719,7 +2780,26 @@ MAX_TOKENS_PER_READ = 16
 
 
 class GatewayResponseEvidence(PersistedModel):
+    _priority_model_group: str | None = PrivateAttr(default=None)
+    _response_cache_hit_reported: bool = PrivateAttr(default=False)
+    _saturation_bounds: tuple[Decimal, Decimal] | None = PrivateAttr(default=None)
+    _reported_saturation: tuple[Decimal, ...] = PrivateAttr(default=())
+    _model_tpm_unconfigured: bool = PrivateAttr(default=False)
+    _model_tpm: int | None = PrivateAttr(default=None)
+    _scoped_limits: dict[str, int | None] = PrivateAttr(default_factory=dict)
     error_kind: Literal["authentication", "model_access", "rate_limit", "unknown"] | None = None
+    policy_rejection: Literal["key_rpm", "priority_pool", "model_capacity", "unknown"] | None = None
+    request_limit: int | None = Field(default=None, ge=0)
+    request_remaining: int | None = Field(default=None, ge=0)
+    token_limit: int | None = Field(default=None, ge=0)
+    token_remaining: int | None = Field(default=None, ge=0)
+    retry_after_seconds: float | None = Field(default=None, ge=0)
+    rate_limit_unit: Literal["requests", "tokens", "unknown"] | None = None
+    priority_matches: bool | None = None
+    limiter_version: Literal["v3"] | None = None
+    priority_request_limit: int | None = Field(default=None, ge=0)
+    model_rpm: int | None = Field(default=None, ge=0)
+    saturation_percent: float | None = Field(default=None, ge=0, le=100)
 
 
 class RequestRecord(PersistedModel):

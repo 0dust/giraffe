@@ -556,6 +556,9 @@ class LLMClient:
         )
         selected_headers = None
         attribution = spec.identity is not None and "gateway_attribution" in spec.check_ids
+        policy_probe = spec.identity is not None and "gateway_policy" in spec.check_ids
+        priority_probe = (policy_probe and self.config.gateway_policy is not None
+                          and self.config.gateway_policy.capability == "priority_rpm")
         if spec.identity is not None:
             from .identities import identity_headers
             try:
@@ -748,15 +751,21 @@ class LLMClient:
                 record.backend_id = backend
             usage = data.get("usage")
             if isinstance(usage, dict):
-                count = _gateway_token_count if attribution else _token_count
+                count = _gateway_token_count if attribution or policy_probe else _token_count
                 prompt_tokens = count(usage.get("prompt_tokens"))
                 completion_tokens = count(usage.get("completion_tokens"))
                 cached = usage.get("prompt_tokens_details")
                 cached_tokens = count(cached.get("cached_tokens")) if isinstance(cached, dict) else None
                 details = usage.get("completion_tokens_details")
-                reasoning_tokens = count(details.get("reasoning_tokens")) if isinstance(details, dict) else None
-                if attribution:
-                    # Even a provisional frame must not supply unbounded counters.
+                if priority_probe and details is not None and not isinstance(details, dict):
+                    raise _ProtocolError("invalid completion token details in gateway response")
+                raw_reasoning_tokens = details.get("reasoning_tokens") if isinstance(details, dict) else None
+                reasoning_tokens = count(raw_reasoning_tokens)
+                if priority_probe:
+                    if raw_reasoning_tokens is not None and reasoning_tokens is None:
+                        raise _ProtocolError("invalid reasoning token usage in gateway response")
+                    _check_gateway_usage_total(prompt_tokens, completion_tokens, _gateway_usage_total(usage))
+                elif attribution or policy_probe:
                     _gateway_token_count(usage.get("total_tokens"))
                 record.input_tokens = prompt_tokens
                 record.completion_tokens = record.output_tokens = completion_tokens
@@ -795,6 +804,12 @@ class LLMClient:
                     record.assistant_message = {"role": "assistant", **content}
                 else:
                     assistant_content_present |= isinstance(content.get("content"), str)
+            if policy_probe:
+                if (content.get("role") != "assistant" or choice.get("finish_reason") not in ("stop", "length")
+                        or content.get("tool_calls") not in (None, []) or content.get("function_call") is not None):
+                    raise _ProtocolError("gateway policy probe requires a completed assistant answer")
+                for field in ("reasoning_content", "reasoning", "refusal"):
+                    _text(content.get(field))
             if (attribution and streaming and record.finish_reason is not None
                     and _has_post_finish_delta_payload(content)):
                 record._gateway_terminal_usage = False
@@ -965,14 +980,25 @@ class LLMClient:
                     record.http_status = response.status_code
                     if spec.identity is not None:
                         from .gateway_response import response_evidence
-                        record.gateway_evidence = response_evidence(response.status_code, headers=response.headers)
+                        record.gateway_evidence = response_evidence(response.status_code, headers=response.headers,
+                            declared_priority=spec.workload.get("declared_priority"))
                     record.backend_id = response.headers.get("x-backend-id") or response.headers.get(
                         "x-replica-id",
                     )
                     if not 200 <= response.status_code < 300:
                         error_body = await _limited_body(response, on_body=body_received)
                         if spec.identity is not None:
-                            record.gateway_evidence = response_evidence(response.status_code, error_body, response.headers)
+                            expected_key_hash = None
+                            policy = self.config.gateway_policy
+                            if (response.status_code == 429 and policy_probe
+                                    and policy is not None and policy.capability == "key_rpm"):
+                                from .identities import litellm_key_fingerprint
+
+                                expected_key_hash = litellm_key_fingerprint(
+                                    request.headers, auth_header=policy.custom_key_header,
+                                )
+                            record.gateway_evidence = response_evidence(response.status_code, error_body, response.headers,
+                                declared_priority=spec.workload.get("declared_priority"), expected_key_hash=expected_key_hash)
                         if spec.scenario == "connection" and response.status_code in {400, 404, 422}:
                             # Keep only the classification, never arbitrary server error text.
                             body = error_body.decode("utf-8", errors="replace").lower()
@@ -1066,7 +1092,8 @@ class LLMClient:
                             record.stream_end_ms = (at - start) * 1000
                         body = await _limited_body(response, on_read=body_read, on_body=body_received)
                         observed_at = start + record.stream_end_ms / 1000 if record.stream_end_ms is not None else time.perf_counter()
-                        data = _object(body, strict_gateway_json=True) if attribution else _object(body)
+                        data = (_object(body, strict_gateway_json=True)
+                                if attribution or policy_probe else _object(body))
                         receive(data, streaming=False, observed_at=observed_at)
                         usage = data.get("usage")
                         if attribution and isinstance(usage, dict):
