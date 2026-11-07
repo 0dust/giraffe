@@ -11,6 +11,7 @@ import pytest
 from giraffe import runner, traffic, load_test
 from giraffe.models import Limits, RequestRecord, TrafficConfig
 from giraffe.runner import run_suite
+from tests.test_arrival_end_to_end import assert_http_arrival_accounting, capacity, traffic_records
 from tests.test_concurrent_load import Client as TokenClient, configuration as load_configuration, short_windows
 from tests.fake_endpoint import FakeEndpoint
 from tests.test_load_reliability import LoadClient
@@ -227,16 +228,42 @@ async def test_arrivals_cancelled_at_run_deadline_are_not_a_pass():
 
 
 async def test_arrivals_without_timing_limit_are_inconclusive_and_pass_with_one():
-    with FakeEndpoint(first_token_delay=.05) as server:
-        c=load_configuration(targets=[{'name':'local','url':server.url,'model':'test'}],concurrency=16,load={'patterns':{'concurrent':{'enabled':False},'constant':{'enabled':True},'rates':[20]},'pass_criteria':{'max_completion_ms':None,'max_first_answer_ms':None}})
-        short_windows(c,.2)
-        unlimited=await run_suite(c)
-        c.load_test.pass_criteria.max_completion_ms=5000
-        limited=await run_suite(c)
-    result=next(v for v in unlimited.checks if v.id == 'load')
-    assert result.status == 'inconclusive' and result.metrics['highest_accepted'] == []
-    assert result.metrics['points'][0]['groups'][0]['reason_code'] == 'measure_only'
-    assert next(v for v in limited.checks if v.id == 'load').status == 'pass'
+    late_attempts = []
+    for _ in range(2):
+        with FakeEndpoint(first_token_delay=.05) as server:
+            cfg = load_configuration(
+                targets=[{"name": "local", "url": server.url, "model": "test"}], concurrency=16,
+                load={"patterns": {"concurrent": {"enabled": False}, "constant": {"enabled": True}, "rates": [20]},
+                      "pass_criteria": {"max_completion_ms": None, "max_first_answer_ms": None}},
+            )
+            short_windows(cfg, .2)
+            unlimited = await run_suite(cfg)
+            unlimited_payloads = list(server.requests)
+            cfg.load_test.pass_criteria.max_completion_ms = 5000
+            limited = await run_suite(cfg)
+            limited_payloads = server.requests[len(unlimited_payloads):]
+
+        late = []
+        for label, report, payloads in (("unlimited", unlimited, unlimited_payloads),
+                                        ("limited", limited, limited_payloads)):
+            assert_http_arrival_accounting(report, payloads, [4], other_requests=1)
+            assert all(record.valid and record.score is True for record in traffic_records(report))
+            point, = capacity(report).metrics["points"]
+            if point["late_arrivals"]:
+                lag_ms = max(offer["scheduler_lag_ms"] for offer in point["offers"])
+                late.append((label, point["late_arrivals"], round(lag_ms, 1)))
+        if not late:
+            break
+        # The timing limit comparison requires full delivery in both runs.
+        late_attempts.append(late)
+    else:
+        pytest.fail(f"Both HTTP comparisons had client scheduler drops (run, drops, max lag ms): {late_attempts}")
+
+    measured, accepted = capacity(unlimited), capacity(limited)
+    assert measured.status == "inconclusive" and measured.metrics["highest_accepted"] == []
+    assert measured.metrics["points"][0]["groups"][0]["reason_code"] == "measure_only"
+    assert accepted.status == "pass"
+    assert [entry["value"] for entry in accepted.metrics["highest_accepted"]] == [20]
 
 
 # recovery
