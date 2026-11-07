@@ -66,7 +66,7 @@ def user_delivery_completions(records: list[RequestRecord], window: dict[str, An
 
 def _user_summary(user: dict[str, Any], window: dict[str, Any], records: list[RequestRecord],
                   criteria: MultiUserCriteria, health: dict | None, lag: float,
-                  timing_threshold: float) -> dict[str, Any]:
+                  timing_threshold: float, *, conversation_modes=()) -> dict[str, Any]:
     start, end = window.get("start_ms"), window.get("end_ms")
     duration = max(0, (end-start)/1000) if start is not None and end is not None else 0
     rows = [r for r in records if r.workload.get("user_id") == user["user_id"]
@@ -82,8 +82,15 @@ def _user_summary(user: dict[str, Any], window: dict[str, Any], records: list[Re
     errors = [r for r in attempts if _error(r)]
     cancelled = [r for r in attempts if r.status == "cancelled"]
     terminal_failures = {r.id for r in errors + cancelled}
+    conversations = user.get("conversations", [])
     unadmitted_turn = any(item.get("stopped_before_cutoff") and terminal_failures.isdisjoint(item["turns"])
-                          for item in user.get("conversations", []))
+                          for item in conversations)
+    valid_ids = {record.id for record in valid}
+    expected_modes = set(conversation_modes) | {item["mode"] for item in conversations}
+    complete_modes = {item["mode"] for item in conversations if not item.get("stop_reason")
+                      and (turns := item["turns"]) and len(turns) == len(set(turns)) == item["planned_turns"]
+                      and valid_ids.issuperset(turns)}
+    missing_modes = sorted(expected_modes - complete_modes)
     eligible = user_delivery_completions(records, window, user["user_id"])
     unclassified = [r for r in valid if r.completed_ms is None]
     late = [r for r in valid if r.completed_ms is not None and r.completed_ms > end]
@@ -121,6 +128,8 @@ def _user_summary(user: dict[str, Any], window: dict[str, Any], records: list[Re
         incomplete.append("Some admitted work has incomplete terminal coverage.")
     if unadmitted_turn:
         incomplete.append("Some required conversation turns were not admitted before the window closed.")
+    if missing_modes:
+        incomplete.append(f"Conversation coverage is incomplete for {', '.join(missing_modes)}.")
     reasons = []
     selected = {}
     for name, first, metric in (("max_first_answer_ms", True, "first_output_ms"),
@@ -179,7 +188,7 @@ def _user_summary(user: dict[str, Any], window: dict[str, Any], records: list[Re
             reasons.append(f"Observed request error rate exceeds {criteria.max_error_percent:g}%.")
     if criteria.min_output_tokens_per_second is not None:
         interrupted = bool(window.get("cut_short") or window.get("drain_reason")
-                           or cancelled or missing_terminal or unadmitted_turn)
+                           or cancelled or missing_terminal or unadmitted_turn or missing_modes)
         failed = (bool(attempts) and not interrupted and rate is not None
                   and rate < criteria.min_output_tokens_per_second)
         selected["min_output_tokens_per_second"] = {
@@ -245,6 +254,7 @@ def _user_summary(user: dict[str, Any], window: dict[str, Any], records: list[Re
             "coverage": {"status": "unexercised" if not attempts else "partial" if coverage_reasons else "complete",
                          "reasons": coverage_reasons, "valid_samples": len(valid),
                          "unadmitted_conversation_turn": unadmitted_turn,
+                         "missing_conversation_modes": missing_modes,
                          "required_samples": criteria.min_samples,
                          "missing_first_answer_count": sum(value is None for value in ready_first),
                          "missing_completion_count": sum(value is None for value in ready_completion),
@@ -358,6 +368,8 @@ def _fairness(observation, window, users, records, criteria, health, lag, timing
             notes.append("Failed or incomplete requests prevent an equal-work comparison.")
         if user["coverage"]["unadmitted_conversation_turn"]:
             notes.append("Unadmitted conversation turns prevent an equal-work comparison.")
+        if user["coverage"]["missing_conversation_modes"]:
+            notes.append("Incomplete conversation mode coverage prevents an equal-work comparison.")
         if any(r.input_tokens is None or r.output_tokens is None for r in work):
             notes.append("Input or output usage is missing.")
         uncached = [_uncached_input_tokens(r) for r in samples]
@@ -443,7 +455,9 @@ def _fairness(observation, window, users, records, criteria, health, lag, timing
 def summarize(observation: dict[str, Any], records: list[RequestRecord], *,
               timing_health: dict | None = None, legacy_max_lag_ms: float = 0) -> dict[str, Any]:
     """Summarize the planned population without mutating its ledger or requests."""
-    criteria = MultiUserCriteria.model_validate(observation.get("settings", {}).get("pass_criteria", {}))
+    settings = observation.get("settings", {})
+    criteria = MultiUserCriteria.model_validate(settings.get("pass_criteria", {}))
+    modes = (settings.get("conversations") or {}).get("modes", ())
     timing_threshold = threshold(records)
     user_records = defaultdict(list)
     for record in records:
@@ -457,7 +471,8 @@ def summarize(observation: dict[str, Any], records: list[RequestRecord], *,
             windows.append({**window, "status": "warmup"})
             continue
         users = [_user_summary(user, window, user_records.get((window["id"], user["user_id"]), []),
-                               criteria, timing_health, legacy_max_lag_ms, timing_threshold)
+                               criteria, timing_health, legacy_max_lag_ms, timing_threshold,
+                               conversation_modes=modes if window["scenario"] == "repeated_conversations" else ())
                  for user in window["users"]]
         fairness = _fairness(observation, window, users, user_records, criteria, timing_health,
                              legacy_max_lag_ms, timing_threshold)

@@ -1292,7 +1292,7 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold):
         work_reason, mix_changed = _load_work_comparison(*comparable_work)
         if drain_comparison and _user_token_work_changed(*comparable_work, threshold):
             work_reason = "Observed work including drained requests differs or lacks token evidence."
-        live_work_changed = _live_input_work_changed(*comparable_work, threshold)
+        live_work_changed = _live_input_work_changed(*comparable_work, threshold, compare_output=True)
         missing = (not complete
                    or c_rate is None or b_rate is None or work_reason or mix_changed or live_work_changed)
         row = {"check": "multi_user", "scenario": " / ".join(map(str, key)),
@@ -1306,7 +1306,7 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold):
                "method": "Observed completed-output delivery over matching common windows; no cross-run confidence interval."}
         if missing:
             detail = (work_reason or "Requested work proportions differ." if mix_changed or work_reason else
-                      "Observed input work or live generated histories differ or lack evidence." if live_work_changed else
+                      "Observed work or live generated histories differ or lack evidence." if live_work_changed else
                       "Missing or incomplete shared-window coverage.")
             message = f"Multi-user {user_id} at {population} users: {detail}"
             row["reason"] = message
