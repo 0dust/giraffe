@@ -772,8 +772,7 @@ def _recovery(observation, window, control, sustained, user_records, criteria, h
                          for user in (sustained or {}).get("users", [])
                          for r in user_delivery_completions(
                              user_records.get((sustained["id"], user["user_id"]), []), sustained, user["user_id"])
-                         if r.stream and r.answer_reads >= 2 and r.answer_chunks >= 2
-                         and r.max_stream_gap_ms is not None
+                         if _has_streamed_answer(r) and r.max_stream_gap_ms is not None
                          and qualify([r], health, timing_threshold,
                              ("latency_ms", "first_output_ms", "max_stream_gap_ms"),
                              legacy_max_lag_ms=lag)["status"] == "qualified"]
@@ -837,7 +836,7 @@ def _recovery(observation, window, control, sustained, user_records, criteria, h
             if user["profile"].endswith("_long") and any(r.output_tokens is None or
                     r.output_tokens < (r.requested_output_tokens or 0)*(1-tolerance) for r in work):
                 notes.append(f"Actual {label} output did not exercise the requested shape.")
-            if any(not r.stream or r.answer_reads < 2 or r.max_stream_gap_ms is None for r in rows):
+            if any(not _has_streamed_answer(r) or r.max_stream_gap_ms is None for r in rows):
                 notes.append(f"Actual {label} stream gaps are unqualified.")
             if qualify(rows, health, timing_threshold, ("latency_ms", "first_output_ms", "max_stream_gap_ms"),
                        legacy_max_lag_ms=lag)["status"] != "qualified":
