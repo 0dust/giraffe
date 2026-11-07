@@ -694,7 +694,7 @@ async def test_exact_policy_predecessor_preserves_measured_multi_user(monkeypatc
                    multi_user={"levels": [2], "duration_seconds": .4,
                                "think_time_seconds": {"values": [.01]}})
     predecessor_generator = "e4ddc7a7e8563f9ab3bba2fc42ad0232ee924c65f67d92dafd89c21025d202d0"
-    predecessor_source = "254f6af45582b4b315363921484a0f28ee9aaa9c097cbad6dd136134353c5aef"
+    predecessor_source = "b3b429a9cdd15823b4d5f11b4eecfa0b7b1fbe625974622bf764f7426a8a9b2d"
     if companion == "load":
         options.update(checks=["multi_user", "load"], load_test=load_config(duration=1).load_test)
     with monkeypatch.context() as policy:
@@ -732,8 +732,9 @@ async def test_exact_policy_predecessor_preserves_measured_multi_user(monkeypatc
     changed_settings = {**identity["settings"],
                         "multi_user": {**identity["settings"]["multi_user"], "levels": [3]}}
     changes = [
-        # Earlier Policy reports used this source with the same generator.
+        # Earlier Policy reports used these sources with the same generator.
         ("multi_user_source_sha256", "bcef9038f2fc90862a69fde8d5529234b828757bb62f89468964ec5ee95c3d2e"),
+        ("multi_user_source_sha256", "254f6af45582b4b315363921484a0f28ee9aaa9c097cbad6dd136134353c5aef"),
         ("multi_user_window_policy", "unreviewed-window-policy"),
         ("generator_source_sha256", "unreviewed-generator"),
         ("settings", changed_settings),
