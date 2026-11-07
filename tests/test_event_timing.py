@@ -1,4 +1,5 @@
 """Socket-free, synthetic SSE endpoint with deterministic receipt timestamps."""
+import asyncio
 import json
 from types import SimpleNamespace
 
@@ -6,6 +7,7 @@ import httpx
 import pytest
 
 from giraffe.client import LLMClient
+from giraffe.concurrent_load import OutputProgress
 from giraffe.models import RequestRecord, RequestSpec, RunConfig, Target
 
 
@@ -40,7 +42,7 @@ class TimedStream(httpx.AsyncByteStream):
         self.closed = True
 
 
-async def execute(monkeypatch, events, *, stream=True, body=None, **spec_options):
+async def execute(monkeypatch, events, *, stream=True, body=None, progress=None, **spec_options):
     from giraffe import client as module
 
     clock = [0.0]
@@ -54,7 +56,8 @@ async def execute(monkeypatch, events, *, stream=True, body=None, **spec_options
         client._client = http
         try:
             record = await client.execute(RequestSpec(fixture_id="synthetic", scenario="serving",
-                check_ids=["serving"], messages=[{"role": "user", "content": "synthetic"}], **spec_options))
+                check_ids=["serving"], messages=[{"role": "user", "content": "synthetic"}], **spec_options),
+                first_output_event=progress)
         finally:
             await client.__aexit__()  # Join transport cleanup as a real client owner does.
     return record, source
@@ -166,6 +169,60 @@ def test_legacy_records_do_not_gain_new_timing_evidence():
     assert record.timing_schema == 0 and record.first_token_ms is None
     assert record.itl_ms is None and record.tpot_direct_ms is None and record.tpot_estimate_ms is None
     assert record.read_gaps_ms is None
+
+
+@pytest.mark.parametrize("intervening_reasoning", [False, True])
+async def test_literal_tag_prefix_keeps_first_token_receipt_time(monkeypatch, intervening_reasoning):
+    events = [(.1, sse({"content": "<"}, tokens=["<"]))]
+    if intervening_reasoning:
+        events.append((.2, sse({"reasoning_content": "thinking"})))
+    events += [(.4, sse({"content": "3"}, tokens=["3"])), (.5, sse(finish="stop")),
+               (.6, b"data: [DONE]\n\n")]
+    record, _ = await execute(monkeypatch, events)
+    assert record.valid and record.output == "<3"
+    assert record.first_token_ms == record.first_output_ms == 100
+    assert record.answer_read_timestamps_ms == [100, 400]
+    assert [e["at_ms"] for e in record.output_events if e["kind"] == "answer"] == [100, 400]
+
+
+@pytest.mark.parametrize("suffix", [None, "3"])
+async def test_load_progress_reports_literal_prefix_on_its_original_delta(monkeypatch, suffix):
+    progress = OutputProgress(asyncio.Event())
+
+    def events():
+        yield .1, sse({"content": "<"})
+        assert progress.first and progress.chunks == 1
+        if suffix is not None:
+            yield .4, sse({"content": suffix})
+            assert progress.chunks == 2
+        yield .5, sse(finish="stop")
+        assert progress.chunks == (1 if suffix is None else 2)
+        yield .6, b"data: [DONE]\n\n"
+
+    record, _ = await execute(monkeypatch, events(), progress=progress)
+    assert record.valid and record.first_token_ms == 100
+    assert record.answer_chunks == progress.chunks
+
+
+@pytest.mark.parametrize("split_prefix", [False, True])
+async def test_multi_user_progress_does_not_signal_answer_on_finish(monkeypatch, split_prefix):
+    from giraffe.multi_user import _UserOutputProgress
+
+    progress = _UserOutputProgress(asyncio.Event(), lambda: None)
+
+    def events():
+        if split_prefix:
+            yield .1, sse({"content": "<"})
+            assert not progress.first_token and not progress.first and progress.chunks == 0
+            yield .2, sse(finish="stop")
+        else:
+            yield .1, sse({"content": "A"}) + sse({"content": "B"}) + sse(finish="stop")
+        assert progress.finished and not progress.first and progress.chunks == 0
+        yield .3, b"data: [DONE]\n\n"
+
+    record, _ = await execute(monkeypatch, events(), progress=progress)
+    assert record.valid and record.first_token_ms == 100
+    assert record.answer_chunks == (1 if split_prefix else 2)
 
 
 async def test_inline_reasoning_classifies_reads_and_keeps_ttft(monkeypatch):

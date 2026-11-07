@@ -23,6 +23,7 @@ WINDOW_POLICY = "completed-output-v1"
 
 
 class _UserOutputProgress(OutputProgress):
+    requires_confirmed_answer = True
     first_token = False
     finished = False
 

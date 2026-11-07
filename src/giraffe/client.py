@@ -298,19 +298,19 @@ class _StreamGeneration:
     """Classify complete text while retaining a possible split inline delimiter."""
 
     def __init__(self):
-        self.pending: list[tuple[str, bool, bool]] = []
+        self.pending: list[tuple[str, float, bool, bool]] = []
         self.stack: list[str] = []
 
-    def receive(self, answer: str = "", reasoning: str = "", *,
-                final: bool = False) -> tuple[int, int, bool]:
-        """Return newly confirmed generation chunks, answer chunks, and token activity."""
+    def receive(self, at: float, answer: str = "", reasoning: str = "", *,
+                final: bool = False) -> tuple[int, int, float | None]:
+        """Return newly confirmed chunk counts and earliest generated-content receipt time."""
         counted = bool(reasoning.strip())
         if not self.pending and "<" not in answer:
             useful = bool(answer.strip())
-            return int(counted or useful), int(useful and not self.stack), bool(answer or reasoning)
+            return int(counted or useful), int(useful and not self.stack), at if answer or reasoning else None
 
-        parts = [*self.pending, (answer, counted, False)]
-        text = "".join(part for part, _, _ in parts)
+        parts = [*self.pending, (answer, at, counted, False)]
+        text = "".join(part for part, _, _, _ in parts)
         end = len(text)
         if not final:
             start = text.rfind("<", max(0, end - _MAX_REASONING_TAG_PREFIX))
@@ -319,6 +319,11 @@ class _StreamGeneration:
         confirmed = text[:end]
         # Preserve offsets so a split literal contributes at most once per SSE delta.
         generated = _mask_reasoning_tags(confirmed)
+        # Whitespace qualifies for TTFT. Skip only complete leading delimiters.
+        token_offset = 0
+        while match := _REASONING_TAG.match(confirmed, token_offset):
+            token_offset = match.end()
+        token_at = at if reasoning else None
         visible, cursor = [], 0
         for start, stop in _answer_spans(confirmed, stream_stack=self.stack):
             visible.extend((" " * (start - cursor), confirmed[start:stop]))
@@ -327,8 +332,10 @@ class _StreamGeneration:
 
         count, answers, offset = int(counted), 0, 0
         self.pending = []
-        for part, already_counted, already_answered in parts:
+        for part, received_at, already_counted, already_answered in parts:
             next_offset = offset + len(part)
+            if offset <= token_offset < min(next_offset, end):
+                token_at = received_at
             if not already_counted and generated[offset:next_offset].strip():
                 count += 1
                 already_counted = True
@@ -336,9 +343,9 @@ class _StreamGeneration:
                 answers += 1
                 already_answered = True
             if next_offset > max(end, offset):
-                self.pending.append((part[max(0, end - offset):], already_counted, already_answered))
+                self.pending.append((part[max(0, end - offset):], received_at, already_counted, already_answered))
             offset = next_offset
-        return count, answers, bool(reasoning or _REASONING_TAG.sub("", confirmed))
+        return count, answers, token_at
 
 
 class LLMClient:
@@ -629,6 +636,9 @@ class LLMClient:
         content_event_spans: list[tuple[dict[str, Any], int, int]] = []
         response_sequence = -1
         generation = _StreamGeneration()
+        confirmed_progress = getattr(first_output_event, "requires_confirmed_answer", False)
+        pending_live_first = False
+        pending_live_chunks = 0
         conversation = spec.workload.get("selection") == "conversation"
         logprob_collector = LogprobCollector(spec.workload["top_logprobs"], self.logprob_budget) if spec.workload.get("logprobs") and stream else None
         assistant_content_present = False
@@ -640,29 +650,34 @@ class LLMClient:
                 read_id += 1
                 body_received(size)
 
-        def first_token(at: float):
-            if record.first_token_ms is None:
-                record.first_token_ms = (at - start) * 1000
+        def first_token(at: float, *, notify=True):
+            at_ms = (at - start) * 1000
+            previous = record.first_token_ms
+            if previous is None or at_ms < previous:
+                record.first_token_ms = at_ms
                 record.first_token_reason = None
-                if first_output_event is not None and hasattr(first_output_event, "on_first_token"):
-                    first_output_event.on_first_token()
+            if previous is None and notify and hasattr(first_output_event, "on_first_token"):
+                first_output_event.on_first_token()
+
+        def notify_answer_chunks(chunks: int):
+            if hasattr(first_output_event, "on_answer_chunk"):
+                for _ in range(chunks):
+                    first_output_event.on_answer_chunk()
 
         def observe_generation(at: float, answer: str = "", reasoning: str = "", *, final=False):
-            chunks, answers, has_token = generation.receive(answer, reasoning, final=final)
-            if has_token:
-                first_token(at)
+            nonlocal pending_live_first, pending_live_chunks
+            chunks, answers, token_at = generation.receive(at, answer, reasoning, final=final)
+            if token_at is not None:
+                first_token(token_at, notify=not final)
             record.generation_chunks += chunks
-            if answers and first_output_event is not None:
-                if record.answer_chunks == 0 and tool_output is None:
-                    first_output_event.set()
-                if hasattr(first_output_event, "on_answer_chunk"):
-                    for _ in range(answers):
-                        first_output_event.on_answer_chunk()
+            if confirmed_progress and answers and not final:
+                pending_live_first |= record.answer_chunks == 0 and tool_output is None
+                pending_live_chunks += answers
             record.answer_chunks += answers
 
         def finish_progress(at: float):
             observe_generation(at, final=True)
-            if first_output_event is not None and hasattr(first_output_event, "on_stream_finished"):
+            if hasattr(first_output_event, "on_stream_finished"):
                 first_output_event.on_stream_finished()
 
         def output_event(kind: str, text: str, at: float, *, tokens=None):
@@ -701,6 +716,7 @@ class LLMClient:
 
         def receive(data: dict[str, Any], *, streaming: bool, observed_at: float) -> None:
             nonlocal last_answer, response_sequence, assistant_content_present, tool_output, reads_truncated
+            nonlocal pending_live_first
             server_id = data.get("id")
             if (spec.cancel_after_chunks is not None and isinstance(server_id, str)
                     and len(server_id) > MAX_SERVER_ID_CHARS):
@@ -830,9 +846,11 @@ class LLMClient:
                     if tool_output is None and (name or arguments):
                         tool_output = now
                         if record.first_output_ms is None:
-                            record.first_output_ms = (now-start)*1000
-                        if first_output_event is not None and record.answer_chunks == 0:
-                            first_output_event.set()
+                            record.first_output_ms = (now - start) * 1000
+                            if first_output_event is not None and (not confirmed_progress or not streaming):
+                                first_output_event.set()
+                        if streaming and confirmed_progress and record.answer_chunks == 0:
+                            pending_live_first = True
             if answer:
                 if record.finish_reason is not None:
                     raise _ProtocolError("answer content arrived after the finish reason")
@@ -846,13 +864,15 @@ class LLMClient:
                 if answer.strip():
                     if record.first_output_ms is None:
                         record.first_output_ms = (now - start) * 1000
-                        if not streaming and first_output_event is not None:
+                        if first_output_event is not None and (not confirmed_progress or not streaming):
                             first_output_event.set()
                     if streaming and last_answer is not None:
                         record.max_stream_gap_ms = max(
                             record.max_stream_gap_ms or 0, (now - last_answer) * 1000,
                         )
                     last_answer = now
+                    if streaming and not confirmed_progress:
+                        notify_answer_chunks(1)
                 if record.first_output_ms is not None:
                     record.last_output_ms = (now - start) * 1000
             if reasoning:
@@ -986,9 +1006,16 @@ class LLMClient:
                         chunk_limit = spec.cancel_after_chunks
                         terminal_usage = (None, None, None)
                         events = _sse_events(response, on_read=stream_body_received,
-                                             mark_read_end=chunk_limit is not None)
+                                             mark_read_end=chunk_limit is not None or confirmed_progress)
                         async for event_type, event, observed_at in events:
                             if event_type is None:
+                                # A finish in this read vetoes new Multi-user answer triggers.
+                                if confirmed_progress and record.finish_reason is None:
+                                    if pending_live_first:
+                                        first_output_event.set()
+                                    notify_answer_chunks(pending_live_chunks)
+                                    pending_live_first = False
+                                    pending_live_chunks = 0
                                 # Finish and [DONE] may already have arrived in this read.
                                 if (chunk_limit is not None and record.generation_chunks >= chunk_limit
                                         and record.finish_reason is None):
