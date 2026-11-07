@@ -4003,6 +4003,11 @@ async function startNewRun(){
   if(location.hash!=='#new'){location.hash='#new';return;}
   renderNew();enterRoute();window.scrollTo?.({top:0,left:0,behavior:'instant'});
 }
+function normalizeRateThreshold(config){
+  const result=clone(config),defaultValue=state.bootstrap.limits_schema?.properties?.regression_rate_points?.default;
+  if(defaultValue!==undefined){result.limits ||= {};if(result.limits.regression_rate_points==null)result.limits.regression_rate_points=defaultValue;}
+  return result;
+}
 async function rerun(){
   const version=state.routeVersion;let source=state.detail.report?.manifest?.config || state.detail.config;
   if(!source){toast('No configuration was saved for this run.');return;}
@@ -4011,11 +4016,7 @@ async function rerun(){
     try{const result=await api('/api/config/draft',{method:'POST',body:JSON.stringify(source)});if(version!==state.routeVersion)return;source=result.config;notes=result.migration_notes;}
     catch(error){toast(error.message);return;}
   }
-  source=clone(source);
-  source.limits ||= {};
-  if(source.limits.regression_rate_points == null){
-    source.limits.regression_rate_points=state.bootstrap.limits_schema.properties.regression_rate_points.default;
-  }
+  source=normalizeRateThreshold(source);
   replaceMigrationNotes(notes);state.config=clone(source);state.autoModel=null;state.setupStep=1;invalidateModelDiscovery();state.datasetSelection=[];state.config.restart_target=null;state.formMode='normal';state.formRestartTarget=null;state.jsonDraft=null;state.jsonBase=null;state.configView='form';configChanged();state.prefillBaseline=state.detail.baseline_id || '';location.hash='#new';
 }
 function portableConfig(payload) {return {...payload.config,restart_target:payload.mode==='cold-start'?payload.restart_target:null};}
@@ -4031,10 +4032,10 @@ async function restoreDraft() {
   try{
     const draft=JSON.parse(sessionStorage.getItem('giraffe-draft-v1'));
     const legacy=draft?.config?.config_version==null;
-    if(draft&&draft.config?.targets?.length&&(legacy||sameConfig(draft.bootstrap,state.bootstrap.config))){
+    if(draft&&draft.config?.targets?.length&&(legacy||sameConfig(draft.bootstrap&&normalizeRateThreshold(draft.bootstrap),normalizeRateThreshold(state.bootstrap.config)))){
       let config=draft.config,notes=[];
       if(legacy){const result=await api('/api/config/draft',{method:'POST',body:JSON.stringify(config)});config=result.config;notes=result.migration_notes || [];}
-      state.config=config;state.dismissedMigrationNotes=draft.dismissedMigrationNotes || [];
+      state.config=normalizeRateThreshold(config);state.dismissedMigrationNotes=draft.dismissedMigrationNotes || [];
       state.migrationNotes=[...new Set([...(draft.migrationNotes || []),...state.dismissedMigrationNotes,...notes])];
     }else sessionStorage.removeItem('giraffe-draft-v1');
   }catch{}
