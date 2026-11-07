@@ -1677,8 +1677,12 @@ main > #report-results { padding-top:20px; }
 .result-heading { padding:20px 24px; }
 .result-heading .run-meta { margin-top:8px; font-size:12px; }
 .result-heading > div:first-child > .hint { margin-top:6px; }
-.findings { display:grid; gap:10px; scroll-margin-top:145px; }
+.findings { display:grid; grid-template-columns:minmax(0,1fr); gap:10px; scroll-margin-top:145px; }
+.findings > *, .finding-expanded { min-width:0; }
 .finding-check { padding:14px 18px; min-width:0; }
+.multi-user-results { min-width:0; padding:14px 0 20px; }
+.multi-user-results > .check-observations { padding:14px 0 20px; }
+.multi-user-results .metric-table { max-width:100%; overflow-x:auto; }
 .finding-check-heading { display:flex; justify-content:space-between; gap:12px; align-items:center; }
 .finding-check-heading h2 { margin:0; font-size:15px; }
 .finding-check-heading button { text-align:left; font:inherit; }

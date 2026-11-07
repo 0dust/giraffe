@@ -112,6 +112,10 @@ def condition_display_name(scenario: str, workload: Mapping[str, Any] | None = N
 def _identity(scenario: str, workload: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Return a stable condition and plain label without changing request metadata."""
     workload = workload or {}
+    if users := re.fullmatch(r"multi_user_(\d+)_(warmup|measurement)", scenario):
+        level, phase = users.groups()
+        return {"id": scenario, "label": f"{int(level)} users · {phase}",
+                "check": "multi_user", "population": int(level), "phase": phase}
     if calibration := re.fullmatch(r"load_calibration_v45_(short|medium|long)_(short_answer|long_output)", scenario):
         return {"id": scenario, "label": f"Calibrating {calibration[1]} input tokens", "check": "load", "load_type": "calibration"}
     if comparison := re.fullmatch(r"load_(?:primary|legacy_.+?)_interference_c(\d+)\.(baseline|probe)(?:\..+)?", scenario):
@@ -200,6 +204,7 @@ def _identity(scenario: str, workload: Mapping[str, Any] | None = None) -> dict[
 
 
 _PURPOSES = {
+    "multi_user": "Measures each persistent user over the same window while sharing request slots.",
     "load": "Measures selected request shapes under maintained concurrency, arrivals or bursts; compares delivery and per-response criteria.",
     "concurrency": "Measures serving under sustained request concurrency with individually replenished slots.",
     "access": "Checks that the server is reachable and can answer a request.",

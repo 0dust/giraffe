@@ -504,6 +504,10 @@ def _track_live_request(job: dict, event: dict, max_requests: int | None) -> Non
         request = {**event["request"], "slot": slot, "intentional": event.get("intentional", False)}
     else:
         return
+    if isinstance(event.get("user"), dict):
+        request["workload"] = {key: value for key, value in event["user"].items()
+                               if key in {"user_id", "population", "profile", "window_id", "phase", "request_sequence"}
+                               and (type(value) is int or isinstance(value, str) and len(value) <= 128)}
     request.update({key: event.get(key) for key in
                     ("input_chars", "requested_max_tokens", "requested_input_tokens")})
     if summary["through_slot"] is not None and slot <= summary["through_slot"]:
