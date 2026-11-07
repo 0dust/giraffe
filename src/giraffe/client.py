@@ -194,6 +194,22 @@ def _text(value: Any) -> str:
     return value
 
 
+def _has_post_finish_delta_payload(delta: dict[str, Any]) -> bool:
+    """Qualify marked usage only when later choice deltas carry no new output."""
+    metadata = {"audio": {"id", "expires_at"}, "function_call": set(),
+                "provider_specific_fields": {"annotations", "citations"}}
+    empty = (None, "", [], {})
+    for field, value in delta.items():
+        if field in {"annotations", "citations"} or (field == "role" and value == "assistant"):
+            continue
+        if field in metadata and isinstance(value, dict):
+            if any(name not in metadata[field] and part not in empty for name, part in value.items()):
+                return True
+        elif value not in empty:
+            return True
+    return False
+
+
 def _token_count(value: Any) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
 
@@ -749,6 +765,11 @@ class LLMClient:
                     record.assistant_message = {"role": "assistant", **content}
                 else:
                     assistant_content_present |= isinstance(content.get("content"), str)
+            if (attribution and streaming and record.finish_reason is not None
+                    and _has_post_finish_delta_payload(content)):
+                record._gateway_terminal_usage = False
+                kind = "reasoning" if content.get("reasoning_content") or content.get("reasoning") else "generated"
+                raise _ProtocolError(f"{kind} content arrived after the finish reason")
             answer = _text(content.get("content"))
             if logprob_collector is not None:
                 logprob_collector.add(choice.get("logprobs"))
@@ -756,17 +777,6 @@ class LLMClient:
                 record.logprob_evidence = self.logprob_budget.collect(choice.get("logprobs"), answer,
                                                           spec.workload["top_logprobs"])
             reasoning = _text(content.get("reasoning_content") or content.get("reasoning"))
-            if attribution and streaming and record.finish_reason is not None:
-                if reasoning:
-                    record._gateway_terminal_usage = False
-                    raise _ProtocolError("reasoning content arrived after the finish reason")
-                function_call = content.get("function_call")
-                audio = content.get("audio")
-                if (content.get("refusal")
-                        or (isinstance(function_call, dict) and (function_call.get("name") or function_call.get("arguments")))
-                        or (isinstance(audio, dict) and (audio.get("data") or audio.get("transcript")))):
-                    record._gateway_terminal_usage = False
-                    raise _ProtocolError("generated content arrived after the finish reason")
             now = observed_at
             if streaming:
                 token_evidence = choice.get("logprobs")

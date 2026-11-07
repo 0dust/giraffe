@@ -209,6 +209,14 @@ async def test_reasoning_after_terminal_usage_invalidates_marked_stream(monkeypa
     {"function_call": {"arguments": '{"n":1}'}},
     {"audio": {"data": "dGVzdA=="}},
     {"audio": {"transcript": "spoken answer"}},
+    {"audio": {"provider_audio_delta": "new samples"}},
+    {"thinking_blocks": [{"type": "thinking", "thinking": "late reasoning", "index": 0}]},
+    {"reasoning_items": [{"type": "reasoning", "summary": [{"text": "late reasoning"}]}]},
+    {"images": [{"type": "image_url", "image_url": {"url": "https://example.com/image"}}]},
+    {"compaction_blocks": [{"type": "compaction", "content": "late summary"}]},
+    {"provider_specific_fields": {"compaction_blocks": [{"type": "compaction", "content": "late summary"}]}},
+    {"provider_output": "unknown generated output"},
+    {"provider_output": False},
 ])
 @pytest.mark.parametrize("placement", ["usage", "late"])
 async def test_generated_delta_after_finish_invalidates_marked_usage(monkeypatch, delta, placement):
@@ -226,8 +234,13 @@ async def test_generated_delta_after_finish_invalidates_marked_usage(monkeypatch
     ({"audio": {"data": "dGVzdA==", "transcript": "spoken answer"}}, "finish"),
     ({"audio": {"id": "audio_1", "expires_at": 2_000_000_000}}, "usage"),
     ({"audio": {"expires_at": 2_000_000_000}}, "late"),
+    ({"thinking_blocks": [{"type": "thinking", "thinking": "final reasoning", "index": 0}]}, "finish"),
+    ({"role": "assistant", "content": None, "thinking_blocks": [], "reasoning_items": None}, "usage"),
+    ({"content": "", "provider_output": None, "images": [], "function_call": {"name": "", "arguments": None}}, "late"),
+    ({"annotations": [{"type": "url_citation", "url_citation": {"url": "https://example.com/source"}}]}, "usage"),
+    ({"provider_specific_fields": {"citations": [{"url": "https://example.com/source"}]}}, "late"),
 ])
-async def test_final_generation_and_audio_metadata_preserve_marked_usage(monkeypatch, delta, placement):
+async def test_final_generation_and_metadata_preserve_marked_usage(monkeypatch, delta, placement):
     _, _, check, _, _ = await exercise(monkeypatch, stream_delta=delta, delta_placement=placement)
     assert check.status == "pass" and check.metrics["matched_requests"] == 2
 
@@ -346,7 +359,7 @@ async def test_attribution_baseline_compares_qualified_aliases(monkeypatch, mode
 
 
 @pytest.mark.usefixtures("local_tokenizer")
-@pytest.mark.parametrize("version", [None, 2, 3, 6])
+@pytest.mark.parametrize("version", [None, 2, 3, 6, 8])
 async def test_legacy_attribution_baseline_requires_a_fresh_collection(monkeypatch, version):
     from giraffe.reporting import compare_baseline
     _, report, _, _, _ = await exercise(monkeypatch, full=True)
