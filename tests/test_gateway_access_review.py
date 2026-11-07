@@ -976,7 +976,7 @@ async def test_access_denial_rules_do_not_change_policy_evidence(monkeypatch, lo
     assert check.status == "pass"
     baseline = report.model_copy(deep=True)
     # A passing quota run saved on the immediate policy predecessor, before gateway access.
-    baseline.manifest["gateway_policy_source_sha256"] = "101ad4d1a0b1809ee20ab91f5aedc1f340c5c9a0a9568a078504ec9616088b1d"
+    baseline.manifest["gateway_policy_source_sha256"] = "0c4e52aacf84d195615ccce1ed1d4cb2080f3bc62c375b8ea92c5fb6aedb0a2a"
     assert compare_baseline(report, baseline).baseline["status"] == "pass"
 
 
@@ -1238,3 +1238,31 @@ async def test_access_baseline_scopes_settings_and_identity_references_to_its_ca
     assert target["status"] == "inconclusive"
     assert "No comparable verdict metric for selected check(s): gateway_access" in target["summary"]
     assert any(row["check"] == "serving" and row["status"] == "pass" for row in target["comparisons"])
+
+
+async def test_oversized_access_usage_preserves_shared_report(monkeypatch):
+    monkeypatch.setenv("ALLOW_KEY", "allow-secret")
+    monkeypatch.setenv("DENY_KEY", "deny-secret")
+
+    def handler(request):
+        if request.method != "POST":
+            return httpx.Response(404)
+        authorization = request.headers.get("authorization")
+        if authorization == "Bearer deny-secret":
+            return httpx.Response(403, json={"error": {"type": "key_model_access_denied", "param": "model"}})
+        return httpx.Response(200, json={"choices": [{"message": {
+            "role": "assistant", "content": "OK"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 8, "completion_tokens": 10 ** 400 if authorization else 2}})
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
+    cfg = config(retention="all", samples=2)
+    cfg.checks = ["serving", "gateway_access"]
+    report = await run_suite(cfg)
+    checks = {check.id: check for check in report.checks}
+    assert checks["serving"].status == "pass"
+    access = checks["gateway_access"]
+    assert access.status == "inconclusive"
+    assert [case["observed"] for case in access.metrics["gateway_access"]["cases"]] == ["unverified", "deny"]
+    rejected = next(record for record in report.requests if record.identity == "allowed")
+    assert rejected.status == "failed" and rejected.output_tokens is None

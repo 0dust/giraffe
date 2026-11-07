@@ -328,6 +328,12 @@ export function multiUserSettings(config, defaults) {
   return result;
 }
 
+function textareaValue(saved, entered) {
+  const text=String(entered ?? '').replace(/\r\n?/g,'\n');
+  // HTML parsing normalizes line endings and drops the first textarea newline.
+  return typeof saved==='string' && saved.replace(/\r\n?/g,'\n').replace(/^\n/,'')===text ? saved : text;
+}
+
 export function configureMultiUser(source, values, defaults, {allowInvalid=false}={}) {
   const config=structuredClone(source);
   if(!values.has('multi_user_rendered'))return config;
@@ -382,9 +388,8 @@ export function configureMultiUser(source, values, defaults, {allowInvalid=false
       for(const name of ['max_tokens','delay_seconds'])if(values.has(prefix+name))conversation[name]=number('conversation_'+name,name);
       if(values.has(prefix+'modes'))conversation.modes=profile==='performance'?['live']:String(values.get(prefix+'modes')).split(',');
       if(values.has(prefix+'turns')){
-        const text=String(values.get(prefix+'turns')).replace(/\r\n?/g,'\n');
-        // Textareas normalize line endings and omit the first newline in their HTML content.
-        const saved=conversation.turns?.join('\n').replace(/\r\n?/g,'\n').replace(/^\n/,'');
+        const saved=conversation.turns?.join('\n');
+        const text=textareaValue(saved,values.get(prefix+'turns'));
         if(text!==saved)conversation.turns=text.split('\n');
       }
       if(values.has(prefix+'sampling_seed')){
@@ -398,13 +403,18 @@ export function configureMultiUser(source, values, defaults, {allowInvalid=false
         conversation.sampling=Object.keys(sampling).length>1?sampling:null;
       }
       if(profile==='performance'&&values.has(prefix+'task_count')){
+        const savedTasks=new Map((conversation.workloads || []).map(task=>[task.name,task]));
         conversation.workloads=[];
         for(let i=0;i<Number(values.get(prefix+'task_count'));i++){
-          if(values.get(prefix+`task_${i}_enabled`)!=='on')continue;
-          conversation.workloads.push({name:String(values.get(prefix+`task_${i}_name`)||'').trim(),
+          const taskPrefix=prefix+`task_${i}_`;
+          if(values.get(taskPrefix+'enabled')!=='on')continue;
+          const name=String(values.get(taskPrefix+'name')||'').trim();
+          const saved=JSON.parse(values.get(taskPrefix+'original_turns') || 'null') ?? savedTasks.get(name)?.turns;
+          conversation.workloads.push({name,
             weight:number(`conversation_task_${i}_weight`,'Task weight'),
             max_tokens:number(`conversation_task_${i}_cap`,'Task output cap'),
-            turns:Array.from({length:Number(values.get(prefix+`task_${i}_turn_count`))},(_,turn)=>String(values.get(prefix+`task_${i}_turn_${turn}`)||''))});
+            turns:Array.from({length:Number(values.get(taskPrefix+'turn_count'))},(_,turn)=>
+              textareaValue(saved?.[turn],values.get(taskPrefix+`turn_${turn}`)))});
         }
         if(!conversation.workloads.length&&!allowInvalid)throw new Error('Select at least one conversation task.');
       }

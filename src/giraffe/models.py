@@ -3140,12 +3140,14 @@ class RunReport(PersistedModel):
         self._stored_derived = "performance" in self.model_fields_set
         if not (info.context or {}).get("metadata_only"):
             from .performance import build_performance
-            from .conditions import aggregate_conditions
+            from .conditions import aggregate_conditions, scheduled_multi_user_window
 
             missing = {"performance", "conditions"} - self.model_fields_set
             if "performance" in missing or self._stored_derived:
                 self.performance = build_performance(self)
-            if "conditions" in missing:
+            if "conditions" in missing or any(
+                    row.get("planned_kind") != "exact" and scheduled_multi_user_window(row.get("condition_id"))
+                    for row in self.conditions):
                 self.conditions = aggregate_conditions(self)
         return self
 

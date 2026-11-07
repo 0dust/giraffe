@@ -643,15 +643,19 @@ def _planned_observation(settings, *, include_offers=True):
             "windows": windows, "calibrations": []}
 
 
+def _plan_condition(run, target, window):
+    planned = window.get("scheduled_offers")
+    run.plan_condition(target.name, window["id"], {"population": window["population"], "phase": window["phase"]},
+                       planned=planned, planned_kind="exact" if planned is not None else "duration")
+
+
 async def execute(run, target, client):
     settings = run.config.multi_user
     observation = _planned_observation(settings)
     windows = observation["windows"]
     run.observations[target.name]["multi_user"] = observation
     for window in windows:
-        run.plan_condition(target.name, window["id"],
-                           {"population": window["population"], "phase": window["phase"]},
-                           planned=None, planned_kind="duration")
+        _plan_condition(run, target, window)
     load_settings = LoadTestSettings(profile=settings.profile,
                                      request_timeout_seconds=run.config.request_timeout_seconds)
     if run.config.custom_fixtures:
@@ -743,6 +747,11 @@ def result(run, target):
     summary = summarize(observation, records, timing_health=health.snapshot() if health else None,
                         legacy_max_lag_ms=run.max_lag_ms)
     observation["summary"] = summary
+    for window in summary["windows"]:
+        if "scheduled_offers" in window:
+            if (target.name, window["id"]) not in run.conditions:
+                _plan_condition(run, target, window)
+            run.finish_condition(target.name, window["id"], reason=window["reason"], verdict=window["status"])
     status = summary["status"]
     if status == "measured":
         message = "Per-user delivery measured; no acceptance criteria selected."

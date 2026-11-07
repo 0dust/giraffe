@@ -68,7 +68,9 @@ async def exercise(monkeypatch, mode="key_rpm", *, behavior="enforce", full=Fals
                    "x-litellm-priority": priority, "retry-after": "1" if behavior == "short_bucket_reset" else "60",
                    "x-litellm-rate-limiter-version": "v3",
                    "x-ratelimit-priority_model-limit-requests": str(user.rpm)}
-        threshold = admitted_affected if admitted_affected is not None else {"overadmit": 3, "early": 1}.get(behavior, 2)
+        threshold = admitted_affected if admitted_affected is not None else {
+            "overadmit": 3, "malformed_affected_admission": 3, "early": 1,
+        }.get(behavior, 2)
         bucket_reset = behavior == "short_bucket_reset" and counts[who] == 5
         if early_peer_admissions is not None:
             if who == "limited" and counts[who] == threshold:
@@ -97,9 +99,27 @@ async def exercise(monkeypatch, mode="key_rpm", *, behavior="enforce", full=Fals
             return httpx.Response(429, headers=headers, json={"error": {
                 "type": "throttling_error", "code": "429", "message": message}})
         admitted += 1
+        if behavior == "malformed_affected_admission" and who == "limited" and counts[who] == 3:
+            return httpx.Response(200, headers=headers, json={"error": {"type": "proxy_local_failure"}})
         usage = {"prompt_tokens": 8, "completion_tokens": 2, "total_tokens": 10}
         if behavior == "missing_usage":
             usage = {}
+        if who == "peer" and behavior == "peer_conflicting_total":
+            usage["total_tokens"] = 99
+        if who == "peer" and behavior == "peer_omitted_total":
+            del usage["total_tokens"]
+        if who == "peer":
+            huge = 10**309
+            if behavior == "peer_unbounded_completion":
+                usage.update(completion_tokens=huge, total_tokens=huge + 8)
+            elif behavior == "peer_unbounded_reasoning":
+                del usage["total_tokens"]
+                usage["completion_tokens_details"] = {"reasoning_tokens": huge}
+            elif behavior == "peer_unbounded_cached":
+                del usage["total_tokens"]
+                usage["prompt_tokens_details"] = {"cached_tokens": huge}
+            elif behavior == "peer_unbounded_total":
+                usage["total_tokens"] = huge
         if behavior == "reasoning_work" and who == "limited":
             usage = {"prompt_tokens": 8, "completion_tokens": 128,
                      "completion_tokens_details": {"reasoning_tokens": 126}}

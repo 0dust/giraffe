@@ -12,7 +12,7 @@ from .identities import gateway_identities_only, identity_headers, litellm_key_f
 from .models import CheckResult, RequestSpec
 
 
-VERSION = 20
+VERSION = 21
 PROMPT = "Reply with exactly the word OK."
 
 
@@ -163,6 +163,11 @@ def _scoped_limit_conflicts(record, expected):
     )
 
 
+def _proven_admission(record):
+    return (record.status == "completed" and record.valid
+            and record.http_status is not None and 200 <= record.http_status < 300)
+
+
 def summarize(settings, observation, records):
     users = []
     for user in settings.users if settings else []:
@@ -170,7 +175,7 @@ def summarize(settings, observation, records):
         completed = [record for record in own if record.status == "completed" and record.valid]
         users.append({"identity": user.identity, "declared_rpm": user.rpm, "priority": user.priority,
             "planned": user.requests, "dispatched": len(own), "completed": len(completed),
-            "admitted": sum(record.http_status is not None and 200 <= record.http_status < 300 for record in own),
+            "admitted": sum(_proven_admission(record) for record in completed),
             "rejected": sum(record.http_status == 429 for record in own),
             "other_failures": sum((record.status in {"failed", "timeout"} or record.status == "completed" and not record.valid) and record.http_status != 429 for record in own),
             "cancelled": sum(record.status == "cancelled" for record in own),
@@ -223,10 +228,9 @@ def summarize(settings, observation, records):
     if any(record.id in cached for record in window_records):
         return outcome("unverified", "Gateway reported a cached completion, so this policy probe could not verify fresh work.")
     affected = [record for record in window_records if record.identity == settings.affected_identity]
-    peers = [record for record in window_records if record.identity != settings.affected_identity]
-    successes = [record for record in window_records if record.status == "completed" and record.valid]
-    admissions = [record for record in window_records if record.http_status is not None and 200 <= record.http_status < 300]
+    admissions = [record for record in window_records if _proven_admission(record)]
     affected_admissions = [record for record in admissions if record.identity == settings.affected_identity]
+    peer_admissions = [record for record in admissions if record.identity != settings.affected_identity]
     declared = next(user for user in settings.users if user.identity == settings.affected_identity)
     rejection_kind = "key_rpm" if settings.capability == "key_rpm" else "priority_pool"
     affected_rejections = [record for record in affected if record.http_status == 429]
@@ -235,18 +239,17 @@ def summarize(settings, observation, records):
                   and record.gateway_evidence.rate_limit_unit == "requests"]
     for rejection in recognized:
         summary["peer_continuation"] = all(any(record.identity == user.identity
-            and record.status == "completed" and record.valid and record.dispatch_ms > rejection.completed_ms
-            for record in peers) for user in settings.users if user.identity != settings.affected_identity)
+            and record.dispatch_ms > rejection.completed_ms
+            for record in peer_admissions) for user in settings.users if user.identity != settings.affected_identity)
         if summary["peer_continuation"]:
             break
-    summary["overlap_observed"] = any(a.status == "completed" and a.valid and b.status == "completed" and b.valid
-        and max(a.dispatch_ms, b.dispatch_ms) < min(a.completed_ms, b.completed_ms)
-        for a in affected for b in peers)
-    inputs = [record.input_tokens for record in successes]
-    outputs = [record.completion_tokens for record in successes]
-    summary["comparable_actual_work"] = bool({record.identity for record in successes} == {user.identity for user in settings.users}
+    summary["overlap_observed"] = any(max(a.dispatch_ms, b.dispatch_ms) < min(a.completed_ms, b.completed_ms)
+        for a in affected_admissions for b in peer_admissions)
+    inputs = [record.input_tokens for record in admissions]
+    outputs = [record.completion_tokens for record in admissions]
+    summary["comparable_actual_work"] = bool({record.identity for record in admissions} == {user.identity for user in settings.users}
         and all(value is not None and value > 0 for value in inputs+outputs)
-        and all(record.reasoning_tokens is None or record.reasoning_tokens < record.completion_tokens for record in successes)
+        and all(record.reasoning_tokens is None or record.reasoning_tokens < record.completion_tokens for record in admissions)
         and len(set(inputs)) == 1 and max(outputs) <= 2*min(outputs))
     if not observation.get("isolated_run"):
         reason = (summary["stop_reason"] if observation.get("budget_limited") else

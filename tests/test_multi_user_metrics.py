@@ -142,6 +142,38 @@ def test_intentional_cancel_is_excluded_and_forced_drain_cancel_is_unknown():
     assert user["partial_missing_usage_count"] == 1
 
 
+@pytest.mark.parametrize("live_coverage", ["unstarted", "partial", "cancelled", "complete"])
+def test_each_user_needs_one_successful_conversation_per_selected_mode(live_coverage):
+    user_id = "user-01"
+    records = [record(user_id, identity=identity) for identity in ("fixed-1", "fixed-2")]
+    conversations = [{"mode": "fixed", "planned_turns": 2, "turns": ["fixed-1", "fixed-2"]}]
+    if live_coverage != "unstarted":
+        records.append(record(user_id, identity="live-1"))
+        live_turns = ["live-1"]
+        if live_coverage != "partial":
+            records.append(record(user_id, identity="live-2",
+                **({"status": "cancelled", "valid": False} if live_coverage == "cancelled" else {})))
+            live_turns.append("live-2")
+        conversations.append({"mode": "live", "planned_turns": 2, "turns": live_turns,
+                              "completed_turns": len(live_turns)})
+    # Reaching the common cutoff during a later repetition is normal.
+    records.append(record(user_id, identity="fixed-repeat-1"))
+    conversations.append({"mode": "fixed", "planned_turns": 2, "turns": ["fixed-repeat-1"],
+                          "stop_reason": "measurement window ended"})
+    source = observation(records, users=(user_id,), criteria={"min_samples": 1, "max_error_percent": 0})
+    source["settings"]["conversations"] = {"modes": ["fixed", "live"]}
+    window = source["windows"][0]
+    window["scenario"] = "repeated_conversations"
+    window["users"][0]["conversations"] = conversations
+
+    result = summarize(source, records)
+    user = row(result)
+    complete = live_coverage == "complete"
+    assert user["status"] == result["status"] == ("pass" if complete else "inconclusive")
+    assert user["coverage"]["status"] == ("complete" if complete else "partial")
+    assert user["coverage"]["missing_conversation_modes"] == ([] if complete else ["live"])
+
+
 def test_no_selected_criteria_are_measured_without_invented_pass():
     records = [record("user-01")]
     result = summarize(observation(records, users=("user-01",),

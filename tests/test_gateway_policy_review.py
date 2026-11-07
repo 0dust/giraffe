@@ -13,7 +13,9 @@ from tests.test_gateway_policy import CACHE_KEY, LIMITED_KEY_HASH, MODEL_POOL, c
 
 
 @pytest.mark.parametrize("mode", ["key_rpm", "priority_rpm"])
-@pytest.mark.parametrize("status,http_status", [("failed", 500), ("timeout", None), ("cancelled", None), ("failed", 429)])
+@pytest.mark.parametrize("status,http_status", [
+    ("failed", 500), ("timeout", None), ("cancelled", None), ("failed", 429), ("failed", 200),
+])
 async def test_unknown_prior_admission_cannot_prove_early_exhaustion(monkeypatch, mode, status, http_status):
     _, run, _ = await exercise(monkeypatch, mode)
     first = next(record for record in run.records if record.identity == "limited")
@@ -22,6 +24,49 @@ async def test_unknown_prior_admission_cannot_prove_early_exhaustion(monkeypatch
     result = summarize(run.config.gateway_policy, run.observations["proxy"]["gateway_policy"], run.records)
     assert result["qualification"] == "unverified", result
     assert result["status"] == "inconclusive"
+
+
+@pytest.mark.usefixtures("local_tokenizer")
+async def test_malformed_2xx_cannot_prove_key_overage(monkeypatch):
+    check, report, _ = await exercise(monkeypatch, behavior="malformed_affected_admission", full=True)
+    summary = check.metrics["gateway_policy"]
+    limited = summary["users"][0]
+    assert [entry["http_status"] for entry in limited["evidence"]] == [200, 200, 200, 429, 429]
+    assert limited["admitted"] == limited["completed"] == 2
+    assert limited["other_failures"] == 1
+    assert [record.http_status for record in report.requests if record.identity == "limited" and not record.valid] == [200, 429, 429]
+    assert summary["peer_continuation"]
+    assert check.status == "inconclusive" and summary["qualification"] == "unverified"
+
+
+@pytest.mark.usefixtures("local_tokenizer")
+@pytest.mark.parametrize("behavior,expected", [("peer_conflicting_total", "inconclusive"), ("peer_omitted_total", "pass")])
+async def test_priority_requires_consistent_supplied_usage_total(monkeypatch, behavior, expected):
+    check, report, _ = await exercise(monkeypatch, "priority_rpm", behavior=behavior, full=True)
+    summary = check.metrics["gateway_policy"]
+    peers = [record for record in report.requests if record.identity == "peer"]
+    assert len(peers) == 8 and all(record.http_status == 200 for record in peers)
+    assert all(record.valid is (expected == "pass") for record in peers)
+    assert summary["comparable_actual_work"] is (expected == "pass")
+    assert check.status == expected
+    assert summary["qualification"] == ("observed" if expected == "pass" else "unverified")
+
+
+@pytest.mark.usefixtures("local_tokenizer")
+@pytest.mark.parametrize("mode", ["key_rpm", "priority_rpm"])
+@pytest.mark.parametrize("counter", ["completion", "reasoning", "cached", "total"])
+async def test_policy_rejects_unbounded_usage_before_reporting(monkeypatch, mode, counter):
+    check, report, _ = await exercise(monkeypatch, mode, behavior=f"peer_unbounded_{counter}", full=True)
+    assert check.status == "inconclusive"
+    assert check.metrics["gateway_policy"]["qualification"] == "unverified"
+    peers = [record for record in report.requests if record.identity == "peer"]
+    assert len(peers) == 8
+    for record in peers:
+        assert record.http_status == 200 and not record.valid
+        assert record.completion_tokens is None
+        assert record.reasoning_tokens is None
+        assert record.cached_prompt_tokens is None
+    assert str(10**309) not in report.model_dump_json()
 
 
 async def test_strict_priority_rejection_precludes_later_borrowing(monkeypatch):
