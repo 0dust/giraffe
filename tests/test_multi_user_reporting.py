@@ -872,6 +872,10 @@ def test_baseline_compares_heavy_work_per_matched_probe(limit, case):
     delivery, = [row for row in target["comparisons"] if row["metric"] == "shared_window_output_tokens_per_second"
                  and row["role"] == "probe" and row["user_id"] == "user-01"]
     assert delivery["status"] == ("pass" if case == "extra_pair" else "inconclusive")
+    heavy_delivery, = [row for row in target["comparisons"]
+                       if row["metric"] == "shared_window_output_tokens_per_second"
+                       and row["role"] == "probe" and row["user_id"] == "user-02"]
+    assert heavy_delivery["status"] == delivery["status"]
     if reduced_delivery:
         assert compared["acceptance"]["baseline"] == "pass"
         assert (delivery["baseline"], delivery["current"]) == (32, 16)
@@ -885,6 +889,66 @@ def test_baseline_compares_heavy_work_per_matched_probe(limit, case):
         assert reason in comparison["reason"]
         if not reduced_delivery:
             assert set(comparison["evidence_ids"]) == {item.id for item in current.requests}
+
+
+
+def test_faster_short_probes_do_not_create_a_heavy_user_delivery_regression():
+    from tests.test_multi_user_scenarios import matched_observation
+
+    current, baseline = user_report(), user_report()
+    for report, short_elapsed in ((current, 165), (baseline, 300)):
+        source, templates = matched_observation()
+        report.manifest["config"]["multi_user"].update(source["settings"])
+        report.manifest["config"]["limits"]["min_samples"] = 2
+        control, probe, heavy = templates
+
+        def observed(template, offset, sequence, elapsed):
+            item = template.model_copy(deep=True, update={"id": f"{template.id}-{sequence}"})
+            for field in ("dispatch_ms", "timing_start_ms", "request_body_sent_ms"):
+                setattr(item, field, getattr(item, field) + offset)
+            item.completed_ms = item.dispatch_ms + elapsed
+            item.elapsed_ms = item.stream_end_ms = elapsed
+            item.last_output_ms = elapsed - 5
+            item.workload.update(ready_ms=item.dispatch_ms, matched_work_sequence=sequence,
+                                 request_sequence=sequence)
+            if "trigger_ms" in item.workload:
+                item.workload["trigger_ms"] = item.dispatch_ms
+            return item
+
+        requests = []
+        for sequence, offset in enumerate((0, 500), 1):
+            requests.extend([observed(control, offset, sequence, 200),
+                             observed(probe, offset, sequence, short_elapsed),
+                             observed(heavy, offset, 2 * sequence - 1, 110)])
+            if report is baseline:
+                requests.append(observed(heavy, offset + 120, 2 * sequence, 110))
+        for window in source["windows"]:
+            for user in window["users"]:
+                cohort = [r for r in requests if r.workload["window_id"] == window["id"]
+                          and r.workload["user_id"] == user["user_id"]]
+                user.update(ready_count=len(cohort), dispatched_count=len(cohort), request_ids=[r.id for r in cohort])
+                for item in cohort:
+                    item.target = "local"
+                    item.workload.update(scenario=window["scenario"], trigger=window["trigger"],
+                                         heavy_profile=window["heavy_profile"], population=window["population"])
+        summary = summarize(source, requests)
+        assert summary["status"] == "pass"
+        report.requests = requests
+        report.checks[0].metrics["multi_user"] = summary
+        report.checks[0].status = report.overall = summary["status"]
+
+    compared = compare_baseline(current, baseline).baseline
+    target, = compared["targets"]
+    rows = {row["metric"]: row for row in target["comparisons"]
+            if row.get("user_id") == "user-02" or " / user-02 / " in row["scenario"]}
+    delivery = rows["shared_window_output_tokens_per_second"]
+    assert (delivery["current"], delivery["baseline"]) == (32, 64)
+    assert (delivery["current_samples"], delivery["baseline_samples"]) == (2, 4)
+    assert delivery["status"] == "inconclusive"
+    assert "exposure per matched probe differs" in delivery["reason"]
+    assert rows["latency_ms"]["status"] == "inconclusive"
+    assert rows["valid_completion_rate"]["status"] == rows["error_rate"]["status"] == "pass"
+    assert compared["status"] == target["status"] == "inconclusive"
 
 
 

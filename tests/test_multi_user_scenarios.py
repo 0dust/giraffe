@@ -282,8 +282,94 @@ def test_selected_cancellation_checks_terminal_events_in_the_same_read(monkeypat
     run_virtual(monkeypatch, run())
 
 
+@pytest.mark.parametrize(("scenario", "answer_read"), [("noisy_neighbors", 2), ("cancellation", 1)])
+@pytest.mark.parametrize("finish_with_answer", [False, True])
+def test_split_inline_reasoning_defers_trigger_until_live_answer(
+    monkeypatch, scenario, answer_read, finish_with_answer,
+):
+    import httpx
+    from giraffe.client import LLMClient
+    from giraffe.models import LoadTestSettings
+    from giraffe.multi_user import run_window
+    from tests.test_review26_phase4_accuracy import run_virtual
+
+    def frame(text):
+        return f'data: {json.dumps({"choices": [{"delta": {"content": text}}]})}\n\n'.encode()
+
+    finish = (b'data: {"choices":[{"delta":{},"finish_reason":"stop"}],'
+              b'"usage":{"prompt_tokens":64,"completion_tokens":18,'
+              b'"completion_tokens_details":{"reasoning_tokens":2}}}\n\n')
+    done = b"data: [DONE]\n\n"
+
+    async def run():
+        cfg = settings(levels=[2], duration_seconds=.3, think_time_seconds={"values": [1]},
+                       profile=PROFILE, scenarios=[scenario],
+                       noisy_neighbors={"heavy_user_ids": ["user-02"], "heavy_profiles": ["long_short"],
+                                        "triggers": ["during_stream"]},
+                       cancellation={"user_id": "user-02", "cancel_after_chunks": 2})
+        target = cfg.targets[0]
+        state = runner._Run(cfg, None, None)
+        client = LLMClient(target, cfg, max_connections=2)
+        clock = asyncio.get_running_loop().time
+        dispatches, answers = [], []
+        first_reasoning = None
+
+        class Stream(httpx.AsyncByteStream):
+            def __init__(self, peer):
+                self.peer = peer
+
+            async def __aiter__(self):
+                nonlocal first_reasoning
+                if self.peer:
+                    for fragment in ("<thi", "nk>"):
+                        await asyncio.sleep(.01)
+                        yield frame(fragment)
+                    await asyncio.sleep(.05)
+                    first_reasoning = clock()
+                    yield frame("reason")
+                    await asyncio.sleep(.01)
+                    yield frame("</think>")
+                    await asyncio.sleep(.01)
+                    answers.append(clock())
+                    if finish_with_answer:
+                        yield frame("K7P4") + frame(" 42") + finish
+                        await asyncio.sleep(.04)
+                        yield done
+                        return
+                yield frame("K7P4")
+                await asyncio.sleep(.01)
+                if self.peer:
+                    answers.append(clock())
+                yield frame(" 42")
+                await asyncio.sleep(.04)
+                yield finish + done
+
+        async def respond(_request):
+            dispatches.append(clock())
+            return httpx.Response(200, stream=Stream(len(dispatches) == 1))
+
+        window = _planned_observation(cfg.multi_user)["windows"][-1]
+        calibration = {(size, variant): {"filler_chars": 100}
+                       for size in ("short", "long") for variant in ("short_answer", "long_output")}
+        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as transport:
+            client._client = transport
+            await run_window(state, target, client, cfg.multi_user, LoadTestSettings(profile=cfg.multi_user.profile),
+                             calibration, window)
+        peer, = [r for r in state.records if r.workload["user_id"] == "user-01"]
+        if finish_with_answer:
+            assert len(dispatches) == 1
+        else:
+            assert len(dispatches) == 2 and dispatches[1] >= answers[answer_read - 1]
+        assert peer.valid and peer.generation_chunks == 3 and peer.answer_chunks == 2
+        assert peer.first_token_ms == peer.first_reasoning_ms == pytest.approx(
+            (first_reasoning - dispatches[0]) * 1000)
+
+    run_virtual(monkeypatch, run())
+
+
 @pytest.mark.parametrize(("reasoning_delay", "hold_slot"), [(.01, .01), (.09, .01), (.01, .3)])
-def test_before_output_rechecks_generation_when_a_slot_opens(monkeypatch, reasoning_delay, hold_slot):
+@pytest.mark.parametrize("inline", [False, True])
+def test_before_output_rechecks_generation_when_a_slot_opens(monkeypatch, reasoning_delay, hold_slot, inline):
     import httpx
     from giraffe.client import LLMClient
     from giraffe.models import LoadTestSettings
@@ -297,9 +383,17 @@ def test_before_output_rechecks_generation_when_a_slot_opens(monkeypatch, reason
 
         async def __aiter__(self):
             if self.reasoning:
-                await asyncio.sleep(reasoning_delay)
-                yield b'data: {"choices":[{"delta":{"reasoning_content":"thinking"}}]}\n\n'
+                if inline:
+                    await asyncio.sleep(.002)
+                    yield b'data: {"choices":[{"delta":{"content":"<thi"}}]}\n\n'
+                    await asyncio.sleep(.002)
+                    yield b'data: {"choices":[{"delta":{"content":"nk>"}}]}\n\n'
+                await asyncio.sleep(reasoning_delay - (.004 if inline else 0))
+                field = "content" if inline else "reasoning_content"
+                yield f'data: {json.dumps({"choices": [{"delta": {field: "thinking"}}]})}\n\n'.encode()
                 await asyncio.sleep(.05)
+                if inline:
+                    yield b'data: {"choices":[{"delta":{"content":"</think>"}}]}\n\n'
             else:
                 await asyncio.sleep(.03)
             yield b'data: {"choices":[{"delta":{"content":"K7P4"}}]}\n\n'
@@ -333,7 +427,7 @@ def test_before_output_rechecks_generation_when_a_slot_opens(monkeypatch, reason
         records = {r.workload["user_id"]: r for r in state.records
                    if r.workload["request_sequence"] == 1}
         reasoning = records["user-02"]
-        assert reasoning.first_reasoning_ms is not None
+        assert reasoning.first_token_ms == reasoning.first_reasoning_ms == pytest.approx(reasoning_delay * 1000)
         first_generation = reasoning.timing_start_ms + reasoning.first_reasoning_ms
         first_answer = reasoning.timing_start_ms + reasoning.first_output_ms
         first_slot_open = records["user-01"].completed_ms
