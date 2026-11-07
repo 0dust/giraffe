@@ -64,7 +64,7 @@ def setup(monkeypatch, observer, *, rejected=None, before_marked=None):
     return cfg, run, reads
 
 
-def streamed_gateway(monkeypatch, *, rejected_attempts=0, reject_marked_logprobs=False):
+def streamed_gateway(monkeypatch, *, rejected_attempts=0, reject_marked_logprobs=False, post_finish_delta=None):
     for ref in ("ALICE", "BOB", "OBSERVER"):
         monkeypatch.setenv(ref, "secret-" + ref)
     cfg = config(stream=True, request_timeout_seconds=.3)
@@ -92,14 +92,32 @@ def streamed_gateway(monkeypatch, *, rejected_attempts=0, reject_marked_logprobs
             if compatibility_attempts <= rejected_attempts:
                 # A gateway can repeatedly reject a known parameter after its first rejection.
                 return httpx.Response(400, json={"error": {"param": "logprobs"}})
+        tail = ("data: " + json.dumps({"choices": [{"delta": post_finish_delta}]}) + "\n\n"
+                if post_finish_delta is not None else "")
         return httpx.Response(200, text=(
             'data: {"choices":[{"delta":{"content":"OK"},"logprobs":{"content":[{"token":"OK"}]}}]}\n\n'
             'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
-            'data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":5}}\n\ndata: [DONE]\n\n'))
+            'data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":5}}\n\n'
+            + tail + 'data: [DONE]\n\n'))
 
     original = httpx.AsyncClient
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
     return cfg, posts
+
+
+async def test_late_delta_qualification_applies_only_to_marked_traffic(monkeypatch):
+    cfg, _ = streamed_gateway(monkeypatch, post_finish_delta={
+        "thinking_blocks": [{"type": "thinking", "thinking": "late reasoning", "index": 0}],
+    })
+    cfg.checks = ["access", "gateway_attribution"]
+    cfg.targets[0].tokenizer = "builtin"
+
+    report = await run_suite(cfg)
+    checks = {check.id: check for check in report.checks}
+    assert checks["access"].status == "pass"
+    attribution = checks["gateway_attribution"]
+    assert attribution.status == "inconclusive" and attribution.metrics["matched_requests"] == 0
+    assert [record.status for record in report.requests if record.identity] == ["failed", "failed"]
 
 
 async def collect(cfg, run):
@@ -182,6 +200,58 @@ async def test_row_limit_is_checked_before_marked_requests(monkeypatch, row_limi
     else:
         assert check.status == "pass" and check.metrics["matched_requests"] == 2
         assert len(keys) == 2 and all(req.url.params["page_size"] == "2" for req in reads)
+
+
+@pytest.mark.parametrize("case", ["row_limit", "reader_unavailable", "preflight_stop", "no_gateway", "no_identity"])
+async def test_zero_dispatch_reports_only_eligible_attribution_conditions(monkeypatch, case):
+    events, marked = [], []
+    stop = asyncio.Event()
+
+    async def observer(request, rows):
+        if case == "preflight_stop":
+            stop.set()
+        return httpx.Response(403)
+
+    async def before_marked(key):
+        marked.append(key)
+
+    cfg, _, reads = setup(monkeypatch, observer, before_marked=before_marked)
+    cfg.targets[0].tokenizer = "builtin"
+    if case == "row_limit":
+        cfg.metrics_max_series = 1
+    elif case in {"reader_unavailable", "preflight_stop"}:
+        cfg.checks = ["access", "gateway_attribution"]
+        cfg.targets.append(cfg.targets[0].model_copy(
+            update={"name": "second", "url": "http://second/v1", "gateway": None}))
+    elif case == "no_gateway":
+        cfg.targets[0].gateway = None
+    else:
+        cfg.targets[0].test_identities.pop("bob")
+
+    report = await run_suite(cfg, progress=events.append, stop_event=stop)
+    check = next(check for check in report.checks if check.target == "proxy" and check.id == "gateway_attribution")
+    conditions = [row for row in report.conditions if row["condition_id"] == "gateway_attribution"]
+    lifecycle = [event for event in events if event["scenario"] == "gateway_attribution"
+                 and event["event"].startswith("condition_")]
+    assert check.status == "inconclusive"
+    assert not marked and not any(record.identity for record in report.requests)
+    if case in {"no_gateway", "no_identity"}:
+        assert not conditions and not lifecycle and not reads
+        return
+
+    assert len(reads) == (0 if case == "row_limit" else 1)
+    assert check.metrics["state"] == ("unavailable" if case == "reader_unavailable" else "unverified")
+    assert check.metrics["planned_requests"] == 2 and check.metrics["observed_requests"] == 0
+    [row] = conditions
+    assert row["target"] == "proxy" and row["status"] == "inconclusive"
+    assert row["planned_kind"] == "exact" and row["planned"] == row["not_started"] == 2
+    assert row["started"] == row["completed"] == row["failed"] == 0
+    assert [event["event"] for event in lifecycle] == ["condition_planned", "condition_scoring", "condition_finished"]
+    final = lifecycle[-1]["condition_summary"]
+    assert final["condition_verdict"] == "inconclusive" and final["aggregate_status"] == row["status"]
+    assert final["started"] == final["completed"] == 0
+    assert final["reasons"] == row["reasons"] == [check.metrics["reason"]]
+    assert events.index(lifecycle[-1]) < next(i for i, event in enumerate(events) if event["event"] == "run_finished")
 
 
 async def test_litellm_required_utc_dates_cover_probes_and_are_stable_on_all_pages(monkeypatch):

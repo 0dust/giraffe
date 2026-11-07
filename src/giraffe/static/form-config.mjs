@@ -328,10 +328,16 @@ export function multiUserSettings(config, defaults) {
   return result;
 }
 
-function textareaValue(saved, entered) {
-  const text=String(entered ?? '').replace(/\r\n?/g,'\n');
-  // HTML parsing normalizes line endings and drops the first textarea newline.
-  return typeof saved==='string' && saved.replace(/\r\n?/g,'\n').replace(/^\n/,'')===text ? saved : text;
+function readConversationTurns(values, prefix, fallback, {stripLeadingNewline=false}={}) {
+  const saved=JSON.parse(values.get(prefix+'original_turns') || 'null') ?? fallback;
+  return Array.from({length:Number(values.get(prefix+'turn_count'))},(_,index)=>{
+    const text=String(values.get(prefix+'turn_'+index) ?? '').replace(/\r\n?/g,'\n');
+    const original=saved?.[index];
+    const normalized=typeof original==='string'?original.replace(/\r\n?/g,'\n'):undefined;
+    // Legacy task controls omit a leading newline during HTML parsing.
+    const displayed=stripLeadingNewline?normalized?.replace(/^\n/,''):normalized;
+    return text===displayed?original:text;
+  });
 }
 
 export function configureMultiUser(source, values, defaults, {allowInvalid=false}={}) {
@@ -387,11 +393,7 @@ export function configureMultiUser(source, values, defaults, {allowInvalid=false
       const prefix='multi_user_conversation_';
       for(const name of ['max_tokens','delay_seconds'])if(values.has(prefix+name))conversation[name]=number('conversation_'+name,name);
       if(values.has(prefix+'modes'))conversation.modes=profile==='performance'?['live']:String(values.get(prefix+'modes')).split(',');
-      if(values.has(prefix+'turns')){
-        const saved=conversation.turns?.join('\n');
-        const text=textareaValue(saved,values.get(prefix+'turns'));
-        if(text!==saved)conversation.turns=text.split('\n');
-      }
+      if(values.has(prefix+'turn_count'))conversation.turns=readConversationTurns(values,prefix,conversation.turns);
       if(values.has(prefix+'sampling_seed')){
         const sampling={seed:number('conversation_sampling_seed','Sampling seed')};
         for(const key of ['think_time_seconds','input_tokens','output_tokens','turn_count']){
@@ -409,12 +411,10 @@ export function configureMultiUser(source, values, defaults, {allowInvalid=false
           const taskPrefix=prefix+`task_${i}_`;
           if(values.get(taskPrefix+'enabled')!=='on')continue;
           const name=String(values.get(taskPrefix+'name')||'').trim();
-          const saved=JSON.parse(values.get(taskPrefix+'original_turns') || 'null') ?? savedTasks.get(name)?.turns;
           conversation.workloads.push({name,
             weight:number(`conversation_task_${i}_weight`,'Task weight'),
             max_tokens:number(`conversation_task_${i}_cap`,'Task output cap'),
-            turns:Array.from({length:Number(values.get(taskPrefix+'turn_count'))},(_,turn)=>
-              textareaValue(saved?.[turn],values.get(taskPrefix+`turn_${turn}`)))});
+            turns:readConversationTurns(values,taskPrefix,savedTasks.get(name)?.turns,{stripLeadingNewline:true})});
         }
         if(!conversation.workloads.length&&!allowInvalid)throw new Error('Select at least one conversation task.');
       }

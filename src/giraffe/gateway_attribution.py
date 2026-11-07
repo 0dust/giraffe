@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import defaultdict
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
 import time
 import uuid
@@ -18,7 +18,7 @@ from .models import CheckResult, RequestSpec
 
 
 CHECK = "gateway_attribution"
-COLLECTION_VERSION = 8
+COLLECTION_VERSION = 9
 MAX_BODY_BYTES = 4 * 1024 * 1024
 MAX_PAGES = 8
 PAGE_SIZE = 128
@@ -265,11 +265,15 @@ async def _pages(client, url, marker, *, start_date, end_date, max_rows, stop, d
 
 
 async def execute(run, target, client, *, deferred=False):
-    if deferred:
-        await _execute(run, target, client, deferred=True)
-    else:
-        with run.inline_gateway_limit_phase():
-            await _execute(run, target, client)
+    with (nullcontext() if deferred else run.inline_gateway_limit_phase()):
+        try:
+            await _execute(run, target, client, deferred=deferred)
+        finally:
+            # Preflight can confirm an exact plan without admitting any probes.
+            observation = run.observations[target.name][CHECK]
+            if (target.name, CHECK) not in run.conditions and (planned := observation.get("planned_requests")):
+                run.plan_condition(target.name, CHECK, planned=planned)
+                run.finish_condition(target.name, CHECK, reason=observation["reason"])
 
 
 async def _execute(run, target, client, *, deferred=False):
@@ -339,7 +343,9 @@ async def _execute(run, target, client, *, deferred=False):
                                planned_requests=0, observed_requests=0)
             return
         if deferred and reader_status != 200:
-            observation.update(reason="Read-only gateway spend logs were unavailable within the remaining run budget.")
+            observation.update(reason="Read-only gateway spend logs were unavailable within the remaining run budget.",
+                               planned_requests=planned, observed_requests=0,
+                               collection_attempts=0, collection_complete=False)
             return
     marker = "giraffe-" + uuid.uuid4().hex
     start_date = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
