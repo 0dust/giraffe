@@ -2,7 +2,7 @@
 from collections import OrderedDict
 import json
 
-from giraffe.models import RunConfig
+from giraffe.models import RunConfig, Target
 from giraffe.web import _track_live_request
 from tests.test_ux_catalogue import browser_logic
 
@@ -67,6 +67,34 @@ def test_live_user_identity_survives_started_and_completed_events():
             event['request'] = {'id': 'r', 'status': 'completed'}
         _track_live_request(job, event, 100)
         assert job['requests'][0]['workload'] == identity
+
+
+def test_live_conversation_turn_identity_survives_long_target_names():
+    target = Target(name='region1-production-tenant-service-ml-inference-'
+                         'release-candidate-2026-11-07-qwen-2.5-coder-32b-vllm',
+                    url='http://localhost/v1', model='test')
+    window = 'multi_user_20_measurement'
+    identity = {'user_id': 'user-01', 'population': 20, 'profile': 'conversation:exact_repeat',
+                'window_id': window, 'phase': 'measurement', 'request_sequence': 2,
+                'turn_id': 1, 'conversation_sequence': 1,
+                'session_id': f'{target.name}:{window}:user-01:1:live'}
+    assert len(identity['session_id']) > 128
+    job = {'requests': OrderedDict(), 'live_request_count': 0, 'evicted_running': set(),
+           'live_request_summary': {'evicted': 0, 'through_slot': None, 'statuses': {}}}
+    rows = []
+    for kind in ['request_started', 'request_completed']:
+        event = {'event': kind, 'request_slot': 0, 'target': target.name, 'scenario': window,
+                 'user': identity, 'request': {'id': 'r', 'status': 'completed'}}
+        _track_live_request(job, event, 100)
+        rows.append(job['requests'][0])
+        assert 'session_id' not in rows[-1]['workload']
+    browser_logic('const rows='+json.dumps(rows)+r"""
+for(const row of rows){
+  assert.match(requestIdentityContent(row,rows),/user-01 · 20 users · Conversation 1 · Turn 2/);
+}
+const request={...rows[0],workload:{user_id:'user-01',population:20}};
+assert.doesNotMatch(requestIdentityContent(request,[request]),/Conversation|Turn/);
+""", configuration())
 
 
 async def test_population_preview_and_bound_label_are_independent_of_slots(tmp_path):

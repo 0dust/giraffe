@@ -601,7 +601,18 @@ function renderRequestTermination(record) {
   return `<section class="request-termination"><h3>Request limits &amp; stop reason</h3><dl class="metrics-grid">${metric('Configured request timeout',timeout==null?'Not recorded':elapsed(timeout))}${reason?metric('Stop reason',labels[reason] || human(reason)):''}${limit!=null?metric('Effective deadline',elapsed(limit),'May be shortened by the remaining run duration or an intentional probe'):''}</dl>${record.error?`<p class="hint">${escape(record.error)}</p>`:''}</section>`;
 }
 function requestLabel(record,records,condition=conditionInfo(record),positions) {return `${condition.label}. ${requestIdentity(record,records,condition,positions)} · ${statusLabels[requestStatus(record)] || record.status} · ${requestTiming(record)}`;}
-function requestIdentityContent(record,records) {return `${record.workload?.user_id?`${escape(record.workload.user_id)} · ${number(record.workload.population)} users · ${record.workload.session_id?`Conversation ${number(record.workload.conversation_sequence)} · Turn ${number(record.workload.turn_id+1)} · `:''}`:''}${escape(requestIdentity(record,records))} · <span class="mono">${escape(record.id || (inProgress(requestStatus(record))?'Request ID pending':'Request ID not recorded'))}</span> · ${escape(statusLabels[requestStatus(record)] || record.status)} · ${requestTiming(record)}`;}
+function requestIdentityContent(record,records) {
+  const workload=record.workload;
+  let identity='';
+  if(workload?.user_id){
+    const {conversation_sequence:conversation,turn_id:turn}=workload;
+    identity=`${escape(workload.user_id)} · ${number(workload.population)} users · `;
+    if(Number.isInteger(conversation)&&conversation>0&&Number.isInteger(turn)&&turn>=0){
+      identity+=`Conversation ${number(conversation)} · Turn ${number(turn+1)} · `;
+    }
+  }
+  return `${identity}${escape(requestIdentity(record,records))} · <span class="mono">${escape(record.id || (inProgress(requestStatus(record))?'Request ID pending':'Request ID not recorded'))}</span> · ${escape(statusLabels[requestStatus(record)] || record.status)} · ${requestTiming(record)}`;
+}
 function renderRequestContext(record,records) {
   const condition=conditionInfo(record),p=condition.parameters,value=v=>Array.isArray(v)?v.map(n=>number(n)).join('–'):v==null?'Not recorded':number(v),chars=record.input_chars>0?record.input_chars:(p.input_chars ?? record.input_chars),tokens=record.requested_input_tokens ?? record.workload?.requested_input_tokens ?? (typeof chars==='number'?Math.ceil(chars/4):p.input_tokens_approx),cap=record.requested_max_tokens || p.output_tokens;
   return `<p class="request-identity">${requestIdentityContent(record,records)}</p><section class="request-sent"><h3>What was sent</h3><dl class="metrics-grid">${metric('Prompt size',`${value(chars)} characters · ~${value(tokens)} tokens`,'Approximate tokens; not server-reported usage')}${metric('Output cap',`${value(cap)} tokens`)}${metric('Concurrency',p.concurrency==null?'Not recorded':`${value(p.concurrency)} at once`)}${metric('Same prompt',condition.summary?.planned===1?'Single request':p.same_prompt===true?'Yes · repeated across this test':p.same_prompt===false?(p.repetitions_per_prompt?`Different prompts · each repeated ${value(p.repetitions_per_prompt)} times`:'No · inputs vary across this test'):'Not recorded in this legacy report')}</dl>${record.evaluation?.messages?.some(message=>typeof message.content==='string'&&message.content.trim())?'<p><button type="button" class="text-button" data-action="request-input">View input messages</button></p>':''}</section><p class="hint request-internal"><small>Internal ID: <span class="mono">${escape(record.scenario || '')}${record.fixture_id?` · ${escape(record.fixture_id)}`:''}</span></small></p>`;
