@@ -520,6 +520,7 @@ def test_before_output_rechecks_generation_when_a_slot_opens(monkeypatch, reason
 
 @pytest.mark.parametrize("opening", [
     "same_read_orphan", "later_read_orphan", "spent_before_orphan", "same_read_answer",
+    "capped_reads", "capped_spent_before_orphan",
 ])
 def test_during_stream_admission_counts_two_visible_answer_events(monkeypatch, opening):
     from types import SimpleNamespace
@@ -533,6 +534,9 @@ def test_during_stream_admission_counts_two_visible_answer_events(monkeypatch, o
     from tests.test_event_timing import sse
     from tests.test_review26_phase4_accuracy import run_virtual
 
+    capped = opening.startswith("capped_")
+    early = opening in {"spent_before_orphan", "capped_spent_before_orphan"}
+
     def frame(text):
         return sse({"content": text})
 
@@ -543,15 +547,19 @@ def test_during_stream_admission_counts_two_visible_answer_events(monkeypatch, o
 
         async def __aiter__(self):
             await asyncio.sleep(.05)
+            if capped and not self.heavy:
+                yield sse({"reasoning_content": " thought"}) * 4096
             if not self.heavy and self.probe:
                 if opening == "same_read_orphan":
                     yield frame("thought A") + frame("thought B") + frame("</think>K7P4")
-                elif opening in {"later_read_orphan", "spent_before_orphan"}:
+                elif opening == "later_read_orphan" or early:
                     yield frame("thought A") + frame("thought B")
                     await asyncio.sleep(.03)
                     yield frame("</think>K7P4")
-                else:
+                elif opening == "same_read_answer":
                     yield frame("<think>thought</think>K7P4") + frame(" 42")
+                else:
+                    yield frame("K7P4")
             else:
                 yield frame("<think>thought</think>K7P4")
             await asyncio.sleep(.07)
@@ -560,8 +568,10 @@ def test_during_stream_admission_counts_two_visible_answer_events(monkeypatch, o
                 await asyncio.sleep(.03)
             yield frame(" 43")
             await asyncio.sleep(.02)
+            reasoning_tokens = 4096 if capped and not self.heavy else 2
             yield sse(finish="stop", usage={"prompt_tokens": 256 if self.heavy else 64,
-                "completion_tokens": 18, "completion_tokens_details": {"reasoning_tokens": 2}})
+                "completion_tokens": 16 + reasoning_tokens,
+                "completion_tokens_details": {"reasoning_tokens": reasoning_tokens}})
             yield b"data: [DONE]\n\n"
 
     async def run():
@@ -605,11 +615,16 @@ def test_during_stream_admission_counts_two_visible_answer_events(monkeypatch, o
         peer, heavy = probes["user-01"], probes["user-02"]
         assert peer.answer_chunks == 3
         evidence = summarize(observation, state.records)["windows"][1]["interference"]
-        if opening == "spent_before_orphan":
+        if capped:
+            assert peer.valid and peer.output_events_truncated
+            assert peer.second_answer_event_ms is None
+            assert len(peer.answer_read_timestamps_ms) == peer.answer_reads == 3
+        if early:
             assert heavy.workload["trigger_ms"] < peer.timing_start_ms + peer.first_output_ms
             assert evidence["status"] == "inconclusive" and not evidence["qualified"], evidence
             return
-        second = peer.timing_start_ms + peer.second_answer_event_ms
+        second = peer.timing_start_ms + (peer.answer_read_timestamps_ms[1] if capped
+                                         else peer.second_answer_event_ms)
         assert heavy.workload["trigger_ms"] == pytest.approx(second)
         assert heavy.request_body_sent_ms >= heavy.workload["trigger_ms"]
         if opening == "same_read_answer":
