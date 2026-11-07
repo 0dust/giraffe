@@ -201,10 +201,26 @@ _COMPANION_REVISIONS = _CONVERSATION_REVISIONS | {
     "policy_after_shared_workloads", "policy_after_all_shared_targets", "access_after_shared_workloads",
     "access_deferred_policy", "access_after_all_shared_targets",
 }
+# Access changed optional dispatch after the shared workloads in these revisions.
+_MULTI_USER_COMPANION_REVISIONS = {"policy_after_all_shared_targets", "access_after_all_shared_targets"}
 _CONVERSATION_BRIDGE_CHECKS = {"prefix", "sessions", "consistency"}
 _CONVERSATION_LOAD_SOURCE = "9b694c97a39d449d8ea15b09a9aeb406bf835179c0882827685c4d7888687d36"
 _ACCESS_CONVERSATION_SOURCE = "9ff9179300b4012552a7bd6fd6ef0ae60c016b9023dba33ffabc9ca03783ac2d"
 _COMPANION_LOAD_SOURCE = "113325dd5cffa04626cc7be7ee93bc6e9be67335531288bc329b3542a155c92a"
+
+
+def _multi_user_workload_identity() -> dict[str, str]:
+    from . import concurrent_load, load_test, multi_user, multi_user_metrics, session_sampling, traffic
+
+    modules = (multi_user, multi_user_metrics, load_test, concurrent_load, session_sampling, traffic)
+    source = sha256(b"".join(Path(module.__file__).read_bytes() for module in modules)).hexdigest()
+    return {"multi_user_source_sha256": source, "multi_user_window_policy": multi_user.WINDOW_POLICY}
+
+
+def _load_test_workload_source_sha256() -> str:
+    from . import concurrent_load, load_test, traffic
+
+    return sha256(b"".join(Path(module.__file__).read_bytes() for module in (load_test, concurrent_load, traffic))).hexdigest()
 
 
 def _baseline_workload_fields(checks, *, shared: bool) -> set[str]:
@@ -224,6 +240,9 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str, include_load
     except ValidationError:
         return None
     fields = _baseline_workload_fields(resolved.checks, shared=shared)
+    has_multi_user = "multi_user" in fields
+    if has_multi_user and revision not in _MULTI_USER_COMPANION_REVISIONS:
+        return None
     exact_conversation = revision in _CONVERSATION_REVISIONS and not include_load
     if exact_conversation:
         checks = set(resolved.checks)
@@ -239,7 +258,9 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str, include_load
             unchanged_fields.add("prefix")
         if revision in _COMPANION_REVISIONS:
             unchanged_fields.update(_baseline_workload_fields({"tools"}, shared=shared))
-        if include_load or exact_conversation:
+        if has_multi_user:
+            unchanged_fields.add("multi_user")
+        if include_load or exact_conversation or has_multi_user:
             unchanged_fields.add("load_test")
         # Legacy concurrency has a separate source and needs its own attested revision.
         if "concurrency" in resolved.checks or not fields <= unchanged_fields:
@@ -291,8 +312,11 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str, include_load
         }[revision] if any(settings.values()) else None,
         "settings": settings,
     }
-    if exact_conversation and "load" in resolved.checks:
-        identity["load_test_source_sha256"] = _CONVERSATION_LOAD_SOURCE
+    if has_multi_user:
+        identity.update(_multi_user_workload_identity())
+    if (exact_conversation or has_multi_user) and "load" in resolved.checks:
+        identity["load_test_source_sha256"] = (
+            _load_test_workload_source_sha256() if has_multi_user else _CONVERSATION_LOAD_SOURCE)
     if sampled_sessions:
         identity["session_sampling_source_sha256"] = {
             "persistent_users": "2fab1370faeab7ddb91a7ae9c0e49520ee9a67e305441a0663877bb12bca24c3",
@@ -433,8 +457,8 @@ def _same_load_workload(current: dict, old: dict, *, fingerprint_key: str = "wor
         except ValidationError:
             return False
         fields = _baseline_workload_fields(resolved.checks, shared=shared)
-        if "load_test" not in fields:
-            return False
+        if "load_test" not in fields or "multi_user" in fields:
+            return False  # The Multi-user bridge attests the exact Load source.
         recorded = manifest.get("fixture_pack", {}).get(fingerprint_key)
         attestations = set()
         for index, sources in enumerate(families):

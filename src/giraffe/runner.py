@@ -3062,7 +3062,8 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
                         "observed_models": sorted({r.observed_model for r in run.records if r.target == t.name and r.observed_model}),
                         "observed_backend_ids": sorted({r.backend_id for r in run.records if r.target == t.name and r.backend_id}),
                         "other_replicas": "unverified"} for t in config.targets]}
-    from .reporting import connection_summary
+    from .reporting import (_load_test_workload_source_sha256, _multi_user_workload_identity,
+                            connection_summary)
     connection_failures = [message for target in config.targets if (message := connection_summary(
         [r for r in run.records if r.target == target.name], target.url))]
     if connection_failures:
@@ -3082,9 +3083,7 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
         workload_identity["session_sampling_source_sha256"] = hashlib.sha256(
             Path(session_sampling.__file__).read_bytes()).hexdigest()
     if "multi_user" in config.checks:
-        from giraffe import multi_user, multi_user_metrics, load_test, concurrent_load, session_sampling, traffic
-        workload_identity["multi_user_source_sha256"] = hashlib.sha256(b"".join(Path(m.__file__).read_bytes() for m in (multi_user, multi_user_metrics, load_test, concurrent_load, session_sampling, traffic))).hexdigest()
-        workload_identity["multi_user_window_policy"] = multi_user.WINDOW_POLICY
+        workload_identity.update(_multi_user_workload_identity())
     if "gateway_access" in config.checks:
         from giraffe import gateway_access, gateway_json
         workload_identity["gateway_access_source_sha256"] = hashlib.sha256(b"".join(
@@ -3094,8 +3093,7 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
         workload_identity["gateway_policy_source_sha256"] = hashlib.sha256(b"".join(
             Path(module.__file__).read_bytes() for module in (gateway_policy, gateway_response, gateway_json))).hexdigest()
     if "load" in config.checks:
-        from giraffe import load_test, concurrent_load, traffic
-        workload_identity["load_test_source_sha256"] = hashlib.sha256(b"".join(Path(m.__file__).read_bytes() for m in (load_test, concurrent_load, traffic))).hexdigest()
+        workload_identity["load_test_source_sha256"] = _load_test_workload_source_sha256()
     if "consistency" in config.checks and config.consistency and config.consistency.logprobs:
         from giraffe import logprobs, logprob_workload
         workload_identity["logprob_source_sha256"] = hashlib.sha256(

@@ -684,3 +684,65 @@ def test_access_sampled_session_bridge_preserves_exact_predecessors(profile, rev
     old.manifest["fixture_pack"]["workload_fixture_sha256"] = fixture_hash(identity)
     assert _settings_reasons(current, old) == []
     assert _settings_reasons(old, current) == []
+
+
+@pytest.mark.parametrize("companion", [None, "gateway_access", "load"])
+async def test_exact_policy_predecessor_preserves_measured_multi_user(monkeypatch, companion):
+    from tests.test_runner import config, load_config
+
+    options = dict(checks=["multi_user"], max_requests=None, max_duration_seconds=3,
+                   multi_user={"levels": [2], "duration_seconds": .4,
+                               "think_time_seconds": {"values": [.01]}})
+    predecessor_generator = "e4ddc7a7e8563f9ab3bba2fc42ad0232ee924c65f67d92dafd89c21025d202d0"
+    predecessor_source = "254f6af45582b4b315363921484a0f28ee9aaa9c097cbad6dd136134353c5aef"
+    if companion == "load":
+        options.update(checks=["multi_user", "load"], load_test=load_config(duration=1).load_test)
+    with monkeypatch.context() as policy:
+        policy.setattr(workloads, "FIXTURE_SOURCE_SHA256", predecessor_generator)
+        old = await runner.run_suite(config(**options))
+
+    if companion == "gateway_access":
+        options.update(checks=["multi_user", "gateway_access"], gateway_access={"profile": "other", "cases": [
+            {"name": "valid", "identity": "allowed", "expected": "allow"},
+            {"name": "invalid", "identity": "denied", "expected": "deny"},
+        ]})
+    current = await runner.run_suite(config(**options))
+    assert all(next(check for check in report.checks if check.id == "multi_user").status == "pass"
+               for report in (current, old))
+    assert _settings_reasons(current, current) == []
+    fingerprint = "workload_fixture_sha256"
+    current_key = "shared_workload_fixture_sha256" if companion == "gateway_access" else fingerprint
+    assert current.manifest["fixture_pack"][current_key] != old.manifest["fixture_pack"][fingerprint]
+    identity = {"generator_source_sha256": predecessor_generator,
+                "multi_user_source_sha256": predecessor_source,
+                "multi_user_window_policy": "completed-output-v1",
+                "settings": {"multi_user": old.manifest["config"]["multi_user"]}}
+    if companion == "load":
+        identity["settings"]["load_test"] = options["load_test"].model_dump(mode="json")
+        identity["load_test_source_sha256"] = "fa40b2a909d2b067529ab02bd686c61adb8a175063e481d802ad33d308ef49fa"
+    assert fixture_hash(identity) == old.manifest["fixture_pack"][fingerprint]
+
+    assert _settings_reasons(current, old) == []
+    assert _settings_reasons(old, current) == []
+    target = compare_baseline(current, old).baseline["targets"][0]
+    assert target["reasons"] == []
+    assert any(row["check"] == "multi_user" and row["status"] in {"pass", "fail"}
+               for row in target["comparisons"])
+
+    changed_settings = {**identity["settings"],
+                        "multi_user": {**identity["settings"]["multi_user"], "levels": [3]}}
+    changes = [
+        # Earlier Policy reports used this source with the same generator.
+        ("multi_user_source_sha256", "bcef9038f2fc90862a69fde8d5529234b828757bb62f89468964ec5ee95c3d2e"),
+        ("multi_user_window_policy", "unreviewed-window-policy"),
+        ("generator_source_sha256", "unreviewed-generator"),
+        ("settings", changed_settings),
+    ]
+    if companion == "load":
+        changes.append(("load_test_source_sha256", NONCE_ONLY_LOAD))
+    for field, value in changes:
+        changed = old.model_copy(deep=True)
+        if field == "settings":
+            changed.manifest["config"]["multi_user"] = value["multi_user"]
+        changed.manifest["fixture_pack"][fingerprint] = fixture_hash({**identity, field: value})
+        assert "Fixture pack identity differs." in _settings_reasons(current, changed), field
