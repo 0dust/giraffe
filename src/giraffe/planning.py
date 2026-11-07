@@ -385,6 +385,10 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
         has_observations = bool((observations or {}).get(target.name))
         for row in ordered:
             name, count = row["id"], row["requests_per_target"]
+            if name == "scale_down":
+                if config.scale_down and target.name == config.scale_down.target:
+                    fixed(target.name, row, 0, "scale_down", timeout=config.scale_down.max_duration_seconds)
+                continue
             if name == "recovery_prime" and "cancellation" in selected:
                 fixed(target.name, {"id": "recovery_wait", "title": "Recovery cleanup wait"},
                       min(5, config.effective_check("cancellation")["cleanup_seconds"]), "test_options.cancellation.cleanup_seconds")
@@ -900,6 +904,19 @@ def request_plan(config: RunConfig | ConfigDraft, *,
                      "requests_per_target": count, "kind": kind, "source": source,
                      "summary": summary})
 
+    if "scale_down" in selected and config.scale_down:
+        settings = config.scale_down
+        maximum = settings.max_requests
+        add("scale_down", None, f"One external removal on {settings.target}; at most {maximum} requests within {settings.max_duration_seconds:g} seconds, subject to shared run limits.", kind="bounded")
+        quota = quotas[settings.target]
+        rows[-1].update(max_requests=maximum, max_duration_seconds=settings.max_duration_seconds, target=settings.target,
+            effective_request_upper_bound=min(maximum, quota) if quota is not None else maximum,
+            effective_duration_upper_bound=min(settings.max_duration_seconds, config.max_duration_seconds)
+                if config.max_duration_seconds is not None else settings.max_duration_seconds)
+        if quota is not None and quota < maximum:
+            warnings.append(f"Scale-down continuity on {settings.target} shares a request allowance of {quota}; its full scenario can offer up to {maximum} requests.")
+        if config.max_duration_seconds is not None and config.max_duration_seconds < settings.max_duration_seconds:
+            warnings.append(f"Scale-down continuity can observe for up to {settings.max_duration_seconds:g} seconds; the shared {config.max_duration_seconds:g}-second run limit can end it earlier.")
     # Only fixture cardinalities are needed. Keep context filler small even if
     # the operator has configured a very large context limit.
     fixtures = builtin_fixtures(config.model_copy(update={"context_limit": 128}))

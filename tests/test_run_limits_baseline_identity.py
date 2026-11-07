@@ -153,7 +153,7 @@ def test_source_bridge_requires_an_explicitly_attested_generator_revision(monkey
 def test_unchanged_text_generator_has_reviewed_identity_table_entry():
     configured = RunConfig(targets=[{"name": "local", "url": "http://localhost", "model": "test"}],
                            checks=["consistency"])
-    identity = _run_limits_workload_identity({"config": configured.model_dump(mode="json")}, revision="issue95_pause_evidence")
+    identity = _run_limits_workload_identity({"config": configured.model_dump(mode="json")}, revision="scale_down_registration")
     actual = {
         "generator_source_sha256": hashlib.sha256(Path(workloads.__file__).read_bytes()).hexdigest(),
     }
@@ -180,7 +180,7 @@ def test_presampling_generator_identity_retains_the_original_session_settings():
     assert _settings_reasons(current, old) == []
 
 
-@pytest.mark.parametrize("revision", ["legacy", "issue45", "issue95", "issue95_pauses", "issue95_pause_evidence"])
+@pytest.mark.parametrize("revision", ["legacy", "issue45", "issue95", "issue95_pauses", "issue95_pause_evidence", "scale_down_registration"])
 def test_sampled_sessions_are_never_attested_as_unchanged_historical_traffic(revision):
     current, _, _, _ = reports()
     current.manifest["config"]["sessions"].update(
@@ -223,3 +223,17 @@ def test_streaming_logprob_generator_is_not_bridged_to_historical_evidence(respo
     before = old.model_dump_json()
     assert "Fixture pack identity differs." in _settings_reasons(current, old)
     assert old.model_dump_json() == before
+
+
+def test_reviewed_registration_keeps_the_previous_generator_identity():
+    current, _, _, _ = reports("consistency")
+    previous = _run_limits_workload_identity(current.manifest, revision="issue95_pause_evidence")
+    assert previous["generator_source_sha256"] == "ab5875f7c635f8f454429a88aac87d52ce3a141a84bcf7b936fa737ffa41fe83"
+
+
+@pytest.mark.parametrize("checks", [["scale_down"], ["sessions", "scale_down"], ["consistency", "scale_down"]])
+def test_scale_down_registration_does_not_attest_external_removal_workloads(checks):
+    config = RunConfig(targets=[{"name": "local", "url": "http://localhost", "model": "test"}],
+                       checks=checks, scale_down={"target": "local"})
+    assert _run_limits_workload_identity({"config": config.model_dump(mode="json")},
+                                        revision="scale_down_registration") is None

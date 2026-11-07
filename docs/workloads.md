@@ -1034,3 +1034,134 @@ discovery is `unknown`. These observations do not prove a cold start or explain 
 slow first response. A separately requested UI connection test may already have
 loaded the model before the run starts. A deliberate restart may also change state
 between observations. This is one endpoint’s inventory, not proof about every replica.
+
+## Scale-down continuity
+
+Select `checks: [scale_down]` and a `scale_down` section naming one configured
+target. The [example configuration](../examples/scale-down.yaml) uses existing
+fixtures and scoring. Other selected checks still run normally. This scenario
+observes one externally performed removal of one replica incarnation; it does not
+provision infrastructure or issue removal commands.
+
+The long cohort occupies `long_cohort_size` slots while one continuous arrival
+stage sends `followup_fixture` requests at `requests_per_second`. Set `concurrency`
+above the cohort size, and leave enough shared run budget for baseline, drain
+and post-removal samples. `baseline_timeout_seconds` bounds baseline/arming;
+`event_timeout_seconds` bounds the wait for an accepted marker; `grace_seconds`
+bounds removal observation; `post_seconds` measures survivor traffic;
+`completion_seconds` bounds final client cleanup. The grace policy explicitly
+anchors to `drain_effective` or `removal_requested`. A client cleanup allowance
+does not extend backend grace. Global limits remain authoritative.
+
+A high token cap does not guarantee a long response. If the default long fixture
+ends early, supply a representative streaming prompt through the existing
+`custom_fixtures` JSON file and select its fixture ID. For example, a file may
+contain:
+
+```json
+[
+  {"fixture_id":"representative.long","messages":[{"role":"user","content":"Write a detailed step-by-step explanation of the water cycle for a science lesson."}],"scorer":"contains","expected":"evaporation","max_tokens":2048,"check_ids":["scale_down"]},
+  {"fixture_id":"representative.short","messages":[{"role":"user","content":"Reply with just OK."}],"scorer":"exact","expected":"OK","max_tokens":8,"check_ids":["scale_down"]}
+]
+```
+
+Set `custom_fixtures` to that file and set `long_fixture` and `followup_fixture` to
+its IDs. Adapt the prompt, expected answer and existing scorer to your workload;
+this illustrative prompt is not guaranteed to stay open. Empty deltas, reasoning
+alone and tool arguments do not arm the text-stream scenario. The observed answer
+must span the confirmed transition interval; an answer ending after arming but
+before removal does not qualify.
+
+The three results have independent prerequisites:
+
+| Result | What establishes a pass |
+| --- | --- |
+| Client-visible continuity | Confirmed transition and baseline topology; enough original answer streams spanning the transition; valid stream termination, configured correctness and timing |
+| Backend drain semantics | Exact removed incarnation; active attributed work; complete all-traffic admissions/completions through termination; no admission after cutoff; successful completion before termination; declared grace respected |
+| Remaining capacity | New requests during the drain observation window and after exit independently meet configured error-rate, correctness and timing limits, with at least `min_post_samples` valid responses in each; confirmed surviving topology and full configured post-removal offered load |
+
+The drain observation window starts at the earliest bounded admission-cutoff
+time and ends at confirmed process exit, using capture times in the runner
+clock. It includes the cutoff polling uncertainty so failures before the next
+collector poll cannot disappear; it is not an exact backend-only drain interval.
+The post-exit window starts when the runner observes termination and lasts
+`post_seconds`. Requests are assigned by dispatch time; responses may finish
+later. Each window is scored separately, so successful later traffic cannot
+dilute a drain-window breach. A short or unconfirmed drain with fewer than
+`min_post_samples` valid responses is inconclusive even when post-exit traffic
+passes. The capacity summary names both window verdicts; JSON reports also
+retain each window's request IDs, limitations and timing evidence.
+
+A confirmed interruption or late admission fails even when some other coverage
+is missing. Unknown attribution, absent overlap, missing lifecycle facts,
+uncertain clock ordering or insufficient samples stay inconclusive. HTTP 200,
+`[DONE]`, recovery and successful retries cannot erase an original error. Backend
+attempts retain their own identities; Giraffe adds no inference retries.
+
+### Read-only lifecycle export
+
+Set `targets[].deployment.collector_url` to an HTTP(S) endpoint returning a JSON
+object with the top-level key `scale_down_lifecycle`. Ordinary allowlisted
+configuration categories may coexist. Lifecycle events do not belong in arbitrary
+metadata. Collection uses the existing bounded read-only transport and does not
+forward inference credentials. The entire collector response must fit 64 KiB.
+Each events, inventories and coverage array is limited to 256 items. Long runs
+must stay within those bounds; gaps or truncation must be explicit, never hidden.
+
+The version 1 lifecycle object has these fields:
+
+| Field | Contract |
+| --- | --- |
+| `schema_version` | Integer `1`, explicitly supplied |
+| `target` | Configured Giraffe target name |
+| `source`, `clock_id` | Stable source identity and source-clock incarnation for this history |
+| `through_sequence` | Nonnegative integer watermark covering both events and inventories |
+| `captured_at` | UTC ISO timestamp generated when this export is sampled, not the last event time |
+| `clock_uncertainty_ms` | Explicit nonnegative upper bound on source UTC clock error, at most 60000 ms |
+| `inventories` | Inventory observations described below |
+| `events` | Lifecycle facts described below |
+| `coverage` | Explicit completeness intervals described below |
+
+Every inventory contains `event_id`, nonnegative integer `sequence`, nonnegative
+`time_ms`, and a `replicas` array of at most 512 unique stable **incarnation IDs**. A restarted
+process must get a different ID. Include baseline inventory with at least two
+incarnations and inventory showing survivors after termination.
+
+Every lifecycle fact contains `event_id`, `sequence`, `time_ms`, `kind` and
+`replica_id`. Supported kinds are `removal_requested`, `drain_effective`,
+`request_admitted`, `request_completed` and `replica_terminated`. Request facts
+require `request_id` and `attempt_id`; completions report `outcome` as `completed`,
+`failed` or `cancelled`. Correlate `request_id` to Giraffe's request ID or the
+server request ID returned with the response. The client records `x-replica-id`
+and the streaming response `id` as attribution hints; backend admissions establish
+which attempt actually reached the removed incarnation. Retries need distinct
+attempt IDs and cannot overwrite original admissions or completions.
+
+Use one ordered sequence across the source history. Re-export unchanged facts
+with the same IDs, sequences and contents. `time_ms` uses the source's own clock
+and units throughout; Giraffe uses same-source ordering and elapsed times for
+admissions, completion and grace. It never subtracts unrelated monotonic clocks.
+`captured_at` plus `clock_uncertainty_ms` maps each collection to a conservative
+runner interval. The timestamp must overlap the HTTP collection interval within
+that declared uncertainty. Missing, stale or unmappable capture time cannot
+establish overlap. Polling must observe an active answer before and after the
+transition; allow time for a fresh source capture after arming before removing.
+
+Every coverage entry contains `replica_id`, `start_sequence`, `end_sequence`,
+`complete`, `scope` (`all` or `giraffe`), `gaps` (at most 256 sequence integers) and `truncated`.
+`complete` and `truncated` are JSON booleans; source sequence fields are integers,
+not numeric strings. Omitting `complete` or `scope` on an entry defaults to `false` and `giraffe`.
+Start must not exceed end. A drain pass requires complete, gap-free, untruncated
+**all-traffic** coverage from source sequence zero through the selected replica's
+confirmed termination. With this schema, sequence zero is the known origin of the
+replica incarnation; a rolling interval starting later cannot rule out earlier
+unfinished work. Include unfinished attempts and failed completions. Coverage of only Giraffe traffic or sampled absence cannot establish
+that other traffic drained correctly. A replica count decrease, readiness change
+or deletion request is not process termination or an effective admission cutoff.
+
+All identifiers are nonempty strings up to 256 characters. Evidence remains a
+claim from its named backend source. Wrong target/incarnation, conflicting IDs,
+backwards sequences, source clock changes, malformed data and exceeded bounds
+leave explicit limitations; none supplies missing proof. For an executable source
+example see [the controlled router fixture](../tests/fake_replica_router.py). It is
+not an adapter for Kubernetes, vLLM or GPUStack.

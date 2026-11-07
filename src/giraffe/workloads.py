@@ -23,6 +23,7 @@ WORKLOAD_CHECKS = {
     "consistency": {"consistency"}, "tool_calling": {"tools"},
     "forced_tool_diagnostic": {"tools"}, "tool_checks": {"tools"},
     "load_test": {"load"},
+    "scale_down": {"scale_down"},
 }
 
 
