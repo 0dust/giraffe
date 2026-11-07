@@ -40,6 +40,12 @@ class _UserOutputProgress(OutputProgress):
         super().set()
         self.expire_trigger_admissions()
 
+    def on_answer_reset(self):
+        self.first = False
+        self.chunks = 0
+        self.expire_trigger_admissions()
+        self.changed.set()
+
     def on_stream_finished(self):
         self.finished = True
         self.expire_trigger_admissions()

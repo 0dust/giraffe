@@ -2845,6 +2845,8 @@ class RequestRecord(PersistedModel):
     first_token_reason: str | None = "Timing schema predates client content-event collection."
     output_events: list[dict[str, Any]] = Field(default_factory=list)
     output_events_truncated: bool = False
+    # The second useful answer SSE event may arrive in the first answer read.
+    second_answer_event_ms: float | None = Field(default=None, ge=0)
     answer_read_timestamps_ms: list[float] = Field(default_factory=list)
     reasoning_read_timestamps_ms: list[float] = Field(default_factory=list)
     read_timestamps_truncated: bool = False

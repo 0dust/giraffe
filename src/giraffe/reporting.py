@@ -731,6 +731,11 @@ def _metric_values(records: list[RequestRecord], *, check: str | None = None,
         arrival = (record.load_point or {}).get("pattern") in {"constant", "poisson", "bursts"}
         return getattr(record, arrival_field if arrival else dispatch_field)
 
+    def stream_gap(record):
+        if check == "multi_user" and (record.output_tokens == 0 or record.completion_tokens == 0):
+            return None
+        return record.max_stream_gap_ms
+
     def timing_values(name, measure):
         values = []
         cohort = []
@@ -746,7 +751,7 @@ def _metric_values(records: list[RequestRecord], *, check: str | None = None,
     timing = {
         "latency_ms": lambda r: clock_value(r, "arrival_elapsed_ms", "elapsed_ms"),
         "first_output_ms": lambda r: clock_value(r, "arrival_first_output_ms", "first_output_ms"),
-        "max_stream_gap_ms": lambda r: r.max_stream_gap_ms,
+        "max_stream_gap_ms": stream_gap,
         "output_tokens_per_second": lambda r: _rate(r) if "multi_user" not in r.check_ids else None,
         "generation_tokens_per_second": lambda r: r.generation_tokens_per_second,
     }
@@ -2290,6 +2295,9 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                     continue
                 current_records = current_groups.get((check, scenario), [])
                 old_records = old_groups.get((check, scenario), [])
+                record_cohorts = current_records, old_records
+                conversation_user = check == "multi_user" and any(
+                    r.workload.get("session_id") for cohort in record_cohorts for r in cohort)
                 point_records = current_records or old_records
                 workload = point_records[0].workload
                 if check == "multi_user" and workload.get("window_id") in slot_changes:
@@ -2317,62 +2325,69 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                                      "status": "inconclusive", "reason": "Missing or different request shapes or proportions.",
                                      "current_samples": len(current_records), "baseline_samples": len(old_records),
                                      "evidence_ids": [record.id for record in current_records]})
-                    continue
+                    # Conversation timing can still match even when attempts differ.
+                    if not conversation_user:
+                        continue
                 if load_point:
                     current_mix = current_shares.get(current_records[0].load_point.get("point_id"), {})
                     old_mix = old_shares.get(old_records[0].load_point.get("point_id"), {})
                     mix_changed |= any(abs(current_mix.get(shape, 0) - old_mix.get(shape, 0)) > Fraction(1, 10)
                                        for shape in current_mix.keys() | old_mix.keys())
-                record_cohorts = current_records, old_records
                 scheduled_user = check == "multi_user" and workload.get("scenario") in {"arrivals", "recovery"}
+                track_timing = conversation_user or scheduled_user
                 current_timing, old_timing = {}, {}
                 current_metrics = _metric_values(current_records, check=check, timing_records=current_timing)
                 old_metrics = _metric_values(old_records, check=check, timing_records=old_timing)
                 current_work, old_work = (_output_work(records, check=check) for records in record_cohorts)
-                outputs = _output_observations(check, scenario, current_work, old_work)
-                if load_point:
-                    for output in outputs:
-                        output["load_point"] = load_point
-                observed_outputs.extend(outputs)
+                if not work_reason:
+                    outputs = _output_observations(check, scenario, current_work, old_work)
+                    if load_point:
+                        for output in outputs:
+                            output["load_point"] = load_point
+                    observed_outputs.extend(outputs)
                 different_work = _different_output_work(current_work, old_work, threshold)
-                timing_cohorts = record_cohorts
-                live_output_differs = False
-                if check == "multi_user":
+                live_inputs_differ = live_output_differs = False
+                if check == "multi_user" and not conversation_user:
                     completions = tuple([r for r in cohort if _valid_completion(r, check)]
                                         for cohort in record_cohorts)
-                    if any(r.workload.get("session_id") for cohort in record_cohorts for r in cohort):
-                        timing_cohorts = completions
                     live_inputs_differ = _live_input_work_changed(*completions, threshold)
                     live_output_differs = (not live_inputs_differ and _live_input_work_changed(
                         *completions, threshold, compare_output=True))
-                else:
+                elif check != "multi_user":
                     live_inputs_differ = (any(r.workload.get("mode") == "live" for r in current_records)
                                           and Counter(r.request_hash for r in current_records)
                                           != Counter(r.request_hash for r in old_records))
-                input_work_changed = _input_work_changed(*timing_cohorts, threshold)
+                input_work_changed = _input_work_changed(*record_cohorts, threshold)
                 for metric, values in current_metrics.items():
-                    if not values and not old_metrics[metric]:
+                    measured_conversation = conversation_user and metric in TIMING_METRICS
+                    if (work_reason and not measured_conversation) or (not values and not old_metrics[metric]):
                         continue
                     row = _compare_metric(metric, values, old_metrics[metric],
                                           1 if check == "access" and metric in {"valid_completion_rate", "error_rate"} else minimum,
                                           threshold)
-                    current_samples, old_samples = timing_cohorts if metric in TIMING_METRICS else record_cohorts
+                    current_samples, old_samples = record_cohorts
                     current_output, old_output = current_work, old_work
-                    metric_input_changed, metric_output_changed = input_work_changed, different_work
                     metric_work_reason, metric_mix_changed = None, mix_changed
+                    metric_input_changed, metric_output_changed = input_work_changed, different_work
+                    metric_live_inputs, metric_live_output = live_inputs_differ, live_output_differs
                     generation_work_changed = visible_work_changed = recovery_work_changed = False
-                    if scheduled_user and metric in TIMING_METRICS:
+                    if track_timing and metric in TIMING_METRICS:
                         current_samples, old_samples = current_timing[metric], old_timing[metric]
-                        if current_samples and old_samples:
-                            metric_work_reason, metric_mix_changed = _load_work_comparison(
-                                current_samples, old_samples, compare_stream_options=False)
-                        else:
-                            metric_mix_changed = False
-                        current_output, old_output = _output_work(current_samples), _output_work(old_samples)
+                        metric_work_reason, metric_mix_changed = (
+                            _load_work_comparison(current_samples, old_samples, compare_stream_options=False)
+                            if current_samples and old_samples else (None, False))
+                        current_output = _output_work(current_samples, check=check)
+                        old_output = _output_work(old_samples, check=check)
+                        metric_output_changed = _different_output_work(current_output, old_output, threshold)
+                    if measured_conversation:
+                        metric_input_changed = _input_work_changed(current_samples, old_samples, threshold)
+                        metric_live_inputs = _live_input_work_changed(current_samples, old_samples, threshold)
+                        metric_live_output = (not metric_live_inputs and _live_input_work_changed(
+                            current_samples, old_samples, threshold, compare_output=True))
+                    if scheduled_user and metric in TIMING_METRICS:
                         metric_input_changed = (_measured_token_work_changed(current_samples, old_samples, threshold,
                                                                              lambda r: r.input_tokens)
                                                 or _uncached_input_work_changed(current_samples, old_samples, threshold))
-                        metric_output_changed = _different_output_work(current_output, old_output, threshold)
                         generation_work_changed = _measured_token_work_changed(
                             current_samples, old_samples, threshold, _total_generated_tokens)
                         # Visible tokens after the first answer affect completion
@@ -2388,14 +2403,14 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                         warnings.append({"code": code, "message": message})
                         if not preserve_failure or row["status"] != "fail":
                             row["status"] = "inconclusive"
-                    if (metric_input_changed or live_inputs_differ) and metric in TIMING_METRICS:
+                    if (metric_input_changed or metric_live_inputs) and metric in TIMING_METRICS:
                         warn("input_work_changed", "Observed input work differs or lacks evidence; timing requires comparable input work."
                              if scheduled_user else "Observed input work or live generated histories differ; timing is not like-for-like.")
                     if generation_work_changed and metric in TIMING_METRICS:
                         warn("output_work_changed", "Observed total generation differs or lacks evidence; timing requires comparable generated work.")
                     elif visible_work_changed:
                         warn("output_work_changed", "Observed visible output differs or lacks evidence; timing requires comparable generated work.")
-                    elif live_output_differs and metric in TIMING_METRICS:
+                    elif metric_live_output and metric in TIMING_METRICS:
                         warn("output_work_changed", "Observed generated work differs at matching live conversation turns; timing is not like-for-like.")
                     elif metric_output_changed and metric in {"latency_ms", "max_stream_gap_ms", "output_tokens_per_second", "generation_tokens_per_second"}:
                         warn("output_work_changed", "Actual generated output lengths differ materially: "
