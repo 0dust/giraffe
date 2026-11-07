@@ -349,6 +349,7 @@ def planned_conditions(config: Any) -> list[dict[str, Any]]:
     Setup, calibration and warm-up remain request/check evidence only.
     """
     from .fixtures import builtin_fixtures
+    from .gateway_access import eligible_probe_count
     from .load_test import scheduled_count, settings_sets, test_points
     from .logprob_workload import corpus_width, sample_count
     from .planning import request_plan
@@ -357,6 +358,12 @@ def planned_conditions(config: Any) -> list[dict[str, Any]]:
 
     selected = set(config.checks)
     scenarios: dict[str, dict[str, Any]] = {}
+
+    def waiting(condition, planned, kind):
+        return {"condition": condition, "planned": planned, "planned_condition": True,
+            "planned_kind": kind if planned is not None else "unknown", "status": "waiting",
+            "sent": 0, "started": 0, "running": 0, "completed": 0, "failed": 0,
+            "not_sent": planned, "reason": None, "request_statuses": {}}
 
     def add(scenario, planned=None, kind="unknown", workload=None):
         condition = condition_for(scenario, workload, config)
@@ -367,10 +374,7 @@ def planned_conditions(config: Any) -> list[dict[str, Any]]:
                 previous["planned"] += planned
                 previous["not_sent"] = previous["planned"]
             return
-        scenarios[key] = {"condition": condition, "planned": planned, "planned_condition": True,
-            "planned_kind": kind if planned is not None else "unknown", "status": "waiting",
-            "sent": 0, "started": 0, "running": 0, "completed": 0, "failed": 0,
-            "not_sent": planned, "reason": None, "request_statuses": {}}
+        scenarios[key] = waiting(condition, planned, kind)
 
     # The request preview already accounts for shared initial work and finite
     # core batches; only rows that actually have a meaningful executor scenario
@@ -482,8 +486,13 @@ def planned_conditions(config: Any) -> list[dict[str, Any]]:
                 prefix = f"tools_{fixture.fixture_id}" if custom else "tools"
                 for mode in resolved_tool_modes(config):
                     add(f"{prefix}_{choice}_{mode}", 1, "exact")
-    return [condition_aggregate({"target": target.name, **summary})
-            for target in config.targets for summary in scenarios.values()]
+    rows = []
+    for target in config.targets:
+        rows.extend(condition_aggregate({"target": target.name, **summary}) for summary in scenarios.values())
+        if count := eligible_probe_count(config, target):
+            condition = condition_for("gateway_access", config=config)
+            rows.append(condition_aggregate({"target": target.name, **waiting(condition, count, "exact")}))
+    return rows
 
 
 def request_status(record: Mapping[str, Any]) -> str:

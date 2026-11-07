@@ -1414,3 +1414,103 @@ async def test_access_condition_retains_verdict_and_transport_counts(
         assert (row["status"], row["planned_kind"], row["planned"], row["failed"], row["not_started"]) == (
             verdict, "exact", 2, failed, 0)
     assert page.json()["totals"]["failed"] == failed
+
+
+@pytest.mark.parametrize("retention,outcome", [
+    ("all", "complete"), ("failures", "complete"), ("none", "complete"),
+    ("none", "cutoff"), ("none", "stopped"), ("none", "credentials_changed"),
+])
+async def test_deferred_access_pages_eligible_probes_before_dispatch(
+        monkeypatch, tmp_path, local_tokenizer, retention, outcome):
+    from threading import Event
+
+    from giraffe.web import create_app
+    from tests.test_web import finished
+
+    monkeypatch.setenv("ALLOW_KEY", "allow-secret")
+    monkeypatch.setenv("DENY_KEY", "deny-secret")
+    shared_started, release_shared = Event(), Event()
+    access_started, release_access = Event(), Event()
+
+    async def handler(request):
+        if request.method != "POST":
+            return httpx.Response(404)
+        authorization = request.headers.get("authorization")
+        if authorization is None:
+            shared_started.set()
+            assert await asyncio.to_thread(release_shared.wait, 5)
+        elif authorization == "Bearer deny-secret":
+            return httpx.Response(401, json={"error": {"type": "token_not_found_in_db"}})
+        elif outcome == "credentials_changed":
+            access_started.set()
+            assert await asyncio.to_thread(release_access.wait, 5)
+        return httpx.Response(200, json={"choices": [{"message": {
+            "role": "assistant", "content": "OK"}, "finish_reason": "stop"}]})
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
+    cfg = config(retention=retention, samples=1, max_requests=2 if outcome == "cutoff" else None).model_dump(mode="json")
+    cfg["checks"] = ["access", "gateway_access"]
+    cfg["targets"].append({**cfg["targets"][0], "name": "unavailable", "test_identities": {
+        "allowed": {"api_key_env": "ALLOW_KEY"}, "denied": {"api_key_env": "ALLOW_KEY"},
+    }})
+    cfg["gateway_access"]["cases"] = [
+        {"name": f"{alias}{index}", "identity": alias, "expected": expected}
+        for alias, expected, count in [("allowed", "allow", 9), ("denied", "deny", 7)]
+        for index in range(count)
+    ]
+    app = create_app(tmp_path)
+    async with app.router.lifespan_context(app):
+        async with original(transport=httpx.ASGITransport(app=app), base_url="http://localhost:8787",
+                            headers={"X-Giraffe-Token": app.state.giraffe_token}) as client:
+            started = await client.post("/api/runs", json={"config": cfg})
+            assert started.status_code == 202, started.text
+            identifier = started.json()["id"]
+            path = f"/api/runs/{identifier}/conditions/gateway_access/requests"
+            try:
+                assert await asyncio.to_thread(shared_started.wait, 5)
+                live = await client.get(f"/api/runs/{identifier}")
+                for response in [started, live]:
+                    rows = [row for row in response.json()["live_conditions"] if row["condition_id"] == "gateway_access"]
+                    assert [(row["target"], row["status"], row["planned_kind"], row["planned"], row["started"])
+                            for row in rows] == [("proxy", "waiting", "exact", 16, 0)]
+                    assert "allow-secret" not in response.text and "deny-secret" not in response.text
+                assert (await client.get(path, params={"target": "unavailable"})).status_code == 404
+                for number, expected in [(1, list(range(1, 11))), (2, list(range(11, 17)))]:
+                    response = await client.get(path, params={"target": "proxy", "page": number})
+                    assert response.status_code == 200
+                    page = response.json()
+                    assert (page["page"], page["pages"], page["total"], page["totals"]["not_started"]) == (number, 2, 16, 16)
+                    assert [(row["number"], row["status"], row["request_id"]) for row in page["rows"]] == [
+                        (index, "not_started", None) for index in expected]
+                if outcome == "stopped":
+                    cancelled = await client.post(f"/api/runs/{identifier}/cancel", json={})
+                    assert cancelled.status_code == 200, cancelled.text
+                    assert cancelled.json()["state"] == "stopping"
+                elif outcome == "credentials_changed":
+                    monkeypatch.delenv("DENY_KEY")
+                    release_shared.set()
+                    assert await asyncio.to_thread(access_started.wait, 5)
+                    # Transport entry can precede delivery of the start event.
+                    async with asyncio.timeout(5):
+                        while True:
+                            page = (await client.get(path, params={"target": "proxy"})).json()
+                            if page["totals"]["running"] == 1:
+                                break
+                            await asyncio.sleep(.01)
+                    assert (page["aggregate"]["status"], page["total"], page["totals"]["not_started"]) == ("running", 9, 8)
+            finally:
+                release_shared.set()
+                release_access.set()
+            detail = await finished(client, identifier)
+            saved = json.loads((tmp_path / identifier / "report.json").read_text())
+            expected_total = 9 if outcome == "credentials_changed" else 16
+            expected_not_started = 16 if outcome in {"cutoff", "stopped"} else 0
+            expected_status = "passed" if outcome == "complete" else "inconclusive"
+            for rows in [detail["live_conditions"], saved["conditions"]]:
+                row = next(row for row in rows if row["condition_id"] == "gateway_access" and row["target"] == "proxy")
+                assert (row["status"], row["planned"], row["not_started"]) == (
+                    expected_status, expected_total, expected_not_started)
+            page = (await client.get(path, params={"target": "proxy", "page": 2})).json()
+            assert (page["total"], page["range_end"], page["totals"]["not_started"]) == (
+                expected_total, expected_total, expected_not_started)
