@@ -35,7 +35,8 @@ def configuration(mode="key_rpm", **changes):
 async def exercise(monkeypatch, mode="key_rpm", *, behavior="enforce", full=False,
                    admitted_affected=None, rejection_saturation=None, saturation_header=None, peer_delay=.01,
                    early_peer_admissions=None, restart=False, model_tpm="not configured",
-                   rejection_unit=None, key_reset="2026-01-01 00:00:00 UTC", max_requests=None, **settings):
+                   rejection_unit=None, key_reset="2026-01-01 00:00:00 UTC", max_requests=None,
+                   peer_completion_details=None, **settings):
     monkeypatch.setenv("LIMITED", "limited-secret")
     monkeypatch.setenv("PEER", "peer-secret")
     if behavior == "duplicate_credentials":
@@ -109,6 +110,8 @@ async def exercise(monkeypatch, mode="key_rpm", *, behavior="enforce", full=Fals
         if who == "peer" and behavior == "peer_omitted_total":
             del usage["total_tokens"]
         if who == "peer":
+            if peer_completion_details is not None:
+                usage["completion_tokens_details"] = peer_completion_details
             huge = 10**309
             if behavior == "peer_unbounded_completion":
                 usage.update(completion_tokens=huge, total_tokens=huge + 8)

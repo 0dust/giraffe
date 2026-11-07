@@ -672,8 +672,11 @@ class LLMClient:
                 cached = usage.get("prompt_tokens_details")
                 cached_tokens = count(cached.get("cached_tokens")) if isinstance(cached, dict) else None
                 details = usage.get("completion_tokens_details")
-                reasoning_tokens = count(details.get("reasoning_tokens")) if isinstance(details, dict) else None
+                raw_reasoning_tokens = details.get("reasoning_tokens") if isinstance(details, dict) else None
+                reasoning_tokens = count(raw_reasoning_tokens)
                 if priority_probe:
+                    if raw_reasoning_tokens is not None and reasoning_tokens is None:
+                        raise _ProtocolError("invalid reasoning token usage in gateway response")
                     _check_gateway_usage_total(prompt_tokens, completion_tokens, _gateway_usage_total(usage))
                 elif attribution or policy_probe:
                     _gateway_token_count(usage.get("total_tokens"))
