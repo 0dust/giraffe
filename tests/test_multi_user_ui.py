@@ -360,3 +360,38 @@ values.set('multi_user_conversation_turns',prompts);
 console.log(JSON.stringify(configureMultiUser(config,values,bootstrap.multi_user.defaults)));
 ''', config)
     assert RunConfig.model_validate(result).multi_user.conversations.turns == turns
+
+
+def test_multi_user_task_form_preserves_original_prompts_after_row_edits():
+    prompts = ['\nFirst task', 'Second line\r\nNext']
+    config = RunConfig.model_validate({**configuration().model_dump(),
+        'multi_user': {'levels': [2], 'conversations': {'profile': 'performance', 'modes': ['live'],
+            'workloads': [{'name': 'other-task', 'turns': ['First', 'Second']},
+                          {'name': 'custom-task', 'turns': prompts}]}}})
+    result = browser_logic(r'''
+const markup=renderMultiUserConversationEditor(config.multi_user),values=new FormData();
+const prefix='multi_user_conversation_',decode=text=>text.replace(/&quot;/g,'"');
+const read=name=>markup.match(new RegExp('<input[^>]*name="'+name+'"[^>]*value="([^"]*)"'))?.[1];
+values.set('multi_user_rendered','1');values.set(prefix+'profile','performance');
+values.set(prefix+'task_count',read(prefix+'task_count'));
+for(const index of [0,1]){
+  const key=prefix+`task_${index}_`,task=config.multi_user.conversations.workloads[index];
+  values.set(key+'enabled','on');values.set(key+'name',task.name);values.set(key+'weight',task.weight);
+  values.set(key+'cap','');values.set(key+'turn_count',task.turns.length);
+  const original=read(key+'original_turns');
+  if(original!==undefined)values.set(key+'original_turns',decode(original));
+  for(let turn=0;turn<task.turns.length;turn++){
+    const name=key+'turn_'+turn;
+    const content=markup.match(new RegExp('<textarea[^>]*name="'+name+'"[^>]*>([\\s\\S]*?)</textarea>'))[1];
+    values.set(name,content.replace(/\r\n?/g,'\n').replace(/^\n/,''));
+  }
+}
+const serialize=(source=config)=>configureMultiUser(source,values,bootstrap.multi_user.defaults);
+assert(sameConfig(serialize().multi_user.conversations.workloads,config.multi_user.conversations.workloads));
+values.delete(prefix+'task_0_enabled');values.set(prefix+'task_1_name','other-task');
+values.set(prefix+'task_1_turn_1','Edited\nfollow-up');
+console.log(JSON.stringify(serialize(serialize())));
+''', config)
+    saved, = RunConfig.model_validate(result).multi_user.conversations.workloads
+    assert saved.name == 'other-task'
+    assert saved.turns == [prompts[0], 'Edited\nfollow-up']

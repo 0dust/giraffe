@@ -110,6 +110,11 @@ def condition_display_name(scenario: str, workload: Mapping[str, Any] | None = N
     return label
 
 
+def scheduled_multi_user_window(scenario: str | None) -> bool:
+    return isinstance(scenario, str) and re.fullmatch(
+        r"multi_user_\d+_(?:arrivals|recovery_(?:control|sustained|lighter))", scenario) is not None
+
+
 def _identity(scenario: str, workload: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Return a stable condition and plain label without changing request metadata."""
     workload = workload or {}
@@ -440,6 +445,13 @@ def planned_conditions(config: Any) -> list[dict[str, Any]]:
     if "arrivals" in selected and config.arrivals:
         add("arrival", config.arrivals.requests, "exact",
             {"requests_per_second": config.arrivals.requests_per_second})
+    if "multi_user" in selected and config.multi_user:
+        from .multi_user import _planned_observation
+
+        for window in _planned_observation(config.multi_user, include_offers=False)["windows"]:
+            if "scheduled_offers" in window:
+                add(window["id"], window["scheduled_offers"], "exact",
+                    {"population": window["population"], "phase": window["phase"]})
     if "sessions" in selected and config.sessions:
         settings = config.sessions
         count = (sum(len(item.turns) for item in workload_plan(settings.workloads, settings.sessions))
@@ -524,7 +536,7 @@ def condition_aggregate(summary: Mapping[str, Any], *, verdict: str | None = Non
     not_started = max(0, planned - started) if planned is not None else None
     reason = summary.get("reason")
     terminal = summary.get("status") not in {"waiting", "running"}
-    explicit = verdict or (summary.get("load_point_result") or {}).get("status")
+    explicit = verdict or summary.get("condition_verdict") or (summary.get("load_point_result") or {}).get("status")
     if running or not terminal and summary.get("status") == "running":
         status = "running"
     elif not terminal:
@@ -532,6 +544,8 @@ def condition_aggregate(summary: Mapping[str, Any], *, verdict: str | None = Non
     elif not started and ((summary.get("load_point_result") or {}).get("status") == "skipped"
                          or (summary.get("load_point_result") or {}).get("input_not_calibrated")):
         status = "skipped"
+    elif explicit in {"pending", "measured"}:
+        status = "inconclusive"
     elif explicit in {"pass", "fail", "inconclusive", "blocked", "skipped"}:
         status = {"pass": "passed", "fail": "failed", "blocked": "inconclusive"}.get(explicit, explicit)
     elif failed:
@@ -609,6 +623,24 @@ def aggregate_conditions(report: Any) -> list[dict[str, Any]]:
         for summary in observation.get("conditions", []):
             condition = summary.get("condition") or {}
             groups[target, condition.get("id")] = {**summary, "target": target}
+    check_rows = [plain(check) for check in checks]
+    verdicts = _condition_verdicts(check_rows)
+    for check in check_rows:
+        target = check.get("target")
+        metrics = check.get("metrics") or {}
+        for window in (metrics.get("multi_user") or {}).get("windows", []):
+            identifier = window.get("id")
+            if not scheduled_multi_user_window(identifier):
+                continue
+            planned = window.get("scheduled_offers", (window.get("offer_accounting") or {}).get("planned"))
+            if planned is None:
+                continue
+            key = target, identifier
+            summary = groups.setdefault(key, {"target": target, "condition": condition_for(identifier, window),
+                                              "status": "finished", "reason": window.get("reason")})
+            summary.update(planned=planned, planned_kind="exact", planned_condition=True)
+            if window.get("status"):
+                verdicts[key] = window["status"]
     counts = {}
     for item in records:
         record = plain(item)
@@ -620,8 +652,6 @@ def aggregate_conditions(report: Any) -> list[dict[str, Any]]:
         status = request_status(record)
         statuses = counts.setdefault(key, {})
         statuses[status] = statuses.get(status, 0) + 1
-    check_rows = [plain(check) for check in checks]
-    verdicts = _condition_verdicts(check_rows)
     # A check verdict is a condition verdict only when it owns one condition.
     # Matrix checks must retain their per-condition evidence instead.
     owners = {}
