@@ -644,6 +644,48 @@ def test_conversation_acceptance_qualifies_the_work_behind_each_failure(mode, ch
         assert rate["status"] == "pass"
 
 
+@pytest.mark.parametrize("miss", ["deadline", "wrong_answer", "second_deadline", "pending_admission"])
+def test_fixed_acceptance_only_qualifies_work_behind_the_observed_miss(miss):
+    current, previous = live_user_report(session_ids=True), live_user_report(session_ids=True)
+    for report in (current, previous):
+        settings = report.manifest["config"]["multi_user"]["pass_criteria"]
+        settings.update(max_completion_ms=300, max_error_percent=None)
+        source = report.observations["targets"]["local"]["multi_user"]
+        source["settings"]["pass_criteria"] = settings
+        if report is current and miss == "pending_admission":
+            source["windows"][0]["users"][-1].update(pending_ready_ms=9500, pending_observed_ms=10000)
+        for request in report.requests:
+            request.workload["mode"] = "fixed"
+            request.fixture_id = f"session_fixed_turn{request.workload['turn_id']}.v1"
+            request.output_tokens = 1
+            if report is previous:
+                continue
+            changed = "user-05-5" if miss == "second_deadline" else "user-05-6"
+            if request.id == changed:
+                request.reasoning_tokens = 30
+            if miss == "pending_admission":
+                continue
+            if request.id == "user-05-7" or (miss == "second_deadline" and request.id == changed):
+                if miss == "wrong_answer":
+                    request.score = False
+                else:
+                    request.elapsed_ms = 500
+                    request.completed_ms = request.dispatch_ms + request.elapsed_ms
+        summary = summarize(source, report.requests)
+        report.checks[0].metrics["multi_user"] = summary
+        report.checks[0].status = report.overall = summary["status"]
+
+    comparison = compare_baseline(current, previous).baseline
+    assert comparison["acceptance"] == {"baseline": "pass", "current": "fail"}
+    rows = {row["metric"]: row for row in comparison["targets"][0]["comparisons"]
+            if row.get("user_id") == "user-05"}
+    assert rows["user_acceptance"]["status"] == comparison["status"] == "fail"
+    assert rows["latency_ms"]["status"] == "inconclusive"
+    assert rows["shared_window_output_tokens_per_second"]["status"] == "pass"
+    assert rows["error_rate"]["current"] == (1 / 8 if miss == "wrong_answer" else 0)
+    assert rows["error_rate"]["baseline"] == 0
+
+
 def test_live_delivery_compares_requested_mix_of_in_window_completions():
     current, previous = live_user_report(), live_user_report()
     current.requests = [r for r in current.requests if r.id not in {f"user-05-{i}" for i in range(3, 8)}]
