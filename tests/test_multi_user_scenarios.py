@@ -449,6 +449,108 @@ def test_before_output_rechecks_generation_when_a_slot_opens(monkeypatch, reason
     run_virtual(monkeypatch, run())
 
 
+@pytest.mark.parametrize("opening", [
+    "same_read_orphan", "later_read_orphan", "spent_before_orphan", "same_read_answer",
+])
+def test_during_stream_admission_counts_two_visible_answer_events(monkeypatch, opening):
+    from types import SimpleNamespace
+
+    import httpx
+
+    from giraffe.client import LLMClient
+    from giraffe.models import LoadTestSettings
+    from giraffe.multi_user import run_window
+    from giraffe.multi_user_metrics import summarize
+    from tests.test_event_timing import sse
+    from tests.test_review26_phase4_accuracy import run_virtual
+
+    def frame(text):
+        return sse({"content": text})
+
+    class Stream(httpx.AsyncByteStream):
+        def __init__(self, heavy, probe):
+            self.heavy = heavy
+            self.probe = probe
+
+        async def __aiter__(self):
+            await asyncio.sleep(.05)
+            if not self.heavy and self.probe:
+                if opening == "same_read_orphan":
+                    yield frame("thought A") + frame("thought B") + frame("</think>K7P4")
+                elif opening in {"later_read_orphan", "spent_before_orphan"}:
+                    yield frame("thought A") + frame("thought B")
+                    await asyncio.sleep(.03)
+                    yield frame("</think>K7P4")
+                else:
+                    yield frame("<think>thought</think>K7P4") + frame(" 42")
+            else:
+                yield frame("<think>thought</think>K7P4")
+            await asyncio.sleep(.07)
+            if self.heavy or not self.probe or opening != "same_read_answer":
+                yield frame(" 42")
+                await asyncio.sleep(.03)
+            yield frame(" 43")
+            await asyncio.sleep(.02)
+            yield sse(finish="stop", usage={"prompt_tokens": 256 if self.heavy else 64,
+                "completion_tokens": 18, "completion_tokens_details": {"reasoning_tokens": 2}})
+            yield b"data: [DONE]\n\n"
+
+    async def run():
+        cfg = settings(levels=[2], duration_seconds=.4, think_time_seconds={"values": [1]},
+                       profile=PROFILE, scenarios=["noisy_neighbors"], pass_criteria={"min_samples": 1},
+                       noisy_neighbors={"heavy_user_ids": ["user-02"], "heavy_profiles": ["long_short"],
+                                        "triggers": ["during_stream"], "max_slowdown": 3})
+        target = cfg.targets[0]
+        state = runner._Run(cfg, None, None)
+        client = LLMClient(target, cfg, max_connections=2)
+        observation = _planned_observation(cfg.multi_user)
+        calibration = {(size, "short_answer"): {"filler_chars": 700 if size == "long" else 100}
+                       for size in ("short", "long")}
+        probe = False
+
+        async def respond(request):
+            trace = request.extensions.get("trace")
+            if trace:
+                await trace("http11.send_request_body.started", {"request": SimpleNamespace(
+                    method=b"POST", url=SimpleNamespace(target=b"/v1/chat/completions"))})
+                await trace("http11.send_request_body.complete", {})
+            return httpx.Response(200, stream=Stream(len(request.content) > 500, probe))
+
+        async def release_busy_slot():
+            await asyncio.sleep(.10)
+            state.release_slot()
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as transport:
+            client._client = transport
+            for window in observation["windows"]:
+                probe = window["role"] == "probe"
+                release = None
+                if probe and opening == "later_read_orphan":
+                    await state.slots.get()
+                    release = asyncio.create_task(release_busy_slot())
+                await run_window(state, target, client, cfg.multi_user,
+                                 LoadTestSettings(profile=cfg.multi_user.profile), calibration, window)
+                if release:
+                    await release
+        probes = {r.workload["user_id"]: r for r in state.records if r.workload["role"] == "probe"}
+        peer, heavy = probes["user-01"], probes["user-02"]
+        assert peer.answer_chunks == 3
+        evidence = summarize(observation, state.records)["windows"][1]["interference"]
+        if opening == "spent_before_orphan":
+            assert heavy.workload["trigger_ms"] < peer.timing_start_ms + peer.first_output_ms
+            assert evidence["status"] == "inconclusive" and not evidence["qualified"], evidence
+            return
+        second = peer.timing_start_ms + peer.second_answer_event_ms
+        assert heavy.workload["trigger_ms"] == pytest.approx(second)
+        assert heavy.request_body_sent_ms >= heavy.workload["trigger_ms"]
+        if opening == "same_read_answer":
+            assert peer.second_answer_event_ms == peer.answer_read_timestamps_ms[0]
+            assert heavy.workload["trigger_ms"] < peer.timing_start_ms + peer.answer_read_timestamps_ms[1]
+        assert evidence["status"] == "pass" and evidence["qualified"], evidence
+
+    run_virtual(monkeypatch, run())
+
+
 def matched_observation(trigger="during_stream", heavy_profile="long_short"):
     cfg = settings(levels=[2], duration_seconds=1, scenarios=["noisy_neighbors"], profile=PROFILE,
         noisy_neighbors={"heavy_user_ids": ["user-02"], "heavy_profiles": [heavy_profile],
@@ -468,6 +570,7 @@ def matched_observation(trigger="during_stream", heavy_profile="long_short"):
             item = record(user["user_id"], identity=f"{offset}-{user['user_id']}", dispatch=dispatch,
                 end=end, first_output_ms=first, stream=True, answer_reads=5, answer_chunks=5,
                 last_output_ms=end-dispatch-10, stream_end_ms=end-dispatch,
+                second_answer_event_ms=first+10,
                 input_tokens=256 if heavy and heavy_profile.startswith("long") else 64,
                 tokens=32 if heavy and heavy_profile.endswith("long") else 16,
                 requested_input_tokens=256 if heavy and heavy_profile.startswith("long") else 64,
@@ -499,6 +602,18 @@ def test_matched_interference_requires_actual_trigger_and_lengths(trigger, profi
     assert user["control_request_ids"] == [records[0].id]
     assert user["probe_request_ids"] == [records[1].id]
     assert user["heavy_request_ids"] == [records[2].id]
+
+
+@pytest.mark.parametrize(("second_answer_at", "expected"), [(None, "inconclusive"), (80, "inconclusive"),
+                                                            (70, "pass"), (50, "pass")])
+def test_during_stream_requires_admission_after_second_answer_event(second_answer_at, expected):
+    from giraffe.multi_user_metrics import summarize
+
+    source, records = matched_observation()
+    records[1].second_answer_event_ms = second_answer_at
+    evidence = summarize(source, records)["windows"][1]["interference"]
+    assert evidence["status"] == expected
+    assert evidence["qualified"] == (expected == "pass")
 
 
 @pytest.mark.parametrize("all_reasoning_user", ["short", "heavy"])
@@ -762,8 +877,10 @@ def test_cancellation_followup_does_not_substitute_for_peer_overlap(delayed):
     assert source == original
 
 
-@pytest.mark.parametrize(("peer_tokens", "expected"), [(0, "inconclusive"), (None, "pass")])
-def test_cancellation_peer_continuation_excludes_known_zero_answer_tokens(peer_tokens, expected):
+@pytest.mark.parametrize(("peer_tokens", "completion_tokens", "expected"), [
+    (0, 2, "inconclusive"), (None, 0, "inconclusive"), (None, None, "pass"),
+])
+def test_cancellation_peer_continuation_excludes_known_zero_answer_tokens(peer_tokens, completion_tokens, expected):
     from giraffe.multi_user_metrics import summarize
     from tests.test_multi_user_metrics import observation
 
@@ -775,8 +892,8 @@ def test_cancellation_peer_continuation_excludes_known_zero_answer_tokens(peer_t
     followup.workload["cancellation_role"] = "followup"
     peer = record("user-02", identity="peer", end=400, stream=True, answer_reads=2, answer_chunks=2,
                   last_output_ms=200, tokens=peer_tokens, score=False,
-                  completion_tokens=2 if peer_tokens == 0 else None,
-                  reasoning_tokens=2 if peer_tokens == 0 else None)
+                  completion_tokens=completion_tokens,
+                  reasoning_tokens=completion_tokens)
     records = [cancelled, followup, peer]
     source = observation(records, criteria={"min_samples": 1, "max_error_percent": None})
     source["windows"][0].update(scenario="cancellation", selected_user_id="user-01", role="cancellation")

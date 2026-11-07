@@ -222,7 +222,7 @@ def test_v8_logprob_length_reason_is_explicit():
     "<think>a<reasoning>b</think>c</reasoning></think>ans", "hidden</think>ans",
     "prefix<think>a</think>suffix", "<think>unclosed"])
 def test_v10_answer_spans_follow_final_answer_depth(text):
-    spans = _answer_spans(text)
+    spans, _ = _answer_spans(text)
     assert "".join(text[a:b] for a, b in spans or ()).lstrip() == final_answer(text)[0]
 
 
