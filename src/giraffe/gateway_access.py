@@ -9,7 +9,7 @@ from giraffe.identities import LITELLM_NATIVE_KEY_HEADERS, gateway_identities_on
 from giraffe.models import CheckResult, RequestSpec
 
 
-EVIDENCE_VERSION = 2
+EVIDENCE_VERSION = 3
 IDENTITY_CHANGED = "Test identity credentials changed after access preflight."
 _IDENTITY_FAILURE_REASONS = {
     IDENTITY_CHANGED: "identity_changed",
@@ -122,7 +122,7 @@ def denial_kind(status, body, *, anonymous=False):
         if (anonymous and error_type == "auth_error" and error.get("param") is None
                 and message == "Authentication Error, No api key passed in."):
             return "authentication"
-    if status == 403 and error_type in {
+    if status == 403 and error.get("param") in (None, "model") and error_type in {
         "key_model_access_denied", "team_model_access_denied", "user_model_access_denied",
         "org_model_access_denied", "project_model_access_denied",
     }:

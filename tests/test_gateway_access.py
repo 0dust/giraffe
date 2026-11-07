@@ -63,6 +63,19 @@ async def test_policy_matrix_uses_evidence_not_failed_requests(monkeypatch, stat
     assert all(record.check_ids == ["gateway_access"] for record in state.records)
 
 
+@pytest.mark.parametrize("param,expected", [
+    ("model", "model_access"),
+    (None, "model_access"),
+    ("search_tool_name", "unknown"),
+    ("team_id", "unknown"),
+])
+def test_403_denial_must_refer_to_model_access(param, expected):
+    from giraffe.gateway_access import denial_kind
+
+    body = json.dumps({"error": {"type": "key_model_access_denied", "code": "403", "param": param}})
+    assert denial_kind(403, body) == expected
+
+
 async def test_missing_identity_sends_nothing_and_cannot_pass(monkeypatch):
     from giraffe.gateway_access import execute, result
     monkeypatch.delenv("ALLOW_KEY", raising=False)
@@ -146,8 +159,12 @@ async def test_full_runner_keeps_policy_separate_and_preserves_exports(monkeypat
     ("unverified", "inconclusive"),
     ("unverified_baseline", "inconclusive"),
     ("old_baseline", "inconclusive"),
+    ("previous_denial_rules", "inconclusive"),
     ("legacy_source", "pass"),
     ("changed_source", "inconclusive"),
+    ("changed_endpoint", "inconclusive"),
+    ("changed_proxy", "inconclusive"),
+    ("irrelevant_fixture_change", "pass"),
 ])
 async def test_baseline_compares_qualified_access_cases(monkeypatch, mode, expected):
     from giraffe.reporting import compare_baseline
@@ -172,14 +189,24 @@ async def test_baseline_compares_qualified_access_cases(monkeypatch, mode, expec
     if mode == "old_baseline":
         check = next(check for check in baseline.checks if check.id == "gateway_access")
         del check.metrics["gateway_access"]["evidence_version"]
+    elif mode == "previous_denial_rules":
+        check = next(check for check in baseline.checks if check.id == "gateway_access")
+        check.metrics["gateway_access"]["evidence_version"] = 2
     elif mode == "legacy_source":
         del baseline.manifest["gateway_access_source_sha256"]
     elif mode == "changed_source":
         baseline.manifest["gateway_access_source_sha256"] = "different-source"
+    elif mode == "changed_endpoint":
+        baseline.manifest["config"]["targets"][0]["url"] = "http://another-proxy/v1"
+    elif mode == "changed_proxy":
+        baseline.manifest["config"]["proxy"] = "http://forward-proxy"
+    elif mode == "irrelevant_fixture_change":
+        baseline.manifest["fixture_pack"]["builtin_sha256"] = "different-builtins"
     deny_status = {"unexpected_access": 200, "unverified": 503}.get(mode, 401)
     current = await run_suite(cfg)
     compared = compare_baseline(current, baseline)
     assert compared.baseline["status"] == expected
+    assert compared.overall == expected
     target = compared.baseline["targets"][0]
     rows = {row["scenario"]: row for row in target["comparisons"]}
     assert set(rows) == {"valid", "invalid"}
@@ -190,7 +217,7 @@ async def test_baseline_compares_qualified_access_cases(monkeypatch, mode, expec
         "unexpected_access": "allow", "unverified": "unverified",
     }.get(mode, "deny")
     assert "collect at least" not in target["summary"]
-    if mode == "old_baseline":
+    if mode in {"old_baseline", "previous_denial_rules"}:
         assert all(row["status"] == "inconclusive" for row in rows.values())
         assert all("credential evidence is missing" in row["reason"] for row in rows.values())
     if mode == "changed_source":

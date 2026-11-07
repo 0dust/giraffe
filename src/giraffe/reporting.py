@@ -2178,7 +2178,7 @@ def _compare_gateway_access(current, baseline, declarations, incompatibility):
     evidence_matches = (current_policy.get("evidence_version") == EVIDENCE_VERSION
                         and old_policy.get("evidence_version") == EVIDENCE_VERSION)
     baseline_passed = (baseline is not None and baseline.status == "pass"
-                       and old_policy.get("coverage_complete")
+                       and old_policy.get("coverage_complete") is True
                        and current_policy.get("profile") == old_policy.get("profile") == "litellm")
     rows = []
     for case in declarations:
@@ -2226,6 +2226,11 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
     minimum = max(2, int(limits.get("min_samples", 5)))
     threshold = float(limits.get("regression_percent", 20))
     old_config = baseline.manifest.get("config", {})
+    access_only = all(
+        isinstance(checks := cfg.get("checks"), list) and "gateway_access" in checks
+        and not any(_uses_shared_request_options(cfg, check) for check in checks)
+        for cfg in (config, old_config)
+    )
     old_targets = {t["name"]: t for t in old_config.get("targets", [])}
     targets = config.get("targets", [])
     comparison: dict[str, Any] = {
@@ -2253,19 +2258,21 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                           if _generator_saturated(run, name)]
         old_target = old_targets.get(name)
         identity_changes = {}
+        identity_reasons = []
         if old_target is None:
-            target_reasons.append("Target is absent from the baseline.")
+            identity_reasons.append("Target is absent from the baseline.")
         else:
             for key in ("model", "url", "route", "parent"):
                 if key not in target or key not in old_target or target[key] != old_target[key]:
                     text = f"Target {key} differs or is unknown."
-                    target_reasons.append(text)
+                    identity_reasons.append(text)
                     target_details[text] = {"code": "target_differs", "key": key,
                                             "baseline": old_target.get(key), "current": target.get(key), "text": text}
             for key in set(target.get("identity", {})) | set(old_target.get("identity", {})):
                 previous, current = old_target.get("identity", {}).get(key), target.get("identity", {}).get(key)
                 if previous != current:
                     identity_changes[key] = {"baseline": previous, "current": current}
+        target_reasons.extend(identity_reasons)
         current_deployment = report.observations.get("targets", {}).get(name, {}).get("deployment")
         old_deployment = baseline.observations.get("targets", {}).get(name, {}).get("deployment")
         configuration_diff = deployment_diff(current_deployment, old_deployment)
@@ -2283,6 +2290,7 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
         rows = _compare_gateway_attribution(report, baseline, name, not target_reasons, target, old_target or {})
         current_access = next((check for check in report.checks if check.id == "gateway_access"
                                and check.target == name and check.required), None)
+        access_reasons = list(identity_reasons)
         if current_access and "gateway_access" in config.get("checks", []):
             old_access = next((check for check in baseline.checks if check.id == "gateway_access"
                                and check.target == name and check.required), None)
@@ -2294,30 +2302,43 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                 old_access_settings = GatewayAccess.model_validate(old_config.get("gateway_access"))
             except ValidationError:
                 old_access_settings = None
-            if access_settings is not None:
+            # Access sends its own fixed probes. Shared timing, fixture settings and
+            # limits only matter to Access when they leave a case without evidence.
+            if not all(is_supported_schema(run.schema_version) for run in (report, baseline)):
+                access_reasons.append("Report schema versions differ.")
+            elif any(type(version) is not int or version != 2
+                     for version in (config.get("config_version", 2), old_config.get("config_version", 2))):
+                access_reasons.append("Recorded configuration has an unsupported config_version.")
+            elif not isinstance(old_checks := old_config.get("checks"), list) or "gateway_access" not in old_checks:
+                access_reasons.append("The baseline did not record a gateway access check.")
+            elif access_settings is None or access_settings != old_access_settings:
+                access_reasons.append("Gateway access settings differ or are missing.")
+            elif not access_reasons:
                 current_refs = target.get("test_identities") or {}
                 old_refs = (old_target or {}).get("test_identities") or {}
-                incompatibility = None
-                if target_reasons:
-                    incompatibility = "Run settings differ."
-                elif access_settings != old_access_settings:
-                    incompatibility = "Gateway access settings differ or are missing."
-                elif any(case.identity not in current_refs
-                         or current_refs.get(case.identity) != old_refs.get(case.identity)
+                uses_tls = any(isinstance(url, str) and url.lower().startswith("https://")
+                               for url in (target["url"], config.get("proxy")))
+                if (config.get("proxy") != old_config.get("proxy")
+                        or (uses_tls and config.get("ca_bundle") != old_config.get("ca_bundle"))):
+                    access_reasons.append("Gateway access transport settings differ.")
+                elif any(not isinstance(current_refs.get(case.identity), dict)
+                         or current_refs[case.identity] != old_refs.get(case.identity)
                          for case in access_settings.cases):
-                    incompatibility = "Gateway test identity references differ."
+                    access_reasons.append("Gateway test identity references differ.")
                 else:
                     source = report.manifest.get("gateway_access_source_sha256")
                     old_source = baseline.manifest.get("gateway_access_source_sha256")
                     if not source or not old_source:
                         # Earlier access reports attested the probe source in the raw workload hash.
-                        source = report.manifest["fixture_pack"].get("workload_fixture_sha256")
-                        old_source = baseline.manifest["fixture_pack"].get("workload_fixture_sha256")
-                    if not source or source != old_source:
-                        incompatibility = "Gateway access source identity differs or is missing. Rerun the access check and baseline."
+                        source, old_source = (
+                            pack.get("workload_fixture_sha256") if isinstance(pack, dict) else None
+                            for pack in (report.manifest.get("fixture_pack"), baseline.manifest.get("fixture_pack")))
+                    if not isinstance(source, str) or not source or source != old_source:
+                        access_reasons.append("Gateway access source identity differs or is missing. Rerun the access check and baseline.")
+            if access_settings is not None:
                 rows.extend(_compare_gateway_access(current_access, old_access,
                                                     [case.model_dump() for case in access_settings.cases],
-                                                    incompatibility))
+                                                    " ".join(access_reasons)))
         for current_check in report.checks:
             if current_check.id != "gateway_policy" or current_check.target != name or not current_check.required:
                 continue
@@ -2605,7 +2626,8 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                            and check.id in config.get("checks", []) and check.id in request_paths}
         covered = {row["check"] for row in assessed
                    if row["metric"] in verdict_metrics.get(row["check"], {row["metric"]})}
-        if current_access and current_access.status != "pass":
+        if current_access and (current_access.status != "pass"
+                               or current_access.metrics.get("gateway_access", {}).get("coverage_complete") is not True):
             covered.discard("gateway_access")
         if any(row["status"] in {"pass", "fail"} for row in (traffic or {}).get("stages", [])):
             covered.add("capacity")
@@ -2619,19 +2641,20 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
         load_failures = [row for row in (load_tests or {}).get("points", []) if row["status"] == "fail"]
         point_count = sum(row["status"] in {"pass", "fail"}
                           for row in (traffic or {}).get("stages", []) + (load_tests or {}).get("points", []))
+        verdict_reasons = access_reasons if access_only and current_access else target_reasons
         if failures or traffic_failures or load_failures:
             status = "fail"
             summary = (f"{len(failures)} material metric regression(s) and "
                        f"{len(traffic_failures)} lost acceptable traffic rate(s) against {baseline.run_id}.")
             if load_failures:
                 summary += f" {len(load_failures)} previously acceptable tested load(s) now fail."
-            if target_reasons:
-                summary += " Other scenarios could not be compared: " + " ".join(target_reasons)
-        elif target_reasons:
+            if verdict_reasons:
+                summary += " Other scenarios could not be compared: " + " ".join(verdict_reasons)
+        elif verdict_reasons:
             status = "inconclusive"
             prefix = ("Nothing comparable between the runs. " if not assessed and not point_count
                       else "Baseline comparison is inconclusive: ")
-            summary = prefix + " ".join(target_reasons)
+            summary = prefix + " ".join(verdict_reasons)
             if missing_checks:
                 summary += " No comparable verdict metric for selected check(s): " + ", ".join(missing_checks) + "."
         elif missing_checks:
@@ -2665,11 +2688,11 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
         if status == "inconclusive" and set(missing_checks) - {"gateway_access", "gateway_attribution"}:
             summary += (f" To conclude, collect at least {minimum} measured samples per metric in both the current and baseline runs,"
                         " using the same workload and settings; rerun longer if variation remains uncertain.")
-        entry = {"target": name, "status": status, "summary": summary, "reasons": target_reasons,
+        entry = {"target": name, "status": status, "summary": summary, "reasons": verdict_reasons,
                  "load_exclusions": load_exclusions,
                  "observed_outputs": observed_outputs,
                  "reason_details": [target_details.get(text, {"code": "comparison_unavailable", "text": text})
-                                    for text in target_reasons],
+                                    for text in verdict_reasons],
                  "client_delayed_runs": saturated_runs,
                  "generator_saturated_runs": saturated_runs,
                  "identity_changes": identity_changes, "configuration_diff": configuration_diff,

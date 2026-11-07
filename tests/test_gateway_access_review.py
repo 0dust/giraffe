@@ -761,6 +761,7 @@ async def test_access_requires_evidence_for_the_declared_model_group(monkeypatch
     ("gateway_policy", None, False),
     ("gateway_policy", "unsupported", False),
     ("serving", None, True),
+    ("serving", "unexpected_access", True),
 ])
 async def test_access_baseline_matches_transmitted_request_options(monkeypatch, other_check, setup, uses_shared_options):
     monkeypatch.setenv("ALLOW_KEY", "allow-secret")
@@ -770,13 +771,14 @@ async def test_access_baseline_matches_transmitted_request_options(monkeypatch, 
                  "functions": [{"name": "legacy"}], "function_call": "auto",
                  "fallbacks": ["backup"], "reasoning_effort": "medium", "temperature": 0.4}
     payloads = []
+    unexpected_access = False
 
     def handler(request):
         if request.method != "POST":
             return httpx.Response(404)
         authorization = request.headers.get("authorization")
         payloads.append((authorization, request.content))
-        if authorization == "Bearer deny-secret":
+        if authorization == "Bearer deny-secret" and not unexpected_access:
             return httpx.Response(401, json={"error": {"type": "token_not_found_in_db"}})
         return httpx.Response(200, json={"choices": [{"message": {
             "role": "assistant", "content": "OK"}, "finish_reason": "stop"}]})
@@ -784,9 +786,9 @@ async def test_access_baseline_matches_transmitted_request_options(monkeypatch, 
     original = httpx.AsyncClient
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
 
-    async def run_with(options):
+    async def run_with(options, max_output_tokens):
         payloads.clear()
-        raw = config(request_options=options).model_dump()
+        raw = config(request_options=options, max_output_tokens=max_output_tokens).model_dump()
         if other_check:
             raw["checks"].append(other_check)
         if other_check == "gateway_attribution" and setup is not None:
@@ -799,12 +801,12 @@ async def test_access_baseline_matches_transmitted_request_options(monkeypatch, 
             raw["gateway_policy"] = {"capability": "unsupported", "affected_identity": "allowed", "users": [
                 {"identity": alias, "requests": 1, "rpm": 1} for alias in ("allowed", "denied")]}
         report = await run_suite(RunConfig.model_validate(raw))
-        assert report.overall == "pass"
+        assert report.overall == ("fail" if unexpected_access else "pass")
         probes = {auth: body for auth, body in payloads if auth is not None}
         assert len(probes) == 2
         return report, probes
 
-    baseline, original_probes = await run_with(inherited)
+    baseline, original_probes = await run_with(inherited, 64)
     assert all(not inherited.keys() & json.loads(body).keys() for body in original_probes.values())
     if other_check == "serving":
         shared = [json.loads(body) for auth, body in payloads if auth is None]
@@ -812,15 +814,19 @@ async def test_access_baseline_matches_transmitted_request_options(monkeypatch, 
     else:
         assert len(payloads) == 2
 
-    current, probes = await run_with({"temperature": 0.7})
+    unexpected_access = setup == "unexpected_access"
+    current, probes = await run_with({"temperature": 0.7}, 128)
     assert probes == original_probes
     comparison = compare_baseline(current, baseline).baseline["targets"][0]
     if uses_shared_options:
-        assert comparison["status"] == "inconclusive"
+        assert comparison["status"] == ("fail" if unexpected_access else "inconclusive")
+        assert not any(row["check"] == "serving" for row in comparison["comparisons"])
         assert "Run setting request_options differs." in comparison["reasons"]
     else:
         assert comparison["status"] == "pass"
-        assert [row["status"] for row in comparison["comparisons"] if row["check"] == "gateway_access"] == ["pass", "pass"]
+        assert not comparison["reasons"]
+    access_statuses = [row["status"] for row in comparison["comparisons"] if row["check"] == "gateway_access"]
+    assert access_statuses == ["pass", "fail" if unexpected_access else "pass"]
 
 
 @pytest.mark.parametrize("limit,case_reason,abort_reason", [
