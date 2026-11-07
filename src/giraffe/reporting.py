@@ -35,6 +35,8 @@ from .timing import TIMING_METRICS, qualify, threshold as timing_threshold
 
 logger = logging.getLogger(__name__)
 
+_P95_MIN_SAMPLES = 20
+
 
 # Identities are deliberately absent: changing a runtime/image is a reason to run the suite.
 _MATCH_CONFIG = (
@@ -1193,8 +1195,10 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                 for metric, values in current_metrics.items():
                     if not values and not old_metrics[metric]:
                         continue
+                    base_metric = metric.removesuffix("_p95_ms") + "_ms" if metric.endswith("_p95_ms") else metric
                     row = _compare_metric(metric, values, old_metrics[metric],
-                                          1 if check == "access" and metric in {"valid_completion_rate", "error_rate"} else minimum,
+                                          1 if check == "access" and metric in {"valid_completion_rate", "error_rate"}
+                                          else max(minimum, _P95_MIN_SAMPLES) if metric.endswith("_p95_ms") else minimum,
                                           threshold)
                     warnings = []
                     initial_uncertainty = row["reason"] if row["status"] == "inconclusive" else None
@@ -1202,7 +1206,6 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                         warnings.append({"code": code, "message": message})
                         if not preserve_failure or row["status"] != "fail":
                             row["status"] = "inconclusive"
-                    base_metric = metric.removesuffix("_p95_ms") + "_ms" if metric.endswith("_p95_ms") else metric
                     if (input_work_changed or live_inputs_differ) and base_metric in {"latency_ms", "first_output_ms", "max_stream_gap_ms", "output_tokens_per_second", "generation_tokens_per_second"}:
                         warn("input_work_changed", "Observed input work or live generated histories differ; timing is not like-for-like.")
                     if different_work and base_metric in {"latency_ms", "max_stream_gap_ms", "output_tokens_per_second", "generation_tokens_per_second"}:
@@ -1223,8 +1226,8 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                                         detail = point.get("concurrency_reason") or point.get("reason") or "Client occupancy or stream concurrency evidence is insufficient."
                                         message = f"{label} requested concurrency was not delivered or evidenced; {detail} Server queueing is not established."
                                     warn("load_not_delivered", message, preserve_failure=label == "Current")
-                        quality = {"Current": _timing_quality(report, name, current_records, (metric,)),
-                                   "Baseline": _timing_quality(baseline, name, old_records, (metric,))}
+                        quality = {"Current": _timing_quality(report, name, current_records, (base_metric,)),
+                                   "Baseline": _timing_quality(baseline, name, old_records, (base_metric,))}
                         delayed_runs = [label for label, item in quality.items() if item["status"] == "client_delayed"]
                         row["timing_quality"] = quality
                         if delayed_runs:
@@ -1243,7 +1246,7 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                                              f"threshold {q['threshold_ms']:.0f} ms).")
                                 warn("client_delayed", delay + " Some waiting time may come from Giraffe, "
                                      "so endpoint timing attribution is uncertain.")
-                        if check == "load" and metric in {"latency_ms", "first_output_ms"}:
+                        if check == "load" and base_metric in {"latency_ms", "first_output_ms"}:
                             completed_counts = [sum(r.status == "completed" and r.valid for r in cohort)
                                                 for cohort in (current_records, old_records)]
                             if len(values) < completed_counts[0] or len(old_metrics[metric]) < completed_counts[1]:

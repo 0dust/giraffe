@@ -27,6 +27,16 @@ def test_tail_latency_comparison_catches_p95_regression_with_stable_median():
     assert tail["status"] == "fail"
 
 
+def test_p95_comparison_requires_a_stable_sample_size():
+    compared = compare_baseline(make_report(count=8), make_report("baseline", count=8))
+    tail = next(row for row in compared.baseline["targets"][0]["comparisons"]
+                if row["metric"] == "latency_p95_ms")
+
+    assert tail["aggregation"] == "p95"
+    assert tail["status"] == "inconclusive"
+    assert "at least 20" in tail["reason"]
+
+
 @pytest.mark.parametrize("current_latency,status,reason", [
     (0, "pass", "Both measurements are zero."),
     (10, "inconclusive", "A zero baseline does not support a relative timing comparison."),
