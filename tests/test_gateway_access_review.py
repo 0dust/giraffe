@@ -1335,6 +1335,54 @@ async def test_access_baseline_compares_auth_header_names_case_insensitively(mon
     assert current.manifest["config"]["gateway_access"]["auth_header"] == "x-access-key"
 
 
+@pytest.mark.parametrize("old_headers,expected", [
+    pytest.param(None, "pass", id="header-case-only"),
+    pytest.param({"X-Access-Key": "allow_key"}, "inconclusive", id="changed-environment-reference"),
+    pytest.param({"X-Access-Key": "ALLOW_KEY", "x-access-key": "ALLOW_KEY"}, "inconclusive",
+                 id="duplicate-historical-header"),
+])
+async def test_access_baseline_compares_identity_header_names_case_insensitively(
+        monkeypatch, old_headers, expected):
+    monkeypatch.setenv("ALLOW_KEY", "Bearer allow-secret")
+    monkeypatch.setenv("DENY_KEY", "Bearer deny-secret")
+    probes = []
+
+    def handler(request):
+        if request.method != "POST":
+            return httpx.Response(404)
+        probes.append((dict(request.headers), request.content))
+        if request.headers["x-access-key"] == "Bearer deny-secret":
+            return httpx.Response(401, json={"error": {"type": "token_not_found_in_db"}})
+        return httpx.Response(200, json={"choices": [{"message": {
+            "role": "assistant", "content": "OK"}, "finish_reason": "stop"}]})
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
+    raw = config().model_dump()
+    identities = raw["targets"][0]["test_identities"] = {
+        "allowed": {"headers_env": {"X-Access-Key": "ALLOW_KEY"}},
+        "denied": {"headers_env": {"X-Access-Key": "DENY_KEY"}},
+    }
+    raw["gateway_access"]["auth_header"] = "X-Access-Key"
+    baseline = await run_suite(RunConfig.model_validate(raw))
+    identities["allowed"]["headers_env"] = {"x-access-key": "ALLOW_KEY"}
+    current = await run_suite(RunConfig.model_validate(raw))
+    assert current.overall == baseline.overall == "pass"
+    assert probes[:2] == probes[2:] and len(probes) == 4
+
+    monkeypatch.delenv("ALLOW_KEY")
+    monkeypatch.delenv("DENY_KEY")
+    if old_headers is not None:
+        baseline_refs = baseline.manifest["config"]["targets"][0]["test_identities"]
+        baseline_refs["allowed"]["headers_env"] = old_headers
+    comparison = compare_baseline(current, baseline).baseline
+    assert comparison["status"] == expected
+    allow, deny = comparison["targets"][0]["comparisons"]
+    assert allow["status"] == expected and deny["status"] == "pass"
+    if expected == "inconclusive":
+        assert allow["reason"] == "Gateway test identity references differ."
+
+
 async def test_access_baseline_preserves_regression_from_unchanged_identity(monkeypatch):
     monkeypatch.setenv("ALLOW_KEY", "allow-secret")
     monkeypatch.setenv("DENY_KEY", "deny-secret")

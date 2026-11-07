@@ -31,7 +31,7 @@ from .multi_user_metrics import (_error as _user_error, _length_mix_differs, _to
                                  fairness_applies, truncated_conversation_turn, user_delivery_completions, user_latency)
 from .models import (CHECK_NAMES, CORE_CHECKS, SHAPES, SHARED_BASELINE_EXCLUDED_WORKLOADS, CheckResult, GatewayAccess,
                      GatewayAttribution, GatewayEvidence, GatewayPolicy, RequestRecord, RunConfig, RunReport,
-                     overall_status, load_shape_label,
+                     TestIdentity, overall_status, load_shape_label,
                      migrate_concurrent_load, migrate_run_limits, is_supported_schema, CURRENT_SCHEMA)
 from .stats import median, percentile
 from .storage import DEFAULT_LIMITS, format_size, fsync_directory, update_metadata, write_metadata
@@ -2261,6 +2261,18 @@ def _compare_gateway_attribution(report, baseline, target, compatible, current_t
 def _compare_gateway_access(current, baseline, declarations, incompatibility, *, current_refs, old_refs):
     from .gateway_access import EVIDENCE_VERSION
 
+    def normalized_reference(reference):
+        if not isinstance(reference, dict):
+            return None
+        try:
+            identity = TestIdentity.model_validate(reference, strict=True)
+        except ValidationError:
+            return None
+        if "headers_env" not in reference:
+            return reference
+        headers = {name.lower(): env for name, env in identity.headers_env.items()}
+        return {**reference, "headers_env": headers}
+
     def matched(policy, case):
         return next((row for row in policy.get("cases", [])
                      if all(row.get(field) == value for field, value in case.items())), {})
@@ -2287,8 +2299,8 @@ def _compare_gateway_access(current, baseline, declarations, incompatibility, *,
             reason = incompatibility
         elif not evidence_matches:
             reason = "Effective gateway credential evidence is missing. Rerun the access check and baseline."
-        elif (not isinstance(reference := current_refs.get(case["identity"]), dict)
-              or reference != old_refs.get(case["identity"])):
+        elif ((reference := normalized_reference(current_refs.get(case["identity"]))) is None
+              or reference != normalized_reference(old_refs.get(case["identity"]))):
             reason = "Gateway test identity references differ."
         elif not baseline_passed or prior != case["expected"]:
             reason = "The baseline lacks a complete passing access matrix for these declarations."
