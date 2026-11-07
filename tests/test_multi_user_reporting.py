@@ -400,6 +400,62 @@ def test_fixed_acceptance_only_qualifies_work_behind_the_observed_miss(miss):
     assert rows["error_rate"]["baseline"] == 0
 
 
+@pytest.mark.parametrize(("miss_mode", "changed_mode", "changed_turn", "change", "warning", "expected"), [
+    ("fixed", None, None, {}, None, "fail"),
+    ("fixed", "live", "fast", {"reasoning_tokens": 16}, "output_work_changed", "fail"),
+    ("live", "fixed", "fast", {"reasoning_tokens": 16}, "output_work_changed", "fail"),
+    ("live", "live", "fast", {"reasoning_tokens": 16}, "output_work_changed", "fail"),
+    ("fixed", "live", "fast", {"request_hash": "other-history"}, "input_work_changed", "fail"),
+    ("fixed", "live", "fast", {"requested_max_tokens": 64}, "requested_work_changed", "fail"),
+    ("fixed", "fixed", "miss", {"reasoning_tokens": 16}, "output_work_changed", "inconclusive"),
+    ("live", "live", "miss", {"reasoning_tokens": 16}, "output_work_changed", "inconclusive"),
+    ("fixed", "fixed", "miss", {"input_tokens": 48}, None, "inconclusive"),
+    ("fixed", "fixed", "miss", {"workload": {"conversation_sequence": 9}}, None, "inconclusive"),
+    ("fixed", "fixed", "miss", {"requested_max_tokens": 64}, "requested_work_changed", "inconclusive"),
+    ("live", "live", "miss", {"request_hash": "other-history"}, "input_work_changed", "inconclusive"),
+    ("live", "live", "miss", {"score": False, "input_tokens": None, "output_tokens": None}, None, "fail"),
+])
+@pytest.mark.parametrize("criterion", ["max_completion_ms", "max_first_answer_ms"])
+def test_mixed_conversation_deadline_compares_the_missed_turn(
+        miss_mode, changed_mode, changed_turn, change, warning, expected, criterion):
+    current, previous = live_user_report(session_ids=True), live_user_report(session_ids=True)
+    for report in (current, previous):
+        settings = report.manifest["config"]["multi_user"]["pass_criteria"]
+        settings.update({criterion: 30, "max_error_percent": None})
+        source = report.observations["targets"]["local"]["multi_user"]
+        source["settings"]["pass_criteria"] = settings
+        for request in report.requests:
+            sequence = request.workload["conversation_sequence"]
+            mode = "fixed" if sequence % 2 else "live"
+            request.workload["mode"] = mode
+            request.fixture_id = f"session_{mode}_turn{request.workload['turn_id']}.v1"
+            request.input_tokens, request.output_tokens, request.output_chars = 24, 1, 4
+            latest_user = report is current and request.workload["user_id"] == "user-05"
+            missed = latest_user and mode == miss_mode and sequence <= 2 and request.workload["turn_id"] == 1
+            if latest_user and mode == changed_mode and changed_turn == ("miss" if missed else "fast"):
+                for field, value in change.items():
+                    if field == "workload":
+                        request.workload.update(value)
+                    else:
+                        setattr(request, field, value)
+            request.elapsed_ms = 60 if missed else 10
+            request.completed_ms = request.dispatch_ms + request.elapsed_ms
+            request.first_output_ms = 55 if missed and criterion == "max_first_answer_ms" else 5
+        summary = summarize(source, report.requests)
+        report.checks[0].metrics["multi_user"] = summary
+        report.checks[0].status = report.overall = summary["status"]
+        assert summary["windows"][0]["users"][-1]["criteria"][criterion]["missed"] == int(report is current)
+
+    comparison = compare_baseline(current, previous).baseline
+    assert comparison["acceptance"] == {"baseline": "pass", "current": "fail"}
+    rows = {row["metric"]: row for row in comparison["targets"][0]["comparisons"]
+            if row.get("user_id") == "user-05"}
+    assert rows["user_acceptance"]["status"] == comparison["status"] == expected
+    if warning:
+        assert rows["latency_ms"]["status"] == "inconclusive"
+        assert any(item["code"] == warning for item in rows["latency_ms"]["warnings"])
+
+
 def test_live_delivery_compares_requested_mix_of_in_window_completions():
     current, previous = live_user_report(), live_user_report()
     current.requests = [r for r in current.requests if r.id not in {f"user-05-{i}" for i in range(3, 8)}]
