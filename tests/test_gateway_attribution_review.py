@@ -108,6 +108,32 @@ async def collect(cfg, run):
     return result(run, cfg.targets[0])
 
 
+@pytest.mark.parametrize("row_limit", [1, 2])
+async def test_row_limit_is_checked_before_marked_requests(monkeypatch, row_limit):
+    keys = []
+
+    async def before_marked(key):
+        keys.append(key)
+
+    async def observer(request, rows):
+        return spend_page(request, rows)
+
+    cfg, run, reads = setup(monkeypatch, observer, before_marked=before_marked)
+    immediate_spend_polls(monkeypatch, cfg)
+    cfg.metrics_max_series = row_limit
+    check = await collect(cfg, run)
+
+    assert check.metrics["planned_requests"] == 2
+    if row_limit == 1:
+        assert check.status == "inconclusive" and check.metrics["reason_code"] == "spend_log_row_limit"
+        assert "require at least 2 spend-log rows" in check.summary and "at most 1" in check.summary
+        assert not keys and not reads and not run.records
+        assert check.metrics["collection_attempts"] == 0
+    else:
+        assert check.status == "pass" and check.metrics["matched_requests"] == 2
+        assert len(keys) == 2 and all(req.url.params["page_size"] == "2" for req in reads)
+
+
 async def test_litellm_required_utc_dates_cover_probes_and_are_stable_on_all_pages(monkeypatch):
     monkeypatch.setattr("giraffe.gateway_attribution.PAGE_SIZE", 1)
     # LiteLLM fca3d4f: public v2 requires both bounds in UTC second precision.

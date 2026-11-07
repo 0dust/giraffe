@@ -21,7 +21,7 @@ from typing import Any, AsyncIterator, Callable
 import httpx
 
 from .caps import (
-    MAX_SERVER_ID_CHARS, MAX_TOKEN_EVIDENCE_PROBE_ATTEMPTS, MAX_TOOL_CALLS,
+    MAX_GATEWAY_USAGE_TOKENS, MAX_SERVER_ID_CHARS, MAX_TOKEN_EVIDENCE_PROBE_ATTEMPTS, MAX_TOOL_CALLS,
 )
 from giraffe.models import RequestRecord, RequestSpec, RunConfig, Target
 from giraffe.logprobs import LogprobBudget, LogprobCollector
@@ -193,10 +193,17 @@ def _token_count(value: Any) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
 
 
+def _gateway_token_count(value: Any) -> int | None:
+    count = _token_count(value)
+    if count is not None and count > MAX_GATEWAY_USAGE_TOKENS:
+        raise _ProtocolError("token usage exceeded the gateway evidence limit")
+    return count
+
+
 def _gateway_usage_total(usage: dict[str, Any]) -> int | None:
     if "total_tokens" not in usage:
         return None
-    total = _token_count(usage["total_tokens"])
+    total = _gateway_token_count(usage["total_tokens"])
     if total is None:
         raise _ProtocolError("invalid total usage in gateway response")
     return total
@@ -616,18 +623,22 @@ class LLMClient:
                 record.backend_id = backend
             usage = data.get("usage")
             if isinstance(usage, dict):
-                record.input_tokens = _token_count(usage.get("prompt_tokens"))
-                record.completion_tokens = _token_count(usage.get("completion_tokens"))
-                record.output_tokens = record.completion_tokens
+                count = _gateway_token_count if attribution else _token_count
+                prompt_tokens = count(usage.get("prompt_tokens"))
+                completion_tokens = count(usage.get("completion_tokens"))
                 cached = usage.get("prompt_tokens_details")
-                if isinstance(cached, dict):
-                    record.cached_prompt_tokens = _token_count(cached.get("cached_tokens"))
-                    if record.cached_prompt_tokens is not None:
-                        record.cache_source = "usage.prompt_tokens_details.cached_tokens"
+                cached_tokens = count(cached.get("cached_tokens")) if isinstance(cached, dict) else None
                 details = usage.get("completion_tokens_details")
-                reasoning_tokens = _token_count(details.get("reasoning_tokens")) if isinstance(
-                    details, dict,
-                ) else None
+                reasoning_tokens = count(details.get("reasoning_tokens")) if isinstance(details, dict) else None
+                if attribution:
+                    # Even a provisional frame must not supply unbounded counters.
+                    _gateway_token_count(usage.get("total_tokens"))
+                record.input_tokens = prompt_tokens
+                record.completion_tokens = record.output_tokens = completion_tokens
+                if isinstance(cached, dict):
+                    record.cached_prompt_tokens = cached_tokens
+                    if cached_tokens is not None:
+                        record.cache_source = "usage.prompt_tokens_details.cached_tokens"
                 record.reasoning_tokens = reasoning_tokens
                 if record.output_tokens is not None and reasoning_tokens is not None:
                     record.output_tokens = max(0, record.output_tokens - reasoning_tokens)
@@ -666,6 +677,9 @@ class LLMClient:
                 record.logprob_evidence = self.logprob_budget.collect(choice.get("logprobs"), answer,
                                                           spec.workload["top_logprobs"])
             reasoning = _text(content.get("reasoning_content") or content.get("reasoning"))
+            if attribution and streaming and reasoning and record.finish_reason is not None:
+                record._gateway_terminal_usage = False
+                raise _ProtocolError("reasoning content arrived after the finish reason")
             now = observed_at
             if streaming:
                 token_evidence = choice.get("logprobs")
