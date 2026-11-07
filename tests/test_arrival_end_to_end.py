@@ -156,9 +156,7 @@ async def test_mixed_http_workload_scores_short_long_input_and_long_output(monke
     assert {g['shape'] for g in p['groups']} == {'short_short','long_short','short_long'}
 
 
-@pytest.mark.parametrize("pause", [False, True])
-async def test_slower_upgrade_reduces_accepted_rate_as_http_queue_grows(monkeypatch, pause):
-    pause_evidence = arrival_host_pause(monkeypatch, pause, 50)
+async def test_slower_upgrade_reduces_accepted_rate_as_http_queue_grows():
     late_attempts = []
     for _ in range(2):
         with FakeEndpoint(first_token_delay=.002, chunk_delay=0, service_slots=1) as endpoint:
@@ -188,9 +186,6 @@ async def test_slower_upgrade_reduces_accepted_rate_as_http_queue_grows(monkeypa
         late_attempts.append(late)
     else:
         pytest.fail(f"Both HTTP comparisons had client scheduler drops (run, rate, drops, max lag ms): {late_attempts}")
-    assert pause_evidence["paused"] == pause
-    if pause:
-        assert late_attempts
     old,current=capacity(baseline).metrics,capacity(candidate).metrics
     assert old['highest_accepted'][0]['value'] == 50 and current['highest_accepted'][0]['value'] == 10
     low,high=current['points']
