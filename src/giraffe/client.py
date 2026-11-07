@@ -38,7 +38,12 @@ _MAX_CONTENT_READS = 65536
 _MAX_OUTPUT_EVENTS = 4096
 # Reuse completed HTTP/1.1 streams without waiting on servers that never send EOF.
 _STREAM_DRAIN_SECONDS = 0.1
-_REASONING_TAG = re.compile(r"<(/?)(think|thinking|reasoning)>", re.IGNORECASE)
+_REASONING_TAG_NAMES = ("think", "thinking", "reasoning")
+_REASONING_TAG = re.compile(r"<(/?)(" + "|".join(_REASONING_TAG_NAMES) + ")>", re.IGNORECASE)
+_REASONING_TAG_PREFIXES = {tag[:size] for name in _REASONING_TAG_NAMES
+                          for tag in (f"<{name}>", f"</{name}>") for size in range(1, len(tag))}
+_REASONING_TAG_PREFIX = re.compile("|".join(sorted(_REASONING_TAG_PREFIXES)), re.IGNORECASE)
+_MAX_REASONING_TAG_PREFIX = max(map(len, _REASONING_TAG_PREFIXES))
 REASONING_BUDGET_ERROR = "reasoning exhausted the output budget before an answer"
 
 
@@ -233,6 +238,40 @@ def _reasoning_spans(spans: list[tuple[int, int]] | None, length: int) -> list[t
         result.append((start, a))
         start = b
     return [*result, (start, length)]
+
+
+class _GenerationChunks:
+    """Defer counting delta fragments that may belong to an inline delimiter."""
+
+    def __init__(self):
+        self.pending: list[tuple[str, bool]] = []
+
+    def receive(self, answer: str = "", reasoning: str = "", *, final: bool = False) -> int:
+        counted = bool(reasoning.strip())
+        if not self.pending and "<" not in answer:
+            return int(counted or bool(answer.strip()))
+
+        parts = [*self.pending, (answer, counted)]
+        text = "".join(part for part, _ in parts)
+        end = len(text)
+        if not final:
+            start = text.rfind("<", max(0, end - _MAX_REASONING_TAG_PREFIX))
+            if start >= 0 and _REASONING_TAG_PREFIX.fullmatch(text[start:]):
+                end = start
+        # Preserve offsets so each original SSE delta contributes at most once.
+        generated = _REASONING_TAG.sub(lambda tag: " " * len(tag[0]), text[:end])
+        count = int(counted)
+        offset = 0
+        self.pending = []
+        for part, already_counted in parts:
+            next_offset = offset + len(part)
+            if not already_counted and generated[offset:next_offset].strip():
+                count += 1
+                already_counted = True
+            if next_offset > max(end, offset):
+                self.pending.append((part[max(0, end - offset):], already_counted))
+            offset = next_offset
+        return count
 
 
 class LLMClient:
@@ -467,6 +506,7 @@ class LLMClient:
         reasoning_read_ids: set[int] = set()
         content_event_spans: list[tuple[dict[str, Any], int, int]] = []
         response_sequence = -1
+        generation_chunks = _GenerationChunks()
         conversation = spec.workload.get("selection") == "conversation"
         logprob_collector = LogprobCollector(spec.workload["top_logprobs"], self.logprob_budget) if spec.workload.get("logprobs") and stream else None
         assistant_content_present = False
@@ -601,8 +641,8 @@ class LLMClient:
                 if content_event is not None:
                     content_event_spans.append((content_event, len(record.output), len(record.output) + len(answer)))
                 output_event("reasoning", reasoning, now)
-            if streaming and (_REASONING_TAG.sub("", answer).strip() or reasoning.strip()):
-                record.generation_chunks += 1
+            if streaming:
+                record.generation_chunks += generation_chunks.receive(answer, reasoning)
             calls = content.get("tool_calls")
             if calls is not None:
                 if not isinstance(calls, list) or len(calls) > MAX_TOOL_CALLS:
@@ -683,6 +723,8 @@ class LLMClient:
                 if record.finish_reason is not None:
                     raise _ProtocolError("repeated completion finish reason")
                 record.finish_reason = finish
+                if streaming:
+                    record.generation_chunks += generation_chunks.receive(final=True)
 
         request_timeout = (spec.request_timeout_seconds if spec.request_timeout_seconds is not None
                            else self.config.request_timeout_seconds)
@@ -802,6 +844,7 @@ class LLMClient:
                             if event_type == "error":
                                 raise _ProtocolError("endpoint returned an SSE error event")
                             if event.strip() == "[DONE]":
+                                record.generation_chunks += generation_chunks.receive(final=True)
                                 record.stream_end_ms = (observed_at - start) * 1000
                                 record.stream_terminated = True
                                 break

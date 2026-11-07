@@ -1623,8 +1623,8 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold, slot_ch
             work_reason = "Observed work including drained requests differs or lacks token evidence."
         elif drain_comparison and scenario == "recovery" and _matched_recovery_work_changed(*comparable_work, threshold):
             work_reason = "Matched recovery work including drained requests differs or lacks token evidence."
-        live_work_changed = _live_input_work_changed(*comparable_work, threshold)
-        live_work_reason = ("Observed input work or live generated histories differ or lack evidence."
+        live_work_changed = _live_input_work_changed(*comparable_work, threshold, compare_output=True)
+        live_work_reason = ("Observed work or live generated histories differ or lack evidence."
                             if live_work_changed else None)
         noisy_probe = scenario == "noisy_neighbors" and role == "probe"
         short_probe = noisy_probe and any(evidence.get("user_id") == user_id
@@ -1646,7 +1646,7 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold, slot_ch
             delivery_scenario_reason = None
         missing = (not complete
                    or c_rate is None or b_rate is None or work_reason or mix_changed
-                   or live_work_reason or delivery_scenario_reason or delivery_reason)
+                   or live_work_reason or delivery_scenario_reason or interference_reason or delivery_reason)
         label = key[:7] if role else key[:4]
         if cohort:
             label += (cohort,)
@@ -1666,7 +1666,8 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold, slot_ch
                 for evidence, records in ((c_scenario, current_work), (b_scenario, old_work)))
         if missing:
             detail = (work_reason or "Requested work proportions differ." if mix_changed or work_reason else
-                      live_work_reason or delivery_scenario_reason or delivery_reason or "Missing or incomplete shared-window coverage.")
+                      live_work_reason or delivery_scenario_reason or interference_reason or delivery_reason
+                      or "Missing or incomplete shared-window coverage.")
             message = f"Multi-user {user_id} at {population} users: {detail}"
             row["reason"] = message
             incomplete.append(message)

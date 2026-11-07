@@ -653,6 +653,32 @@ def test_live_delivery_compares_requested_mix_of_in_window_completions():
     assert rate["evidence_ids"] == ["user-05-0", "user-05-1"]
 
 
+@pytest.mark.parametrize(("field", "value", "current_rate"), [
+    ("output_tokens", 4, 41.6),
+    ("completion_tokens", 300, 80),
+])
+def test_live_delivery_requires_comparable_actual_generation(field, value, current_rate):
+    current, previous = live_user_report(), live_user_report()
+    for report in (current, previous):
+        source = report.observations["targets"]["local"]["multi_user"]
+        window = source["windows"][0]
+        window["scenario"] = "repeated_conversations"
+        for user in window["users"]:
+            user["profile"] = "conversation:chat"
+        if report is current:
+            for request in report.requests:
+                if request.workload["user_id"] == "user-05" and request.workload["turn_id"] == 1:
+                    setattr(request, field, value)
+        report.checks[0].metrics["multi_user"] = summarize(source, report.requests)
+
+    result = compare_baseline(current, previous).baseline
+    delivery = [row for row in result["targets"][0]["comparisons"]
+                if row["metric"] == "shared_window_output_tokens_per_second"]
+    assert [row["status"] for row in delivery] == ["pass"] * 4 + ["inconclusive"]
+    assert (delivery[-1]["current"], delivery[-1]["baseline"]) == (current_rate, 80)
+    assert result["status"] == "inconclusive"
+
+
 def test_live_timing_regression_requires_comparable_reasoning_work():
     current, previous = live_user_report(), live_user_report()
     for request in current.requests:
@@ -941,7 +967,7 @@ def test_probe_timing_regression_requires_heavy_overlap_in_both_runs(exposure):
     delivery = next(row for row in compared.baseline["targets"][0]["comparisons"]
                     if row["metric"] == "shared_window_output_tokens_per_second" and row.get("user_id") == "user-01")
     assert delivery["current"] == delivery["baseline"] == (70 if late_unmatched else 80)
-    assert delivery["status"] == ("pass" if exposure in {"complete", "late_unmatched", "changed_heavy"} else "inconclusive")
+    assert delivery["status"] == ("pass" if exposure in {"complete", "late_unmatched"} else "inconclusive")
     assert compared.baseline["status"] == {"complete": "fail", "late_unmatched": "pass"}.get(exposure, "inconclusive")
     if exposure == "changed_heavy":
         acceptance = next(row for row in compared.baseline["targets"][0]["comparisons"] if row["metric"] == "user_acceptance")
@@ -1044,7 +1070,7 @@ def test_interference_baseline_attributes_matched_slowdown_only_to_short_user(
         assert not acceptance
         delivery, = [row for row in rows if row["metric"] == "shared_window_output_tokens_per_second"
                      and row["role"] == "probe" and row["user_id"] == "user-01"]
-        assert delivery["status"] == "pass"
+        assert delivery["status"] == expected
         if expected == "pass":
             assert not measured
             return
@@ -1063,12 +1089,13 @@ def test_interference_baseline_attributes_matched_slowdown_only_to_short_user(
 
 
 @pytest.mark.parametrize("limit", [None, 3])
-@pytest.mark.parametrize("case", ["extra_exposure", "extra_pair", "legacy_missing"])
+@pytest.mark.parametrize("case", ["extra_exposure", "extra_pair", "legacy_missing", "reduced_delivery"])
 def test_baseline_compares_heavy_work_per_matched_probe(limit, case):
     from tests.test_multi_user_scenarios import matched_observation
 
     current, baseline = user_report(), user_report()
-    extra_exposure = case == "extra_exposure"
+    reduced_delivery = case == "reduced_delivery"
+    extra_exposure = case == "extra_exposure" or reduced_delivery
     for report in (current, baseline):
         source, requests = matched_observation()
         source["settings"]["noisy_neighbors"]["max_slowdown"] = limit
@@ -1085,17 +1112,18 @@ def test_baseline_compares_heavy_work_per_matched_probe(limit, case):
                 clone.workload["trigger_ms"] += delay
             return clone
 
-        if report is current:
-            if extra_exposure:
-                # The same short response spans two sequential heavy requests.
-                heavy.completed_ms = heavy.dispatch_ms + 110
-                heavy.elapsed_ms = heavy.stream_end_ms = 110
-                heavy.last_output_ms = 105
-                requests.append(later(heavy, 120, 2))
-                probe.completed_ms = probe.workload["ready_ms"] + 810
-                probe.elapsed_ms = probe.completed_ms - probe.dispatch_ms
-            else:
-                requests.extend(later(item, 500, 2) for item in (control, probe, heavy))
+        if report is current and extra_exposure:
+            # The same short response spans two sequential heavy requests.
+            heavy.completed_ms = heavy.dispatch_ms + 110
+            heavy.elapsed_ms = heavy.stream_end_ms = 110
+            heavy.last_output_ms = 105
+            probe.completed_ms = probe.workload["ready_ms"] + (500 if reduced_delivery else 810)
+            probe.elapsed_ms = probe.completed_ms - probe.dispatch_ms
+            if reduced_delivery:
+                requests.append(later(control, 500, 2))
+            requests.append(later(heavy, 120, 2))
+        if (report is current and not extra_exposure) or (report is baseline and reduced_delivery):
+            requests.extend(later(item, 500, 2) for item in (control, probe, heavy))
         for window in source["windows"]:
             for user in window["users"]:
                 cohort = [item for item in requests if item.workload["window_id"] == window["id"]
@@ -1108,11 +1136,11 @@ def test_baseline_compares_heavy_work_per_matched_probe(limit, case):
         summary = summarize(source, requests)
         short, = summary["windows"][1]["interference"]["users"]
         assert short["qualified"], short["reasons"]
-        assert short["matched_samples"] == (2 if report is current and not extra_exposure else 1)
-        assert len(short["heavy_request_ids"]) == (2 if report is current else 1)
+        assert short["matched_samples"] == (2 if len(requests) == 6 else 1)
+        assert len(short["heavy_request_ids"]) == (2 if len(requests) > 3 else 1)
         assert short["status"] == ("measured" if limit is None else "fail"
-                                   if report is current and extra_exposure else "pass")
-        if report is baseline or case == "legacy_missing":
+                                   if report is current and case == "extra_exposure" else "pass")
+        if (report is baseline and not reduced_delivery) or case == "legacy_missing":
             short.pop("probe_heavy_request_ids")
         report.requests = requests
         report.checks[0].metrics["multi_user"] = summary
@@ -1126,10 +1154,14 @@ def test_baseline_compares_heavy_work_per_matched_probe(limit, case):
     compared = compare_baseline(current, baseline).baseline
     target, = compared["targets"]
     assert compared["status"] == target["status"] == ("pass" if case == "extra_pair" else "inconclusive")
-    assert compared["acceptance"]["current"] == ("fail" if limit is not None and extra_exposure else "pass")
+    assert compared["acceptance"]["current"] == ("fail" if limit is not None and case == "extra_exposure" else "pass")
     delivery, = [row for row in target["comparisons"] if row["metric"] == "shared_window_output_tokens_per_second"
                  and row["role"] == "probe" and row["user_id"] == "user-01"]
-    assert delivery["status"] == "pass"
+    assert delivery["status"] == ("pass" if case == "extra_pair" else "inconclusive")
+    if reduced_delivery:
+        assert compared["acceptance"]["baseline"] == "pass"
+        assert (delivery["baseline"], delivery["current"]) == (32, 16)
+        assert "exposure per matched probe differs" in delivery["reason"]
     if case != "extra_pair":
         metric = "matched_interference_slowdown" if limit is None else "scenario_acceptance"
         comparison, = [row for row in target["comparisons"] if row["metric"] == metric]
@@ -1137,7 +1169,8 @@ def test_baseline_compares_heavy_work_per_matched_probe(limit, case):
         reason = ("exposure per matched probe differs" if extra_exposure
                   else "exposure per probe is missing or incomplete")
         assert reason in comparison["reason"]
-        assert set(comparison["evidence_ids"]) == {item.id for item in current.requests}
+        if not reduced_delivery:
+            assert set(comparison["evidence_ids"]) == {item.id for item in current.requests}
 
 
 
@@ -1214,7 +1247,7 @@ def test_baseline_compares_competitor_exposure_for_the_same_short_work(limit, ca
     assert compared["acceptance"]["current"] == ("fail" if limit is not None and slow_case else "pass")
     delivery, = [row for row in target["comparisons"] if row["metric"] == "shared_window_output_tokens_per_second"
                  and row["role"] == "probe" and row["user_id"] == "user-01"]
-    assert delivery["status"] == "pass"
+    assert delivery["status"] == ("pass" if comparable else "inconclusive")
     assert delivery["timing_exposure_qualified"] == comparable
     if not comparable:
         metric = "matched_interference_slowdown" if limit is None else "scenario_acceptance"
