@@ -73,6 +73,24 @@ async def test_policy_validates_supplied_reasoning_counts(monkeypatch, mode, rea
     assert summary["comparable_actual_work"] is qualified
 
 
+@pytest.mark.parametrize("mode", ["key_rpm", "priority_rpm"])
+@pytest.mark.parametrize("details", [None, [], [{"reasoning_tokens": 2}], "", False, 0, 1.5])
+async def test_priority_requires_supplied_completion_details_to_be_an_object(monkeypatch, mode, details):
+    check, run, _ = await exercise(monkeypatch, mode, peer_completion_details=details)
+    qualified = details is None or mode == "key_rpm"
+    summary = check.metrics["gateway_policy"]
+    assert check.status == ("pass" if qualified else "inconclusive")
+    assert summary["qualification"] == ("observed" if qualified else "unverified")
+    assert summary["comparable_actual_work"] is qualified
+    peers = [record for record in run.records if record.identity == "peer"]
+    assert len(peers) == 8
+    for record in peers:
+        assert record.http_status == 200 and record.valid is qualified
+        assert record.input_tokens == (8 if qualified else None)
+        assert record.completion_tokens == record.output_tokens == (2 if qualified else None)
+        assert record.reasoning_tokens is None
+
+
 @pytest.mark.usefixtures("local_tokenizer")
 @pytest.mark.parametrize("mode", ["key_rpm", "priority_rpm"])
 @pytest.mark.parametrize("counter", ["completion", "reasoning", "cached", "total"])

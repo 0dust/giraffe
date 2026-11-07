@@ -12,7 +12,7 @@ from .identities import gateway_identities_only, identity_headers, litellm_key_f
 from .models import CheckResult, RequestSpec
 
 
-VERSION = 22
+VERSION = 23
 PROMPT = "Reply with exactly the word OK."
 
 

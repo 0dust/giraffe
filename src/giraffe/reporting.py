@@ -26,8 +26,9 @@ from .caps import (MAX_HTML_PREVIEW_CHARS, MAX_HTML_JSON_PREVIEW_CHARS,
                    MAX_FAILURE_SUMMARY_CHARS)
 from .deployment import deployment_diff, fixture_hash, safe_config, sanitize
 from .report_inputs import input_ref as _input_ref
-from .multi_user_metrics import (_length_mix_differs, _total_generated_tokens, _uncached_input_tokens, fairness_applies, truncated_conversation_turn,
-                                 user_delivery_completions, user_latency)
+from .multi_user_metrics import (_error as _user_error, _length_mix_differs, _total_generated_tokens,
+                                 _uncached_input_tokens, _valid as _user_valid_completion,
+                                 fairness_applies, truncated_conversation_turn, user_delivery_completions, user_latency)
 from .models import (CHECK_NAMES, CORE_CHECKS, SHAPES, SHARED_BASELINE_EXCLUDED_WORKLOADS, CheckResult, GatewayAccess,
                      GatewayAttribution, GatewayEvidence, GatewayPolicy, RequestRecord, RunConfig, RunReport,
                      overall_status, load_shape_label,
@@ -814,10 +815,16 @@ def _timing_quality(report, target, records, metrics):
                    legacy_max_lag_ms=report.observations.get("generator_max_lag_ms", 0))
 
 
-def _metric_values(records: list[RequestRecord], *,
-                   timing_records: dict[str, list[RequestRecord]] | None = None) -> dict[str, list[float]]:
-    completed = [r for r in records if r.status == "completed" and r.valid]
+def _valid_completion(record: RequestRecord, check: str | None) -> bool:
+    if check == "multi_user" and record.workload.get("session_id"):
+        return _user_valid_completion(record)
+    return record.status == "completed" and record.valid
 
+
+def _metric_values(records: list[RequestRecord], *, check: str | None = None,
+                   timing_records: dict[str, list[RequestRecord]] | None = None) -> dict[str, list[float]]:
+    valid = [_valid_completion(record, check) for record in records]
+    completed = [record for record, success in zip(records, valid) if success]
     def clock_value(record, arrival_field, dispatch_field):
         if "multi_user" in record.check_ids:
             return user_latency(record, first=dispatch_field == "first_output_ms")
@@ -844,8 +851,9 @@ def _metric_values(records: list[RequestRecord], *,
         "generation_tokens_per_second": lambda r: r.generation_tokens_per_second,
     }
     return {
-        "valid_completion_rate": [float(r.status == "completed" and r.valid) for r in records],
-        "error_rate": [float(r.status in {"failed", "timeout"}) for r in records],
+        "valid_completion_rate": [float(success) for success in valid],
+        "error_rate": [float(_user_error(r) if check == "multi_user" and r.workload.get("session_id")
+                             else r.status in {"failed", "timeout"}) for r in records],
         "correctness_rate": [float(r.score) for r in records if r.score is not None],
         **{name: timing_values(name, measure) for name, measure in timing.items()},
     }
@@ -883,8 +891,8 @@ def _stream_options_reason(current: list[RequestRecord], old: list[RequestRecord
     return None
 
 
-def _output_work(records: list[RequestRecord]) -> dict[str, Any]:
-    completed = [r for r in records if r.status == "completed" and r.valid]
+def _output_work(records: list[RequestRecord], *, check: str | None = None) -> dict[str, Any]:
+    completed = [r for r in records if _valid_completion(r, check)]
     tokens = [r.output_tokens for r in completed if r.output_tokens is not None]
     return {
         "valid_completions": len(completed),
@@ -1085,8 +1093,7 @@ def _live_input_work_changed(current, old, threshold, *, compare_output=False):
         return turn, record.fixture_id, record.request_hash, record.input_tokens, output_work(record)
 
     def completed(record):
-        return (record.status == "completed" and record.valid and record.score is not False
-                and not truncated_conversation_turn(record) and None not in output_work(record))
+        return _user_valid_completion(record) and None not in output_work(record)
 
     shorter, longer = sorted(histories, key=len)
     witnessed = {observed_turn(turn, record) for (_, turn), record in shorter.items() if completed(record)}
@@ -2419,34 +2426,39 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
             refs_match = settings is not None and all(
                 user.identity in current_refs and current_refs[user.identity] == old_refs.get(user.identity)
                 for user in settings.users)
+            current_users, old_users = current_policy.get("users", []), old_policy.get("users", [])
+            identities = {user.identity for user in settings.users} if settings else set()
+            outcomes_match = all(len(users) == len(identities)
+                                 and {user.get("identity") for user in users} == identities
+                                 for users in (current_users, old_users))
             source = report.manifest.get("gateway_policy_source_sha256")
             old_source = baseline.manifest.get("gateway_policy_source_sha256")
             if not target_reasons and (not source or not old_source):
                 # Earlier policy reports attested their source in the full workload identity.
                 source = report.manifest["fixture_pack"].get("workload_fixture_sha256")
                 old_source = baseline.manifest["fixture_pack"].get("workload_fixture_sha256")
-            compatible = (not target_reasons and refs_match and isinstance(source, str) and bool(source)
+            compatible = (not target_reasons and refs_match and outcomes_match
+                          and isinstance(source, str) and bool(source)
                           and source == old_source
                           and current_policy.get("version") == old_policy.get("version") == POLICY_VERSION
                           and settings == old_settings
                           and settings.model_dump(mode="json") == current_policy.get("settings") == old_policy.get("settings")
                           and old_check is not None and old_check.status == "pass"
                           and old_policy.get("qualification") == "observed")
-            for user in current_policy.get("users", []):
-                previous = next((item for item in old_policy.get("users", []) if item["identity"] == user["identity"]), None)
-                status = (current_check.status if compatible and previous and current_check.status in {"pass", "fail"}
-                          else "inconclusive")
-                rows.append({"check": "gateway_policy", "scenario": user["identity"],
-                    "user_id": user["identity"], "metric": "policy_acceptance", "aggregation": "observed",
-                    "status": status, "current": current_policy.get("qualification"),
-                    "baseline": old_policy.get("qualification"),
-                    "current_samples": user["dispatched"], "baseline_samples": previous["dispatched"] if previous else 0,
-                    "current_outcomes": user, "baseline_outcomes": previous,
-                    "qualification": current_policy.get("qualification"), "threshold": 0,
-                    "worsening": 100 if status == "fail" else 0,
-                    "reason": current_check.summary if compatible and previous else
-                              "Policy identity references, settings, source, summary version or qualified passing baseline do not match.",
-                    "evidence_ids": user["request_ids"]})
+            status = (current_check.status if compatible and current_check.status in {"pass", "fail"}
+                      else "inconclusive")
+            rows.append({"check": "gateway_policy", "scenario": "gateway_policy", "scenario_label": "Whole policy",
+                "metric": "policy_acceptance", "aggregation": "observed",
+                "status": status, "current": current_policy.get("qualification"),
+                "baseline": old_policy.get("qualification"),
+                "current_samples": sum(user["dispatched"] for user in current_users),
+                "baseline_samples": sum(user["dispatched"] for user in old_users),
+                "current_outcomes": current_users, "baseline_outcomes": old_users,
+                "qualification": current_policy.get("qualification"), "threshold": 0,
+                "worsening": 100 if status == "fail" else 0,
+                "reason": current_check.summary if compatible else
+                          "Policy identities, outcomes, settings, source, summary version or qualified passing baseline do not match.",
+                "evidence_ids": [request_id for user in current_users for request_id in user["request_ids"]]})
         slot_changes = _scheduled_user_slot_changes(report, baseline, name)
         user_rows, user_reasons = _compare_user_delivery(report, baseline, name, target_reasons, threshold, slot_changes)
         rows.extend(user_rows)
@@ -2519,22 +2531,25 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                     old_mix = old_shares.get(old_records[0].load_point.get("point_id"), {})
                     mix_changed |= any(abs(current_mix.get(shape, 0) - old_mix.get(shape, 0)) > Fraction(1, 10)
                                        for shape in current_mix.keys() | old_mix.keys())
+                record_cohorts = current_records, old_records
                 scheduled_user = check == "multi_user" and workload.get("scenario") in {"arrivals", "recovery"}
                 current_timing, old_timing = {}, {}
-                current_metrics = _metric_values(current_records, timing_records=current_timing)
-                old_metrics = _metric_values(old_records, timing_records=old_timing)
-                current_work, old_work = _output_work(current_records), _output_work(old_records)
+                current_metrics = _metric_values(current_records, check=check, timing_records=current_timing)
+                old_metrics = _metric_values(old_records, check=check, timing_records=old_timing)
+                current_work, old_work = (_output_work(records, check=check) for records in record_cohorts)
                 outputs = _output_observations(check, scenario, current_work, old_work)
                 if load_point:
                     for output in outputs:
                         output["load_point"] = load_point
                 observed_outputs.extend(outputs)
                 different_work = _different_output_work(current_work, old_work, threshold)
-                input_work_changed = _input_work_changed(current_records, old_records, threshold)
+                timing_cohorts = record_cohorts
                 live_output_differs = False
                 if check == "multi_user":
-                    completions = [[r for r in cohort if r.status == "completed" and r.valid]
-                                   for cohort in (current_records, old_records)]
+                    completions = tuple([r for r in cohort if _valid_completion(r, check)]
+                                        for cohort in record_cohorts)
+                    if any(r.workload.get("session_id") for cohort in record_cohorts for r in cohort):
+                        timing_cohorts = completions
                     live_inputs_differ = _live_input_work_changed(*completions, threshold)
                     live_output_differs = (not live_inputs_differ and _live_input_work_changed(
                         *completions, threshold, compare_output=True))
@@ -2542,13 +2557,14 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                     live_inputs_differ = (any(r.workload.get("mode") == "live" for r in current_records)
                                           and Counter(r.request_hash for r in current_records)
                                           != Counter(r.request_hash for r in old_records))
+                input_work_changed = _input_work_changed(*timing_cohorts, threshold)
                 for metric, values in current_metrics.items():
                     if not values and not old_metrics[metric]:
                         continue
                     row = _compare_metric(metric, values, old_metrics[metric],
                                           1 if check == "access" and metric in {"valid_completion_rate", "error_rate"} else minimum,
                                           threshold)
-                    current_samples, old_samples = current_records, old_records
+                    current_samples, old_samples = timing_cohorts if metric in TIMING_METRICS else record_cohorts
                     current_output, old_output = current_work, old_work
                     metric_input_changed, metric_output_changed = input_work_changed, different_work
                     metric_work_reason, metric_mix_changed = None, mix_changed
@@ -3735,9 +3751,18 @@ def _baseline_table_html(baseline: dict[str, Any], report: RunReport | None = No
                               " tokens" if metric == "output_tokens" else
                               " chars" if metric == "output_chars" else "")
                     change = f"{after - before:+,.1f}{suffix} · from zero"
+
+            def cell(side, qualification):
+                outcomes = row.get(f"{side}_outcomes")
+                details = ""
+                if row.get("metric") == "policy_acceptance" and isinstance(outcomes, list):
+                    details = "".join(f'<div><small>{_e(user["identity"])} · {_e(user["admitted"])} admitted · '
+                                      f'{_e(user["rejected"])} rejected</small></div>' for user in outcomes)
+                return f'<td>{value(qualification)}{details}</td>'
+
             verdict, tone = _baseline_verdict(row)
             parts.append(f'<tr><th scope="row">{_e(label)}</th>'
-                         f'<td>{value(before)}</td><td>{value(after)}</td>'
+                         f'{cell("baseline", before)}{cell("current", after)}'
                          f'<td class="{tone}">{_e(change)}</td>'
                          f'<td><strong class="{tone}">{verdict}</strong></td>')
             if reason_column:

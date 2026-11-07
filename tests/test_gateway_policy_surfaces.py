@@ -31,9 +31,51 @@ async def test_baseline_preserves_current_inconclusive_policy_reason(monkeypatch
     assert current_check.status == "inconclusive"
     compared = compare_baseline(current, baseline)
     rows = [row for row in compared.baseline["targets"][0]["comparisons"] if row["metric"] == "policy_acceptance"]
-    assert len(rows) == 2
-    assert all(row["status"] == "inconclusive" for row in rows)
-    assert all(row["reason"] == current_check.summary for row in rows)
+    row, = rows
+    assert row["status"] == "inconclusive"
+    assert row["reason"] == current_check.summary
+
+
+@pytest.mark.usefixtures("local_tokenizer")
+async def test_baseline_counts_one_policy_failure_and_keeps_each_identity_outcome(monkeypatch):
+    import json
+
+    from giraffe.reporting import _baseline_table_html
+    from tests.test_ux_catalogue import browser_logic
+
+    with monkeypatch.context() as context:
+        baseline_check, baseline, _ = await exercise(context, full=True)
+    with monkeypatch.context() as context:
+        current_check, current, _ = await exercise(context, full=True, behavior="overadmit")
+
+    assert baseline_check.status == "pass"
+    assert current_check.status == "fail"
+    assert current_check.metrics["gateway_policy"]["peer_continuation"] is True
+    comparison = compare_baseline(current, baseline).baseline
+    target = comparison["targets"][0]
+    assert comparison["status"] == target["status"] == "fail"
+    assert "1 material metric regression(s)" in target["summary"]
+    row, = target["comparisons"]
+    assert row["metric"] == "policy_acceptance" and row["status"] == "fail"
+    assert row["baseline_samples"] == row["current_samples"] == 13
+    for side, check in (("baseline", baseline_check), ("current", current_check)):
+        assert row[f"{side}_outcomes"] == check.metrics["gateway_policy"]["users"]
+    assert [user["admitted"] for user in row["baseline_outcomes"]] == [2, 8]
+    assert [user["admitted"] for user in row["current_outcomes"]] == [3, 8]
+
+    html = _baseline_table_html(comparison)
+    assert html.count(">Policy acceptance<") == 1
+    assert "limited · 2 admitted · 3 rejected" in html
+    assert "limited · 3 admitted · 2 rejected" in html
+    assert html.count("peer · 8 admitted · 0 rejected") == 2
+
+    browser_logic("const rows=" + json.dumps([row]) + """
+const html=comparisonTable(rows);
+assert.equal((html.match(/Observed failure/g)||[]).length,1);
+assert.match(html,/limited · 2 admitted · 3 rejected/);
+assert.match(html,/limited · 3 admitted · 2 rejected/);
+assert.equal((html.match(/peer · 8 admitted · 0 rejected/g)||[]).length,2);
+""")
 
 
 @pytest.mark.usefixtures("local_tokenizer")
@@ -88,8 +130,8 @@ async def test_blocked_policy_check_cannot_establish_baseline_comparison(monkeyp
     for current, baseline in ((successful, blocked), (blocked, successful)):
         comparison = compare_baseline(current, baseline).baseline
         assert comparison["status"] == "inconclusive"
-        rows = comparison["targets"][0]["comparisons"]
-        assert len(rows) == 2 and all(row["status"] == "inconclusive" for row in rows)
+        row, = comparison["targets"][0]["comparisons"]
+        assert row["status"] == "inconclusive"
 
 
 def test_policy_plan_follows_shared_workloads():
