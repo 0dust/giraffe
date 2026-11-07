@@ -1501,15 +1501,17 @@ def _compare_interference_work(current, old, user_id, current_records, old_recor
         elif _interference_role_work_changed(*cohorts, tolerance):
             reasons.append(f"Matched {role} work differs or lacks observed token evidence.")
     if not reasons:
-        exposure = [_interference_exposure(evidence, records)
-                    for evidence, records in ((current, current_records), (old, old_records))]
-        if any(groups is None for groups in exposure):
+        links = [_interference_exposure(evidence) for evidence in (current, old)]
+        if any(groups is None for groups in links):
             reasons.append("Matched heavy exposure per probe is missing or incomplete.")
-        elif _heavy_work_per_probe_changed(exposure, tolerance):
-            reasons.append("Matched heavy exposure per matched probe differs between runs.")
-        elif reason := _compare_interference_groups(
-                (current, current_records, exposure[0]), (old, old_records, exposure[1]), tolerance):
-            reasons.append(reason)
+        else:
+            exposure = [[[records[rid] for rid in group] for group in groups]
+                        for groups, records in zip(links, (current_records, old_records))]
+            if _heavy_work_per_probe_changed(exposure, tolerance):
+                reasons.append("Matched heavy exposure per matched probe differs between runs.")
+            elif reason := _compare_interference_groups(
+                    (current, current_records, exposure[0]), (old, old_records, exposure[1]), tolerance):
+                reasons.append(reason)
     return list(dict.fromkeys(retained_ids)), " ".join(reasons) or None
 
 
@@ -1554,8 +1556,10 @@ def _compare_interference_groups(current, old, tolerance):
     return None
 
 
-def _interference_exposure(evidence, records):
-    probes, heavy_ids = evidence["probe_request_ids"], set(evidence["heavy_request_ids"])
+def _interference_exposure(evidence):
+    probes, heavy_ids = evidence.get("probe_request_ids", []), set(evidence.get("heavy_request_ids", []))
+    if not probes or not heavy_ids or len(probes) != len(set(probes)):
+        return None
     links = evidence.get("probe_heavy_request_ids")
     if links is None and (len(probes) == 1 or len(heavy_ids) == 1):
         # Older reports only retain the union. In either case it determines every group.
@@ -1571,7 +1575,7 @@ def _interference_exposure(evidence, records):
         represented.update(ids)
     if represented != heavy_ids:
         return None
-    return [[records[rid] for rid in links[probe]] for probe in probes]
+    return [links[probe] for probe in probes]
 
 
 def _heavy_work_per_probe_changed(exposure, tolerance):
@@ -1584,10 +1588,52 @@ def _heavy_work_per_probe_changed(exposure, tolerance):
         for measure in measures)
 
 
+def _heavy_interference_peers(evidence, request_ids):
+    """Keep only the short pairs whose recorded competitor was this heavy user."""
+    peers = {}
+    request_ids = set(request_ids)
+    for short in evidence.get("users", []):
+        heavy = request_ids.intersection(short.get("heavy_request_ids", []))
+        if not heavy:
+            continue
+        peer_id = short.get("user_id")
+        peers[peer_id] = {}
+        if not peer_id or not short.get("qualified") or short.get("status") == "inconclusive":
+            continue
+        control, probe = (short.get(f"{role}_request_ids", []) for role in ("control", "probe"))
+        links = _interference_exposure(short)
+        if links is None or len(control) != len(probe) or len(probe) != short.get("matched_samples"):
+            continue
+        matched = {pid: [rid for rid in competitors if rid in heavy]
+                   for pid, competitors in zip(probe, links)}
+        matched = {pid: ids for pid, ids in matched.items() if ids}
+        peers[peer_id] = {"user_id": peer_id, "matched_samples": len(matched),
+                          "control_request_ids": [cid for cid, pid in zip(control, probe) if pid in matched],
+                          "probe_request_ids": list(matched), "heavy_request_ids": sorted(heavy),
+                          "probe_heavy_request_ids": matched}
+    return peers
+
+
+def _compare_heavy_interference_work(current, old, current_records, old_records, tolerance):
+    if not current or current.keys() != old.keys():
+        return (), "Matched short-peer exposure for this heavy user is missing or differs between runs."
+    linked = [Counter(), Counter()]
+    for peer_id, latest in current.items():
+        previous = old[peer_id]
+        if not latest or not previous:
+            return (), "Matched short-peer exposure for this heavy user is incomplete."
+        _, reason = _compare_interference_work(latest, previous, peer_id, current_records, old_records, tolerance)
+        if reason:
+            return (), reason
+        for counts, peer in zip(linked, (latest, previous)):
+            counts.update(rid for ids in peer["probe_heavy_request_ids"].values() for rid in ids)
+    if _work_samples_changed([list(counts.values()) for counts in linked], tolerance):
+        return (), "Matched short-probe exposure per heavy request differs between runs."
+    return tuple({"probe_request_ids": counts.keys()} for counts in linked), None
+
+
 def _probe_has_overlap(evidence: dict, records: list[RequestRecord]) -> bool:
     exposed = set(evidence.get("probe_request_ids", []))
-    # The fallback for a heavy user describes the whole probe window.
-    exposed.update(rid for user in evidence.get("users", []) for rid in user.get("heavy_request_ids", []))
     return bool(records) and all(record.id in exposed for record in records)
 
 
@@ -1797,8 +1843,17 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold, slot_ch
         if short_probe:
             interference_ids, interference_reason = _compare_interference_work(
                 c_scenario, b_scenario, user_id, current_records, old_records, tolerance)
+        elif noisy_probe:
+            peers = [_heavy_interference_peers(evidence, user.get("request_ids", []))
+                     for evidence, user in ((c_scenario, c), (b_scenario, b))]
+            overlap, interference_reason = _compare_heavy_interference_work(
+                *peers, current_records, old_records, tolerance)
+            # The window-level status combines every short user's evidence. This
+            # heavy user's rows depend only on the qualified peers it overlapped.
+            c_scenario, b_scenario = overlap or ({}, {})
+            scenario_reason = None
         delivery_reason = ("Shared-window delivery includes samples without qualified heavy overlap."
-                           if noisy_probe and not scenario_reason and not all(
+                           if noisy_probe and not (scenario_reason or interference_reason) and not all(
                                _probe_has_overlap(evidence, records)
                                for evidence, records in zip((c_scenario, b_scenario), comparable_work))
                            else None)

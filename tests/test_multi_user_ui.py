@@ -332,7 +332,7 @@ for(const i of selected(renderMultiUserConversationEditor(fresh.multi_user))){
 const first=configureMultiUser(fresh,initial,bootstrap.multi_user.defaults).multi_user.conversations;
 assert(sameConfig(first.workloads,presets));
 assert.equal(JSON.stringify(first.modes),'["live"]');
-nodes['#new-run-form']={elements:{multi_user_conversation_task_0_name:{value:'custom-1'}}};
+nodes['#new-run-form']={elements:{multi_user_conversation_task_0_enabled:{checked:true}}};
 captureFormDraft=()=>{};
 configChanged=()=>{};
 let markup;
@@ -395,3 +395,42 @@ console.log(JSON.stringify(serialize(serialize())));
     saved, = RunConfig.model_validate(result).multi_user.conversations.workloads
     assert saved.name == 'other-task'
     assert saved.turns == [prompts[0], 'Edited\nfollow-up']
+
+
+def test_multi_user_task_actions_target_the_checked_row_with_a_duplicate_name():
+    config = RunConfig.model_validate({**configuration().model_dump(),
+        'multi_user': {'levels': [2], 'conversations': {'profile': 'performance', 'modes': ['live'],
+            'workloads': [{'name': 'alpha', 'turns': ['\nAlpha prompt', 'Alpha follow-up']},
+                          {'name': 'skipped', 'turns': ['Skipped prompt', 'Skipped follow-up']},
+                          {'name': 'beta', 'turns': ['Beta prompt', 'Beta\r\nfollow-up', 'Beta ending']}]}}})
+    browser_logic(r'''
+const values=new FormData(),elements={},prefix='multi_user_conversation_';
+const [alpha,skipped,beta]=config.multi_user.conversations.workloads;
+values.set('multi_user_rendered','1');values.set(prefix+'profile','performance');
+values.set(prefix+'task_count',3);
+for(const [i,task] of [alpha,skipped,beta].entries()){
+  const key=prefix+`task_${i}_`,checked=i!==1;
+  elements[key+'enabled']={checked};elements[key+'name']={value:'shared'};
+  values.set(key+'enabled',checked?'on':'off');values.set(key+'name','shared');
+  values.set(key+'weight',task.weight);values.set(key+'cap','');
+  values.set(key+'turn_count',task.turns.length);values.set(key+'original_turns',JSON.stringify(task.turns));
+  task.turns.forEach((turn,j)=>values.set(key+'turn_'+j,turn.replace(/\r\n?/g,'\n').replace(/^\n/,'')));
+}
+nodes['#new-run-form']={elements};nodes['#toast']={};
+captureFormDraft=()=>{state.config=configureMultiUser(config,values,bootstrap.multi_user.defaults,{allowInvalid:true});};
+configChanged=()=>{};renderNew=()=>{};
+const tasks=()=>state.config.multi_user.conversations.workloads;
+const expectTurns=expected=>assert.equal(JSON.stringify(tasks().map(task=>task.turns)),JSON.stringify(expected));
+editUserConversation('user-add-turn',2);
+expectTurns([alpha.turns,[...beta.turns,'Build on your previous answer.']]);
+editUserConversation('user-remove-turn',2);
+expectTurns([alpha.turns,beta.turns.slice(0,-1)]);
+editUserConversation('user-remove-task',2);
+expectTurns([alpha.turns]);
+editUserConversation('user-remove-task',1);
+expectTurns([alpha.turns,beta.turns]);
+assert.match(nodes['#toast'].textContent,/Select this task/);
+editUserConversation('user-add-task');
+assert.equal(tasks().map(task=>task.name).join(','),'shared,shared,custom-1');
+expectTurns([alpha.turns,beta.turns,['Explain a topic in detail.','Build on your previous answer.']]);
+''', config)

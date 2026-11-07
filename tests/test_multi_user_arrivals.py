@@ -866,25 +866,27 @@ def test_transport_lane_wait_respects_backlog_discard(monkeypatch, stall):
 
 
 @pytest.mark.parametrize("scenario", ["arrivals", "recovery"])
-def test_scheduled_request_timeouts_only_fail_multi_user(monkeypatch, scenario):
+@pytest.mark.parametrize("timeout_phase", ["measurement", "warmup"])
+def test_scheduled_request_timeouts_stay_in_multi_user(monkeypatch, scenario, timeout_phase):
     from contextvars import ContextVar
 
     from giraffe.client import LLMClient
 
-    current_scenario = ContextVar("current_scenario", default="")
+    timeout_request = ContextVar("timeout_request", default=False)
 
     class Endpoint(LLMClient):
         async def execute(self, spec, **kwargs):
-            token = current_scenario.set(spec.scenario)
+            token = timeout_request.set(spec.workload.get("scenario") == scenario
+                                        and spec.workload.get("phase") == timeout_phase)
             try:
                 return await super().execute(spec, **kwargs)
             finally:
-                current_scenario.reset(token)
+                timeout_request.reset(token)
 
     async def respond(request):
         if request.method != "POST":
             return httpx.Response(404)
-        if current_scenario.get().endswith(("_arrivals", "_recovery_control", "_recovery_sustained", "_recovery_lighter")):
+        if timeout_request.get():
             await asyncio.sleep(.25)
         return httpx.Response(200, json={
             "choices": [{"message": {"role": "assistant", "content": "K7P4"}, "finish_reason": "stop"}],
@@ -896,6 +898,7 @@ def test_scheduled_request_timeouts_only_fail_multi_user(monkeypatch, scenario):
         transport=httpx.MockTransport(respond), **options))
     monkeypatch.setattr(runner, "LLMClient", Endpoint)
     cfg = settings(levels=[2], scenarios=[scenario], duration_seconds=.2, profile=PROFILE,
+                   warmup_seconds=.15 if timeout_phase == "warmup" else 0,
                    arrivals={"requests_per_second": 2}, recovery={"control_seconds": .2,
                        "sustained_seconds": .2, "lighter_seconds": .2,
                        "sustained_requests_per_second": 10, "lighter_requests_per_second": 5}).model_copy(
@@ -903,16 +906,31 @@ def test_scheduled_request_timeouts_only_fail_multi_user(monkeypatch, scenario):
                 "request_timeout_seconds": .06, "concurrency": 2})
     report = run_virtual(monkeypatch, runner.run_suite(cfg))
     requests = [request for request in report.requests if request.workload.get("scenario") == scenario]
-    assert len(requests) == (2 if scenario == "arrivals" else 8)
-    assert all(request.status == "timeout" and request.check_ids == ["multi_user"] for request in requests)
+    measured = [request for request in requests if request.workload["phase"] == "measurement"]
+    assert len(measured) == (2 if scenario == "arrivals" else 8)
+    timed_out = [request for request in requests if request.workload["phase"] == timeout_phase]
+    assert timed_out
+    assert all(request.status == "timeout" and request.check_ids == ["multi_user"] for request in timed_out)
     checks = {check.id: check for check in report.checks}
     assert checks["access"].status == checks["serving"].status == "pass"
     assert checks["serving"].metrics["error_rate"] == 0
-    assert checks["multi_user"].status == "fail"
+    measured_verdict = "fail" if timeout_phase == "measurement" else "pass"
+    # The buffered transport cannot supply recovery's streamed overlap evidence.
+    check_verdict = "inconclusive" if scenario == "recovery" and timeout_phase == "warmup" else measured_verdict
+    assert checks["multi_user"].status == check_verdict
+    if timeout_phase == "warmup":
+        assert all(request.status == "completed" for request in measured)
     conditions = {row["condition_id"]: row for row in report.conditions}
     for window in checks["multi_user"].metrics["multi_user"]["windows"]:
-        assert window["status"] == "fail"
-        assert conditions[window["id"]]["aggregate_status"] == "failed"
+        condition = conditions[window["id"]]
+        if window["phase"] == "warmup":
+            assert window["status"] == "warmup"
+            assert condition["planned_kind"] == "unknown" and condition["planned"] is None
+            assert condition["aggregate_status"] == "failed"
+        else:
+            verdict = check_verdict if window["role"] == "lighter" else measured_verdict
+            assert window["status"] == verdict
+            assert condition["aggregate_status"] == {"pass": "passed", "fail": "failed"}.get(verdict, verdict)
 
 
 @pytest.mark.parametrize("concurrency,budget", [(1, None), (4, 5), (4, None)])

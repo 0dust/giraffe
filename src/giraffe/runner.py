@@ -110,8 +110,9 @@ def _stats(records: list[RequestRecord]) -> dict:
 
 
 def _stress(scenario):
+    # Scheduled warmup traffic shares stress accounting with its measurement window.
     return (scenario.startswith(("traffic_stage_", "context", "fairness_", "bucket_", "mixed_", "arrival", "stress_", "load_"))
-            or scheduled_multi_user_window(scenario)
+            or scheduled_multi_user_window(scenario.removesuffix("_warmup"))
             or scenario in {"sustained", "recovery", "recovery_baseline", "recovery_prime", "limits",
                             "stop_control", "client_cancel", "client_deadline", "backend_cancel",
                             "cancellation_probe", "cancellation_baseline"})
