@@ -26,8 +26,9 @@ from .caps import (MAX_HTML_PREVIEW_CHARS, MAX_HTML_JSON_PREVIEW_CHARS,
                    MAX_FAILURE_SUMMARY_CHARS)
 from .deployment import deployment_diff, fixture_hash, safe_config, sanitize
 from .report_inputs import input_ref as _input_ref
-from .multi_user_metrics import (_length_mix_differs, _total_generated_tokens, _uncached_input_tokens, truncated_conversation_turn,
-                                 user_delivery_completions, user_latency)
+from .multi_user_metrics import (_error as _user_error, _length_mix_differs, _total_generated_tokens,
+                                 _uncached_input_tokens, _valid as _user_valid_completion,
+                                 truncated_conversation_turn, user_delivery_completions, user_latency)
 from .models import (CHECK_NAMES, CORE_CHECKS, SHAPES, CheckResult, RequestRecord, RunConfig, RunReport, overall_status, load_shape_label,
                      migrate_concurrent_load, migrate_run_limits, is_supported_schema, CURRENT_SCHEMA)
 from .stats import median, percentile
@@ -515,16 +516,24 @@ def _timing_quality(report, target, records, metrics):
                    legacy_max_lag_ms=report.observations.get("generator_max_lag_ms", 0))
 
 
-def _metric_values(records: list[RequestRecord]) -> dict[str, list[float]]:
-    completed = [r for r in records if r.status == "completed" and r.valid]
+def _valid_completion(record: RequestRecord, check: str | None) -> bool:
+    if check == "multi_user" and record.workload.get("session_id"):
+        return _user_valid_completion(record)
+    return record.status == "completed" and record.valid
+
+
+def _metric_values(records: list[RequestRecord], *, check: str | None = None) -> dict[str, list[float]]:
+    valid = [_valid_completion(record, check) for record in records]
+    completed = [record for record, success in zip(records, valid) if success]
     def clock_value(record, arrival_field, dispatch_field):
         if "multi_user" in record.check_ids:
             return user_latency(record, first=dispatch_field == "first_output_ms")
         arrival = (record.load_point or {}).get("pattern") in {"constant", "poisson", "bursts"}
         return getattr(record, arrival_field if arrival else dispatch_field)
     return {
-        "valid_completion_rate": [float(r.status == "completed" and r.valid) for r in records],
-        "error_rate": [float(r.status in {"failed", "timeout"}) for r in records],
+        "valid_completion_rate": [float(success) for success in valid],
+        "error_rate": [float(_user_error(r) if check == "multi_user" and r.workload.get("session_id")
+                             else r.status in {"failed", "timeout"}) for r in records],
         "correctness_rate": [float(r.score) for r in records if r.score is not None],
         "latency_ms": [v for r in completed if (v := clock_value(r, "arrival_elapsed_ms", "elapsed_ms")) is not None],
         "first_output_ms": [v for r in completed if (v := clock_value(r, "arrival_first_output_ms", "first_output_ms")) is not None],
@@ -537,8 +546,8 @@ def _metric_values(records: list[RequestRecord]) -> dict[str, list[float]]:
     }
 
 
-def _output_work(records: list[RequestRecord]) -> dict[str, Any]:
-    completed = [r for r in records if r.status == "completed" and r.valid]
+def _output_work(records: list[RequestRecord], *, check: str | None = None) -> dict[str, Any]:
+    completed = [r for r in records if _valid_completion(r, check)]
     tokens = [r.output_tokens for r in completed if r.output_tokens is not None]
     return {
         "valid_completions": len(completed),
@@ -722,8 +731,7 @@ def _live_input_work_changed(current, old, threshold, *, compare_output=False):
         return turn, record.fixture_id, record.request_hash, record.input_tokens, output_work(record)
 
     def completed(record):
-        return (record.status == "completed" and record.valid and record.score is not False
-                and not truncated_conversation_turn(record) and None not in output_work(record))
+        return _user_valid_completion(record) and None not in output_work(record)
 
     shorter, longer = sorted(histories, key=len)
     witnessed = {observed_turn(turn, record) for (_, turn), record in shorter.items() if completed(record)}
@@ -1495,19 +1503,22 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                     old_mix = old_shares.get(old_records[0].load_point.get("point_id"), {})
                     mix_changed |= any(abs(current_mix.get(shape, 0) - old_mix.get(shape, 0)) > Fraction(1, 10)
                                        for shape in current_mix.keys() | old_mix.keys())
-                current_metrics, old_metrics = _metric_values(current_records), _metric_values(old_records)
-                current_work, old_work = _output_work(current_records), _output_work(old_records)
+                record_cohorts = current_records, old_records
+                current_metrics, old_metrics = (_metric_values(records, check=check) for records in record_cohorts)
+                current_work, old_work = (_output_work(records, check=check) for records in record_cohorts)
                 outputs = _output_observations(check, scenario, current_work, old_work)
                 if load_point:
                     for output in outputs:
                         output["load_point"] = load_point
                 observed_outputs.extend(outputs)
                 different_work = _different_output_work(current_work, old_work, threshold)
-                input_work_changed = _input_work_changed(current_records, old_records, threshold)
+                timing_cohorts = record_cohorts
                 live_output_differs = False
                 if check == "multi_user":
-                    completions = [[r for r in cohort if r.status == "completed" and r.valid]
-                                   for cohort in (current_records, old_records)]
+                    completions = tuple([r for r in cohort if _valid_completion(r, check)]
+                                        for cohort in record_cohorts)
+                    if any(r.workload.get("session_id") for cohort in record_cohorts for r in cohort):
+                        timing_cohorts = completions
                     live_inputs_differ = _live_input_work_changed(*completions, threshold)
                     live_output_differs = (not live_inputs_differ and _live_input_work_changed(
                         *completions, threshold, compare_output=True))
@@ -1515,6 +1526,7 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                     live_inputs_differ = (any(r.workload.get("mode") == "live" for r in current_records)
                                           and Counter(r.request_hash for r in current_records)
                                           != Counter(r.request_hash for r in old_records))
+                input_work_changed = _input_work_changed(*timing_cohorts, threshold)
                 for metric, values in current_metrics.items():
                     if not values and not old_metrics[metric]:
                         continue
@@ -1549,8 +1561,8 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                                         detail = point.get("concurrency_reason") or point.get("reason") or "Client occupancy or stream concurrency evidence is insufficient."
                                         message = f"{label} requested concurrency was not delivered or evidenced; {detail} Server queueing is not established."
                                     warn("load_not_delivered", message, preserve_failure=label == "Current")
-                        quality = {"Current": _timing_quality(report, name, current_records, (metric,)),
-                                   "Baseline": _timing_quality(baseline, name, old_records, (metric,))}
+                        quality = {"Current": _timing_quality(report, name, timing_cohorts[0], (metric,)),
+                                   "Baseline": _timing_quality(baseline, name, timing_cohorts[1], (metric,))}
                         delayed_runs = [label for label, item in quality.items() if item["status"] == "client_delayed"]
                         row["timing_quality"] = quality
                         if delayed_runs:
@@ -1581,9 +1593,10 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                             warnings.insert(0, {"code": "sample_uncertainty", "message": initial_uncertainty})
                         row["reason"] = " ".join(warning["message"] for warning in warnings)
                     row["warnings"] = warnings
+                    evidence = timing_cohorts[0] if metric in TIMING_METRICS else current_records
                     row.update(check=check, scenario=scenario,
                                output_work={"current": current_work, "baseline": old_work},
-                               evidence_ids=[record.id for record in current_records])
+                               evidence_ids=[record.id for record in evidence])
                     if load_point:
                         row["load_point"] = load_point
                     if check == "multi_user":
