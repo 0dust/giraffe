@@ -2478,6 +2478,8 @@ class RequestRecord(PersistedModel):
     started_at: str
     status: Literal["completed", "failed", "timeout", "cancelled"]
     http_status: int | None = None
+    rate_limited: bool = False
+    retry_after_seconds: float | None = Field(default=None, ge=0)
     response_body_bytes: int = Field(default=0, ge=0)
     error: str | None = None
     request_timeout_seconds: float | None = None

@@ -244,6 +244,45 @@ class FakeClient:
             answer_chunks=2, http_status=200 if ok else None, finish_reason="stop" if ok else None)
 
 
+async def test_rate_limit_does_not_consume_generic_error_budget():
+    config = cfg(stop_after_errors=1)
+    run = runner._Run(config, None, None)
+    spec = builtin_fixtures(config)["short"][0].model_copy(update={
+        "scenario": "warm", "check_ids": ["serving"]})
+
+    class RateLimited:
+        async def execute(self, spec, *, first_output_event=None):
+            return RequestRecord(id=uuid.uuid4().hex, target="t", fixture_id=spec.fixture_id,
+                scenario=spec.scenario, check_ids=spec.check_ids, started_at="now", status="failed",
+                http_status=429, rate_limited=True, retry_after_seconds=1.0,
+                error="rate limited (HTTP 429); retry after 1s")
+
+    await run.request(config.targets[0], RateLimited(), spec)
+    assert run.errors == 0
+    assert run.reason is None
+    assert run.records[0].rate_limited
+    stats = runner._stats(run.records)
+    assert stats["rate_limited"] == 1 and stats["failed"] == 0
+    assert stats["error_rate"] is None
+    assert next(c for c in runner._checks(run, config.targets[0]) if c.id == "serving").status == "inconclusive"
+
+
+async def test_rate_limit_wait_honors_extended_window():
+    import time
+
+    config = cfg()
+    run = runner._Run(config, None, None)
+    spec = builtin_fixtures(config)["short"][0].model_copy(update={
+        "scenario": "warm", "check_ids": ["serving"]})
+    run.rate_limit_until["t"] = time.monotonic() + .05
+    task = asyncio.create_task(run.request(config.targets[0], FakeClient(), spec))
+    await asyncio.sleep(.02)
+    run.rate_limit_until["t"] = time.monotonic() + .1
+    await asyncio.sleep(.06)
+    assert not task.done()
+    await task
+
+
 
 
 async def test_first_output_counts_timed_out_request_without_output(monkeypatch):

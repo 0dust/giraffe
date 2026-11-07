@@ -54,14 +54,15 @@ def _reasoning_budget(record) -> bool:
 
 
 def _stats(records: list[RequestRecord]) -> dict:
-    """attempted = completed + failed + timed_out + cancelled + reasoning_budget_exhausted.
+    """attempted = completed + failed + timed_out + cancelled + reasoning_budget_exhausted + rate_limited.
 
     Reasoning-budget records are neither errors nor answers; they are excluded from error_rate.
     """
     good = [r for r in records if r.status == "completed" and r.valid]
     latencies = [r.elapsed_ms for r in good]
     output = [r.first_output_ms for r in good if r.first_output_ms is not None]
-    evaluated = [r for r in records if r.status != "cancelled" and not _reasoning_budget(r)]
+    evaluated = [r for r in records if r.status != "cancelled" and not _reasoning_budget(r)
+                 and not r.rate_limited]
     errors = sum(r.status in {"failed", "timeout"} or (r.status == "completed" and not r.valid) for r in evaluated)
     rates = [r.output_tokens / (r.elapsed_ms / 1000) for r in good
              if r.output_tokens is not None and r.elapsed_ms > 0]
@@ -69,10 +70,11 @@ def _stats(records: list[RequestRecord]) -> dict:
     result = {
         "attempted": len(records), "completed": len(good),
         "failed": sum((r.status == "failed" or (r.status == "completed" and not r.valid))
-                      and not _reasoning_budget(r) for r in records),
+                      and not _reasoning_budget(r) and not r.rate_limited for r in records),
         "reasoning_budget_exhausted": sum(map(_reasoning_budget, records)),
         "timed_out": sum(r.status == "timeout" for r in records),
         "cancelled": sum(r.status == "cancelled" for r in records),
+        "rate_limited": sum(r.rate_limited for r in records),
         "error_rate": errors / len(evaluated) if evaluated else None,
         "p50_ms": percentile(latencies, .5), "p95_ms": percentile(latencies, .95),
         "first_output_p50_ms": percentile(output, .5),
@@ -257,6 +259,7 @@ class _Run:
         self.dropped_offers = 0
         self.budget_counts = Counter()
         self.errors = 0
+        self.rate_limit_until = {target.name: 0.0 for target in config.targets}
         self.reason: str | None = None
         self.limits_reached = set()
         self.memory_limit_reached = False
@@ -582,6 +585,14 @@ class _Run:
         evidence_probe = spec.scenario == "performance_evidence_probe"
         slot_deadline = min(self.deadline, deadline_override if deadline_override is not None else self.deadline)
         async with self.slot(slot_reserved, slot_deadline) as admitted:
+            while admitted and not self.stop.is_set():
+                wait = self.rate_limit_until[target.name] - time.monotonic()
+                if wait <= 0 or time.monotonic() >= slot_deadline:
+                    break
+                try:
+                    await asyncio.wait_for(self.stop.wait(), min(wait, slot_deadline - time.monotonic()))
+                except TimeoutError:
+                    pass
             # An offered arrival owns its budget even if a later arrival exhausts
             # the ceiling. Only a real stop condition can prevent its dispatch.
             reason = self.stop_reason(target.name)
@@ -773,8 +784,13 @@ class _Run:
                             record.error = self.endpoint_health[target.name]["abort_reason"]
                         self.mark_unfinished(target.name, _scenario_checks(spec))
                 budget_only = bool(set(spec.check_ids) & {"prefix", "sessions", "tools"}) and reasoning_budget(record)
+                if record.rate_limited and not intentional:
+                    retry_after = record.retry_after_seconds or 0.0
+                    self.rate_limit_until[target.name] = max(
+                        self.rate_limit_until[target.name], time.monotonic() + retry_after)
                 if _serving_failure(record, spec.scenario) and not readiness and not intentional and not budget_only:
-                    self.errors += 1
+                    if not record.rate_limited:
+                        self.errors += 1
                     record.check_ids = list(dict.fromkeys([*record.check_ids, *[
                         name for name in ("access", "serving", "first_output") if name in self.config.checks]]))
                 if budget_exempt:
@@ -1577,6 +1593,8 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
         elif check_id == "serving":
             if metrics["error_rate"] is not None and metrics["error_rate"] > limits.max_error_rate:
                 status, summary = "fail", "Invalid completions, errors or timeouts exceeded the configured allowance."
+            elif metrics["rate_limited"]:
+                status, summary = "inconclusive", "Requests were rate limited (HTTP 429); serving was not fully assessed."
             elif metrics["reasoning_budget_exhausted"]:
                 status, summary = "inconclusive", "Reasoning exhausted the output budget before an answer."
             else:
