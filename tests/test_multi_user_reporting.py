@@ -441,6 +441,50 @@ def test_live_baseline_qualifies_only_the_completions_delivered_in_the_window(cu
     assert row["current"] == row["baseline"] == 70
 
 
+@pytest.mark.parametrize("conversation", [True, False])
+def test_baseline_counts_truncated_conversation_turn_as_unsuccessful(conversation):
+    build_report = live_user_report if conversation else user_report
+    current, previous = build_report(), build_report()
+    for report in (current, previous):
+        source = report.observations["targets"]["local"]["multi_user"]
+        if conversation:
+            window = source["windows"][0]
+            window["scenario"] = "repeated_conversations"
+            for user in window["users"]:
+                user["profile"] = "conversation:chat"
+            for request in report.requests:
+                request.workload["session_id"] = (
+                    f"{request.workload['user_id']}:{request.workload['conversation_sequence']}"
+                )
+        if report is current:
+            report.requests[-1].finish_reason = "length"
+            report.observations["client_timing_health"] = {
+                "schema_version": 1, "windows": [{"start_ms": 7000, "end_ms": 7100, "lag_ms": 200}]
+            }
+        summary = summarize(source, report.requests, timing_health=report.observations.get("client_timing_health"))
+        report.checks[0].metrics["multi_user"] = summary
+        report.checks[0].status = report.overall = summary["status"]
+
+    outcome = current.checks[0].metrics["multi_user"]["windows"][0]["users"][-1]["outcomes"]
+    valid, errors = (7, 1) if conversation else (8, 0)
+    assert (outcome["valid_completed"], outcome["errors"]) == (valid, errors)
+
+    comparison = compare_baseline(current, previous).baseline
+    rows = {row["metric"]: row for row in comparison["targets"][0]["comparisons"]
+            if row.get("user_id") == "user-05"}
+    assert rows["valid_completion_rate"]["current"] == valid / 8
+    assert rows["error_rate"]["current"] == errors / 8
+    assert rows["valid_completion_rate"]["current_samples"] == rows["error_rate"]["current_samples"] == 8
+    for metric in ("latency_ms", "first_output_ms"):
+        timing = rows[metric]
+        assert (timing["current_samples"], timing["baseline_samples"]) == (valid, 8)
+        assert timing["output_work"]["current"]["valid_completions"] == valid
+        quality = timing["timing_quality"]["Current"]
+        assert quality["total_requests"] == valid
+        assert quality["affected_request_ids"] == ([] if conversation else ["user-05-7"])
+        assert ("user-05-7" in timing["evidence_ids"]) is not conversation
+
+
 def test_failures_retention_keeps_truncated_conversation_output_in_a_passing_run(tmp_path):
     report = user_report(retention="failures")
     truncated = report.requests[0]

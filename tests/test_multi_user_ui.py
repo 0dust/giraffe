@@ -2,7 +2,7 @@
 from collections import OrderedDict
 import json
 
-from giraffe.models import RunConfig
+from giraffe.models import RunConfig, Target
 from giraffe.web import _track_live_request
 from tests.test_ux_catalogue import browser_logic
 
@@ -136,6 +136,34 @@ def test_live_user_identity_survives_started_and_completed_events():
         assert job['requests'][0]['workload'] == identity
 
 
+def test_live_conversation_turn_identity_survives_long_target_names():
+    target = Target(name='region1-production-tenant-service-ml-inference-'
+                         'release-candidate-2026-11-07-qwen-2.5-coder-32b-vllm',
+                    url='http://localhost/v1', model='test')
+    window = 'multi_user_20_measurement'
+    identity = {'user_id': 'user-01', 'population': 20, 'profile': 'conversation:exact_repeat',
+                'window_id': window, 'phase': 'measurement', 'request_sequence': 2,
+                'turn_id': 1, 'conversation_sequence': 1,
+                'session_id': f'{target.name}:{window}:user-01:1:live'}
+    assert len(identity['session_id']) > 128
+    job = {'requests': OrderedDict(), 'live_request_count': 0, 'evicted_running': set(),
+           'live_request_summary': {'evicted': 0, 'through_slot': None, 'statuses': {}}}
+    rows = []
+    for kind in ['request_started', 'request_completed']:
+        event = {'event': kind, 'request_slot': 0, 'target': target.name, 'scenario': window,
+                 'user': identity, 'request': {'id': 'r', 'status': 'completed'}}
+        _track_live_request(job, event, 100)
+        rows.append(job['requests'][0])
+        assert 'session_id' not in rows[-1]['workload']
+    browser_logic('const rows='+json.dumps(rows)+r"""
+for(const row of rows){
+  assert.match(requestIdentityContent(row,rows),/user-01 · 20 users · Conversation 1 · Turn 2/);
+}
+const request={...rows[0],workload:{user_id:'user-01',population:20}};
+assert.doesNotMatch(requestIdentityContent(request,[request]),/Conversation|Turn/);
+""", configuration())
+
+
 async def test_population_preview_and_bound_label_are_independent_of_slots(tmp_path):
     from tests.test_web import browser
     values = configuration().model_dump(mode='json')
@@ -212,13 +240,15 @@ assert.equal(JSON.stringify(changed.multi_user.shapes),'[]');console.log(JSON.st
 def test_fairness_and_conversation_settings_roundtrip():
     result = browser_logic(r'''
 const markup=renderMultiUserEditor(config);
-for(const name of ['criteria_max_throughput_ratio','fairness_tolerance_percent','conversation_profile','conversation_modes','conversation_turns','conversation_max_tokens','conversation_sample_turn_count'])assert(markup.includes('name="multi_user_'+name+'"'));
+for(const name of ['criteria_max_throughput_ratio','fairness_tolerance_percent','conversation_profile','conversation_modes','conversation_turn_0','conversation_max_tokens','conversation_sample_turn_count'])assert(markup.includes('name="multi_user_'+name+'"'));
 const values=new FormData();values.set('multi_user_rendered','1');
 values.set('multi_user_criteria_max_throughput_ratio','1.5');
 values.set('multi_user_fairness_tolerance_percent','5');
 values.set('multi_user_conversation_profile','correctness');
 values.set('multi_user_conversation_modes','live');
-values.set('multi_user_conversation_turns','Remember the name.\nRepeat the name.');
+values.set('multi_user_conversation_turn_count','2');
+values.set('multi_user_conversation_turn_0','Remember the name.');
+values.set('multi_user_conversation_turn_1','Repeat the name.');
 values.set('multi_user_conversation_max_tokens','48');
 values.set('multi_user_conversation_delay_seconds','0.1');
 const changed=configureMultiUser(config,values,bootstrap.multi_user.defaults);
@@ -301,19 +331,62 @@ assert.throws(()=>configureMultiUser(state.config,values,bootstrap.multi_user.de
 ''', config)
 
 
-def test_unchanged_multi_user_form_preserves_multiline_recall_prompts():
-    turns = ['Remember the name.\nReply with it only.', 'Repeat it.']
+def test_editing_one_recall_turn_preserves_other_multiline_prompts():
+    turns = ['\nRemember the name.\r\nReply with it only.\rKeep it short.', 'Repeat it.', 'End here.']
     config = RunConfig.model_validate({**configuration().model_dump(),
         'multi_user': {'levels': [2], 'conversations': {'turns': turns}}})
-    result = browser_logic(r'''
-const markup=renderMultiUserEditor(config);
-const prompts=markup.match(/<textarea[^>]*name="multi_user_conversation_turns"[^>]*>([\s\S]*?)<\/textarea>/)[1];
-const values=new FormData();values.set('multi_user_rendered','1');
-values.set('multi_user_conversation_profile','correctness');
-values.set('multi_user_conversation_turns',prompts);
-console.log(JSON.stringify(configureMultiUser(config,values,bootstrap.multi_user.defaults)));
-''', config)
-    assert RunConfig.model_validate(result).multi_user.conversations.turns == turns
+    result = browser_logic(r"""
+const markup=renderMultiUserEditor(config),prefix='multi_user_conversation_';
+const values=new FormData();
+values.set('multi_user_rendered','1');
+values.set(prefix+'profile','correctness');
+const read=name=>markup.match(new RegExp('<input[^>]*name="'+name+'"[^>]*value="([^"]*)"'))[1];
+values.set(prefix+'turn_count',read(prefix+'turn_count'));
+values.set(prefix+'original_turns',read(prefix+'original_turns').replace(/&quot;/g,'"'));
+for(let index=0;index<Number(values.get(prefix+'turn_count'));index++){
+  const name=prefix+'turn_'+index;
+  const content=markup.match(new RegExp('<textarea[^>]*name="'+name+'"[^>]*>([\\s\\S]*?)</textarea>'))[1];
+  values.set(name,content.replace(/\r\n?/g,'\n').replace(/^\n/,''));
+}
+const serialize=(source=config)=>configureMultiUser(source,values,bootstrap.multi_user.defaults);
+const original=config.multi_user.conversations.turns;
+assert.equal(values.get(prefix+'turn_0'),original[0].replace(/\r\n?/g,'\n'));
+assert(sameConfig(serialize().multi_user.conversations.turns,original));
+assert.equal(settingDestination('multi_user.conversations.turns.1').name,prefix+'turn_1');
+assert.equal(settingDestination('multi_user.conversations.turns').name,prefix+'turn_0');
+assert.equal(settingPath(prefix+'turn_1'),'multi_user.conversations.turns.1');
+values.set(prefix+'turn_0','Temporary edit');
+const draft=serialize();
+values.set(prefix+'turn_0',original[0].replace(/\r\n?/g,'\n'));
+values.set(prefix+'turn_1','Repeat it exactly.\nThen give the first letter.');
+console.log(JSON.stringify(serialize(serialize(draft))));
+""", config)
+    assert RunConfig.model_validate(result).multi_user.conversations.turns == [
+        turns[0], 'Repeat it exactly.\nThen give the first letter.', turns[2],
+    ]
+
+
+def test_recall_turn_actions_keep_prompt_order_and_respect_bounds():
+    config = RunConfig.model_validate({**configuration().model_dump(),
+        'multi_user': {'levels': [2], 'conversations': {'turns': ['First\nline', 'Second']}}})
+    browser_logic(r"""
+const limits=bootstrap.limits['multi_user.conversations.turns'];
+captureFormDraft=()=>{};configChanged=()=>{};renderNew=()=>{};
+const turns=state.config.multi_user.conversations.turns;
+const button=action=>renderMultiUserEditor(state.config).match(new RegExp('<button[^>]*data-action="'+action+'"[^>]*>'))[0];
+assert.match(button('user-remove-recall-turn'),/disabled/);
+editUserRecall('user-remove-recall-turn');
+assert.equal(turns.length,limits.minItems);
+editUserRecall('user-add-recall-turn');
+assert.equal(turns.length,limits.minItems+1);
+assert.doesNotMatch(button('user-remove-recall-turn'),/disabled/);
+editUserRecall('user-remove-recall-turn');
+assert(sameConfig(turns,['First\nline','Second']));
+while(turns.length<limits.maxItems)editUserRecall('user-add-recall-turn');
+assert.match(button('user-add-recall-turn'),/disabled/);
+editUserRecall('user-add-recall-turn');
+assert.equal(turns.length,limits.maxItems);
+""", config)
 
 
 def test_multi_user_task_form_preserves_original_prompts_after_row_edits():
