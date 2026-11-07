@@ -192,6 +192,8 @@ def test_describe_has_full_authoritative_schema_without_traffic(monkeypatch, cap
     assert result["defaults"]["load_test"]["patterns"]["rates"] == [1, 2]
     from giraffe.models import CHECK_NAMES
     assert {check["id"] for check in result["checks"]} == set(CHECK_NAMES)
+    assert next(check for check in result["checks"] if check["id"] == "gateway_access")["optional"]
+    assert "GatewayAccess" in result["config_schema"]["$defs"]
     assert any(check["id"] == "gateway_attribution" for check in result["checks"])
     assert "runtime availability" in result["validation_note"]
 

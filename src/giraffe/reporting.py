@@ -29,8 +29,9 @@ from .report_inputs import input_ref as _input_ref
 from .multi_user_metrics import (_error as _user_error, _length_mix_differs, _total_generated_tokens,
                                  _uncached_input_tokens, _valid as _user_valid_completion,
                                  fairness_applies, truncated_conversation_turn, user_delivery_completions, user_latency)
-from .models import (CHECK_NAMES, CORE_CHECKS, SHAPES, SHARED_BASELINE_EXCLUDED_WORKLOADS, CheckResult, GatewayAttribution,
-                     GatewayPolicy, RequestRecord, RunConfig, RunReport, overall_status, load_shape_label,
+from .models import (CHECK_NAMES, CORE_CHECKS, SHAPES, SHARED_BASELINE_EXCLUDED_WORKLOADS, CheckResult, GatewayAccess,
+                     GatewayAttribution, GatewayEvidence, GatewayPolicy, RequestRecord, RunConfig, RunReport,
+                     TestIdentity, overall_status, load_shape_label,
                      migrate_concurrent_load, migrate_run_limits, is_supported_schema, CURRENT_SCHEMA)
 from .stats import median, percentile
 from .storage import DEFAULT_LIMITS, format_size, fsync_directory, update_metadata, write_metadata
@@ -87,10 +88,38 @@ def _groups(records: list[RequestRecord], target: str) -> dict[tuple[str, str], 
     return groups
 
 
+def _uses_shared_request_options(config: dict, check: str) -> bool:
+    if check in ("gateway_access", "gpu"):
+        return False
+    if check not in ("gateway_attribution", "gateway_policy"):
+        return True
+    settings = config.get(check)
+    if settings is None:
+        return False
+    try:
+        if check == "gateway_policy":
+            return GatewayPolicy.model_validate(settings).supported
+        GatewayAttribution.model_validate(settings)
+        targets = config.get("targets")
+        if not isinstance(targets, list) or not targets:
+            return True
+        return any(not isinstance(target, dict) or (target.get("gateway") is not None
+                   and GatewayEvidence.model_validate(target["gateway"]).profile == "litellm") for target in targets)
+    except ValidationError:
+        return True
+
+
 def _comparison_config(value: dict) -> dict:
     """Normalize saved config I/O without changing the recorded workload identity."""
     config, _ = migrate_run_limits(deepcopy(value))
     config, _ = migrate_concurrent_load(config)
+    checks = config.get("checks")
+    options = config.get("request_options")
+    if (isinstance(checks, list) and "gateway_access" in checks
+            and not config.get("restart_target") and isinstance(options, dict)
+            and not any(_uses_shared_request_options(config, check) for check in checks)):
+        # Access sends a fixed probe. Telemetry and unavailable probes send no inference.
+        config["request_options"] = {}
     if isinstance(config.get("limits"), dict):
         config["limits"].pop("regression_percent", None)
         for field in ("first_output_ms", "stream_gap_ms"):
@@ -168,10 +197,30 @@ _CONVERSATION_REVISIONS = {"persistent_users", "shared_conversations"}
 _COMPANION_REVISIONS = _CONVERSATION_REVISIONS | {
     "gateway_attribution", "gateway_conversations", "gateway_shared_first", "gateway_shared_targets_first",
     "gateway_policy", "policy_conversations", "policy_shared_first", "policy_shared_targets_first",
-    "policy_after_shared_workloads", "policy_after_all_shared_targets",
+    "gateway_access", "gateway_access_policy", "access_conversations", "access_shared_first", "access_shared_targets_first",
+    "policy_after_shared_workloads", "policy_after_all_shared_targets", "access_after_shared_workloads",
+    "access_deferred_policy", "access_after_all_shared_targets",
 }
+# Access changed optional dispatch after the shared workloads in these revisions.
+_MULTI_USER_COMPANION_REVISIONS = {"policy_after_all_shared_targets", "access_after_all_shared_targets"}
 _CONVERSATION_BRIDGE_CHECKS = {"prefix", "sessions", "consistency"}
 _CONVERSATION_LOAD_SOURCE = "9b694c97a39d449d8ea15b09a9aeb406bf835179c0882827685c4d7888687d36"
+_ACCESS_CONVERSATION_SOURCE = "9ff9179300b4012552a7bd6fd6ef0ae60c016b9023dba33ffabc9ca03783ac2d"
+_COMPANION_LOAD_SOURCE = "113325dd5cffa04626cc7be7ee93bc6e9be67335531288bc329b3542a155c92a"
+
+
+def _multi_user_workload_identity() -> dict[str, str]:
+    from . import concurrent_load, load_test, multi_user, multi_user_metrics, session_sampling, traffic
+
+    modules = (multi_user, multi_user_metrics, load_test, concurrent_load, session_sampling, traffic)
+    source = sha256(b"".join(Path(module.__file__).read_bytes() for module in modules)).hexdigest()
+    return {"multi_user_source_sha256": source, "multi_user_window_policy": multi_user.WINDOW_POLICY}
+
+
+def _load_test_workload_source_sha256() -> str:
+    from . import concurrent_load, load_test, traffic
+
+    return sha256(b"".join(Path(module.__file__).read_bytes() for module in (load_test, concurrent_load, traffic))).hexdigest()
 
 
 def _baseline_workload_fields(checks, *, shared: bool) -> set[str]:
@@ -191,6 +240,9 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str, include_load
     except ValidationError:
         return None
     fields = _baseline_workload_fields(resolved.checks, shared=shared)
+    has_multi_user = "multi_user" in fields
+    if has_multi_user and revision not in _MULTI_USER_COMPANION_REVISIONS:
+        return None
     exact_conversation = revision in _CONVERSATION_REVISIONS and not include_load
     if exact_conversation:
         checks = set(resolved.checks)
@@ -206,7 +258,9 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str, include_load
             unchanged_fields.add("prefix")
         if revision in _COMPANION_REVISIONS:
             unchanged_fields.update(_baseline_workload_fields({"tools"}, shared=shared))
-        if include_load or exact_conversation:
+        if has_multi_user:
+            unchanged_fields.add("multi_user")
+        if include_load or exact_conversation or has_multi_user:
             unchanged_fields.add("load_test")
         # Legacy concurrency has a separate source and needs its own attested revision.
         if "concurrency" in resolved.checks or not fields <= unchanged_fields:
@@ -237,21 +291,32 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str, include_load
             "issue95_pause_evidence": "ab5875f7c635f8f454429a88aac87d52ce3a141a84bcf7b936fa737ffa41fe83",
             "persistent_users": "aee9ca71bc5ffd780d1574422b761e3177471a12f951a10b04322573ca062f76",
             "gateway_attribution": "e29f47df17e250a0fc0133ce3ead964ef97539f8066ac76c374308c9ee552c88",
+            "gateway_access": "9c18e53a9181a3bcf7c4470365ecba67a2c3e4f7f2f5c15a0d444bd8d7d6f5ac",
             "gateway_policy": "8630615d4b6321fe111f312cff35ad9b1c4864f15f19ed5bd7be9e4649291791",
+            "gateway_access_policy": "4a2232070b9effa22e7fa01ca91f015c035d4b26c1d74794fca33c4114fb548f",
             "shared_conversations": "d9a9e921584262148e06b636f0e8f195b7e530fd2a69c5e98f013359cf947ede",
             "gateway_conversations": "bcdc3b8411d9039e90a35bcd5b109504e7123e95ec6baebd5e654287b4774605",
             "policy_conversations": "7c1455ec2c7d65ec707e41ef1864d117fe72fe6f919ba18992e84f39b2449181",
+            "access_conversations": _ACCESS_CONVERSATION_SOURCE,
             "gateway_shared_first": "7a16b503242045f808ecfdb41df6bc8c507ca68181aaf019f003dc2d4d2ffb72",
             "policy_shared_first": "60eac0571375a103c1ebe7b23c3107b9814ceb0c002797736c55a6248a168f86",
+            "access_shared_first": "ffda4bac34b3ab331e55c050a91707b1a0bfa16322347e7109646540e5fc4891",
             "gateway_shared_targets_first": "8037d490881621f37f1aef446474bc52a1ba276bcfcd174f39a14e37032dc9f0",
             "policy_shared_targets_first": "d72acf540fbf8fbd8c45d3ab76d6041054209bb45913c681df171525f8ddc158",
+            "access_shared_targets_first": "16c362d1f79e5dd0b3f0601e0100ec9b19d7a512f5cee081af72594a683bf49f",
+            "access_after_shared_workloads": "2d8a82427a1c241c95e2719c8ab307513d970ba7f14c80db77201d85c35a0897",
+            "access_deferred_policy": "13a3e111a4f8985fa4dd8f763a093ade7ec118a6272e875b5f8abe0e1f104d94",
+            "access_after_all_shared_targets": "67da297a94f8a07f9ab21008c9c6ca87090a7fac3d30e4ff9a543e7491427667",
             "policy_after_shared_workloads": "49dcdfb6b173a93720e4e9e5a9bc54ffcea7580346d2ea0210e600e0779a03e6",
             "policy_after_all_shared_targets": "e4ddc7a7e8563f9ab3bba2fc42ad0232ee924c65f67d92dafd89c21025d202d0",
         }[revision] if any(settings.values()) else None,
         "settings": settings,
     }
-    if exact_conversation and "load" in resolved.checks:
-        identity["load_test_source_sha256"] = _CONVERSATION_LOAD_SOURCE
+    if has_multi_user:
+        identity.update(_multi_user_workload_identity())
+    if (exact_conversation or has_multi_user) and "load" in resolved.checks:
+        identity["load_test_source_sha256"] = (
+            _load_test_workload_source_sha256() if has_multi_user else _CONVERSATION_LOAD_SOURCE)
     if sampled_sessions:
         identity["session_sampling_source_sha256"] = {
             "persistent_users": "2fab1370faeab7ddb91a7ae9c0e49520ee9a67e305441a0663877bb12bca24c3",
@@ -260,10 +325,18 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str, include_load
             "gateway_conversations": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
             "gateway_policy": "2fab1370faeab7ddb91a7ae9c0e49520ee9a67e305441a0663877bb12bca24c3",
             "policy_conversations": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
+            "gateway_access": "2fab1370faeab7ddb91a7ae9c0e49520ee9a67e305441a0663877bb12bca24c3",
+            "gateway_access_policy": "2fab1370faeab7ddb91a7ae9c0e49520ee9a67e305441a0663877bb12bca24c3",
+            "access_conversations": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
             "gateway_shared_first": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
             "policy_shared_first": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
+            "access_shared_first": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
             "gateway_shared_targets_first": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
             "policy_shared_targets_first": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
+            "access_shared_targets_first": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
+            "access_after_shared_workloads": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
+            "access_deferred_policy": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
+            "access_after_all_shared_targets": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
             "policy_after_shared_workloads": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
             "policy_after_all_shared_targets": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
         }[revision]
@@ -289,14 +362,22 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str, include_load
             "issue95_pause_evidence": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
             "persistent_users": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
             "gateway_attribution": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
+            "gateway_access": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
             "gateway_policy": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
+            "gateway_access_policy": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
             "shared_conversations": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
             "gateway_conversations": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
             "policy_conversations": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
+            "access_conversations": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
             "gateway_shared_first": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
             "policy_shared_first": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
+            "access_shared_first": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
             "gateway_shared_targets_first": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
             "policy_shared_targets_first": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
+            "access_shared_targets_first": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
+            "access_after_shared_workloads": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
+            "access_deferred_policy": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
+            "access_after_all_shared_targets": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
             "policy_after_shared_workloads": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
             "policy_after_all_shared_targets": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
         }[revision]
@@ -349,7 +430,9 @@ def _same_load_workload(current: dict, old: dict, *, fingerprint_key: str = "wor
     revisions = ("shared_conversations", "gateway_conversations",
                  "gateway_shared_first", "gateway_shared_targets_first",
                  "policy_conversations", "policy_shared_first", "policy_shared_targets_first",
-                 "policy_after_shared_workloads", "policy_after_all_shared_targets")
+                 "policy_after_shared_workloads", "policy_after_all_shared_targets",
+                 "access_conversations", "access_shared_first", "access_shared_targets_first",
+                 "access_after_shared_workloads", "access_deferred_policy", "access_after_all_shared_targets")
     families = (
         # Explicit multi-user stages preserve ordinary Load dispatch.
         (_CONVERSATION_LOAD_SOURCE,
@@ -374,8 +457,8 @@ def _same_load_workload(current: dict, old: dict, *, fingerprint_key: str = "wor
         except ValidationError:
             return False
         fields = _baseline_workload_fields(resolved.checks, shared=shared)
-        if "load_test" not in fields:
-            return False
+        if "load_test" not in fields or "multi_user" in fields:
+            return False  # The Multi-user bridge attests the exact Load source.
         recorded = manifest.get("fixture_pack", {}).get(fingerprint_key)
         attestations = set()
         for index, sources in enumerate(families):
@@ -392,6 +475,44 @@ def _same_load_workload(current: dict, old: dict, *, fingerprint_key: str = "wor
             return False
         matches.append(attestations)
     return bool(matches[0] & matches[1])
+
+
+def _with_legacy_shared_workload(manifest: dict) -> dict:
+    """Recover the shared fingerprint only from a verified historical full identity."""
+    pack = manifest["fixture_pack"]
+    config = manifest.get("config", {})
+    if "shared_workload_fixture_sha256" in pack or config.get("config_version") != 2:
+        return manifest
+    checks = config.get("checks")
+    if not isinstance(checks, list) or not all(isinstance(check, str) for check in checks):
+        return manifest
+    gateways = SHARED_BASELINE_EXCLUDED_WORKLOADS.intersection(checks)
+    if (not gateways or not gateways <= {"gateway_access", "gateway_attribution"}
+            or ("gateway_attribution" in gateways and config.get("gateway_attribution") is not None)):
+        return manifest
+    shared = _run_limits_workload_identity(manifest, revision="access_conversations",
+                                           include_load="load" in checks, shared=True)
+    if shared is None:
+        return manifest
+    if "load" in checks:
+        shared["load_test_source_sha256"] = _COMPANION_LOAD_SOURCE
+    full = {**shared, "settings": {**shared["settings"], **{check: config.get(check) for check in gateways}}}
+    if any(full["settings"].values()):
+        full["generator_source_sha256"] = _ACCESS_CONVERSATION_SOURCE
+    if "gateway_access" in gateways:
+        if "gateway_access" not in config:
+            return manifest
+        # 2099543e recorded the module only in the full hash. 08f99814 also
+        # attested the combined access and response source in the manifest.
+        source = manifest.get("gateway_access_source_sha256")
+        if source is None:
+            source = "4417c0111cd71cf6e40b0e3a730f8b6acf7bbfa6badcae05639012e3722e5939"
+        elif source != "a2589b46b16ae2c103aec0acf9cf94d9fcc10907b6c339a30820df4e9d4bbf27":
+            return manifest
+        full["gateway_access_source_sha256"] = source
+    if fixture_hash(full) != pack.get("workload_fixture_sha256"):
+        return manifest
+    return {**manifest, "fixture_pack": {**pack, "shared_workload_fixture_sha256": fixture_hash(shared)}}
 
 
 def _mixed_gateway_run(report: RunReport) -> bool:
@@ -654,7 +775,12 @@ def _settings_reasons(report: RunReport, baseline: RunReport, *, details: dict[s
         if shared_selection_changed and pack_only:
             inactive.add("builtin_sha256")  # Both runs used only the recorded request pack for shared work.
         fingerprint_key = "workload_fixture_sha256"
+        full = current_pack.get(fingerprint_key)
+        full_match = isinstance(full, str) and bool(full) and full == old_pack.get(fingerprint_key)
         sources = (report.manifest, baseline.manifest)
+        if shared_selection_changed or not full_match:
+            sources = tuple(_with_legacy_shared_workload(source) for source in sources)
+            current_pack, old_pack = (source["fixture_pack"] for source in sources)
         if shared_selection_changed:
             # A full digest attests shared work only when no excluded check
             # was selected in that run.
@@ -669,8 +795,6 @@ def _settings_reasons(report: RunReport, baseline: RunReport, *, details: dict[s
         has_identity = use_shared or not shared_selection_changed
         # Older reports attest the full identity only. Keep their existing
         # compatibility when those recorded identities still match.
-        full = current_pack.get(fingerprint_key)
-        full_match = isinstance(full, str) and bool(full) and full == old_pack.get(fingerprint_key)
         if use_shared and (shared_selection_changed or not full_match):
             fingerprint_key = shared_key
             current_pack, old_pack = ({**pack, "workload_fixture_sha256": pack[fingerprint_key]}
@@ -2221,6 +2345,70 @@ def _compare_gateway_attribution(report, baseline, target, compatible, current_t
     return rows
 
 
+def _compare_gateway_access(current, baseline, declarations, incompatibility, *, current_refs, old_refs):
+    from .gateway_access import EVIDENCE_VERSION
+
+    def normalized_reference(reference):
+        if not isinstance(reference, dict):
+            return None
+        try:
+            identity = TestIdentity.model_validate(reference, strict=True)
+        except ValidationError:
+            return None
+        if "headers_env" not in reference:
+            return reference
+        headers = {name.lower(): env for name, env in identity.headers_env.items()}
+        return {**reference, "headers_env": headers}
+
+    def matched(policy, case):
+        return next((row for row in policy.get("cases", [])
+                     if all(row.get(field) == value for field, value in case.items())), {})
+
+    def decision(row):
+        observed = row.get("observed")
+        return observed if observed in ("allow", "deny") else "unverified"
+
+    current_policy = current.metrics.get("gateway_access", {})
+    old_policy = baseline.metrics.get("gateway_access", {}) if baseline else {}
+    current_refs = current_refs if isinstance(current_refs, dict) else {}
+    old_refs = old_refs if isinstance(old_refs, dict) else {}
+    evidence_matches = (current_policy.get("evidence_version") == EVIDENCE_VERSION
+                        and old_policy.get("evidence_version") == EVIDENCE_VERSION)
+    baseline_passed = (baseline is not None and baseline.status == "pass"
+                       and old_policy.get("coverage_complete") is True
+                       and current_policy.get("profile") == old_policy.get("profile") == "litellm")
+    rows = []
+    for case in declarations:
+        latest, previous = matched(current_policy, case), matched(old_policy, case)
+        observed, prior = decision(latest), decision(previous)
+        status = "inconclusive"
+        if incompatibility:
+            reason = incompatibility
+        elif not evidence_matches:
+            reason = "Effective gateway credential evidence is missing. Rerun the access check and baseline."
+        elif ((reference := normalized_reference(current_refs.get(case["identity"]))) is None
+              or reference != normalized_reference(old_refs.get(case["identity"]))):
+            reason = "Gateway test identity references differ."
+        elif not baseline_passed or prior != case["expected"]:
+            reason = "The baseline lacks a complete passing access matrix for these declarations."
+        elif observed not in {"allow", "deny"}:
+            reason = "The current run has no qualified access observation for this case."
+        else:
+            status = "pass" if observed == case["expected"] else "fail"
+            reason = ("The observed decision still matches the declared policy." if status == "pass" else
+                      "This previously passing access case now differs from the declared policy.")
+        rows.append({"check": "gateway_access", "scenario": case["name"],
+                     "identity": case["identity"], "expected": case["expected"],
+                     "scenario_label": f'{case["name"]} ({case["identity"]}) · expected {case["expected"]}',
+                     "metric": "policy_acceptance", "aggregation": "observed", "status": status,
+                     "current": observed, "baseline": prior,
+                     "current_samples": int(observed in {"allow", "deny"}),
+                     "baseline_samples": int(prior in {"allow", "deny"}),
+                     "threshold": 0, "worsening": 100 if status == "fail" else 0,
+                     "reason": reason, "evidence_ids": [latest["request_id"]] if latest.get("request_id") else []})
+    return rows
+
+
 def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
     """Return a new report with explicit baseline evidence; never mutate or promote a baseline."""
     from .gateway_policy import VERSION as POLICY_VERSION
@@ -2238,6 +2426,11 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
     minimum = max(2, int(limits.get("min_samples", 5)))
     threshold = float(limits.get("regression_percent", 20))
     old_config = baseline.manifest.get("config", {})
+    access_only = all(
+        isinstance(checks := cfg.get("checks"), list) and "gateway_access" in checks
+        and not any(_uses_shared_request_options(cfg, check) for check in checks)
+        for cfg in (config, old_config)
+    )
     old_targets = {t["name"]: t for t in old_config.get("targets", [])}
     targets = config.get("targets", [])
     comparison: dict[str, Any] = {
@@ -2265,19 +2458,21 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                           if _generator_saturated(run, name)]
         old_target = old_targets.get(name)
         identity_changes = {}
+        identity_reasons = []
         if old_target is None:
-            target_reasons.append("Target is absent from the baseline.")
+            identity_reasons.append("Target is absent from the baseline.")
         else:
             for key in ("model", "url", "route", "parent"):
                 if key not in target or key not in old_target or target[key] != old_target[key]:
                     text = f"Target {key} differs or is unknown."
-                    target_reasons.append(text)
+                    identity_reasons.append(text)
                     target_details[text] = {"code": "target_differs", "key": key,
                                             "baseline": old_target.get(key), "current": target.get(key), "text": text}
             for key in set(target.get("identity", {})) | set(old_target.get("identity", {})):
                 previous, current = old_target.get("identity", {}).get(key), target.get("identity", {}).get(key)
                 if previous != current:
                     identity_changes[key] = {"baseline": previous, "current": current}
+        target_reasons.extend(identity_reasons)
         current_deployment = report.observations.get("targets", {}).get(name, {}).get("deployment")
         old_deployment = baseline.observations.get("targets", {}).get(name, {}).get("deployment")
         configuration_diff = deployment_diff(current_deployment, old_deployment)
@@ -2293,6 +2488,55 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                         "comparable": not target_reasons,
                         "interpretation": "Repeatability and task correctness are separate. Different answers alone do not prove regression."})
         rows = _compare_gateway_attribution(report, baseline, name, not target_reasons, target, old_target or {})
+        current_access = next((check for check in report.checks if check.id == "gateway_access"
+                               and check.target == name and check.required), None)
+        access_reasons = list(identity_reasons)
+        if current_access and "gateway_access" in config.get("checks", []):
+            old_access = next((check for check in baseline.checks if check.id == "gateway_access"
+                               and check.target == name and check.required), None)
+            try:
+                access_settings = GatewayAccess.model_validate(config.get("gateway_access"))
+            except ValidationError:
+                access_settings = None
+            try:
+                old_access_settings = GatewayAccess.model_validate(old_config.get("gateway_access"))
+            except ValidationError:
+                old_access_settings = None
+            # Access sends its own fixed probes. Shared timing, fixture settings and
+            # limits only matter to Access when they leave a case without evidence.
+            if not all(is_supported_schema(run.schema_version) for run in (report, baseline)):
+                access_reasons.append("Report schema versions differ.")
+            elif any(type(version) is not int or version != 2
+                     for version in (config.get("config_version", 2), old_config.get("config_version", 2))):
+                access_reasons.append("Recorded configuration has an unsupported config_version.")
+            elif not isinstance(old_checks := old_config.get("checks"), list) or "gateway_access" not in old_checks:
+                access_reasons.append("The baseline did not record a gateway access check.")
+            elif (access_settings is None or old_access_settings is None
+                  or access_settings.model_dump(exclude={"auth_header"}) != old_access_settings.model_dump(exclude={"auth_header"})
+                  or (access_settings.auth_header or "").lower() != (old_access_settings.auth_header or "").lower()):
+                access_reasons.append("Gateway access settings differ or are missing.")
+            elif not access_reasons:
+                uses_tls = any(isinstance(url, str) and url.lower().startswith("https://")
+                               for url in (target["url"], config.get("proxy")))
+                if (config.get("proxy") != old_config.get("proxy")
+                        or (uses_tls and config.get("ca_bundle") != old_config.get("ca_bundle"))):
+                    access_reasons.append("Gateway access transport settings differ.")
+                else:
+                    source = report.manifest.get("gateway_access_source_sha256")
+                    old_source = baseline.manifest.get("gateway_access_source_sha256")
+                    if not source or not old_source:
+                        # Earlier access reports attested the probe source in the raw workload hash.
+                        source, old_source = (
+                            pack.get("workload_fixture_sha256") if isinstance(pack, dict) else None
+                            for pack in (report.manifest.get("fixture_pack"), baseline.manifest.get("fixture_pack")))
+                    if not isinstance(source, str) or not source or source != old_source:
+                        access_reasons.append("Gateway access source identity differs or is missing. Rerun the access check and baseline.")
+            if access_settings is not None:
+                rows.extend(_compare_gateway_access(current_access, old_access,
+                                                    [case.model_dump() for case in access_settings.cases],
+                                                    " ".join(access_reasons),
+                                                    current_refs=target.get("test_identities"),
+                                                    old_refs=(old_target or {}).get("test_identities")))
         for current_check in report.checks:
             if current_check.id != "gateway_policy" or current_check.target != name or not current_check.required:
                 continue
@@ -2603,31 +2847,35 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                            and check.id in config.get("checks", []) and check.id in request_paths}
         covered = {row["check"] for row in assessed
                    if row["metric"] in verdict_metrics.get(row["check"], {row["metric"]})}
+        if current_access and (current_access.status != "pass"
+                               or current_access.metrics.get("gateway_access", {}).get("coverage_complete") is not True):
+            covered.discard("gateway_access")
         if any(row["status"] in {"pass", "fail"} for row in (traffic or {}).get("stages", [])):
             covered.add("capacity")
         if any(row["status"] in {"pass", "fail"} for row in (load_tests or {}).get("points", [])):
             covered.add("load")
-        for check in ("gateway_attribution", "gateway_policy"):
-            if any(row["check"] == check and row["status"] == "inconclusive" for row in rows):
-                covered.discard(check)
+        covered.difference_update(row["check"] for row in rows
+                                  if row["check"] in SHARED_BASELINE_EXCLUDED_WORKLOADS
+                                  and row["status"] == "inconclusive")
         missing_checks = sorted(selected_checks - covered)
         traffic_failures = [row for row in (traffic or {}).get("stages", []) if row["status"] == "fail"]
         load_failures = [row for row in (load_tests or {}).get("points", []) if row["status"] == "fail"]
         point_count = sum(row["status"] in {"pass", "fail"}
                           for row in (traffic or {}).get("stages", []) + (load_tests or {}).get("points", []))
+        verdict_reasons = access_reasons if access_only and current_access else target_reasons
         if failures or traffic_failures or load_failures:
             status = "fail"
             summary = (f"{len(failures)} material metric regression(s) and "
                        f"{len(traffic_failures)} lost acceptable traffic rate(s) against {baseline.run_id}.")
             if load_failures:
                 summary += f" {len(load_failures)} previously acceptable tested load(s) now fail."
-            if target_reasons:
-                summary += " Other scenarios could not be compared: " + " ".join(target_reasons)
-        elif target_reasons:
+            if verdict_reasons:
+                summary += " Other scenarios could not be compared: " + " ".join(verdict_reasons)
+        elif verdict_reasons:
             status = "inconclusive"
             prefix = ("Nothing comparable between the runs. " if not assessed and not point_count
                       else "Baseline comparison is inconclusive: ")
-            summary = prefix + " ".join(target_reasons)
+            summary = prefix + " ".join(verdict_reasons)
             if missing_checks:
                 summary += " No comparable verdict metric for selected check(s): " + ", ".join(missing_checks) + "."
         elif missing_checks:
@@ -2658,14 +2906,14 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
             summary += " " + load_tests["reason"]
         if excluded:
             summary += f" {excluded} metric(s) not comparable (low samples, undefined values or uncertain attribution); see comparison details."
-        if status == "inconclusive" and set(missing_checks) - {"gateway_attribution"}:
+        if status == "inconclusive" and set(missing_checks) - {"gateway_access", "gateway_attribution"}:
             summary += (f" To conclude, collect at least {minimum} measured samples per metric in both the current and baseline runs,"
                         " using the same workload and settings; rerun longer if variation remains uncertain.")
-        entry = {"target": name, "status": status, "summary": summary, "reasons": target_reasons,
+        entry = {"target": name, "status": status, "summary": summary, "reasons": verdict_reasons,
                  "load_exclusions": load_exclusions,
                  "observed_outputs": observed_outputs,
                  "reason_details": [target_details.get(text, {"code": "comparison_unavailable", "text": text})
-                                    for text in target_reasons],
+                                    for text in verdict_reasons],
                  "client_delayed_runs": saturated_runs,
                  "generator_saturated_runs": saturated_runs,
                  "identity_changes": identity_changes, "configuration_diff": configuration_diff,
@@ -3107,6 +3355,13 @@ def _traffic_table(check: CheckResult) -> str:
     return "".join(parts)
 
 
+def _gateway_access_html(data: dict[str, Any]) -> str:
+    rows = ''.join('<tr>' + ''.join(f'<td>{_e(row.get(key) if row.get(key) is not None else "—")}</td>'
+                   for key in ("name", "identity", "expected", "observed", "http_status", "status", "reason"))
+                   + '</tr>' for row in data.get("cases", []))
+    return ('<h3>Declared access cases</h3><div class="table-wrap"><table><thead><tr>'
+            '<th>Case</th><th>Identity</th><th>Expected</th><th>Observed</th><th>HTTP</th><th>Outcome</th><th>Evidence</th>'
+            '</tr></thead><tbody>' + rows + '</tbody></table></div><p>' + _e(data.get("qualification", "")) + '</p>')
 def _multi_user_scenario_export(window: dict[str, Any]) -> dict[str, Any]:
     result = {}
     if evidence := window.get("recovery"):
@@ -3901,6 +4156,8 @@ def _render(report: RunReport) -> str:
             metrics = _concurrent_load_html(check.metrics) + metrics
         if check.id == "multi_user" and check.metrics.get("multi_user"):
             metrics = _multi_user_html(check.metrics["multi_user"], anchors) + metrics
+        if check.id == "gateway_access" and check.metrics.get("gateway_access"):
+            metrics = _gateway_access_html(check.metrics["gateway_access"]) + metrics
         if check.id == "gateway_policy" and check.metrics.get("gateway_policy"):
             metrics = _gateway_policy_html(check.metrics["gateway_policy"]) + metrics
         if check.id == "sessions" and check.metrics.get("conversation_performance"):
@@ -4252,6 +4509,10 @@ def reproduction_export(report: RunReport) -> dict:
             "invocation": safe_invocation(retained.manifest.get("invocation")),
             "config": retained.manifest.get("config", {}),
             "fixture_pack": retained.manifest.get("fixture_pack", {}),
+            **({"gateway_access": {check.target: check.metrics["gateway_access"]
+                                   for check in retained.checks
+                                   if check.id == "gateway_access" and check.metrics.get("gateway_access")}}
+               if any(check.id == "gateway_access" and check.metrics.get("gateway_access") for check in retained.checks) else {}),
             **({"gateway_policy": {check.target: check.metrics["gateway_policy"] for check in retained.checks
                                    if check.id == "gateway_policy" and check.metrics.get("gateway_policy")}}
                if any(check.id == "gateway_policy" for check in retained.checks) else {}),

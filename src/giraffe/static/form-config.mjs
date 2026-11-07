@@ -639,6 +639,71 @@ export function configureProfiles(source, values, defaults, {allowInvalid=false,
   return config;
 }
 
+function validIdentityReferences(value) {
+  const isObject=value=>value&&typeof value==='object'&&!Array.isArray(value);
+  if(!isObject(value))return false;
+  const matches=(value,pattern)=>typeof value==='string'&&value===value.trim()&&pattern.test(value);
+  const envReference=/^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
+  const reservedHeaders=['host','content-length','content-type','transfer-encoding','connection','accept','accept-encoding','expect','upgrade'];
+  const identities=Object.entries(value);
+  return identities.length<=32&&identities.every(([alias,identity])=>{
+    if(!matches(alias,/^[A-Za-z][A-Za-z0-9_-]{0,63}$/)||!isObject(identity)||
+      Object.keys(identity).some(key=>!['api_key_env','headers_env'].includes(key)))return false;
+    const {api_key_env:apiKey,headers_env:headers={}}=identity;
+    if((apiKey!=null&&apiKey!==''&&!matches(apiKey,envReference))||!isObject(headers))return false;
+    const names=Object.keys(headers).map(name=>name.toLowerCase());
+    return names.length<=16&&new Set(names).size===names.length&&!(apiKey&&names.includes('authorization'))&&
+      !names.some(name=>reservedHeaders.includes(name))&&Object.entries(headers).every(([name,ref])=>
+        matches(name,/^[A-Za-z][A-Za-z0-9-]{0,63}$/)&&matches(ref,envReference));
+  });
+}
+
+export function configureGatewayAccess(source, values, {allowInvalid=false,draft=null}={}) {
+  const config=structuredClone(source),selected=config.checks?.includes('gateway_access');
+  if(!selected)config.gateway_access=null;
+  if(!values.has('gateway_access_rendered'))return config;
+  if(draft||selected){
+    const raw=Object.fromEntries(['profile','cases','auth_header','request_timeout_seconds','max_output_tokens']
+      .map(key=>[key,String(values.get('gateway_access_'+key) || '')]));
+    if(draft){
+      // Only the selected validation path promotes raw Access fields into the payload.
+      draft.settings=raw;
+      config.gateway_access=null;
+    }else{
+      let cases;
+      try{
+        cases=raw.cases.split('\n').map(line=>line.trim()).filter(Boolean).map(line=>{
+          const parts=line.split(/\s+/);
+          if(parts.length!==3||!['allow','deny'].includes(parts[2]))throw new Error('Enter a case name, identity alias and allow or deny on each line.');
+          return {name:parts[0],identity:parts[1],expected:parts[2]};
+        });
+      }catch(error){
+        if(!allowInvalid)throw error;
+        cases=raw.cases;
+      }
+      config.gateway_access={profile:raw.profile||'unknown',cases,auth_header:raw.auth_header.trim()||null,
+        request_timeout_seconds:Number(raw.request_timeout_seconds),max_output_tokens:Number(raw.max_output_tokens)};
+    }
+  }
+  config.targets.forEach((target,index)=>{
+    const key='gateway_access_identities_'+index;
+    if(!values.has(key))return;
+    const text=String(values.get(key)||'{}');
+    try{
+      const value=JSON.parse(text);
+      if(!validIdentityReferences(value))throw new Error();
+      target.test_identities=value;
+    }
+    catch{
+      if(selected&&!allowInvalid)throw new Error('Environment references must be an object mapping identity aliases to api_key_env and headers_env.');
+      if(draft)(draft.identities ||= {})[index]=text;
+      else if(selected){target.test_identities=text;return;}
+      if(!validIdentityReferences(target.test_identities))delete target.test_identities;
+    }
+  });
+  return config;
+}
+
 // HTML has no exclusive min attribute. Apply the same schema rule to positive
 // numeric fields and array entries before preview/validation makes an API call.
 export function positiveBoundErrors(config, limits={}, explanations={}) {

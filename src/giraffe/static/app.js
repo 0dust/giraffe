@@ -1,4 +1,4 @@
-import {positiveBoundErrors, inferSetupPreset, configureLoadTest, loadTestIssues, loadTestSettings, loadFieldName, convertExpectedAnswer, datasetCaseFromValues, changeDatasetScorer, configureJudging, configureSessions, configureMultiUser, multiUserSettings, configureGatewayPolicy, gatewayPolicySettings, configureProfiles, parseLogprobSettings, parseToolFixtures, effectiveProfileDefaults, configureTests, configureRunLimits, limitValue, optionDefault, optionValue, sameConfig} from './form-config.mjs?v=20261028-results-merge-ci';
+import {configureGatewayAccess, configureGatewayPolicy, gatewayPolicySettings, positiveBoundErrors, inferSetupPreset, configureLoadTest, loadTestIssues, loadTestSettings, loadFieldName, convertExpectedAnswer, datasetCaseFromValues, changeDatasetScorer, configureJudging, configureSessions, configureMultiUser, multiUserSettings, configureProfiles, parseLogprobSettings, parseToolFixtures, effectiveProfileDefaults, configureTests, configureRunLimits, limitValue, optionDefault, optionValue, sameConfig} from './form-config.mjs?v=20261028-results-merge-ci';
 
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
@@ -524,7 +524,7 @@ function renderFlightPlan(plan) {
   const rows=(plan.rows || []).filter(r=>r.requests_per_target!==0),max=Math.max(1,...rows.map(r=>r.requests_per_target || 0));
   return `<div class="flight-plan"><div class="viz-heading"><h3>Flight plan</h3><span class="hint">Per endpoint</span></div>${rows.map(r=>`<div class="flight-row"><div><span>${escape(checkGuide[r.id]?catalogTitle(r.id):r.title)}</span><span class="mono">${r.target_request_counts?escape(planTargetCounts(r.target_request_counts)):r.requests_per_target==null?(r.kind==='duration'?'Duration-based':'Adaptive'):`${r.kind==='estimate'?'~':''}${number(r.requests_per_target)}`}</span></div><div class="flight-track ${r.requests_per_target==null?'adaptive':''}">${r.requests_per_target==null?'':`<span style="width:${r.requests_per_target/max*100}%"></span>`}</div></div>`).join('')}</div>`;
 }
-const phaseNames={"initial":"First request","readiness":"Readiness","warm":"Warm-up","short":"Short requests","long":"Long requests","generation":"Generation speed","context":"Long-context recall","correctness":"Answer correctness","json":"Structured JSON","sustained":"Sustained load","recovery":"Recovery check","recovery_baseline":"Recovery baseline","recovery_prime":"Recovery preparation","limits":"Output limits","stop_control":"Stop-sequence baseline","client_cancel":"Client cancellation","client_deadline":"Client deadline","backend_cancel":"Server cancellation","backend_cancel_control":"Server cancellation baseline","backend_cancel_followup":"Server cancellation follow-up","cancellation_probe":"Cancellation probes","cancellation_baseline":"Cancellation baseline","fairness":"Mixed long/short fairness","fairness_baseline":"Short requests alone","fairness_short":"Short requests with competing load","fairness_long":"Competing long requests","pack_control":"Quiet baseline","pack_loaded":"Your questions under load","request_pack":"Your questions","arrival":"Scheduled arrivals","mixed_control":"Short-request baseline","prefix_shared":"Shared prefix","prefix_independent":"Independent prefixes","prefix_history":"Growing conversation history","consistency":"Repeated-request consistency","judging":"AI evaluation","connection":"Connection","deadline_probe":"Client deadline","gateway_attribution":"Gateway usage attribution"};
+const phaseNames={"gateway_access":"Gateway access policy","initial":"First request","readiness":"Readiness","warm":"Warm-up","short":"Short requests","long":"Long requests","generation":"Generation speed","context":"Long-context recall","correctness":"Answer correctness","json":"Structured JSON","sustained":"Sustained load","recovery":"Recovery check","recovery_baseline":"Recovery baseline","recovery_prime":"Recovery preparation","limits":"Output limits","stop_control":"Stop-sequence baseline","client_cancel":"Client cancellation","client_deadline":"Client deadline","backend_cancel":"Server cancellation","backend_cancel_control":"Server cancellation baseline","backend_cancel_followup":"Server cancellation follow-up","cancellation_probe":"Cancellation probes","cancellation_baseline":"Cancellation baseline","fairness":"Mixed long/short fairness","fairness_baseline":"Short requests alone","fairness_short":"Short requests with competing load","fairness_long":"Competing long requests","pack_control":"Quiet baseline","pack_loaded":"Your questions under load","request_pack":"Your questions","arrival":"Scheduled arrivals","mixed_control":"Short-request baseline","prefix_shared":"Shared prefix","prefix_independent":"Independent prefixes","prefix_history":"Growing conversation history","consistency":"Repeated-request consistency","judging":"AI evaluation","connection":"Connection","deadline_probe":"Client deadline","gateway_attribution":"Gateway usage attribution"};
 const phasePurposes={"concurrency":"Measures response quality, timing and evidenced concurrency for each duration-based test point.","access":"Checks that the server is reachable and can answer a request.","serving":"Checks that the server returns valid answers reliably.","generation":"Measures how quickly the server generates an answer.","context":"Checks whether the model can recall facts from a long input.","correctness":"Checks answers against the expected answers for different questions.","json":"Checks whether answers follow the required JSON structure.","recovery":"Checks whether normal answers return after sustained heavy traffic.","cancellation":"Checks request limits, cancellation, and the server's ability to keep serving afterwards.","fairness":"Checks whether competing long requests delay short answers.","mixed":"Checks whether a heavy partner delays a short request before or during its answer.","prefix":"Compares serving behavior when requests share an input prefix or use independent prefixes.","arrivals":"Checks whether the server keeps up with requests sent on a fixed schedule.","capacity":"Measures how many requests the server can handle at the configured arrival rate.","buckets":"Checks serving speed and reliability for this input size, output cap, and number of simultaneous requests.","token_stress":"Checks serving behavior with a large input or a long generated answer under load.","consistency":"Checks whether repeated copies of each prompt produce consistent answers under load.","sessions":"Checks whether answers stay correct as conversation history grows across turns.","tools":"Checks whether the model selects tools and uses their results correctly.","judging":"Asks an AI evaluator to check a recorded answer against its expected answer."};
 const phaseChecks={"initial":"access","readiness":"access","warm":"serving","short":"serving","long":"serving","generation":"generation","context":"context","correctness":"correctness","json":"json","sustained":"recovery","recovery":"recovery","recovery_baseline":"recovery","recovery_prime":"recovery","limits":"cancellation","stop_control":"cancellation","client_cancel":"cancellation","client_deadline":"cancellation","backend_cancel":"cancellation","backend_cancel_control":"cancellation","backend_cancel_followup":"cancellation","cancellation_probe":"cancellation","cancellation_baseline":"cancellation","fairness":"fairness","fairness_baseline":"fairness","fairness_short":"fairness","fairness_long":"fairness","pack_control":"correctness","pack_loaded":"correctness","request_pack":"correctness","arrival":"arrivals","mixed_control":"mixed","prefix_shared":"prefix","prefix_independent":"prefix","prefix_history":"prefix","consistency":"consistency","judging":"judging","connection":"access","deadline_probe":"cancellation"};
 const plainName=value=>String(value).replaceAll('_',' ').replaceAll('-',' ').toLowerCase().replace(/^./,c=>c.toUpperCase());
@@ -1130,6 +1130,9 @@ function infoHelp(name,label,help,details='') {
   return `<button type="button" class="field-info" id="${escape(id)}-info" popovertarget="${escape(id)}-help" aria-label="About ${escape(label)}" aria-describedby="${escape(id)}-help-text"><span aria-hidden="true">i</span></button><div id="${escape(id)}-help" class="field-help" popover="auto" data-help-for="${escape(id)}-info" role="note"><strong>${escape(label)}</strong><p id="${escape(id)}-help-text">${escape(help)}</p>${details}</div>`;
 }
 function settingDestination(path) {
+  if(path==='gateway_access'||path.startsWith('gateway_access.'))return {step:2,check:'gateway_access',name:'gateway_access_'+(path==='gateway_access'||path.startsWith('gateway_access.cases')?'cases':path.slice(15)),label:'Gateway access policy'};
+  const gatewayIdentity=/^targets\.(\d+)\.test_identities(?:\.|$)/.exec(path);
+  if(gatewayIdentity&&state.config?.checks?.includes('gateway_access'))return {step:2,check:'gateway_access',name:'gateway_access_identities_'+gatewayIdentity[1],label:'Environment references'};
   const parts=String(path).split('.'),root=parts[0];
   if(parts[1]==='levels')parts.splice(2);
   let name=path,check=null,step=2;
@@ -1343,6 +1346,8 @@ function loadSettingPath(name) {
   const path=paths.find(path=>loadFieldName(path)===name);return path?'load_test.'+path:name;
 }
 function settingPath(name) {
+  if(name.startsWith('gateway_access_identities_'))return 'targets.'+name.slice(26)+'.test_identities';
+  if(name.startsWith('gateway_access_'))return 'gateway_access.'+name.slice(15);
   const check=state.bootstrap?.checks?.find(check=>name.startsWith(`test_${check.id}_`));
   if(check)return `test_options.${check.id}.${name.slice(check.id.length+6).replace(/^limit_/,'limits.')}`;
   if(name.startsWith('load_'))return loadSettingPath(name);
@@ -1404,9 +1409,10 @@ const checkGroups=[
   {id:'answers',title:'Answers',blurb:'Is the output right?',checks:['access','serving','correctness','json','context','tools']},
   {id:'speed',title:'Speed & load',blurb:'How fast, and under how much load?',checks:['first_output','generation','load','multi_user']},
   {id:'reliability',title:'Reliability',blurb:'Does it hold up over time?',checks:['recovery','sessions','consistency']},
-  {id:'server',title:'Diagnostics',blurb:'Evidence from the server itself.',checks:['cancellation','prefix','gpu','gateway_attribution','gateway_policy']},
+  {id:'server',title:'Diagnostics',blurb:'Evidence from the server itself.',checks:['cancellation','prefix','gpu','gateway_access','gateway_attribution','gateway_policy']},
 ];
 const checkGuide={
+  gateway_access:{name:'Gateway access policy',purpose:'Check declared allow and deny behavior for existing test identities.',sends:'One bounded chat-completion request per case, using environment references.',shows:'Expected and observed decisions; incomplete or unsupported evidence remains unverified.',needs:'LiteLLM endpoint and existing test identities'},
   gateway_policy:{name:'Gateway quotas & priorities',purpose:'Exercise a declared admission policy for separate test identities.',sends:'Bounded identical requests per identity through LiteLLM; no gateway configuration changes.',shows:'Affected-user rejections, continued peer service, actual work and evidence qualifications.'},
   gateway_attribution:{name:'Gateway usage attribution',purpose:'Compare each test identity’s final usage with gateway request logs.',sends:'Bounded marked requests using selected identities, followed by read-only evidence requests.',shows:'Matched, mismatched or unverified identity and token counts. Missing evidence stays inconclusive.',needs:'LiteLLM spend logs and identity environment-variable references'},
   multi_user:{name:'Multi-user',purpose:'See which users become slow or fail while sharing one endpoint.',sends:'Repeated user work, matched noisy neighbors or selected-user cancellation; all share the request limits.',shows:'Per-user delivery and qualified interference or cancellation observations.'},
@@ -1442,6 +1448,7 @@ function renderProfileEditor(check,config) {
   }
   if(key==='load')return renderLoadEditor(config);
   if(key==='multi_user')return renderMultiUserEditor(config);
+  if(key==='gateway_access')return renderGatewayAccessEditor(config);
   if(key==='gateway_policy')return renderGatewayPolicyEditor(config);
   if(key==='sessions')return `<input type="hidden" name="profile_edits_sessions" value="[]">${renderSessionEditor(config)}<button type="button" class="text-button reset-profile" data-action="reset-profile" data-profile="sessions">Reset this profile</button>`;
   if(key==='tools'){
@@ -1888,6 +1895,24 @@ function renderConcurrentResults(metrics) {
   }).join('');
 }
 
+function gatewayAccessCaseLines(cases) {
+  return typeof cases==='string'?cases:(cases||[]).map(row=>`${row.name} ${row.identity} ${row.expected}`).join('\n');
+}
+function omitInactiveGatewayAccess(config,draft) {
+  if(config.checks?.includes('gateway_access')||config.gateway_access==null)return config;
+  draft.settings ??= {...config.gateway_access,cases:gatewayAccessCaseLines(config.gateway_access.cases)};
+  return {...config,gateway_access:null};
+}
+function renderGatewayAccessEditor(config) {
+  const draft=state.gatewayAccessDraft || {};
+  const s={profile:'unknown',cases:[],request_timeout_seconds:10,max_output_tokens:16,...config.gateway_access,...draft.settings};
+  const cases=gatewayAccessCaseLines(s.cases);
+  const identityText=(target,index)=>draft.identities?.[index] ?? (typeof target.test_identities==='string'?target.test_identities:JSON.stringify(target.test_identities||{},null,2));
+  return `<div data-gateway-access-settings><input type="hidden" name="gateway_access_rendered" value="1"><p>Uses each configured endpoint and model. Supply both an allowed and a denied case; only these declared cases are verified.</p>${selectField('gateway_access_profile','Gateway profile',[...new Set(['unknown','litellm',s.profile])].map(value=>`<option value="${escape(value)}" ${s.profile===value?'selected':''}>${escape(value==='litellm'?'LiteLLM':value==='unknown'?'Not configured':value+' (unsupported)')}</option>`).join(''))}${field('gateway_access_auth_header','LiteLLM custom key header (optional)',s.auth_header??'',{hint:'Use the header name configured on LiteLLM. Leave blank for the default key headers.'})}${textField('gateway_access_cases','Declared cases',cases,{hint:'One line: case name, identity alias, allow or deny. Example: valid allowed allow. Maximum 16 cases.'})}<div class="fields">${field('gateway_access_request_timeout_seconds','Timeout per case (seconds)',s.request_timeout_seconds,{type:'number',step:'any',required:true})}${field('gateway_access_max_output_tokens','Output cap per case (tokens)',s.max_output_tokens,{type:'number',step:1,required:true})}</div>${config.targets.map((target,index)=>textField('gateway_access_identities_'+index,'Environment references · '+target.name,identityText(target,index),{hint:'Existing test identities only. Example: {"allowed":{"api_key_env":"ALLOW_KEY"},"denied":{"api_key_env":"DENY_KEY"}}. Optional headers_env maps header names to environment variable names. Never paste key values. An empty identity object explicitly sends no authentication.'})).join('')}<p class="hint">No keys or permissions are changed. Network failures and unsupported gateway responses cannot confirm a denial. These fixtures do not certify tenant isolation.</p></div>`;
+}
+function renderGatewayAccessResults(value) {
+  return `<section class="gateway-access-results"><h3>Declared access cases</h3><div class="metric-table"><table><thead><tr><th>Case / identity</th><th>Expected</th><th>Observed</th><th>HTTP</th><th>Outcome</th></tr></thead><tbody>${(value.cases||[]).map(row=>`<tr><td>${escape(row.name)}<small>${escape(row.identity)}</small></td><td>${escape(row.expected)}</td><td>${escape(row.observed)}</td><td>${escape(row.http_status??'—')}</td><td>${badge(row.status)}<small>${escape(human(row.reason))}</small></td></tr>`).join('')}</tbody></table></div><p class="hint">${escape(value.qualification)}</p></section>`;
+}
 function renderGatewayPolicyEditor(config) {
   const s=gatewayPolicySettings(config),numberField=(name,label,required=true)=>field('gateway_policy_'+name,label,s[name],{type:'number',step:'any',required});
   const modes=[['key_rpm','Per-key RPM quota'],['priority_rpm','Dynamic RPM priority reservation']];
@@ -2927,7 +2952,7 @@ function renderNew(preset=inferSetupPreset(state.config,{limits:state.bootstrap?
   if(state.jsonDraft===null){state.jsonDraft=JSON.stringify(portableConfig(readForm(true)),null,2);state.jsonBase=state.jsonDraft;$('#config-editor').value=state.jsonDraft;}
   syncTestControls();updateBounds();updateRestart();syncConfigView();syncPackControls();renderRequestPreview();syncSetupStep();renderModelDiscovery();watchPlanViewport();scheduleTokenizerSelection({immediate:true});renderTokenizerSelection();
 }
-function readForm(allowEmpty=false) {
+function readForm(allowEmpty=false,{gatewayAccessDraft=null}={}) {
   const form=$('#new-run-form'),data=new FormData(form);let config=clone(state.config);
   // Disabled editors still retain their values when a test is unchecked.
   for(const input of form.querySelectorAll('[data-test-editor] input, [data-test-editor] select, [data-test-editor] textarea')){if(input.type==='radio'&&!input.checked)continue;data.set(input.name,input.type==='checkbox'?(input.checked?'on':'off'):input.value);}
@@ -2952,6 +2977,7 @@ function readForm(allowEmpty=false) {
   config=configureProfiles(config,data,state.bootstrap.profile_defaults || {},{allowInvalid:allowEmpty,limits:state.bootstrap.limits});
   config=configureSessions(config,data,state.bootstrap.session_workloads.defaults,{allowInvalid:allowEmpty});
   config=configureMultiUser(config,data,state.bootstrap.multi_user?.defaults,{allowInvalid:allowEmpty});
+  config=configureGatewayAccess(config,data,{allowInvalid:allowEmpty,draft:gatewayAccessDraft});
   config=configureGatewayPolicy(config,data,{allowInvalid:allowEmpty});
   config.restart_target=null;
   return {config,baseline_id:data.get('baseline_id') || null,mode:data.get('mode') || 'normal',restart_target:data.get('mode')==='cold-start'?data.get('restart_target'):null};
@@ -2999,7 +3025,7 @@ async function startRun(event) {
   try {
     assertAppliedConfig();
     if(!validateRunForm(event.target))return;
-    const draft=readForm(true).config;
+    const gatewayAccessDraft={},draft=readForm(true,{gatewayAccessDraft}).config;
     if(draft.request_source==='request_pack'&&draft.checks.some(id=>['correctness','load'].includes(id))){
       if(!draft.request_pack?.cases?.length){revealQuestionEditor(draft);$('[data-action="add-example"]').focus();throw new Error('Add a question or choose built-in examples before testing.');}
       if(draft.request_pack.cases.some(item=>item.scorer==='judge')&&!judgesReady(draft)){revealSetupStep(2);configureEvaluator();throw new Error('Set up the AI evaluator to check questions that accept paraphrased answers.');}
@@ -3014,6 +3040,7 @@ async function startRun(event) {
     if(version!==state.routeVersion)return;
     $('#start-run').textContent='Checking input preparation…';
     const result=await api('/api/runs',{method:'POST',body:JSON.stringify({...payload,migration_notes:[...(state.migrationNotes || [])],api_keys:sessionAPIKeys(payload.config)})});state.config=clone(payload.config);state.config.targets[0].tokenizer=draft.targets[0].tokenizer;
+    state.gatewayAccessDraft=gatewayAccessDraft;
     if(draft.request_source==='request_pack'&&!draft.request_pack&&!draft.checks.some(id=>['correctness','load'].includes(id)))state.config.request_source=draft.request_source;
     setActive(result.id);if(version===state.routeVersion)location.hash=linkRun(result.id);
   }catch(error){if(version!==state.routeVersion){toast(`Run was not started: ${error.message}`);return;}focusFirstSettingError(error);const errorEl=$('#form-error');errorEl.textContent=error.message;errorEl.hidden=false;if($('#start-run')){$('#start-run').disabled=true;$('#start-run').innerHTML=`Launch ${icon('arrow')}`;}}finally{state.submitting=false;const button=$('#start-run');if(button)button.disabled=!canStartRun();}
@@ -3106,7 +3133,7 @@ function resultGuidance(report) {
 // Report navigation is scoped to this visit. Polls never override an explicit tab choice.
 let reportView={id:null,tab:null,explicit:false,wasLive:false,terminalSwitch:false,performance:null,target:null,window:null,error:'',pending:false,sequence:0,lastFetch:0};
 const reportSections=[['overview','Performance overview',null],['timing','Request timing',null],['throughput','Throughput & capacity','throughput_capacity'],['delivery','Load delivery','delivery'],['outcomes','Outcomes & quality','outcomes'],['tokens','Workload & tokens','token_accounting'],['effects','Conversations & workload effects','conversations'],['server','Server observations','server'],['baseline','Baseline comparison','baseline']];
-const comparisonSections=[['answers','Answers & correctness'],['timing','Response timing'],['delivery','Request completion'],['gateway-attribution-outcomes','Gateway attribution outcomes']];
+const comparisonSections=[['answers','Answers & correctness'],['timing','Response timing'],['delivery','Request completion'],['gateway-access-decisions','Gateway access decisions'],['gateway-attribution-outcomes','Gateway attribution outcomes']];
 const reportResultSections=[['comparison','Baseline comparison'],['acceptance','Pass / fail','comparison'],['load-acceptance','Tested load acceptance','comparison'],...comparisonSections.map(([id,label])=>[id,label,'comparison']),['checks','Checks & evidence'],['configuration','Run configuration'],['requests','All requests'],['resources','Peak memory (RAM)']];
 function reportRoute(hash=typeof location==='undefined'?'':location.hash) {
   const request=hash.match(/^#runs\/([^/]+)\/requests\/([^/]+)$/);
@@ -3759,6 +3786,10 @@ function renderCheck(check,report) {
     const points=Object.values(m.load_types).flatMap(group=>group.points || []),sum=key=>points.reduce((total,point)=>total+(point[key] || 0),0);
     metrics.push(metric('Test points',number(points.length),counted(Object.keys(m.load_types).length,'load type')));
     metrics.push(metric('Requests completed / sent',`${number(sum('completed'))} / ${number(sum('sent'))}`,`${number(sum('failed'))} failed · ${number(sum('timed_out'))} timed out · includes drain`));
+  }else if(check.id==='gateway_access'){
+    const cases=m.gateway_access?.cases || [];
+    metrics.push(metric('Cases matched',`${cases.filter(row=>row.status==='pass').length} / ${cases.length}`,'Only declared allow and deny cases'));
+    metrics.push(metric('Unverified cases',number(cases.filter(row=>row.observed==='unverified').length),'Missing or unsupported evidence cannot confirm a decision'));
   }else if(check.id==='gateway_attribution'){
     metrics.push(metric('Attribution evidence',human(m.state || 'unverified'),'Only complete, correlated request evidence can verify attribution'));
     metrics.push(metric('Matched / observed requests',`${number(m.matched_requests || 0)} / ${number(m.observed_requests || 0)}`));
@@ -3799,9 +3830,9 @@ function renderCheck(check,report) {
   ${check.id==='cancellation'?`<div class="notice" style="margin:20px 24px 0">${escape(m.backend_cancellation?.summary || 'Backend cancellation was not verified.')} Physical device memory reclamation is not measured.</div>`:''}
   ${check.id==='recovery'?`<div class="notice" style="margin:20px 24px 0">Sustained traffic was configured for ${number(config.sustained_seconds,1)} seconds. Results describe this bounded observation period.</div>`:''}
   ${m.logprobs?renderLogprobResults(m.logprobs):''}
+  ${check.id==='gateway_access'&&m.gateway_access?renderGatewayAccessResults(m.gateway_access):''}${check.id==='multi_user'&&m.multi_user?renderMultiUserResults(m.multi_user):''}${check.id==='sessions'&&m.conversation_performance?renderSessionResults(m.conversation_performance):''}${check.id==='concurrency'?renderConcurrentResults(m):check.id==='load'?renderLoadTestResults(m):''}
   ${m.gateway_policy?renderGatewayPolicyResults(m.gateway_policy):''}
   ${check.id==='gateway_attribution'?renderGatewayAttributionResults(m):''}
-  ${check.id==='multi_user'&&m.multi_user?renderMultiUserResults(m.multi_user):''}${check.id==='sessions'&&m.conversation_performance?renderSessionResults(m.conversation_performance):''}${check.id==='concurrency'?renderConcurrentResults(m):check.id==='load'?renderLoadTestResults(m):''}
   ${m.request_pack?renderPackResults(m.request_pack):''}
   ${check.id==='capacity'&&m.traffic_stages?renderTrafficStages(m.traffic_stages,m.request_pack):''}
   ${check.id==='capacity'&&m.levels?`<div class="metric-table"><table><thead><tr><th>Load</th><th>Achieved</th><th>Correct</th><th>p95</th></tr></thead><tbody>${Object.entries(m.levels).map(([k,v])=>`<tr><td class="mono">${escape(k)}</td><td>${number(v.achieved_concurrency)}</td><td>${v.correct ?? 0} / ${v.scored ?? 0}</td><td class="mono">${ms(v.p95_ms)}</td></tr>`).join('')}</tbody></table></div>`:''}
@@ -3873,7 +3904,9 @@ function comparisonOutputs(target) {
   return rows;
 }
 function comparisonChange(row) {
-  if(row.metric==='attribution_outcome')return row.status==='inconclusive'?'Not comparable':row.current===row.baseline?'Same outcome':'Outcome changed';
+  if(row.metric==='attribution_outcome'||(row.metric==='policy_acceptance'&&row.check==='gateway_access')){
+    return row.status==='inconclusive'?'Not comparable':row.current===row.baseline?'Same outcome':'Outcome changed';
+  }
   if(row.metric==='policy_acceptance')return row.current===row.baseline?'Same qualification':'Qualification changed';
   if(row.current==null||row.baseline==null)return 'Not measured';
   const delta=row.current-row.baseline;
@@ -3889,7 +3922,7 @@ function comparisonMetricLabel(row) {
 function comparisonWarnings(row) {
   return row.warnings?.length?row.warnings.map(w=>w.message):row.status==='inconclusive'?[row.reason||'Insufficient evidence to interpret this change.']:[];
 }
-function comparisonCategory(row){if(row.metric==='attribution_outcome')return 'gateway-attribution-outcomes';return ['correctness_rate','output_tokens','output_chars'].includes(row.metric)?'answers':['valid_completion_rate','error_rate'].includes(row.metric)?'delivery':'timing';}
+function comparisonCategory(row){if(row.metric==='attribution_outcome')return 'gateway-attribution-outcomes';return row.check==='gateway_access'?'gateway-access-decisions':['correctness_rate','output_tokens','output_chars'].includes(row.metric)?'answers':['valid_completion_rate','error_rate'].includes(row.metric)?'delivery':'timing';}
 function comparisonWarningSummary(row) {
   const notes=[];
   for(const warning of row.warnings||[]){
@@ -4193,7 +4226,8 @@ async function startNewRun(){
   const version=state.routeVersion,revision=state.configRevision;
   if($('#new-run-form'))captureFormDraft();
   try{
-    const result=await api('/api/config/draft',{method:'POST',body:JSON.stringify(state.config || state.bootstrap.config)});
+    const config=omitInactiveGatewayAccess(state.config || state.bootstrap.config,state.gatewayAccessDraft ||= {});
+    const result=await api('/api/config/draft',{method:'POST',body:JSON.stringify(config)});
     if(version!==state.routeVersion||revision!==state.configRevision)return;
     state.config=result.config;replaceMigrationNotes(result.migration_notes);
   }catch(error){toast(error.message);return;}
@@ -4209,7 +4243,7 @@ async function rerun(){
     try{const result=await api('/api/config/draft',{method:'POST',body:JSON.stringify(source)});if(version!==state.routeVersion)return;source=result.config;notes=result.migration_notes;}
     catch(error){toast(error.message);return;}
   }
-  replaceMigrationNotes(notes);state.config=clone(source);state.autoModel=null;state.setupStep=1;invalidateModelDiscovery();state.datasetSelection=[];state.config.restart_target=null;state.formMode='normal';state.formRestartTarget=null;state.jsonDraft=null;state.jsonBase=null;state.configView='form';configChanged();state.prefillBaseline=state.detail.baseline_id || '';location.hash='#new';
+  replaceMigrationNotes(notes);state.config=clone(source);state.gatewayAccessDraft={};state.autoModel=null;state.setupStep=1;invalidateModelDiscovery();state.datasetSelection=[];state.config.restart_target=null;state.formMode='normal';state.formRestartTarget=null;state.jsonDraft=null;state.jsonBase=null;state.configView='form';configChanged();state.prefillBaseline=state.detail.baseline_id || '';location.hash='#new';
 }
 function portableConfig(payload) {return {...payload.config,restart_target:payload.mode==='cold-start'?payload.restart_target:null};}
 function hasJsonChanges() {return state.jsonDraft!==null&&state.jsonDraft!==state.jsonBase;}
@@ -4218,16 +4252,18 @@ function captureFormDraft() {
   const form=$('#new-run-form');if(!form)return;
   state.prefillBaseline=form.elements.baseline_id.value;
   state.formMode=form.elements.mode.value;state.formRestartTarget=form.elements.restart_target.value;
-  try{state.config=readForm(true).config;}catch{}
+  const gatewayAccessDraft={};
+  try{state.config=readForm(true,{gatewayAccessDraft}).config;state.gatewayAccessDraft=gatewayAccessDraft;}catch{}
 }
 async function restoreDraft() {
   try{
     const draft=JSON.parse(sessionStorage.getItem('giraffe-draft-v1'));
     const legacy=draft?.config?.config_version==null;
     if(draft&&draft.config?.targets?.length&&(legacy||sameConfig(draft.bootstrap,state.bootstrap.config))){
-      let config=draft.config,notes=[];
+      const gatewayAccessDraft=draft.gatewayAccessDraft || {};
+      let config=omitInactiveGatewayAccess(draft.config,gatewayAccessDraft),notes=[];
       if(legacy){const result=await api('/api/config/draft',{method:'POST',body:JSON.stringify(config)});config=result.config;notes=result.migration_notes || [];}
-      state.config=config;state.dismissedMigrationNotes=draft.dismissedMigrationNotes || [];
+      state.config=config;state.gatewayAccessDraft=gatewayAccessDraft;state.dismissedMigrationNotes=draft.dismissedMigrationNotes || [];
       state.migrationNotes=[...new Set([...(draft.migrationNotes || []),...state.dismissedMigrationNotes,...notes])];
     }else sessionStorage.removeItem('giraffe-draft-v1');
   }catch{}
@@ -4235,7 +4271,7 @@ async function restoreDraft() {
 function saveDraft() {
   if(!state.bootstrap||!state.config)return;
   captureFormDraft();
-  try{sessionStorage.setItem('giraffe-draft-v1',JSON.stringify({bootstrap:state.bootstrap.config,config:state.config,migrationNotes:state.migrationNotes,dismissedMigrationNotes:state.dismissedMigrationNotes}));}catch{}
+  try{sessionStorage.setItem('giraffe-draft-v1',JSON.stringify({bootstrap:state.bootstrap.config,config:state.config,gatewayAccessDraft:state.gatewayAccessDraft,migrationNotes:state.migrationNotes,dismissedMigrationNotes:state.dismissedMigrationNotes}));}catch{}
 }
 function syncConfigView() {
   const dirty=hasJsonChanges();
@@ -4284,7 +4320,7 @@ async function applyConfig(text=state.jsonDraft,{importing=false}={}) {
     if(version!==state.routeVersion||revision!==state.configRevision)return;
     captureFormDraft();
     replaceMigrationNotes(result.migration_notes);
-    state.config=result.config;state.autoModel=null;invalidateModelDiscovery();state.datasetSelection=[];
+    state.config=result.config;state.gatewayAccessDraft={};state.autoModel=null;invalidateModelDiscovery();state.datasetSelection=[];
     // An explicit restart target in imported/edited JSON remains visible and intentional.
     state.formMode=result.config.restart_target?'cold-start':'normal';state.formRestartTarget=result.config.restart_target;
     state.config.restart_target=null;

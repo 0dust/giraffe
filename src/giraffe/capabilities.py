@@ -62,6 +62,8 @@ CHECK_DETAILS = {
 }
 
 CHECK_DESCRIPTIONS["multi_user"] = "Persistent users, arrivals, bursts and recovery sharing the request limit."
+CHECK_DESCRIPTIONS["gateway_access"] = "Do the supplied gateway identities match declared allow and deny policies?"
+CHECK_DETAILS["gateway_access"] = "Opt-in LiteLLM chat-completion probes use explicit test identity references. Valid completions and recognized gateway authentication/model-access errors qualify allow/deny observations. Transport failures, unsupported errors and incomplete matrices remain unverified. No keys or permissions are changed; these cases do not certify tenant isolation."
 CHECK_DESCRIPTIONS["gateway_policy"] = "Does an explicitly declared quota or priority reservation reject one identity while peers continue?"
 CHECK_DETAILS["gateway_policy"] = "Opt-in LiteLLM key RPM and dynamic RPM reservation probes. Uses existing test identities, bounded request counts and an explicit policy window. Keeps rejected requests and peer outcomes. Missing provenance, actual work or overlap leaves priority unverified; timing differences never establish priority enforcement. Does not change gateway configuration."
 CHECK_DETAILS["multi_user"] = "Keeps each simulated user across repeated requests and population levels. Users pause without holding request slots. All users share the run budgets; per-user results use an explicit common measurement window, with warmup and late completions shown separately."

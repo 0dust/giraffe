@@ -41,6 +41,7 @@ CHECK_NAMES = {
     "prefix": "Prefix cache",
     "sessions": "Multi-turn sessions",
     "multi_user": "Multi-user",
+    "gateway_access": "Gateway access policy",
     "gateway_policy": "Gateway quotas & priorities",
     "gateway_attribution": "Gateway usage attribution",
     "consistency": "Answer consistency",
@@ -48,7 +49,7 @@ CHECK_NAMES = {
 }
 CATALOGUE_NAMES = INTERNAL_CHECK_NAMES = CHECK_NAMES
 # These checks compare their own declared workload and evidence.
-SHARED_BASELINE_EXCLUDED_WORKLOADS = frozenset({"gateway_attribution", "gateway_policy"})
+SHARED_BASELINE_EXCLUDED_WORKLOADS = frozenset({"gateway_access", "gateway_attribution", "gateway_policy"})
 CORE_CHECKS = ("access", "serving", "first_output", "generation", "load", "context",
                "correctness", "json", "cancellation", "recovery", "gpu")
 DEFAULT_CHECKS = ("access", "serving", "correctness", "first_output")
@@ -1442,6 +1443,26 @@ class Consistency(Model):
         return self
 
 
+class GatewayAccessCase(Model):
+    name: str = Field(pattern=r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
+    identity: str = Field(pattern=r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
+    expected: Literal["allow", "deny"]
+
+
+class GatewayAccess(Model):
+    profile: str = Field(default="unknown", pattern=r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
+    auth_header: str | None = Field(default=None, pattern=r"^[A-Za-z][A-Za-z0-9-]{0,63}$")
+    cases: list[GatewayAccessCase] = Field(default_factory=list, max_length=16)
+    request_timeout_seconds: float = Field(default=10, gt=0, le=60)
+    max_output_tokens: int = Field(default=16, ge=1, le=128)
+
+    @model_validator(mode="after")
+    def unique_cases(self):
+        if len({case.name for case in self.cases}) != len(self.cases):
+            raise ValueError("gateway access case names must be unique")
+        return self
+
+
 class TestIdentity(Model):
     """Explicit credential references; an empty identity is anonymous."""
 
@@ -2258,6 +2279,7 @@ class RunConfig(Model):
     _concurrency_warnings: list[dict[str, Any]] = PrivateAttr(default_factory=list)
     sessions: Sessions | None = None
     multi_user: MultiUser | None = None
+    gateway_access: GatewayAccess | None = None
     gateway_policy: GatewayPolicy | None = None
     gateway_attribution: GatewayAttribution | None = None
     consistency: Consistency | None = None
@@ -2691,6 +2713,7 @@ class ConfigDraft(RunConfig):
 
 
 class RequestSpec(Model):
+    _gateway_access_credential_digest: bytes | None = PrivateAttr(default=None)
     identity: str | None = Field(default=None, pattern=r"^[A-Za-z][A-Za-z0-9_-]{0,63}$",
         description="Explicit gateway probe identity. Probes retain numeric response evidence, not response text.")
     condition_id: str | None = None
@@ -2816,6 +2839,9 @@ class RequestRecord(PersistedModel):
     _timing_started_monotonic: float | None = PrivateAttr(default=None)
     _gateway_key_hash: str | None = PrivateAttr(default=None)
     _gateway_terminal_usage: bool = PrivateAttr(default=False)
+    _gateway_access_routing_issue: str | None = PrivateAttr(default=None)
+    _gateway_access_refusal: bool = PrivateAttr(default=False)
+    _gateway_access_metered_reasoning: bool = PrivateAttr(default=False)
     _request_body_sent_monotonic: float | None = PrivateAttr(default=None)
     id: str
     target: str

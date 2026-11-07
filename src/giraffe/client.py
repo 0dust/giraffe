@@ -556,6 +556,7 @@ class LLMClient:
         )
         selected_headers = None
         attribution = spec.identity is not None and "gateway_attribution" in spec.check_ids
+        access_probe = spec.identity is not None and "gateway_access" in spec.check_ids
         policy_probe = spec.identity is not None and "gateway_policy" in spec.check_ids
         priority_probe = (policy_probe and self.config.gateway_policy is not None
                           and self.config.gateway_policy.capability == "priority_rpm")
@@ -566,6 +567,12 @@ class LLMClient:
             except ValueError:
                 record.error = "Test identity credentials are unavailable."
                 return record
+            if access_probe:
+                from .gateway_access import IDENTITY_CHANGED, credential_digest, denial_kind, routing_issue
+
+                if credential_digest(selected_headers) != spec._gateway_access_credential_digest:
+                    record.error = IDENTITY_CHANGED
+                    return record
             if attribution:
                 from .identities import litellm_key_fingerprint
 
@@ -575,8 +582,9 @@ class LLMClient:
                 selected_headers["x-litellm-session-id"] = spec.workload["gateway_run"]
                 selected_headers["x-litellm-spend-logs-metadata"] = json.dumps({
                     "giraffe_run": spec.workload["gateway_run"], "giraffe_request": record.id})
+        options = spec.options if access_probe else self.config.request_options | spec.options
         payload = {
-            key: value for key, value in (self.config.request_options | spec.options).items()
+            key: value for key, value in options.items()
             if key not in _RESERVED_OPTIONS and value is not None
         }
         if attribution:
@@ -751,7 +759,8 @@ class LLMClient:
                 record.backend_id = backend
             usage = data.get("usage")
             if isinstance(usage, dict):
-                count = _gateway_token_count if attribution or policy_probe else _token_count
+                gateway_probe = attribution or policy_probe or access_probe
+                count = _gateway_token_count if gateway_probe else _token_count
                 prompt_tokens = count(usage.get("prompt_tokens"))
                 completion_tokens = count(usage.get("completion_tokens"))
                 cached = usage.get("prompt_tokens_details")
@@ -765,7 +774,7 @@ class LLMClient:
                     if raw_reasoning_tokens is not None and reasoning_tokens is None:
                         raise _ProtocolError("invalid reasoning token usage in gateway response")
                     _check_gateway_usage_total(prompt_tokens, completion_tokens, _gateway_usage_total(usage))
-                elif attribution or policy_probe:
+                elif gateway_probe:
                     _gateway_token_count(usage.get("total_tokens"))
                 record.input_tokens = prompt_tokens
                 record.completion_tokens = record.output_tokens = completion_tokens
@@ -815,13 +824,21 @@ class LLMClient:
                 record._gateway_terminal_usage = False
                 kind = "reasoning" if content.get("reasoning_content") or content.get("reasoning") else "generated"
                 raise _ProtocolError(f"{kind} content arrived after the finish reason")
-            answer = _text(content.get("content"))
+            if access_probe:
+                from .gateway_access import assistant_reply
+
+                answer, reasoning, record._gateway_access_refusal, record._gateway_access_metered_reasoning = (
+                    assistant_reply(content, choice.get("finish_reason"), usage, record)
+                )
+            else:
+                answer = _text(content.get("content"))
             if logprob_collector is not None:
                 logprob_collector.add(choice.get("logprobs"))
             if spec.workload.get("logprobs") and not streaming:
                 record.logprob_evidence = self.logprob_budget.collect(choice.get("logprobs"), answer,
                                                           spec.workload["top_logprobs"])
-            reasoning = _text(content.get("reasoning_content") or content.get("reasoning"))
+            if not access_probe:
+                reasoning = _text(content.get("reasoning_content") or content.get("reasoning"))
             now = observed_at
             if streaming:
                 token_evidence = choice.get("logprobs")
@@ -978,6 +995,8 @@ class LLMClient:
                 events = None
                 try:
                     record.http_status = response.status_code
+                    if access_probe:
+                        record._gateway_access_routing_issue = routing_issue(response.headers, payload["model"])
                     if spec.identity is not None:
                         from .gateway_response import response_evidence
                         record.gateway_evidence = response_evidence(response.status_code, headers=response.headers,
@@ -987,7 +1006,13 @@ class LLMClient:
                     )
                     if not 200 <= response.status_code < 300:
                         error_body = await _limited_body(response, on_body=body_received)
-                        if spec.identity is not None:
+                        if access_probe and response.status_code in (401, 403):
+                            custom_header = self.config.gateway_access.auth_header
+                            anonymous = (selected_headers.keys() == {"Accept"}
+                                         and (custom_header is None or custom_header not in request.headers))
+                            record.gateway_evidence.error_kind = denial_kind(
+                                response.status_code, error_body, anonymous=anonymous)
+                        elif spec.identity is not None:
                             expected_key_hash = None
                             policy = self.config.gateway_policy
                             if (response.status_code == 429 and policy_probe
@@ -1093,7 +1118,7 @@ class LLMClient:
                         body = await _limited_body(response, on_read=body_read, on_body=body_received)
                         observed_at = start + record.stream_end_ms / 1000 if record.stream_end_ms is not None else time.perf_counter()
                         data = (_object(body, strict_gateway_json=True)
-                                if attribution or policy_probe else _object(body))
+                                if attribution or policy_probe or access_probe else _object(body))
                         receive(data, streaming=False, observed_at=observed_at)
                         usage = data.get("usage")
                         if attribution and isinstance(usage, dict):
@@ -1111,6 +1136,9 @@ class LLMClient:
                     from .fixtures import final_answer
                     final, stripped, _ = final_answer(record.output)
                     if spec.scorer != "tool" and not final.strip():
+                        if record._gateway_access_refusal:
+                            record.status = "completed"
+                            return record
                         if record.finish_reason == "length" and (record.reasoning.strip() or stripped
                                                                   or (record.reasoning_tokens or 0) > 0):
                             # The endpoint honoured Giraffe's own output budget: not a
