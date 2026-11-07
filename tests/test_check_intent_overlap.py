@@ -14,6 +14,7 @@ from giraffe.overlap import evidenced_overlap, output_window, peak_evidenced_con
 from giraffe.runner import _Run, _checks, _missing_timing, _pack_results, _stats, _timing_violations, run_suite
 from giraffe.workloads import results, spec
 from tests.fake_endpoint import FakeEndpoint
+from tests.measurement_clock import MeasurementClock
 
 
 def configuration(**extra):
@@ -277,6 +278,7 @@ class StreamEndpoint:
     def __init__(self, monkeypatch, serial):
         import httpx
         from giraffe.client import LLMClient
+        self.clock = MeasurementClock(monkeypatch)
         self.lock = asyncio.Lock() if serial else None
         async def enter(client):
             client._client = httpx.AsyncClient(transport=httpx.MockTransport(self.handle))
@@ -300,7 +302,7 @@ class StreamEndpoint:
         usage = {'prompt_tokens': len(prompt.split()) + 8, 'completion_tokens': len(pieces)}
         if self.lock:
             await self.lock.acquire()
-        await asyncio.sleep(.003)
+        await asyncio.sleep(0)
         endpoint = self
         class Stream(httpx.AsyncByteStream):
             released = False
@@ -313,8 +315,10 @@ class StreamEndpoint:
                 try:
                     for piece in pieces:
                         yield ('data: ' + json.dumps({'model': 'fake-model', 'choices': [{'delta': {'content': piece}}]}) + '\n\n').encode()
-                        await asyncio.sleep(.001)
-                    await asyncio.sleep(.01)
+                        await asyncio.sleep(0)
+                    # Keep an observable interval after the single answer chunk.
+                    # The yield lets parallel streams emit before either completes.
+                    endpoint.clock.advance(.01)
                     yield ('data: ' + json.dumps({'choices': [{'delta': {}, 'finish_reason': finish}], 'usage': usage}) + '\n\ndata: [DONE]\n\n').encode()
                 finally:
                     await self.aclose()
