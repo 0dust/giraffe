@@ -108,6 +108,56 @@ async def collect(cfg, run):
     return result(run, cfg.targets[0])
 
 
+@pytest.mark.parametrize("mode,expected,started", [
+    ("only", "pass", 2),
+    ("mixed", "pass", 2),
+    ("deferred", "fail", 2),
+    ("budget", "inconclusive", 1),
+])
+async def test_live_attribution_condition_finishes_with_the_qualified_check(
+        monkeypatch, local_tokenizer, mode, expected, started):
+    events = []
+    reads_during_scoring = []
+
+    async def observer(request, rows):
+        if rows:
+            lifecycle = [event["event"] for event in events if event["scenario"] == "gateway_attribution"]
+            reads_during_scoring.append(lifecycle[-1] == "condition_scoring")
+        if mode == "deferred":
+            rows = [{**row, "completion_tokens": 6, "total_tokens": 9} for row in rows]
+        return spend_page(request, rows)
+
+    cfg, _, _ = setup(monkeypatch, observer)
+    immediate_spend_polls(monkeypatch, cfg)
+    if mode in {"mixed", "deferred"}:
+        cfg.checks = ["access", "gateway_attribution"]
+        cfg.targets[0].api_key_env = "SHARED"
+    if mode == "deferred":
+        cfg.targets.append(cfg.targets[0].model_copy(
+            update={"name": "second", "url": "http://second/v1", "gateway": None}))
+    if mode == "budget":
+        cfg.max_requests = 1
+
+    report = await run_suite(cfg, progress=events.append)
+    check = next(check for check in report.checks if check.target == "proxy" and check.id == "gateway_attribution")
+    saved = next(row for row in report.conditions if row["condition_id"] == "gateway_attribution")
+    assert check.status == expected
+    assert reads_during_scoring and all(reads_during_scoring)
+    scoring, finished = [event for event in events if event["target"] == "proxy"
+                         and event["scenario"] == "gateway_attribution"
+                         and event["event"] in {"condition_scoring", "condition_finished"}]
+    assert scoring["event"] == "condition_scoring"
+    assert scoring["condition_summary"]["condition_verdict"] == "pending"
+    assert finished["event"] == "condition_finished"
+    summary = finished["condition_summary"]
+    assert summary["condition_verdict"] == check.status
+    assert summary["aggregate_status"] == saved["status"]
+    assert summary["planned"] == saved["planned"] == 2
+    assert summary["started"] == summary["completed"] == saved["started"] == saved["completed"] == started
+    assert summary["failed"] == saved["failed"] == 0
+    assert events.index(finished) < next(i for i, event in enumerate(events) if event["event"] == "run_finished")
+
+
 @pytest.mark.parametrize("row_limit", [1, 2])
 async def test_row_limit_is_checked_before_marked_requests(monkeypatch, row_limit):
     keys = []

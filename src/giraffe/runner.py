@@ -396,9 +396,9 @@ class _Run:
         row["status"] = "finished"
         if load_point_result is not None:
             row["load_point_result"] = dict(load_point_result)
-        if scheduled_multi_user_window(scenario):
-            # These windows have a verdict only after Multi-user qualifies the
-            # complete offer ledger and any cross-window recovery evidence.
+        if scheduled_multi_user_window(scenario) or scenario in SHARED_BASELINE_EXCLUDED_WORKLOADS:
+            # Scheduled windows and gateway probes need evidence qualification
+            # after request dispatch finishes.
             row["condition_verdict"] = verdict or row.get("condition_verdict") or "pending"
         self.emit_condition("condition_finished", scenario, row)
 
@@ -2865,6 +2865,13 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
         if check.target in target_abort_reasons and check.status == "pass":
             check.status = "inconclusive"
             check.summary = target_abort_reasons[check.target] + ". This check was interrupted."
+    gateway_conditions = []
+    for check in checks:
+        if check.id in SHARED_BASELINE_EXCLUDED_WORKLOADS:
+            row = run.conditions.get((check.target, check.id))
+            if row is not None and row.get("condition_verdict") == "pending":
+                row["condition_verdict"] = check.status
+                gateway_conditions.append(row)
     grouped = defaultdict(lambda: defaultdict(list))
     for record in run.records:
         grouped[record.target][record.scenario].append(record)
@@ -3041,6 +3048,8 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
         # when asyncio.timeout converts this cancellation into TimeoutError.
         outer_cancellation.giraffe_report = report
     try:
+        for row in gateway_conditions:
+            run.emit_condition("condition_finished", row["condition"]["id"], row)
         run.emit("run_finished", abort_reason=verdict_reason, target_abort_reasons=target_abort_reasons)
     except Exception:
         if outer_cancellation is None:

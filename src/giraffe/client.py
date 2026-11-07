@@ -717,9 +717,17 @@ class LLMClient:
                 record.logprob_evidence = self.logprob_budget.collect(choice.get("logprobs"), answer,
                                                           spec.workload["top_logprobs"])
             reasoning = _text(content.get("reasoning_content") or content.get("reasoning"))
-            if attribution and streaming and reasoning and record.finish_reason is not None:
-                record._gateway_terminal_usage = False
-                raise _ProtocolError("reasoning content arrived after the finish reason")
+            if attribution and streaming and record.finish_reason is not None:
+                if reasoning:
+                    record._gateway_terminal_usage = False
+                    raise _ProtocolError("reasoning content arrived after the finish reason")
+                function_call = content.get("function_call")
+                audio = content.get("audio")
+                if (content.get("refusal")
+                        or (isinstance(function_call, dict) and (function_call.get("name") or function_call.get("arguments")))
+                        or (isinstance(audio, dict) and (audio.get("data") or audio.get("transcript")))):
+                    record._gateway_terminal_usage = False
+                    raise _ProtocolError("generated content arrived after the finish reason")
             now = observed_at
             if streaming:
                 token_evidence = choice.get("logprobs")
