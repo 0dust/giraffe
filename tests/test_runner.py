@@ -1431,6 +1431,28 @@ async def test_correctness_only_pack_uses_quiet_and_concurrent_pass_and_case_cov
     assert result.metrics["request_pack"]["coverage_complete"]
 
 
+async def test_pack_correctness_ignores_scheduled_multi_user_answers(client, monkeypatch):
+    execute = client.execute
+
+    async def wrong_arrivals(self, spec, **kwargs):
+        record = await execute(self, spec, **kwargs)
+        if spec.check_ids == ["multi_user"]:
+            record.output = "wrong"
+        return record
+
+    monkeypatch.setattr(client, "execute", wrong_arrivals)
+    report = await runner.run_suite(pack_config(checks=["correctness", "multi_user"], multi_user={
+        "levels": [2], "scenarios": ["arrivals"], "duration_seconds": .2,
+        "arrivals": {"requests_per_second": 5}}))
+    arrivals = [row for row in report.requests if "multi_user" in row.check_ids]
+    assert len(arrivals) == 2
+    assert all(row.score is False and row.traffic_stage is None for row in arrivals)
+    correctness = check(report, "correctness")
+    assert correctness.status == "pass"
+    assert correctness.metrics["attempted"] == correctness.metrics["correct"] == 4
+    assert all(case["loaded"]["attempted"] == 1 for case in correctness.metrics["request_pack"]["cases"])
+
+
 async def test_pack_quiet_budget_shortfall_prevents_acceptable_load_claim():
     report = await runner.run_suite(_pack_config(max_requests=1))
     assert check(report, "load").status == "inconclusive"

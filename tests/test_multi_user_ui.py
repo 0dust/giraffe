@@ -12,6 +12,51 @@ def configuration():
                      checks=['multi_user'], concurrency=5, multi_user={'levels': [20]})
 
 
+def test_arrival_recovery_form_roundtrip():
+    value = browser_logic(r'''
+const markup=renderMultiUserEditor(config);
+for(const name of ['scenario_arrivals','scenario_recovery','arrivals_requests_per_second','arrivals_activations','arrivals_bursts','recovery_control_seconds','recovery_sustained_seconds','recovery_lighter_seconds','recovery_max_slowdown'])assert(markup.includes('name="multi_user_'+name+'"'));
+const form=new FormData();form.set('multi_user_rendered','1');form.set('multi_user_scenarios_rendered','1');
+form.set('multi_user_scenario_arrivals','on');form.set('multi_user_scenario_recovery','on');
+form.set('multi_user_arrivals_requests_per_second','2');form.set('multi_user_arrivals_activations','user-02@2, user-03@3');
+form.set('multi_user_arrivals_bursts','user-01@4@3@0, user-02@5@2@0.1');
+form.set('multi_user_recovery_control_seconds','4');form.set('multi_user_recovery_sustained_seconds','8');
+form.set('multi_user_recovery_lighter_seconds','4');form.set('multi_user_recovery_max_slowdown','1.5');
+assert.equal(settingPath('multi_user_arrivals_requests_per_second'),'multi_user.arrivals.requests_per_second');
+assert.equal(settingDestination('multi_user.arrivals.bursts.0.requests').name,'multi_user_arrivals_bursts');
+assert.equal(settingPath('multi_user_recovery_control_seconds'),'multi_user.recovery.control_seconds');
+console.log(JSON.stringify(configureMultiUser(config,form,bootstrap.multi_user.defaults)));
+''', configuration())
+    config = RunConfig.model_validate(value)
+    assert config.multi_user.scenarios == ['arrivals', 'recovery']
+    assert config.multi_user.arrivals.activations == {'user-02': 2, 'user-03': 3}
+    assert config.multi_user.arrivals.bursts[1].spacing_seconds == .1
+    assert config.multi_user.recovery.max_slowdown == 1.5
+
+
+def test_arrival_recovery_form_preserves_imported_scenario_order():
+    config = configuration()
+    config.multi_user.scenarios = ['recovery', 'arrivals']
+    value = browser_logic(r'''
+const form=new FormData();form.set('multi_user_rendered','1');form.set('multi_user_scenarios_rendered','1');
+form.set('multi_user_scenario_arrivals','on');form.set('multi_user_scenario_recovery','on');
+console.log(JSON.stringify(configureMultiUser(config,form,bootstrap.multi_user.defaults)));
+''', config)
+    assert value['multi_user']['scenarios'] == config.multi_user.scenarios
+
+
+def test_recovery_results_keep_user_qualification_and_phase_evidence():
+    from tests.test_multi_user_recovery import recovery_observation
+    from giraffe.multi_user_metrics import summarize
+    source, records = recovery_observation()
+    summary = summarize(source, records)
+    browser_logic('const summary='+json.dumps(summary)+r''';
+const markup=renderMultiUserResults(summary);
+for(const text of ['Scheduled and achieved traffic','Matched per-user recovery','user-03','Recovery slowdown','Control:','Sustained:','Lighter:','not server queue time'])assert(markup.includes(text));
+assert.match(markup,/data-request="2-user-03"/);
+''', configuration())
+
+
 def test_multi_user_scenarios_form_roundtrip_and_field_destinations():
     value = browser_logic(r'''
 const markup=renderMultiUserEditor(config);
@@ -126,7 +171,8 @@ def test_live_user_identity_survives_started_and_completed_events():
     job = {'requests': OrderedDict(), 'live_request_count': 0, 'evicted_running': set(),
            'live_request_summary': {'evicted': 0, 'through_slot': None, 'statuses': {}}}
     identity = {'user_id': 'user-01', 'population': 20, 'profile': 'short_short',
-                'window_id': 'multi_user_20_measurement', 'phase': 'measurement', 'request_sequence': 2}
+                'window_id': 'multi_user_20_measurement', 'phase': 'measurement', 'request_sequence': 2,
+                'activation_seconds': .5}
     for kind in ['request_started', 'request_completed']:
         event = {'event': kind, 'request_slot': 0, 'target': 'local', 'scenario': 'multi_user_20_measurement',
                  'user': {**identity, 'prompt': 'must not reach live identity'}}

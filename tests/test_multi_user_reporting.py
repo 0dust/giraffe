@@ -74,7 +74,9 @@ def test_single_user_regression_is_not_pooled_with_healthy_peers():
 
 @pytest.mark.parametrize("field,value", [("seed", 999), ("levels", [1, 5]), ("duration_seconds", 20),
                                          ("shapes", ["long_long"]), ("fairness_tolerance_percent", 5),
-                                         ("conversations", {"modes": ["live"]})])
+                                         ("conversations", {"modes": ["live"]}),
+                                         ("arrivals", {"requests_per_second": 2}),
+                                         ("recovery", {"lighter_seconds": 9})])
 def test_changed_user_workload_cannot_pass_baseline(field, value):
     current, previous = user_report(), user_report()
     current.manifest["config"]["multi_user"][field] = value
@@ -112,6 +114,78 @@ def test_legacy_reports_do_not_gain_persistent_users(tmp_path):
     assert "multi_user" not in reproduction_export(report)
 
 
+def test_recovery_report_export_cli_and_baseline_keep_all_phase_users(tmp_path, capsys):
+    from tests.test_multi_user_recovery import recovery_observation
+    source, records = recovery_observation()
+    report = make_report()
+    for r in records:
+        r.target = "local"
+        r.workload.update(population=3, cohort="shared")
+    report.requests = records
+    report.manifest['config'].update(checks=['multi_user'], multi_user=source['settings'])
+    summary = summarize(source, records)
+    report.checks = [CheckResult(id='multi_user', target='local', title='Multi-user', status=summary['status'],
+                                summary='Per-user recovery', metrics={'multi_user': summary})]
+    _, path = write_report(report, tmp_path, html=True)
+    html = path.read_text()
+    assert 'Matched per-user recovery' in html and 'user-03' in html and 'Recovery slowdown' in html
+    assert 'Scheduled and achieved traffic' in html and 'not server queue time' in html
+    exported = reproduction_export(report)['multi_user']['local']
+    assert [w['role'] for w in exported['windows']] == ['control', 'sustained', 'lighter']
+    assert exported['windows'][2]['recovery']['users'][2]['slowdown'] == 3
+    comparisons = compare_baseline(report, report).baseline["targets"][0]["comparisons"]
+    delivery = {row["scenario"] for row in comparisons if row["metric"] == "shared_window_output_tokens_per_second"}
+    timing = {row["scenario"] for row in comparisons if row["metric"] == "latency_ms"}
+    assert len(delivery) == 9 and delivery == timing
+    assert all(scenario.endswith(" / shared") for scenario in delivery)
+    _print_result(report, tmp_path/'report.json', path, tmp_path, {})
+    output = capsys.readouterr().out
+    assert 'Matched per-user recovery: fail' in output and 'user-03: fail' in output
+
+
+def test_loaded_recovery_sample_count_is_escaped_in_html():
+    from html.parser import HTMLParser
+    from giraffe.models import RunReport
+    from giraffe.reporting import _render
+    from tests.test_multi_user_recovery import recovery_observation
+
+    source, records = recovery_observation()
+    summary = summarize(source, records)
+    payload = '<img src=x onerror="alert(document.domain)">'
+    summary["windows"][-1]["recovery"]["users"][0]["matched_samples"] = payload
+    report = make_report()
+    report.checks = [CheckResult(id="multi_user", target="local", title="Multi-user", status="inconclusive",
+                                summary="Imported recovery", metrics={"multi_user": summary})]
+    loaded = RunReport.model_validate_json(report.model_dump_json())
+    html = _render(loaded)
+    tags = []
+
+    class Tags(HTMLParser):
+        def handle_starttag(self, tag, attrs):
+            tags.append((tag, dict(attrs)))
+
+    Tags().feed(html)
+    assert not any("onerror" in attrs for _, attrs in tags)
+    assert '&lt;img src=x onerror=&quot;alert(document.domain)&quot;&gt;' in html
+
+
+def test_finite_user_request_comparisons_keep_phase_and_cohort():
+    from tests.test_multi_user_recovery import recovery_observation
+    from giraffe.reporting import _groups
+    source, records = recovery_observation()
+    for r in records:
+        r.traffic_stage = 0
+        r.workload['cohort'] = 'shared'
+    groups = _groups(records, 'service')
+    assert len(groups) == 9
+    for rows in groups.values():
+        role = rows[0].workload["role"]
+        assert all(row.workload["role"] == role for row in rows)
+        assert len(rows) == (4 if role == "sustained" else 1)
+    assert all('shared' in scenario for check, scenario in groups)
+    assert {r.workload['role'] for rows in groups.values() for r in rows} == {'control', 'sustained', 'lighter'}
+
+
 def test_matching_user_baseline_preserves_per_user_delivery_rows():
     result = compare_baseline(user_report(), user_report())
     rows = result.baseline["targets"][0]["comparisons"]
@@ -119,6 +193,88 @@ def test_matching_user_baseline_preserves_per_user_delivery_rows():
     assert result.baseline["status"] == "pass"
     assert len(rates) == 5 and all(row["current"] == 80 for row in rates)
     assert all("worsening_interval_95" not in row for row in rates)
+
+
+@pytest.mark.parametrize("previous, current, blocked", [
+    (("concurrency", 1), ("concurrency", 2), True),
+    (("default_concurrency", 1), ("default_concurrency", 2), True),
+    (("concurrency", 1), ("default_concurrency", 1), False),
+    (("concurrency", 2), ("concurrency", 3), False),
+])
+def test_scheduled_baseline_requires_matching_effective_slots_when_constrained(
+        monkeypatch, local_tokenizer, previous, current, blocked):
+    import asyncio
+
+    from giraffe import multi_user, runner
+    from giraffe.models import RequestSpec
+    from tests.test_multi_user import settings
+    from tests.test_multi_user_scenarios import PROFILE
+    from tests.test_review26_phase4_accuracy import run_virtual
+    from tests.test_runner import FakeClient
+
+    async def calibrate(*args, **kwargs):
+        return {"status": "calibrated"}
+
+    def build(run, settings, point, *args, **kwargs):
+        return RequestSpec(fixture_id="short", scenario=point["id"], check_ids=["multi_user"],
+            messages=[{"role": "user", "content": "x" * 256}], input_chars=256,
+            requested_input_tokens=64, requested_output_tokens=2, stream=True, max_tokens=2)
+
+    class Endpoint(FakeClient):
+        in_flight = 0
+
+        async def execute(self, spec, **kwargs):
+            self.in_flight += 1
+            try:
+                await asyncio.sleep(.005)
+                if self.in_flight > 1:
+                    await asyncio.sleep(.070)
+                return await super().execute(spec, **kwargs)
+            finally:
+                self.in_flight -= 1
+
+    async def make(key, limit):
+        cfg = settings(levels=[2], scenarios=["arrivals"], profile=PROFILE, duration_seconds=1,
+                       arrivals={"requests_per_second": 8})
+        raw = cfg.model_dump(mode="json")
+        raw.pop("concurrency")
+        cfg = RunConfig.model_validate({**raw, key: limit})
+        target = cfg.targets[0]
+        state = runner._Run(cfg, None, None)
+        await multi_user.execute(state, target, Endpoint(target, cfg))
+        report = user_report()
+        report.manifest["config"] = cfg.model_dump(mode="json")
+        report.requests = state.records
+        report.checks = [multi_user.result(state, target)]
+        report.overall = report.checks[0].status
+        report.limits_reached = sorted(state.limits_reached)
+        window, = report.checks[0].metrics["multi_user"]["windows"]
+        assert window["max_in_flight"] == limit
+        assert window["slot_limit_reached"] is (limit == 1)
+        assert window["offer_accounting"]["dispatched"] == (8 if limit == 1 else 16)
+        assert "concurrency" not in report.limits_reached
+        return report
+
+    async def run():
+        baseline, report = await make(*previous), await make(*current)
+        for historical in (False, True):
+            if historical:
+                window, = baseline.checks[0].metrics["multi_user"]["windows"]
+                window.pop("max_in_flight")
+                window.pop("slot_limit_reached")
+            comparison = compare_baseline(report, baseline).baseline
+            target, = comparison["targets"]
+            timing = [row for row in target["comparisons"] if row["metric"] == "latency_ms"]
+            assert any("dropped scheduled offers at its slot limit" in reason for reason in target["reasons"]) is blocked
+            if blocked:
+                assert comparison["status"] == "inconclusive"
+                assert not timing
+            else:
+                assert timing and all(row["status"] == "pass" for row in timing)
+
+    monkeypatch.setattr(multi_user, "calibrate", calibrate)
+    monkeypatch.setattr(multi_user, "build_spec", build)
+    run_virtual(monkeypatch, run())
 
 
 @pytest.mark.parametrize(("change", "expected"), [({}, "fail"), ({"input_tokens": 200}, "inconclusive"),
@@ -160,23 +316,35 @@ def test_measured_zero_delivery_compares_when_the_same_work_drains_after_cutoff(
     (1.1, 100, False, "inconclusive"),
     (None, 100, True, "pass"),
 ])
+@pytest.mark.parametrize("scheduled", [False, True], ids=["repeated", "arrivals"])
 def test_selected_fairness_baseline_tracks_threshold_crossings_with_comparable_work(
-        limit, new_input_tokens, new_overlap, expected):
+        limit, new_input_tokens, new_overlap, expected, scheduled):
     current, previous = user_report(), user_report()
-    current.requests = [request for request in current.requests if request.id != "user-05-7"]
+    if not scheduled:
+        current.requests = [request for request in current.requests if request.id != "user-05-7"]
     for report in (current, previous):
         settings = report.manifest["config"]["multi_user"]
         settings["pass_criteria"]["max_throughput_ratio"] = limit
+        source = report.observations["targets"]["local"]["multi_user"]
+        window = source["windows"][0]
+        if scheduled:
+            settings["scenarios"] = ["arrivals"]
+            window.update(scenario="arrivals", role="arrivals", offer_accounting={
+                "planned": len(report.requests), "offered": len(report.requests), "dispatched": len(report.requests)})
         for request in report.requests:
+            if scheduled:
+                request.workload.update(scenario="arrivals", role="arrivals", population=window["population"])
+                if report is current and request.id == "user-05-7":
+                    request.completed_ms = window["end_ms"] + 100
+                    request.elapsed_ms = request.completed_ms - request.dispatch_ms
             request.stream = True
             request.answer_chunks = request.answer_reads = 3 if report is previous or new_overlap else 1
             request.last_output_ms = 90
             if report is current:
                 request.input_tokens = new_input_tokens
-        source = report.observations["targets"]["local"]["multi_user"]
         source["settings"] = settings
-        if report is current:
-            source["windows"][0]["users"][-1]["dispatched_count"] = 7
+        if report is current and not scheduled:
+            window["users"][-1]["dispatched_count"] = 7
         summary = summarize(source, report.requests)
         report.checks[0].metrics["multi_user"] = summary
         report.checks[0].status = report.overall = summary["status"]
@@ -190,6 +358,124 @@ def test_selected_fairness_baseline_tracks_threshold_crossings_with_comparable_w
         assert len(fairness) == 1 and fairness[0]["status"] == expected
         assert fairness[0]["baseline"] == 1 and fairness[0]["current"] == pytest.approx(8 / 7)
         assert result.baseline["acceptance"]["current"] == ("fail" if new_overlap else "inconclusive")
+
+
+def test_recovery_fairness_baseline_requires_applied_threshold_and_keeps_phase_identity():
+    from tests.test_multi_user_recovery import recovery_observation
+
+    def report(*, slow=False, incomplete_schedule=False, late_cache=False):
+        source, records = recovery_observation(lighter_rate=2, sustained_rate=4)
+        source["settings"]["pass_criteria"]["max_throughput_ratio"] = 1.5
+        if incomplete_schedule:
+            source["windows"][1]["offer_accounting"]["planned"] += 1
+        result = user_report()
+        target = result.manifest["config"]["targets"][0]["name"]
+        result.manifest["config"]["multi_user"] = source["settings"]
+        for request in records:
+            request.target = target
+            request.cached_prompt_tokens = 0
+            request.workload["population"] = 3
+            role = request.workload["role"]
+            if role == "lighter":
+                request.completed_ms = request.dispatch_ms + 100
+                request.elapsed_ms = request.stream_end_ms = 100
+                request.last_output_ms = 90
+            if (slow and role == "sustained" and request.workload["user_id"] == "user-03"
+                    and request.dispatch_ms > 1000):
+                request.completed_ms = 2100
+                request.elapsed_ms = 2100 - request.dispatch_ms
+                request.cached_prompt_tokens = 64 if late_cache else 0
+        summary = summarize(source, records)
+        result.requests = records
+        result.checks[0].status = result.overall = summary["status"]
+        result.checks[0].metrics["multi_user"] = summary
+        result.observations = {"targets": {target: {"multi_user": {**source, "summary": summary}}}}
+        return result
+
+    current, previous = report(slow=True), report()
+    assert (current.overall, previous.overall) == ("fail", "pass")
+    result = compare_baseline(current, previous)
+    rows = [row for row in result.baseline["targets"][0]["comparisons"] if row["metric"] == "fairness_acceptance"]
+    assert {row["role"]: row["status"] for row in rows} == {"control": "pass", "sustained": "fail", "lighter": "pass"}
+    sustained = next(row for row in rows if row["role"] == "sustained")
+    assert sustained["current"] == 4
+    assert sustained["window_id"] == "multi_user_3_recovery_sustained"
+    assert sustained["scenario"] == "recovery / 3 / sustained"
+    assert len(sustained["evidence_ids"]) == sustained["current_samples"] == 9
+
+    cached = report(slow=True, late_cache=True)
+    missing = current.model_copy(deep=True)
+    discarded = next(request for request in missing.requests if request.workload["role"] == "sustained"
+                     and request.workload["user_id"] == "user-03" and request.completed_ms == 2100)
+    missing.requests.remove(discarded)
+    for candidate, expected in ((current, "fail"), (cached, "inconclusive"), (missing, "inconclusive")):
+        compared = compare_baseline(candidate, previous).baseline
+        delivery = next(row for row in compared["targets"][0]["comparisons"]
+                        if row["metric"] == "shared_window_output_tokens_per_second"
+                        and row["role"] == "sustained" and row["user_id"] == "user-03")
+        assert delivery["status"] == expected
+        assert (delivery["current"], delivery["baseline"]) == (16, 64)
+        assert (delivery["current_samples"], delivery["baseline_samples"]) == (1, 4)
+        if expected == "inconclusive":
+            assert "drained requests" in delivery["reason"]
+        if candidate is cached:
+            assert compared["status"] == "inconclusive"
+
+    incomplete = compare_baseline(report(incomplete_schedule=True), previous)
+    sustained = next(row for row in incomplete.baseline["targets"][0]["comparisons"]
+                     if row["metric"] == "fairness_acceptance" and row["role"] == "sustained")
+    assert sustained["status"] == "inconclusive"
+
+    for window in previous.checks[0].metrics["multi_user"]["windows"]:
+        window["fairness"].pop("acceptance_applies")
+    previous.checks[0].status = previous.overall = "inconclusive"
+    legacy = compare_baseline(current, previous)
+    assert legacy.baseline["acceptance"]["baseline"] == "inconclusive"
+    assert all(row["metric"] != "fairness_acceptance" for row in legacy.baseline["targets"][0]["comparisons"])
+
+
+@pytest.mark.parametrize("same_work", [False, True])
+def test_scheduled_fairness_baseline_checks_work_that_finishes_after_delivery_cutoff(same_work):
+    def report(*, late_cache):
+        result = user_report()
+        settings = result.manifest["config"]["multi_user"]
+        settings["scenarios"] = ["arrivals"]
+        settings["pass_criteria"]["max_throughput_ratio"] = 1.2
+        source = result.observations["targets"]["local"]["multi_user"]
+        source["settings"] = settings
+        window, = source["windows"]
+        window.update(scenario="arrivals", role="arrivals", offer_accounting={
+            "planned": len(result.requests), "offered": len(result.requests), "dispatched": len(result.requests)})
+        for request in result.requests:
+            request.workload.update(scenario="arrivals", role="arrivals", population=window["population"])
+            request.stream = True
+            request.answer_chunks = request.answer_reads = 3
+            request.last_output_ms = 90
+            request.cached_prompt_tokens = 0
+            if request.id.endswith(("-6", "-7")):
+                request.completed_ms = window["end_ms"] + 100
+                request.elapsed_ms = request.completed_ms - request.dispatch_ms
+                request.cached_prompt_tokens = 100 if late_cache else 0
+        summary = summarize(source, result.requests)
+        result.checks[0].metrics["multi_user"] = summary
+        result.checks[0].status = result.overall = summary["status"]
+        return result
+
+    current, previous = report(late_cache=True), report(late_cache=same_work)
+    for result in (current, previous):
+        fairness = result.checks[0].metrics["multi_user"]["windows"][0]["fairness"]
+        assert fairness["status"] == result.overall == "pass"
+        assert fairness["ratio"] == 1
+        assert all(user["valid_samples"] == 6 and user["work_samples"] == 8 for user in fairness["users"])
+
+    comparison = compare_baseline(current, previous)
+    rows = comparison.baseline["targets"][0]["comparisons"]
+    fairness, = [row for row in rows if row["metric"] == "fairness_acceptance"]
+    expected = "pass" if same_work else "inconclusive"
+    assert fairness["status"] == expected
+    assert fairness["current_samples"] == fairness["baseline_samples"] == 30
+    delivery = [row for row in rows if row["metric"] == "shared_window_output_tokens_per_second"]
+    assert len(delivery) == 5 and all(row["status"] == expected and row["current"] == row["baseline"] == 60 for row in delivery)
 
 
 @pytest.mark.parametrize(("drop_request", "changed_work", "expected"), [
@@ -899,7 +1185,7 @@ def test_user_baseline_keeps_control_probe_and_heavy_profiles_separate():
     other_profile.update(id="other-profile", heavy_profile="short_long")
     summary["windows"] = [control, probe, other_profile]
     assert len(_user_measurements(report, "local")) == 15
-    rows, _ = _compare_user_delivery(report, report, "local", [], 10)
+    rows, _ = _compare_user_delivery(report, report, "local", [], 10, {})
     assert len(rows) == 15
     assert {row["role"] for row in rows} == {"control", "probe"}
 
