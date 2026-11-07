@@ -14,7 +14,7 @@ _VALUE_FLAGS = frozenset("""
 --metrics-url --host-metrics-url --metrics-api-key-env --metrics-profile --fixtures
 --request-pack --retention --ca-bundle --proxy --first-output-ms --latency-ms
 --stream-gap-ms --min-output-tokens-per-second --max-error-rate --min-correctness
---case --target --regression-percent --baseline --output --save-config --output-format --runs-dir --restart
+--case --target --regression-percent --regression-rate-points --baseline --output --save-config --output-format --runs-dir --restart
 """.split())
 _URL_FLAGS = frozenset({"--url", "--metrics-url", "--host-metrics-url", "--proxy"})
 

@@ -76,6 +76,7 @@ def _comparison_config(value: dict) -> dict:
     config, _ = migrate_concurrent_load(config)
     if isinstance(config.get("limits"), dict):
         config["limits"].pop("regression_percent", None)
+        config["limits"].pop("regression_rate_points", None)
         for field in ("first_output_ms", "stream_gap_ms"):
             config["limits"].setdefault(field, None)
     default = config.setdefault("default_concurrency", 4)
@@ -329,7 +330,7 @@ def _settings_reasons(report: RunReport, baseline: RunReport, *, details: dict[s
         if key == "effective_checks" and isinstance(value, dict):
             value = {check: {**settings, **({"limits": {
                 name: limit for name, limit in settings["limits"].items()
-                if name != "regression_percent"
+                if name not in {"regression_percent", "regression_rate_points"}
             }} if isinstance(settings.get("limits"), dict) else {})}
                             if isinstance(settings, dict) else settings
                      for check, settings in value.items()}
@@ -519,7 +520,8 @@ def _different_output_work(current: dict[str, Any], old: dict[str, Any], thresho
 
 
 def _compare_metric(
-    name: str, current: list[float], old: list[float], minimum: int, threshold: float
+    name: str, current: list[float], old: list[float], minimum: int, threshold: float,
+    *, rate_threshold: float | None = None,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {
         "metric": name, "current_samples": len(current), "baseline_samples": len(old),
@@ -542,6 +544,7 @@ def _compare_metric(
     higher_is_better = name in {"correctness_rate", "valid_completion_rate", "output_tokens_per_second",
                                "generation_tokens_per_second"}
     direction = -1 if higher_is_better else 1
+    threshold = rate_threshold if is_rate and rate_threshold is not None else threshold
     # Rates use percentage points, avoiding undefined percentages for a zero baseline error rate.
     scale = 100 if is_rate else (100 / old_value if old_value > 0 else None)
     if scale is None:
@@ -1058,11 +1061,13 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
     limits = config.get("limits", {})
     minimum = max(2, int(limits.get("min_samples", 5)))
     threshold = float(limits.get("regression_percent", 20))
+    rate_threshold = float(limits.get("regression_rate_points", 5))
     old_targets = {t["name"]: t for t in baseline.manifest.get("config", {}).get("targets", [])}
     targets = config.get("targets", [])
     comparison: dict[str, Any] = {
         "run_id": baseline.run_id, "status": "inconclusive", "targets": [],
         "min_samples": minimum, "regression_threshold": threshold,
+        "regression_rate_threshold": rate_threshold,
         "deployment_changes_establish_causality": False,
         "source_outcome": baseline.overall,
         "acceptance": {label: _acceptance_status(run)
@@ -1070,7 +1075,7 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
         "source_started_at": baseline.started_at, "source_finished_at": baseline.finished_at,
         "method": "Per check/scenario; medians for timing and means for rates; "
                   "400 deterministic bootstrap resamples, 95% sample intervals. "
-                  "Rates use percentage points; timing and output rate use relative percent. "
+                  "Rates use a percentage-point threshold; timing and output rate use relative percent. "
                   "Output token rate is end-to-end server-reported output tokens / elapsed seconds. "
                   "Intervals describe within-run variation, not cross-run environmental stability.",
     }
@@ -1188,7 +1193,7 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                         continue
                     row = _compare_metric(metric, values, old_metrics[metric],
                                           1 if check == "access" and metric in {"valid_completion_rate", "error_rate"} else minimum,
-                                          threshold)
+                                          threshold, rate_threshold=rate_threshold)
                     warnings = []
                     initial_uncertainty = row["reason"] if row["status"] == "inconclusive" else None
                     def warn(code, message, *, preserve_failure=False):

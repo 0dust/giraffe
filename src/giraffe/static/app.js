@@ -1067,7 +1067,8 @@ const fieldDescriptions={
   limit_fairness_max_ratio:{help:'How much slower a short answer may become when long requests run alongside it. A value of 2 allows up to twice the short-only response time. Use a number greater than 1.'},
   limit_max_error_rate:{help:'The largest allowed share of failed, timed-out or invalid responses. Enter a percentage from 0 to 100: 5 means 5%. Intentional cancellation probes are treated separately.'},
   limit_min_correctness:{help:'The smallest allowed share of correct answers among scored requests. Enter a percentage from 0 to 100: 95 means 95%. Missing or unscored answers can leave a test inconclusive.'},
-  limit_regression_percent:{help:'How much a result may worsen compared with a saved baseline before Giraffe flags a material regression. Timing changes use percent; rate changes use percentage points. Too few comparable samples can leave the comparison inconclusive.'},
+  limit_regression_percent:{help:'How much a timing or output-rate result may worsen compared with a saved baseline before Giraffe flags a material regression. Too few comparable samples can leave the comparison inconclusive.'},
+  limit_regression_rate_points:{help:'How many percentage points a rate metric may worsen compared with a saved baseline before Giraffe flags a material regression. Too few comparable samples can leave the comparison inconclusive.'},
   limit_min_samples:{help:'The minimum number of usable measurements needed to judge a result. Fewer samples produce an inconclusive result rather than a pass.'},
   test_samples:{help:'How many sample requests this test should try. Some tests need extra requests to cover every case. Leave blank to use the run setting.'},
   test_concurrency:{help:'How many requests this test asks to run at the same time. An accepted value is not demonstrated delivery capacity. Leave blank to inherit this check’s default.'},
@@ -1161,7 +1162,7 @@ function settingDestination(path) {
   else if(['arrivals','prefix','sessions','consistency'].includes(root)){check=root;name=`profile_${root}_${parts[1]}`;}
   else if(root==='traffic'){check='capacity';name=`traffic_${parts[1]}`;}
   else if(root==='tool_checks'){check='tools';name=`profile_tools_${parts[1]}`;}
-  else if(root==='limits'){name=`limit_${parts[1]}`;if(parts[1]==='regression_percent')step=3;}
+  else if(root==='limits'){name=`limit_${parts[1]}`;if(['regression_percent','regression_rate_points'].includes(parts[1]))step=3;}
   else if(root==='judging')name=parts[1]==='judges'?`judge_${parts[2]}_${parts[3]}`:`judging_${parts[1]}`;
   else if(root==='config')name='config_editor';
   const labels={session_sampling_seed:'sampling seed',session_sample_think_time_seconds:'pause values',session_sample_input_tokens:'input message lengths',session_sample_output_tokens:'output cap values',session_sample_turn_count:'turns per conversation',max_memory_mb:'Maximum memory',concurrency:'Simultaneous limit',max_duration_seconds:'Maximum duration',request_timeout_seconds:'request timeout',max_output_tokens:'output cap',max_requests:'Maximum requests',load_schedule_levels:'concurrency levels',load_schedule_duration_seconds:'send new requests for',load_combinations_enabled:'load types',load_combinations_selected_short_short:'combinations',load_mixed_shares_short_short:'mixed request shares',load_interference_enabled:'stream interference',load_stress_large_input:'stress cases',traffic_rates:'rates',traffic_duration_seconds:'seconds per rate',traffic_max_in_flight:'capacity requests at once',config_editor:'advanced configuration',sessions_max_tokens:'output cap per turn',sessions_count:'total conversations',sessions_delay:'pause between turns'};
@@ -2739,7 +2740,7 @@ function renderNew(preset=inferSetupPreset(state.config,{limits:state.bootstrap?
   <section class="setup-step-content" id="setup-panel-3" data-setup-panel="3" aria-label="Review and run" hidden>
   <section class="setup-section" id="setup-review"><h2 class="sr-only">Run configuration</h2><div class="setup-body">
   <div class="review-main"><div id="run-bounds"></div>
-  <details class="setup-disclosure" id="execution-settings"><summary>Saved evidence, baseline & restart options</summary><div class="details-content"><div class="fields">${selectField('retention','Keep response text',['failures','all','none'].map(mode=>`<option value="${mode}" ${mode===(c.retention||'failures')?'selected':''}>${{failures:'Failures only',all:'All',none:'None'}[mode]}</option>`).join(''),{hint:'',help:'Questions and expected answers are always saved with the run. This setting controls whether response text and evaluator reasons are kept. Timings, status and scores are always saved. It does not cap disk use; storage limits do.'})}${field('name','Endpoint name',target.name,{required:true,placeholder:'local'})}${selectField('mode','Server startup','<option value="normal">Use the running server</option><option value="cold-start">Restart one server before testing</option>')}<div id="restart-controls" hidden>${selectField('restart_target','Server to restart',(c.targets || []).map(t=>`<option value="${escape(t.name)}">${escape(t.name)}</option>`).join(''))}<p class="hint" id="restart-hook"></p><p class="hint">Runs only the restart command already configured for this server.</p></div><div>${selectField('baseline_id','Compare with baseline',baselineOptions(state.prefillBaseline || ''))}${schemaField('limit_regression_percent',limits.regression_percent,state.bootstrap.limits_schema.properties.regression_percent,{label:'Regression threshold (%)',hint:''})}</div></div></div></details>
+  <details class="setup-disclosure" id="execution-settings"><summary>Saved evidence, baseline & restart options</summary><div class="details-content"><div class="fields">${selectField('retention','Keep response text',['failures','all','none'].map(mode=>`<option value="${mode}" ${mode===(c.retention||'failures')?'selected':''}>${{failures:'Failures only',all:'All',none:'None'}[mode]}</option>`).join(''),{hint:'',help:'Questions and expected answers are always saved with the run. This setting controls whether response text and evaluator reasons are kept. Timings, status and scores are always saved. It does not cap disk use; storage limits do.'})}${field('name','Endpoint name',target.name,{required:true,placeholder:'local'})}${selectField('mode','Server startup','<option value="normal">Use the running server</option><option value="cold-start">Restart one server before testing</option>')}<div id="restart-controls" hidden>${selectField('restart_target','Server to restart',(c.targets || []).map(t=>`<option value="${escape(t.name)}">${escape(t.name)}</option>`).join(''))}<p class="hint" id="restart-hook"></p><p class="hint">Runs only the restart command already configured for this server.</p></div><div>${selectField('baseline_id','Compare with baseline',baselineOptions(state.prefillBaseline || ''))}${schemaField('limit_regression_percent',limits.regression_percent,state.bootstrap.limits_schema.properties.regression_percent,{label:'Timing regression threshold (%)',hint:''})}${schemaField('limit_regression_rate_points',limits.regression_rate_points,state.bootstrap.limits_schema.properties.regression_rate_points,{label:'Rate regression threshold (percentage points)',hint:''})}</div></div></div></details>
   </div><section id="request-plan" class="request-plan review-section"></section><div id="setup-history" hidden></div>
   </div></section></section></div>
 <section class="panel form-section" id="config-panel-json" role="tabpanel" aria-labelledby="config-tab-json" hidden><h2>Run configuration</h2><p class="hint">Apply changes before returning to the form.</p>${renderField('config_editor','Configuration · JSON',`<textarea class="config-editor" id="config-editor" spellcheck="false">${escape(state.jsonDraft ?? JSON.stringify(c,null,2))}</textarea>`,{controlId:'config-editor',hint:'',help:[fieldDescription('config_editor').help,inputRetentionNotice].join(' ')})}<div class="editor-actions"><button class="button small" type="button" data-action="apply-config">Apply changes</button><span class="hint" id="json-status" role="status"></span></div></section><aside id="run-blueprint" class="run-blueprint" tabindex="0" aria-label="Run plan" hidden></aside>
@@ -2773,7 +2774,7 @@ function readForm(allowEmpty=false) {
   for(const name of ['max_requests','max_duration_seconds','concurrency'])if(form.elements[`${name}_enabled`])data.set(`${name}_enabled`,form.elements[`${name}_enabled`].checked?'on':'off');
   config=configureRunLimits(config,data,{allowInvalid:allowEmpty});
   config.limits ||= {};
-  for(const key of [...limitFields.map(x=>x[0]),'max_error_rate','min_correctness','min_samples','regression_percent']){if(!data.has(`limit_${key}`))continue;const v=data.get(`limit_${key}`);config.limits[key]=v===''?null:Number(v)/(['max_error_rate','min_correctness'].includes(key)?100:1);}
+  for(const key of [...limitFields.map(x=>x[0]),'max_error_rate','min_correctness','min_samples','regression_percent','regression_rate_points']){if(!data.has(`limit_${key}`))continue;const v=data.get(`limit_${key}`);config.limits[key]=v===''?null:Number(v)/(['max_error_rate','min_correctness'].includes(key)?100:1);}
   if(form.elements.samples)config.samples=Number(form.elements.samples.value);
   if(form.elements.retention)config.retention=form.elements.retention.value;
   if(form.elements.stream)config.stream=form.elements.stream.value==='true';
@@ -4002,6 +4003,11 @@ async function startNewRun(){
   if(location.hash!=='#new'){location.hash='#new';return;}
   renderNew();enterRoute();window.scrollTo?.({top:0,left:0,behavior:'instant'});
 }
+function normalizeRateThreshold(config){
+  const result=clone(config),defaultValue=state.bootstrap.limits_schema?.properties?.regression_rate_points?.default;
+  if(defaultValue!==undefined){result.limits ||= {};if(result.limits.regression_rate_points==null)result.limits.regression_rate_points=defaultValue;}
+  return result;
+}
 async function rerun(){
   const version=state.routeVersion;let source=state.detail.report?.manifest?.config || state.detail.config;
   if(!source){toast('No configuration was saved for this run.');return;}
@@ -4010,6 +4016,7 @@ async function rerun(){
     try{const result=await api('/api/config/draft',{method:'POST',body:JSON.stringify(source)});if(version!==state.routeVersion)return;source=result.config;notes=result.migration_notes;}
     catch(error){toast(error.message);return;}
   }
+  source=normalizeRateThreshold(source);
   replaceMigrationNotes(notes);state.config=clone(source);state.autoModel=null;state.setupStep=1;invalidateModelDiscovery();state.datasetSelection=[];state.config.restart_target=null;state.formMode='normal';state.formRestartTarget=null;state.jsonDraft=null;state.jsonBase=null;state.configView='form';configChanged();state.prefillBaseline=state.detail.baseline_id || '';location.hash='#new';
 }
 function portableConfig(payload) {return {...payload.config,restart_target:payload.mode==='cold-start'?payload.restart_target:null};}
@@ -4025,10 +4032,10 @@ async function restoreDraft() {
   try{
     const draft=JSON.parse(sessionStorage.getItem('giraffe-draft-v1'));
     const legacy=draft?.config?.config_version==null;
-    if(draft&&draft.config?.targets?.length&&(legacy||sameConfig(draft.bootstrap,state.bootstrap.config))){
+    if(draft&&draft.config?.targets?.length&&(legacy||sameConfig(draft.bootstrap&&normalizeRateThreshold(draft.bootstrap),normalizeRateThreshold(state.bootstrap.config)))){
       let config=draft.config,notes=[];
       if(legacy){const result=await api('/api/config/draft',{method:'POST',body:JSON.stringify(config)});config=result.config;notes=result.migration_notes || [];}
-      state.config=config;state.dismissedMigrationNotes=draft.dismissedMigrationNotes || [];
+      state.config=normalizeRateThreshold(config);state.dismissedMigrationNotes=draft.dismissedMigrationNotes || [];
       state.migrationNotes=[...new Set([...(draft.migrationNotes || []),...state.dismissedMigrationNotes,...notes])];
     }else sessionStorage.removeItem('giraffe-draft-v1');
   }catch{}
