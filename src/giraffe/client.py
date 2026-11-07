@@ -213,9 +213,11 @@ def _rejected_evidence_field(body: bytes) -> str | None:
     return None
 
 
-def _answer_spans(output: str, *, stream_stack: list[str] | None = None) -> list[tuple[int, int]] | None:
-    """Locate answer text, retaining delimiter state when classifying a stream incrementally."""
-    cursor, spans = 0, []
+def _answer_spans(
+    output: str, *, stream_stack: list[str] | None = None,
+) -> tuple[list[tuple[int, int]] | None, bool]:
+    """Locate answer text and report whether an orphan close revoked earlier spans."""
+    cursor, spans, answer_reset = 0, [], False
     stack = [] if stream_stack is None else stream_stack
     for tag in _REASONING_TAG.finditer(output):
         name = tag[2].lower()
@@ -229,10 +231,10 @@ def _answer_spans(output: str, *, stream_stack: list[str] | None = None) -> list
                 if not stack:
                     cursor = tag.end()
         else:
-            spans, cursor = [], tag.end()
+            spans, cursor, answer_reset = [], tag.end(), True
     if stack:
-        return None if stream_stack is None else spans
-    return [*spans, (cursor, len(output))]
+        return (None if stream_stack is None else spans), answer_reset
+    return [*spans, (cursor, len(output))], answer_reset
 
 
 def _reasoning_spans(spans: list[tuple[int, int]] | None, length: int) -> list[tuple[int, int]]:
@@ -255,12 +257,13 @@ class _StreamGeneration:
         self.stack: list[str] = []
 
     def receive(self, at: float, answer: str = "", reasoning: str = "", *,
-                final: bool = False) -> tuple[int, int, float | None]:
-        """Return newly confirmed chunk counts and earliest generated-content receipt time."""
+                final: bool = False) -> tuple[int, int, float | None, bool]:
+        """Return chunk counts, first generated-content receipt, and answer revocation."""
         counted = bool(reasoning.strip())
         if not self.pending and "<" not in answer:
             useful = bool(answer.strip())
-            return int(counted or useful), int(useful and not self.stack), at if answer or reasoning else None
+            return (int(counted or useful), int(useful and not self.stack),
+                    at if answer or reasoning else None, False)
 
         parts = [*self.pending, (answer, at, counted, False)]
         text = "".join(part for part, _, _, _ in parts)
@@ -278,7 +281,8 @@ class _StreamGeneration:
             token_offset = match.end()
         token_at = at if reasoning else None
         visible, cursor = [], 0
-        for start, stop in _answer_spans(confirmed, stream_stack=self.stack):
+        spans, answer_reset = _answer_spans(confirmed, stream_stack=self.stack)
+        for start, stop in spans:
             visible.extend((" " * (start - cursor), confirmed[start:stop]))
             cursor = stop
         answer_text = "".join(visible)
@@ -292,13 +296,15 @@ class _StreamGeneration:
             if not already_counted and generated[offset:next_offset].strip():
                 count += 1
                 already_counted = True
+            if answer_reset:
+                already_answered = False
             if not already_answered and answer_text[offset:next_offset].strip():
                 answers += 1
                 already_answered = True
             if next_offset > max(end, offset):
                 self.pending.append((part[max(0, end - offset):], received_at, already_counted, already_answered))
             offset = next_offset
-        return count, answers, token_at
+        return count, answers, token_at, answer_reset
 
 
 class LLMClient:
@@ -564,10 +570,18 @@ class LLMClient:
 
         def observe_generation(at: float, answer: str = "", reasoning: str = "", *, final=False):
             nonlocal pending_live_first, pending_live_chunks
-            chunks, answers, token_at = generation.receive(at, answer, reasoning, final=final)
+            chunks, answers, token_at, answer_reset = generation.receive(at, answer, reasoning, final=final)
             if token_at is not None:
                 first_token(token_at, notify=not final)
             record.generation_chunks += chunks
+            if answer_reset:
+                record.answer_chunks = 0
+                if confirmed_progress:
+                    # An orphan close makes earlier apparent answers reasoning,
+                    # including any queued in the current read.
+                    pending_live_first = tool_output is not None
+                    pending_live_chunks = 0
+                    first_output_event.on_answer_reset()
             if confirmed_progress and answers and not final:
                 pending_live_first |= record.answer_chunks == 0 and tool_output is None
                 pending_live_chunks += answers
@@ -1003,18 +1017,29 @@ class LLMClient:
             from .fixtures import final_answer
             final, stripped, _ = final_answer(record.output)
             record.answer_chars = len(final)
-            spans = _answer_spans(record.output)
-            if (record.reasoning.strip() or stripped) and not record.reasoning_tokens:
+            spans, _ = _answer_spans(record.output)
+            if spans is None:
+                record.answer_chunks = 0
+            if ((record.reasoning.strip() or stripped) and not record.reasoning_tokens
+                    and record.completion_tokens != 0):
                 record.output_tokens = None
             record.reasoning_stripped = record.reasoning_stripped or stripped
             reasoning_spans = _reasoning_spans(spans, len(record.output))
             reasoning_output = _mask_reasoning_tags(record.output) if stripped else ""
             # Inline reasoning is known only once all fragments/tags have been
             # parsed. Reclassify bounded metadata without retaining extra text.
-            if stripped:
-                for event, offset, end in content_event_spans:
-                    answer_text = "".join(record.output[max(a, offset):min(b, end)] for a, b in spans or ())
-                    has_answer = bool(answer_text.strip())
+            answer_events = 0
+            for event, offset, end in content_event_spans:
+                answer_text = ("".join(record.output[max(a, offset):min(b, end)] for a, b in spans or ())
+                               if stripped else record.output[offset:end])
+                has_answer = bool(answer_text.strip())
+                if has_answer:
+                    answer_events += 1
+                    if answer_events == 2:
+                        record.second_answer_event_ms = event["at_ms"]
+                        if not stripped:
+                            break
+                if stripped:
                     has_reasoning = any(reasoning_output[max(a, offset):min(b, end)].strip()
                                         for a, b in reasoning_spans)
                     event["kind"] = ("answer_and_reasoning" if has_answer and has_reasoning else

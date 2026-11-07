@@ -46,7 +46,7 @@ def _tokens(records: list[RequestRecord]) -> tuple[int, int]:
 
 def _has_streamed_answer(record: RequestRecord) -> bool:
     # Retained usage can contradict text classified as answer during the stream.
-    return (record.stream and record.output_tokens != 0
+    return (record.stream and record.output_tokens != 0 and record.completion_tokens != 0
             and record.answer_reads >= 2 and record.answer_chunks >= 2)
 
 
@@ -645,7 +645,11 @@ def _interference(observation, window, control, user_records, criteria, health, 
                 short_span = ((probe.request_body_sent_ms, first)
                               if probe.request_body_sent_ms is not None and first is not None else None)
             else:
-                trigger_span = short_span = span
+                if span is None or probe.second_answer_event_ms is None:
+                    excluded.add("Second short-user answer event receipt is unavailable.")
+                    continue
+                second_answer = probe.timing_start_ms + probe.second_answer_event_ms
+                trigger_span = short_span = (max(span[0], second_answer), span[1])
             if trigger_span is None or short_span is None:
                 continue
             lo = bisect_left(candidates, trigger_span[0], key=trigger_time)
