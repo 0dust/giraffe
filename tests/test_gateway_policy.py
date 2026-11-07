@@ -108,6 +108,18 @@ async def exercise(monkeypatch, mode="key_rpm", *, behavior="enforce", full=Fals
             usage["total_tokens"] = 99
         if who == "peer" and behavior == "peer_omitted_total":
             del usage["total_tokens"]
+        if who == "peer":
+            huge = 10**309
+            if behavior == "peer_unbounded_completion":
+                usage.update(completion_tokens=huge, total_tokens=huge + 8)
+            elif behavior == "peer_unbounded_reasoning":
+                del usage["total_tokens"]
+                usage["completion_tokens_details"] = {"reasoning_tokens": huge}
+            elif behavior == "peer_unbounded_cached":
+                del usage["total_tokens"]
+                usage["prompt_tokens_details"] = {"cached_tokens": huge}
+            elif behavior == "peer_unbounded_total":
+                usage["total_tokens"] = huge
         if behavior == "reasoning_work" and who == "limited":
             usage = {"prompt_tokens": 8, "completion_tokens": 128,
                      "completion_tokens_details": {"reasoning_tokens": 126}}

@@ -666,15 +666,16 @@ class LLMClient:
                 record.backend_id = backend
             usage = data.get("usage")
             if isinstance(usage, dict):
-                count = _gateway_token_count if attribution else _token_count
+                count = _gateway_token_count if attribution or policy_probe else _token_count
                 prompt_tokens = count(usage.get("prompt_tokens"))
                 completion_tokens = count(usage.get("completion_tokens"))
                 cached = usage.get("prompt_tokens_details")
                 cached_tokens = count(cached.get("cached_tokens")) if isinstance(cached, dict) else None
                 details = usage.get("completion_tokens_details")
                 reasoning_tokens = count(details.get("reasoning_tokens")) if isinstance(details, dict) else None
-                if attribution:
-                    # Even a provisional frame must not supply unbounded counters.
+                if priority_probe:
+                    _check_gateway_usage_total(prompt_tokens, completion_tokens, _gateway_usage_total(usage))
+                elif attribution or policy_probe:
                     _gateway_token_count(usage.get("total_tokens"))
                 record.input_tokens = prompt_tokens
                 record.completion_tokens = record.output_tokens = completion_tokens
@@ -994,12 +995,8 @@ class LLMClient:
                         observed_at = start + record.stream_end_ms / 1000 if record.stream_end_ms is not None else time.perf_counter()
                         data = (_object(body, strict_gateway_json=True)
                                 if attribution or policy_probe else _object(body))
-                        usage = data.get("usage")
-                        if priority_probe and isinstance(usage, dict):
-                            _check_gateway_usage_total(_token_count(usage.get("prompt_tokens")),
-                                                       _token_count(usage.get("completion_tokens")),
-                                                       _gateway_usage_total(usage))
                         receive(data, streaming=False, observed_at=observed_at)
+                        usage = data.get("usage")
                         if attribution and isinstance(usage, dict):
                             _check_gateway_usage_total(record.input_tokens, record.completion_tokens, _gateway_usage_total(usage))
                         record.stream_terminated = True

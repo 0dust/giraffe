@@ -52,6 +52,23 @@ async def test_priority_requires_consistent_supplied_usage_total(monkeypatch, be
     assert summary["qualification"] == ("observed" if expected == "pass" else "unverified")
 
 
+@pytest.mark.usefixtures("local_tokenizer")
+@pytest.mark.parametrize("mode", ["key_rpm", "priority_rpm"])
+@pytest.mark.parametrize("counter", ["completion", "reasoning", "cached", "total"])
+async def test_policy_rejects_unbounded_usage_before_reporting(monkeypatch, mode, counter):
+    check, report, _ = await exercise(monkeypatch, mode, behavior=f"peer_unbounded_{counter}", full=True)
+    assert check.status == "inconclusive"
+    assert check.metrics["gateway_policy"]["qualification"] == "unverified"
+    peers = [record for record in report.requests if record.identity == "peer"]
+    assert len(peers) == 8
+    for record in peers:
+        assert record.http_status == 200 and not record.valid
+        assert record.completion_tokens is None
+        assert record.reasoning_tokens is None
+        assert record.cached_prompt_tokens is None
+    assert str(10**309) not in report.model_dump_json()
+
+
 async def test_strict_priority_rejection_precludes_later_borrowing(monkeypatch):
     _, run, _ = await exercise(monkeypatch, "priority_rpm", saturation_threshold=.29,
         users=[dict(identity="limited", requests=5, rpm=2, priority="low"),
