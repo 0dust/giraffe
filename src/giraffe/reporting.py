@@ -2211,34 +2211,39 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
             refs_match = settings is not None and all(
                 user.identity in current_refs and current_refs[user.identity] == old_refs.get(user.identity)
                 for user in settings.users)
+            current_users, old_users = current_policy.get("users", []), old_policy.get("users", [])
+            identities = {user.identity for user in settings.users} if settings else set()
+            outcomes_match = all(len(users) == len(identities)
+                                 and {user.get("identity") for user in users} == identities
+                                 for users in (current_users, old_users))
             source = report.manifest.get("gateway_policy_source_sha256")
             old_source = baseline.manifest.get("gateway_policy_source_sha256")
             if not target_reasons and (not source or not old_source):
                 # Earlier policy reports attested their source in the full workload identity.
                 source = report.manifest["fixture_pack"].get("workload_fixture_sha256")
                 old_source = baseline.manifest["fixture_pack"].get("workload_fixture_sha256")
-            compatible = (not target_reasons and refs_match and isinstance(source, str) and bool(source)
+            compatible = (not target_reasons and refs_match and outcomes_match
+                          and isinstance(source, str) and bool(source)
                           and source == old_source
                           and current_policy.get("version") == old_policy.get("version") == POLICY_VERSION
                           and settings == old_settings
                           and settings.model_dump(mode="json") == current_policy.get("settings") == old_policy.get("settings")
                           and old_check is not None and old_check.status == "pass"
                           and old_policy.get("qualification") == "observed")
-            for user in current_policy.get("users", []):
-                previous = next((item for item in old_policy.get("users", []) if item["identity"] == user["identity"]), None)
-                status = (current_check.status if compatible and previous and current_check.status in {"pass", "fail"}
-                          else "inconclusive")
-                rows.append({"check": "gateway_policy", "scenario": user["identity"],
-                    "user_id": user["identity"], "metric": "policy_acceptance", "aggregation": "observed",
-                    "status": status, "current": current_policy.get("qualification"),
-                    "baseline": old_policy.get("qualification"),
-                    "current_samples": user["dispatched"], "baseline_samples": previous["dispatched"] if previous else 0,
-                    "current_outcomes": user, "baseline_outcomes": previous,
-                    "qualification": current_policy.get("qualification"), "threshold": 0,
-                    "worsening": 100 if status == "fail" else 0,
-                    "reason": current_check.summary if compatible and previous else
-                              "Policy identity references, settings, source, summary version or qualified passing baseline do not match.",
-                    "evidence_ids": user["request_ids"]})
+            status = (current_check.status if compatible and current_check.status in {"pass", "fail"}
+                      else "inconclusive")
+            rows.append({"check": "gateway_policy", "scenario": "gateway_policy", "scenario_label": "Whole policy",
+                "metric": "policy_acceptance", "aggregation": "observed",
+                "status": status, "current": current_policy.get("qualification"),
+                "baseline": old_policy.get("qualification"),
+                "current_samples": sum(user["dispatched"] for user in current_users),
+                "baseline_samples": sum(user["dispatched"] for user in old_users),
+                "current_outcomes": current_users, "baseline_outcomes": old_users,
+                "qualification": current_policy.get("qualification"), "threshold": 0,
+                "worsening": 100 if status == "fail" else 0,
+                "reason": current_check.summary if compatible else
+                          "Policy identities, outcomes, settings, source, summary version or qualified passing baseline do not match.",
+                "evidence_ids": [request_id for user in current_users for request_id in user["request_ids"]]})
         slot_changes = _scheduled_user_slot_changes(report, baseline, name)
         user_rows, user_reasons = _compare_user_delivery(report, baseline, name, target_reasons, threshold, slot_changes)
         rows.extend(user_rows)
@@ -3516,9 +3521,18 @@ def _baseline_table_html(baseline: dict[str, Any], report: RunReport | None = No
                               " tokens" if metric == "output_tokens" else
                               " chars" if metric == "output_chars" else "")
                     change = f"{after - before:+,.1f}{suffix} · from zero"
+
+            def cell(side, qualification):
+                outcomes = row.get(f"{side}_outcomes")
+                details = ""
+                if row.get("metric") == "policy_acceptance" and isinstance(outcomes, list):
+                    details = "".join(f'<div><small>{_e(user["identity"])} · {_e(user["admitted"])} admitted · '
+                                      f'{_e(user["rejected"])} rejected</small></div>' for user in outcomes)
+                return f'<td>{value(qualification)}{details}</td>'
+
             verdict, tone = _baseline_verdict(row)
             parts.append(f'<tr><th scope="row">{_e(label)}</th>'
-                         f'<td>{value(before)}</td><td>{value(after)}</td>'
+                         f'{cell("baseline", before)}{cell("current", after)}'
                          f'<td class="{tone}">{_e(change)}</td>'
                          f'<td><strong class="{tone}">{verdict}</strong></td>')
             if reason_column:

@@ -358,7 +358,7 @@ def test_policy_reports_exports_ui_and_baseline(tmp_path, capsys, monkeypatch):
     matched = compare_baseline(report, report.model_copy(deep=True))
     assert matched.baseline["status"] == "pass", matched.baseline
     rows = matched.baseline["targets"][0]["comparisons"]
-    assert len([row for row in rows if row["metric"] == "policy_acceptance"]) == 2
+    assert len([row for row in rows if row["metric"] == "policy_acceptance"]) == 1
     different = report.model_copy(deep=True)
     different.manifest["config"]["gateway_policy"]["duration_seconds"] = 1
     assert compare_baseline(report, different).baseline["status"] == "inconclusive"

@@ -3869,6 +3869,10 @@ function comparisonWarningSummary(row) {
   }
   return [...new Set(notes.length?notes:comparisonWarnings(row))];
 }
+function comparisonPolicyOutcomes(outcomes) {
+  if(!Array.isArray(outcomes))return '';
+  return outcomes.map(user=>`<div><small>${escape(user.identity)} · ${number(user.admitted)} admitted · ${number(user.rejected)} rejected</small></div>`).join('');
+}
 function comparisonTable(rows) {
   return `<div class="comparison-values">${rows.map(row=>{
     const warnings=comparisonWarnings(row),shortWarnings=comparisonWarningSummary(row),commonWindow=row.aggregation==='common_window';
@@ -3878,7 +3882,7 @@ function comparisonTable(rows) {
     else if(commonWindow)label=row.status==='fail'?'Observed decrease':warnings.length?'Warning':'Observed';
     else if(row.descriptive)label='Observed';
     else label=row.status==='fail'?'Regression detected':warnings.length?'Warning':'No material regression';
-    return `<article class="comparison-measurement" data-metric="${escape(row.metric)}"><div class="comparison-measurement-heading"><h4>${escape(comparisonMetricLabel(row))}</h4><small>${aggregation} · ${escape(label)}</small></div><dl class="comparison-value-grid"><div><dt>Baseline</dt><dd>${comparisonValue(row,row.baseline)}</dd><small>n=${number(row.baseline_samples)}</small></div><div><dt>Current</dt><dd>${comparisonValue(row,row.current)}</dd><small>n=${number(row.current_samples)}</small></div><div><dt>Change</dt><dd>${comparisonChange(row)}</dd></div></dl>${commonWindow&&row.method?`<p class="hint">${escape(row.method)}</p>`:''}${warnings.length?`<div class="comparison-brief-warning">${shortWarnings.map(w=>`<p>${escape(w)}</p>`).join('')}<details class="comparison-support"><summary>Why this warning?</summary><ul>${warnings.map(w=>`<li>${escape(w)}</li>`).join('')}</ul></details></div>`:''}${row.worsening_interval_95?`<details class="comparison-statistics"><summary>Statistical details</summary><p>95% interval for worsening: ${row.worsening_interval_95.map(v=>number(v,1)).join(' to ')} ${row.change_unit==='percentage_points'?'percentage points':'%'}. Threshold: ${number(row.threshold,1)} ${row.change_unit==='percentage_points'?'percentage points':'%'}. Warnings still apply.</p></details>`:''}</article>`;
+    return `<article class="comparison-measurement" data-metric="${escape(row.metric)}"><div class="comparison-measurement-heading"><h4>${escape(comparisonMetricLabel(row))}</h4><small>${aggregation} · ${escape(label)}</small></div><dl class="comparison-value-grid"><div><dt>Baseline</dt><dd>${comparisonValue(row,row.baseline)}</dd><small>n=${number(row.baseline_samples)}</small>${row.metric==='policy_acceptance'?comparisonPolicyOutcomes(row.baseline_outcomes):''}</div><div><dt>Current</dt><dd>${comparisonValue(row,row.current)}</dd><small>n=${number(row.current_samples)}</small>${row.metric==='policy_acceptance'?comparisonPolicyOutcomes(row.current_outcomes):''}</div><div><dt>Change</dt><dd>${comparisonChange(row)}</dd></div></dl>${commonWindow&&row.method?`<p class="hint">${escape(row.method)}</p>`:''}${warnings.length?`<div class="comparison-brief-warning">${shortWarnings.map(w=>`<p>${escape(w)}</p>`).join('')}<details class="comparison-support"><summary>Why this warning?</summary><ul>${warnings.map(w=>`<li>${escape(w)}</li>`).join('')}</ul></details></div>`:''}${row.worsening_interval_95?`<details class="comparison-statistics"><summary>Statistical details</summary><p>95% interval for worsening: ${row.worsening_interval_95.map(v=>number(v,1)).join(' to ')} ${row.change_unit==='percentage_points'?'percentage points':'%'}. Threshold: ${number(row.threshold,1)} ${row.change_unit==='percentage_points'?'percentage points':'%'}. Warnings still apply.</p></details>`:''}</article>`;
   }).join('')}</div>`;
 }
 function comparisonCohort(row){return row.load_point?['source','type','workload','shape','pattern','level','rate','bursts','phase','role'].map(name=>row.load_point[name]):row.scenario;}
