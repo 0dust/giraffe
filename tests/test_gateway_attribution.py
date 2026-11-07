@@ -36,7 +36,8 @@ def spend_page(request, rows, *, total=None, **overrides):
 
 
 async def exercise(monkeypatch, mode="match", *, stream=True, full=False, missing_shared=False,
-                   bob_header=None, bob_authorization=None, usage_overrides=None):
+                   bob_header=None, bob_authorization=None, usage_overrides=None,
+                   stream_delta=None, delta_placement=None):
     from giraffe.gateway_attribution import execute, result
     for ref in ("ALICE", "BOB", "OBSERVER"):
         monkeypatch.setenv(ref, "secret-" + ref)
@@ -120,9 +121,13 @@ async def exercise(monkeypatch, mode="match", *, stream=True, full=False, missin
             after_finish = 'data: {"choices":[],"usage":{"total_tokens":99}}\n\ndata: {"choices":[],' + terminal_usage + '}\n\n'
         else:
             after_finish = '' if mode == "usage_on_finish" else 'data: {"choices":[],' + terminal_usage + '}\n\n'
-        if mode.startswith("late_"):
-            late = {"choices": [{"delta": {mode.removeprefix("late_"): "reasoned after usage"}}]}
-            after_finish += "data: " + json.dumps(late) + "\n\n"
+        if delta_placement == "finish":
+            finish = json.dumps({"choices": [{"delta": stream_delta, "finish_reason": "stop"}], "usage": usage})[1:-1]
+        elif delta_placement == "usage":
+            finish = '"choices":[{"delta":{},"finish_reason":"stop"}]'
+            after_finish = "data: " + json.dumps({"choices": [{"delta": stream_delta}], "usage": usage}) + "\n\n"
+        elif delta_placement == "late":
+            after_finish += "data: " + json.dumps({"choices": [{"delta": stream_delta}]}) + "\n\n"
         return httpx.Response(200, text=(
             'data: {"choices":[{"delta":{"content":"OK"},"finish_reason":null}],"usage":{"prompt_tokens":3,"completion_tokens":2}}\n\n'
             'data: {' + finish + '}\n\n' + after_finish + 'data: [DONE]\n\n'))
@@ -189,12 +194,42 @@ async def test_out_of_range_gateway_usage_never_reaches_request_counters(monkeyp
 
 @pytest.mark.parametrize("field", ["reasoning_content", "reasoning"])
 async def test_reasoning_after_terminal_usage_invalidates_marked_stream(monkeypatch, field):
-    _, run, check, _, _ = await exercise(monkeypatch, "late_" + field)
+    _, run, check, _, _ = await exercise(monkeypatch,
+        stream_delta={field: "reasoned after usage"}, delta_placement="late")
     assert check.status == "inconclusive" and check.metrics["matched_requests"] == 0
     assert len(run.records) == 2
     for record in run.records:
         assert record.status == "failed" and "reasoning content arrived after" in record.error
         assert record.reasoning == "" and not record._gateway_terminal_usage
+
+
+@pytest.mark.parametrize("delta", [
+    {"refusal": "I cannot comply"},
+    {"function_call": {"name": "lookup"}},
+    {"function_call": {"arguments": '{"n":1}'}},
+    {"audio": {"data": "dGVzdA=="}},
+    {"audio": {"transcript": "spoken answer"}},
+])
+@pytest.mark.parametrize("placement", ["usage", "late"])
+async def test_generated_delta_after_finish_invalidates_marked_usage(monkeypatch, delta, placement):
+    _, run, check, _, _ = await exercise(monkeypatch, stream_delta=delta, delta_placement=placement)
+    assert check.status == "inconclusive" and check.metrics["matched_requests"] == 0
+    assert len(run.records) == 2
+    for record in run.records:
+        assert record.status == "failed" and "content arrived after the finish reason" in record.error
+        assert not record._gateway_terminal_usage
+
+
+@pytest.mark.parametrize("delta,placement", [
+    ({"refusal": "I cannot comply"}, "finish"),
+    ({"function_call": {"name": "lookup", "arguments": '{"n":1}'}}, "finish"),
+    ({"audio": {"data": "dGVzdA==", "transcript": "spoken answer"}}, "finish"),
+    ({"audio": {"id": "audio_1", "expires_at": 2_000_000_000}}, "usage"),
+    ({"audio": {"expires_at": 2_000_000_000}}, "late"),
+])
+async def test_final_generation_and_audio_metadata_preserve_marked_usage(monkeypatch, delta, placement):
+    _, _, check, _, _ = await exercise(monkeypatch, stream_delta=delta, delta_placement=placement)
+    assert check.status == "pass" and check.metrics["matched_requests"] == 2
 
 
 @pytest.mark.parametrize("mode,state,status", [
