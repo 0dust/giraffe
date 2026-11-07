@@ -270,6 +270,7 @@ class _Run:
         self.request_limit_scopes: set[str] = set()
         self.concurrency_limit_scopes: set[str] = set()
         self.duration_limit_scope: str | None = None
+        self.user_stop_scope: Literal["gateway"] | None = None
         self._gateway_only_phase = False
         self.memory_limit_reached = False
         self.memory_stop_reason = None
@@ -467,18 +468,20 @@ class _Run:
                 or (self.config.restart_target and (not restart or restart["status"] != "ready"))):
             yield
             return
-        # Attribute the first reached deadline to the phase that owned it,
+        # Attribute a deadline or user stop to the phase that owned it,
         # including when the monitor has not had a chance to wake.
-        if time.monotonic() >= self.deadline:
+        if self.stop.is_set() or time.monotonic() >= self.deadline:
             self.stop_reason()
         previous = self._gateway_only_phase
         self._gateway_only_phase = True
         try:
             yield
         finally:
-            if time.monotonic() >= self.deadline:
-                self.stop_reason()
-            self._gateway_only_phase = previous
+            try:
+                if self.stop.is_set() or time.monotonic() >= self.deadline:
+                    self.stop_reason()
+            finally:
+                self._gateway_only_phase = previous
 
     def inline_gateway_limit_phase(self):
         ordinary = set(self.config.checks) - SHARED_BASELINE_EXCLUDED_WORKLOADS - {"gpu"}
@@ -529,6 +532,12 @@ class _Run:
         if self.errors >= self.config.stop_after_errors:
             self.reason = self.reason or "error threshold reached"
         self.reason = self.reason or previous
+        if (self.reason == "cancelled by user" and previous != self.reason and self._gateway_only_phase
+                and all(check in SHARED_BASELINE_EXCLUDED_WORKLOADS for _, check in self.pending_checks)
+                and all(checks <= SHARED_BASELINE_EXCLUDED_WORKLOADS for checks in self.unfinished.values())
+                and not any(health["abort_reason"] for health in self.endpoint_health.values())):
+            # A user stop also skips judging, which the inference deadline allows.
+            self.user_stop_scope = "gateway"
         if self.reason and self.reason != "maximum request budget reached" and not self.stop_notified:
             self.stop_notified = True
             self.emit("run_stopping", abort_reason=self.reason)
@@ -2925,6 +2934,7 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
                     "request_limit_scopes": sorted(run.request_limit_scopes),
                     "concurrency_limit_scopes": sorted(run.concurrency_limit_scopes),
                     **({"duration_limit_scope": run.duration_limit_scope} if run.duration_limit_scope else {}),
+                    **({"user_stop_scope": run.user_stop_scope} if run.user_stop_scope else {}),
                     "inference_duration_seconds": inference_duration,
                     **({"judging": judging_summary} if judging_summary is not None else {}),
                     "replica_coverage": [{"target": t.name, "route": t.route, "parent": t.parent,

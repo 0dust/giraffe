@@ -443,7 +443,11 @@ def _settings_reasons(report: RunReport, baseline: RunReport, *, details: dict[s
         gateway_deadline = (run.abort_reason == "maximum run duration reached"
                             and "max_duration_seconds" in run.limits_reached
                             and "max_duration_seconds" not in limits)
-        return run.observations.get("target_abort_reasons") or (run.abort_reason and not (gateway_budget or gateway_deadline))
+        gateway_user_stop = (run.abort_reason == "cancelled by user"
+                             and run.observations.get("user_stop_scope") == "gateway"
+                             and _mixed_gateway_run(run))
+        return run.observations.get("target_abort_reasons") or (
+            run.abort_reason and not (gateway_budget or gateway_deadline or gateway_user_stop))
 
     if shared_abort(report, current_limits):
         reasons.append("Current run was aborted; incomplete traffic cannot establish a regression.")
