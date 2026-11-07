@@ -213,9 +213,10 @@ def _rejected_evidence_field(body: bytes) -> str | None:
     return None
 
 
-def _answer_spans(output: str) -> list[tuple[int, int]] | None:
-    """Raw-output spans that fixtures.final_answer keeps; None when reasoning is unclosed."""
-    cursor, spans, stack = 0, [], []
+def _answer_spans(output: str, *, stream_stack: list[str] | None = None) -> list[tuple[int, int]] | None:
+    """Locate answer text, retaining delimiter state when classifying a stream incrementally."""
+    cursor, spans = 0, []
+    stack = [] if stream_stack is None else stream_stack
     for tag in _REASONING_TAG.finditer(output):
         name = tag[2].lower()
         if not tag[1]:
@@ -229,7 +230,9 @@ def _answer_spans(output: str) -> list[tuple[int, int]] | None:
                     cursor = tag.end()
         else:
             spans, cursor = [], tag.end()
-    return None if stack else [*spans, (cursor, len(output))]
+    if stack:
+        return None if stream_stack is None else spans
+    return [*spans, (cursor, len(output))]
 
 
 def _reasoning_spans(spans: list[tuple[int, int]] | None, length: int) -> list[tuple[int, int]]:
@@ -240,38 +243,55 @@ def _reasoning_spans(spans: list[tuple[int, int]] | None, length: int) -> list[t
     return [*result, (start, length)]
 
 
-class _GenerationChunks:
-    """Defer counting delta fragments that may belong to an inline delimiter."""
+def _mask_reasoning_tags(text: str) -> str:
+    return _REASONING_TAG.sub(lambda tag: " " * len(tag[0]), text)
+
+
+class _StreamGeneration:
+    """Classify complete text while retaining a possible split inline delimiter."""
 
     def __init__(self):
-        self.pending: list[tuple[str, bool]] = []
+        self.pending: list[tuple[str, bool, bool]] = []
+        self.stack: list[str] = []
 
-    def receive(self, answer: str = "", reasoning: str = "", *, final: bool = False) -> int:
+    def receive(self, answer: str = "", reasoning: str = "", *,
+                final: bool = False) -> tuple[int, int, bool]:
+        """Return newly confirmed generation chunks, answer chunks, and token activity."""
         counted = bool(reasoning.strip())
         if not self.pending and "<" not in answer:
-            return int(counted or bool(answer.strip()))
+            useful = bool(answer.strip())
+            return int(counted or useful), int(useful and not self.stack), bool(answer or reasoning)
 
-        parts = [*self.pending, (answer, counted)]
-        text = "".join(part for part, _ in parts)
+        parts = [*self.pending, (answer, counted, False)]
+        text = "".join(part for part, _, _ in parts)
         end = len(text)
         if not final:
             start = text.rfind("<", max(0, end - _MAX_REASONING_TAG_PREFIX))
             if start >= 0 and _REASONING_TAG_PREFIX.fullmatch(text[start:]):
                 end = start
-        # Preserve offsets so each original SSE delta contributes at most once.
-        generated = _REASONING_TAG.sub(lambda tag: " " * len(tag[0]), text[:end])
-        count = int(counted)
-        offset = 0
+        confirmed = text[:end]
+        # Preserve offsets so a split literal contributes at most once per SSE delta.
+        generated = _mask_reasoning_tags(confirmed)
+        visible, cursor = [], 0
+        for start, stop in _answer_spans(confirmed, stream_stack=self.stack):
+            visible.extend((" " * (start - cursor), confirmed[start:stop]))
+            cursor = stop
+        answer_text = "".join(visible)
+
+        count, answers, offset = int(counted), 0, 0
         self.pending = []
-        for part, already_counted in parts:
+        for part, already_counted, already_answered in parts:
             next_offset = offset + len(part)
             if not already_counted and generated[offset:next_offset].strip():
                 count += 1
                 already_counted = True
+            if not already_answered and answer_text[offset:next_offset].strip():
+                answers += 1
+                already_answered = True
             if next_offset > max(end, offset):
-                self.pending.append((part[max(0, end - offset):], already_counted))
+                self.pending.append((part[max(0, end - offset):], already_counted, already_answered))
             offset = next_offset
-        return count
+        return count, answers, bool(reasoning or _REASONING_TAG.sub("", confirmed))
 
 
 class LLMClient:
@@ -506,7 +526,7 @@ class LLMClient:
         reasoning_read_ids: set[int] = set()
         content_event_spans: list[tuple[dict[str, Any], int, int]] = []
         response_sequence = -1
-        generation_chunks = _GenerationChunks()
+        generation = _StreamGeneration()
         conversation = spec.workload.get("selection") == "conversation"
         logprob_collector = LogprobCollector(spec.workload["top_logprobs"], self.logprob_budget) if spec.workload.get("logprobs") and stream else None
         assistant_content_present = False
@@ -518,19 +538,38 @@ class LLMClient:
                 read_id += 1
                 body_received(size)
 
-        def output_event(kind: str, text: str, at: float, *, tokens=None):
-            # Client receipt time, not server generation time. Tool-only TTFT
-            # starts at generated argument content, not ID/type/function names.
-            # No tokenization or text retention is added to the stream reader.
-            # A nonempty whitespace delta is still generated content for TTFT;
-            # useful-answer timing continues to require non-whitespace output.
-            if not stream or not text:
-                return
+        def first_token(at: float):
             if record.first_token_ms is None:
                 record.first_token_ms = (at - start) * 1000
                 record.first_token_reason = None
                 if first_output_event is not None and hasattr(first_output_event, "on_first_token"):
                     first_output_event.on_first_token()
+
+        def observe_generation(at: float, answer: str = "", reasoning: str = "", *, final=False):
+            chunks, answers, has_token = generation.receive(answer, reasoning, final=final)
+            if has_token:
+                first_token(at)
+            record.generation_chunks += chunks
+            if answers and first_output_event is not None:
+                if record.answer_chunks == 0 and tool_output is None:
+                    first_output_event.set()
+                if hasattr(first_output_event, "on_answer_chunk"):
+                    for _ in range(answers):
+                        first_output_event.on_answer_chunk()
+            record.answer_chunks += answers
+
+        def finish_progress(at: float):
+            observe_generation(at, final=True)
+            if first_output_event is not None and hasattr(first_output_event, "on_stream_finished"):
+                first_output_event.on_stream_finished()
+
+        def output_event(kind: str, text: str, at: float, *, tokens=None):
+            # Tool-only TTFT starts at generated arguments, rather than call metadata.
+            # Content TTFT comes from delimiter-aware classification.
+            if not stream or not text:
+                return
+            if kind == "tool_arguments":
+                first_token(at)
             if kind == "reasoning" and read_id not in reasoning_read_ids:
                 if len(record.reasoning_read_timestamps_ms) < _MAX_CONTENT_READS:
                     record.reasoning_read_timestamps_ms.append((at - start) * 1000)
@@ -641,8 +680,7 @@ class LLMClient:
                 if content_event is not None:
                     content_event_spans.append((content_event, len(record.output), len(record.output) + len(answer)))
                 output_event("reasoning", reasoning, now)
-            if streaming:
-                record.generation_chunks += generation_chunks.receive(answer, reasoning)
+                observe_generation(now, answer, reasoning)
             calls = content.get("tool_calls")
             if calls is not None:
                 if not isinstance(calls, list) or len(calls) > MAX_TOOL_CALLS:
@@ -678,11 +716,11 @@ class LLMClient:
                     part["function"]["arguments"] += arguments
                     if streaming:
                         output_event("tool_arguments", arguments, now)
-                    if tool_output is None and (function.get("name") or function.get("arguments")):
+                    if tool_output is None and (name or arguments):
                         tool_output = now
-                    if record.first_output_ms is None and (function.get("name") or function.get("arguments")):
-                        record.first_output_ms = (now-start)*1000
-                        if first_output_event is not None:
+                        if record.first_output_ms is None:
+                            record.first_output_ms = (now-start)*1000
+                        if first_output_event is not None and record.answer_chunks == 0:
                             first_output_event.set()
             if answer:
                 if record.finish_reason is not None:
@@ -697,17 +735,13 @@ class LLMClient:
                 if answer.strip():
                     if record.first_output_ms is None:
                         record.first_output_ms = (now - start) * 1000
-                        if first_output_event is not None:
+                        if not streaming and first_output_event is not None:
                             first_output_event.set()
                     if streaming and last_answer is not None:
                         record.max_stream_gap_ms = max(
                             record.max_stream_gap_ms or 0, (now - last_answer) * 1000,
                         )
                     last_answer = now
-                    if streaming:
-                        record.answer_chunks += 1
-                        if first_output_event is not None and hasattr(first_output_event, "on_answer_chunk"):
-                            first_output_event.on_answer_chunk()
                 if record.first_output_ms is not None:
                     record.last_output_ms = (now - start) * 1000
             if reasoning:
@@ -724,7 +758,7 @@ class LLMClient:
                     raise _ProtocolError("repeated completion finish reason")
                 record.finish_reason = finish
                 if streaming:
-                    record.generation_chunks += generation_chunks.receive(final=True)
+                    finish_progress(now)
 
         request_timeout = (spec.request_timeout_seconds if spec.request_timeout_seconds is not None
                            else self.config.request_timeout_seconds)
@@ -844,7 +878,8 @@ class LLMClient:
                             if event_type == "error":
                                 raise _ProtocolError("endpoint returned an SSE error event")
                             if event.strip() == "[DONE]":
-                                record.generation_chunks += generation_chunks.receive(final=True)
+                                if record.finish_reason is None:
+                                    finish_progress(observed_at)
                                 record.stream_end_ms = (observed_at - start) * 1000
                                 record.stream_terminated = True
                                 break
@@ -946,14 +981,15 @@ class LLMClient:
                 record.output_tokens = None
             record.reasoning_stripped = record.reasoning_stripped or stripped
             reasoning_spans = _reasoning_spans(spans, len(record.output))
+            reasoning_output = _mask_reasoning_tags(record.output) if stripped else ""
             # Inline reasoning is known only once all fragments/tags have been
             # parsed. Reclassify bounded metadata without retaining extra text.
             if stripped:
                 for event, offset, end in content_event_spans:
                     answer_text = "".join(record.output[max(a, offset):min(b, end)] for a, b in spans or ())
-                    reasoning_text = "".join(record.output[max(a, offset):min(b, end)] for a, b in reasoning_spans)
                     has_answer = bool(answer_text.strip())
-                    has_reasoning = bool(_REASONING_TAG.sub("", reasoning_text).strip())
+                    has_reasoning = any(reasoning_output[max(a, offset):min(b, end)].strip()
+                                        for a, b in reasoning_spans)
                     event["kind"] = ("answer_and_reasoning" if has_answer and has_reasoning else
                                      "answer" if has_answer else "reasoning")
                     event["token_count"] = event["token_count_source"] = None
@@ -963,7 +999,7 @@ class LLMClient:
                 end = content_reads[index + 1][0] if index + 1 < len(content_reads) else len(record.output)
                 text = "".join(record.output[max(a, offset):min(b, end)] for a, b in spans or ())
                 has_reasoning = stripped and any(
-                    _REASONING_TAG.sub("", record.output[max(offset, a):min(end, b)]).strip()
+                    reasoning_output[max(offset, a):min(end, b)].strip()
                     for a, b in reasoning_spans)
                 if has_reasoning and stream and content_read_id not in reasoning_read_ids:
                     if len(record.reasoning_read_timestamps_ms) < _MAX_CONTENT_READS:
