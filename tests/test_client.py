@@ -14,6 +14,49 @@ def spec(**changes):
     )
 
 
+@pytest.mark.parametrize("route", ["direct", "configured_proxy", "environment_proxy"])
+async def test_noisy_neighbor_upload_evidence_requires_origin_form(route, monkeypatch):
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    paths = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            paths.append(self.path)
+            self.rfile.read(int(self.headers["Content-Length"]))
+            body = b'{"choices":[{"message":{"content":"42"},"finish_reason":"stop"}]}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args):
+            pass
+
+    for name in ("http_proxy", "HTTP_PROXY", "all_proxy", "ALL_PROXY", "no_proxy", "NO_PROXY"):
+        monkeypatch.delenv(name, raising=False)
+    with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": .01})
+        thread.start()
+        try:
+            local_url = f"http://127.0.0.1:{server.server_port}"
+            target = Target(name="local", url=local_url if route == "direct" else "http://origin.invalid", model="test")
+            if route == "environment_proxy":
+                monkeypatch.setenv("HTTP_PROXY", local_url)
+            config = RunConfig(targets=[target], proxy=local_url if route == "configured_proxy" else None)
+            async with LLMClient(target, config) as client:
+                record = await client.execute(spec(stream=False, workload={"scenario": "noisy_neighbors", "role": "probe"}))
+        finally:
+            server.shutdown()
+            thread.join()
+
+    assert record.valid
+    assert paths == ["/v1/chat/completions" if route == "direct" else "http://origin.invalid/v1/chat/completions"]
+    assert (record._request_body_sent_monotonic is not None) == (route == "direct")
+
+
 async def test_client_setup_keeps_event_loop_responsive(monkeypatch):
     import asyncio
     import threading
@@ -813,6 +856,8 @@ async def test_execute_closes_untransferred_sse_iterator_before_return(monkeypat
             payload = "{" if failure == "protocol" else json.dumps(
                 {"choices": [{"delta": {"content": "42"}, "finish_reason": None}]})
             yield "message", payload, time.perf_counter()
+            if kwargs.get("mark_read_end"):
+                yield None, "", time.perf_counter()
             await asyncio.Event().wait()
         finally:
             closed.set()

@@ -1193,7 +1193,26 @@ class Sessions(ConversationSettings):
     concurrency: int = Field(default=2, ge=1, le=MAX_SIMULTANEOUS_REQUESTS)
 
 
+class MultiUserNeighbors(Model):
+    heavy_user_ids: list[str] | None = Field(default=None, min_length=1, max_length=31)
+    heavy_user_count: StrictInt = Field(default=1, ge=1, le=31)
+    heavy_profiles: list[Literal["long_short", "short_long", "long_long"]] = Field(
+        default_factory=lambda: ["long_short", "short_long"], min_length=1, max_length=3)
+    triggers: list[Literal["before_output", "during_stream"]] = Field(
+        default_factory=lambda: ["before_output", "during_stream"], min_length=1, max_length=2)
+    max_slowdown: float | None = Field(default=None, ge=1)
+
+
+class MultiUserCancellation(Model):
+    user_id: str = "user-01"
+    cancel_after_chunks: StrictInt = Field(default=5, ge=1, le=1000)
+
+
 class MultiUser(Model):
+    scenarios: list[Literal["repeated_requests", "noisy_neighbors", "cancellation"]] = Field(
+        default_factory=lambda: ["repeated_requests"], min_length=1, max_length=3)
+    noisy_neighbors: MultiUserNeighbors = Field(default_factory=MultiUserNeighbors)
+    cancellation: MultiUserCancellation = Field(default_factory=MultiUserCancellation)
     levels: list[Annotated[StrictInt, Field(ge=1, le=MAX_SIMULATED_USERS)]] = Field(
         default_factory=lambda: [1, 5, 20], min_length=1, max_length=MAX_SIMULATED_USERS)
     profile: LoadTestProfile = Field(default_factory=LoadTestProfile)
@@ -1208,6 +1227,24 @@ class MultiUser(Model):
 
     @model_validator(mode="after")
     def valid_population(self):
+        if len(set(self.scenarios)) != len(self.scenarios):
+            raise ValueError("multi-user scenarios must be distinct")
+        if self.conversations and self.scenarios != ["repeated_requests"]:
+            raise ValueError("conversation users support the repeated_requests scenario")
+        if any(s != "repeated_requests" for s in self.scenarios) and min(self.levels) < 2:
+            raise ValueError("noisy neighbors and cancellation require at least two users at every level")
+        ids = {f"user-{index + 1:02d}" for index in range(min(self.levels))}
+        if "cancellation" in self.scenarios and self.cancellation.user_id not in ids:
+            raise ValueError("the cancellation user must exist at every population level")
+        if "noisy_neighbors" in self.scenarios:
+            heavy = self.noisy_neighbors
+            if heavy.heavy_user_ids is not None:
+                if len(set(heavy.heavy_user_ids)) != len(heavy.heavy_user_ids) or not set(heavy.heavy_user_ids) < ids:
+                    raise ValueError("heavy user IDs must be distinct, exist at every level and leave a short user")
+            elif heavy.heavy_user_count >= min(self.levels):
+                raise ValueError("heavy user count must leave at least one short user")
+            if len(set(heavy.heavy_profiles)) != len(heavy.heavy_profiles) or len(set(heavy.triggers)) != len(heavy.triggers):
+                raise ValueError("heavy profiles and interference triggers must be distinct")
         if len(set(self.levels)) != len(self.levels) or len(set(self.shapes)) != len(self.shapes):
             raise ValueError("multi-user levels and shapes must be distinct")
         if any(value > 60 for value in self.think_time_seconds.values):
@@ -2512,6 +2549,7 @@ MAX_TOKENS_PER_READ = 16
 
 class RequestRecord(PersistedModel):
     _timing_started_monotonic: float | None = PrivateAttr(default=None)
+    _request_body_sent_monotonic: float | None = PrivateAttr(default=None)
     id: str
     target: str
     fixture_id: str
@@ -2540,6 +2578,8 @@ class RequestRecord(PersistedModel):
     first_token_reason: str | None = "Timing schema predates client content-event collection."
     output_events: list[dict[str, Any]] = Field(default_factory=list)
     output_events_truncated: bool = False
+    # The second useful answer SSE event may arrive in the first answer read.
+    second_answer_event_ms: float | None = Field(default=None, ge=0)
     answer_read_timestamps_ms: list[float] = Field(default_factory=list)
     reasoning_read_timestamps_ms: list[float] = Field(default_factory=list)
     read_timestamps_truncated: bool = False
@@ -2593,6 +2633,7 @@ class RequestRecord(PersistedModel):
     dispatch_ms: float | None = None
     completed_ms: float | None = None
     timing_start_ms: float | None = None
+    request_body_sent_ms: float | None = None
     client_preparation_ms: float = 0
     scheduled_ms: float | None = None
     client_wait_ms: float | None = None
