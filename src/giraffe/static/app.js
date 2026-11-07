@@ -3904,7 +3904,9 @@ function comparisonOutputs(target) {
   return rows;
 }
 function comparisonChange(row) {
-  if(row.metric==='attribution_outcome')return row.status==='inconclusive'?'Not comparable':row.current===row.baseline?'Same outcome':'Outcome changed';
+  if(row.metric==='attribution_outcome'||(row.metric==='policy_acceptance'&&row.check==='gateway_access')){
+    return row.status==='inconclusive'?'Not comparable':row.current===row.baseline?'Same outcome':'Outcome changed';
+  }
   if(row.metric==='policy_acceptance')return row.current===row.baseline?'Same qualification':'Qualification changed';
   if(row.current==null||row.baseline==null)return 'Not measured';
   const delta=row.current-row.baseline;

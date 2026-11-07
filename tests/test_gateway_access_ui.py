@@ -187,15 +187,23 @@ def test_gateway_access_phase_fallback_matches_canonical_label():
                   json.dumps(_SCENARIOS['gateway_access'][0]) + ");", config())
 
 
-def test_access_baseline_shows_decisions_as_policy_evidence():
-    browser_logic(r'''
+@pytest.mark.parametrize("status,current,change,interpretation", [
+    ("pass", "deny", "Same outcome", "Observed"),
+    ("fail", "allow", "Outcome changed", "Observed failure"),
+    ("inconclusive", "deny", "Not comparable", "Unverified"),
+])
+def test_access_baseline_shows_decisions_as_policy_evidence(status, current, change, interpretation):
+    args = json.dumps([status, current, change, interpretation])
+    browser_logic(f"const [status,current,change,interpretation]={args};" + r'''
 const html=renderComparison({baseline:{run_id:'reference',targets:[{target:'proxy',comparisons:[{
   check:'gateway_access',scenario:'invalid',scenario_label:'invalid (denied) · expected deny',
-  metric:'policy_acceptance',aggregation:'observed',status:'fail',
-  baseline:'deny',current:'allow',baseline_samples:1,current_samples:1,
+  metric:'policy_acceptance',aggregation:'observed',status,
+  baseline:'deny',current,baseline_samples:1,current_samples:1,
+  reason:status==='inconclusive'?'Gateway test identity references differ.':undefined,
 }]}]}});
 assert.match(html,/Gateway access decisions/);
 assert.match(html,/invalid \(denied\) · expected deny/);
-assert.match(html,/Observed failure/);
+assert(html.includes(`Policy evidence · ${interpretation}</small>`));
+assert.equal(html.match(/<dt>Change<\/dt><dd>([^<]+)<\/dd>/)?.[1],change);
 assert.doesNotMatch(html,/Response timing/);
 ''', config())
