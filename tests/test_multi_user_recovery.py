@@ -187,6 +187,30 @@ def test_recovery_exposes_one_slow_user_when_median_recovers():
     assert result["worst_user"]["user_id"] == "user-03"
 
 
+@pytest.mark.parametrize("output_tokens", [0, None], ids=["known-zero", "missing-usage"])
+def test_recovery_distinguishes_zero_visible_output_from_missing_usage(output_tokens):
+    source, records = recovery_observation()
+    known_zero = output_tokens == 0
+    for request in records:
+        request.output_tokens = output_tokens
+        if known_zero:
+            request.completion_tokens = request.reasoning_tokens = 16
+
+    result = summarize(source, records)
+    evidence = result["windows"][-1]["recovery"]
+    assert result["status"] == evidence["status"] == "inconclusive"
+    assert not evidence["qualified"]
+    overlap_reason = "This user lacks sustained samples with qualified peer streaming overlap."
+    for user in evidence["users"]:
+        assert user["status"] == "inconclusive"
+        assert (overlap_reason in user["reasons"]) == known_zero
+        for phase, metrics in user["phases"].items():
+            assert metrics["output_tokens"] == output_tokens
+            assert metrics["stream_gap_ms"] == 20
+            assert (f"Actual {phase} stream gaps are unqualified." in user["reasons"]) == known_zero
+            assert (f"Actual {phase} token usage is missing." in user["reasons"]) == (output_tokens is None)
+
+
 @pytest.mark.parametrize("drift_phase", [None, "lighter", "sustained"])
 def test_recovery_checks_actual_lengths_of_each_replay(drift_phase):
     source, records = recovery_observation(lighter_rate=2)
