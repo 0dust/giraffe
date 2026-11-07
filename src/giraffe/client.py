@@ -711,6 +711,8 @@ class LLMClient:
                 cached = usage.get("prompt_tokens_details")
                 cached_tokens = count(cached.get("cached_tokens")) if isinstance(cached, dict) else None
                 details = usage.get("completion_tokens_details")
+                if priority_probe and details is not None and not isinstance(details, dict):
+                    raise _ProtocolError("invalid completion token details in gateway response")
                 raw_reasoning_tokens = details.get("reasoning_tokens") if isinstance(details, dict) else None
                 reasoning_tokens = count(raw_reasoning_tokens)
                 if priority_probe:
