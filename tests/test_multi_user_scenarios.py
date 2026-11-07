@@ -501,6 +501,20 @@ def test_matched_interference_requires_actual_trigger_and_lengths(trigger, profi
     assert user["heavy_request_ids"] == [records[2].id]
 
 
+@pytest.mark.parametrize("all_reasoning_user", ["short", "heavy"])
+def test_interference_excludes_overlap_contradicted_by_zero_answer_tokens(all_reasoning_user):
+    from giraffe.multi_user_metrics import summarize
+
+    source, records = matched_observation()
+    rows = records[:2] if all_reasoning_user == "short" else [records[2]]
+    for item in rows:
+        item.reasoning_tokens = item.completion_tokens = item.output_tokens
+        item.output_tokens = 0
+    user, = summarize(source, records)["windows"][1]["interference"]["users"]
+    assert user["status"] == "inconclusive"
+    assert user["matched_samples"] == 0
+
+
 def test_fairness_threshold_requires_an_eligible_window():
     from giraffe.multi_user_metrics import summarize
 
@@ -746,6 +760,31 @@ def test_cancellation_followup_does_not_substitute_for_peer_overlap(delayed):
     assert evidence["peer_continuation"]["status"] == "inconclusive"
     assert result["status"] == "inconclusive"
     assert source == original
+
+
+@pytest.mark.parametrize(("peer_tokens", "expected"), [(0, "inconclusive"), (None, "pass")])
+def test_cancellation_peer_continuation_excludes_known_zero_answer_tokens(peer_tokens, expected):
+    from giraffe.multi_user_metrics import summarize
+    from tests.test_multi_user_metrics import observation
+
+    cancelled = record("user-01", identity="cancelled", status="cancelled", valid=False, intentional=True,
+        end=100, generation_chunks=2, termination_reason="generation_chunk_limit",
+        client_cancelled_ms=90, client_cancelled_at_ns=1, finish_reason=None)
+    cancelled.workload["cancellation_role"] = "selected"
+    followup = record("user-01", identity="followup", dispatch=200, end=300)
+    followup.workload["cancellation_role"] = "followup"
+    peer = record("user-02", identity="peer", end=400, stream=True, answer_reads=2, answer_chunks=2,
+                  last_output_ms=200, tokens=peer_tokens, score=False,
+                  completion_tokens=2 if peer_tokens == 0 else None,
+                  reasoning_tokens=2 if peer_tokens == 0 else None)
+    records = [cancelled, followup, peer]
+    source = observation(records, criteria={"min_samples": 1, "max_error_percent": None})
+    source["windows"][0].update(scenario="cancellation", selected_user_id="user-01", role="cancellation")
+
+    evidence = summarize(source, records)["windows"][0]["cancellation"]
+    assert evidence["cancellation"]["status"] == evidence["followup"]["status"] == "pass"
+    assert evidence["peer_continuation"]["status"] == evidence["status"] == expected
+    assert evidence["peer_continuation"]["request_ids"] == (["peer"] if expected == "pass" else [])
 
 
 @pytest.mark.parametrize(("peer_overlap", "error_limit", "expected"), [
