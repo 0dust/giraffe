@@ -367,6 +367,32 @@ def test_live_delivery_compares_requested_mix_of_in_window_completions():
     assert rate["evidence_ids"] == ["user-05-0", "user-05-1"]
 
 
+@pytest.mark.parametrize(("field", "value", "current_rate"), [
+    ("output_tokens", 4, 41.6),
+    ("completion_tokens", 300, 80),
+])
+def test_live_delivery_requires_comparable_actual_generation(field, value, current_rate):
+    current, previous = live_user_report(), live_user_report()
+    for report in (current, previous):
+        source = report.observations["targets"]["local"]["multi_user"]
+        window = source["windows"][0]
+        window["scenario"] = "repeated_conversations"
+        for user in window["users"]:
+            user["profile"] = "conversation:chat"
+        if report is current:
+            for request in report.requests:
+                if request.workload["user_id"] == "user-05" and request.workload["turn_id"] == 1:
+                    setattr(request, field, value)
+        report.checks[0].metrics["multi_user"] = summarize(source, report.requests)
+
+    result = compare_baseline(current, previous).baseline
+    delivery = [row for row in result["targets"][0]["comparisons"]
+                if row["metric"] == "shared_window_output_tokens_per_second"]
+    assert [row["status"] for row in delivery] == ["pass"] * 4 + ["inconclusive"]
+    assert (delivery[-1]["current"], delivery[-1]["baseline"]) == (current_rate, 80)
+    assert result["status"] == "inconclusive"
+
+
 def test_live_timing_regression_requires_comparable_reasoning_work():
     current, previous = live_user_report(), live_user_report()
     for request in current.requests:

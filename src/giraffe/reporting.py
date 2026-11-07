@@ -1471,8 +1471,8 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold):
         work_reason, mix_changed = _load_work_comparison(*comparable_work)
         if drain_comparison and _user_token_work_changed(*comparable_work, threshold):
             work_reason = "Observed work including drained requests differs or lacks token evidence."
-        live_work_changed = _live_input_work_changed(*comparable_work, threshold)
-        live_work_reason = ("Observed input work or live generated histories differ or lack evidence."
+        live_work_changed = _live_input_work_changed(*comparable_work, threshold, compare_output=True)
+        live_work_reason = ("Observed work or live generated histories differ or lack evidence."
                             if live_work_changed else None)
         noisy_probe = scenario == "noisy_neighbors" and role == "probe"
         short_probe = noisy_probe and any(evidence.get("user_id") == user_id
