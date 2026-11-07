@@ -968,15 +968,15 @@ loaded the model before the run starts. A deliberate restart may also change sta
 between observations. This is one endpoint’s inventory, not proof about every replica.
 
 
-## Persistent multi-user requests
+## Persistent multi-user work
 
-The opt-in **Multi-user** check keeps a stable simulated user across repeated independent requests. Start with [multi-user.yaml](../examples/multi-user.yaml):
+The opt-in **Multi-user** check keeps a stable simulated user across repeated independent requests or fresh conversations. Start with [multi-user.yaml](../examples/multi-user.yaml):
 
 ```sh
 giraffe run --config examples/multi-user.yaml --output runs/multi-user --html
 ```
 
-Set the endpoint and model first. All simulated users share its optional `api_key_env`; these are workload identities, not separate credentials. This first slice tests repeated independent requests only. Conversations, fairness verdicts, interference, cancellation scenarios, arrivals and recovery remain separate follow-up work.
+Set the endpoint and model first. All simulated users share its optional `api_key_env`; these are workload identities, not separate credentials. Interference, cancellation scenarios, arrivals and recovery remain separate follow-up work.
 
 `multi_user.levels` selects populations of 1–32 users independently of the run's `concurrency` ceiling. The example runs 1, 5 and 20 users behind five shared request slots. Each user sends one request at a time, waits for completion and then pauses. Sleeping users hold no request slot. `think_time_seconds.values` and optional `weights` reuse the session distribution format; `seed` makes each user's profile and pause sequence reproducible across levels. `shapes` selects the existing short/medium/long input-output combinations; `profile` accepts the existing increasing token-size profile. Requests keep the run's request timeout and all existing global budgets.
 
@@ -989,3 +989,34 @@ Optional `max_first_answer_ms` and `max_completion_ms` apply from the time a use
 `max_error_percent` defaults to zero; set it to `null` to omit that criterion. `min_output_tokens_per_second` is optional and measures shared-window delivery, not generation speed. `min_samples` requires that many valid responses for each user. With all acceptance thresholds set to `null`, results are measurements and the check remains inconclusive rather than claiming acceptance.
 
 CLI output, the UI, HTML, JSON and reproduction exports retain every planned user, including those with no requests. Results identify the worst served user and link user rows to their request evidence. Response retention still controls bodies and reasoning. Baselines compare each user at the same population and profile; changing population, shapes, seed, duration or window policy prevents a passing comparison. Shared-window rate changes are observed changes without a cross-run confidence interval. Reproduction exports include user settings, plans and compact outcomes, but do not recreate inaccessible server state.
+
+### Qualified delivery fairness
+
+Set `multi_user.pass_criteria.max_throughput_ratio` to compare **median user throughput / worst user throughput** against a maximum (at least 1). Without a threshold, fairness remains a measurement. A one-user level still contributes to per-user criteria, and the fairness threshold requires a level with at least two users. A zero or unknown worst throughput leaves the ratio undefined. Other selected per-user criteria retain their own failures even when fairness evidence is inconclusive.
+
+Every compared user needs sufficient valid in-window samples, known input/output usage, equivalent active exposure, the same work and pause plans, and qualified streamed overlap with another user. Users need not all overlap at once: twenty users can be compared behind five request slots. The eligible population and concrete qualification reasons appear beside the ratio in CLI, UI, HTML, JSON and exports. `fairness_tolerance_percent` defaults to 10 and applies to differences in actual median token lengths, per-request token length mixes, and active exposure. For length mixes, it bounds the average token difference between corresponding percentiles as a percentage of the smaller mean. Qualification includes total generated tokens and, when requests report cache reuse, uncached input. Throughput still counts answer tokens. An unserved user, early EOS before the requested output shape, incomplete work or client scheduling delay prevents a fairness verdict. Conversations can finish below their output cap when their actual work is comparable. Independently sampled variable pauses or conversation lengths do not establish equal work. The result describes observed delivery fairness; it does not establish a server scheduling defect.
+
+### Repeated conversations
+
+Set `multi_user.conversations` to use the existing conversation settings. Omit it or set it to `null` for independent requests. The Multi-user editor exposes both choices. For example:
+
+```yaml
+multi_user:
+  levels: [2, 5]
+  duration_seconds: 30
+  think_time_seconds: {values: [1]}
+  conversations:
+    profile: correctness
+    modes: [fixed, live]
+    max_tokens: 32
+    delay_seconds: 0.5
+    turns:
+      - Remember the conversation name.
+      - Repeat the original name.
+```
+
+Each user alternates the selected modes across fresh conversations. Fixed histories use the conversation's seeded answer; live histories use actual preceding answers. The outer `think_time_seconds` pauses between conversations, while `delay_seconds` or `sampling.think_time_seconds` pauses between turns. None holds a request slot while sleeping. The optional conversation `sampling` uses the same seed, weighted pause/input/output/turn-count distributions as Sessions; input/output/turn-count sampling requires `profile: performance` with `modes: [live]` and selected `workloads`. Task weights assign each persistent user a stable task independently of population and peer completion order. Performance replies are unscored.
+
+A failed, cancelled or truncated turn stops its conversation without a substitute answer. Truncated conversation output counts as partial output and a request error; it cannot qualify as valid delivered work. The user can then start a fresh conversation, subject to the shared budgets and stop rules. If no turn can be dispatched (for example, its first prompt exceeds the history admission ceiling), that user stops instead of repeatedly attempting the same impossible history. Every conversation has a distinct ID and request/turn links under the same user. Conversation summaries and links survive response retention. Copied live assistant replies are omitted from saved request inputs unless `retention: all`; bodies kept by `retention: failures` remain attached to their original requests. Existing Sessions counts and concurrency semantics remain unchanged.
+
+Reproduction and baseline identity include fairness criteria, comparability tolerance, conversation settings and generator sources. Changed work or window policies cannot pass a baseline comparison. Live history can vary between runs; actual shape and hash evidence remain authoritative.
