@@ -187,6 +187,7 @@ def _qualify_identities(target, rows, auth_header):
         if {row["expected"] for row in cases} == {"allow", "deny"}:
             for row in cases:
                 row["reason"] = "identity_conflict"
+                del digests[row["name"]]
     return digests
 
 
@@ -205,8 +206,8 @@ def _prepare_cases(config, target):
 def eligible_probe_count(config, target):
     if not configured_probe_count(config, target):
         return 0
-    rows, _ = _prepare_cases(config, target)
-    return sum(row["reason"] == "not_run" for row in rows)
+    _, digests = _prepare_cases(config, target)
+    return len(digests)
 
 
 def _record_cutoff(run, target, rows, *, inference_finished=False):
@@ -233,18 +234,21 @@ def record_unstarted(run, target):
     observation = run.observations[target.name]
     if "gateway_access" in observation:
         return
-    rows, _ = _prepare_cases(run.config, target)
+    rows, digests = _prepare_cases(run.config, target)
     observation["gateway_access"] = {"cases": rows}
+    run.plan_condition(target.name, "gateway_access", planned=len(digests))
     _record_cutoff(run, target.name, rows, inference_finished=True)
+    run.finish_condition(target.name, "gateway_access")
 
 
 async def execute(run, target, client):
     settings = run.config.gateway_access
     rows, digests = _prepare_cases(run.config, target)
     run.observations[target.name]["gateway_access"] = {"cases": rows}
-    if settings is None or settings.profile != "litellm":
-        return
+    run.plan_condition(target.name, "gateway_access", planned=len(digests))
     try:
+        if not digests:
+            return
         for case, row in zip(settings.cases, rows):
             if row["reason"] != "not_run":
                 continue
@@ -268,6 +272,7 @@ async def execute(run, target, client):
                 row["reason"] = "request_not_dispatched"
     finally:
         _record_cutoff(run, target.name, rows)
+        run.finish_condition(target.name, "gateway_access")
 
 
 def result(run, target):

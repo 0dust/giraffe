@@ -904,6 +904,10 @@ async def test_shared_deadline_classifies_only_eligible_access_cases(monkeypatch
     cases = check.metrics["gateway_access"]["cases"]
     assert [(case["reason"], case["request_id"]) for case in cases] == [
         ("run_deadline", None), ("identity_unavailable", None)]
+    condition = next(row for row in report.conditions if row["condition_id"] == "gateway_access")
+    assert condition["status"] == "inconclusive"
+    assert (condition["planned_kind"], condition["planned"], condition["started"], condition["not_started"]) == (
+        "exact", 1, 0, 1)
 
 
 @pytest.mark.parametrize("cap", [3, 4])
@@ -1356,3 +1360,57 @@ async def test_access_baseline_preserves_regression_from_unchanged_identity(monk
     allow, deny = comparison["targets"][0]["comparisons"]
     assert allow["status"] == "inconclusive" and "identity references differ" in allow["reason"]
     assert deny["status"] == "fail" and deny["baseline"] == "deny" and deny["current"] == "allow"
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+@pytest.mark.parametrize("deny_http,verdict,failed", [
+    (401, "passed", 1), (200, "failed", 0), (503, "inconclusive", 1)])
+async def test_access_condition_retains_verdict_and_transport_counts(
+        monkeypatch, tmp_path, local_tokenizer, deferred, deny_http, verdict, failed):
+    from giraffe.web import create_app
+    from tests.test_web import finished, start
+
+    monkeypatch.setenv("ALLOW_KEY", "allow-secret")
+    monkeypatch.setenv("DENY_KEY", "deny-secret")
+    events = []
+
+    def handler(request):
+        if request.method != "POST":
+            return httpx.Response(404)
+        if request.headers.get("authorization") == "Bearer deny-secret" and deny_http != 200:
+            return httpx.Response(deny_http, json={"error": {"type": "token_not_found_in_db"}})
+        return httpx.Response(200, json={"choices": [{"message": {
+            "role": "assistant", "content": "OK"}, "finish_reason": "stop"}]})
+
+    async def with_events(config, *, progress, stop_event):
+        def capture(event):
+            if event.get("scenario") == "gateway_access" and event["event"].startswith("condition_"):
+                row = event["condition_summary"]
+                events.append((event["event"], row["aggregate_status"], row["planned"], row["failed"]))
+            progress(event)
+        return await run_suite(config, progress=capture, stop_event=stop_event)
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
+    monkeypatch.setattr("giraffe.web.run_suite", with_events)
+    cfg = config(retention="all", samples=1)
+    if deferred:
+        cfg.checks = ["access", "gateway_access"]
+    app = create_app(tmp_path)
+    async with app.router.lifespan_context(app):
+        async with original(transport=httpx.ASGITransport(app=app), base_url="http://localhost:8787",
+                            headers={"X-Giraffe-Token": app.state.giraffe_token}) as client:
+            identifier = await start(client, cfg.model_dump(mode="json"))
+            detail = await finished(client, identifier)
+            page = await client.get(f"/api/runs/{identifier}/conditions/gateway_access/requests?target=proxy")
+
+    assert events == [("condition_planned", "waiting", 2, 0), ("condition_started", "running", 2, 0),
+                      ("condition_scoring", "inconclusive", 2, failed), ("condition_finished", verdict, 2, failed)]
+    saved = json.loads((tmp_path / identifier / "report.json").read_text())
+    live_row = next(row for row in detail["live_conditions"] if row["condition_id"] == "gateway_access")
+    saved_row = next(row for row in saved["conditions"] if row["condition_id"] == "gateway_access")
+    assert page.status_code == 200
+    for row in [live_row, saved_row, page.json()["aggregate"]]:
+        assert (row["status"], row["planned_kind"], row["planned"], row["failed"], row["not_started"]) == (
+            verdict, "exact", 2, failed, 0)
+    assert page.json()["totals"]["failed"] == failed
