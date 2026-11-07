@@ -1019,6 +1019,54 @@ def _fixed_generation_work_changed(current, old, threshold):
                for turn in latest.keys() & previous.keys())
 
 
+def _comparable_fixed_timing_miss(current, old, user, failed_criteria, threshold):
+    if not any(record.workload.get("session_id") and record.workload.get("mode") == "fixed"
+               for record in current):
+        return True
+    quality = user.get("timing_quality")
+    affected_metrics = quality.get("affected_metrics") if isinstance(quality, dict) else None
+    if not isinstance(affected_metrics, dict):
+        return True
+
+    # Compare each observed miss to its baseline repetition when retained.
+    previous_turns = defaultdict(list)
+    for record in old:
+        sequence = record.workload.get("conversation_sequence")
+        if type(sequence) is int:
+            previous_turns[record.fixture_id, sequence].append(record)
+
+    checked_miss = False
+    for name, first, metric in (("max_first_answer_ms", True, "first_output_ms"),
+                                ("max_completion_ms", False, "latency_ms")):
+        if name not in failed_criteria:
+            continue
+        criterion = user["criteria"][name]
+        limit = criterion.get("limit")
+        if (type(limit) not in {int, float} or not 0 < limit < math.inf
+                or criterion.get("pending_breach")):
+            return True
+        affected_ids = affected_metrics.get(metric)
+        if not isinstance(affected_ids, list) or not all(isinstance(item, str) for item in affected_ids):
+            return True
+        affected = set(affected_ids)
+        for record in current:
+            if _user_error(record):
+                return True
+            if record.status == "cancelled" or record.id in affected:
+                continue
+            value = user_latency(record, first)
+            if value is None or value <= limit:
+                continue
+            checked_miss = True
+            sequence = record.workload.get("conversation_sequence")
+            previous = (previous_turns.get((record.fixture_id, sequence), old)
+                        if type(sequence) is int else old)
+            if not _fixed_generation_work_changed([record], previous, threshold):
+                return True
+    # Older summaries may lack the request evidence needed to revisit a miss.
+    return not checked_miss
+
+
 def _load_not_delivered(point):
     # A higher-priority failure can own reason_code despite missing concurrency.
     # The flag applies only to concurrent points; older reports may omit it.
@@ -2019,9 +2067,10 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold, slot_ch
                 and _probe_has_overlap(b_scenario, old_attempts))
             attempt_failure = comparable_attempts and ("max_error_percent" in failed_criteria
                 or timing_exposed and (not failed_criteria
-                    or observed_timing_failures and not timing_work_changed and not (
-                        _live_input_work_changed(current_attempts, old_attempts, threshold, compare_output=True)
-                        or _fixed_generation_work_changed(current_attempts, old_attempts, threshold))))
+                    or observed_timing_failures and not timing_work_changed and not _live_input_work_changed(
+                        current_attempts, old_attempts, threshold, compare_output=True)
+                    and _comparable_fixed_timing_miss(
+                        current_attempts, old_attempts, c, observed_timing_failures, threshold)))
             acceptance = {**row, "metric": "user_acceptance", "current": "fail", "baseline": "pass",
                           "aggregation": "selected_criteria", "observed_change": None, "observed_delta": None,
                           "current_samples": len(current_attempts), "baseline_samples": len(old_attempts),
