@@ -455,7 +455,8 @@ def test_generator_saturation_cannot_create_timing_regressions(saturated_run):
     assert result.overall == "pass"
     rows = result.baseline["targets"][0]["comparisons"]
     timing = {"latency_ms", "first_output_ms", "max_stream_gap_ms", "output_tokens_per_second",
-              "generation_tokens_per_second"}
+              "generation_tokens_per_second", "latency_p95_ms", "first_output_p95_ms",
+              "max_stream_gap_p95_ms"}
     assert all(row["status"] == "inconclusive" for row in rows if row["metric"] in timing)
     assert all(row["status"] == "pass" for row in rows if row["metric"] not in timing)
 
