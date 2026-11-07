@@ -612,10 +612,18 @@ def _interference(observation, window, control, user_records, criteria, health, 
                 short_span = ((probe.request_body_sent_ms, first)
                               if probe.request_body_sent_ms is not None and first is not None else None)
             else:
-                if span is None or probe.second_answer_event_ms is None:
+                second_answer = probe.second_answer_event_ms
+                reads = probe.answer_read_timestamps_ms
+                # The second finalized answer read is at or after the second
+                # answer event. Keep the exact time when events share a read.
+                if (second_answer is None and probe.output_events_truncated and span is not None
+                        and len(reads) >= 2
+                        and probe.first_output_ms <= reads[0] <= reads[1] < probe.last_output_ms):
+                    second_answer = reads[1]
+                if span is None or second_answer is None:
                     excluded.add("Second short-user answer event receipt is unavailable.")
                     continue
-                second_answer = probe.timing_start_ms + probe.second_answer_event_ms
+                second_answer += probe.timing_start_ms
                 trigger_span = short_span = (max(span[0], second_answer), span[1])
             if trigger_span is None or short_span is None:
                 continue
