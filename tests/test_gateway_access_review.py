@@ -881,6 +881,31 @@ async def test_access_only_counts_requests_admitted_to_transport(monkeypatch, li
     assert [event["fixture_id"] for event in events if event["event"] == "request_started"] == ["gateway-access-valid"]
 
 
+async def test_shared_deadline_classifies_only_eligible_access_cases(monkeypatch):
+    monkeypatch.setenv("ALLOW_KEY", "allow-secret")
+    monkeypatch.delenv("DENY_KEY", raising=False)
+    calls = []
+
+    async def handler(request):
+        if request.method != "POST":
+            return httpx.Response(404)
+        calls.append(request.headers.get("authorization"))
+        await asyncio.sleep(10)
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
+    cfg = config(retention="all", max_requests=10)
+    cfg.checks = ["serving", "gateway_access"]
+    cfg.max_duration_seconds = .25
+    report = await run_suite(cfg)
+    assert calls == [None]
+    assert report.abort_reason == "maximum run duration reached"
+    check = next(check for check in report.checks if check.id == "gateway_access")
+    cases = check.metrics["gateway_access"]["cases"]
+    assert [(case["reason"], case["request_id"]) for case in cases] == [
+        ("run_deadline", None), ("identity_unavailable", None)]
+
+
 @pytest.mark.parametrize("cap", [3, 4])
 @pytest.mark.parametrize("baseline_capped", [False, True])
 async def test_access_quota_cutoff_preserves_completed_serving_comparison(monkeypatch, cap, baseline_capped):
@@ -1225,6 +1250,14 @@ async def test_access_baseline_scopes_settings_and_identity_references_to_its_ca
     assert target["status"] == "pass"
     assert [row["status"] for row in target["comparisons"] if row["check"] == "gateway_access"] == ["pass", "pass"]
 
+    previous_usage_rules = baseline.model_copy(deep=True)
+    access = next(check for check in previous_usage_rules.checks if check.id == "gateway_access")
+    access.metrics["gateway_access"]["evidence_version"] = 3
+    target = compare_baseline(current, previous_usage_rules).baseline["targets"][0]
+    assert target["status"] == "inconclusive"
+    assert any(row["check"] == "serving" and row["status"] == "pass" for row in target["comparisons"])
+    assert all(row["status"] == "inconclusive" for row in target["comparisons"] if row["check"] == "gateway_access")
+
     current = await run_with("CURRENT_UNUSED", 32)
     target = compare_baseline(current, baseline).baseline["targets"][0]
     assert target["status"] == "inconclusive"
@@ -1266,3 +1299,60 @@ async def test_oversized_access_usage_preserves_shared_report(monkeypatch):
     assert [case["observed"] for case in access.metrics["gateway_access"]["cases"]] == ["unverified", "deny"]
     rejected = next(record for record in report.requests if record.identity == "allowed")
     assert rejected.status == "failed" and rejected.output_tokens is None
+
+
+async def test_access_baseline_compares_auth_header_names_case_insensitively(monkeypatch):
+    monkeypatch.setenv("ALLOW_KEY", "Bearer allow-secret")
+    monkeypatch.setenv("DENY_KEY", "Bearer deny-secret")
+    probes = []
+
+    def handler(request):
+        if request.method != "POST":
+            return httpx.Response(404)
+        probes.append((request.headers.raw, request.content))
+        if request.headers["x-access-key"] == "Bearer deny-secret":
+            return httpx.Response(401, json={"error": {"type": "token_not_found_in_db"}})
+        return httpx.Response(200, json={"choices": [{"message": {
+            "role": "assistant", "content": "OK"}, "finish_reason": "stop"}]})
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
+    raw = config().model_dump()
+    raw["targets"][0]["test_identities"] = {
+        alias: {"headers_env": {"X-Access-Key": env}}
+        for alias, env in [("allowed", "ALLOW_KEY"), ("denied", "DENY_KEY")]}
+    raw["gateway_access"]["auth_header"] = "X-Access-Key"
+    baseline = await run_suite(RunConfig.model_validate(raw))
+    raw["gateway_access"]["auth_header"] = "x-access-key"
+    current = await run_suite(RunConfig.model_validate(raw))
+    assert probes[:2] == probes[2:] and len(probes) == 4
+    assert compare_baseline(current, baseline).baseline["status"] == "pass"
+    assert baseline.manifest["config"]["gateway_access"]["auth_header"] == "X-Access-Key"
+    assert current.manifest["config"]["gateway_access"]["auth_header"] == "x-access-key"
+
+
+async def test_access_baseline_preserves_regression_from_unchanged_identity(monkeypatch):
+    monkeypatch.setenv("ALLOW_KEY", "allow-secret")
+    monkeypatch.setenv("DENY_KEY", "deny-secret")
+    deny_request = True
+
+    def handler(request):
+        if request.method != "POST":
+            return httpx.Response(404)
+        if deny_request and request.headers["authorization"] == "Bearer deny-secret":
+            return httpx.Response(401, json={"error": {"type": "token_not_found_in_db"}})
+        return httpx.Response(200, json={"choices": [{"message": {
+            "role": "assistant", "content": "OK"}, "finish_reason": "stop"}]})
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
+    raw = config().model_dump()
+    baseline = await run_suite(RunConfig.model_validate(raw))
+    deny_request = False
+    del raw["targets"][0]["test_identities"]["allowed"]
+    current = await run_suite(RunConfig.model_validate(raw))
+    comparison = compare_baseline(current, baseline).baseline
+    assert baseline.overall == "pass" and current.overall == comparison["status"] == "fail"
+    allow, deny = comparison["targets"][0]["comparisons"]
+    assert allow["status"] == "inconclusive" and "identity references differ" in allow["reason"]
+    assert deny["status"] == "fail" and deny["baseline"] == "deny" and deny["current"] == "allow"

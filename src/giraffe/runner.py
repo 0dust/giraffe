@@ -2909,6 +2909,11 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
         await asyncio.gather(monitor, return_exceptions=True)
         if any(task.cancelled() or not task.done() for task in tasks) or any(run.unfinished.values()):
             run.stop_reason()
+    if "gateway_access" in config.checks:
+        from .gateway_access import record_unstarted
+
+        for target in config.targets:
+            record_unstarted(run, target)
     inference_duration = time.monotonic() - run.start
     sampler.set_phase("scoring")
     consume_samples()

@@ -9,7 +9,8 @@ from giraffe.identities import LITELLM_NATIVE_KEY_HEADERS, gateway_identities_on
 from giraffe.models import CheckResult, RequestSpec
 
 
-EVIDENCE_VERSION = 3
+# Version 4 also requires the client-side bounds on gateway response usage.
+EVIDENCE_VERSION = 4
 IDENTITY_CHANGED = "Test identity credentials changed after access preflight."
 _IDENTITY_FAILURE_REASONS = {
     IDENTITY_CHANGED: "identity_changed",
@@ -17,11 +18,6 @@ _IDENTITY_FAILURE_REASONS = {
 }
 QUALIFICATION = ("Only the declared identities and endpoint/model were exercised. "
                  "These fixtures do not certify tenant isolation or comprehensive gateway security.")
-
-
-def configured_cases(config):
-    settings = config.gateway_access
-    return settings.cases if settings else []
 
 
 def configured_probe_count(config, target):
@@ -194,35 +190,60 @@ def _qualify_identities(target, rows, auth_header):
     return digests
 
 
+def _prepare_cases(config, target):
+    settings = config.gateway_access
+    if settings is None:
+        return [], {}
+    rows = [_row(case) for case in settings.cases]
+    if settings.profile != "litellm":
+        for row in rows:
+            row["reason"] = "unsupported_profile"
+        return rows, {}
+    return rows, _qualify_identities(target, rows, settings.auth_header)
+
+
 def eligible_probe_count(config, target):
     if not configured_probe_count(config, target):
         return 0
-    settings = config.gateway_access
-    rows = [_row(case) for case in settings.cases]
-    _qualify_identities(target, rows, settings.auth_header)
+    rows, _ = _prepare_cases(config, target)
     return sum(row["reason"] == "not_run" for row in rows)
 
 
-def _cutoff_reason(run, target):
-    reason = run.stop_reason(target)
-    if reason == "maximum run duration reached":
-        return "run_deadline"
-    if reason and reason != "maximum request budget reached":
-        return "run_stopped"
-    if reason or run.remaining(target) == 0:
-        return "request_budget_exhausted"
-    return None
+def _record_cutoff(run, target, rows, *, inference_finished=False):
+    pending = [row for row in rows if row["reason"] == "not_run"]
+    if not pending:
+        return
+    # A deadline expiring after inference cannot explain a probe that did not run.
+    stopped = ((run.endpoint_health[target]["abort_reason"] or run.reason)
+               if inference_finished else run.stop_reason(target))
+    if stopped == "maximum run duration reached":
+        reason = "run_deadline"
+    elif stopped and stopped != "maximum request budget reached":
+        reason = "run_stopped"
+    elif stopped or run.remaining(target) == 0:
+        reason = "request_budget_exhausted"
+    else:
+        return
+    for row in pending:
+        row["reason"] = reason
+    run.mark_unfinished(target, ["gateway_access"])
+
+
+def record_unstarted(run, target):
+    observation = run.observations[target.name]
+    if "gateway_access" in observation:
+        return
+    rows, _ = _prepare_cases(run.config, target)
+    observation["gateway_access"] = {"cases": rows}
+    _record_cutoff(run, target.name, rows, inference_finished=True)
 
 
 async def execute(run, target, client):
     settings = run.config.gateway_access
-    rows = [_row(case) for case in configured_cases(run.config)]
+    rows, digests = _prepare_cases(run.config, target)
     run.observations[target.name]["gateway_access"] = {"cases": rows}
     if settings is None or settings.profile != "litellm":
-        for row in rows:
-            row["reason"] = "unsupported_profile"
         return
-    digests = _qualify_identities(target, rows, settings.auth_header)
     try:
         for case, row in zip(settings.cases, rows):
             if row["reason"] != "not_run":
@@ -246,17 +267,13 @@ async def execute(run, target, client):
                     break
                 row["reason"] = "request_not_dispatched"
     finally:
-        pending = [row for row in rows if row["reason"] == "not_run"]
-        if pending and (reason := _cutoff_reason(run, target.name)):
-            for row in pending:
-                row["reason"] = reason
-            run.mark_unfinished(target.name, ["gateway_access"])
+        _record_cutoff(run, target.name, rows)
 
 
 def result(run, target):
     settings = run.config.gateway_access
     data = run.observations[target.name].get("gateway_access", {})
-    rows = data["cases"] if "cases" in data else [_row(case) for case in configured_cases(run.config)]
+    rows = data.get("cases", [])
     matrix = {row["expected"] for row in rows} == {"allow", "deny"}
     complete = bool(rows) and matrix and all(row["observed"] != "unverified" for row in rows)
     status = ("fail" if any(row["status"] == "fail" for row in rows) else

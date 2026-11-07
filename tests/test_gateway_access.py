@@ -149,8 +149,9 @@ async def test_full_runner_keeps_policy_separate_and_preserves_exports(monkeypat
     comparison = compare_baseline(altered, report)
     target = comparison.baseline["targets"][0]
     assert target["status"] == "inconclusive"
-    assert {row["status"] for row in target["comparisons"]} == {"inconclusive"}
-    assert all("identity references" in row["reason"] for row in target["comparisons"])
+    assert {row["scenario"]: row["status"] for row in target["comparisons"]} == {
+        "valid": "inconclusive", "invalid": "pass"}
+    assert "identity references" in next(row["reason"] for row in target["comparisons"] if row["scenario"] == "valid")
 
 
 @pytest.mark.parametrize("mode,expected", [
@@ -160,6 +161,7 @@ async def test_full_runner_keeps_policy_separate_and_preserves_exports(monkeypat
     ("unverified_baseline", "inconclusive"),
     ("old_baseline", "inconclusive"),
     ("previous_denial_rules", "inconclusive"),
+    ("previous_usage_rules", "inconclusive"),
     ("legacy_source", "pass"),
     ("changed_source", "inconclusive"),
     ("changed_endpoint", "inconclusive"),
@@ -192,6 +194,9 @@ async def test_baseline_compares_qualified_access_cases(monkeypatch, mode, expec
     elif mode == "previous_denial_rules":
         check = next(check for check in baseline.checks if check.id == "gateway_access")
         check.metrics["gateway_access"]["evidence_version"] = 2
+    elif mode == "previous_usage_rules":
+        check = next(check for check in baseline.checks if check.id == "gateway_access")
+        check.metrics["gateway_access"]["evidence_version"] = 3
     elif mode == "legacy_source":
         del baseline.manifest["gateway_access_source_sha256"]
     elif mode == "changed_source":
@@ -217,7 +222,7 @@ async def test_baseline_compares_qualified_access_cases(monkeypatch, mode, expec
         "unexpected_access": "allow", "unverified": "unverified",
     }.get(mode, "deny")
     assert "collect at least" not in target["summary"]
-    if mode in {"old_baseline", "previous_denial_rules"}:
+    if mode in {"old_baseline", "previous_denial_rules", "previous_usage_rules"}:
         assert all(row["status"] == "inconclusive" for row in rows.values())
         assert all("credential evidence is missing" in row["reason"] for row in rows.values())
     if mode == "changed_source":

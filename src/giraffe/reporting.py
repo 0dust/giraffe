@@ -2163,7 +2163,7 @@ def _compare_gateway_attribution(report, baseline, target, compatible, current_t
     return rows
 
 
-def _compare_gateway_access(current, baseline, declarations, incompatibility):
+def _compare_gateway_access(current, baseline, declarations, incompatibility, *, current_refs, old_refs):
     from .gateway_access import EVIDENCE_VERSION
 
     def matched(policy, case):
@@ -2176,6 +2176,8 @@ def _compare_gateway_access(current, baseline, declarations, incompatibility):
 
     current_policy = current.metrics.get("gateway_access", {})
     old_policy = baseline.metrics.get("gateway_access", {}) if baseline else {}
+    current_refs = current_refs if isinstance(current_refs, dict) else {}
+    old_refs = old_refs if isinstance(old_refs, dict) else {}
     evidence_matches = (current_policy.get("evidence_version") == EVIDENCE_VERSION
                         and old_policy.get("evidence_version") == EVIDENCE_VERSION)
     baseline_passed = (baseline is not None and baseline.status == "pass"
@@ -2190,6 +2192,9 @@ def _compare_gateway_access(current, baseline, declarations, incompatibility):
             reason = incompatibility
         elif not evidence_matches:
             reason = "Effective gateway credential evidence is missing. Rerun the access check and baseline."
+        elif (not isinstance(reference := current_refs.get(case["identity"]), dict)
+              or reference != old_refs.get(case["identity"])):
+            reason = "Gateway test identity references differ."
         elif not baseline_passed or prior != case["expected"]:
             reason = "The baseline lacks a complete passing access matrix for these declarations."
         elif observed not in {"allow", "deny"}:
@@ -2312,20 +2317,16 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                 access_reasons.append("Recorded configuration has an unsupported config_version.")
             elif not isinstance(old_checks := old_config.get("checks"), list) or "gateway_access" not in old_checks:
                 access_reasons.append("The baseline did not record a gateway access check.")
-            elif access_settings is None or access_settings != old_access_settings:
+            elif (access_settings is None or old_access_settings is None
+                  or access_settings.model_dump(exclude={"auth_header"}) != old_access_settings.model_dump(exclude={"auth_header"})
+                  or (access_settings.auth_header or "").lower() != (old_access_settings.auth_header or "").lower()):
                 access_reasons.append("Gateway access settings differ or are missing.")
             elif not access_reasons:
-                current_refs = target.get("test_identities") or {}
-                old_refs = (old_target or {}).get("test_identities") or {}
                 uses_tls = any(isinstance(url, str) and url.lower().startswith("https://")
                                for url in (target["url"], config.get("proxy")))
                 if (config.get("proxy") != old_config.get("proxy")
                         or (uses_tls and config.get("ca_bundle") != old_config.get("ca_bundle"))):
                     access_reasons.append("Gateway access transport settings differ.")
-                elif any(not isinstance(current_refs.get(case.identity), dict)
-                         or current_refs[case.identity] != old_refs.get(case.identity)
-                         for case in access_settings.cases):
-                    access_reasons.append("Gateway test identity references differ.")
                 else:
                     source = report.manifest.get("gateway_access_source_sha256")
                     old_source = baseline.manifest.get("gateway_access_source_sha256")
@@ -2339,7 +2340,9 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
             if access_settings is not None:
                 rows.extend(_compare_gateway_access(current_access, old_access,
                                                     [case.model_dump() for case in access_settings.cases],
-                                                    " ".join(access_reasons)))
+                                                    " ".join(access_reasons),
+                                                    current_refs=target.get("test_identities"),
+                                                    old_refs=(old_target or {}).get("test_identities")))
         for current_check in report.checks:
             if current_check.id != "gateway_policy" or current_check.target != name or not current_check.required:
                 continue
