@@ -795,52 +795,78 @@ def _fixed_generation_work_changed(current, old, threshold):
                for turn in latest.keys() & previous.keys())
 
 
-def _comparable_fixed_timing_miss(current, old, user, failed_criteria, threshold):
-    if not any(record.workload.get("session_id") and record.workload.get("mode") == "fixed"
-               for record in current):
-        return True
+def _comparable_user_timing_miss(current, old, user, failed_criteria, threshold):
+    """Qualify a deadline miss against the same turn in the accepted run."""
+    def comparable_attempts():
+        return (not any(_load_work_comparison(current, old))
+                and not _live_input_work_changed(current, old, threshold, compare_output=True))
+
+    def turn_key(record):
+        mode = record.workload.get("mode")
+        sequence = record.workload.get("conversation_sequence")
+        turn = record.workload.get("turn_id")
+        if type(sequence) is int and sequence > 0:
+            if mode == "fixed":
+                # The fixed fixture identifies the turn even in older records.
+                return mode, sequence, record.fixture_id
+            if mode == "live" and type(turn) is int and turn >= 0:
+                return mode, sequence, record.fixture_id, turn
+        return None
+
     quality = user.get("timing_quality")
     affected_metrics = quality.get("affected_metrics") if isinstance(quality, dict) else None
     if not isinstance(affected_metrics, dict):
-        return True
+        return comparable_attempts()
 
-    # Compare each observed miss to its baseline repetition when retained.
     previous_turns = defaultdict(list)
     for record in old:
-        sequence = record.workload.get("conversation_sequence")
-        if type(sequence) is int:
-            previous_turns[record.fixture_id, sequence].append(record)
+        if key := turn_key(record):
+            previous_turns[key].append(record)
 
     checked_miss = False
+    fallback_miss = False
     for name, first, metric in (("max_first_answer_ms", True, "first_output_ms"),
                                 ("max_completion_ms", False, "latency_ms")):
         if name not in failed_criteria:
             continue
         criterion = user["criteria"][name]
         limit = criterion.get("limit")
-        if (type(limit) not in {int, float} or not 0 < limit < math.inf
-                or criterion.get("pending_breach")):
-            return True
+        fallback_miss |= bool(criterion.get("pending_breach"))
         affected_ids = affected_metrics.get(metric)
-        if not isinstance(affected_ids, list) or not all(isinstance(item, str) for item in affected_ids):
-            return True
+        if (type(limit) not in {int, float} or not 0 < limit < math.inf
+                or not isinstance(affected_ids, list) or not all(isinstance(item, str) for item in affected_ids)):
+            fallback_miss = True
+            continue
         affected = set(affected_ids)
         for record in current:
-            if _user_error(record):
-                return True
-            if record.status == "cancelled" or record.id in affected:
-                continue
-            value = user_latency(record, first)
-            if value is None or value <= limit:
-                continue
+            error = _user_error(record)
+            if not error:
+                if record.status == "cancelled" or record.id in affected:
+                    continue
+                value = user_latency(record, first)
+                if value is None or value <= limit:
+                    continue
             checked_miss = True
-            sequence = record.workload.get("conversation_sequence")
-            previous = (previous_turns.get((record.fixture_id, sequence), old)
-                        if type(sequence) is int else old)
-            if not _fixed_generation_work_changed([record], previous, threshold):
+            key = turn_key(record)
+            if key is None:
+                fallback_miss |= error or not _fixed_generation_work_changed([record], old, threshold)
+                continue
+            previous = previous_turns.get(key, [])
+            if len(previous) != 1 or any(_load_work_comparison([record], previous)):
+                continue
+            if key[0] == "fixed":
+                if (not _input_work_changed([record], previous, threshold)
+                        and (error or not _fixed_generation_work_changed([record], previous, threshold))):
+                    return True
+            elif error and record.input_tokens is None:
+                # An unsuccessful turn can miss the criterion without producing usage.
+                if (record.request_hash and record.request_hash == previous[0].request_hash
+                        and previous[0].input_tokens is not None):
+                    return True
+            elif not _live_input_work_changed([record], previous, threshold, compare_output=not error):
                 return True
-    # Older summaries may lack the request evidence needed to revisit a miss.
-    return not checked_miss
+    # Pending admission and legacy summaries can lack an observed turn to match.
+    return (fallback_miss or not checked_miss) and comparable_attempts()
 
 
 def _load_not_delivered(point):
@@ -1416,22 +1442,20 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold):
             # Acceptance also includes attempts that drain after delivery closes.
             current_attempts = [record for record in current_work if not record.intentional]
             old_attempts = [record for record in old_work if not record.intentional]
-            attempt_reason, attempt_mix_changed = _load_work_comparison(current_attempts, old_attempts)
             failed_criteria = {name for name, criterion in c.get("criteria", {}).items()
                                if criterion.get("status") == "fail"}
             delivery_failure = "min_output_tokens_per_second" in failed_criteria and not missing
-            comparable_attempts = not (attempt_reason or attempt_mix_changed or _live_input_work_changed(
-                current_attempts, old_attempts, threshold))
+            attempt_failure = (not failed_criteria or "max_error_percent" in failed_criteria) and not (
+                any(_load_work_comparison(current_attempts, old_attempts))
+                or _live_input_work_changed(current_attempts, old_attempts, threshold))
             failed_timing = failed_criteria & {"max_first_answer_ms", "max_completion_ms"}
-            attempt_failure = comparable_attempts and (not failed_criteria or "max_error_percent" in failed_criteria
-                or bool(failed_timing)
-                and not _live_input_work_changed(current_attempts, old_attempts, threshold, compare_output=True)
-                and _comparable_fixed_timing_miss(current_attempts, old_attempts, c, failed_timing, threshold))
+            timing_failure = failed_timing and _comparable_user_timing_miss(
+                current_attempts, old_attempts, c, failed_timing, threshold)
             acceptance = {**row, "metric": "user_acceptance", "current": "fail", "baseline": "pass",
                           "aggregation": "selected_criteria", "observed_change": None, "observed_delta": None,
                           "current_samples": len(current_attempts), "baseline_samples": len(old_attempts),
                           "evidence_ids": [record.id for record in current_attempts]}
-            if not (delivery_failure or attempt_failure):
+            if not (delivery_failure or attempt_failure or timing_failure):
                 reason = (f"Multi-user {user_id} at {population} users: Work behind the selected "
                           "acceptance criteria differs or lacks evidence.")
                 incomplete.append(reason)
