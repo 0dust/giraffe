@@ -41,10 +41,13 @@ CHECK_NAMES = {
     "prefix": "Prefix cache",
     "sessions": "Multi-turn sessions",
     "multi_user": "Multi-user",
+    "gateway_attribution": "Gateway usage attribution",
     "consistency": "Answer consistency",
     "tools": "Tool calling",
 }
 CATALOGUE_NAMES = INTERNAL_CHECK_NAMES = CHECK_NAMES
+# These checks compare their own declared workload and evidence.
+SHARED_BASELINE_EXCLUDED_WORKLOADS = frozenset({"gateway_attribution"})
 CORE_CHECKS = ("access", "serving", "first_output", "generation", "load", "context",
                "correctness", "json", "cancellation", "recovery", "gpu")
 DEFAULT_CHECKS = ("access", "serving", "correctness", "first_output")
@@ -1385,6 +1388,63 @@ class Consistency(Model):
         return self
 
 
+class TestIdentity(Model):
+    """Explicit credential references; an empty identity is anonymous."""
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+    api_key_env: str | None = Field(default=None, max_length=128)
+    headers_env: dict[str, str] = Field(default_factory=dict, max_length=16)
+
+    @model_validator(mode="after")
+    def validate_references(self):
+        refs = [*self.headers_env.values(), *([self.api_key_env] if self.api_key_env else [])]
+        if any(not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,127}", ref) for ref in refs):
+            raise ValueError("identity credentials must name environment variables")
+        names = [name.lower() for name in self.headers_env]
+        reserved = {"host", "content-length", "content-type", "transfer-encoding", "connection",
+                    "accept", "accept-encoding", "expect", "upgrade"}
+        if (len(set(names)) != len(names) or reserved.intersection(names)
+                or (self.api_key_env and "authorization" in names)
+                or any(not re.fullmatch(r"[A-Za-z][A-Za-z0-9-]{0,63}", name) for name in self.headers_env)):
+            raise ValueError("identity headers must be unique credential headers, not protocol headers")
+        return self
+
+
+class GatewayEvidence(TestIdentity):
+    profile: str = Field(default="litellm", min_length=1, max_length=64)
+    url: str
+
+    @field_validator("url")
+    @classmethod
+    def validate_url(cls, value):
+        from urllib.parse import urlsplit
+        parsed = urlsplit(value)
+        if (parsed.scheme not in {"http", "https"} or not parsed.hostname
+                or any((parsed.username, parsed.password, parsed.query, parsed.fragment))
+                or any(char.isspace() for char in value)):
+            raise ValueError("gateway evidence URL must be http(s) without credentials, query or fragment")
+        try:
+            valid_port = parsed.port != 0
+        except ValueError:
+            valid_port = False
+        if not valid_port:
+            raise ValueError("gateway evidence URL must have a valid port")
+        return value
+
+
+class GatewayAttribution(Model):
+    identities: list[str] = Field(min_length=1, max_length=32)
+    samples: int = Field(default=2, ge=1, le=16)
+    settle_seconds: float = Field(default=2, gt=0, le=30)
+
+    @field_validator("identities")
+    @classmethod
+    def validate_identities(cls, value):
+        if len(set(value)) != len(value) or any(not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", x) for x in value):
+            raise ValueError("attribution identities must be unique configured identity labels")
+        return value
+
+
 class Target(Model):
     tokenizer: str | None = Field(default=None, min_length=1,
         description="Prompt sizing tokenizer: null or auto resolves the served model name and falls back to builtin; builtin uses tiktoken o200k_base. A model ID or local directory remains an optional CLI override. Tokenizer assets download and cache locally; no inference is used for sizing.")
@@ -1396,6 +1456,8 @@ class Target(Model):
     model: str = Field(min_length=1)
     api_key_env: str | None = None
     headers_env: dict[str, str] = Field(default_factory=dict)
+    test_identities: dict[str, TestIdentity] = Field(default_factory=dict, max_length=32)
+    gateway: GatewayEvidence | None = None
     route: Literal["direct", "gateway", "replica"] = "direct"
     parent: str | None = None
     identity: dict[str, str] = Field(default_factory=dict)
@@ -1409,6 +1471,15 @@ class Target(Model):
     deployment: Deployment = Field(default_factory=Deployment)
     restart_command: list[str] | None = None
 
+    @model_serializer(mode="wrap")
+    def serialize_optional_identity_settings(self, handler):
+        result = handler(self)
+        if not self.test_identities:
+            result.pop("test_identities", None)
+        if self.gateway is None:
+            result.pop("gateway", None)
+        return result
+
     @field_validator("tokenizer", mode="before")
     @classmethod
     def trim_tokenizer(cls, value):
@@ -1417,6 +1488,9 @@ class Target(Model):
     @model_validator(mode="after")
     def validate_target(self) -> Target:
         from urllib.parse import urlsplit
+
+        if any(not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", name) for name in self.test_identities):
+            raise ValueError("test identity names must be short labels using letters, numbers, underscores or hyphens")
 
         parsed = urlsplit(self.url)
         if parsed.scheme not in {"http", "https"} or not parsed.hostname:
@@ -2130,6 +2204,7 @@ class RunConfig(Model):
     _concurrency_warnings: list[dict[str, Any]] = PrivateAttr(default_factory=list)
     sessions: Sessions | None = None
     multi_user: MultiUser | None = None
+    gateway_attribution: GatewayAttribution | None = None
     consistency: Consistency | None = None
     tool_calling: bool = False
     forced_tool_diagnostic: bool = False
@@ -2484,6 +2559,8 @@ class RunConfig(Model):
         result = handler(self)
         if "default_concurrency" not in self.model_fields_set:
             result.pop("default_concurrency", None)
+        if self.gateway_attribution is None:
+            result.pop("gateway_attribution", None)
         return result
 
     @field_serializer("limits")
@@ -2553,6 +2630,8 @@ class ConfigDraft(RunConfig):
 
 
 class RequestSpec(Model):
+    identity: str | None = Field(default=None, pattern=r"^[A-Za-z][A-Za-z0-9_-]{0,63}$",
+        description="Explicit gateway probe identity. Probes retain numeric response evidence, not response text.")
     condition_id: str | None = None
     fixture_id: str
     scenario: str
@@ -2576,6 +2655,13 @@ class RequestSpec(Model):
     requested_input_tokens: int | None = None
     requested_output_tokens: int | None = None
     workload: dict[str, Any] = Field(default_factory=dict)
+
+    @model_serializer(mode="wrap")
+    def serialize_optional_identity(self, handler):
+        result = handler(self)
+        if self.identity is None:
+            result.pop("identity", None)
+        return result
 
     @model_validator(mode="after")
     def validate_tool_expectation(self):
@@ -2632,8 +2718,24 @@ class EvaluationEvidence(PersistedModel):
 MAX_TOKENS_PER_READ = 16
 
 
+class GatewayResponseEvidence(PersistedModel):
+    error_kind: Literal["authentication", "model_access", "rate_limit", "unknown"] | None = None
+
+
 class RequestRecord(PersistedModel):
+    identity: str | None = None
+    gateway_evidence: GatewayResponseEvidence | None = None
+
+    @model_serializer(mode="wrap")
+    def serialize_optional_evidence(self, handler):
+        result = handler(self)
+        for name in ("identity", "gateway_evidence", "requested_stream_logprobs", "requested_stream_usage"):
+            if getattr(self, name) is None:
+                result.pop(name, None)
+        return result
     _timing_started_monotonic: float | None = PrivateAttr(default=None)
+    _gateway_key_hash: str | None = PrivateAttr(default=None)
+    _gateway_terminal_usage: bool = PrivateAttr(default=False)
     _request_body_sent_monotonic: float | None = PrivateAttr(default=None)
     id: str
     target: str
@@ -2727,6 +2829,8 @@ class RequestRecord(PersistedModel):
     requested_input_tokens: int | None = None
     requested_output_tokens: int | None = None
     workload: dict[str, Any] = Field(default_factory=dict)
+    requested_stream_logprobs: StrictBool | None = None
+    requested_stream_usage: StrictBool | None = None
     answer_hash: str | None = None
     request_hash: str | None = None
     history_hash: str | None = None

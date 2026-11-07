@@ -181,8 +181,9 @@ async def test_waiting_for_shared_slots_ends_with_point_window(monkeypatch):
     run = _Run(c, None, None)
     admitted = 0
     @asynccontextmanager
-    async def shared_slot(reserved, deadline=None):
+    async def shared_slot(reserved, deadline=None, *, gateway_probe=False):
         nonlocal admitted
+        assert not gateway_probe
         if reserved:
             yield True
             return
@@ -208,6 +209,7 @@ async def test_waiting_for_shared_slots_ends_with_point_window(monkeypatch):
         await asyncio.wait_for(load.concurrent_window(run, c.targets[0], Client(), c.load_test, p, calibration), .15)
     except TimeoutError:
         pytest.fail('slot waits outlived the point sending window')
+    assert admitted > 1
     assert time.monotonic() - before < .1
     assert p['drain_seconds'] < .03
 

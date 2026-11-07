@@ -684,7 +684,10 @@ def _main(argv: list[str] | None = None) -> int:
                 print("Configuration preview. No traffic was sent.")
                 print("Targets: " + ", ".join(target.name for target in config.targets))
                 print("Checks: " + ", ".join(config.checks))
-                print(f"Known requests per target: {plan['known_per_target']:,}")
+                if counts := plan.get("known_target_counts"):
+                    print("Known requests by target: " + ", ".join(f"{name}: {count:,}" for name, count in counts.items()))
+                else:
+                    print(f"Known requests per target: {plan['known_per_target']:,}")
                 print(f"Maximum requests: {format(config.max_requests, ',') if config.max_requests is not None else 'Not set'}")
                 for warning in plan["warnings"]:
                     print(f"Warning: {warning}")
@@ -889,11 +892,17 @@ def _main(argv: list[str] | None = None) -> int:
             if json_output:
                 emit("blocked", 3, message=str(error))
             return 3
-        if args.command == "run" and not args.skip_preflight:
+        # Explicit identity probes must not spend or require shared credentials
+        # before measuring their own gateway policy and attribution evidence.
+        from giraffe.identities import gateway_identities_only
+        gateway_only = gateway_identities_only(config.checks)
+        preflight_targets = [target for target in config.targets
+                             if not gateway_only or config.restart_target == target.name]
+        if args.command == "run" and not args.skip_preflight and preflight_targets:
             from giraffe.deployment import preparation_residency
             config._preparation_residency = asyncio.run(preparation_residency(config))
             async def preflight():
-                for target in config.targets:
+                for target in preflight_targets:
                     try:
                         await check_target(target, config)
                     except PreflightError as error:
@@ -1166,6 +1175,13 @@ def _print_result(report: RunReport, json_path: Path, html_path: Path | None,
             line = f"Performance · {target_name} · {label}"
         print(line)
     for check in report.checks:
+        if check.id == "gateway_attribution" and check.metrics.get("state") != "not_selected":
+            data = check.metrics
+            print(f"Gateway attribution · {check.target} · {data.get('state', 'unverified')} · "
+                  f"{data.get('matched_requests', 0)} matched / {data.get('observed_requests', 0)} observed requests")
+            for row in data.get("identities", []):
+                print(f"  {row['identity']} · {row['matched_requests']} matched · "
+                      f"{row['mismatched_requests']} mismatched · {row['unverified_requests']} unverified")
         users = check.metrics.get("multi_user") if check.id == "multi_user" else None
         if not users:
             continue

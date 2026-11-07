@@ -97,6 +97,47 @@ def test_readiness_is_excluded_and_unmeasured_target_work_stays_separate():
     assert overlap["unknown_time_components"] == result["unknown_time_components"]
 
 
+@pytest.mark.parametrize("overlap,bound", [(False, 34), (True, 30)])
+def test_restart_setup_replaces_initial_connection_allowance(overlap, bound):
+    result = plan(config(checks=["access"], restart_target="local", overlap_models=overlap, stream=False,
+                         request_timeout_seconds=10, readiness_timeout_seconds=20,
+                         test_options={"access": {"request_timeout_seconds": 4}},
+                         targets=[{"name": "local", "url": "http://localhost:1", "model": "a",
+                                   "restart_command": ["restart-service"]},
+                                  {"name": "other", "url": "http://localhost:2", "model": "b"}]))
+
+    assert result["estimated_high_seconds"] == 0
+    assert result["budget_high_seconds"] == bound
+    assert [(item["target"], item["id"], item["high_seconds"]) for item in result["time_timeline"]] == [
+        ("local", "restart_hook", 10), ("local", "restart_readiness", 20), ("other", "initial", 4)]
+
+
+@pytest.mark.parametrize("cap,eligible", [(None, True), (6, False), (7, True)])
+def test_streamed_restart_compatibility_allowance_depends_on_target_quota(cap, eligible):
+    result = plan(config(checks=["access", "serving"], samples=2, stream=True,
+                         restart_target="local", request_timeout_seconds=10, readiness_timeout_seconds=20,
+                         max_requests=cap,
+                         targets=[{"name": "local", "url": "http://localhost:1", "model": "a",
+                                   "restart_command": ["restart-service"]},
+                                  {"name": "other", "url": "http://localhost:2", "model": "b"}]))
+    setup = [(item["target"], item["id"], item["high_seconds"])
+             for item in result["time_timeline"] if item["kind"] == "setup"]
+    expected = [("local", "restart_hook", 10), ("local", "restart_readiness", 20)]
+    if eligible:
+        expected.append(("local", "performance_evidence_probe", 10))
+    assert setup == [*expected, ("other", "initial", 10)]
+    assert result["budget_high_seconds"] == (50 if eligible else 40)
+    assert result["estimated_high_seconds"] is None
+
+
+def test_deadline_remedy_omits_minimum_when_the_estimate_fits_the_failed_cap():
+    from giraffe.runner import _deadline_guidance, _deadline_remediation
+
+    configuration = config(checks=["access"], request_timeout_seconds=10, max_duration_seconds=10)
+    assert _deadline_remediation(configuration) == {"action": "set_limit", "limit": "max_duration"}
+    assert _deadline_guidance(configuration) == "Increase --max-duration (current 10 s) or select fewer checks."
+
+
 def test_context_unknown_timeout_bounds_and_sessions_include_fixed_pauses():
     result = plan(config(checks=["context"], samples=2, request_timeout_seconds=10))
     first = next(row["requests_per_target"] for row in result["rows"] if row["id"] == "context_first_batch")
