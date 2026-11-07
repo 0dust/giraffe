@@ -10,6 +10,7 @@ import uuid
 
 import httpx
 
+from .caps import MAX_GATEWAY_USAGE_TOKENS
 from .gateway_json import parse_gateway_json
 from .identities import (credential_headers, gateway_identities_only, identity_headers,
                          identity_scope, litellm_key_fingerprint)
@@ -17,7 +18,7 @@ from .models import CheckResult, RequestSpec
 
 
 CHECK = "gateway_attribution"
-COLLECTION_VERSION = 7
+COLLECTION_VERSION = 8
 MAX_BODY_BYTES = 4 * 1024 * 1024
 MAX_PAGES = 8
 PAGE_SIZE = 128
@@ -51,7 +52,7 @@ def _state(state, reason, **details):
 
 
 def _number(value):
-    return type(value) is int and 0 <= value <= 10**12
+    return type(value) is int and 0 <= value <= MAX_GATEWAY_USAGE_TOKENS
 
 
 def _normalize(rows, marker, expected):
@@ -296,8 +297,17 @@ async def _execute(run, target, client, *, deferred=False):
     except ValueError:
         observation.update(reason="Gateway reader or selected identity credentials are unavailable.")
         return
-    verify = client.tls_context
     planned = settings.samples * len(settings.identities)
+    row_limit = min(run.config.metrics_max_series, PAGE_SIZE * MAX_PAGES)
+    if planned > row_limit:
+        observation.update(state="unverified", reason_code="spend_log_row_limit",
+                           planned_requests=planned, observed_requests=0, collection_attempts=0,
+                           collection_complete=False,
+                           reason=f"The configured attribution probes require at least {planned} spend-log rows. "
+                                  f"The collector can read at most {row_limit}. "
+                                  "Raise metrics_max_series within the pagination limit or reduce the probe count.")
+        return
+    verify = client.tls_context
     reader_status = None
     if preflight_bound := reader_preflight_bound(run.config, deferred=deferred):
         def report_preflight_stop(reason):
@@ -420,7 +430,7 @@ async def _execute(run, target, client, *, deferred=False):
                     async with asyncio.timeout_at(deadline):
                         rows, complete = await _pages(reader, gateway.url, marker,
                             start_date=start_date, end_date=end_date,
-                            max_rows=run.config.metrics_max_series, stop=run.stop, deadline=deadline)
+                            max_rows=row_limit, stop=run.stop, deadline=deadline)
                     if _reader_interrupted(run.stop, deadline):
                         break
                     if isinstance(rows, str):

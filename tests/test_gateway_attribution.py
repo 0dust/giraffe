@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
+from giraffe.caps import MAX_GATEWAY_USAGE_TOKENS
 from giraffe.client import LLMClient
 from giraffe.models import RunConfig
 from giraffe.runner import _Run
@@ -35,7 +36,7 @@ def spend_page(request, rows, *, total=None, **overrides):
 
 
 async def exercise(monkeypatch, mode="match", *, stream=True, full=False, missing_shared=False,
-                   bob_header=None, bob_authorization=None):
+                   bob_header=None, bob_authorization=None, usage_overrides=None):
     from giraffe.gateway_attribution import execute, result
     for ref in ("ALICE", "BOB", "OBSERVER"):
         monkeypatch.setenv(ref, "secret-" + ref)
@@ -96,7 +97,7 @@ async def exercise(monkeypatch, mode="match", *, stream=True, full=False, missin
         if mode == "early_usage_matches":
             row.update(completion_tokens=2, total_tokens=5)
         rows.append(row)
-        usage = {"prompt_tokens": 3, "completion_tokens": 5}
+        usage = {"prompt_tokens": 3, "completion_tokens": 5, **(usage_overrides or {})}
         if mode == "consistent_total":
             usage["total_tokens"] = 8
         if mode == "inconsistent_total":
@@ -119,6 +120,9 @@ async def exercise(monkeypatch, mode="match", *, stream=True, full=False, missin
             after_finish = 'data: {"choices":[],"usage":{"total_tokens":99}}\n\ndata: {"choices":[],' + terminal_usage + '}\n\n'
         else:
             after_finish = '' if mode == "usage_on_finish" else 'data: {"choices":[],' + terminal_usage + '}\n\n'
+        if mode.startswith("late_"):
+            late = {"choices": [{"delta": {mode.removeprefix("late_"): "reasoned after usage"}}]}
+            after_finish += "data: " + json.dumps(late) + "\n\n"
         return httpx.Response(200, text=(
             'data: {"choices":[{"delta":{"content":"OK"},"finish_reason":null}],"usage":{"prompt_tokens":3,"completion_tokens":2}}\n\n'
             'data: {' + finish + '}\n\n' + after_finish + 'data: [DONE]\n\n'))
@@ -163,6 +167,34 @@ async def test_explicit_marked_total_must_agree_with_final_counts(monkeypatch, s
     if expected == "unverified":
         assert check.metrics["matched_requests"] == 0
         assert all("inconsistent total usage" in record.error for record in run.records)
+
+
+@pytest.mark.parametrize("stream", [True, False])
+@pytest.mark.parametrize("usage", [
+    {"prompt_tokens": MAX_GATEWAY_USAGE_TOKENS + 1},
+    {"completion_tokens": 10**309, "total_tokens": 10**309 + 3},
+    {"total_tokens": MAX_GATEWAY_USAGE_TOKENS + 1},
+    {"prompt_tokens_details": {"cached_tokens": MAX_GATEWAY_USAGE_TOKENS + 1}},
+    {"completion_tokens_details": {"reasoning_tokens": MAX_GATEWAY_USAGE_TOKENS + 1}},
+])
+async def test_out_of_range_gateway_usage_never_reaches_request_counters(monkeypatch, stream, usage):
+    _, run, check, _, _ = await exercise(monkeypatch, stream=stream, usage_overrides=usage)
+    assert check.status == "inconclusive" and check.metrics["matched_requests"] == 0
+    assert len(run.records) == 2
+    for record in run.records:
+        assert record.status == "failed" and "gateway evidence limit" in record.error
+        assert record.cached_prompt_tokens is None and record.reasoning_tokens is None
+        assert (record.input_tokens, record.completion_tokens) == ((3, 2) if stream else (None, None))
+
+
+@pytest.mark.parametrize("field", ["reasoning_content", "reasoning"])
+async def test_reasoning_after_terminal_usage_invalidates_marked_stream(monkeypatch, field):
+    _, run, check, _, _ = await exercise(monkeypatch, "late_" + field)
+    assert check.status == "inconclusive" and check.metrics["matched_requests"] == 0
+    assert len(run.records) == 2
+    for record in run.records:
+        assert record.status == "failed" and "reasoning content arrived after" in record.error
+        assert record.reasoning == "" and not record._gateway_terminal_usage
 
 
 @pytest.mark.parametrize("mode,state,status", [

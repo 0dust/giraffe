@@ -23,7 +23,7 @@ import httpx
 
 from . import __version__
 from .client import LLMClient, no_response_failure
-from .conditions import condition_aggregate, condition_for, request_status
+from .conditions import condition_aggregate, condition_for, request_status, scheduled_multi_user_window
 from .deployment import fixture_hash
 from .fixtures import (FIXTURE_VERSION, builtin_fixtures, load_custom_fixtures,
                        score_response, traffic_fixtures, deterministic_options, reasoning_budget)
@@ -112,6 +112,7 @@ def _stats(records: list[RequestRecord]) -> dict:
 
 def _stress(scenario):
     return (scenario.startswith(("traffic_stage_", "context", "fairness_", "bucket_", "mixed_", "arrival", "stress_", "load_"))
+            or scheduled_multi_user_window(scenario)
             or scenario in {"sustained", "recovery", "recovery_baseline", "recovery_prime", "limits",
                             "stop_control", "client_cancel", "client_deadline", "backend_cancel",
                             "cancellation_probe", "cancellation_baseline"})
@@ -384,6 +385,8 @@ class _Run:
     def emit_condition(self, event, scenario, row):
         # Keep the global completed progress counter separate from condition totals.
         aggregate = condition_aggregate(row)
+        if event == "condition_finished" and row.get("condition_verdict") == "pending":
+            event = "condition_scoring"
         self.emit(event, row["target"], scenario, condition_summary={**row, "aggregate_status": aggregate["status"],
                   **{key: aggregate[key] for key in ("condition_id", "check_id", "name", "concurrency_description", "not_started", "reasons")}},
                   **{k: v for k, v in row.items() if k not in {"target", "completed"}})
@@ -397,7 +400,7 @@ class _Run:
             return "request budget reached"
         return fallback
 
-    def finish_condition(self, target, scenario, workload=None, reason=None, load_point_result=None):
+    def finish_condition(self, target, scenario, workload=None, reason=None, load_point_result=None, *, verdict=None):
         key = (target, condition_for(scenario, workload or {}, self.config)["id"])
         row = self.conditions.get(key)
         if row is None:
@@ -408,6 +411,10 @@ class _Run:
         row["status"] = "finished"
         if load_point_result is not None:
             row["load_point_result"] = dict(load_point_result)
+        if scheduled_multi_user_window(scenario):
+            # These windows have a verdict only after Multi-user qualifies the
+            # complete offer ledger and any cross-window recovery evidence.
+            row["condition_verdict"] = verdict or row.get("condition_verdict") or "pending"
         self.emit_condition("condition_finished", scenario, row)
 
     def record_finished(self, record: RequestRecord) -> None:

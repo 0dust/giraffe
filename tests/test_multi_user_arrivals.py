@@ -863,3 +863,151 @@ def test_transport_lane_wait_respects_backlog_discard(monkeypatch, stall):
             assert window["peak_in_flight"] == 3
 
     run_virtual(monkeypatch, run())
+
+
+@pytest.mark.parametrize("scenario", ["arrivals", "recovery"])
+def test_scheduled_request_timeouts_only_fail_multi_user(monkeypatch, scenario):
+    from contextvars import ContextVar
+
+    from giraffe.client import LLMClient
+
+    current_scenario = ContextVar("current_scenario", default="")
+
+    class Endpoint(LLMClient):
+        async def execute(self, spec, **kwargs):
+            token = current_scenario.set(spec.scenario)
+            try:
+                return await super().execute(spec, **kwargs)
+            finally:
+                current_scenario.reset(token)
+
+    async def respond(request):
+        if request.method != "POST":
+            return httpx.Response(404)
+        if current_scenario.get().endswith(("_arrivals", "_recovery_control", "_recovery_sustained", "_recovery_lighter")):
+            await asyncio.sleep(.25)
+        return httpx.Response(200, json={
+            "choices": [{"message": {"role": "assistant", "content": "K7P4"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 64, "completion_tokens": 16, "total_tokens": 80},
+        })
+
+    async_client = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **options: async_client(
+        transport=httpx.MockTransport(respond), **options))
+    monkeypatch.setattr(runner, "LLMClient", Endpoint)
+    cfg = settings(levels=[2], scenarios=[scenario], duration_seconds=.2, profile=PROFILE,
+                   arrivals={"requests_per_second": 2}, recovery={"control_seconds": .2,
+                       "sustained_seconds": .2, "lighter_seconds": .2,
+                       "sustained_requests_per_second": 10, "lighter_requests_per_second": 5}).model_copy(
+        update={"checks": ["access", "serving", "multi_user"], "stream": False,
+                "request_timeout_seconds": .06, "concurrency": 2})
+    report = run_virtual(monkeypatch, runner.run_suite(cfg))
+    requests = [request for request in report.requests if request.workload.get("scenario") == scenario]
+    assert len(requests) == (2 if scenario == "arrivals" else 8)
+    assert all(request.status == "timeout" and request.check_ids == ["multi_user"] for request in requests)
+    checks = {check.id: check for check in report.checks}
+    assert checks["access"].status == checks["serving"].status == "pass"
+    assert checks["serving"].metrics["error_rate"] == 0
+    assert checks["multi_user"].status == "fail"
+    conditions = {row["condition_id"]: row for row in report.conditions}
+    for window in checks["multi_user"].metrics["multi_user"]["windows"]:
+        assert window["status"] == "fail"
+        assert conditions[window["id"]]["aggregate_status"] == "failed"
+
+
+@pytest.mark.parametrize("concurrency,budget", [(1, None), (4, 5), (4, None)])
+def test_scheduled_conditions_use_exact_offers_and_qualified_window_verdict(monkeypatch, concurrency, budget):
+    from giraffe.conditions import ConditionRequestIndex, condition_aggregate, planned_conditions
+    from giraffe.models import RunReport
+
+    cfg = settings(levels=[2, 3], scenarios=["arrivals", "recovery"], duration_seconds=.5,
+                   profile=PROFILE, arrivals={"requests_per_second": 10},
+                   recovery={"control_seconds": .5, "sustained_seconds": .5, "lighter_seconds": .5,
+                             "sustained_requests_per_second": 10, "lighter_requests_per_second": 5},
+                   pass_criteria={"max_completion_ms": 500}).model_copy(
+        update={"concurrency": concurrency, "max_requests": budget})
+    events = []
+    monkeypatch.setattr(runner, "LLMClient", FakeClient)
+    report = run_virtual(monkeypatch, runner.run_suite(cfg, progress=events.append))
+    windows = next(check for check in report.checks if check.id == "multi_user").metrics["multi_user"]["windows"]
+    assert [window["scheduled_offers"] for window in windows] == [10, 6, 10, 6, 15, 9, 15, 9]
+    if concurrency == 1:
+        assert windows[0]["offer_accounting"]["dropped_local"] == 5
+    elif budget:
+        assert windows[0]["offer_accounting"]["not_offered"] > 0
+        assert windows[-1]["offer_accounting"]["dispatched"] == 0
+    else:
+        assert all(window["status"] == "pass" for window in windows)
+    assert windows[0]["status"] == ("pass" if concurrency == 4 and budget is None else "inconclusive")
+
+    # Exercise both the current serialized report and a pre-fix saved report
+    # whose condition data treated schedule windows as duration-based cells.
+    saved = report.model_dump(mode="json")
+    restored = RunReport.model_validate(saved)
+    for condition in saved["observations"]["targets"]["service"]["conditions"] + saved["conditions"]:
+        condition.update(planned_kind="duration", aggregate_status="passed")
+        condition.pop("condition_verdict", None)
+    legacy = RunReport.model_validate(saved)
+    index = ConditionRequestIndex.from_report(saved)
+    preview = {row["condition_id"]: row for row in planned_conditions(cfg)}
+    actual = {row["condition_id"]: row for row in restored.conditions}
+    legacy_rows = {row["condition_id"]: row for row in legacy.conditions}
+    for window in windows:
+        identifier = window["id"]
+        accounting = window["offer_accounting"]
+        expected = {"pass": "passed", "fail": "failed", "inconclusive": "inconclusive"}[window["status"]]
+        lifecycle = [event for event in events if event["scenario"] == identifier and event.get("condition_summary")]
+        final = [event for event in lifecycle if event["event"] == "condition_finished"]
+        assert final == lifecycle[-1:]
+        assert all(condition_aggregate(event["condition_summary"])["status"] != "passed" for event in lifecycle[:-1])
+        assert preview[identifier]["planned_kind"] == "exact"
+        assert preview[identifier]["planned"] == accounting["planned"]
+        for summary in (final[0]["condition_summary"], actual[identifier], legacy_rows[identifier],
+                        index.summaries["service", identifier]):
+            assert summary["aggregate_status"] == expected
+            assert summary["planned_kind"] == "exact"
+            assert summary["planned"] == accounting["planned"]
+            assert summary["not_started"] == accounting["planned"] - accounting["dispatched"]
+
+
+async def test_web_conditions_keep_scheduled_cell_visible_while_awaiting_verdict(tmp_path, monkeypatch):
+    import threading
+
+    from tests.test_web import browser, finished, start
+
+    scoring, release = threading.Event(), threading.Event()
+    identifier = "multi_user_2_arrivals"
+    cfg = settings(levels=[2], scenarios=["arrivals"], duration_seconds=.1, profile=PROFILE,
+                   arrivals={"requests_per_second": 10}, pass_criteria={"max_completion_ms": 500})
+
+    async def measured(config, *, progress, stop_event):
+        def observe(event):
+            progress(event)
+            if event["event"] == "condition_scoring" and event["scenario"] == identifier:
+                scoring.set()
+                release.wait(5)
+
+        return await runner.run_suite(config, progress=observe, stop_event=stop_event)
+
+    async def no_metrics(*args):
+        pass
+
+    monkeypatch.setattr(runner, "LLMClient", FakeClient)
+    monkeypatch.setattr(runner, "_metrics", no_metrics)
+    monkeypatch.setattr("giraffe.web.run_suite", measured)
+    async with browser(tmp_path) as client:
+        run_id = await start(client, cfg.model_dump(mode="json"))
+        path = f"/api/runs/{run_id}"
+        try:
+            assert await asyncio.to_thread(scoring.wait, 5)
+            update = (await client.get(path + "/events?after=0")).json()
+            cell, = [row for row in update["checks"] if row.get("condition_id") == identifier]
+            assert cell["aggregate_status"] == "inconclusive"
+            assert cell["planned"] == cell["completed"] == 2
+            assert cell["planned_kind"] == "exact"
+        finally:
+            release.set()
+        detail = await finished(client, run_id)
+        saved, = [row for row in detail["report"]["conditions"] if row["condition_id"] == identifier]
+        assert saved["aggregate_status"] == "passed"
+        assert saved["planned"] == 2 and saved["planned_kind"] == "exact"
