@@ -36,7 +36,7 @@ async def exercise(monkeypatch, mode="key_rpm", *, behavior="enforce", full=Fals
                    admitted_affected=None, rejection_saturation=None, saturation_header=None, peer_delay=.01,
                    early_peer_admissions=None, restart=False, model_tpm="not configured",
                    rejection_unit=None, key_reset="2026-01-01 00:00:00 UTC", max_requests=None,
-                   peer_completion_details=None, **settings):
+                   peer_completion_details=None, progress=None, **settings):
     monkeypatch.setenv("LIMITED", "limited-secret")
     monkeypatch.setenv("PEER", "peer-secret")
     if behavior == "duplicate_credentials":
@@ -172,7 +172,7 @@ async def exercise(monkeypatch, mode="key_rpm", *, behavior="enforce", full=Fals
         else:
             target.api_key_env = "UNUSED_SHARED_CREDENTIAL"
             monkeypatch.delenv("UNUSED_SHARED_CREDENTIAL", raising=False)
-        report = await runner.run_suite(cfg)
+        report = await runner.run_suite(cfg, progress=progress)
         return next(check for check in report.checks if check.id == "gateway_policy"), report, seen
     state = runner._Run(cfg, None, None)
     async with LLMClient(cfg.targets[0], cfg, max_connections=2) as client:
@@ -184,8 +184,20 @@ async def exercise(monkeypatch, mode="key_rpm", *, behavior="enforce", full=Fals
 @pytest.mark.parametrize("mode", ["key_rpm", "priority_rpm"])
 @pytest.mark.parametrize("behavior,expected", [("enforce", "pass"), ("overadmit", "fail"), ("unknown", "inconclusive")])
 async def test_full_runner_keeps_policy_verdict_and_does_not_send_shared_setup(monkeypatch, mode, behavior, expected):
-    check, report, seen = await exercise(monkeypatch, mode, behavior=behavior, full=True)
+    events = []
+    check, report, seen = await exercise(monkeypatch, mode, behavior=behavior, full=True, progress=events.append)
     assert check.status == expected, check.summary
+    status = {"pass": "passed", "fail": "failed", "inconclusive": "inconclusive"}[expected]
+    condition = next(row for row in report.conditions if row["condition_id"] == "gateway_policy")
+    assert condition["status"] == status
+    assert condition["started"] == condition["completed"] == 13
+
+    terminal = [event for event in events if event.get("scenario") == "gateway_policy"
+                and event["event"] in {"condition_scoring", "condition_finished"}]
+    assert [event["event"] for event in terminal] == ["condition_scoring", "condition_finished"]
+    assert terminal[0]["condition_summary"]["aggregate_status"] == "inconclusive"
+    assert terminal[1]["condition_summary"]["aggregate_status"] == status
+    assert terminal[1]["condition_summary"]["condition_verdict"] == expected
     assert len(seen) == 13
     assert all(record.identity in {"limited", "peer"} for record in report.requests)
     assert len(report.requests) == 13
