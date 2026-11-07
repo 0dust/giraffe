@@ -462,6 +462,8 @@ class LLMClient:
         selected_headers = None
         attribution = spec.identity is not None and "gateway_attribution" in spec.check_ids
         policy_probe = spec.identity is not None and "gateway_policy" in spec.check_ids
+        priority_probe = (policy_probe and self.config.gateway_policy is not None
+                          and self.config.gateway_policy.capability == "priority_rpm")
         if spec.identity is not None:
             from .identities import identity_headers
             try:
@@ -935,8 +937,12 @@ class LLMClient:
                         observed_at = start + record.stream_end_ms / 1000 if record.stream_end_ms is not None else time.perf_counter()
                         data = (_object(body, strict_gateway_json=True)
                                 if attribution or policy_probe else _object(body))
-                        receive(data, streaming=False, observed_at=observed_at)
                         usage = data.get("usage")
+                        if priority_probe and isinstance(usage, dict):
+                            _check_gateway_usage_total(_token_count(usage.get("prompt_tokens")),
+                                                       _token_count(usage.get("completion_tokens")),
+                                                       _gateway_usage_total(usage))
+                        receive(data, streaming=False, observed_at=observed_at)
                         if attribution and isinstance(usage, dict):
                             _check_gateway_usage_total(record.input_tokens, record.completion_tokens, _gateway_usage_total(usage))
                         record.stream_terminated = True
