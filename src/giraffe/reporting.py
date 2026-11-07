@@ -1488,7 +1488,7 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold):
                            else None)
         missing = (not complete
                    or c_rate is None or b_rate is None or work_reason or mix_changed
-                   or live_work_reason or scenario_reason or delivery_reason)
+                   or live_work_reason or scenario_reason or interference_reason or delivery_reason)
         identity = {"check": "multi_user", "scenario": " / ".join(map(str, key if role else key[:4])),
                     "user_id": user_id, "population": population, "profile": profile,
                     "role": role, "trigger": trigger, "heavy_profile": heavy_profile,
@@ -1505,7 +1505,8 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold):
                 for evidence, records in ((c_scenario, current_work), (b_scenario, old_work)))
         if missing:
             detail = (work_reason or "Requested work proportions differ." if mix_changed or work_reason else
-                      live_work_reason or scenario_reason or delivery_reason or "Missing or incomplete shared-window coverage.")
+                      live_work_reason or scenario_reason or interference_reason or delivery_reason
+                      or "Missing or incomplete shared-window coverage.")
             message = f"Multi-user {user_id} at {population} users: {detail}"
             row["reason"] = message
             incomplete.append(message)
