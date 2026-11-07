@@ -44,6 +44,12 @@ def _tokens(records: list[RequestRecord]) -> tuple[int, int]:
             sum(r.output_tokens is None for r in records))
 
 
+def _has_streamed_answer(record: RequestRecord) -> bool:
+    # Retained usage can contradict text classified as answer during the stream.
+    return (record.stream and record.output_tokens != 0
+            and record.answer_reads >= 2 and record.answer_chunks >= 2)
+
+
 def _first(record: RequestRecord) -> float | None:
     start = record.timing_start_ms if record.timing_start_ms is not None else record.dispatch_ms
     return start + record.first_output_ms if start is not None and record.first_output_ms is not None else None
@@ -448,7 +454,7 @@ def _fairness(observation, window, users, records, criteria, health, lag, timing
         if user["timing_quality"]["status"] != "qualified":
             notes.append("Client scheduling delay affects user timing.")
         streams[uid] = [r.model_copy(update={"stream_end_ms": r.last_output_ms}) for r in samples
-                        if r.stream and r.answer_reads >= 2 and r.answer_chunks >= 2]
+                        if _has_streamed_answer(r)]
         lengths = {"input_median_tokens": [r.input_tokens for r in comparison_work],
                    "output_median_tokens": [r.output_tokens for r in comparison_work],
                    "uncached_input_median_tokens": uncached,
@@ -515,7 +521,7 @@ def _cancellation(window, records, criteria, health, lag, timing_threshold, dela
         for peer in records:
             span = answer_window(peer)
             if (peer.workload.get("user_id") != window["selected_user_id"] and span
-                    and peer.stream and peer.answer_reads >= 2 and peer.answer_chunks >= 2
+                    and _has_streamed_answer(peer)
                     and _overlap(span, (span[0], at), delays) and _overlap(span, (at, span[1]), delays)
                     and qualify([peer], health, timing_threshold, ("latency_ms", "max_stream_gap_ms"),
                                 legacy_max_lag_ms=lag)["status"] == "qualified"):
@@ -577,7 +583,7 @@ def _interference(observation, window, control, user_records, criteria, health, 
     for heavy_id in window["heavy_user_ids"]:
         for competitor in user_records.get((window["id"], heavy_id), []):
             at = competitor.workload.get("trigger_ms")
-            if not _valid(competitor) or at is None:
+            if not _valid(competitor) or competitor.output_tokens == 0 or at is None:
                 continue
             for uid in competitor.workload.get("trigger_peer_ids", []):
                 heavy_by_peer[uid].append((at, competitor))
@@ -630,7 +636,7 @@ def _interference(observation, window, control, user_records, criteria, health, 
             if not _comparable_uncached_input(baseline, probe, tolerance):
                 excluded.add("Actual matched short-user uncached input is not comparable.")
                 continue
-            if not probe.stream or probe.answer_reads < 2 or probe.answer_chunks < 2:
+            if not _has_streamed_answer(probe):
                 continue
             span = answer_window(probe)
             if window["trigger"] == "before_output":
@@ -654,7 +660,7 @@ def _interference(observation, window, control, user_records, criteria, health, 
                     last = _first_generation(competitor)
                     heavy_span = (sent, last) if last is not None else None
                 else:
-                    heavy_span = answer_window(competitor) if competitor.answer_reads >= 2 and competitor.answer_chunks >= 2 else None
+                    heavy_span = answer_window(competitor) if _has_streamed_answer(competitor) else None
                 overlap_span = span if heavy_output == "long" else short_span
                 if not _overlap(overlap_span, heavy_span, delays):
                     continue
