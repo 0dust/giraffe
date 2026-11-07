@@ -267,7 +267,8 @@ class FakeEndpoint:
                         result['observation_id'] = 'invented-observation'
                     text = json.dumps(result)
                 if results and mode == 'conversation_timeout':
-                    time.sleep(0.2)
+                    # Hang until the endpoint exits so the client deadline always fires first.
+                    endpoint._stop.wait(30)
                 finish = 'length' if results and mode in {'conversation_truncated', 'conversation_repeat_truncated'} else 'tool_calls' if calls else 'stop'
                 extras = {'reasoning_content': 'Need weather.'} if mode == 'conversation_reasoning' else {}
                 if mode == 'conversation_unknown_field':
@@ -298,7 +299,8 @@ class FakeEndpoint:
                         'function': {'name': c['function']['name'][4:],
                         'arguments': c['function']['arguments'][3:]}} for i, c in reversed(list(enumerate(calls)))]})
                     if results and mode == 'conversation_repeat_timeout':
-                        time.sleep(0.2)
+                        # Hang until the endpoint exits so the client deadline always fires first.
+                        endpoint._stop.wait(30)
                 event({'content': text[3:] if text else None}, finish)
                 if not (results and mode == 'conversation_eof'):
                     self.wfile.write(b'data: [DONE]\n\n')
