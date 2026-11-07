@@ -108,6 +108,56 @@ async def collect(cfg, run):
     return result(run, cfg.targets[0])
 
 
+@pytest.mark.parametrize("mode,expected,started", [
+    ("only", "pass", 2),
+    ("mixed", "pass", 2),
+    ("deferred", "fail", 2),
+    ("budget", "inconclusive", 1),
+])
+async def test_live_attribution_condition_finishes_with_the_qualified_check(
+        monkeypatch, local_tokenizer, mode, expected, started):
+    events = []
+    reads_during_scoring = []
+
+    async def observer(request, rows):
+        if rows:
+            lifecycle = [event["event"] for event in events if event["scenario"] == "gateway_attribution"]
+            reads_during_scoring.append(lifecycle[-1] == "condition_scoring")
+        if mode == "deferred":
+            rows = [{**row, "completion_tokens": 6, "total_tokens": 9} for row in rows]
+        return spend_page(request, rows)
+
+    cfg, _, _ = setup(monkeypatch, observer)
+    immediate_spend_polls(monkeypatch, cfg)
+    if mode in {"mixed", "deferred"}:
+        cfg.checks = ["access", "gateway_attribution"]
+        cfg.targets[0].api_key_env = "SHARED"
+    if mode == "deferred":
+        cfg.targets.append(cfg.targets[0].model_copy(
+            update={"name": "second", "url": "http://second/v1", "gateway": None}))
+    if mode == "budget":
+        cfg.max_requests = 1
+
+    report = await run_suite(cfg, progress=events.append)
+    check = next(check for check in report.checks if check.target == "proxy" and check.id == "gateway_attribution")
+    saved = next(row for row in report.conditions if row["condition_id"] == "gateway_attribution")
+    assert check.status == expected
+    assert reads_during_scoring and all(reads_during_scoring)
+    scoring, finished = [event for event in events if event["target"] == "proxy"
+                         and event["scenario"] == "gateway_attribution"
+                         and event["event"] in {"condition_scoring", "condition_finished"}]
+    assert scoring["event"] == "condition_scoring"
+    assert scoring["condition_summary"]["condition_verdict"] == "pending"
+    assert finished["event"] == "condition_finished"
+    summary = finished["condition_summary"]
+    assert summary["condition_verdict"] == check.status
+    assert summary["aggregate_status"] == saved["status"]
+    assert summary["planned"] == saved["planned"] == 2
+    assert summary["started"] == summary["completed"] == saved["started"] == saved["completed"] == started
+    assert summary["failed"] == saved["failed"] == 0
+    assert events.index(finished) < next(i for i, event in enumerate(events) if event["event"] == "run_finished")
+
+
 @pytest.mark.parametrize("row_limit", [1, 2])
 async def test_row_limit_is_checked_before_marked_requests(monkeypatch, row_limit):
     keys = []
@@ -1799,6 +1849,84 @@ async def test_duration_limit_preserves_only_shared_work_completed_before_gatewa
     current.observations.pop("duration_limit_scope")
     assert all(any("run was aborted" in reason for reason in entry["reasons"])
                for entry in compare_baseline(current, baseline).baseline["targets"])
+
+
+@pytest.mark.parametrize("targets,stop_during", [(1, "gateway_fast"), (2, "gateway"), (2, "shared")])
+async def test_user_stop_preserves_only_shared_work_completed_before_gateway_phase(
+        monkeypatch, local_tokenizer, tmp_path, targets, stop_during):
+    client_class = httpx.AsyncClient
+    original_send = client_class.send
+    stop = asyncio.Event()
+    stop_in_gateway = stop_during.startswith("gateway")
+
+    async def saved_run(*, mixed):
+        async def observer(request, rows):
+            if mixed and stop_in_gateway and rows:
+                stop.set()
+                if stop_during == "gateway":
+                    await asyncio.Event().wait()
+            return spend_page(request, rows)
+
+        async def send(client, request, **kwargs):
+            if mixed and stop_during == "shared" and request.method == "POST" and request.url.host == "second":
+                stop.set()
+                await asyncio.Event().wait()
+            return await original_send(client, request, **kwargs)
+
+        with monkeypatch.context() as env:
+            cfg, _, _ = setup(env, observer)
+            immediate_spend_polls(env, cfg)
+            if targets == 2:
+                cfg.targets.append(cfg.targets[0].model_copy(
+                    update={"name": "second", "url": "http://second/v1", "gateway": None}))
+            cfg.checks = ["serving"] + (["gateway_attribution"] if mixed else [])
+            cfg.samples = cfg.limits.min_samples = 2
+            cfg.max_requests = None
+            env.setattr(client_class, "send", send)
+            report = await run_suite(cfg, stop_event=stop)
+            path, _ = write_report(report, tmp_path)
+            return RunReport.model_validate_json(path.read_bytes())
+
+    baseline = await saved_run(mixed=False)
+    current = await saved_run(mixed=True)
+    assert current.abort_reason == "cancelled by user" and current.overall == "inconclusive"
+    assert current.observations.get("user_stop_scope") == ("gateway" if stop_in_gateway else None)
+    if stop_in_gateway:
+        attribution = next(check for check in current.checks if check.id == "gateway_attribution")
+        assert attribution.status == "inconclusive" and attribution.metrics["matched_requests"] == 0
+        assert all(check.status == "pass" for check in current.checks if check.id == "serving")
+    for report, previous in ((current, baseline), (baseline, current)):
+        compared = compare_baseline(report, previous).baseline
+        assert len(compared["targets"]) == targets
+        for target in compared["targets"]:
+            if stop_in_gateway:
+                assert not target["reasons"]
+                assert any(row["check"] == "serving" and row["metric"] == "valid_completion_rate"
+                           and row["status"] == "pass" for row in target["comparisons"])
+            else:
+                assert any("run was aborted" in reason for reason in target["reasons"])
+                assert not any(row["check"] == "serving" for row in target["comparisons"])
+
+
+@pytest.mark.parametrize("shared_pending,stop_before_gateway", [
+    (True, False), (False, True),
+])
+def test_stop_scope_requires_complete_shared_work_and_a_new_stop(shared_pending, stop_before_gateway):
+    cfg = config(stream=False)
+    cfg.checks = ["serving", "correctness", "gateway_attribution"]
+    cfg.targets.append(cfg.targets[0].model_copy(
+        update={"name": "second", "url": "http://second/v1", "gateway": None}))
+    run = _Run(cfg, None, None)
+    run.finish_checks("proxy", {"serving", "correctness"})
+    # Completed inference on the other target can still need judging.
+    run.judging_pending = shared_pending
+    run.finish_checks("second", {"serving", "correctness"})
+    if stop_before_gateway:
+        run.stop.set()
+    with run.gateway_limit_phase():
+        run.stop.set()
+    assert run.reason == "cancelled by user"
+    assert run.user_stop_scope is None
 
 
 async def test_concurrency_limit_records_which_requests_waited_for_a_slot():

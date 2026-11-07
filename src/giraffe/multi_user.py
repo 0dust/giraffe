@@ -24,6 +24,7 @@ WINDOW_POLICY = "completed-output-v1"
 
 class _UserOutputProgress(OutputProgress):
     first_token = False
+    finished = False
 
     def __init__(self, changed, expire_trigger_admissions):
         super().__init__(changed)
@@ -37,6 +38,11 @@ class _UserOutputProgress(OutputProgress):
     def set(self):
         super().set()
         self.expire_trigger_admissions()
+
+    def on_stream_finished(self):
+        self.finished = True
+        self.expire_trigger_admissions()
+        self.changed.set()
 
 
 def _matched_work_sha256(spec, *, nonce=None):
@@ -112,12 +118,13 @@ async def run_window(run, target, client, settings, load_settings, calibration, 
     sequences = sequences if sequences is not None else {}
 
     def trigger_peers():
-        return [uid for uid, progress in active.items() if uid not in window.get("heavy_user_ids", [])
+        return [uid for uid, progress in active.items() if not progress.finished
+                and uid not in window.get("heavy_user_ids", [])
                 and (not (progress.first_token or progress.first)
                      if window.get("trigger") == "before_output" else progress.chunks >= 2)]
 
     def cancellation_peers():
-        return [uid for uid, progress in active.items() if progress.first]
+        return [uid for uid, progress in active.items() if progress.first and not progress.finished]
 
     def expire_trigger_admissions():
         if not trigger_waiters or closed or time.monotonic() >= cutoff:
