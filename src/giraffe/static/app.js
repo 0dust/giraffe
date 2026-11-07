@@ -1903,7 +1903,7 @@ function renderMultiUserConversationEditor(settings) {
 }
 
 function editUserConversation(action,index) {
-  const form=$('#new-run-form'),name=form.elements[`multi_user_conversation_task_${index}_name`]?.value;
+  const form=$('#new-run-form');
   captureFormDraft();
   const tasks=state.config.multi_user?.conversations?.workloads;
   if(!tasks)return;
@@ -1911,7 +1911,11 @@ function editUserConversation(action,index) {
     let suffix=1;while(tasks.some(item=>item.name===`custom-${suffix}`))suffix++;
     tasks.push({name:`custom-${suffix}`,weight:1,max_tokens:null,turns:['Explain a topic in detail.','Build on your previous answer.']});
   }else{
-    const position=tasks.findIndex(item=>item.name===name),task=tasks[position];
+    // The draft contains only checked rows, in form order.
+    const checked=row=>form.elements[`multi_user_conversation_task_${row}_enabled`]?.checked;
+    let position=0;
+    for(let row=0;row<index;row++)if(checked(row))position++;
+    const task=checked(index)?tasks[position]:null;
     if(!task){toast('Select this task before editing it.');return;}
     if(action==='user-add-turn'&&task.turns.length<state.bootstrap.limits['sessions.workloads[].turns'].maxItems)task.turns.push('Build on your previous answer.');
     if(action==='user-remove-turn'&&task.turns.length>2)task.turns.pop();
