@@ -227,10 +227,15 @@ def test_fairness_baseline_qualifies_work_even_when_both_runs_pass(drop_request,
     assert result.baseline["acceptance"] == {"baseline": "pass", "current": "fail" if drop_request else "pass"}
 
 
-def live_user_report():
+def live_user_report(*, session_ids=False):
     report = user_report()
     window = report.checks[0].metrics["multi_user"]["windows"][0]
     window["scenario"] = "repeated_conversations"
+    if session_ids:
+        source_window = report.observations["targets"]["local"]["multi_user"]["windows"][0]
+        source_window["scenario"] = window["scenario"]
+        for user in source_window["users"]:
+            user["profile"] = "conversation:chat"
     for user in window["users"]:
         user["profile"] = "conversation:chat"
     for request in report.requests:
@@ -238,6 +243,8 @@ def live_user_report():
         request.workload.update(mode="live", profile="conversation:chat", turn_id=turn,
                                 conversation_sequence=conversation+1, task_type="exact_repeat",
                                 scenario="repeated_conversations")
+        if session_ids:
+            request.workload["session_id"] = f"{request.workload['user_id']}:{conversation+1}"
         request.fixture_id = f"session_live_turn{turn}"
         request.request_hash = f"conversation-{conversation}-turn-{turn}"
         request.finish_reason = "stop"
@@ -438,6 +445,91 @@ def test_live_baseline_qualifies_only_the_completions_delivered_in_the_window(cu
                if row.get("user_id") == "user-05" and row["metric"] == "shared_window_output_tokens_per_second")
     assert row["status"] == result.baseline["status"] == expected
     assert row["current"] == row["baseline"] == 70
+
+
+def test_baseline_stream_gap_uses_only_measured_conversation_turns():
+    current, previous = live_user_report(session_ids=True), live_user_report(session_ids=True)
+    for report, gap in ((current, 60), (previous, 5)):
+        for request in report.requests[-8:]:
+            request.stream = True
+            request.answer_reads = 2
+            request.max_stream_gap_ms = gap
+        request = report.requests[-1]
+        request.answer_reads = 1
+        request.max_stream_gap_ms = None
+        if report is current:
+            request.output_chars = 1000
+            request.request_hash = "different one-read turn"
+    current.observations["client_timing_health"] = {
+        "schema_version": 1, "windows": [{"start_ms": 7000, "end_ms": 7100, "lag_ms": 200}]
+    }
+
+    comparison = compare_baseline(current, previous).baseline
+    gap = next(row for row in comparison["targets"][0]["comparisons"]
+               if row.get("user_id") == "user-05" and row["metric"] == "max_stream_gap_ms")
+    assert gap["status"] == "fail"
+    assert gap["current_samples"] == gap["baseline_samples"] == 7
+    assert gap["timing_quality"]["Current"]["total_requests"] == 7
+    assert gap["timing_quality"]["Current"]["affected_request_ids"] == []
+    assert gap["output_work"]["current"]["valid_completions"] == 7
+    assert gap["evidence_ids"] == [request.id for request in current.requests[-8:-1]]
+
+
+@pytest.mark.parametrize("different_cap", [False, True])
+def test_baseline_conversation_latency_uses_measured_work_mix(different_cap):
+    current, previous = live_user_report(session_ids=True), live_user_report(session_ids=True)
+    for request in current.requests[-8:]:
+        request.elapsed_ms = 300
+        request.completed_ms = request.dispatch_ms + 300
+    first_turn = current.requests[-2]
+    for index in range(8):
+        request = first_turn.model_copy(deep=True)
+        request.id = f"user-05-truncated-{index}"
+        request.dispatch_ms = request.timing_start_ms = request.workload["ready_ms"] = 8000 + index * 100
+        request.completed_ms = request.dispatch_ms + 50
+        request.elapsed_ms = 50
+        request.finish_reason = "length"
+        request.workload.update(conversation_sequence=index+5, session_id=f"user-05:{index+5}")
+        if different_cap:
+            request.requested_max_tokens += 100
+        current.requests.append(request)
+    source = current.observations["targets"]["local"]["multi_user"]
+    source["windows"][0]["users"][-1]["dispatched_count"] = 16
+    current.checks[0].metrics["multi_user"] = summarize(source, current.requests)
+
+    comparison = compare_baseline(current, previous).baseline
+    rows = {row["metric"]: row for row in comparison["targets"][0]["comparisons"]
+            if row.get("user_id") == "user-05"}
+    assert rows["latency_ms"]["status"] == "fail"
+    assert rows["latency_ms"]["current_samples"] == rows["latency_ms"]["baseline_samples"] == 8
+    assert rows["latency_ms"]["evidence_ids"] == [request.id for request in current.requests[-16:-8]]
+    if not different_cap:
+        assert rows["valid_completion_rate"]["current_samples"] == rows["error_rate"]["current_samples"] == 16
+        assert rows["valid_completion_rate"]["current"] == rows["error_rate"]["current"] == 0.5
+
+
+@pytest.mark.parametrize("counter", ["output_tokens", "completion_tokens", None])
+def test_baseline_multi_user_gap_requires_no_contradictory_token_count(counter):
+    current, previous = user_report(), user_report()
+    for report, gap in ((current, 60), (previous, 5)):
+        for request in report.requests[-8:]:
+            request.stream = True
+            request.answer_reads = 2
+            request.max_stream_gap_ms = gap
+            request.output_tokens = request.completion_tokens = None
+            if counter:
+                setattr(request, counter, 0)
+
+    comparison = compare_baseline(current, previous).baseline
+    gaps = [row for row in comparison["targets"][0]["comparisons"]
+            if row.get("user_id") == "user-05" and row["metric"] == "max_stream_gap_ms"]
+    if counter:
+        assert gaps == []
+    else:
+        gap, = gaps
+        assert gap["status"] == "fail"
+        assert gap["current_samples"] == gap["baseline_samples"] == 8
+    assert current.requests[-1].max_stream_gap_ms == 60
 
 
 @pytest.mark.parametrize("conversation", [True, False])
