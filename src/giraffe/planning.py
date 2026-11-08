@@ -448,6 +448,13 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
                         # timeout after sending stops, even without timing samples.
                         item["coverage_high_seconds"] = item["high_seconds"]
                 continue
+            if name.startswith("multi_user_"):
+                settings = config.multi_user
+                phases = 1 + bool(settings.warmup_seconds)
+                fixed(target.name, row, settings.duration_seconds + settings.warmup_seconds,
+                      "multi_user.duration_seconds", count=phases,
+                      timeout=config.request_timeout_seconds)
+                continue
             if name == "capacity":
                 settings = config.effective_traffic()
                 options = effective("capacity")
@@ -1080,6 +1087,15 @@ def request_plan(config: RunConfig | ConfigDraft, *,
                 "msg":"Expected scheduled Load test requests exceed the total request budget; some tests will be truncated.",
                 "values":{"expected_scheduled_requests":load_plan["expected_scheduled_requests"]*target_count,"max_requests":config.max_requests}})
         warnings.extend(w["msg"] for w in load_warnings)
+    if "multi_user" in selected:
+        settings = config.multi_user
+        for level in settings.levels:
+            add(f"multi_user_{level}", None,
+                f"{level} persistent users share the run request slots for {settings.duration_seconds:g} s"
+                f" after {settings.warmup_seconds:g} s warmup; each request drains within its ordinary timeout.",
+                source="generated token-target prompts", kind="duration", title=f"Multi-user · {level} users")
+            rows[-1].update(users=level, simultaneous_limit=config.concurrency,
+                            configured_seconds=settings.duration_seconds + settings.warmup_seconds)
     if "sessions" in selected:
         settings = config.sessions
         if settings.profile == "performance":

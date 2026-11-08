@@ -1,0 +1,25 @@
+config_version: 2
+# Simulated users share one endpoint and the same optional API-key reference.
+targets:
+  - name: local
+    url: http://127.0.0.1:8000/v1
+    model: your-model
+    # api_key_env: LLM_API_KEY
+checks: [multi_user]
+concurrency: 5
+max_requests: 2000
+max_duration_seconds: 120
+request_timeout_seconds: 10
+multi_user:
+  levels: [1, 5, 20]
+  shapes: [short_short]
+  seed: 42
+  duration_seconds: 15
+  warmup_seconds: 0
+  think_time_seconds:
+    values: [0.25]
+  pass_criteria:
+    max_first_answer_ms: 2000
+    max_completion_ms: 10000
+    max_error_percent: 0
+    min_samples: 2
