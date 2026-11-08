@@ -18,7 +18,7 @@ from time import monotonic
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 import math
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Callable
 
 import httpx
 
@@ -401,6 +401,7 @@ class LLMClient:
 
     async def execute(
         self, spec: RequestSpec, *, first_output_event: asyncio.Event | None = None,
+        on_rate_limit: Callable[[float | None], None] | None = None,
     ) -> RequestRecord:
         if self._client is None:
             raise RuntimeError("Use LLMClient as an async context manager")
@@ -745,6 +746,8 @@ class LLMClient:
                     if response.status_code == 429:
                         record.rate_limited = True
                         record.retry_after_seconds = _retry_after(response.headers.get("retry-after"))
+                        if on_rate_limit is not None:
+                            on_rate_limit(record.retry_after_seconds)
                     record.backend_id = response.headers.get("x-backend-id") or response.headers.get(
                         "x-replica-id",
                     )

@@ -259,7 +259,7 @@ async def test_rate_limit_does_not_consume_generic_error_budget():
 
     await run.request(config.targets[0], RateLimited(), spec)
     assert run.errors == 0
-    assert run.reason is None
+    assert run.reason == "rate limit threshold reached"
     assert run.records[0].rate_limited
     stats = runner._stats(run.records)
     assert stats["rate_limited"] == 1 and stats["failed"] == 0

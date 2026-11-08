@@ -90,6 +90,30 @@ async def test_rate_limit_records_retry_after(monkeypatch):
     assert record.error == "rate limited (HTTP 429); retry after 1.5s"
 
 
+async def test_rate_limit_callback_runs_before_error_body(monkeypatch):
+    target = Target(name="local", url="http://local/v1", model="test")
+    config = RunConfig(targets=[target])
+    original = httpx.AsyncClient
+    seen = []
+
+    class Body(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            seen.append("body")
+            yield b'{"error":"limited"}'
+
+        async def aclose(self):
+            pass
+
+    monkeypatch.setattr("giraffe.client.httpx.AsyncClient", lambda **kwargs: original(
+        transport=httpx.MockTransport(lambda _: httpx.Response(
+            429, headers={"Retry-After": "2"}, stream=Body())), **kwargs,
+    ))
+    async with LLMClient(target, config) as client:
+        await client.execute(spec(), on_rate_limit=lambda retry: seen.append(("header", retry)))
+
+    assert seen == [("header", 2.0), "body"]
+
+
 def test_retry_after_accepts_http_date_and_rejects_invalid_values():
     from datetime import datetime, timedelta, timezone
     from email.utils import format_datetime

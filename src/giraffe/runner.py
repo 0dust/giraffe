@@ -40,6 +40,7 @@ from .models import (
 
 
 logger = logging.getLogger(__name__)
+RATE_LIMIT_FALLBACK_SECONDS = 1.0
 # A context-local sink lets web runs persist evidence without changing request()
 # or sharing a writer between concurrent CLI invocations.
 record_sink = ContextVar("giraffe_record_sink", default=lambda record: None)
@@ -260,6 +261,7 @@ class _Run:
         self.budget_counts = Counter()
         self.errors = 0
         self.rate_limit_until = {target.name: 0.0 for target in config.targets}
+        self.rate_limit_failures = Counter()
         self.reason: str | None = None
         self.limits_reached = set()
         self.memory_limit_reached = False
@@ -483,6 +485,8 @@ class _Run:
             self.reason = self.reason or "; ".join(health["abort_reason"] for health in self.endpoint_health.values())
         if self.errors >= self.config.stop_after_errors:
             self.reason = self.reason or "error threshold reached"
+        if any(count >= self.config.stop_after_errors for count in self.rate_limit_failures.values()):
+            self.reason = self.reason or "rate limit threshold reached"
         self.reason = self.reason or previous
         if self.reason and self.reason != "maximum request budget reached" and not self.stop_notified:
             self.stop_notified = True
@@ -500,6 +504,13 @@ class _Run:
             return
         health.update(last_response_seconds=time.monotonic() - self.start,
                       consecutive_failures=0, failure_request_ids=[])
+        self.rate_limit_failures[target] = 0
+
+    def rate_limit_received(self, target, retry_after):
+        self.rate_limit_failures[target] += 1
+        delay = retry_after if retry_after is not None else RATE_LIMIT_FALLBACK_SECONDS
+        self.rate_limit_until[target] = max(self.rate_limit_until[target], time.monotonic() + delay)
+        self.stop_reason(target)
 
     def endpoint_failure(self, target, record_id=None):
         health = self.endpoint_health[target]
@@ -569,7 +580,9 @@ class _Run:
                 self.release_slot()
 
     async def request(self, target, client, spec, event=None, on_start=None, timeout_override=None,
-                      *, slot_reserved=False, budget_reserved=False, deadline_override=None, budget_exempt=False, evaluate_record=None, finalize_record=None, request_parameters=None):
+                      *, slot_reserved=False, budget_reserved=False, deadline_override=None,
+                      latest_dispatch_deadline=None, budget_exempt=False, evaluate_record=None,
+                      finalize_record=None, request_parameters=None):
         """Complete a request and persist its terminal evidence once.
 
         ``finalize_record`` synchronously adds scheduler-owned measurements before
@@ -583,7 +596,9 @@ class _Run:
         readiness = spec.scenario == "readiness" or (
             spec.scenario == "initial" and self.config.restart_target == target.name)
         evidence_probe = spec.scenario == "performance_evidence_probe"
-        slot_deadline = min(self.deadline, deadline_override if deadline_override is not None else self.deadline)
+        dispatch_deadlines = [deadline for deadline in (deadline_override, latest_dispatch_deadline)
+                              if deadline is not None]
+        slot_deadline = min([self.deadline, *dispatch_deadlines])
         async with self.slot(slot_reserved, slot_deadline) as admitted:
             while admitted and not self.stop.is_set():
                 wait = self.rate_limit_until[target.name] - time.monotonic()
@@ -632,6 +647,7 @@ class _Run:
             started, started_at = time.monotonic(), _now()
             token = self.inflight.start(target.name)
             failure = None
+            rate_limit_noted = False
             task = asyncio.current_task()
             cancellations = task.cancelling()
             try:
@@ -655,7 +671,15 @@ class _Run:
                                         self.deadline - time.monotonic()))
                 deadline = asyncio.timeout(timeout)
                 async with deadline:
-                    record = await client.execute(spec, first_output_event=event)
+                    def note_rate_limit(retry_after):
+                        nonlocal rate_limit_noted
+                        rate_limit_noted = True
+                        self.rate_limit_received(target.name, retry_after)
+
+                    execute_kwargs = {"first_output_event": event}
+                    if getattr(client, "_client", None) is not None:
+                        execute_kwargs["on_rate_limit"] = note_rate_limit
+                    record = await client.execute(spec, **execute_kwargs)
                 if deadline.expired():
                     record.status, record.valid = ("cancelled" if global_deadline else "timeout"), False
                     record.error = "maximum run duration reached" if global_deadline else (
@@ -784,10 +808,8 @@ class _Run:
                             record.error = self.endpoint_health[target.name]["abort_reason"]
                         self.mark_unfinished(target.name, _scenario_checks(spec))
                 budget_only = bool(set(spec.check_ids) & {"prefix", "sessions", "tools"}) and reasoning_budget(record)
-                if record.rate_limited and not intentional:
-                    retry_after = record.retry_after_seconds or 0.0
-                    self.rate_limit_until[target.name] = max(
-                        self.rate_limit_until[target.name], time.monotonic() + retry_after)
+                if record.rate_limited and not intentional and not rate_limit_noted:
+                    self.rate_limit_received(target.name, record.retry_after_seconds)
                 if _serving_failure(record, spec.scenario) and not readiness and not intentional and not budget_only:
                     if not record.rate_limited:
                         self.errors += 1
