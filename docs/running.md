@@ -187,6 +187,9 @@ Incompatible workloads leave metric comparison inconclusive. See
 The **Baseline comparison** panel shows all measurements by default: baseline,
 current, and change. Changes are signed as
 current minus baseline; correctness and other rates use percentage points.
+Timing and output-rate regressions use `limits.regression_percent`; error,
+correctness, and other percentage rates use `limits.regression_rate_points`
+(5 percentage points by default).
 Answer lengths are observations, not better/worse judgments.
 
 **Pass / fail** reports acceptance separately. A failed
@@ -292,7 +295,7 @@ config-only. These options moved from ordinary help into the advanced group:
   `--request-pack`, `--retention`, `--ca-bundle`, `--proxy`.
 - `--first-output-ms`, `--latency-ms`, `--stream-gap-ms`,
   `--min-output-tokens-per-second`, `--max-error-rate`, `--min-correctness`,
-  `--regression-percent`, `--save-config`.
+  `--regression-percent`, `--regression-rate-points`, `--save-config`.
 - `--max-total-storage`, `--min-free-disk`, `--max-run-storage`,
   `--auto-cleanup-keep-latest`, `--auto-cleanup-older-than`,
   `--auto-cleanup-max-total`, `--runs-dir`.

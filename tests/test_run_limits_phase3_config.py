@@ -141,7 +141,10 @@ def test_regression_threshold_is_baseline_metadata_and_not_workload_identity():
     compared = compare_baseline(current, old)
     assert compared.baseline["regression_threshold"] == 5
     configured = config(limits={"regression_percent": 5})
-    metadata = {"field": "limits.regression_percent", "regression_percent": 5}
+    metadata = {"field": "limits.regression_percent", "regression_percent": 5,
+                "regression_rate_points": 5,
+                "fields": {"timing": "limits.regression_percent",
+                           "rates": "limits.regression_rate_points"}}
     assert capabilities(configured)["baseline_comparison"] == metadata
     assert request_plan(configured)["baseline_comparison"] == metadata
 
