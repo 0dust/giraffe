@@ -467,7 +467,8 @@ def test_rate_regression_in_matching_cohort_survives_mix_warning_elsewhere():
     assert rows[1]['status'] == 'fail' and rows[1]['warnings'] == []
     assert (rows[1]['current'], rows[1]['baseline']) == (0, 1)
     assert rows[4]['status'] == 'inconclusive'
-    assert [warning['code'] for warning in rows[4]['warnings']] == ['request_mix_changed']
+    assert [warning['code'] for warning in rows[4]['warnings']] == [
+        'sample_uncertainty', 'request_mix_changed']
 
 
 @pytest.mark.parametrize('count,changed', [(36, False), (37, True)])

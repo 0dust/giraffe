@@ -1039,7 +1039,9 @@ class _Run:
                                   *({"request_body_sent_ms"} if record.request_body_sent_ms is not None else ()),
                                   "timing_schema", "first_token_ms", "first_reasoning_ms", "last_output_ms",
                                   "stream", "stream_end_ms", "answer_reads", "answer_chunks", "answer_chars",
-                                  "first_read_answer_chars", "max_stream_gap_ms", "input_tokens", "output_tokens",
+                                  "first_read_answer_chars", "first_read_output_tokens", "last_read_output_tokens",
+                                  "read_output_tokens_source",
+                                  "max_stream_gap_ms", "input_tokens", "output_tokens",
                                   "completion_tokens", "reasoning_tokens", "cached_prompt_tokens", "finish_reason",
                               }), intentional=intentional)
                 except Exception:
@@ -2681,7 +2683,12 @@ def _verdict_summary(check, config, records, budget):
     elif check.id == "cancellation" and not config.stream:
         remedy = "enable streaming (stream: true, omit --nonstream) so the client can observe output and interrupt the request, then rerun cancellation"
     elif any(word in text for word in ("stream", "timing", "measurable", "measured", "token measurements", "first-output baseline")) and check.status == "inconclusive":
-        remedy = (f"enable streaming (stream: true, omit --nonstream), disable response buffering along the route and enable completion token usage reporting; "
+        usage_guidance = ("enable streamed logprobs or cumulative completion token usage alongside streamed content "
+                          "(request_options.stream_options.continuous_usage_stats: true on a compatible server); "
+                          "final-only usage cannot establish generation pace; "
+                          if "generation_tokens_per_second" in metrics.get("missing_timing_metrics", []) else "")
+        remedy = (f"enable streaming (stream: true, omit --nonstream), disable response buffering along the route; "
+                  f"{usage_guidance}"
                   f"collect at least {limits.min_samples} responses with the required timing measurements, then rerun the same workload")
     elif "sample" in text or "score" in text or "scor" in text:
         remedy = (f"collect at least {samples} complete scored answers per tested condition; "
@@ -3131,7 +3138,7 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
                 "scenario_counts": dict(counts),
                 "measurement_definitions": {
                     "first_output_ms": "client-observed first non-whitespace answer or parsed tool delta; not server TTFT",
-                    "generation_tokens_per_second": "(answer tokens - 1) / seconds between first and last answer chunk; estimate",
+                    "generation_tokens_per_second": "difference in output token counts (cumulative server usage or streamed logprob tokens) / seconds between first and last answer-bearing client reads; client-observed estimate",
                     "aggregate": "valid completions or known output tokens / seconds from first dispatch to last completion within each scenario; includes errors in window",
                     "latency_ms": "client dispatch through protocol completion",
                     "workload_sizes": "character sizing is requested shape; server token usage is observed length",

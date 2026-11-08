@@ -13,6 +13,7 @@ def record(**changes):
         "started_at": "2026-10-04T00:00:00Z", "status": "completed", "valid": True,
         "first_output_ms": 39000, "last_output_ms": 39250, "elapsed_ms": 45000,
         "output_tokens": 4, "answer_chunks": 4, "answer_reads": 4,
+        "first_read_output_tokens": 1, "last_read_output_tokens": 4,
         "answer_chars": 4, "first_read_answer_chars": 1, "stream": True, **changes,
     })
 
