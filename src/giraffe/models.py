@@ -2164,6 +2164,35 @@ class RunConfig(Model):
 
     @model_validator(mode="before")
     @classmethod
+    def finite_request_options(cls, value):
+        if not isinstance(value, dict):
+            return value
+
+        def visit(item, path):
+            if isinstance(item, dict):
+                for key, child in item.items():
+                    visit(child, f"{path}.{key}")
+            elif isinstance(item, list):
+                for index, child in enumerate(item):
+                    visit(child, f"{path}.{index}")
+            elif isinstance(item, float) and not math.isfinite(item):
+                raise ValueError(f"{path} must be a finite number")
+
+        visit(value.get("request_options"), "request_options")
+        for group, field in (("request_pack", "cases"), ("tool_checks", "fixtures"),
+                             ("tool_checks", "conversations")):
+            container = value.get(group)
+            if isinstance(container, BaseModel):
+                container = container.model_dump(mode="python")
+            items = container.get(field, []) if isinstance(container, dict) else []
+            if isinstance(items, list):
+                for index, item in enumerate(items):
+                    options = item.get("options") if isinstance(item, dict) else getattr(item, "options", None)
+                    visit(options, f"{group}.{field}.{index}.options")
+        return value
+
+    @model_validator(mode="before")
+    @classmethod
     def load_profile_defaults(cls, value):
         # Sparse profiles inherit missing dimensions, never a suite output ceiling.
         if not isinstance(value, dict):

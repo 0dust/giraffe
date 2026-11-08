@@ -20,6 +20,46 @@ def arrival_settings(**changes):
                   "bursts": [{"user_id": "user-01", "at_seconds": .05, "requests": 3}]}, **changes)
 
 
+def test_preparation_failures_are_unissued_and_do_not_stop_peer_arrivals(monkeypatch):
+    calls = []
+
+    class PreparationClient(FakeClient):
+        _supports_dispatch_guard = True
+
+        async def execute(self, spec, *, _before_send, **kwargs):
+            uid = spec.workload["user_id"]
+            calls.append(uid)
+            if uid == "user-01":
+                assert calls.count(uid) == 1, "preparation failure was retried"
+                raise ValueError("secret-sk-123")
+            _before_send()
+            return await super().execute(spec, **kwargs)
+
+    async def scenario():
+        cfg = arrival_settings()
+        state = runner._Run(cfg, None, None)
+        target = cfg.targets[0]
+        await execute(state, target, PreparationClient(target, cfg))
+        window, = state.observations[target.name]["multi_user"]["windows"]
+        accounting = window["offer_accounting"]
+        assert accounting == {"planned": 9, "offered": 9, "dispatched": 2,
+            "dropped_local": 0, "dropped_late": 0, "unissued": 7, "not_offered": 0}
+        assert state.budget_used == state.attempted == 2
+        assert state.errors == 1
+        assert len(state.records) == 3
+        failed, = [record for record in state.records if record.status == "failed"]
+        assert failed.dispatch_ms is None
+        assert failed.error == "request could not be prepared (ValueError)"
+        assert window["users"][0]["stop_reason"] == "request could not be prepared"
+        assert all(offer["outcome"] == "unissued" for offer in window["offers"]
+                   if offer["user_id"] == "user-01")
+        check = result(state, target)
+        assert check.status == "fail"
+        assert check.metrics["multi_user"]["worst_user"]["user_id"] == "user-01"
+
+    run_virtual(monkeypatch, scenario())
+
+
 def test_preview_counts_offers_without_materializing_request_ledger(monkeypatch):
     from giraffe import multi_user
     from giraffe.planning import request_plan
