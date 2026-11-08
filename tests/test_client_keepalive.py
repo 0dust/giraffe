@@ -11,7 +11,7 @@ from giraffe.models import RequestSpec, RunConfig, Target
 
 
 @asynccontextmanager
-async def endpoint(*, connection_delay=0, eof_delay=0):
+async def endpoint(*, connection_delay=0, eof_delay=0, eof_release=None):
     connections, tasks, writers = [], set(), set()
 
     async def handle(reader, writer):
@@ -32,7 +32,10 @@ async def endpoint(*, connection_delay=0, eof_delay=0):
                              b'Transfer-Encoding: chunked\r\n\r\n'
                              + f'{len(data):x}\r\n'.encode() + data + b'\r\n')
                 await writer.drain()
-                await asyncio.sleep(eof_delay)
+                if eof_release is None:
+                    await asyncio.sleep(eof_delay)
+                else:
+                    await eof_release.wait()
                 writer.write(b'0\r\n\r\n')
                 await writer.drain()
         except (asyncio.IncompleteReadError, ConnectionError):
@@ -138,14 +141,23 @@ async def test_repeated_concurrent_streams_keep_pool_bookkeeping_linear(monkeypa
     assert idle_checks <= len(records) * 16
 
 
-async def test_waiting_request_timeout_does_not_release_a_draining_connection():
-    async with endpoint(eof_delay=.05) as (target, connections):
+async def test_waiting_request_timeout_does_not_release_a_draining_connection(monkeypatch):
+    release = asyncio.Event()
+    # Keep EOF pending until the waiter times out, without a competing drain deadline.
+    monkeypatch.setattr('giraffe.client._STREAM_DRAIN_SECONDS', None)
+    async with endpoint(eof_release=release) as (target, connections):
         async with LLMClient(target, RunConfig(targets=[target]), max_connections=1) as client:
-            assert (await client.execute(request())).valid
-            impatient = request().model_copy(update={'request_timeout_seconds': .005})
-            timed_out = await client.execute(impatient)
-            assert timed_out.status == 'timeout'
-            assert (await client.execute(request())).valid
+            try:
+                assert (await client.execute(request())).valid
+                impatient = request().model_copy(update={'request_timeout_seconds': .005})
+                timed_out = await client.execute(impatient)
+                assert timed_out.status == 'timeout'
+                assert client._stream_drains and client._client._slots._value == 0
+                release.set()
+                await asyncio.gather(*client._stream_drains)
+                assert (await client.execute(request())).valid
+            finally:
+                release.set()
         assert len(connections) == 1
 
 

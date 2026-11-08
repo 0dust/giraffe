@@ -1,5 +1,4 @@
 import asyncio
-import time
 from contextlib import asynccontextmanager
 
 import httpx
@@ -176,40 +175,47 @@ async def test_interference_role_scenarios_keep_baseline_groups_comparable():
     assert {g['shape'] for g in p['groups']} == {'short_short','long_short'}
 
 
-async def test_waiting_for_shared_slots_ends_with_point_window(monkeypatch):
-    c = short_windows(configuration(load={'schedule': {'levels': [2]}}), .03)
-    run = _Run(c, None, None)
-    admitted = 0
-    @asynccontextmanager
-    async def shared_slot(reserved, deadline=None):
-        nonlocal admitted
-        if reserved:
-            yield True
-            return
-        admitted += 1
-        if admitted == 1:
-            yield True
-            return
+def test_waiting_for_shared_slots_ends_with_point_window(monkeypatch):
+    from tests.virtual_clock import run_virtual
+
+    async def scenario():
+        monkeypatch.setattr("tests.test_concurrent_load.time", load.time)
+        clock = asyncio.get_running_loop().time
+        c = short_windows(configuration(load={'schedule': {'levels': [2]}}), .03)
+        run = _Run(c, None, None)
+        admitted = 0
+        @asynccontextmanager
+        async def shared_slot(reserved, deadline=None):
+            nonlocal admitted
+            if reserved:
+                yield True
+                return
+            admitted += 1
+            if admitted == 1:
+                yield True
+                return
+            try:
+                async with asyncio.timeout_at(deadline):
+                    await asyncio.Event().wait()
+            except TimeoutError:
+                yield False
+        request = run.request
+        async def delayed_dispatch(*args, **kw):
+            await asyncio.sleep(0)
+            return await request(*args, **kw)
+        monkeypatch.setattr(run, 'request', delayed_dispatch)
+        monkeypatch.setattr(run, 'slot', shared_slot)
+        p = load.test_points(c.load_test)[0]
+        calibration = {('short', 'short_answer'): {'filler_chars': 64}}
+        before = clock()
         try:
-            async with asyncio.timeout_at(deadline):
-                await asyncio.Event().wait()
+            await asyncio.wait_for(load.concurrent_window(run, c.targets[0], Client(), c.load_test, p, calibration), .15)
         except TimeoutError:
-            yield False
-    request = run.request
-    async def delayed_dispatch(*args, **kw):
-        await asyncio.sleep(0)
-        return await request(*args, **kw)
-    monkeypatch.setattr(run, 'request', delayed_dispatch)
-    monkeypatch.setattr(run, 'slot', shared_slot)
-    p = load.test_points(c.load_test)[0]
-    calibration = {('short', 'short_answer'): {'filler_chars': 64}}
-    before = time.monotonic()
-    try:
-        await asyncio.wait_for(load.concurrent_window(run, c.targets[0], Client(), c.load_test, p, calibration), .15)
-    except TimeoutError:
-        pytest.fail('slot waits outlived the point sending window')
-    assert time.monotonic() - before < .1
-    assert p['drain_seconds'] < .03
+            pytest.fail('slot waits outlived the point sending window')
+        assert clock() - before < .1
+        assert p['drain_seconds'] < .03
+
+    run_virtual(monkeypatch, scenario())
 
 
 @pytest.mark.parametrize('other_aborted', [False, True])
@@ -262,7 +268,7 @@ async def test_endpoint_failures_are_measured_requests_after_local_preparation(s
 @pytest.mark.parametrize('buffered,expected', [(1, 'pass'), (4, 'inconclusive')])
 def test_interference_buffering_scoring_uses_majority(buffered, expected, monkeypatch):
     from giraffe import runner
-    from tests.test_review26_phase4_accuracy import run_virtual
+    from tests.virtual_clock import run_virtual
 
     class Buffered(Client):
         async def execute(self,spec,**kw):

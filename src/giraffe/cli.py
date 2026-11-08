@@ -285,7 +285,7 @@ Exit codes:
         run.add_argument("--proxy", help="HTTP proxy URL")
         for option in ("first-output-ms", "latency-ms", "stream-gap-ms",
                        "min-output-tokens-per-second", "max-error-rate", "min-correctness",
-                       "regression-percent"):
+                       "regression-percent", "regression-rate-points"):
             run.add_argument("--" + option, type=float, help="Threshold for " + option.replace("-", " "))
         run.add_argument("--baseline", type=Path, help="Compare to this explicitly saved report")
         run.add_argument("--output", type=Path, help="New report directory (never overwrites a run)")

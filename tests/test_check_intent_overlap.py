@@ -15,6 +15,7 @@ from giraffe.runner import _Run, _checks, _missing_timing, _pack_results, _stats
 from giraffe.workloads import results, spec
 from tests.fake_endpoint import FakeEndpoint
 from tests.measurement_clock import MeasurementClock
+from tests.virtual_clock import run_virtual
 
 
 def configuration(**extra):
@@ -328,7 +329,7 @@ class StreamEndpoint:
 
 
 @pytest.mark.parametrize('serial', [False, True])
-async def test_single_chunk_packs_and_sessions_have_repeatable_evidence(monkeypatch, serial):
+def test_single_chunk_packs_and_sessions_have_repeatable_evidence(monkeypatch, serial):
     endpoint = StreamEndpoint(monkeypatch, serial)
     settings = configuration(targets=[{'name': 'local', 'url': endpoint.url, 'model': 'fake-model'}],
         checks=['correctness', 'sessions'], request_source='request_pack',
@@ -336,22 +337,27 @@ async def test_single_chunk_packs_and_sessions_have_repeatable_evidence(monkeypa
             {'fixture_id': f'question-{index}', 'messages': [{'role': 'user', 'content': f'Return 42 for question {index}'}],
              'scorer': 'exact', 'expected': '42'} for index in range(6)]},
         sessions={'sessions': 2, 'concurrency': 2, 'modes': ['live']})
-    for _ in range(5):
-        report = await run_suite(settings)
-        expected = 'inconclusive' if serial else 'pass'
-        for result in report.checks:
-            if result.id in settings.checks:
-                assert result.status == expected, (result.id, result.summary, result.metrics)
-            if result.id == 'correctness':
-                pack = result.metrics['request_pack']
-                assert pack['control_status'] == 'pass'
-                assert pack['loaded_status'] == expected
-                assert all((case['loaded']['evidenced_overlap'] == 1 if serial else
-                            case['loaded']['evidenced_overlap'] >= 2) for case in pack['cases'])
-            if result.id == 'sessions':
-                assert (result.metrics['evidenced_session_overlap'] == 1 if serial else
-                        result.metrics['evidenced_session_overlap'] >= 2)
-        assert all(r.answer_chunks == 1 for r in report.requests)
+
+    async def scenario():
+        for _ in range(5):
+            report = await run_suite(settings)
+            expected = 'inconclusive' if serial else 'pass'
+            for result in report.checks:
+                if result.id in settings.checks:
+                    assert result.status == expected, (result.id, result.summary, result.metrics)
+                if result.id == 'correctness':
+                    pack = result.metrics['request_pack']
+                    assert pack['control_status'] == 'pass'
+                    assert pack['loaded_status'] == expected
+                    assert all((case['loaded']['evidenced_overlap'] == 1 if serial else
+                                case['loaded']['evidenced_overlap'] >= 2) for case in pack['cases'])
+                if result.id == 'sessions':
+                    assert (result.metrics['evidenced_session_overlap'] == 1 if serial else
+                            result.metrics['evidenced_session_overlap'] >= 2)
+            assert all(r.answer_chunks == 1 for r in report.requests)
+
+    # Virtual time keeps the two workers' ~11 ms stream windows aligned regardless of host load.
+    run_virtual(monkeypatch, scenario())
 
 
 @pytest.mark.parametrize('levels,expected', [([1], 'pass'), ([1, 2], 'inconclusive')])

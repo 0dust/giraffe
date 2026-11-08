@@ -154,14 +154,16 @@ def setup_client(monkeypatch, chunks=None, *, body=None, timeout=1, stream=True,
     return LLMClient(target, config), transport_stream, calls
 
 
-def event(content=None, *, reasoning=None, finish=None):
+def event(content=None, *, reasoning=None, finish=None, usage=None):
     delta = {}
     if content is not None:
         delta["content"] = content
     if reasoning is not None:
         delta["reasoning_content"] = reasoning
-    return ("data: " + json.dumps({"choices": [{"delta": delta, "finish_reason": finish}]})
-            + "\n\n").encode()
+    data = {"choices": [{"delta": delta, "finish_reason": finish}]}
+    if usage is not None:
+        data["usage"] = usage
+    return ("data: " + json.dumps(data) + "\n\n").encode()
 
 
 @pytest.mark.asyncio
@@ -203,7 +205,7 @@ async def test_generation_timing_ends_at_answer_not_finish_or_usage(monkeypatch)
     from types import SimpleNamespace
 
     client, _, _ = setup_client(monkeypatch, [
-        event("33"), event("692F"),
+        event("33", usage={"completion_tokens": 2}), event("692F", usage={"completion_tokens": 4}),
         b'data: {"choices":[{"delta":{},"finish_reason":"stop"}],'
         b'"usage":{"completion_tokens":4}}\n\n',
         b'data: [DONE]\n\n',
@@ -217,7 +219,7 @@ async def test_generation_timing_ends_at_answer_not_finish_or_usage(monkeypatch)
     assert result.last_output_ms == 39250
     assert result.elapsed_ms == 45000
     assert result.answer_chunks == 2
-    assert result.generation_tokens_per_second == pytest.approx((4 - 4 * 2 / 6) / .25)
+    assert result.generation_tokens_per_second == 8
 
 
 async def test_first_output_timestamp_precedes_json_processing(monkeypatch):
