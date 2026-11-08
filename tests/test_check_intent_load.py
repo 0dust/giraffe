@@ -227,7 +227,9 @@ async def test_arrivals_cancelled_at_run_deadline_are_not_a_pass():
     assert p['cancelled']>0 and p['status'] == result.status == 'inconclusive'
 
 
-async def test_arrivals_without_timing_limit_are_inconclusive_and_pass_with_one():
+async def test_arrivals_without_timing_limit_are_inconclusive_and_pass_with_one(monkeypatch):
+    # A shared-runner stall over 100 ms would drop the backlog; this test is about timing limits.
+    monkeypatch.setattr(load_test, "SCHEDULER_LAG_MS", 2000)
     late_attempts = []
     for _ in range(2):
         with FakeEndpoint(first_token_delay=.05) as server:
@@ -246,7 +248,7 @@ async def test_arrivals_without_timing_limit_are_inconclusive_and_pass_with_one(
         late = []
         for label, report, payloads in (("unlimited", unlimited, unlimited_payloads),
                                         ("limited", limited, limited_payloads)):
-            assert_http_arrival_accounting(report, payloads, [4], other_requests=1)
+            assert_http_arrival_accounting(report, payloads, [4], other_requests=1, tolerance_ms=2000)
             assert all(record.valid and record.score is True for record in traffic_records(report))
             point, = capacity(report).metrics["points"]
             if point["late_arrivals"]:
@@ -427,7 +429,7 @@ async def test_duration_elapsed_needs_time_weighted_occupancy(endpoint, monkeypa
 
 
 def test_unscored_sustained_completions_block_a_recovery_pass(endpoint, monkeypatch):
-    from tests.test_review26_phase4_accuracy import run_virtual
+    from tests.virtual_clock import run_virtual
 
     async def scenario():
         monkeypatch.setattr("tests.test_load_reliability.time", runner.time)

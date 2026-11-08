@@ -1,6 +1,7 @@
 // Minimal DOM for node-vm renderer tests. No browser, socket or npm dependency.
 const encode=value=>String(value).replaceAll('&','&amp;').replaceAll('"','&quot;').replaceAll('<','&lt;');
 const decode=value=>value.replace(/&(amp|lt|gt|quot|#39);/g,(_,name)=>({amp:'&',lt:'<',gt:'>',quot:'"','#39':"'"}[name]));
+const PARSED_SELECTORS=new Map();
 export function browserDOM(listeners) {
   let document;
   class Node {
@@ -41,12 +42,22 @@ export function browserDOM(listeners) {
     removeChild(child){if(child.isConnected&&child.contains(document.activeElement))document.activeElement=document.body;const index=this.childNodes.indexOf(child);if(index<0)throw Error('Not a child');this.childNodes.splice(index,1);child.parentNode=null;return child;}
     matches(selector){
       if(this.nodeType!==1)return false;
-      if(selector.includes(','))return selector.split(',').some(part=>this.matches(part.trim()));
-      const excluded=[...selector.matchAll(/:not\(([^)]+)\)/g)];if(excluded.some(([,part])=>this.matches(part)))return false;selector=selector.replace(/:not\([^)]+\)/g,'');
-      const attrs=[...selector.matchAll(/\[([^=\]]+)(?:="([^"]*)")?\]/g)];
-      if(attrs.some(([,name,value])=>!this.hasAttribute(name)||value!==undefined&&this.getAttribute(name)!==value))return false;
-      const base=selector.replace(/\[[^\]]*\]/g,''),id=base.match(/#([\w-]+)/)?.[1],tag=base.match(/^[\w-]+/)?.[0];
-      return (!id||this.id===id)&&(!tag||this.tagName===tag.toUpperCase())&&[...base.matchAll(/\.([\w-]+)/g)].every(([,name])=>this.classList.contains(name));
+      let parsed=PARSED_SELECTORS.get(selector);
+      if(!parsed){
+        if(selector.includes(','))parsed={any:selector.split(',').map(part=>part.trim())};
+        else{
+          const excluded=[...selector.matchAll(/:not\(([^)]+)\)/g)].map(([,part])=>part),included=selector.replace(/:not\([^)]+\)/g,'');
+          const attrs=[...included.matchAll(/\[([^=\]]+)(?:="([^"]*)")?\]/g)].map(([,name,value])=>[name,value]);
+          const base=included.replace(/\[[^\]]*\]/g,''),id=base.match(/#([\w-]+)/)?.[1],tag=base.match(/^[\w-]+/)?.[0]?.toUpperCase(),classes=[...base.matchAll(/\.([\w-]+)/g)].map(([,name])=>name);
+          parsed={excluded,attrs,id,tag,classes};
+        }
+        PARSED_SELECTORS.set(selector,parsed);
+      }
+      if(parsed.any)return parsed.any.some(part=>this.matches(part));
+      const {excluded,attrs,id,tag,classes}=parsed;
+      if(excluded.some(part=>this.matches(part)))return false;
+      if(attrs.some(([name,value])=>!this.hasAttribute(name)||value!==undefined&&this.getAttribute(name)!==value))return false;
+      return (!id||this.id===id)&&(!tag||this.tagName===tag)&&classes.every(name=>this.classList.contains(name));
     }
     closest(selector){for(let node=this;node;node=node.parentNode)if(node.matches(selector))return node;return null;}
     querySelectorAll(selector){

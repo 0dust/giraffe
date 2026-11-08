@@ -52,7 +52,7 @@ async def test_tools_never_silently_disappear_when_suite_output_cap_matches_cont
 
 
 def test_recovery_allowance_records_request_limit_before_total_exhaustion(monkeypatch):
-    from tests.test_review26_phase4_accuracy import run_virtual
+    from tests.virtual_clock import run_virtual
 
     async def scenario():
         monkeypatch.setattr(runner, "LLMClient", FakeClient)

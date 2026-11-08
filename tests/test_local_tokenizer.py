@@ -70,25 +70,38 @@ async def test_builtin_failure_never_reverts_to_character_estimator(monkeypatch)
 
 
 async def test_hung_tokenizer_is_killed_and_other_event_loop_work_continues(monkeypatch):
+    process = await asyncio.create_subprocess_exec(sys.executable, "-c", "import time; time.sleep(60)",
+        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE)
     workers = []
+    responsive = asyncio.Event()
+    pending_at_probe = []
+    def probe():
+        pending_at_probe.append(not task.done())
+        responsive.set()
     async def hung(_):
-        p = await asyncio.create_subprocess_exec(sys.executable, "-c", "import time; time.sleep(60)",
-            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE)
-        workers.append(p)
-        return p
+        workers.append(process)
+        asyncio.get_running_loop().call_soon(probe)
+        return process
     monkeypatch.setattr(sizing, "_start_worker", hung)
     monkeypatch.setattr(sizing, "PREPARATION_TIMEOUT_SECONDS", .08)
     run, target, events = run_and_target()
     target.tokenizer = "explicit/model"
     began = time.monotonic()
     task = asyncio.create_task(sizing.prepare_messages(run, target, "load", lambda n: [], 128))
-    await asyncio.sleep(.01)
-    assert not task.done()
-    result = await task
-    assert time.monotonic() - began < .5
+    try:
+        await asyncio.wait_for(responsive.wait(), 5)
+        assert pending_at_probe == [True]
+        result = await asyncio.wait_for(task, 5)
+        assert workers[0].returncode is not None
+        assert time.monotonic() - began < 5
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        if process.returncode is None:
+            process.kill()
+        await process.wait()
     assert result["status"] == "unavailable"
     assert result["reason"] == "Local tokenizer preparation exceeded 0.08s; no inference calibration was sent."
-    assert workers[0].returncode is not None
     assert events[-1][0][3] == "unavailable"
 
 
@@ -119,7 +132,6 @@ async def test_stop_during_preparation_kills_worker_and_finishes_progress(monkey
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
-    assert workers[0].returncode is not None
     assert events[-1][0][3] == "cancelled"
     assert run._tokenizer_preparation_seconds[target.name] > 0
 

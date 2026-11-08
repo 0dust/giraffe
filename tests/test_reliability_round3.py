@@ -15,7 +15,7 @@ from giraffe.models import Arrival, Limits, RunConfig
 from tests.test_fixtures import record
 from tests.test_gpu_reliability import snapshot
 from tests.test_runner import FakeClient, check, config
-from tests.test_review26_phase4_accuracy import run_virtual
+from tests.virtual_clock import run_virtual
 from tests.test_scoring_reliability import fixture
 from tests.test_workload_reliability import MemoryEndpoint
 from tests.test_workloads import config as workload_config
@@ -154,6 +154,9 @@ async def test_overlapping_heavy_hangs_survive_sustained_window_in_recovery_evid
     # Keep the example's real budgets and limits. The fixture controls elapsed
     # measurement time and fault completion instead of racing subsecond sleeps.
     values.update(checks=['access', 'serving', 'first_output', 'recovery'])
+    # Preserve the historical rate limit while requesting its required evidence.
+    values['request_options'] = {**values.get('request_options', {}),
+        'stream_options': {'include_usage': True, 'continuous_usage_stats': True}}
     clock = MeasurementClock(monkeypatch)
     values['targets'][0]['url'] = 'http://memory.test/v1'
     configured = RunConfig.model_validate(values)
@@ -234,8 +237,15 @@ async def test_overlapping_heavy_hangs_survive_sustained_window_in_recovery_evid
             await asyncio.sleep(0)
             answer = answers[prompt]
             split = max(1, len(answer) // (2 if is_heavy else 8))
-            events = [dict(choices=[dict(delta={'content': answer[start:start + split]})])
-                      for start in range(0, len(answer), split)]
+            stream_options = payload.get('stream_options', {})
+            continuous = stream_options.get('include_usage') and stream_options.get('continuous_usage_stats')
+            events = []
+            for start in range(0, len(answer), split):
+                event = dict(choices=[dict(delta={'content': answer[start:start + split]})])
+                if continuous:
+                    event['usage'] = {'prompt_tokens': 32,
+                                      'completion_tokens': len(answer[:start + split].split())}
+                events.append(event)
             events.append(dict(choices=[dict(delta={}, finish_reason='stop')],
                                usage={'prompt_tokens': 32, 'completion_tokens': len(answer.split())}))
             class EventStream(httpx.AsyncByteStream):
