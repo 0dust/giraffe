@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import math
+import re
 import platform
 import socket
 import ssl
@@ -726,6 +727,24 @@ class _Run:
             pending_start = None
             start_progress_error = None
             completed_before_progress = None
+            overlap = 0
+
+            def preparation_failure(kind):
+                if task.cancelling() > cancellations:
+                    raise asyncio.CancelledError
+                if self.stop.is_set() or time.monotonic() >= slot_deadline or deadline is not None and deadline.expired():
+                    if self.stop.is_set() or time.monotonic() >= self.deadline:
+                        self.mark_unfinished(target.name, _scenario_checks(spec))
+                    return None
+                if budget_reserved and not budget_exempt:
+                    self.budget_used -= 1
+                    self.budget_counts[target.name] -= 1
+                return RequestRecord(
+                    id=uuid.uuid4().hex, target=target.name, fixture_id=spec.fixture_id,
+                    scenario=spec.scenario, check_ids=spec.check_ids, started_at=_now(),
+                    status="failed", valid=False, error=f"request could not be prepared ({kind})",
+                    input_chars=spec.input_chars, requested_max_tokens=output_cap, stream=spec.stream,
+                )
 
             def emit_start():
                 self.emit("request_started", target.name, spec.scenario,
@@ -808,13 +827,17 @@ class _Run:
                     else:
                         record = await client.execute(spec, first_output_event=event)
                 if token is None:
-                    # A failure during HTTP preparation is not an HTTP attempt.
-                    if task.cancelling() > cancellations:
-                        raise asyncio.CancelledError
-                    if deadline.expired():
-                        self.mark_unfinished(target.name, _scenario_checks(spec))
-                    return None
-                if deadline.expired():
+                    if record.status == "cancelled":
+                        if task.cancelling() > cancellations:
+                            raise asyncio.CancelledError
+                        if time.monotonic() >= self.deadline:
+                            self.mark_unfinished(target.name, _scenario_checks(spec))
+                        return None
+                    kind = re.fullmatch(r"request (?:failed|timeout) \(([A-Za-z_]\w*)\)", record.error or "")
+                    record = preparation_failure(kind[1] if kind else "Exception")
+                    if record is None:
+                        return None
+                elif deadline.expired():
                     record.status, record.valid = ("cancelled" if global_deadline else "timeout"), False
                     record.error = "maximum run duration reached" if global_deadline else (
                         "intentional request deadline" if timeout_override else "request deadline exceeded")
@@ -824,32 +847,37 @@ class _Run:
                 if token is None:
                     if isinstance(exc, asyncio.CancelledError):
                         raise
-                    self.mark_unfinished(target.name, _scenario_checks(spec))
-                    return None
-                if isinstance(exc, asyncio.CancelledError) and task.cancelling() > cancellations:
-                    failure = exc
-                run_deadline_expired = global_deadline and deadline is not None and deadline.expired()
-                record = RequestRecord(
-                    id=uuid.uuid4().hex, target=target.name, fixture_id=spec.fixture_id,
-                    scenario=spec.scenario, check_ids=spec.check_ids, started_at=started_at,
-                    status="cancelled" if isinstance(exc, asyncio.CancelledError) or run_deadline_expired else "timeout",
-                    error="run cancelled" if isinstance(exc, asyncio.CancelledError)
-                    else ("maximum run duration reached" if run_deadline_expired else "request deadline exceeded"), elapsed_ms=(time.monotonic()-started)*1000,
-                    input_chars=spec.input_chars, requested_max_tokens=output_cap, stream=spec.stream,
-                )
+                    record = preparation_failure(type(exc).__name__)
+                    if record is None:
+                        return None
+                else:
+                    if isinstance(exc, asyncio.CancelledError) and task.cancelling() > cancellations:
+                        failure = exc
+                    run_deadline_expired = global_deadline and deadline is not None and deadline.expired()
+                    record = RequestRecord(
+                        id=uuid.uuid4().hex, target=target.name, fixture_id=spec.fixture_id,
+                        scenario=spec.scenario, check_ids=spec.check_ids, started_at=started_at,
+                        status="cancelled" if isinstance(exc, asyncio.CancelledError) or run_deadline_expired else "timeout",
+                        error="run cancelled" if isinstance(exc, asyncio.CancelledError)
+                        else ("maximum run duration reached" if run_deadline_expired else "request deadline exceeded"), elapsed_ms=(time.monotonic()-started)*1000,
+                        input_chars=spec.input_chars, requested_max_tokens=output_cap, stream=spec.stream,
+                    )
             except Exception as exc:
                 if token is None:
-                    raise
-                if not isinstance(exc, (httpx.HTTPError, OSError)):
-                    failure = exc
-                # Exception text can contain credential-bearing URLs from transports.
-                record = RequestRecord(
-                    id=uuid.uuid4().hex, target=target.name, fixture_id=spec.fixture_id,
-                    scenario=spec.scenario, check_ids=spec.check_ids, started_at=started_at,
-                    status="failed", error=f"client failure ({type(exc).__name__})",
-                    elapsed_ms=(time.monotonic()-started)*1000,
-                    input_chars=spec.input_chars, requested_max_tokens=output_cap,
-                )
+                    record = preparation_failure(type(exc).__name__)
+                    if record is None:
+                        return None
+                else:
+                    if not isinstance(exc, (httpx.HTTPError, OSError)):
+                        failure = exc
+                    # Exception text can contain credential-bearing URLs from transports.
+                    record = RequestRecord(
+                        id=uuid.uuid4().hex, target=target.name, fixture_id=spec.fixture_id,
+                        scenario=spec.scenario, check_ids=spec.check_ids, started_at=started_at,
+                        status="failed", error=f"client failure ({type(exc).__name__})",
+                        elapsed_ms=(time.monotonic()-started)*1000,
+                        input_chars=spec.input_chars, requested_max_tokens=output_cap,
+                    )
             finally:
                 if token is not None:
                     self.active[key] -= 1
@@ -910,7 +938,7 @@ class _Run:
                     record.termination_reason = "intentional_cancellation" if spec.cancel_after_ms else "workload_cancelled"
                     record.termination_limit_seconds = spec.cancel_after_ms / 1000 if spec.cancel_after_ms else None
             record.condition_id = condition_id
-            record.dispatch_ms = (started-self.start)*1000
+            record.dispatch_ms = (started-self.start)*1000 if token is not None else None
             record.timing_start_ms = ((record._timing_started_monotonic - self.start) * 1000
                 if record._timing_started_monotonic is not None else record.dispatch_ms)
             if record._request_body_sent_monotonic is not None:
@@ -922,7 +950,8 @@ class _Run:
             record.requested_input_tokens = spec.requested_input_tokens
             record.requested_output_tokens = spec.requested_output_tokens
             record.scheduled_ms = spec.workload.get("scheduled_ms")
-            record.client_wait_ms = max(0, record.dispatch_ms-record.scheduled_ms) if record.scheduled_ms is not None else None
+            record.client_wait_ms = (max(0, record.dispatch_ms-record.scheduled_ms)
+                if record.scheduled_ms is not None and record.dispatch_ms is not None else None)
             record.overlap = overlap
             intentional = (record.status == "cancelled" and record.termination_reason in {
                 "generation_chunk_limit", "intentional_cancellation", "intentional_cancellation_deadline",
@@ -947,7 +976,7 @@ class _Run:
                 if (not evidence_probe and not getattr(client, "reports_response_activity", False)
                         and (record.response_body_bytes or record.chunks or record.output or record.reasoning)):
                     self.endpoint_response(target.name)
-                if (not readiness and not evidence_probe and no_response_failure(record, include_timeouts=not _stress(spec.scenario))
+                if (token is not None and not readiness and not evidence_probe and no_response_failure(record, include_timeouts=not _stress(spec.scenario))
                         and not intentional and timeout_override is None
                         and deadline_override is None and spec.cancel_after_ms is None
                         and spec.cancel_after_chunks is None and not self.stop.is_set()
@@ -971,7 +1000,7 @@ class _Run:
                 if budget_exempt:
                     self.observations[target.name].setdefault("readiness_requests", []).append(record.id)
                 if condition is not None:
-                    condition["running"] -= 1
+                    condition["running"] -= int(token is not None)
                     condition["completed"] += 1
                     condition["failed"] += int(_request_failed(record))
                     result_status = request_status(record.model_dump(include={"status", "score", "valid"}))

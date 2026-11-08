@@ -241,6 +241,9 @@ async def run_window(run, target, client, settings, load_settings, calibration, 
                 if finalize:
                     finalize(record)
                 user["request_ids"].append(record.id)
+                if record.status == "failed" and record.dispatch_ms is None:
+                    user["stop_reason"] = "request could not be prepared"
+                    user["pending_ready_ms"] = None
 
             while not closed and time.monotonic() < cutoff:
                 if eligible_peers and not await wait_for_trigger(eligible_peers):
@@ -320,11 +323,16 @@ async def run_window(run, target, client, settings, load_settings, calibration, 
                 pause_sequence = sequence
             preceding_pause = random.Random(f"{settings.seed}:pause:{user['user_id']}:{pause_sequence}").choices(
                 settings.think_time_seconds.values, weights=settings.think_time_seconds.weights)[0]
+            if user["stop_reason"] == "request could not be prepared":
+                if preceding_pause == 0:
+                    break
+                user["stop_reason"] = None
             if not await pause(preceding_pause):
                 break
         if user["pending_ready_ms"] is not None:
             user["pending_observed_ms"] = min(_relative(run), window["end_ms"])
-        user["stop_reason"] = window["reason"] or user.get("stop_reason")
+        if user.get("stop_reason") != "request could not be prepared":
+            user["stop_reason"] = window["reason"] or user.get("stop_reason")
 
     order = list(window["users"])
     launch_seed = f"{settings.seed}:launch:{window['population']}:{window['phase']}"
@@ -371,7 +379,8 @@ async def run_window(run, target, client, settings, load_settings, calibration, 
                     item["stop_reason"] = window["reason"] or window["drain_reason"] or "conversation interrupted"
             if user["pending_ready_ms"] is not None:
                 user["pending_observed_ms"] = window["end_ms"]
-            user["stop_reason"] = window["reason"] or user.get("stop_reason")
+            if user.get("stop_reason") != "request could not be prepared":
+                user["stop_reason"] = window["reason"] or user.get("stop_reason")
         if window["cut_short"]:
             run.mark_unfinished(target.name, ["multi_user"])
         run.finish_condition(target.name, scenario,
@@ -492,6 +501,10 @@ async def run_arrival_window(run, target, client, settings, load_settings, calib
     async def send(spec, annotate, check_admission):
         offer = offers[spec.workload["offer_index"]]
         user = users[offer["user_id"]]
+        if user.get("stop_reason") == "request could not be prepared":
+            run.budget_used -= 1
+            run.budget_counts[target.name] -= 1
+            return None
         spec.workload["ready_ms"] = spec.workload["scheduled_ms"]
 
         def started():
@@ -505,6 +518,8 @@ async def run_arrival_window(run, target, client, settings, load_settings, calib
             record.traffic_rate_rps = None
             offer["request_id"] = record.id
             user["request_ids"].append(record.id)
+            if record.status == "failed" and record.dispatch_ms is None:
+                user["stop_reason"] = "request could not be prepared"
 
         return await run.request(target, client, spec, slot_reserved=True, budget_reserved=True,
                                  admission_deadline=run.deadline, admission_check=check_admission,
@@ -564,7 +579,8 @@ async def run_arrival_window(run, target, client, settings, load_settings, calib
     for user in window["users"]:
         own = offers_by_user[user["user_id"]]
         user.update(offer_accounting=_offer_counts(own), scheduled_activation_ms=start+user["activation_seconds"]*1000,
-                    stop_reason=window["reason"], active_duration_seconds=max(0, (end-user["activated_ms"])/1000)
+                    stop_reason=(user["stop_reason"] if user.get("stop_reason") == "request could not be prepared"
+                                 else window["reason"]), active_duration_seconds=max(0, (end-user["activated_ms"])/1000)
                         if user["activated_ms"] is not None else 0)
     run.finish_condition(target.name, window["id"], reason=window["reason"])
     if evidence.interrupted:
