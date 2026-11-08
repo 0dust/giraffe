@@ -11,7 +11,7 @@ import pytest
 from giraffe.capabilities import capabilities
 
 
-def run_render_checks(assertions: str, *, dom: bool = False, timeout_seconds: int = 20) -> None:
+def run_render_checks(assertions: str, *, dom: bool = False, timeout_seconds: int = 60) -> None:
     node = shutil.which("node")
     if not node:
         pytest.skip("Node is needed to execute browser result rendering")

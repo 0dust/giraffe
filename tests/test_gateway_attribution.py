@@ -159,6 +159,50 @@ async def test_marked_usage_matches_and_stream_cumulative_counts_once(monkeypatc
         assert hashlib.sha256(("secret-" + ref).encode()).hexdigest() not in serialized
 
 
+@pytest.mark.parametrize("counts,reasoning,boundaries,output", [
+    ((2, 5, 5), (None, None, None), (2, 5), 5),
+    ((4, 3, 5), (None, None, None), (None, None), 5),
+    ((2, 10, 9), (None, None, None), (None, None), 9),
+    ((14, 20, 21), (10, 12, 12), (4, 8), 9),
+    ((14, 20, 21), (10, 9, 12), (None, None), 9),
+    ((14, 20, 21), (10, 19, 20), (None, None), 1),
+    ((14, 20, 21), (10, None, None), (None, None), None),
+])
+async def test_marked_terminal_usage_preserves_cumulative_pace_consistency(
+        monkeypatch, caplog, counts, reasoning, boundaries, output):
+    from tests.test_client import setup_client
+    from giraffe.models import RequestSpec
+
+    secret = "marked-cumulative-secret"
+    monkeypatch.setenv("ALICE", secret)
+
+    def frame(count, reason, *, text=None, finish=None, usage_only=False):
+        usage = {"prompt_tokens": 3, "completion_tokens": count, "total_tokens": 3 + count}
+        if reason is not None:
+            usage["completion_tokens_details"] = {"reasoning_tokens": reason}
+        return ("data: " + json.dumps({"id": secret, "model": secret, "backend_id": secret,
+            "choices": [] if usage_only else [{"delta": {"content": text} if text else {},
+                                               "finish_reason": finish}], "usage": usage}) + "\n\n").encode()
+
+    reads = [frame(counts[0], reasoning[0], text=secret),
+             frame(counts[1], reasoning[1], text=secret),
+             frame(counts[2], reasoning[2], finish="stop"),
+             frame(counts[2], reasoning[2], usage_only=True), b"data: [DONE]\n\n"]
+    client, _, _ = setup_client(monkeypatch, reads, test_identities={"alice": {"api_key_env": "ALICE"}})
+    request = RequestSpec(fixture_id="marked", scenario="gateway", check_ids=["gateway_attribution"],
+                          messages=[{"role": "user", "content": "Say OK"}], identity="alice",
+                          workload={"gateway_run": "cumulative-test"})
+    with caplog.at_level("DEBUG"):
+        async with client:
+            record = await client.execute(request)
+    assert record.valid and record._gateway_terminal_usage
+    assert record.completion_tokens == counts[-1] and record.output_tokens == output
+    assert (record.first_read_output_tokens, record.last_read_output_tokens) == boundaries
+    assert record.read_output_tokens_source == ("usage" if boundaries[0] is not None else None)
+    assert (record.generation_tokens_per_second is not None) == (boundaries[0] is not None)
+    assert secret not in record.model_dump_json() and secret not in caplog.text
+
+
 @pytest.mark.parametrize("stream,mode,expected", [
     (False, "consistent_total", "verified"),
     (True, "consistent_total", "verified"),

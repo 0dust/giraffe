@@ -6,6 +6,35 @@ changes to the license, code owners, and repository rules. Authors cannot approv
 their own pull requests; a pull request by either owner needs the other owner's
 approval. Pushes that change the diff invalidate earlier approvals.
 
+## Branches
+
+`main` is the development branch. Use a short-lived branch for each change and
+open a pull request to `main`. GitHub deletes merged PR branches automatically;
+run `git fetch --prune` to remove stale remote-tracking references locally. Delete
+local branches only after confirming their work is merged, and keep branches
+with open PRs, unmerged commits, or active worktrees.
+
+`release/0.1` prepares the next 0.1 release from the reviewed `main` snapshot cut
+on November 5, 2026. It is not a claim that the current commit is ready to publish.
+For later release lines, cut `release/<major>.<minor>` from a reviewed, passing
+commit on `main` shortly before release preparation starts. Keep one branch per
+supported release line; tags such as `v0.1.0a2` identify individual releases.
+
+Keep feature development on `main`. Reproduce and fix bugs there first, then
+cherry-pick the needed fix with `git cherry-pick -x` onto a short-lived branch
+based on `release/0.1` and open a PR targeting `release/0.1`. Test the backport
+there too. Do not routinely merge all of `main` into a release branch, and do not
+merge the release branch back into `main`.
+
+Release branches require the same owner approval as `main`, and block deletion
+and force pushes. GitHub rulesets enforce these settings. Pushes and PRs run CI;
+check the results for the exact release commit before publishing. Once a release
+line is no longer supported, explicitly retire its protection before deleting
+the branch; retain its release tags.
+
+This follows [GitHub flow](https://docs.github.com/en/get-started/using-github/github-flow)
+with [branches for release](https://trunkbaseddevelopment.com/branch-for-release/).
+
 ## Activate enforcement (repository admin)
 
 The CODEOWNERS file selects reviewers. It does not enforce approvals on its own.
@@ -37,8 +66,8 @@ gh api --method PUT repos/0dust/giraffe/rulesets/RULESET_ID \
 
 ## Automated checks
 
-Pull requests and pushes to `main` run separate Ruff and pytest checks. CI uses
-Python 3.12 because the validation observer tests require `sys.monitoring`, plus
+Pull requests and pushes to `main` and `release/*` run separate Ruff and pytest
+checks. CI uses Python 3.12 because the validation observer tests require `sys.monitoring`, plus
 Node 22 for browser behavior tests. Dependencies come from `uv.lock`:
 
 ```sh
@@ -57,8 +86,8 @@ coverage, not passes. This workflow does not activate branch-protection rules.
 
 The distribution is `giraffe-llm`; its import and command remain `giraffe`.
 `.github/workflows/publish.yml` builds on pull requests without publishing.
-A manual run from `main` publishes to TestPyPI; publishing a GitHub release
-publishes to PyPI. Neither path uses a stored API token.
+A manual run from `main` or the matching `release/<major>.<minor>` branch publishes
+to TestPyPI; publishing a GitHub release publishes to PyPI. Neither path uses a stored API token.
 
 ### One-time account setup
 
@@ -85,7 +114,7 @@ upload, manage it under the project's **Publishing** settings.
 In GitHub **Settings → Environments**, maintain these protections:
 
 - `pypi`: selected deployment tags `v*` only.
-- `testpypi`: selected deployment branch `main` only.
+- `testpypi`: selected deployment branches `main` and `release/*`.
 - Both: approval from `0dust` or `aiswarya797`, prevent self-review, and disallow
   administrator bypass. The person who starts a release needs the other owner
   to approve its publishing job.
@@ -95,11 +124,13 @@ Keep them in place before registering the trusted publishers.
 
 ### Rehearse, then publish
 
-1. Update the version in `pyproject.toml` and `src/giraffe/__init__.py` together,
-   run `uv lock`, and merge the reviewed change. For the first alpha, both are
-   `0.1.0a1`. Keep the README installation example in sync when changing versions.
-2. Run **Actions → Publish package → Run workflow** on `main`. The workflow
-   checks versions, runs Ruff and pytest, builds a source archive and a wheel
+1. Choose an unused version (for example, `0.1.0a2` after the published
+   `0.1.0a1`). Update `pyproject.toml` and `src/giraffe/__init__.py` together,
+   run `uv lock`, and merge the reviewed version change into the release branch.
+   Keep the README installation example in sync. Do not reuse `0.1.0a1`.
+2. Run **Actions → Publish package → Run workflow** on `release/0.1` (or `main`
+   when releasing directly from development). The branch's major/minor must match
+   the package version. The workflow checks versions, runs Ruff and pytest, builds a source archive and a wheel
    from that archive, validates metadata, and checks the installed CLI and UI
    assets in a fresh environment. Approve the `testpypi` deployment after
    reviewing its commit and results.
@@ -109,18 +140,20 @@ Keep them in place before registering the trusted publishers.
    ```sh
    python -m pip download --no-deps --only-binary=:all: \
      --index-url https://test.pypi.org/simple/ --dest test-dist \
-     "giraffe-llm==0.1.0a1"
-   python -m pip install test-dist/giraffe_llm-0.1.0a1-py3-none-any.whl
+     "giraffe-llm==0.1.0a2"
+   python -m pip install test-dist/giraffe_llm-0.1.0a2-py3-none-any.whl
    giraffe --help
    giraffe ui
    ```
 
    Open the UI and confirm it loads. Avoid combining TestPyPI and PyPI with
    `--extra-index-url`; dependencies should come from the normal PyPI index.
-4. Create a GitHub release tagged `v0.1.0a1` at the same tested commit on `main`
-   and mark this alpha as a prerelease. Publishing the release reruns verification
-   and waits for approval of the `pypi` deployment. A draft release does not upload.
-5. After upload, verify `python -m pip install "giraffe-llm==0.1.0a1"` and the CLI
+4. Create a GitHub release tagged for the chosen version (for example,
+   `v0.1.0a2`) at the exact tested commit on `release/0.1` or `main`, and mark an
+   alpha as a prerelease. The tag must match the package version and its commit
+   must be reachable from `main` or the matching release branch. Publishing the
+   release reruns verification and waits for approval of the `pypi` deployment. A draft release does not upload.
+5. After upload, verify `python -m pip install "giraffe-llm==0.1.0a2"` and the CLI
    in another fresh environment. Then update README installation instructions
    to use the published package.
 

@@ -80,8 +80,8 @@ def words(n, start=0):
 
 def streamed(n=6, delay=.01, tokens=None):
     parts = []
-    for word in words(n):
-        parts += [ev(word), delay]
+    for index, word in enumerate(words(n), 1):
+        parts += [ev(word, usage={"completion_tokens": index * (tokens or n) // n}), delay]
     return parts + [ev(finish="stop", usage={"completion_tokens": tokens or n}), DONE]
 
 
@@ -129,7 +129,10 @@ async def test_unreported_reasoning_tokens_make_rate_unknown(monkeypatch):
     assert record.valid and record.reasoning and record.reasoning_tokens is None
     assert record.generation_tokens_per_second is None
     reported = [p for _ in range(5) for p in (ev(reasoning="think "), .05)]
-    reported += [ev("K7P4 "), .02, ev("done "), .02, ev("now"), ev(finish="stop", usage={
+    reported += [ev(text, usage={"completion_tokens": count,
+        "completion_tokens_details": {"reasoning_tokens": 5}})
+        for count, text in enumerate(("K7P4 ", "done ", "now"), 6)]
+    reported += [ev(finish="stop", usage={
         "completion_tokens": 8, "completion_tokens_details": {"reasoning_tokens": 5}}), DONE]
     record = await one(monkeypatch, reported)
     assert record.output_tokens == 3 and record.generation_tokens_per_second is not None
@@ -377,7 +380,9 @@ async def test_timeout_violation_respects_overlapping_client_delay():
 
 
 async def test_inline_reasoning_and_answer_in_same_read_keep_both_timestamps(monkeypatch):
-    record = await one(monkeypatch, [ev("<think>x</think>K7P4"), .05, ev(" yes"),
+    record = await one(monkeypatch, [ev("<think>x</think>K7P4", usage={"completion_tokens": 3,
+        "completion_tokens_details": {"reasoning_tokens": 2}}), .05, ev(" yes", usage={
+        "completion_tokens": 4, "completion_tokens_details": {"reasoning_tokens": 2}}),
         ev(finish="stop", usage={"completion_tokens": 4, "completion_tokens_details": {"reasoning_tokens": 2}}), DONE])
     assert record.valid and record.first_reasoning_ms == record.first_output_ms
     assert record.answer_reads == 2 and record.first_read_answer_chars == 4
@@ -385,7 +390,9 @@ async def test_inline_reasoning_and_answer_in_same_read_keep_both_timestamps(mon
 
 
 async def test_inline_reasoning_without_token_breakdown_has_no_rate(monkeypatch):
-    record = await one(monkeypatch, [ev("<think>x</think>K7P4"), .05, ev(" yes"),
+    record = await one(monkeypatch, [ev("<think>x</think>K7P4", usage={"completion_tokens": 3,
+        "completion_tokens_details": {"reasoning_tokens": 2}}), .05, ev(" yes", usage={
+        "completion_tokens": 4, "completion_tokens_details": {"reasoning_tokens": 2}}),
         ev(finish="stop", usage={"completion_tokens": 20}), DONE])
     assert record.valid and record.output_tokens is None and record.generation_tokens_per_second is None
 
@@ -406,10 +413,11 @@ async def test_legacy_sse_counts_are_not_network_read_evidence():
     assert runner._missing_timing([record], Limits(stream_gap_ms=20)) == ["stream_gap_ms"]
 
 
-async def test_rate_subtracts_first_read_token_share():
+async def test_rate_subtracts_reported_first_read_tokens():
     record = RequestRecord(id="rate", target="t", fixture_id="f", scenario="generation",
         check_ids=["generation"], started_at="now", status="completed", valid=True,
-        answer_chars=10, output_tokens=10, answer_reads=2, first_read_answer_chars=8,
+        answer_chars=10, output_tokens=10, answer_reads=2, first_read_answer_chars=1,
+        first_read_output_tokens=8, last_read_output_tokens=10,
         first_output_ms=500, last_output_ms=1500)
     assert record.generation_tokens_per_second == 2
 

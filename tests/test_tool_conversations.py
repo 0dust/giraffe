@@ -51,17 +51,22 @@ def timeout_tool_followups(monkeypatch):
     return timed_out
 
 
+# Wide enough that the derived connect timeout (90%) never fires on a loaded runner;
+# the endpoint hangs final turns until it exits, so the request deadline always wins.
+FINAL_TURN_DEADLINE = .5
+
+
 @pytest.fixture
 def final_turn_timeout(monkeypatch):
     from giraffe.runner import _Run
 
-    # Exercise the final conversation timeout without imposing a 50 ms socket
+    # Exercise the final conversation timeout without imposing a short socket
     # deadline on unrelated successful single-response requests.
     original_request = _Run.request
 
     async def final_turn_deadline(self, target, client, spec, *args, **kwargs):
         if spec.workload.get('selection') == 'conversation' and spec.workload.get('stage') == 'final':
-            spec = spec.model_copy(update={'request_timeout_seconds': .05})
+            spec = spec.model_copy(update={'request_timeout_seconds': FINAL_TURN_DEADLINE})
         return await original_request(self, target, client, spec, *args, **kwargs)
 
     monkeypatch.setattr(_Run, 'request', final_turn_deadline)
@@ -276,7 +281,7 @@ async def test_timeout_remains_inconclusive_alongside_passing_single_response_fi
         def delayed_single_response(self, payload, mode):
             if payload['messages'][0]['content'].startswith('Single response:'):
                 delayed_modes.append(payload['stream'])
-                time.sleep(.075)  # Longer than the conversation-only final-turn deadline.
+                time.sleep(FINAL_TURN_DEADLINE + .1)  # Longer than the conversation-only final-turn deadline.
             return original(self, payload, mode)
 
         monkeypatch.setattr(handler, '_conversation', delayed_single_response)
@@ -295,7 +300,7 @@ async def test_timeout_remains_inconclusive_alongside_passing_single_response_fi
     final_turns = [r for r in workload_records(report.requests) if r.workload.get('stage') == 'final']
     assert len(final_turns) == 2
     assert all(r.status == 'timeout' and r.termination_reason == 'request_timeout'
-               and r.request_timeout_seconds == .05 for r in final_turns)
+               and r.request_timeout_seconds == FINAL_TURN_DEADLINE for r in final_turns)
     outcomes = next(c for c in report.checks if c.id == 'tools').metrics['conversations']
     assert len(outcomes) == 2
     assert all(o['reason'] == 'timeout' and o['status'] == 'inconclusive' for o in outcomes)
@@ -503,8 +508,8 @@ async def test_mixed_fixture_timeout_keeps_independent_single_response_evidence(
     assert all(r.request_timeout_seconds == cfg.request_timeout_seconds for r in singles)
     final_turns = [r for r in workload_records(report.requests) if r.workload.get('stage') == 'final']
     assert len(final_turns) == 2
-    assert all(r.status == 'timeout' and r.request_timeout_seconds == .05
-               and r.termination_limit_seconds == .05 for r in final_turns)
+    assert all(r.status == 'timeout' and r.request_timeout_seconds == FINAL_TURN_DEADLINE
+               and r.termination_limit_seconds == FINAL_TURN_DEADLINE for r in final_turns)
     outcomes = next(c for c in report.checks if c.id == 'tools').metrics['conversations']
     assert len(outcomes) == 2
     assert all(o['reason'] == 'timeout' and o['status'] == 'inconclusive' for o in outcomes)
@@ -562,7 +567,8 @@ async def test_conflicting_stream_call_ids_fail_before_supplying_any_result():
 
 async def test_verified_repeat_survives_later_stream_timeout():
     with FakeEndpoint(mode='conversation_repeat_timeout') as endpoint:
-        report = await run_suite(config(endpoint, request_timeout_seconds=.05))
+        # Connect timeout is 90% of this; keep it well above loopback jitter.
+        report = await run_suite(config(endpoint, request_timeout_seconds=.5))
     assert report.overall == 'fail'
     stream_final = workload_records(report.requests)[-1]
     assert stream_final.stream and stream_final.status == 'timeout'

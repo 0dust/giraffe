@@ -599,11 +599,18 @@ class LLMClient:
                 payload.update(spec.tool_expectation.choice.request_options())
             record.tool_request_options = {key: payload[key] for key in
                 ("tools", "tool_choice", "parallel_tool_calls") if key in payload}
+        # Continuous usage is a server-specific, explicit opt-in. It requires
+        # include_usage on compatible endpoints, unless the caller disables it.
+        options = payload.get("stream_options")
+        if stream and isinstance(options, dict) and options.get("continuous_usage_stats") is True:
+            payload["stream_options"] = {"include_usage": True, **options}
         probing = spec.workload.get("performance_evidence_probe")
         # The shared key may route to a different backend from marked identities.
         if stream and not probing and not attribution:
             if self.token_evidence["usage"] == "supported":
-                payload.setdefault("stream_options", {"include_usage": True})
+                options = payload.setdefault("stream_options", {})
+                if isinstance(options, dict):
+                    payload["stream_options"] = {"include_usage": True, **options}
             if self._evidence_probe_attempts:
                 # Explicit caller options still take precedence over automatic evidence.
                 # A plain-text probe does not certify combinations with tools or
@@ -645,8 +652,11 @@ class LLMClient:
         tool_parts: dict[int, dict] = {}
         last_answer: float | None = None
         tool_output: float | None = None
-        # (output offset, read time) per network read carrying content; bounded.
-        content_reads: list[tuple[int, float, int]] = []
+        # Last content event's cumulative counts per read; trailers cannot backfill.
+        # (output offset, read time, read ID, completion tokens, reasoning tokens).
+        content_reads: list[tuple[int, float, int, int | None, int | None]] = []
+        usage_consistent = True
+        previous_completion = previous_reasoning = previous_output = None
         reads_truncated = False
         read_id = 0
         reasoning_read_ids: set[int] = set()
@@ -742,6 +752,7 @@ class LLMClient:
         def receive(data: dict[str, Any], *, streaming: bool, observed_at: float) -> None:
             nonlocal last_answer, response_sequence, assistant_content_present, tool_output, reads_truncated
             nonlocal pending_live_first
+            nonlocal usage_consistent, previous_completion, previous_reasoning, previous_output
             server_id = data.get("id")
             if (spec.cancel_after_chunks is not None and isinstance(server_id, str)
                     and len(server_id) > MAX_SERVER_ID_CHARS):
@@ -758,6 +769,7 @@ class LLMClient:
             if isinstance(backend, str) and backend:
                 record.backend_id = backend
             usage = data.get("usage")
+            completion_tokens = reasoning_tokens = None
             if isinstance(usage, dict):
                 gateway_probe = attribution or policy_probe or access_probe
                 count = _gateway_token_count if gateway_probe else _token_count
@@ -785,6 +797,26 @@ class LLMClient:
                 record.reasoning_tokens = reasoning_tokens
                 if record.output_tokens is not None and reasoning_tokens is not None:
                     record.output_tokens = max(0, record.output_tokens - reasoning_tokens)
+                if completion_tokens is None:
+                    usage_consistent = False
+                else:
+                    if previous_completion is not None and completion_tokens < previous_completion:
+                        usage_consistent = False
+                    previous_completion = completion_tokens
+                if details is not None and not isinstance(details, dict):
+                    usage_consistent = False
+                if isinstance(details, dict) and "reasoning_tokens" in details:
+                    if (reasoning_tokens is None or completion_tokens is None
+                            or reasoning_tokens > completion_tokens
+                            or (previous_reasoning is not None and reasoning_tokens < previous_reasoning)):
+                        usage_consistent = False
+                    else:
+                        output_tokens = completion_tokens - reasoning_tokens
+                        if previous_output is not None and output_tokens < previous_output:
+                            usage_consistent = False
+                        previous_reasoning, previous_output = reasoning_tokens, output_tokens
+            elif usage is not None:
+                usage_consistent = False
             choices = data.get("choices")
             if not isinstance(choices, list) or (not choices and not isinstance(usage, dict)):
                 raise _ProtocolError("response is missing completion choices")
@@ -903,9 +935,12 @@ class LLMClient:
                 trace("content", offset=len(record.output), length=len(answer))
                 if not content_reads or content_reads[-1][2] != read_id:
                     if len(content_reads) < _MAX_CONTENT_READS:
-                        content_reads.append((len(record.output), now, read_id))
+                        content_reads.append((len(record.output), now, read_id, completion_tokens, reasoning_tokens))
                     else:
                         reads_truncated = True
+                else:
+                    # Missing usage on a later content event invalidates this boundary.
+                    content_reads[-1] = (content_reads[-1][0], now, read_id, completion_tokens, reasoning_tokens)
                 record.output += answer
                 if answer.strip():
                     if record.first_output_ms is None:
@@ -1214,8 +1249,9 @@ class LLMClient:
             spans, _ = _answer_spans(record.output)
             if spans is None:
                 record.answer_chunks = 0
-            if ((record.reasoning.strip() or stripped) and not record.reasoning_tokens
-                    and record.completion_tokens != 0):
+            if (((record.reasoning.strip() or stripped) and not record.reasoning_tokens
+                    and record.completion_tokens != 0)
+                    or (previous_reasoning and record.reasoning_tokens is None)):
                 record.output_tokens = None
             record.reasoning_stripped = record.reasoning_stripped or stripped
             reasoning_spans = _reasoning_spans(spans, len(record.output))
@@ -1240,8 +1276,10 @@ class LLMClient:
                                      "answer" if has_answer else "reasoning")
                     event["token_count"] = event["token_count_source"] = None
             first_read = last_read = None
+            first_read_id = last_read_id = None
             gap = None
-            for index, (offset, at, content_read_id) in enumerate(content_reads):
+            first_counts = last_counts = None
+            for index, (offset, at, content_read_id, completion_count, reasoning_count) in enumerate(content_reads):
                 end = content_reads[index + 1][0] if index + 1 < len(content_reads) else len(record.output)
                 text = "".join(record.output[max(a, offset):min(b, end)] for a, b in spans or ())
                 has_reasoning = stripped and any(
@@ -1263,9 +1301,34 @@ class LLMClient:
                 record.answer_reads += 1
                 if first_read is None:
                     first_read, record.first_read_answer_chars = at, len(text)
+                    first_read_id = content_read_id
+                    first_counts = (completion_count, reasoning_count)
                 else:
                     gap = max(gap or 0, (at - last_read) * 1000)
                 last_read = at
+                last_read_id = content_read_id
+                last_counts = (completion_count, reasoning_count)
+            if usage_consistent and not reads_truncated and not tool_parts:
+                needs_reasoning = bool(record.reasoning.strip() or stripped or previous_reasoning)
+                def answer_count(counts):
+                    if counts is None or counts[0] is None or (needs_reasoning and counts[1] is None):
+                        return None
+                    return counts[0] - (counts[1] or 0)
+                record.first_read_output_tokens = answer_count(first_counts)
+                record.last_read_output_tokens = answer_count(last_counts)
+            if record.first_read_output_tokens is not None and record.last_read_output_tokens is not None:
+                record.read_output_tokens_source = "usage"
+            else:
+                record.first_read_output_tokens = record.last_read_output_tokens = None
+                events = [event for event in record.output_events if event["kind"] == "answer"]
+                if (not reads_truncated and not record.output_events_truncated and not tool_parts
+                        and first_read_id is not None and last_read_id is not None and events
+                        and all(event.get("token_count") is not None for event in events)):
+                    record.first_read_output_tokens = sum(event["token_count"] for event in events
+                        if event["read_id"] <= first_read_id)
+                    record.last_read_output_tokens = sum(event["token_count"] for event in events
+                        if event["read_id"] <= last_read_id)
+                    record.read_output_tokens_source = "logprobs"
             if reads_truncated:
                 record.read_timestamps_truncated = True
                 record.answer_reads = 0

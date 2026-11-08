@@ -152,7 +152,7 @@ async def test_pack_loaded_effective_one_with_unset_ceiling_passes(client):
 
 
 def test_recovery_unlimited_allowance_prime_and_effective_windows(client, monkeypatch):
-    from tests.test_review26_phase4_accuracy import run_virtual
+    from tests.virtual_clock import run_virtual
 
     async def scenario():
         configured = RunConfig(targets=[TARGET], checks=["recovery"], concurrency=40,

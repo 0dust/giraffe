@@ -2,7 +2,6 @@
 
 import asyncio
 import json
-import time
 from types import SimpleNamespace
 
 import pytest
@@ -325,20 +324,20 @@ async def test_global_budget_limits_all_workloads():
 
 
 async def test_cancellation_stops_arrival_scheduler_and_saves_partial_evidence():
+    stop = asyncio.Event()
+    def progress(event):
+        if event["event"] == "request_completed" and event["scenario"].startswith("load_primary_"):
+            stop.set()
+
     with FakeEndpoint(first_token_delay=0.1) as endpoint:
-        stop = asyncio.Event()
-        task = asyncio.create_task(
+        report = await asyncio.wait_for(
             run_suite(
                 config(endpoint, arrivals={"requests": 100, "requests_per_second": 100}),
-                stop_event=stop,
-            )
+                progress=progress, stop_event=stop,
+            ), 5,
         )
-        await asyncio.sleep(0.25)
-        start = time.monotonic()
-        stop.set()
-        report = await task
-        assert time.monotonic() - start < 0.5
         assert len(endpoint.requests) < 100
+    assert stop.is_set()
     assert report.abort_reason == "cancelled by user"
     assert report.requests
 

@@ -7,7 +7,7 @@ import pytest
 
 from giraffe import runner, traffic
 from giraffe.models import Limits, RequestRecord, RequestSpec, TrafficConfig
-from tests.test_review26_phase4_accuracy import run_virtual
+from tests.virtual_clock import run_virtual
 
 
 def profile(**overrides):
@@ -216,18 +216,22 @@ def test_budget_exhaustion_counts_exact_remainder_and_drains_admitted_requests(m
     run_virtual(monkeypatch, scenario())
 
 
-async def test_stop_cancels_active_tasks_and_preserves_exact_plan():
-    harness = Harness(delay=1)
-    harness.on_start = lambda: setattr(harness, "stop", "Stopped by user.")
-    start = time.monotonic()
-    drops = []
-    result = await harness.run(profile(duration_seconds=.2),
-                               on_drop=lambda: drops.append(harness.budget))
-    assert drops == []
-    assert time.monotonic() - start < .2
-    assert result["started"] == result["cancelled"] == 1
-    assert result["not_offered"] == result["scheduled"] - 1
-    assert result["status"] == "inconclusive"
+def test_stop_cancels_active_tasks_and_preserves_exact_plan(monkeypatch):
+    async def scenario():
+        monkeypatch.setattr(__name__ + ".time", traffic.time)
+        harness = Harness(delay=1)
+        harness.on_start = lambda: setattr(harness, "stop", "Stopped by user.")
+        start = time.monotonic()
+        drops = []
+        result = await harness.run(profile(duration_seconds=.2),
+                                   on_drop=lambda: drops.append(harness.budget))
+        assert drops == []
+        assert time.monotonic() - start < .2
+        assert result["started"] == result["cancelled"] == 1
+        assert result["not_offered"] == result["scheduled"] - 1
+        assert result["status"] == "inconclusive"
+
+    run_virtual(monkeypatch, scenario())
 
 
 async def test_global_deadline_cancels_drain_without_leaking_tasks():
