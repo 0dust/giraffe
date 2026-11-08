@@ -202,6 +202,7 @@ const html=renderComparison({baseline:{run_id:'reference',targets:[{target:'prox
   reason:status==='inconclusive'?'Gateway test identity references differ.':undefined,
 }]}]}});
 assert.match(html,/Gateway access decisions/);
+assert.doesNotMatch(html,/Gateway policy outcomes/);
 assert.match(html,/invalid \(denied\) · expected deny/);
 assert(html.includes(`Policy evidence · ${interpretation}</small>`));
 assert.equal(html.match(/<dt>Change<\/dt><dd>([^<]+)<\/dd>/)?.[1],change);

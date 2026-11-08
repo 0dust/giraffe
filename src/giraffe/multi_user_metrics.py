@@ -87,10 +87,12 @@ def _user_summary(user: dict[str, Any], window: dict[str, Any], records: list[Re
     duration = max(0, (end-start)/1000) if start is not None and end is not None else 0
     rows = [r for r in records if r.workload.get("user_id") == user["user_id"]
             and r.workload.get("window_id") == window["id"]
-            and r.dispatch_ms is not None and start is not None and end is not None
-            and start <= r.dispatch_ms
-            and (r.dispatch_ms < end or window.get("cut_short") and r.dispatch_ms == end)]
-    missing_terminal = max(0, user.get("dispatched_count", len(rows))-len(rows))
+            and start is not None and end is not None
+            and (r.dispatch_ms is None and r.status == "failed" and r.id in user.get("request_ids", [])
+                 or r.dispatch_ms is not None and start <= r.dispatch_ms
+                 and (r.dispatch_ms < end or window.get("cut_short") and r.dispatch_ms == end))]
+    dispatched_terminal = sum(r.dispatch_ms is not None for r in rows)
+    missing_terminal = max(0, user.get("dispatched_count", dispatched_terminal)-dispatched_terminal)
     intentional = [r for r in rows if r.intentional]
     attempts = [r for r in rows if not r.intentional]
     valid = [r for r in attempts if _valid(r)]
@@ -254,7 +256,7 @@ def _user_summary(user: dict[str, Any], window: dict[str, Any], records: list[Re
                         "dispatch_completion_ms": distribution(dispatch_completion),
                         "client_wait_ms": distribution([
                             r.dispatch_ms-r.workload["ready_ms"] for r in rows
-                            if r.workload.get("ready_ms") is not None])},
+                            if r.workload.get("ready_ms") is not None and r.dispatch_ms is not None])},
             "lengths": {"input_tokens": distribution([r.input_tokens for r in rows]),
                         "output_tokens": distribution([r.output_tokens for r in rows]),
                         "requested_input_tokens": distribution([r.requested_input_tokens for r in rows]),

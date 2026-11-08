@@ -5,6 +5,96 @@ from giraffe.models import required_concurrency
 from giraffe.planning import request_plan
 from giraffe.reporting import compare_baseline
 from tests.test_gateway_policy import exercise
+from tests.test_ux_results import run_render_checks
+
+
+@pytest.mark.parametrize("status", ["fail", "inconclusive"])
+@pytest.mark.parametrize("warning_mode", ["absent", "empty", "other", "matching"])
+def test_policy_baseline_comparison_has_own_section_and_escaped_reason(status, warning_mode):
+    run_render_checks("const status='" + status + "',warningMode='" + warning_mode + "';" + r'''
+const row={check:'gateway_policy',metric:'policy_acceptance',aggregation:'observed',
+ status,baseline:'observed',current:'observed',baseline_samples:13,current_samples:13,
+ reason:'  Over-admitted <script>quota</script> & "limited"  '};
+if(warningMode==='empty')row.warnings=[];
+if(warningMode==='other')row.warnings=[{message:'Separate policy evidence warning'}];
+if(warningMode==='matching')row.warnings=[{message:row.reason.trim()}];
+const expectHint=warningMode==='other'||status==='fail'&&['absent','empty'].includes(warningMode);
+const result=report([],{baseline:{run_id:'reference',targets:[{target:'local',comparisons:[row]}]}});
+state.detail={report:result};
+assert(resultsSections().some(([id,label,parent])=>id==='gateway-policy-outcomes'&&
+ label==='Gateway policy outcomes'&&parent==='comparison'));
+assert(!resultsSections().some(([id])=>id==='timing'||id==='gateway-attribution-outcomes'));
+for(const [scope,prefix] of [['results','results'],['performance','performance-comparison']]){
+ const html=renderComparison(result,{scope});
+ const container=document.createElement('div');container.innerHTML=html;
+ const section=container.querySelector('#'+prefix+'-gateway-policy-outcomes');
+ assert(section);
+ assert.equal(section.querySelector('h3').textContent,'Gateway policy outcomes');
+ assert(section.querySelector('[data-comparison-group="gateway_policy"] [data-metric="policy_acceptance"]'));
+ assert.equal(section.querySelector('h4').textContent,'Policy acceptance');
+ assert.match(html,/Over-admitted &lt;script&gt;quota&lt;\/script&gt; &amp; &quot;limited&quot;/);
+ const article=section.querySelector('[data-metric]'),hint=article.querySelector('.hint');
+ assert.equal(Boolean(hint),expectHint);
+ if(expectHint){
+  assert.equal(hint.textContent,row.reason);
+  assert.equal(article.querySelector('.comparison-value-grid').nextSibling,hint);
+ }
+ assert.equal(container.querySelector('script'),null);
+ assert.doesNotMatch(html,/Response timing/);
+ // The existing collapsed warning details repeat the summary as supporting evidence.
+ for(const details of article.querySelectorAll('details:not([open])'))details.parentNode.removeChild(details);
+ assert.equal(article.textContent.split(row.reason.trim()).length-1,1);
+}
+state.comparisonCheck='gateway_attribution';
+const filtered=renderComparison(result);
+assert.match(filtered,/id="results-gateway-policy-outcomes"/);
+assert.match(filtered,/No measurements match these filters/);
+assert.doesNotMatch(filtered,/data-metric="policy_acceptance"/);
+''', dom=True)
+
+
+def test_policy_baseline_reason_is_only_shown_for_nonpassing_rows_with_text():
+    run_render_checks(r'''
+const row={check:'gateway_policy',metric:'policy_acceptance',aggregation:'observed',
+ baseline:'observed',current:'observed',baseline_samples:13,current_samples:13};
+const passing=comparisonTable([{...row,status:'pass',reason:'Policy accepted <script>quota</script>'}]);
+assert.doesNotMatch(passing,/<p class="hint">|Policy accepted|<script>/);
+for(const status of ['fail','inconclusive'])for(const reason of ['', '   ', null, undefined, 42, {}]){
+ assert.doesNotMatch(comparisonTable([{...row,status,reason}]),/<p class="hint">/);
+}
+''')
+
+
+def test_policy_comparison_preserves_attribution_and_timing_sections():
+    run_render_checks(r'''
+const common={aggregation:'observed',status:'fail',baseline_samples:1,current_samples:1};
+const rows=[{...common,check:'gateway_policy',metric:'policy_acceptance',
+ baseline:'observed',current:'observed',reason:'Policy quota exceeded'},
+ {...common,check:'gateway_access',metric:'policy_acceptance',scenario:'allowed',
+ baseline:'deny',current:'allow',reason:'Access decision changed'},
+ {...common,check:'gateway_attribution',metric:'attribution_outcome',scenario:'alice',
+ baseline:'verified',current:'mismatch',reason:'Attribution mismatch'},
+ {...common,check:'serving',metric:'latency_ms',aggregation:'median',
+ baseline:100,current:200,reason:'Latency increased'}];
+const result=report([],{baseline:{run_id:'reference',targets:[{target:'local',comparisons:rows}]}});
+const container=document.createElement('div');container.innerHTML=renderComparison(result);
+for(const [id,title,metric] of [
+ ['gateway-policy-outcomes','Gateway policy outcomes','policy_acceptance'],
+ ['gateway-access-decisions','Gateway access decisions','policy_acceptance'],
+ ['gateway-attribution-outcomes','Gateway attribution outcomes','attribution_outcome'],
+ ['timing','Response timing','latency_ms']]){
+ const section=container.querySelector('#results-'+id);
+ assert.equal(section.querySelector('h3').textContent,title);
+ assert.equal(section.querySelectorAll('[data-metric]').length,1);
+ assert(section.querySelector('[data-metric="'+metric+'"]'));
+ if(id!=='gateway-policy-outcomes')assert.equal(section.querySelector('[data-metric] .hint'),null);
+}
+const titles=Array.from(container.querySelectorAll('.comparison-section h3'),node=>node.textContent);
+assert.equal(titles.indexOf('Gateway policy outcomes'),titles.indexOf('Gateway attribution outcomes')+1);
+state.detail={report:report([],{baseline:{targets:[]}})};
+assert(!resultsSections().some(([id])=>id==='gateway-policy-outcomes'));
+assert.doesNotMatch(renderComparison(state.detail.report),/Gateway policy outcomes/);
+''', dom=True)
 
 
 @pytest.mark.parametrize("settings", [{"gateway": "unsupported"}, {"capability": "unsupported"}])
