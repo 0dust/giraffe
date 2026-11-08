@@ -31,8 +31,10 @@ def test_main_schema_three_fixture_preserves_checks_outcome_and_conditions():
     assert [check.model_dump(mode="json") for check in saved.checks] == expected["checks"]
     assert saved.conditions == expected["conditions"]
     # Main gained seven speculative-decoding rows after this fixture was
-    # frozen. Project only those additive rows out; every original metric,
-    # numeric value and section row must still match the untouched snapshot.
+    # frozen. Project those additive rows out. The only changed historical
+    # measurements are character-derived pace estimates: these requests lack
+    # cumulative counts at the first/last read, so they now lack rate evidence.
+    # All other measurements, sections, verdicts and conditions stay unchanged.
     from giraffe.performance import SPEC_DECODE_ROWS
     actual = without_series(saved.performance)
     for target, frozen_target in zip(actual["targets"], expected["performance"]["targets"], strict=True):
@@ -46,6 +48,21 @@ def test_main_schema_three_fixture_preserves_checks_outcome_and_conditions():
                 summary["metrics"][key] for key, _, _ in SPEC_DECODE_ROWS]
             summary["sections"]["server"] = summary["sections"]["server"][:original_server_rows]
             summary["metrics"] = {key: value for key, value in summary["metrics"].items() if key not in added}
+            sources = {
+                "generation_pace": "Client-observed pace from server token counts (cumulative usage or streamed logprobs) at first/last answer reads",
+                "tpot_estimate": "1000 / generation_tokens_per_second",
+                "tpot": "1000 / generation_tokens_per_second",
+            }
+            for key, source in sources.items():
+                row = frozen["metrics"][key]
+                assert row["counts"] == {"sample": 5, "eligible": 5, "missing": 0}
+                row.update(value=None, p95=None, sample_count=0, state="insufficient_evidence",
+                    counts={"sample": 0, "eligible": 5, "missing": 5}, source=source,
+                    reason="No eligible observations in this scope.", action="Collect eligible observations for this scope.")
+                if key in frozen["distributions"]:
+                    frozen["distributions"][key].update(value=None, sample_count=0, state="insufficient_evidence",
+                        counts={"sample": 0, "eligible": 5, "missing": 5}, source=source,
+                        reason="No eligible observations in this scope.", action="Collect eligible observations for this scope.")
     assert actual == expected["performance"]
     assert saved.observations["derived_recomputed"] is True
 

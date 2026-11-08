@@ -75,6 +75,7 @@ class FakeClient:
             started_at=datetime.now(timezone.utc).isoformat(), status=status,
             http_status=200, valid=status == "completed", output=output,
             output_chars=len(output), output_tokens=2,
+            first_read_output_tokens=1, last_read_output_tokens=2,
             input_tokens=max(1, spec.input_chars//4) if cls.input_usage else None,
             input_chars=spec.input_chars, elapsed_ms=elapsed, stream_end_ms=elapsed if status == "completed" else None,
             first_output_ms=first_output, last_output_ms=first_output + 2,
@@ -484,7 +485,7 @@ async def test_context_override_controls_declared_limit_and_fixture_sizes():
 
 
 def test_recovery_honors_correctness_allowance_without_hiding_protocol_failure(client, monkeypatch):
-    from tests.test_review26_phase4_accuracy import run_virtual
+    from tests.virtual_clock import run_virtual
 
     async def scenario():
         original = client.execute
@@ -803,7 +804,7 @@ async def test_answer_failure_summary_identifies_fixture_and_warmup_failure(
 
 
 def test_answer_failure_details_do_not_hide_timing_failure(client, monkeypatch):
-    from tests.test_review26_phase4_accuracy import run_virtual
+    from tests.virtual_clock import run_virtual
 
     async def scenario():
         original = client.execute
@@ -873,7 +874,7 @@ async def test_unstreamed_generation_cannot_pass_a_generation_rate_limit():
 
 
 def test_sustained_timing_is_observational_when_recovery_is_fast(client, monkeypatch):
-    from tests.test_review26_phase4_accuracy import run_virtual
+    from tests.virtual_clock import run_virtual
 
     async def scenario():
         client.bad_sustained = True
@@ -936,7 +937,7 @@ async def test_one_sample_still_exercises_both_output_and_stop_limits():
 
 
 def test_sustained_semantic_corruption_fails_recovery(client, monkeypatch):
-    from tests.test_review26_phase4_accuracy import run_virtual
+    from tests.virtual_clock import run_virtual
 
     async def scenario():
         original = client.execute
@@ -1008,11 +1009,19 @@ async def test_stale_gpu_samples_are_unavailable(monkeypatch):
     assert "scored answers" not in result.summary and "output budget" not in result.summary
 
 
-async def test_operator_stop_is_missing_evidence_not_endpoint_failure(client):
+async def test_operator_stop_is_missing_evidence_not_endpoint_failure(client, monkeypatch):
     client.delay = .5
     stop = asyncio.Event()
+    started = asyncio.Event()
+    execute = client.execute
+
+    async def request_started(self, spec, **kwargs):
+        started.set()
+        return await execute(self, spec, **kwargs)
+
+    monkeypatch.setattr(client, "execute", request_started)
     task = asyncio.create_task(runner.run_suite(config(), stop_event=stop))
-    await asyncio.sleep(.01)
+    await asyncio.wait_for(started.wait(), 5)
     stop.set()
     report = await task
     result = check(report, "serving")
@@ -1064,7 +1073,7 @@ async def test_oversized_metrics_response_is_unavailable_and_bounded(monkeypatch
 
 
 def test_recovery_missing_configured_output_rate_is_inconclusive(client, monkeypatch):
-    from tests.test_review26_phase4_accuracy import run_virtual
+    from tests.virtual_clock import run_virtual
 
     async def scenario():
         original = client.execute
@@ -1274,35 +1283,42 @@ async def test_generator_saturation_does_not_hide_known_answer_failure(client, m
     assert check(report, check_id).status == report.overall == "fail"
 
 
-async def test_metrics_trickle_has_a_total_deadline(monkeypatch):
-    import httpx
+def test_metrics_trickle_has_a_total_deadline(monkeypatch):
+    from tests.virtual_clock import run_virtual
 
-    actual_client = httpx.AsyncClient
-    chunks = []
+    metrics = runner._metrics
 
-    class Trickle(httpx.AsyncByteStream):
-        async def __aiter__(self):
-            for index in range(1000):
-                await asyncio.sleep(.003)
-                chunks.append(index)
-                yield b"DCGM_FI_DEV_GPU_UTIL 1\n"
+    async def scenario():
+        import httpx
 
-    def mock_client(**kwargs):
-        return actual_client(**kwargs, transport=httpx.MockTransport(
-            lambda req: httpx.Response(200, stream=Trickle())))
+        actual_client = httpx.AsyncClient
+        chunks = []
 
-    monkeypatch.setattr(httpx, "AsyncClient", mock_client)
-    target = Target(name="service", model="local", url="http://localhost:1234",
-                    metrics_url="http://localhost:1234/metrics")
-    state = runner._Run(config(targets=[target], max_duration_seconds=.03), None, None)
-    started = time.monotonic()
-    await runner._metrics(state, target, "before")
-    snapshot = state.observations["service"]["metrics"][0]
-    assert time.monotonic()-started < .1
-    assert 0 < len(chunks) < 20
-    assert snapshot["status"] == "connection_failure"
-    assert "TimeoutError" in snapshot["reason"]
-    assert len(snapshot["unavailable"]) == 5
+        class Trickle(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                for index in range(1000):
+                    await asyncio.sleep(.003)
+                    chunks.append(index)
+                    yield b"DCGM_FI_DEV_GPU_UTIL 1\n"
+
+        def mock_client(**kwargs):
+            return actual_client(**kwargs, transport=httpx.MockTransport(
+                lambda req: httpx.Response(200, stream=Trickle())))
+
+        monkeypatch.setattr(httpx, "AsyncClient", mock_client)
+        target = Target(name="service", model="local", url="http://localhost:1234",
+                        metrics_url="http://localhost:1234/metrics")
+        state = runner._Run(config(targets=[target], max_duration_seconds=.03), None, None)
+        started = time.monotonic()
+        await metrics(state, target, "before")
+        snapshot = state.observations["service"]["metrics"][0]
+        assert time.monotonic()-started < .1
+        assert 0 < len(chunks) < 20
+        assert snapshot["status"] == "connection_failure"
+        assert "TimeoutError" in snapshot["reason"]
+        assert len(snapshot["unavailable"]) == 5
+
+    run_virtual(monkeypatch, scenario())
 
 
 async def test_metrics_skips_when_stop_already_requested(monkeypatch):
@@ -1732,7 +1748,9 @@ async def test_live_request_events_keep_identity_and_exclude_response_bodies(cli
                 "elapsed_ms", "first_output_ms", "check_ids", "http_status", "started_at", "dispatch_ms",
                 "completed_ms", "timing_start_ms", "timing_schema", "first_token_ms", "first_reasoning_ms",
                 "last_output_ms", "stream", "stream_end_ms", "answer_reads", "answer_chunks", "answer_chars",
-                "first_read_answer_chars", "max_stream_gap_ms", "input_tokens", "output_tokens",
+                "first_read_answer_chars", "first_read_output_tokens", "last_read_output_tokens",
+                "read_output_tokens_source",
+                                  "max_stream_gap_ms", "input_tokens", "output_tokens",
                 "completion_tokens", "reasoning_tokens", "cached_prompt_tokens", "finish_reason"}
         assert not {"output", "reasoning", "tool_calls", "assistant_message", "evaluation",
                     "logprob_evidence", "content_reads", "reasoning_reads", "output_events"} & record.keys()
@@ -2114,17 +2132,22 @@ async def test_run_deadline_expiring_during_preparation_starts_no_traffic(client
     assert report.overall != "pass" and client.active == 0
 
 
-async def test_slot_wait_is_bounded_by_run_deadline_without_monitor(client):
-    from giraffe.models import RequestSpec
+def test_slot_wait_is_bounded_by_run_deadline_without_monitor(client, monkeypatch):
+    from tests.virtual_clock import run_virtual
 
-    settings = config(concurrency=1, max_duration_seconds=.01)
-    state = runner._Run(settings, None, None)
-    assert state.try_acquire_slot()
-    spec = RequestSpec(fixture_id="queued", scenario="warm", check_ids=["serving"], messages=[])
-    async with client(settings.targets[0], settings) as transport:
-        record = await asyncio.wait_for(state.request(settings.targets[0], transport, spec), .1)
-    assert record is None and state.stop_reason() == "maximum run duration reached"
-    assert "serving" in state.unfinished["service"]
+    async def scenario():
+        from giraffe.models import RequestSpec
+
+        settings = config(concurrency=1, max_duration_seconds=.01)
+        state = runner._Run(settings, None, None)
+        assert state.try_acquire_slot()
+        spec = RequestSpec(fixture_id="queued", scenario="warm", check_ids=["serving"], messages=[])
+        async with client(settings.targets[0], settings) as transport:
+            record = await asyncio.wait_for(state.request(settings.targets[0], transport, spec), .1)
+        assert record is None and state.stop_reason() == "maximum run duration reached"
+        assert "serving" in state.unfinished["service"]
+
+    run_virtual(monkeypatch, scenario())
 
 
 async def test_slow_cold_start_does_not_consume_watchdog_window(monkeypatch):
@@ -2284,7 +2307,7 @@ async def test_watchdog_can_be_disabled(monkeypatch, disabled):
 def test_target_outage_cancels_only_its_capacity_requests(monkeypatch, overlap):
     import httpx
     from tests.test_client import Chunks
-    from tests.test_review26_phase4_accuracy import run_virtual
+    from tests.virtual_clock import run_virtual
 
     silent_calls, healthy_calls, streams = 0, 0, []
 

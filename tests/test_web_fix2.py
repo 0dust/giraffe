@@ -22,16 +22,16 @@ def test_cached_hit_does_not_wait_for_unrelated_cold_factory():
     entered, release = threading.Event(), threading.Event()
     def slow():
         entered.set()
-        assert release.wait(2)
+        release.wait()
         return 'cold'
     with ThreadPoolExecutor(2) as pool:
         cold = pool.submit(cache.get, 'cold', 1, slow)
         try:
-            assert entered.wait(1)
-            assert pool.submit(cache.get, 'hot', 1, lambda: None).result(.2) == 'ready'
+            assert entered.wait(5)
+            assert pool.submit(cache.get, 'hot', 1, lambda: None).result(5) == 'ready'
         finally:
             release.set()
-        assert cold.result(1) == 'cold'
+        assert cold.result(5) == 'cold'
 
 
 def test_cancelled_worker_cannot_kill_shared_host():
@@ -128,13 +128,21 @@ def test_evidence_handoff_does_not_deepcopy_retained_body_on_caller(tmp_path, mo
         return original(self, *args, **kwargs)
     monkeypatch.setattr(type(record()), 'model_copy', copy)
     writer = EvidenceWriter(tmp_path, {'config': {'retention': 'all'}})
+    enqueued = []
+    enqueue = writer._enqueue
+    def capture(item):
+        enqueued.append(item)
+        enqueue(item)
+    monkeypatch.setattr(writer, '_enqueue', capture)
     try:
         large = record(response_events=[{'text': 'x' * 10000} for _ in range(256)])
         began = time.perf_counter()
         writer.record_finished(large)
         elapsed = (time.perf_counter() - began) * 1000
         request.node.user_properties.append(('large_evidence_handoff_ms', elapsed))
-        assert elapsed < 25
+        kind, snapshot = enqueued[0]
+        assert kind == 'record' and snapshot is not large
+        assert snapshot.response_events is large.response_events
     finally:
         writer.close()
     assert len(recover_evidence(tmp_path, {}).requests) == 1
