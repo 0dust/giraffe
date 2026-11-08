@@ -632,7 +632,7 @@ def planned_arrivals(settings, point):
 
 
 def build_spec(
-    run, settings, point, shape, calibration, *, role="request", phase=None, progress=None
+    run, settings, point, shape, calibration, *, role="request", phase=None, progress=None, frozen_sources=None
 ):
     size, output = shape.split("_")
     key = size, "short_answer" if output == "short" else "long_output"
@@ -649,9 +649,11 @@ def build_spec(
     scenario = point["id"] + ("." + phase if phase else "")
     # Never swap a saved question for a synthetic label prompt. Shape targets
     # remain requested targets; the report exposes actual lengths and shortfall.
-    sources = getattr(run, "pack_specs", []) or getattr(run, "load_custom_specs", [])
+    sources = (frozen_sources if frozen_sources is not None else
+               getattr(run, "pack_specs", []) or getattr(run, "load_custom_specs", []))
     if sources:
-        sources = _shape_sources(settings, size, sources, run.records)
+        if frozen_sources is None:
+            sources = _shape_sources(settings, size, sources, run.records)
         index = point.get("_source_index", 0)
         point["_source_index"] = index + 1
         if getattr(run, "pack_specs", []):

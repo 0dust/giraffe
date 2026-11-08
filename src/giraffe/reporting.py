@@ -26,6 +26,7 @@ from .caps import (MAX_HTML_PREVIEW_CHARS, MAX_HTML_JSON_PREVIEW_CHARS,
                    MAX_FAILURE_SUMMARY_CHARS)
 from .deployment import deployment_diff, fixture_hash, safe_config, sanitize
 from .report_inputs import input_ref as _input_ref
+from .multi_user_metrics import user_latency
 from .models import (CHECK_NAMES, SHAPES, CheckResult, RequestRecord, RunConfig, RunReport, overall_status, load_shape_label,
                      migrate_concurrent_load, migrate_run_limits, is_supported_schema, CURRENT_SCHEMA)
 from .stats import median, percentile
@@ -61,6 +62,11 @@ def _groups(records: list[RequestRecord], target: str) -> dict[tuple[str, str], 
                 if check == "load" and not (record.load_point or {}).get("point_id"):
                     continue  # Setup calibration is not a workload result group.
                 scenario = record.scenario
+                if check == "multi_user":
+                    if record.workload.get("phase") != "measurement" or not record.workload.get("user_id"):
+                        continue
+                    scenario = " / ".join(str(record.workload.get(key, "unknown"))
+                        for key in ("scenario", "population", "profile", "user_id"))
                 if check == "load" and record.load_point:
                     # A mixed test has one sending window but distinct shape cohorts.
                     scenario += "." + str(record.load_point.get("shape", "unknown"))
@@ -158,8 +164,14 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str) -> dict | No
         resolved = RunConfig.model_validate({**config, "max_requests": None, "max_duration_seconds": None})
     except ValidationError:
         return None
-    if revision in {"issue45", "issue95", "issue95_pauses", "issue95_pause_evidence"} and not set(resolved.checks) <= {"sessions", "consistency"}:
-        return None  # Load generators changed; this attestation covers unchanged specialists only.
+    if revision in {"issue45", "issue95", "issue95_pauses", "issue95_pause_evidence", "persistent_users"}:
+        unchanged_checks = {"sessions", "consistency"}
+        if revision in {"issue95_pause_evidence", "persistent_users"}:
+            # Multi-user wiring changed the shared file, but prefix requests are
+            # unchanged between these two exact generator revisions.
+            unchanged_checks.add("prefix")
+        if not set(resolved.checks) <= unchanged_checks:
+            return None  # Load generators changed; attest unchanged specialists only.
     if "sessions" in resolved.checks and resolved.sessions and resolved.sessions.sampling is not None:
         return None  # Sampled traffic has no historical equivalent.
     settings = {}
@@ -185,6 +197,7 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str) -> dict | No
             "issue95": "ebc8dc0b150701e1a97f571a6ea7a37cdcf62f4d3d9db97244d8c2bd5c17b092",
             "issue95_pauses": "37bf5c074bfdb19f367e5348b678e5a923977fe7bf013b8c781a43bb8efca19e",
             "issue95_pause_evidence": "ab5875f7c635f8f454429a88aac87d52ce3a141a84bcf7b936fa737ffa41fe83",
+            "persistent_users": "aee9ca71bc5ffd780d1574422b761e3177471a12f951a10b04322573ca062f76",
         }[revision] if any(settings.values()) else None,
         "settings": settings,
     }
@@ -208,6 +221,7 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str) -> dict | No
             "issue95": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
             "issue95_pauses": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
             "issue95_pause_evidence": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
+            "persistent_users": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
         }[revision]
     if "tools" in resolved.checks:
         from .tool_checks import resolved_tool_fixtures, resolved_tool_modes
@@ -226,7 +240,7 @@ def _same_run_limits_workload(current: dict, old: dict) -> bool:
     if current.get("config", {}).get("config_version") != 2 or old.get("config", {}).get("config_version", 2) != 2:
         return False
     for manifest in (current, old):
-        revisions = ("phase2", "phase3", "review26", "caps26", "issue45", "issue95", "issue95_pauses", "issue95_pause_evidence") if "config_version" in manifest.get("config", {}) else ("legacy",)
+        revisions = ("phase2", "phase3", "review26", "caps26", "issue45", "issue95", "issue95_pauses", "issue95_pause_evidence", "persistent_users") if "config_version" in manifest.get("config", {}) else ("legacy",)
         identities = [_run_limits_workload_identity(manifest, revision=revision) for revision in revisions]
         if not any(identity is not None and fixture_hash(identity) == manifest.get("fixture_pack", {}).get("workload_fixture_sha256")
                    for identity in identities):
@@ -370,6 +384,14 @@ def _settings_reasons(report: RunReport, baseline: RunReport, *, details: dict[s
         return value
 
     selected = set(current_config.get("checks", [])) | set(old_config.get("checks", []))
+    if "multi_user" in selected:
+        policies = [{check.target: (check.metrics.get("multi_user", {}).get("version"),
+                                   check.metrics.get("multi_user", {}).get("window_policy"))
+                     for check in run.checks if check.id == "multi_user"}
+                    for run in (report, baseline)]
+        if (policies[0] != policies[1] or not policies[0]
+                or any(None in policy for policies_by_target in policies for policy in policies_by_target.values())):
+            reasons.append("Multi-user summary or window policy differs or is missing; rerun a matching baseline.")
     inactive_pack_globals = ({"context_limit", "samples", "sustained_seconds"}
                              if all(pack_modes) and selected <= {"load", "capacity", "correctness"} else set())
     comparison_workloads = {**WORKLOAD_CHECKS, "concurrent_load": {"concurrency"},
@@ -457,6 +479,8 @@ def _generator_saturated(report: RunReport, target: str) -> bool:
 
 
 def _timing_quality(report, target, records, metrics):
+    records = [record.model_copy(update={"scheduled_ms": record.workload.get("ready_ms")})
+               if "multi_user" in record.check_ids else record for record in records]
     return qualify(records, report.observations.get("client_timing_health"),
                    timing_threshold([r for r in report.requests if r.target == target]), metrics,
                    legacy_max_lag_ms=report.observations.get("generator_max_lag_ms", 0))
@@ -465,6 +489,8 @@ def _timing_quality(report, target, records, metrics):
 def _metric_values(records: list[RequestRecord]) -> dict[str, list[float]]:
     completed = [r for r in records if r.status == "completed" and r.valid]
     def clock_value(record, arrival_field, dispatch_field):
+        if "multi_user" in record.check_ids:
+            return user_latency(record, first=dispatch_field == "first_output_ms")
         arrival = (record.load_point or {}).get("pattern") in {"constant", "poisson", "bursts"}
         return getattr(record, arrival_field if arrival else dispatch_field)
     return {
@@ -476,7 +502,7 @@ def _metric_values(records: list[RequestRecord]) -> dict[str, list[float]]:
         "max_stream_gap_ms": [
             r.max_stream_gap_ms for r in completed if r.max_stream_gap_ms is not None
         ],
-        "output_tokens_per_second": [value for r in completed if (value := _rate(r)) is not None],
+        "output_tokens_per_second": [value for r in completed if "multi_user" not in r.check_ids and (value := _rate(r)) is not None],
         "generation_tokens_per_second": [value for r in completed
                                          if (value := r.generation_tokens_per_second) is not None],
     }
@@ -1039,6 +1065,66 @@ def _concurrent_load_html(metrics):
     return "".join(parts)
 
 
+def _user_measurements(report: RunReport, target: str) -> dict[tuple, tuple[dict, dict]]:
+    summary = next((check.metrics.get("multi_user", {}) for check in report.checks
+                    if check.id == "multi_user" and check.target == target), {})
+    return {(window["scenario"], window["population"], user["profile"], user["user_id"]): (window, user)
+            for window in summary.get("windows", []) if window.get("phase") == "measurement"
+            for user in window.get("users", [])}
+
+
+def _compare_user_delivery(report, baseline, target, reasons, threshold):
+    current, previous = _user_measurements(report, target), _user_measurements(baseline, target)
+    rows, incomplete = [], []
+    if reasons or not (current or previous):
+        return rows, incomplete
+    current_records = {record.id: record for record in report.requests if record.target == target}
+    old_records = {record.id: record for record in baseline.requests if record.target == target}
+    for key in sorted(current.keys() | previous.keys()):
+        scenario, population, profile, user_id = key
+        c_window, c = current.get(key, ({}, {}))
+        b_window, b = previous.get(key, ({}, {}))
+        c_rate, b_rate = c.get("output_tokens_per_second"), b.get("output_tokens_per_second")
+        current_work = [current_records[rid] for rid in c.get("request_ids", []) if rid in current_records]
+        old_work = [old_records[rid] for rid in b.get("request_ids", []) if rid in old_records]
+        work_reason, mix_changed = _load_work_comparison(current_work, old_work)
+        missing = (not c or not b or c.get("coverage", {}).get("status") != "complete"
+                   or b.get("coverage", {}).get("status") != "complete"
+                   or c_rate is None or b_rate is None or work_reason or mix_changed)
+        row = {"check": "multi_user", "scenario": " / ".join(map(str, key)),
+               "user_id": user_id, "population": population, "profile": profile,
+               "window_id": c_window.get("id", b_window.get("id")),
+               "metric": "shared_window_output_tokens_per_second", "aggregation": "common_window",
+               "current": c_rate, "baseline": b_rate, "status": "inconclusive",
+               "current_samples": c.get("outcomes", {}).get("valid_completed", 0),
+               "baseline_samples": b.get("outcomes", {}).get("valid_completed", 0),
+               "threshold": threshold, "change_unit": "percent", "evidence_ids": c.get("request_ids", []),
+               "method": "Observed completed-output delivery over matching common windows; no cross-run confidence interval."}
+        if missing:
+            detail = (work_reason or "Requested work proportions differ." if mix_changed or work_reason else
+                      "Missing or incomplete shared-window coverage.")
+            message = f"Multi-user {user_id} at {population} users: {detail}"
+            row["reason"] = message
+            incomplete.append(message)
+        elif b_rate == 0 and c_rate != 0:
+            row["reason"] = "Zero baseline delivery does not support a relative rate comparison."
+            incomplete.append(f"Multi-user {user_id} has zero baseline delivery.")
+        else:
+            worsening = (b_rate-c_rate)*100/b_rate if b_rate else 0
+            row.update(worsening=worsening, observed_delta=c_rate-b_rate,
+                       observed_change=-worsening,
+                       status="fail" if worsening > threshold else "pass",
+                       reason="Observed shared-window delivery decreased beyond the selected threshold."
+                              if worsening > threshold else "No material shared-window delivery decrease observed.")
+        rows.append(row)
+        if c.get("status") == "fail" and b.get("status") == "pass" and not work_reason and not mix_changed:
+            rows.append({**row, "metric": "user_acceptance", "status": "fail",
+                         "current": "fail", "baseline": "pass", "aggregation": "selected_criteria",
+                         "worsening": 100, "reason": "This previously accepted user now fails its selected criteria.",
+                         "observed_change": None, "observed_delta": None})
+    return rows, incomplete
+
+
 def _acceptance_status(report: RunReport) -> str:
     checks = [check for check in report.checks if check.id != "baseline"]
     interrupted = {(item["target"], item["id"]) for item in
@@ -1077,7 +1163,8 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                   "400 deterministic bootstrap resamples, 95% sample intervals. "
                   "Rates use a percentage-point threshold; timing and output rate use relative percent. "
                   "Output token rate is end-to-end server-reported output tokens / elapsed seconds. "
-                  "Intervals describe within-run variation, not cross-run environmental stability.",
+                  "Intervals describe within-run variation, not cross-run environmental stability. "
+                  "Per-user shared-window delivery compares observed common-window rates without a confidence interval.",
     }
     for target in targets or [{"name": "unknown"}]:
         name = target["name"]
@@ -1115,6 +1202,8 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                         "comparable": not target_reasons,
                         "interpretation": "Repeatability and task correctness are separate. Different answers alone do not prove regression."})
         rows = []
+        user_rows, user_reasons = _compare_user_delivery(report, baseline, name, target_reasons, threshold)
+        rows.extend(user_rows)
         # Optional observations and checks without inference/acceptance cohorts
         # do not participate in baseline verdicts or sample-collection guidance.
         non_request_checks = {"gpu"}
@@ -1159,8 +1248,8 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                                      for r in records)
                     return {shape: Fraction(count, len(records)) for shape, count in counts.items()}
                 work_reason, mix_changed = (_load_work_comparison(current_records, old_records)
-                                            if check == "load" else (None, False))
-                if check != "load" and (not current_records or not old_records or shapes(current_records) != shapes(old_records)):
+                                            if check in {"load", "multi_user"} else (None, False))
+                if check not in {"load", "multi_user"} and (not current_records or not old_records or shapes(current_records) != shapes(old_records)):
                     work_reason = "missing or different request shapes or proportions."
                 if work_reason:
                     if check == "load":
@@ -1257,7 +1346,12 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                                evidence_ids=[record.id for record in current_records])
                     if load_point:
                         row["load_point"] = load_point
+                    if check == "multi_user":
+                        row.update({key: point_records[0].workload.get(key)
+                                    for key in ("user_id", "population", "profile", "window_id")})
+                        row["timing_origin"] = "user_ready"
                     rows.append(row)
+        target_reasons.extend(user_reasons)
         covered_load_points = {point["id"] for row in (load_tests or {}).get("points", [])
                                for side in ("current", "baseline") if (point := row.get(side))
                                and point.get("id") and point.get("pattern") != "interference"}
@@ -1775,6 +1869,69 @@ def _traffic_table(check: CheckResult) -> str:
     parts.append('</table></div><details><summary>Arrival cohort windows and stage accounting</summary>'
                  f'<pre>{_json(check.metrics["traffic_stages"])}</pre></details>')
     return "".join(parts)
+
+
+def _multi_user_export(data: dict[str, Any]) -> dict[str, Any]:
+    """Export user plans and compact outcomes, never prompts or response bodies."""
+    user_fields = ("user_id", "profile", "status", "reasons", "activated_ms", "ready_count",
+        "dispatched_count", "request_ids", "outcomes", "known_output_tokens", "missing_usage_count",
+        "output_tokens_per_second", "late_output_tokens", "late_missing_usage_count", "late_completed",
+        "partial_output_tokens", "partial_missing_usage_count", "cancelled_output_tokens",
+        "cancelled_missing_usage_count", "latency", "lengths", "finish_reasons", "pending_wait",
+        "coverage", "criteria", "timing_quality", "stop_reason")
+    window_fields = ("id", "scenario", "population", "phase", "start_ms", "end_ms", "planned_end_ms",
+        "duration_seconds", "planned_duration_seconds", "drain_seconds", "cut_short", "reason", "drain_reason", "status")
+    value = {key: data.get(key) for key in ("version", "window_policy", "settings", "population",
+                                          "status", "worst_user", "interpretation")}
+    value["windows"] = [{**{key: window.get(key) for key in window_fields},
+                         "users": [{key: user[key] for key in user_fields if key in user}
+                                   for user in window.get("users", [])]}
+                        for window in data.get("windows", [])]
+    return sanitize(value, bounded=False)
+
+
+def _multi_user_html(data: dict[str, Any], anchors: dict[str, str]) -> str:
+    parts = ['<h3>Per-user shared-window delivery</h3>']
+    worst = data.get("worst_user")
+    if worst:
+        parts.append(f'<p><strong>Worst served user: {_e(worst["user_id"])} at '
+                     f'{_e(worst["population"])} users</strong> · {_e(worst["status"])} · '
+                     f'{_number(worst.get("output_tokens_per_second"))} tok/s. '
+                     f'{_e(" ".join(worst.get("reasons", [])))}</p>')
+    parts.append(f'<p class="muted">{_e(data.get("interpretation", ""))}</p>')
+    for window in data.get("windows", []):
+        parts.append(f'<h4>{_e(window["population"])} users · {_e(window["phase"])}</h4>'
+                     f'<p>Common window: {_number(window.get("duration_seconds"))} / '
+                     f'{_number(window.get("planned_duration_seconds"))} planned seconds. '
+                     f'{_e(window.get("reason") or window.get("drain_reason") or "")}</p>')
+        if window.get("phase") != "measurement":
+            parts.append('<p>Warmup is excluded from per-user acceptance and delivered throughput.</p>')
+            continue
+        parts.append('<div class="table"><table><tr><th>User / profile</th><th>Outcome</th>'
+                     '<th>Completed / sent / errors</th><th>Shared-window tok/s</th>'
+                     '<th>Ready-to-first / completion p95 ms</th><th>Coverage / requests</th></tr>')
+        for user in window.get("users", []):
+            outcome, latency = user.get("outcomes", {}), user.get("latency", {})
+            links = ' '.join(f'<a href="#{anchors[rid]}">{_e(rid)}</a>'
+                             for rid in user.get("request_ids", []) if rid in anchors)
+            pending = user.get("pending_wait")
+            notes = " ".join(user.get("reasons", []) + user.get("coverage", {}).get("reasons", []))
+            if pending:
+                notes += f' Client admission wait: {pending["wait_ms"]:.3g} ms ({pending["status"]}).'
+            parts.append(f'<tr><td>{_e(user["user_id"])}<br>{_e(user["profile"])}</td>'
+                f'<td>{_badge(user["status"])}<br>{_e(notes)}</td>'
+                f'<td>{_e(outcome.get("completed", 0))} / {_e(outcome.get("attempted", 0))} / {_e(outcome.get("errors", 0))}</td>'
+                f'<td>{_number(user.get("output_tokens_per_second"))}<br>Known tokens: {_e(user.get("known_output_tokens", 0))}; '
+                f'missing usage: {_e(user.get("missing_usage_count", 0))}; late tokens: {_e(user.get("late_output_tokens", 0))} '
+                f'(missing usage: {_e(user.get("late_missing_usage_count", 0))}); partial tokens: '
+                f'{_e(user.get("partial_output_tokens", 0))} (missing usage: {_e(user.get("partial_missing_usage_count", 0))})</td>'
+                f'<td>{_number(latency.get("ready_first_answer_ms", {}).get("p95"))} / '
+                f'{_number(latency.get("ready_completion_ms", {}).get("p95"))}</td>'
+                f'<td>{_e(user.get("coverage", {}).get("status", "unknown"))}'
+                f'<details><summary>{len(user.get("request_ids", []))} associated requests</summary>'
+                f'{links}<p>Full request records are in report.json.</p></details></td></tr>')
+        parts.append('</table></div>')
+    return ''.join(parts)
 
 
 def _session_performance_html(data: dict[str, Any]) -> str:
@@ -2371,6 +2528,8 @@ def _render(report: RunReport) -> str:
             metrics = _load_test_html(check.metrics) + metrics
         if check.id == "concurrency" and "load_types" in check.metrics:
             metrics = _concurrent_load_html(check.metrics) + metrics
+        if check.id == "multi_user" and check.metrics.get("multi_user"):
+            metrics = _multi_user_html(check.metrics["multi_user"], anchors) + metrics
         if check.id == "sessions" and check.metrics.get("conversation_performance"):
             metrics = _session_performance_html(check.metrics["conversation_performance"]) + metrics
         applied = ((report.manifest.get("effective_checks") or {}).get(check.id) or {}).get("limits") or {}
@@ -2720,6 +2879,10 @@ def reproduction_export(report: RunReport) -> dict:
             "invocation": safe_invocation(retained.manifest.get("invocation")),
             "config": retained.manifest.get("config", {}),
             "fixture_pack": retained.manifest.get("fixture_pack", {}),
+            **({"multi_user": {check.target: _multi_user_export(check.metrics["multi_user"])
+                               for check in retained.checks
+                               if check.id == "multi_user" and check.metrics.get("multi_user")}}
+               if any(check.id == "multi_user" and check.metrics.get("multi_user") for check in retained.checks) else {}),
             "deployments": {name: obs.get("deployment") for name, obs in retained.observations.get("targets", {}).items()},
             "deployment_history": {name: obs.get("deployment_history", []) for name, obs in retained.observations.get("targets", {}).items()},
             "instructions": ["Supply secret environment-variable references locally.",

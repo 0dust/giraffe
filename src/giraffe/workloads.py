@@ -20,6 +20,7 @@ from giraffe.tool_checks import default_tool_fixture, is_discovery_rejection, re
 WORKLOAD_CHECKS = {
     "prefix": {"prefix"},
     "sessions": {"sessions"},
+    "multi_user": {"multi_user"},
     "consistency": {"consistency"}, "tool_calling": {"tools"},
     "forced_tool_diagnostic": {"tools"}, "tool_checks": {"tools"},
     "load_test": {"load"},
@@ -493,9 +494,11 @@ async def tools(run, target, client):
 
 async def execute(run, target, client, fixtures):
     from giraffe.load_test import execute as load_test
+    from giraffe.multi_user import execute as multi_user
     for field, callback in (
         ("prefix", prefixes),
         ("load_test", load_test),
+        ("multi_user", multi_user),
         ("sessions", sessions),
         ("consistency", consistency),
         ("tool_calling", tools),
@@ -503,7 +506,7 @@ async def execute(run, target, client, fixtures):
         selected = WORKLOAD_CHECKS[field].intersection(run.config.checks)
         if selected and getattr(run.config, field):
             run.emit("scenario_started", target.name, field)
-            if field != "load_test" and not run.allowed(target.name):
+            if field not in {"load_test", "multi_user"} and not run.allowed(target.name):
                 run.unfinished[target.name].update(selected)
                 continue
             if field in {"arrivals", "consistency"}:
@@ -521,6 +524,11 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
     result = []
     selected = set(config.checks) - set(CORE_CHECKS)
     for check in CHECK_NAMES:
+        if check == "multi_user" and check in selected:
+            from giraffe.multi_user import result as user_result
+            result_value = user_result(run, target)
+            result.append(result_value)
+            continue
         if check in {"concurrency", "token_stress"}:
             continue
         if check not in selected:

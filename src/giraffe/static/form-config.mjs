@@ -286,6 +286,38 @@ export function configureJudging(source, values, {allowInvalid=false}={}) {
   return config;
 }
 
+export function multiUserSettings(config, defaults) {
+  const saved=config.multi_user || {}, result={...structuredClone(defaults),...structuredClone(saved)};
+  result.profile=Object.fromEntries(loadSizes.map(size=>[size,{...defaults.profile[size],...saved.profile?.[size]}]));
+  result.pass_criteria={...defaults.pass_criteria,...saved.pass_criteria};
+  result.think_time_seconds={...defaults.think_time_seconds,...saved.think_time_seconds};
+  return result;
+}
+
+export function configureMultiUser(source, values, defaults, {allowInvalid=false}={}) {
+  const config=structuredClone(source);
+  if(!values.has('multi_user_rendered'))return config;
+  const settings=multiUserSettings(source,defaults);
+  const number=(name,label)=>numeric(values.get('multi_user_'+name),label,allowInvalid);
+  const list=(name,label)=>String(values.get('multi_user_'+name)||'').split(',').map(value=>numeric(value.trim(),label,allowInvalid));
+  if(values.has('multi_user_levels'))settings.levels=list('levels','User levels');
+  for(const name of ['duration_seconds','warmup_seconds','seed'])if(values.has('multi_user_'+name))settings[name]=number(name,name);
+  if(values.has('multi_user_think_time_values'))settings.think_time_seconds.values=list('think_time_values','Pause values');
+  if(values.has('multi_user_think_time_weights'))settings.think_time_seconds.weights=String(values.get('multi_user_think_time_weights')).trim()?list('think_time_weights','Pause weights'):null;
+  if(loadShapes.some(shape=>values.has('multi_user_shape_'+shape))){
+    const selected=loadShapes.filter(shape=>values.get('multi_user_shape_'+shape)==='on');
+    settings.shapes=[...settings.shapes.filter(shape=>selected.includes(shape)),...selected.filter(shape=>!settings.shapes.includes(shape))];
+  }
+  for(const size of loadSizes)for(const kind of ['input_tokens','output_tokens']){
+    const name='profile_'+size+'_'+kind;if(values.has('multi_user_'+name))settings.profile[size][kind]=number(name,kind);
+  }
+  for(const key of Object.keys(defaults.pass_criteria))if(values.has('multi_user_criteria_'+key))settings.pass_criteria[key]=number('criteria_'+key,key);
+  // An untouched hidden drawer must not activate or materialize an optional check.
+  if(source.multi_user==null&&!config.checks?.includes('multi_user')&&sameConfig(settings,defaults))return config;
+  config.multi_user=settings;
+  return config;
+}
+
 export function configureSessions(source, values, defaults, {allowInvalid=false}={}) {
   const config = structuredClone(source);
   if (!values.has('sessions_profile')) return config;
