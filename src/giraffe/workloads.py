@@ -197,6 +197,132 @@ async def prefixes(run, target, client):
             run.finish_condition(target.name, scenario)
 
 
+async def execute_conversation(run, target, client, config, settings, mode, index, *,
+                               items, prepared_inputs, plan=None, session_id=None,
+                               check="sessions", send=None, pause=None):
+    """Execute one isolated history; its caller owns user lifetime and admission."""
+    history = []
+    session_id = session_id or f"{target.name}:{mode}:{index}"
+    workload = plan["workload"] if plan else None
+    turns = workload.turns[:len(plan["turns"])] if workload else settings.turns
+    item = {"id": session_id, "mode": mode, "turns": [], "stop_reason": None,
+            "task_type": workload.name if workload else "exact_repeat",
+            "planned_turns": len(turns)}
+    if plan:
+        item["sampled_turns"] = plan["turns"]
+    items.append(item)
+    value = f"Session_{index:04d}_{mode}"
+    item["seeded_value"] = value
+    previous_completed_ms = None
+
+    def finalize_pause(record):
+        item["turns"].append(record.id)
+        item["completed_turns"] = len(item["turns"])
+        record.workload["actual_pause_seconds"] = (
+            max(0, (record.dispatch_ms - previous_completed_ms) / 1000)
+            if previous_completed_ms is not None and record.dispatch_ms is not None else None)
+
+    for turn, prompt in enumerate(turns):
+        sampled = plan["turns"][turn] if plan else {
+            "think_time_seconds": settings.delay_seconds if turn else 0,
+            "input_tokens": None, "output_tokens": settings.max_tokens}
+        budget = sampled["output_tokens"]
+        delay = sampled["think_time_seconds"]
+        due = time.monotonic() + delay
+        if not run.allowed(target.name):
+            item["stop_reason"] = run.reason or "target request budget reached"
+            run.unfinished[target.name].add(check)
+            break
+        if pause is not None:
+            if not await pause(delay):
+                item["stop_reason"] = "measurement window closed during turn pause"
+                break
+        else:
+            await asyncio.sleep(
+                max(0, min(due - time.monotonic(), run.deadline - time.monotonic()))
+            )
+        if not run.allowed(target.name):
+            item["stop_reason"] = run.reason or "request budget reached during turn pause"
+            run.unfinished[target.name].add(check)
+            break
+        if not workload:
+            prompt = session_prompt(prompt, turn, value)
+        preparation = None
+        if sampled["input_tokens"] is not None:
+            preparation = prepared_inputs[(prompt, sampled["input_tokens"])]
+            if preparation["status"] != "calibrated" or preparation.get("reason_code") == "minimum_prompt_length":
+                item["stop_reason"] = preparation.get("reason") or "requested input length could not be prepared"
+                run.unfinished[target.name].add(check)
+                break
+            prompt = preparation["messages"][0]["content"]
+        messages = [*history, {"role": "user", "content": prompt}]
+        input_chars = sum(len(m["content"]) for m in messages)
+        if input_chars + budget + 32 > config.context_limit:
+            item["stop_reason"] = (
+                "history admission ceiling reached; required history not cropped"
+            )
+            run.unfinished[target.name].add(check)
+            break
+        request = spec(
+            prompt,
+            f"session_{mode}_turn{turn}",
+            check,
+            max_tokens=budget,
+            request_timeout_seconds=config.request_timeout_seconds,
+            session_id=session_id,
+            task_type=item["task_type"],
+            turn_id=turn,
+            mode=mode,
+            history_messages=len(history),
+            configured_delay_seconds=delay,
+            sampled_input_tokens=sampled["input_tokens"],
+            sampled_output_tokens=budget,
+            sampling_seed=settings.sampling.seed if settings.sampling else None,
+            scheduled_ms=(due - run.start) * 1000,
+        )
+        if preparation:
+            request.workload["input_preparation"] = {key: value for key, value in preparation.items()
+                                                    if key not in {"messages", "request_ids"}}
+        request.messages, request.input_chars = messages, input_chars
+        if not workload:
+            request.scorer, request.expected = "exact", value
+            request.options = deterministic_options(config, request.options)
+        record = (await send(request, finalize_pause) if send is not None else
+                  await run.request(target, client, request, finalize_record=finalize_pause))
+        if record is None:
+            item["stop_reason"] = run.reason or "request budget reached"
+            run.unfinished[target.name].add(check)
+            break
+        previous_completed_ms = record.completed_ms
+        if reasoning_budget(record):
+            item["stop_reason"] = "reasoning exhausted the output budget before an answer; session recall unverified"
+            run.unfinished[target.name].add(check)
+            break
+        if (
+            not record.valid
+            or record.status != "completed"
+            or (not workload and (record.finish_reason == "length" or record.score is not True))
+            or (check == "multi_user" and record.finish_reason == "length")
+            or record.score is False
+        ):
+            item["stop_reason"] = (
+                "failed task/transport, cancelled or truncated turn; stopped without substitute answer"
+            )
+            run.unfinished[target.name].add(check)
+            break
+        if (
+            record.input_tokens is not None
+            and record.input_tokens + budget > config.context_limit
+        ):
+            item["stop_reason"] = "observed context budget reached"
+            run.unfinished[target.name].add(check)
+            break
+        answer = final_answer(record.output)[0] if mode == "live" else value
+        history = [*messages, {"role": "assistant", "content": answer}]
+    item["completed_turns"] = len(item["turns"])
+    return item
+
+
 async def sessions(run, target, client):
     from giraffe.runner import _check_config
 
@@ -224,117 +350,8 @@ async def sessions(run, target, client):
     run.observations[target.name]["sessions"] = observation
 
     async def session(mode, index, plan=None):
-        history, previous = [], None
-        session_id = f"{target.name}:{mode}:{index}"
-        workload = plan["workload"] if plan else None
-        turns = workload.turns[:len(plan["turns"])] if workload else settings.turns
-        item = {"id": session_id, "mode": mode, "turns": [], "stop_reason": None,
-                "task_type": workload.name if workload else "exact_repeat",
-                "planned_turns": len(turns)}
-        if plan:
-            item["sampled_turns"] = plan["turns"]
-        observation["sessions"].append(item)
-        value = f"Session_{index:04d}_{mode}"
-        item["seeded_value"] = value
-        previous_completed_ms = None
-
-        def finalize_pause(record):
-            record.workload["actual_pause_seconds"] = (
-                max(0, (record.dispatch_ms - previous_completed_ms) / 1000)
-                if previous_completed_ms is not None and record.dispatch_ms is not None else None)
-
-        for turn, prompt in enumerate(turns):
-            sampled = plan["turns"][turn] if plan else {
-                "think_time_seconds": settings.delay_seconds if turn else 0,
-                "input_tokens": None, "output_tokens": settings.max_tokens}
-            budget = sampled["output_tokens"]
-            delay = sampled["think_time_seconds"]
-            due = time.monotonic() + delay
-            if not run.allowed(target.name):
-                item["stop_reason"] = run.reason or "target request budget reached"
-                run.unfinished[target.name].add("sessions")
-                break
-            await asyncio.sleep(
-                max(0, min(due - time.monotonic(), run.deadline - time.monotonic()))
-            )
-            if not run.allowed(target.name):
-                item["stop_reason"] = run.reason or "request budget reached during turn pause"
-                run.unfinished[target.name].add("sessions")
-                break
-            if not workload:
-                prompt = session_prompt(prompt, turn, value)
-            preparation = None
-            if sampled["input_tokens"] is not None:
-                preparation = prepared_inputs[(prompt, sampled["input_tokens"])]
-                if preparation["status"] != "calibrated" or preparation.get("reason_code") == "minimum_prompt_length":
-                    item["stop_reason"] = preparation.get("reason") or "requested input length could not be prepared"
-                    run.unfinished[target.name].add("sessions")
-                    break
-                prompt = preparation["messages"][0]["content"]
-            messages = [*history, {"role": "user", "content": prompt}]
-            input_chars = sum(len(m["content"]) for m in messages)
-            if input_chars + budget + 32 > config.context_limit:
-                item["stop_reason"] = (
-                    "history admission ceiling reached; required history not cropped"
-                )
-                run.unfinished[target.name].add("sessions")
-                break
-            request = spec(
-                prompt,
-                f"session_{mode}_turn{turn}",
-                "sessions",
-                max_tokens=budget,
-                request_timeout_seconds=config.request_timeout_seconds,
-                session_id=session_id,
-                task_type=item["task_type"],
-                turn_id=turn,
-                mode=mode,
-                history_messages=len(history),
-                configured_delay_seconds=delay,
-                sampled_input_tokens=sampled["input_tokens"],
-                sampled_output_tokens=budget,
-                sampling_seed=settings.sampling.seed if settings.sampling else None,
-                scheduled_ms=(due - run.start) * 1000,
-            )
-            if preparation:
-                request.workload["input_preparation"] = {key: value for key, value in preparation.items()
-                                                        if key not in {"messages", "request_ids"}}
-            request.messages, request.input_chars = messages, input_chars
-            if not workload:
-                request.scorer, request.expected = "exact", value
-                request.options = deterministic_options(config, request.options)
-            record = await run.request(target, client, request, finalize_record=finalize_pause)
-            if record is None:
-                item["stop_reason"] = run.reason or "request budget reached"
-                run.unfinished[target.name].add("sessions")
-                break
-            item["turns"].append(record.id)
-            previous_completed_ms = record.completed_ms
-            if reasoning_budget(record):
-                item["stop_reason"] = "reasoning exhausted the output budget before an answer; session recall unverified"
-                run.unfinished[target.name].add("sessions")
-                break
-            if (
-                not record.valid
-                or record.status != "completed"
-                or (not workload and (record.finish_reason == "length" or record.score is not True))
-                or record.score is False
-            ):
-                item["stop_reason"] = (
-                    "failed task/transport, cancelled or truncated turn; stopped without substitute answer"
-                )
-                run.unfinished[target.name].add("sessions")
-                break
-            if (
-                record.input_tokens is not None
-                and record.input_tokens + budget > config.context_limit
-            ):
-                item["stop_reason"] = "observed context budget reached"
-                run.unfinished[target.name].add("sessions")
-                break
-            previous = final_answer(record.output)[0] if mode == "live" else value
-            history = [*messages, {"role": "assistant", "content": previous}]
-        item["completed_turns"] = len(item["turns"])
+        return await execute_conversation(run, target, client, config, settings, mode, index,
+            items=observation["sessions"], prepared_inputs=prepared_inputs, plan=plan)
 
     for mode in settings.modes:
         planned = sum(len(plan["turns"]) for plan in plans) if mixed else settings.sessions * len(settings.turns)

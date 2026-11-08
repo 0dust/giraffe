@@ -1091,27 +1091,8 @@ class MultiUserCriteria(Model):
     max_completion_ms: float | None = Field(default=None, gt=0)
     max_error_percent: float | None = Field(default=0, ge=0, le=100)
     min_output_tokens_per_second: float | None = Field(default=None, gt=0)
+    max_throughput_ratio: float | None = Field(default=None, ge=1)
     min_samples: StrictInt = Field(default=1, ge=1)
-
-
-class MultiUser(Model):
-    levels: list[Annotated[StrictInt, Field(ge=1, le=MAX_SIMULATED_USERS)]] = Field(
-        default_factory=lambda: [1, 5, 20], min_length=1, max_length=MAX_SIMULATED_USERS)
-    profile: LoadTestProfile = Field(default_factory=LoadTestProfile)
-    shapes: list[Literal[*SHAPES]] = Field(default_factory=lambda: ["short_short"], min_length=1, max_length=9)
-    seed: StrictInt = Field(default=42, ge=0, le=2**32 - 1)
-    think_time_seconds: SessionDistribution = Field(default_factory=lambda: SessionDistribution(values=[0]))
-    warmup_seconds: float = Field(default=0, ge=0, le=MAX_STAGE_SECONDS)
-    duration_seconds: float = Field(default=15, gt=0, le=MAX_STAGE_SECONDS)
-    pass_criteria: MultiUserCriteria = Field(default_factory=MultiUserCriteria)
-
-    @model_validator(mode="after")
-    def valid_population(self):
-        if len(set(self.levels)) != len(self.levels) or len(set(self.shapes)) != len(self.shapes):
-            raise ValueError("multi-user levels and shapes must be distinct")
-        if any(value > 60 for value in self.think_time_seconds.values):
-            raise ValueError("multi-user think times must be between 0 and 60 seconds")
-        return self
 
 
 class SessionSampling(Model):
@@ -1167,11 +1148,9 @@ def session_workload_presets() -> list[SessionWorkload]:
     ]
 
 
-class Sessions(Model):
+class ConversationSettings(Model):
     profile: Literal["correctness", "performance"] = "correctness"
     modes: list[Literal["fixed", "live"]] = Field(default_factory=lambda: ["fixed", "live"])
-    sessions: int = Field(default=5, ge=1, le=MAX_SESSIONS)
-    concurrency: int = Field(default=2, ge=1, le=MAX_SIMULTANEOUS_REQUESTS)
     turns: list[Annotated[str, Field(min_length=1, max_length=MAX_SESSION_TURN_CHARS)]] = Field(min_length=2, max_length=MAX_SESSION_TURNS, default_factory=lambda: [
         "Remember the name assigned to this conversation and reply with that name only.",
         SESSION_REPEAT_PROMPT])
@@ -1206,6 +1185,33 @@ class Sessions(Model):
             raise ValueError("select distinct fixed/live session modes")
         if not 2 <= len(self.turns) <= MAX_SESSION_TURNS or any(not t.strip() or len(t) > MAX_SESSION_TURN_CHARS for t in self.turns):
             raise ValueError(f"sessions need 2..{MAX_SESSION_TURNS} non-empty bounded user turns")
+        return self
+
+
+class Sessions(ConversationSettings):
+    sessions: int = Field(default=5, ge=1, le=MAX_SESSIONS)
+    concurrency: int = Field(default=2, ge=1, le=MAX_SIMULTANEOUS_REQUESTS)
+
+
+class MultiUser(Model):
+    levels: list[Annotated[StrictInt, Field(ge=1, le=MAX_SIMULATED_USERS)]] = Field(
+        default_factory=lambda: [1, 5, 20], min_length=1, max_length=MAX_SIMULATED_USERS)
+    profile: LoadTestProfile = Field(default_factory=LoadTestProfile)
+    shapes: list[Literal[*SHAPES]] = Field(default_factory=lambda: ["short_short"], min_length=1, max_length=9)
+    seed: StrictInt = Field(default=42, ge=0, le=2**32 - 1)
+    think_time_seconds: SessionDistribution = Field(default_factory=lambda: SessionDistribution(values=[0]))
+    warmup_seconds: float = Field(default=0, ge=0, le=MAX_STAGE_SECONDS)
+    duration_seconds: float = Field(default=15, gt=0, le=MAX_STAGE_SECONDS)
+    conversations: ConversationSettings | None = None
+    fairness_tolerance_percent: float = Field(default=10, ge=0, le=100)
+    pass_criteria: MultiUserCriteria = Field(default_factory=MultiUserCriteria)
+
+    @model_validator(mode="after")
+    def valid_population(self):
+        if len(set(self.levels)) != len(self.levels) or len(set(self.shapes)) != len(self.shapes):
+            raise ValueError("multi-user levels and shapes must be distinct")
+        if any(value > 60 for value in self.think_time_seconds.values):
+            raise ValueError("multi-user think times must be between 0 and 60 seconds")
         return self
 
 

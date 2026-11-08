@@ -72,7 +72,8 @@ def test_single_user_regression_is_not_pooled_with_healthy_peers():
 
 
 @pytest.mark.parametrize("field,value", [("seed", 999), ("levels", [1, 5]), ("duration_seconds", 20),
-                                         ("shapes", ["long_long"])])
+                                         ("shapes", ["long_long"]), ("fairness_tolerance_percent", 5),
+                                         ("conversations", {"modes": ["live"]})])
 def test_changed_user_workload_cannot_pass_baseline(field, value):
     current, previous = user_report(), user_report()
     current.manifest["config"]["multi_user"][field] = value
@@ -117,6 +118,642 @@ def test_matching_user_baseline_preserves_per_user_delivery_rows():
     assert result.baseline["status"] == "pass"
     assert len(rates) == 5 and all(row["current"] == 80 for row in rates)
     assert all("worsening_interval_95" not in row for row in rates)
+
+
+@pytest.mark.parametrize(("change", "expected"), [({}, "fail"), ({"input_tokens": 200}, "inconclusive"),
+                                                    ({"output_tokens": None}, "inconclusive")])
+def test_measured_zero_delivery_compares_when_the_same_work_drains_after_cutoff(change, expected):
+    current, previous = user_report(), user_report()
+    for report in (current, previous):
+        settings = report.manifest["config"]["multi_user"]
+        settings["pass_criteria"]["min_output_tokens_per_second"] = 1
+        source = report.observations["targets"]["local"]["multi_user"]
+        source["settings"] = settings
+        if report is current:
+            for request in report.requests:
+                if request.workload["user_id"] == "user-05":
+                    request.completed_ms = 10100
+                    request.elapsed_ms = request.completed_ms - request.dispatch_ms
+                    for field, value in change.items():
+                        setattr(request, field, value)
+        summary = summarize(source, report.requests)
+        report.checks[0].metrics["multi_user"] = summary
+        report.checks[0].status = report.overall = summary["status"]
+
+    result = compare_baseline(current, previous)
+    rows = {row["metric"]: row for row in result.baseline["targets"][0]["comparisons"]
+            if row.get("user_id") == "user-05"}
+    rate = rows["shared_window_output_tokens_per_second"]
+    assert result.baseline["acceptance"] == {"current": "fail", "baseline": "pass"}
+    assert rate["status"] == rows["user_acceptance"]["status"] == expected
+    assert (rate["current"], rate["baseline"]) == (0, 80)
+    assert rate["current_samples"] == 0
+    if expected == "fail":
+        assert result.baseline["status"] == "fail"
+        assert rate["evidence_ids"] == [f"user-05-{i}" for i in range(8)]
+
+
+@pytest.mark.parametrize(("limit", "new_input_tokens", "new_overlap", "expected"), [
+    (1.1, 100, True, "fail"),
+    (1.1, 200, True, "inconclusive"),
+    (1.1, 100, False, "inconclusive"),
+    (None, 100, True, "pass"),
+])
+def test_selected_fairness_baseline_tracks_threshold_crossings_with_comparable_work(
+        limit, new_input_tokens, new_overlap, expected):
+    current, previous = user_report(), user_report()
+    current.requests = [request for request in current.requests if request.id != "user-05-7"]
+    for report in (current, previous):
+        settings = report.manifest["config"]["multi_user"]
+        settings["pass_criteria"]["max_throughput_ratio"] = limit
+        for request in report.requests:
+            request.stream = True
+            request.answer_chunks = request.answer_reads = 3 if report is previous or new_overlap else 1
+            request.last_output_ms = 90
+            if report is current:
+                request.input_tokens = new_input_tokens
+        source = report.observations["targets"]["local"]["multi_user"]
+        source["settings"] = settings
+        if report is current:
+            source["windows"][0]["users"][-1]["dispatched_count"] = 7
+        summary = summarize(source, report.requests)
+        report.checks[0].metrics["multi_user"] = summary
+        report.checks[0].status = report.overall = summary["status"]
+
+    result = compare_baseline(current, previous)
+    assert result.baseline["status"] == expected
+    fairness = [row for row in result.baseline["targets"][0]["comparisons"] if row["metric"] == "fairness_acceptance"]
+    if limit is None:
+        assert not fairness
+    else:
+        assert len(fairness) == 1 and fairness[0]["status"] == expected
+        assert fairness[0]["baseline"] == 1 and fairness[0]["current"] == pytest.approx(8 / 7)
+        assert result.baseline["acceptance"]["current"] == ("fail" if new_overlap else "inconclusive")
+
+
+@pytest.mark.parametrize(("drop_request", "changed_work", "expected"), [
+    (True, True, "inconclusive"),
+    (False, True, "inconclusive"),
+    (False, False, "pass"),
+])
+def test_fairness_baseline_qualifies_work_even_when_both_runs_pass(drop_request, changed_work, expected):
+    current, previous = user_report(), user_report()
+    if drop_request:
+        current.requests = [request for request in current.requests if request.id != "user-05-0"]
+    old_lengths = [100]*5 + [120]*2 + [200]
+    new_lengths = [100]*3 + [120]*4 + [200] if changed_work else old_lengths
+    for report, lengths in ((previous, old_lengths), (current, new_lengths)):
+        settings = report.manifest["config"]["multi_user"]
+        settings["pass_criteria"]["max_throughput_ratio"] = 1.1
+        for request in report.requests:
+            request.stream = True
+            request.answer_chunks = request.answer_reads = 3
+            request.last_output_ms = 90
+            request.input_tokens = lengths[int(request.id.rsplit("-", 1)[1])]
+        source = report.observations["targets"]["local"]["multi_user"]
+        source["settings"] = settings
+        if report is current and drop_request:
+            source["windows"][0]["users"][-1]["dispatched_count"] = 7
+        summary = summarize(source, report.requests)
+        report.checks[0].metrics["multi_user"] = summary
+        report.checks[0].status = report.overall = summary["status"]
+        fairness = summary["windows"][0]["fairness"]
+        assert fairness["qualified"]
+        assert [sample["input_median_tokens"] for sample in fairness["users"]] == [lengths[3]] * 5
+
+    result = compare_baseline(current, previous)
+    row = next(row for row in result.baseline["targets"][0]["comparisons"] if row["metric"] == "fairness_acceptance")
+    assert row["status"] == result.baseline["status"] == expected
+    assert result.baseline["acceptance"] == {"baseline": "pass", "current": "fail" if drop_request else "pass"}
+
+
+def live_user_report(*, session_ids=False):
+    report = user_report()
+    window = report.checks[0].metrics["multi_user"]["windows"][0]
+    window["scenario"] = "repeated_conversations"
+    if session_ids:
+        source_window = report.observations["targets"]["local"]["multi_user"]["windows"][0]
+        source_window["scenario"] = window["scenario"]
+        for user in source_window["users"]:
+            user["profile"] = "conversation:chat"
+    for user in window["users"]:
+        user["profile"] = "conversation:chat"
+    for request in report.requests:
+        conversation, turn = divmod(int(request.id.rsplit("-", 1)[1]), 2)
+        request.workload.update(mode="live", profile="conversation:chat", turn_id=turn,
+                                conversation_sequence=conversation+1, task_type="exact_repeat",
+                                scenario="repeated_conversations")
+        if session_ids:
+            request.workload["session_id"] = f"{request.workload['user_id']}:{conversation+1}"
+        request.fixture_id = f"session_live_turn{turn}"
+        request.request_hash = f"conversation-{conversation}-turn-{turn}"
+        request.finish_reason = "stop"
+        request.score = True
+    return report
+
+
+@pytest.mark.parametrize(("changed_field", "changed_value"), [
+    ("request_hash", "different-live-history"),
+    ("input_tokens", 400),
+    ("request_hash", None),
+    ("input_tokens", None),
+])
+def test_live_user_baseline_requires_comparable_history_and_input_usage(changed_field, changed_value):
+    current, previous = live_user_report(), live_user_report()
+    assert compare_baseline(previous, previous).baseline["status"] == "pass"
+
+    for request in current.requests:
+        if request.workload["user_id"] == "user-05" and request.workload["turn_id"] == 1:
+            setattr(request, changed_field, changed_value)
+    result = compare_baseline(current, previous)
+    rates = [row for row in result.baseline["targets"][0]["comparisons"]
+             if row["metric"] == "shared_window_output_tokens_per_second"]
+    assert result.baseline["status"] == "inconclusive"
+    assert [row["status"] for row in rates] == ["pass"] * 4 + ["inconclusive"]
+    assert rates[-1]["current"] == rates[-1]["baseline"] == 80
+    assert "live generated histories" in rates[-1]["reason"]
+
+
+@pytest.mark.parametrize(("exact_recall", "extra_change", "expected"), [
+    (True, {}, "fail"),
+    (True, {"input_tokens": 400}, "inconclusive"),
+    (False, {}, "fail"),
+    (False, {"input_tokens": 101}, "inconclusive"),
+    (False, {"request_hash": "unseen-history"}, "inconclusive"),
+])
+def test_live_history_repetitions_compare_when_the_extra_work_is_comparable(exact_recall, extra_change, expected):
+    current, previous = live_user_report(), live_user_report()
+    user = current.checks[0].metrics["multi_user"]["windows"][0]["users"][-1]
+    unserved = set(user["request_ids"][4:])
+    for report in (current, previous):
+        for request in report.requests:
+            if not exact_recall:
+                request.workload["task_type"] = "chat"
+                request.score = None
+                request.request_hash = f"repeatable-history-{request.workload['turn_id']}"
+            if report is previous and request.id in unserved:
+                for field, value in extra_change.items():
+                    setattr(request, field, value)
+    current.requests = [request for request in current.requests if request.id not in unserved]
+    user["request_ids"] = user["request_ids"][:4]
+    user["outcomes"]["valid_completed"] = 4
+    user["output_tokens_per_second"] = 40
+    result = compare_baseline(current, previous)
+    row = next(row for row in result.baseline["targets"][0]["comparisons"]
+               if row.get("user_id") == "user-05" and row["metric"] == "shared_window_output_tokens_per_second")
+    assert row["status"] == result.baseline["status"] == expected
+    assert row["current"] == 40 and row["baseline"] == 80
+
+
+@pytest.mark.parametrize(("mode", "change", "error_regression", "expected"), [
+    ("live", {"request_hash": "different-late-history", "input_tokens": 400}, False, "inconclusive"),
+    ("live", {"output_tokens": 300}, False, "inconclusive"),
+    ("live", {"completion_tokens": 300}, False, "inconclusive"),
+    ("live", {"output_tokens": 300}, True, "fail"),
+    ("live", {}, False, "fail"),
+    ("fixed", {"reasoning_tokens": 300}, False, "inconclusive"),
+    ("fixed", {"reasoning_tokens": 300}, True, "fail"),
+    ("fixed", {"output_tokens": None}, False, "fail"),
+    ("fixed", {}, False, "fail"),
+])
+def test_conversation_acceptance_qualifies_the_work_behind_each_failure(mode, change, error_regression, expected):
+    current = live_user_report(session_ids=mode == "fixed")
+    previous = live_user_report(session_ids=mode == "fixed")
+    for report in (current, previous):
+        settings = report.manifest["config"]["multi_user"]["pass_criteria"]
+        settings["max_completion_ms"] = 300
+        if mode == "fixed" and error_regression:
+            settings["max_error_percent"] = 0
+        source = report.observations["targets"]["local"]["multi_user"]
+        source["settings"]["pass_criteria"] = settings
+        source["windows"][0]["scenario"] = "repeated_conversations"
+        for user in source["windows"][0]["users"]:
+            user["profile"] = "conversation:chat"
+        for request in report.requests:
+            request.workload["mode"] = mode
+            request.fixture_id = f"session_{mode}_turn{request.workload['turn_id']}"
+            if request.id == "user-05-7":
+                request.dispatch_ms = request.timing_start_ms = request.workload["ready_ms"] = 9900
+                request.elapsed_ms = 200 if report is previous else 500
+                request.completed_ms = request.dispatch_ms + request.elapsed_ms
+                if report is current:
+                    for field, value in change.items():
+                        setattr(request, field, value)
+            if report is current and error_regression and request.id == "user-05-6":
+                request.score = False
+        summary = summarize(source, report.requests)
+        report.checks[0].metrics["multi_user"] = summary
+        report.checks[0].status = report.overall = summary["status"]
+
+    result = compare_baseline(current, previous)
+    rows = result.baseline["targets"][0]["comparisons"]
+    assert result.baseline["acceptance"] == {"baseline": "pass", "current": "fail"}
+    assert result.baseline["status"] == expected
+    acceptance = next(row for row in rows if row.get("user_id") == "user-05" and row["metric"] == "user_acceptance")
+    assert acceptance["status"] == expected
+    rate = next(row for row in rows if row.get("user_id") == "user-05"
+                and row["metric"] == "shared_window_output_tokens_per_second")
+    if not error_regression:
+        assert rate["status"] == "pass"
+
+
+@pytest.mark.parametrize("miss", ["deadline", "wrong_answer", "second_deadline", "pending_admission"])
+def test_fixed_acceptance_only_qualifies_work_behind_the_observed_miss(miss):
+    current, previous = live_user_report(session_ids=True), live_user_report(session_ids=True)
+    for report in (current, previous):
+        settings = report.manifest["config"]["multi_user"]["pass_criteria"]
+        settings.update(max_completion_ms=300, max_error_percent=None)
+        source = report.observations["targets"]["local"]["multi_user"]
+        source["settings"]["pass_criteria"] = settings
+        if report is current and miss == "pending_admission":
+            source["windows"][0]["users"][-1].update(pending_ready_ms=9500, pending_observed_ms=10000)
+        for request in report.requests:
+            request.workload["mode"] = "fixed"
+            request.fixture_id = f"session_fixed_turn{request.workload['turn_id']}.v1"
+            request.output_tokens = 1
+            if report is previous:
+                continue
+            changed = "user-05-5" if miss == "second_deadline" else "user-05-6"
+            if request.id == changed:
+                request.reasoning_tokens = 30
+            if miss == "pending_admission":
+                continue
+            if request.id == "user-05-7" or (miss == "second_deadline" and request.id == changed):
+                if miss == "wrong_answer":
+                    request.score = False
+                else:
+                    request.elapsed_ms = 500
+                    request.completed_ms = request.dispatch_ms + request.elapsed_ms
+        summary = summarize(source, report.requests)
+        report.checks[0].metrics["multi_user"] = summary
+        report.checks[0].status = report.overall = summary["status"]
+
+    comparison = compare_baseline(current, previous).baseline
+    assert comparison["acceptance"] == {"baseline": "pass", "current": "fail"}
+    rows = {row["metric"]: row for row in comparison["targets"][0]["comparisons"]
+            if row.get("user_id") == "user-05"}
+    assert rows["user_acceptance"]["status"] == comparison["status"] == "fail"
+    assert rows["latency_ms"]["status"] == "inconclusive"
+    assert rows["shared_window_output_tokens_per_second"]["status"] == "pass"
+    assert rows["error_rate"]["current"] == (1 / 8 if miss == "wrong_answer" else 0)
+    assert rows["error_rate"]["baseline"] == 0
+
+
+@pytest.mark.parametrize(("miss_mode", "changed_mode", "changed_turn", "change", "warning", "expected"), [
+    ("fixed", None, None, {}, None, "fail"),
+    ("fixed", "live", "fast", {"reasoning_tokens": 16}, "output_work_changed", "fail"),
+    ("live", "fixed", "fast", {"reasoning_tokens": 16}, "output_work_changed", "fail"),
+    ("live", "live", "fast", {"reasoning_tokens": 16}, "output_work_changed", "fail"),
+    ("fixed", "live", "fast", {"request_hash": "other-history"}, "input_work_changed", "fail"),
+    ("fixed", "live", "fast", {"requested_max_tokens": 64}, "requested_work_changed", "fail"),
+    ("fixed", "fixed", "miss", {"reasoning_tokens": 16}, "output_work_changed", "inconclusive"),
+    ("live", "live", "miss", {"reasoning_tokens": 16}, "output_work_changed", "inconclusive"),
+    ("fixed", "fixed", "miss", {"input_tokens": 48}, None, "inconclusive"),
+    ("fixed", "fixed", "miss", {"workload": {"conversation_sequence": 9}}, None, "inconclusive"),
+    ("fixed", "fixed", "miss", {"requested_max_tokens": 64}, "requested_work_changed", "inconclusive"),
+    ("live", "live", "miss", {"request_hash": "other-history"}, "input_work_changed", "inconclusive"),
+    ("live", "live", "miss", {"score": False, "input_tokens": None, "output_tokens": None}, None, "fail"),
+])
+@pytest.mark.parametrize("criterion", ["max_completion_ms", "max_first_answer_ms"])
+def test_mixed_conversation_deadline_compares_the_missed_turn(
+        miss_mode, changed_mode, changed_turn, change, warning, expected, criterion):
+    current, previous = live_user_report(session_ids=True), live_user_report(session_ids=True)
+    for report in (current, previous):
+        settings = report.manifest["config"]["multi_user"]["pass_criteria"]
+        settings.update({criterion: 30, "max_error_percent": None})
+        source = report.observations["targets"]["local"]["multi_user"]
+        source["settings"]["pass_criteria"] = settings
+        for request in report.requests:
+            sequence = request.workload["conversation_sequence"]
+            mode = "fixed" if sequence % 2 else "live"
+            request.workload["mode"] = mode
+            request.fixture_id = f"session_{mode}_turn{request.workload['turn_id']}.v1"
+            request.input_tokens, request.output_tokens, request.output_chars = 24, 1, 4
+            latest_user = report is current and request.workload["user_id"] == "user-05"
+            missed = latest_user and mode == miss_mode and sequence <= 2 and request.workload["turn_id"] == 1
+            if latest_user and mode == changed_mode and changed_turn == ("miss" if missed else "fast"):
+                for field, value in change.items():
+                    if field == "workload":
+                        request.workload.update(value)
+                    else:
+                        setattr(request, field, value)
+            request.elapsed_ms = 60 if missed else 10
+            request.completed_ms = request.dispatch_ms + request.elapsed_ms
+            request.first_output_ms = 55 if missed and criterion == "max_first_answer_ms" else 5
+        summary = summarize(source, report.requests)
+        report.checks[0].metrics["multi_user"] = summary
+        report.checks[0].status = report.overall = summary["status"]
+        assert summary["windows"][0]["users"][-1]["criteria"][criterion]["missed"] == int(report is current)
+
+    comparison = compare_baseline(current, previous).baseline
+    assert comparison["acceptance"] == {"baseline": "pass", "current": "fail"}
+    rows = {row["metric"]: row for row in comparison["targets"][0]["comparisons"]
+            if row.get("user_id") == "user-05"}
+    assert rows["user_acceptance"]["status"] == comparison["status"] == expected
+    if warning:
+        assert rows["latency_ms"]["status"] == "inconclusive"
+        assert any(item["code"] == warning for item in rows["latency_ms"]["warnings"])
+
+
+def test_live_delivery_compares_requested_mix_of_in_window_completions():
+    current, previous = live_user_report(), live_user_report()
+    current.requests = [r for r in current.requests if r.id not in {f"user-05-{i}" for i in range(3, 8)}]
+    late = next(request for request in current.requests if request.id == "user-05-2")
+    late.dispatch_ms = late.timing_start_ms = late.workload["ready_ms"] = 9900
+    late.elapsed_ms, late.completed_ms = 200, 10100
+    for report in (current, previous):
+        source = report.observations["targets"]["local"]["multi_user"]
+        window = source["windows"][0]
+        window["scenario"] = "repeated_conversations"
+        for user in window["users"]:
+            user["profile"] = "conversation:chat"
+        if report is current:
+            window["users"][-1]["dispatched_count"] = 3
+        report.checks[0].metrics["multi_user"] = summarize(source, report.requests)
+
+    result = compare_baseline(current, previous)
+    rate = next(row for row in result.baseline["targets"][0]["comparisons"]
+                if row.get("user_id") == "user-05" and row["metric"] == "shared_window_output_tokens_per_second")
+    assert rate["status"] == result.baseline["status"] == "fail"
+    assert (rate["current"], rate["baseline"]) == (20, 80)
+    assert (rate["current_samples"], rate["baseline_samples"]) == (2, 8)
+    assert rate["evidence_ids"] == ["user-05-0", "user-05-1"]
+
+
+@pytest.mark.parametrize(("field", "value", "current_rate"), [
+    ("output_tokens", 4, 41.6),
+    ("completion_tokens", 300, 80),
+])
+def test_live_delivery_requires_comparable_actual_generation(field, value, current_rate):
+    current, previous = live_user_report(), live_user_report()
+    for report in (current, previous):
+        source = report.observations["targets"]["local"]["multi_user"]
+        window = source["windows"][0]
+        window["scenario"] = "repeated_conversations"
+        for user in window["users"]:
+            user["profile"] = "conversation:chat"
+        if report is current:
+            for request in report.requests:
+                if request.workload["user_id"] == "user-05" and request.workload["turn_id"] == 1:
+                    setattr(request, field, value)
+        report.checks[0].metrics["multi_user"] = summarize(source, report.requests)
+
+    result = compare_baseline(current, previous).baseline
+    delivery = [row for row in result["targets"][0]["comparisons"]
+                if row["metric"] == "shared_window_output_tokens_per_second"]
+    assert [row["status"] for row in delivery] == ["pass"] * 4 + ["inconclusive"]
+    assert (delivery[-1]["current"], delivery[-1]["baseline"]) == (current_rate, 80)
+    assert result["status"] == "inconclusive"
+
+
+def test_live_timing_regression_requires_comparable_reasoning_work():
+    current, previous = live_user_report(), live_user_report()
+    for request in current.requests:
+        if request.workload["user_id"] == "user-05":
+            request.completion_tokens = 300
+            request.elapsed_ms = 500
+            request.completed_ms = request.dispatch_ms + request.elapsed_ms
+
+    result = compare_baseline(current, previous)
+    timing = next(row for row in result.baseline["targets"][0]["comparisons"]
+                  if row.get("user_id") == "user-05" and row["metric"] == "latency_ms")
+    assert timing["status"] == "inconclusive"
+    assert any(warning["code"] == "output_work_changed" for warning in timing["warnings"])
+
+
+@pytest.mark.parametrize(("extra_reasoning", "only_without_gap", "timing_status", "gap_status"), [
+    (16, False, "inconclusive", "inconclusive"),
+    (16, True, "inconclusive", "fail"),
+    (0, False, "fail", "fail"),
+])
+def test_fixed_recall_baseline_timing_qualifies_observed_generation(
+        extra_reasoning, only_without_gap, timing_status, gap_status):
+    current, previous = live_user_report(session_ids=True), live_user_report(session_ids=True)
+    for report in (current, previous):
+        report.manifest["config"]["limits"]["min_samples"] = 3
+        source = report.observations["targets"]["local"]["multi_user"]
+        user = source["windows"][0]["users"][-1]
+        unadmitted = set(user["request_ids"][6:])
+        report.requests = [request for request in report.requests if request.id not in unadmitted]
+        user["request_ids"] = user["request_ids"][:6]
+        user["ready_count"] = user["dispatched_count"] = 6
+        for request in report.requests:
+            turn = request.workload["turn_id"]
+            has_gap = turn == 1
+            request.workload["mode"] = "fixed"
+            request.fixture_id = f"session_fixed_turn{turn}.v1"
+            request.input_tokens, request.output_tokens, request.output_chars = 24, 1, 4
+            slower = report is current and request.workload["user_id"] == user["user_id"]
+            extra_work = slower and not (only_without_gap and has_gap)
+            request.reasoning_tokens = extra_reasoning if extra_work else 0
+            if has_gap:
+                request.completion_tokens = request.output_tokens + request.reasoning_tokens
+                request.stream = True
+                request.answer_reads = 2
+                request.max_stream_gap_ms = 20 if slower else 2
+            request.elapsed_ms = 30 if slower else 6
+            request.completed_ms = request.dispatch_ms + request.elapsed_ms
+            request.first_output_ms = 9 if slower else 3
+        summary = summarize(source, report.requests)
+        report.checks[0].metrics["multi_user"] = summary
+        report.checks[0].status = report.overall = summary["status"]
+
+    comparison = compare_baseline(current, previous).baseline
+    rows = {row["metric"]: row for row in comparison["targets"][0]["comparisons"]
+            if row.get("user_id") == "user-05"}
+    for metric, values, status, samples in (
+            ("latency_ms", (30, 6), timing_status, 6),
+            ("first_output_ms", (9, 3), timing_status, 6),
+            ("max_stream_gap_ms", (20, 2), gap_status, 3)):
+        row = rows[metric]
+        assert (row["current"], row["baseline"]) == values
+        assert row["current_samples"] == row["baseline_samples"] == samples
+        assert row["status"] == status
+        if status == "inconclusive":
+            assert any(warning["code"] == "output_work_changed" for warning in row["warnings"])
+    assert rows["shared_window_output_tokens_per_second"]["status"] == "pass"
+    assert rows["error_rate"]["status"] == "pass"
+
+
+@pytest.mark.parametrize(("current_long_index", "expected"), [(5, "inconclusive"), (None, "pass")])
+def test_live_baseline_qualifies_only_the_completions_delivered_in_the_window(current_long_index, expected):
+    current, previous = live_user_report(), live_user_report()
+    for report, long_index in ((current, current_long_index), (previous, 7)):
+        source = report.observations["targets"]["local"]["multi_user"]
+        window = source["windows"][0]
+        window["scenario"] = "repeated_conversations"
+        for user in window["users"]:
+            user["profile"] = "conversation:chat"
+        for request in report.requests:
+            if request.workload["user_id"] != "user-05":
+                continue
+            index = int(request.id.rsplit("-", 1)[1])
+            if index == long_index:
+                request.request_hash = "long-history"
+                request.input_tokens = 400
+            if index == 7:
+                request.completed_ms = window["end_ms"] + 10
+                request.elapsed_ms = request.completed_ms - request.dispatch_ms
+        summary = summarize(source, report.requests)
+        report.checks[0].metrics["multi_user"] = summary
+        user = summary["windows"][0]["users"][-1]
+        assert user["coverage"]["status"] == "complete"
+        assert user["late_completed"] == 1
+        assert user["output_tokens_per_second"] == 70
+
+    result = compare_baseline(current, previous)
+    row = next(row for row in result.baseline["targets"][0]["comparisons"]
+               if row.get("user_id") == "user-05" and row["metric"] == "shared_window_output_tokens_per_second")
+    assert row["status"] == result.baseline["status"] == expected
+    assert row["current"] == row["baseline"] == 70
+
+
+def test_baseline_stream_gap_uses_only_measured_conversation_turns():
+    current, previous = live_user_report(session_ids=True), live_user_report(session_ids=True)
+    for report, gap in ((current, 60), (previous, 5)):
+        for request in report.requests[-8:]:
+            request.stream = True
+            request.answer_reads = 2
+            request.max_stream_gap_ms = gap
+        request = report.requests[-1]
+        request.answer_reads = 1
+        request.max_stream_gap_ms = None
+        if report is current:
+            request.output_chars = 1000
+            request.request_hash = "different one-read turn"
+    current.observations["client_timing_health"] = {
+        "schema_version": 1, "windows": [{"start_ms": 7000, "end_ms": 7100, "lag_ms": 200}]
+    }
+
+    comparison = compare_baseline(current, previous).baseline
+    gap = next(row for row in comparison["targets"][0]["comparisons"]
+               if row.get("user_id") == "user-05" and row["metric"] == "max_stream_gap_ms")
+    assert gap["status"] == "fail"
+    assert gap["current_samples"] == gap["baseline_samples"] == 7
+    assert gap["timing_quality"]["Current"]["total_requests"] == 7
+    assert gap["timing_quality"]["Current"]["affected_request_ids"] == []
+    assert gap["output_work"]["current"]["valid_completions"] == 7
+    assert gap["evidence_ids"] == [request.id for request in current.requests[-8:-1]]
+
+
+@pytest.mark.parametrize("different_cap", [False, True])
+def test_baseline_conversation_latency_uses_measured_work_mix(different_cap):
+    current, previous = live_user_report(session_ids=True), live_user_report(session_ids=True)
+    for request in current.requests[-8:]:
+        request.elapsed_ms = 300
+        request.completed_ms = request.dispatch_ms + 300
+    first_turn = current.requests[-2]
+    for index in range(8):
+        request = first_turn.model_copy(deep=True)
+        request.id = f"user-05-truncated-{index}"
+        request.dispatch_ms = request.timing_start_ms = request.workload["ready_ms"] = 8000 + index * 100
+        request.completed_ms = request.dispatch_ms + 50
+        request.elapsed_ms = 50
+        request.finish_reason = "length"
+        request.workload.update(conversation_sequence=index+5, session_id=f"user-05:{index+5}")
+        if different_cap:
+            request.requested_max_tokens += 100
+        current.requests.append(request)
+    source = current.observations["targets"]["local"]["multi_user"]
+    source["windows"][0]["users"][-1]["dispatched_count"] = 16
+    current.checks[0].metrics["multi_user"] = summarize(source, current.requests)
+
+    comparison = compare_baseline(current, previous).baseline
+    rows = {row["metric"]: row for row in comparison["targets"][0]["comparisons"]
+            if row.get("user_id") == "user-05"}
+    assert rows["latency_ms"]["status"] == "fail"
+    assert rows["latency_ms"]["current_samples"] == rows["latency_ms"]["baseline_samples"] == 8
+    assert rows["latency_ms"]["evidence_ids"] == [request.id for request in current.requests[-16:-8]]
+    if not different_cap:
+        assert rows["valid_completion_rate"]["current_samples"] == rows["error_rate"]["current_samples"] == 16
+        assert rows["valid_completion_rate"]["current"] == rows["error_rate"]["current"] == 0.5
+
+
+@pytest.mark.parametrize("counter", ["output_tokens", "completion_tokens", None])
+def test_baseline_multi_user_gap_requires_no_contradictory_token_count(counter):
+    current, previous = user_report(), user_report()
+    for report, gap in ((current, 60), (previous, 5)):
+        for request in report.requests[-8:]:
+            request.stream = True
+            request.answer_reads = 2
+            request.max_stream_gap_ms = gap
+            request.output_tokens = request.completion_tokens = None
+            if counter:
+                setattr(request, counter, 0)
+
+    comparison = compare_baseline(current, previous).baseline
+    gaps = [row for row in comparison["targets"][0]["comparisons"]
+            if row.get("user_id") == "user-05" and row["metric"] == "max_stream_gap_ms"]
+    if counter:
+        assert gaps == []
+    else:
+        gap, = gaps
+        assert gap["status"] == "fail"
+        assert gap["current_samples"] == gap["baseline_samples"] == 8
+    assert current.requests[-1].max_stream_gap_ms == 60
+
+
+@pytest.mark.parametrize("conversation", [True, False])
+def test_baseline_counts_truncated_conversation_turn_as_unsuccessful(conversation):
+    build_report = live_user_report if conversation else user_report
+    current, previous = build_report(), build_report()
+    for report in (current, previous):
+        source = report.observations["targets"]["local"]["multi_user"]
+        if conversation:
+            window = source["windows"][0]
+            window["scenario"] = "repeated_conversations"
+            for user in window["users"]:
+                user["profile"] = "conversation:chat"
+            for request in report.requests:
+                request.workload["session_id"] = (
+                    f"{request.workload['user_id']}:{request.workload['conversation_sequence']}"
+                )
+        if report is current:
+            report.requests[-1].finish_reason = "length"
+            report.observations["client_timing_health"] = {
+                "schema_version": 1, "windows": [{"start_ms": 7000, "end_ms": 7100, "lag_ms": 200}]
+            }
+        summary = summarize(source, report.requests, timing_health=report.observations.get("client_timing_health"))
+        report.checks[0].metrics["multi_user"] = summary
+        report.checks[0].status = report.overall = summary["status"]
+
+    outcome = current.checks[0].metrics["multi_user"]["windows"][0]["users"][-1]["outcomes"]
+    valid, errors = (7, 1) if conversation else (8, 0)
+    assert (outcome["valid_completed"], outcome["errors"]) == (valid, errors)
+
+    comparison = compare_baseline(current, previous).baseline
+    rows = {row["metric"]: row for row in comparison["targets"][0]["comparisons"]
+            if row.get("user_id") == "user-05"}
+    assert rows["valid_completion_rate"]["current"] == valid / 8
+    assert rows["error_rate"]["current"] == errors / 8
+    assert rows["valid_completion_rate"]["current_samples"] == rows["error_rate"]["current_samples"] == 8
+    for metric in ("latency_ms", "first_output_ms"):
+        timing = rows[metric]
+        assert (timing["current_samples"], timing["baseline_samples"]) == (valid, 8)
+        assert timing["output_work"]["current"]["valid_completions"] == valid
+        quality = timing["timing_quality"]["Current"]
+        assert quality["total_requests"] == valid
+        assert quality["affected_request_ids"] == ([] if conversation else ["user-05-7"])
+        assert ("user-05-7" in timing["evidence_ids"]) is not conversation
+
+
+def test_failures_retention_keeps_truncated_conversation_output_in_a_passing_run(tmp_path):
+    report = user_report(retention="failures")
+    truncated = report.requests[0]
+    truncated.workload.update(session_id="conversation", mode="live")
+    truncated.finish_reason = "length"
+    truncated.output = "partial conversation answer"
+    source = report.observations["targets"]["local"]["multi_user"]
+    source["settings"]["pass_criteria"]["max_error_percent"] = 20
+    summary = summarize(source, report.requests)
+    assert summary["status"] == "pass"
+    assert summary["windows"][0]["users"][0]["outcomes"]["errors"] == 1
+    report.checks[0].metrics["multi_user"] = summary
+
+    json_path, _ = write_report(report, tmp_path, html=False)
+    saved = json.loads(json_path.read_text())
+    assert saved["requests"][0]["output"] == "partial conversation answer"
+    assert saved["requests"][1]["output"] == ""
 
 
 def test_ready_wait_regression_is_not_hidden_by_short_dispatch_latency():

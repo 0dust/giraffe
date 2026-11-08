@@ -26,8 +26,10 @@ from .caps import (MAX_HTML_PREVIEW_CHARS, MAX_HTML_JSON_PREVIEW_CHARS,
                    MAX_FAILURE_SUMMARY_CHARS)
 from .deployment import deployment_diff, fixture_hash, safe_config, sanitize
 from .report_inputs import input_ref as _input_ref
-from .multi_user_metrics import user_latency
-from .models import (CHECK_NAMES, SHAPES, CheckResult, RequestRecord, RunConfig, RunReport, overall_status, load_shape_label,
+from .multi_user_metrics import (_error as _user_error, _length_mix_differs, _total_generated_tokens,
+                                 _uncached_input_tokens, _valid as _user_valid_completion,
+                                 truncated_conversation_turn, user_delivery_completions, user_latency)
+from .models import (CHECK_NAMES, CORE_CHECKS, SHAPES, CheckResult, RequestRecord, RunConfig, RunReport, overall_status, load_shape_label,
                      migrate_concurrent_load, migrate_run_limits, is_supported_schema, CURRENT_SCHEMA)
 from .stats import median, percentile
 from .storage import DEFAULT_LIMITS, format_size, fsync_directory, update_metadata, write_metadata
@@ -154,6 +156,10 @@ def _comparison_manifest(manifest: dict) -> dict:
     return value
 
 
+_CONVERSATION_REVISIONS = {"persistent_users", "shared_conversations"}
+_CONVERSATION_BRIDGE_CHECKS = {"prefix", "sessions", "consistency"}
+
+
 def _run_limits_workload_identity(manifest: dict, *, revision: str) -> dict | None:
     """Reconstruct only identities whose generator revision is known exactly."""
     raw = manifest.get("config", {})
@@ -164,16 +170,21 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str) -> dict | No
         resolved = RunConfig.model_validate({**config, "max_requests": None, "max_duration_seconds": None})
     except ValidationError:
         return None
-    if revision in {"issue45", "issue95", "issue95_pauses", "issue95_pause_evidence", "persistent_users"}:
+    if revision in {"issue45", "issue95", "issue95_pauses", "issue95_pause_evidence", "persistent_users", "shared_conversations"}:
         unchanged_checks = {"sessions", "consistency"}
-        if revision in {"issue95_pause_evidence", "persistent_users"}:
-            # Multi-user wiring changed the shared file, but prefix requests are
-            # unchanged between these two exact generator revisions.
+        if revision in {"issue95_pause_evidence", "persistent_users", "shared_conversations"}:
+            # User and conversation wiring changed the shared file, but prefix
+            # requests are unchanged across these exact generator revisions.
             unchanged_checks.add("prefix")
+        if revision in _CONVERSATION_REVISIONS:
+            # Core and Tool calling dispatch are unchanged in this refactor.
+            # Load also has a separate source digest below.
+            unchanged_checks.update(CORE_CHECKS, {"tools"})
         if not set(resolved.checks) <= unchanged_checks:
             return None  # Load generators changed; attest unchanged specialists only.
-    if "sessions" in resolved.checks and resolved.sessions and resolved.sessions.sampling is not None:
-        return None  # Sampled traffic has no historical equivalent.
+    sampled_sessions = "sessions" in resolved.checks and resolved.sessions and resolved.sessions.sampling is not None
+    if sampled_sessions and revision not in {"persistent_users", "shared_conversations"}:
+        return None  # Earlier revisions have no attested sampled-traffic equivalent.
     settings = {}
     for field, checks in WORKLOAD_CHECKS.items():
         if not checks.intersection(resolved.checks):
@@ -198,9 +209,17 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str) -> dict | No
             "issue95_pauses": "37bf5c074bfdb19f367e5348b678e5a923977fe7bf013b8c781a43bb8efca19e",
             "issue95_pause_evidence": "ab5875f7c635f8f454429a88aac87d52ce3a141a84bcf7b936fa737ffa41fe83",
             "persistent_users": "aee9ca71bc5ffd780d1574422b761e3177471a12f951a10b04322573ca062f76",
+            "shared_conversations": "d9a9e921584262148e06b636f0e8f195b7e530fd2a69c5e98f013359cf947ede",
         }[revision] if any(settings.values()) else None,
         "settings": settings,
     }
+    if "load" in resolved.checks and revision in _CONVERSATION_REVISIONS:
+        identity["load_test_source_sha256"] = "9b694c97a39d449d8ea15b09a9aeb406bf835179c0882827685c4d7888687d36"
+    if sampled_sessions:
+        identity["session_sampling_source_sha256"] = {
+            "persistent_users": "2fab1370faeab7ddb91a7ae9c0e49520ee9a67e305441a0663877bb12bca24c3",
+            "shared_conversations": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
+        }[revision]
     if "concurrency" in resolved.checks:
         identity["concurrent_load_source_sha256"] = {
             "legacy": "33b66f3784ad9613db082fa1f00a2f3292fc910b9f842bd3fe018340a0fe7aa7",
@@ -222,14 +241,16 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str) -> dict | No
             "issue95_pauses": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
             "issue95_pause_evidence": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
             "persistent_users": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
+            "shared_conversations": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
         }[revision]
     if "tools" in resolved.checks:
         from .tool_checks import resolved_tool_fixtures, resolved_tool_modes
+        tool_conversation_revisions = _CONVERSATION_REVISIONS | {"phase3", "review26", "caps26"}
         identity["resolved_tool_checks"] = {
             "fixtures": [fixture.model_dump(mode="json") for fixture in resolved_tool_fixtures(resolved)],
             "modes": resolved_tool_modes(resolved),
             **({"conversations": [fixture.model_dump(mode="json") for fixture in resolved.tool_checks.conversations],
-                "conversation_source_sha256": ("4080132330b5ceb3d7e0b824bb26244a73967d81ae6b467441600e45c483eb48" if revision in {"phase3", "review26", "caps26"} else
+                "conversation_source_sha256": ("4080132330b5ceb3d7e0b824bb26244a73967d81ae6b467441600e45c483eb48" if revision in tool_conversation_revisions else
                                                "283d1eb18bb852ca0132a2d4a8c63e49bc7155614603e74740dd80afe8189714")}
                if resolved.tool_checks and resolved.tool_checks.conversations else {}),
         }
@@ -239,15 +260,25 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str) -> dict | No
 def _same_run_limits_workload(current: dict, old: dict) -> bool:
     if current.get("config", {}).get("config_version") != 2 or old.get("config", {}).get("config_version", 2) != 2:
         return False
+    matched_revisions = []
     for manifest in (current, old):
-        revisions = ("phase2", "phase3", "review26", "caps26", "issue45", "issue95", "issue95_pauses", "issue95_pause_evidence", "persistent_users") if "config_version" in manifest.get("config", {}) else ("legacy",)
-        identities = [_run_limits_workload_identity(manifest, revision=revision) for revision in revisions]
-        if not any(identity is not None and fixture_hash(identity) == manifest.get("fixture_pack", {}).get("workload_fixture_sha256")
-                   for identity in identities):
+        revisions = ("phase2", "phase3", "review26", "caps26", "issue45", "issue95", "issue95_pauses", "issue95_pause_evidence", "persistent_users", "shared_conversations") if "config_version" in manifest.get("config", {}) else ("legacy",)
+        fingerprint = manifest.get("fixture_pack", {}).get("workload_fixture_sha256")
+        matched = {revision for revision in revisions
+                   if (identity := _run_limits_workload_identity(manifest, revision=revision)) is not None
+                   and fixture_hash(identity) == fingerprint}
+        if not matched:
             return False
+        matched_revisions.append(matched)
     current_config = _comparison_manifest(current)["config"]
     old_config = _comparison_manifest(old)["config"]
     selected = set(current_config.get("checks", [])) | set(old_config.get("checks", []))
+    if not selected <= _CONVERSATION_BRIDGE_CHECKS:
+        # Newly attested companion checks must match the exact conversation
+        # revisions on both reports. Earlier bridges keep their existing scope.
+        if not (all(matches & _CONVERSATION_REVISIONS for matches in matched_revisions)
+                or all(matches - _CONVERSATION_REVISIONS for matches in matched_revisions)):
+            return False
     return all(current_config.get(field) == old_config.get(field)
                for field, checks in WORKLOAD_CHECKS.items() if checks & selected)
 
@@ -486,30 +517,57 @@ def _timing_quality(report, target, records, metrics):
                    legacy_max_lag_ms=report.observations.get("generator_max_lag_ms", 0))
 
 
-def _metric_values(records: list[RequestRecord]) -> dict[str, list[float]]:
-    completed = [r for r in records if r.status == "completed" and r.valid]
+def _valid_completion(record: RequestRecord, check: str | None) -> bool:
+    if check == "multi_user" and record.workload.get("session_id"):
+        return _user_valid_completion(record)
+    return record.status == "completed" and record.valid
+
+
+def _metric_values(records: list[RequestRecord], *, check: str | None = None,
+                   timing_records: dict[str, list[RequestRecord]] | None = None) -> dict[str, list[float]]:
+    valid = [_valid_completion(record, check) for record in records]
+    completed = [record for record, success in zip(records, valid) if success]
     def clock_value(record, arrival_field, dispatch_field):
         if "multi_user" in record.check_ids:
             return user_latency(record, first=dispatch_field == "first_output_ms")
         arrival = (record.load_point or {}).get("pattern") in {"constant", "poisson", "bursts"}
         return getattr(record, arrival_field if arrival else dispatch_field)
+
+    def stream_gap(record):
+        if check == "multi_user" and (record.output_tokens == 0 or record.completion_tokens == 0):
+            return None
+        return record.max_stream_gap_ms
+
+    def timing_values(name, measure):
+        values = []
+        cohort = []
+        for record in completed:
+            if (value := measure(record)) is not None:
+                values.append(value)
+                if timing_records is not None:
+                    cohort.append(record)
+        if timing_records is not None:
+            timing_records[name] = cohort
+        return values
+
+    timing = {
+        "latency_ms": lambda r: clock_value(r, "arrival_elapsed_ms", "elapsed_ms"),
+        "first_output_ms": lambda r: clock_value(r, "arrival_first_output_ms", "first_output_ms"),
+        "max_stream_gap_ms": stream_gap,
+        "output_tokens_per_second": lambda r: _rate(r) if "multi_user" not in r.check_ids else None,
+        "generation_tokens_per_second": lambda r: r.generation_tokens_per_second,
+    }
     return {
-        "valid_completion_rate": [float(r.status == "completed" and r.valid) for r in records],
-        "error_rate": [float(r.status in {"failed", "timeout"}) for r in records],
+        "valid_completion_rate": [float(success) for success in valid],
+        "error_rate": [float(_user_error(r) if check == "multi_user" and r.workload.get("session_id")
+                             else r.status in {"failed", "timeout"}) for r in records],
         "correctness_rate": [float(r.score) for r in records if r.score is not None],
-        "latency_ms": [v for r in completed if (v := clock_value(r, "arrival_elapsed_ms", "elapsed_ms")) is not None],
-        "first_output_ms": [v for r in completed if (v := clock_value(r, "arrival_first_output_ms", "first_output_ms")) is not None],
-        "max_stream_gap_ms": [
-            r.max_stream_gap_ms for r in completed if r.max_stream_gap_ms is not None
-        ],
-        "output_tokens_per_second": [value for r in completed if "multi_user" not in r.check_ids and (value := _rate(r)) is not None],
-        "generation_tokens_per_second": [value for r in completed
-                                         if (value := r.generation_tokens_per_second) is not None],
+        **{name: timing_values(name, measure) for name, measure in timing.items()},
     }
 
 
-def _output_work(records: list[RequestRecord]) -> dict[str, Any]:
-    completed = [r for r in records if r.status == "completed" and r.valid]
+def _output_work(records: list[RequestRecord], *, check: str | None = None) -> dict[str, Any]:
+    completed = [r for r in records if _valid_completion(r, check)]
     tokens = [r.output_tokens for r in completed if r.output_tokens is not None]
     return {
         "valid_completions": len(completed),
@@ -644,6 +702,174 @@ def _load_work_comparison(current, old):
                                - Fraction(counts[1][key], len(paired[1]))) > Fraction(1, 10)
                            for key in counts[0])
     return None, mix_changed
+
+
+def _input_work_changed(current, old, threshold):
+    current_input = median(r.input_tokens for r in current if r.valid)
+    old_input = median(r.input_tokens for r in old if r.valid)
+    return (current_input is not None and old_input is not None and old_input > 0
+            and abs(current_input - old_input)*100/old_input > threshold)
+
+
+def _live_input_work_changed(current, old, threshold, *, compare_output=False):
+    """Match generated history at each repeated conversation's logical turn."""
+    def output_work(record):
+        return record.output_tokens, _total_generated_tokens(record), record.output_chars
+
+    histories = []
+    for records in (current, old):
+        history = {}
+        for record in records:
+            if record.intentional or record.workload.get("mode") != "live":
+                continue
+            sequence, turn = (record.workload.get(key) for key in ("conversation_sequence", "turn_id"))
+            if (type(sequence) is not int or sequence < 1 or type(turn) is not int or turn < 0
+                    or not record.request_hash or record.input_tokens is None or (sequence, turn) in history):
+                return True
+            history[sequence, turn] = record
+        histories.append(history)
+    if not any(histories):
+        return False
+
+    positions = [sorted(history) for history in histories]
+    common = min(map(len, positions))
+    if not common or positions[0][:common] != positions[1][:common]:
+        return True
+    for position in positions[0][:common]:
+        latest, previous = (history[position] for history in histories)
+        if (latest.request_hash != previous.request_hash
+                or abs(latest.input_tokens - previous.input_tokens)*100 > previous.input_tokens*threshold):
+            return True
+        if compare_output and any(latest_size is None or previous_size is None
+                                  or abs(latest_size-previous_size)*100 > previous_size*threshold
+                                  for latest_size, previous_size in zip(output_work(latest), output_work(previous))):
+            return True
+    if len(positions[0]) == len(positions[1]):
+        return False
+
+    # An extra exact-recall repetition has a fresh marker. Other extra turns
+    # need a witnessed repetition of the same history and actual work.
+    def observed_turn(turn, record):
+        return turn, record.fixture_id, record.request_hash, record.input_tokens, output_work(record)
+
+    def completed(record):
+        return _user_valid_completion(record) and None not in output_work(record)
+
+    shorter, longer = sorted(histories, key=len)
+    witnessed = {observed_turn(turn, record) for (_, turn), record in shorter.items() if completed(record)}
+    for (sequence, turn), record in longer.items():
+        if (sequence, turn) in shorter:
+            continue
+        verified_recall = record.workload.get("task_type") == "exact_repeat" and record.score is True
+        if not completed(record) or not (verified_recall or observed_turn(turn, record) in witnessed):
+            return True
+
+    cohorts = []
+    for history in histories:
+        turns = defaultdict(list)
+        for (_, turn), record in history.items():
+            turns[turn].append(record)
+        cohorts.append(turns)
+    if cohorts[0].keys() != cohorts[1].keys():
+        return True
+    measures = (lambda r: r.input_tokens, lambda r: r.output_tokens, _total_generated_tokens)
+    if compare_output:
+        measures += (lambda r: r.output_chars,)
+    for turn in cohorts[0]:
+        for measure in measures:
+            lengths = [[measure(record) for record in turns[turn]] for turns in cohorts]
+            if any(None in values for values in lengths) or _length_mix_differs(lengths, threshold):
+                return True
+    return False
+
+
+def _fixed_generation_work_changed(current, old, threshold):
+    # Fixed fixtures identify logical turns across repetitions. Compare known
+    # totals for each turn so heavier and lighter turns cannot cancel out.
+    cohorts = []
+    for records in (current, old):
+        turns = defaultdict(list)
+        for record in records:
+            if record.workload.get("session_id") and record.workload.get("mode") == "fixed":
+                turns[record.fixture_id].append(_total_generated_tokens(record))
+        cohorts.append(turns)
+    latest, previous = cohorts
+    return any(_length_mix_differs([latest[turn], previous[turn]], threshold)
+               for turn in latest.keys() & previous.keys())
+
+
+def _comparable_user_timing_miss(current, old, user, failed_criteria, threshold):
+    """Qualify a deadline miss against the same turn in the accepted run."""
+    def comparable_attempts():
+        return (not any(_load_work_comparison(current, old))
+                and not _live_input_work_changed(current, old, threshold, compare_output=True))
+
+    def turn_key(record):
+        mode = record.workload.get("mode")
+        sequence = record.workload.get("conversation_sequence")
+        turn = record.workload.get("turn_id")
+        if type(sequence) is int and sequence > 0:
+            if mode == "fixed":
+                # The fixed fixture identifies the turn even in older records.
+                return mode, sequence, record.fixture_id
+            if mode == "live" and type(turn) is int and turn >= 0:
+                return mode, sequence, record.fixture_id, turn
+        return None
+
+    quality = user.get("timing_quality")
+    affected_metrics = quality.get("affected_metrics") if isinstance(quality, dict) else None
+    if not isinstance(affected_metrics, dict):
+        return comparable_attempts()
+
+    previous_turns = defaultdict(list)
+    for record in old:
+        if key := turn_key(record):
+            previous_turns[key].append(record)
+
+    checked_miss = False
+    fallback_miss = False
+    for name, first, metric in (("max_first_answer_ms", True, "first_output_ms"),
+                                ("max_completion_ms", False, "latency_ms")):
+        if name not in failed_criteria:
+            continue
+        criterion = user["criteria"][name]
+        limit = criterion.get("limit")
+        fallback_miss |= bool(criterion.get("pending_breach"))
+        affected_ids = affected_metrics.get(metric)
+        if (type(limit) not in {int, float} or not 0 < limit < math.inf
+                or not isinstance(affected_ids, list) or not all(isinstance(item, str) for item in affected_ids)):
+            fallback_miss = True
+            continue
+        affected = set(affected_ids)
+        for record in current:
+            error = _user_error(record)
+            if not error:
+                if record.status == "cancelled" or record.id in affected:
+                    continue
+                value = user_latency(record, first)
+                if value is None or value <= limit:
+                    continue
+            checked_miss = True
+            key = turn_key(record)
+            if key is None:
+                fallback_miss |= error or not _fixed_generation_work_changed([record], old, threshold)
+                continue
+            previous = previous_turns.get(key, [])
+            if len(previous) != 1 or any(_load_work_comparison([record], previous)):
+                continue
+            if key[0] == "fixed":
+                if (not _input_work_changed([record], previous, threshold)
+                        and (error or not _fixed_generation_work_changed([record], previous, threshold))):
+                    return True
+            elif error and record.input_tokens is None:
+                # An unsuccessful turn can miss the criterion without producing usage.
+                if (record.request_hash and record.request_hash == previous[0].request_hash
+                        and previous[0].input_tokens is not None):
+                    return True
+            elif not _live_input_work_changed([record], previous, threshold, compare_output=not error):
+                return True
+    # Pending admission and legacy summaries can lack an observed turn to match.
+    return (fallback_miss or not checked_miss) and comparable_attempts()
 
 
 def _load_not_delivered(point):
@@ -1073,6 +1299,83 @@ def _user_measurements(report: RunReport, target: str) -> dict[tuple, tuple[dict
             for user in window.get("users", [])}
 
 
+def _user_token_work_changed(current, previous, tolerance):
+    measures = (lambda r: r.input_tokens, lambda r: r.output_tokens, _total_generated_tokens)
+    if any((record.cached_prompt_tokens or 0) > 0 for cohort in (current, previous) for record in cohort):
+        measures += (_uncached_input_tokens,)
+    for measure in measures:
+        lengths = [[measure(record) for record in cohort] for cohort in (current, previous)]
+        if any(not values or None in values for values in lengths):
+            return True
+        medians = [median(values) for values in lengths]
+        if max(medians) > min(medians) * (1 + tolerance / 100) or _length_mix_differs(lengths, tolerance):
+            return True
+    return False
+
+
+def _compare_user_fairness(current, previous, current_records, old_records):
+    """Compare a previously accepted fairness limit on the same observed work."""
+    latest, old = current.get("fairness", {}), previous.get("fairness", {})
+    limit = old.get("threshold")
+    latest_status = latest.get("status")
+    if (current.get("role") or previous.get("role") or limit is None or latest.get("threshold") != limit
+            or old.get("status") != "pass" or old.get("qualified") is not True
+            or latest_status not in {"pass", "fail", "inconclusive"}):
+        return None
+
+    tolerance = old.get("tolerance_percent", 10)
+    compared = set(old.get("compared_user_ids", []))
+    comparable = (latest_status in {"pass", "fail"} and latest.get("qualified") is True
+                  and latest.get("tolerance_percent", 10) == tolerance
+                  and old.get("ratio") is not None and latest.get("ratio") is not None
+                  and len(compared) >= 2 and all(set(fairness.get(field, [])) == compared
+                      for fairness in (latest, old) for field in ("compared_user_ids", "eligible_user_ids")))
+    evidence = []
+    if comparable:
+        latest_users, old_users = ({user["user_id"]: user for user in window["users"]}
+                                   for window in (current, previous))
+        latest_samples, old_samples = ({sample["user_id"]: sample for sample in fairness["users"]}
+                                       for fairness in (latest, old))
+        for user_id in sorted(compared):
+            latest_sample, old_sample = latest_samples.get(user_id, {}), old_samples.get(user_id, {})
+            latest_exposure, old_exposure = (sample.get("active_exposure_ms") for sample in (latest_sample, old_sample))
+            if (not latest_exposure or not old_exposure
+                    or abs(latest_exposure - old_exposure)*100 > min(latest_exposure, old_exposure)*tolerance):
+                comparable = False
+                break
+            cohorts = []
+            for window, user, records, sample in (
+                    (current, latest_users.get(user_id, {}), current_records, latest_sample),
+                    (previous, old_users.get(user_id, {}), old_records, old_sample)):
+                cohort = user_delivery_completions(
+                    [records[rid] for rid in user.get("request_ids", []) if rid in records], window, user_id)
+                if not cohort or len(cohort) != sample.get("valid_samples"):
+                    comparable = False
+                    break
+                cohorts.append(cohort)
+            if not comparable:
+                break
+            if (latest_users[user_id]["profile"] != old_users[user_id]["profile"]
+                    or any(_load_work_comparison(*cohorts)) or _live_input_work_changed(*cohorts, tolerance)
+                    or _user_token_work_changed(*cohorts, tolerance)):
+                comparable = False
+                break
+            evidence.extend(record.id for record in cohorts[0])
+
+    scenario, population = current["scenario"], current["population"]
+    status = latest_status if comparable else "inconclusive"
+    reasons = {"pass": "Observed delivery fairness stayed within the previously accepted threshold.",
+               "fail": "Observed delivery fairness exceeded the previously accepted threshold.",
+               "inconclusive": "Observed fairness work or overlap differs or lacks evidence."}
+    return {"check": "multi_user", "scenario": f"{scenario} / {population}", "population": population,
+            "window_id": current["id"], "metric": "fairness_acceptance", "aggregation": "selected_criteria",
+            "current": latest.get("ratio"), "baseline": old.get("ratio"), "threshold": limit,
+            "current_samples": sum(item.get("valid_samples", 0) for item in latest.get("users", [])),
+            "baseline_samples": sum(item.get("valid_samples", 0) for item in old.get("users", [])),
+            "status": status, "worsening": {"pass": 0, "fail": 100}.get(status),
+            "reason": f"Multi-user fairness at {population} users: {reasons[status]}", "evidence_ids": evidence}
+
+
 def _compare_user_delivery(report, baseline, target, reasons, threshold):
     current, previous = _user_measurements(report, target), _user_measurements(baseline, target)
     rows, incomplete = [], []
@@ -1080,28 +1383,49 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold):
         return rows, incomplete
     current_records = {record.id: record for record in report.requests if record.target == target}
     old_records = {record.id: record for record in baseline.requests if record.target == target}
+    window_pairs = {}
     for key in sorted(current.keys() | previous.keys()):
         scenario, population, profile, user_id = key
         c_window, c = current.get(key, ({}, {}))
         b_window, b = previous.get(key, ({}, {}))
+        if c_window and b_window:
+            window_pairs[c_window["id"], b_window["id"]] = c_window, b_window
         c_rate, b_rate = c.get("output_tokens_per_second"), b.get("output_tokens_per_second")
         current_work = [current_records[rid] for rid in c.get("request_ids", []) if rid in current_records]
         old_work = [old_records[rid] for rid in b.get("request_ids", []) if rid in old_records]
-        work_reason, mix_changed = _load_work_comparison(current_work, old_work)
-        missing = (not c or not b or c.get("coverage", {}).get("status") != "complete"
-                   or b.get("coverage", {}).get("status") != "complete"
-                   or c_rate is None or b_rate is None or work_reason or mix_changed)
+        current_delivery = user_delivery_completions(current_work, c_window, user_id)
+        old_delivery = user_delivery_completions(old_work, b_window, user_id)
+        comparable_work = current_delivery, old_delivery
+        complete = all(user.get("coverage", {}).get("status") == "complete" for user in (c, b))
+        drain_comparison = False
+        if complete and c_rate is not None and b_rate is not None and (
+                (c_rate == 0 and not current_delivery) or (b_rate == 0 and not old_delivery)):
+            # A measured zero can have no in-window completions. Match the
+            # actual admitted work only when it all finished successfully.
+            drained = tuple(user_delivery_completions(work, window, user_id, include_drain=True)
+                            for work, window in ((current_work, c_window), (old_work, b_window)))
+            if all(cohort and len(cohort) == user.get("outcomes", {}).get("attempted")
+                   for cohort, user in zip(drained, (c, b))):
+                comparable_work = drained
+                drain_comparison = True
+        work_reason, mix_changed = _load_work_comparison(*comparable_work)
+        if drain_comparison and _user_token_work_changed(*comparable_work, threshold):
+            work_reason = "Observed work including drained requests differs or lacks token evidence."
+        live_work_changed = _live_input_work_changed(*comparable_work, threshold, compare_output=True)
+        missing = (not complete
+                   or c_rate is None or b_rate is None or work_reason or mix_changed or live_work_changed)
         row = {"check": "multi_user", "scenario": " / ".join(map(str, key)),
                "user_id": user_id, "population": population, "profile": profile,
                "window_id": c_window.get("id", b_window.get("id")),
                "metric": "shared_window_output_tokens_per_second", "aggregation": "common_window",
                "current": c_rate, "baseline": b_rate, "status": "inconclusive",
-               "current_samples": c.get("outcomes", {}).get("valid_completed", 0),
-               "baseline_samples": b.get("outcomes", {}).get("valid_completed", 0),
-               "threshold": threshold, "change_unit": "percent", "evidence_ids": c.get("request_ids", []),
+               "current_samples": len(current_delivery), "baseline_samples": len(old_delivery),
+               "threshold": threshold, "change_unit": "percent",
+               "evidence_ids": [record.id for record in (current_delivery or comparable_work[0])],
                "method": "Observed completed-output delivery over matching common windows; no cross-run confidence interval."}
         if missing:
             detail = (work_reason or "Requested work proportions differ." if mix_changed or work_reason else
+                      "Observed work or live generated histories differ or lack evidence." if live_work_changed else
                       "Missing or incomplete shared-window coverage.")
             message = f"Multi-user {user_id} at {population} users: {detail}"
             row["reason"] = message
@@ -1117,11 +1441,37 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold):
                        reason="Observed shared-window delivery decreased beyond the selected threshold."
                               if worsening > threshold else "No material shared-window delivery decrease observed.")
         rows.append(row)
-        if c.get("status") == "fail" and b.get("status") == "pass" and not work_reason and not mix_changed:
-            rows.append({**row, "metric": "user_acceptance", "status": "fail",
-                         "current": "fail", "baseline": "pass", "aggregation": "selected_criteria",
-                         "worsening": 100, "reason": "This previously accepted user now fails its selected criteria.",
-                         "observed_change": None, "observed_delta": None})
+        if c.get("status") == "fail" and b.get("status") == "pass":
+            # Acceptance also includes attempts that drain after delivery closes.
+            current_attempts = [record for record in current_work if not record.intentional]
+            old_attempts = [record for record in old_work if not record.intentional]
+            failed_criteria = {name for name, criterion in c.get("criteria", {}).items()
+                               if criterion.get("status") == "fail"}
+            delivery_failure = "min_output_tokens_per_second" in failed_criteria and not missing
+            attempt_failure = (not failed_criteria or "max_error_percent" in failed_criteria) and not (
+                any(_load_work_comparison(current_attempts, old_attempts))
+                or _live_input_work_changed(current_attempts, old_attempts, threshold))
+            failed_timing = failed_criteria & {"max_first_answer_ms", "max_completion_ms"}
+            timing_failure = failed_timing and _comparable_user_timing_miss(
+                current_attempts, old_attempts, c, failed_timing, threshold)
+            acceptance = {**row, "metric": "user_acceptance", "current": "fail", "baseline": "pass",
+                          "aggregation": "selected_criteria", "observed_change": None, "observed_delta": None,
+                          "current_samples": len(current_attempts), "baseline_samples": len(old_attempts),
+                          "evidence_ids": [record.id for record in current_attempts]}
+            if not (delivery_failure or attempt_failure or timing_failure):
+                reason = (f"Multi-user {user_id} at {population} users: Work behind the selected "
+                          "acceptance criteria differs or lacks evidence.")
+                incomplete.append(reason)
+                acceptance.update(status="inconclusive", worsening=None, reason=reason)
+            else:
+                acceptance.update(status="fail", worsening=100,
+                                  reason="This previously accepted user now fails its selected criteria.")
+            rows.append(acceptance)
+    for c_window, b_window in window_pairs.values():
+        if row := _compare_user_fairness(c_window, b_window, current_records, old_records):
+            rows.append(row)
+            if row["status"] == "inconclusive":
+                incomplete.append(row["reason"])
     return rows, incomplete
 
 
@@ -1237,6 +1587,9 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                     continue
                 current_records = current_groups.get((check, scenario), [])
                 old_records = old_groups.get((check, scenario), [])
+                record_cohorts = current_records, old_records
+                conversation_user = check == "multi_user" and any(
+                    r.workload.get("session_id") for cohort in record_cohorts for r in cohort)
                 point_records = current_records or old_records
                 load_point = ({field: point_records[0].load_point.get(field) for field in (*_LOAD_POINT_FIELDS, "point_id")}
                               if check == "load" and point_records else None)
@@ -1259,44 +1612,85 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                                      "status": "inconclusive", "reason": "Missing or different request shapes or proportions.",
                                      "current_samples": len(current_records), "baseline_samples": len(old_records),
                                      "evidence_ids": [record.id for record in current_records]})
-                    continue
+                    # Conversation timing can still match even when attempts differ.
+                    if not conversation_user:
+                        continue
                 if load_point:
                     current_mix = current_shares.get(current_records[0].load_point.get("point_id"), {})
                     old_mix = old_shares.get(old_records[0].load_point.get("point_id"), {})
                     mix_changed |= any(abs(current_mix.get(shape, 0) - old_mix.get(shape, 0)) > Fraction(1, 10)
                                        for shape in current_mix.keys() | old_mix.keys())
-                current_metrics, old_metrics = _metric_values(current_records), _metric_values(old_records)
-                current_work, old_work = _output_work(current_records), _output_work(old_records)
-                outputs = _output_observations(check, scenario, current_work, old_work)
-                if load_point:
-                    for output in outputs:
-                        output["load_point"] = load_point
-                observed_outputs.extend(outputs)
+                current_timing, old_timing = {}, {}
+                current_metrics = _metric_values(current_records, check=check,
+                                                 timing_records=current_timing if conversation_user else None)
+                old_metrics = _metric_values(old_records, check=check,
+                                             timing_records=old_timing if conversation_user else None)
+                current_work, old_work = (_output_work(records, check=check) for records in record_cohorts)
+                if not work_reason:
+                    outputs = _output_observations(check, scenario, current_work, old_work)
+                    if load_point:
+                        for output in outputs:
+                            output["load_point"] = load_point
+                    observed_outputs.extend(outputs)
                 different_work = _different_output_work(current_work, old_work, threshold)
-                current_inputs = [r.input_tokens for r in current_records if r.valid and r.input_tokens is not None]
-                old_inputs = [r.input_tokens for r in old_records if r.valid and r.input_tokens is not None]
-                input_work_changed = bool(current_inputs and old_inputs and median(old_inputs)>0 and abs(median(current_inputs)-median(old_inputs))*100/median(old_inputs)>threshold)
-                live_inputs_differ = any(r.workload.get("mode")=="live" for r in current_records) and Counter(r.request_hash for r in current_records) != Counter(r.request_hash for r in old_records)
+                live_inputs_differ = live_output_differs = False
+                if check == "multi_user" and not conversation_user:
+                    completions = tuple([r for r in cohort if _valid_completion(r, check)]
+                                        for cohort in record_cohorts)
+                    live_inputs_differ = _live_input_work_changed(*completions, threshold)
+                    live_output_differs = (not live_inputs_differ and _live_input_work_changed(
+                        *completions, threshold, compare_output=True))
+                elif check != "multi_user":
+                    live_inputs_differ = (any(r.workload.get("mode") == "live" for r in current_records)
+                                          and Counter(r.request_hash for r in current_records)
+                                          != Counter(r.request_hash for r in old_records))
+                input_work_changed = _input_work_changed(*record_cohorts, threshold)
                 for metric, values in current_metrics.items():
-                    if not values and not old_metrics[metric]:
+                    measured_conversation = conversation_user and metric in TIMING_METRICS
+                    if (work_reason and not measured_conversation) or (not values and not old_metrics[metric]):
                         continue
                     row = _compare_metric(metric, values, old_metrics[metric],
                                           1 if check == "access" and metric in {"valid_completion_rate", "error_rate"} else minimum,
                                           threshold, rate_threshold=rate_threshold)
+                    current_samples, old_samples = record_cohorts
+                    current_output, old_output = current_work, old_work
+                    metric_work_reason, metric_mix_changed = None, mix_changed
+                    metric_input_changed, metric_output_changed = input_work_changed, different_work
+                    metric_live_inputs, metric_live_output = live_inputs_differ, live_output_differs
+                    metric_fixed_output = False
+                    if measured_conversation:
+                        current_samples, old_samples = current_timing[metric], old_timing[metric]
+                        metric_work_reason, metric_mix_changed = (
+                            _load_work_comparison(current_samples, old_samples)
+                            if current_samples and old_samples else (None, False))
+                        current_output = _output_work(current_samples, check=check)
+                        old_output = _output_work(old_samples, check=check)
+                        metric_input_changed = _input_work_changed(current_samples, old_samples, threshold)
+                        metric_output_changed = _different_output_work(current_output, old_output, threshold)
+                        metric_live_inputs = _live_input_work_changed(current_samples, old_samples, threshold)
+                        metric_live_output = (not metric_live_inputs and _live_input_work_changed(
+                            current_samples, old_samples, threshold, compare_output=True))
+                        metric_fixed_output = _fixed_generation_work_changed(current_samples, old_samples, threshold)
                     warnings = []
                     initial_uncertainty = row["reason"] if row["status"] == "inconclusive" else None
                     def warn(code, message, *, preserve_failure=False):
                         warnings.append({"code": code, "message": message})
                         if not preserve_failure or row["status"] != "fail":
                             row["status"] = "inconclusive"
-                    if (input_work_changed or live_inputs_differ) and metric in {"latency_ms", "first_output_ms", "max_stream_gap_ms", "output_tokens_per_second", "generation_tokens_per_second"}:
+                    if (metric_input_changed or metric_live_inputs) and metric in TIMING_METRICS:
                         warn("input_work_changed", "Observed input work or live generated histories differ; timing is not like-for-like.")
-                    if different_work and metric in {"latency_ms", "max_stream_gap_ms", "output_tokens_per_second", "generation_tokens_per_second"}:
+                    if metric_live_output and metric in TIMING_METRICS:
+                        warn("output_work_changed", "Observed generated work differs at matching live conversation turns; timing is not like-for-like.")
+                    elif metric_fixed_output:
+                        warn("output_work_changed", "Observed total generation differs at matching fixed conversation turns. Timing requires comparable generated work.")
+                    elif metric_output_changed and metric in {"latency_ms", "max_stream_gap_ms", "output_tokens_per_second", "generation_tokens_per_second"}:
                         warn("output_work_changed", "Actual generated output lengths differ materially: "
-                             f"median {old_work['reported_output_tokens_p50']} → {current_work['reported_output_tokens_p50']} tokens "
-                             f"and {old_work['output_chars_p50']} → {current_work['output_chars_p50']} characters. "
+                             f"median {old_output['reported_output_tokens_p50']} → {current_output['reported_output_tokens_p50']} tokens "
+                             f"and {old_output['output_chars_p50']} → {current_output['output_chars_p50']} characters. "
                              "These timings include different amounts of generated work; this does not establish a speed improvement or regression.")
-                    if mix_changed:
+                    if metric_work_reason:
+                        warn("requested_work_changed", metric_work_reason)
+                    if metric_mix_changed:
                         warn("request_mix_changed", "Request work identity shares differ by more than 10 percentage points; observed aggregate values reflect different request mixes.")
                     if metric in TIMING_METRICS:
                         if load_point:
@@ -1309,8 +1703,8 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                                         detail = point.get("concurrency_reason") or point.get("reason") or "Client occupancy or stream concurrency evidence is insufficient."
                                         message = f"{label} requested concurrency was not delivered or evidenced; {detail} Server queueing is not established."
                                     warn("load_not_delivered", message, preserve_failure=label == "Current")
-                        quality = {"Current": _timing_quality(report, name, current_records, (metric,)),
-                                   "Baseline": _timing_quality(baseline, name, old_records, (metric,))}
+                        quality = {"Current": _timing_quality(report, name, current_samples, (metric,)),
+                                   "Baseline": _timing_quality(baseline, name, old_samples, (metric,))}
                         delayed_runs = [label for label, item in quality.items() if item["status"] == "client_delayed"]
                         row["timing_quality"] = quality
                         if delayed_runs:
@@ -1342,8 +1736,8 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                         row["reason"] = " ".join(warning["message"] for warning in warnings)
                     row["warnings"] = warnings
                     row.update(check=check, scenario=scenario,
-                               output_work={"current": current_work, "baseline": old_work},
-                               evidence_ids=[record.id for record in current_records])
+                               output_work={"current": current_output, "baseline": old_output},
+                               evidence_ids=[record.id for record in current_samples])
                     if load_point:
                         row["load_point"] = load_point
                     if check == "multi_user":
@@ -1501,8 +1895,17 @@ def _retained(report: RunReport) -> RunReport:
         keep = policy == "all" or (policy == "failures" and (
             (record.status in {"failed", "timeout"} and record.scenario not in {"client_cancel", "client_deadline"})
             or (record.status == "completed" and not record.valid) or record.score is False
+            or ("multi_user" in record.check_ids and truncated_conversation_turn(record))
             or record.evaluation_error is not None or record.id in failed_evidence
         ))
+        if (policy != "all" and "multi_user" in record.check_ids
+                and record.workload.get("session_id") and record.workload.get("mode") == "live"
+                and record.evaluation and any(message.get("role") == "assistant"
+                    for message in record.evaluation.messages)):
+            # Prior replies are response bodies even when copied into later inputs.
+            record = record.model_copy(update={"evaluation": record.evaluation.model_copy(update={
+                "messages": [{**message, "content": ""} if message.get("role") == "assistant" else message
+                             for message in record.evaluation.messages]})})
         result.requests.append(record if keep else _without_response(record))
     from .performance import refresh_performance
     return refresh_performance(result)
@@ -1780,7 +2183,8 @@ def _duration_ms(value: float) -> str:
 
 
 def _badge(status: str) -> str:
-    return f'<span class="badge {_e(status)}">{_e(status)}</span>'
+    label = "Not applicable" if status == "not_applicable" else status
+    return f'<span class="badge {_e(status)}">{_e(label)}</span>'
 
 
 def _rps(value: float | None) -> str:
@@ -1878,9 +2282,9 @@ def _multi_user_export(data: dict[str, Any]) -> dict[str, Any]:
         "output_tokens_per_second", "late_output_tokens", "late_missing_usage_count", "late_completed",
         "partial_output_tokens", "partial_missing_usage_count", "cancelled_output_tokens",
         "cancelled_missing_usage_count", "latency", "lengths", "finish_reasons", "pending_wait",
-        "coverage", "criteria", "timing_quality", "stop_reason")
+        "coverage", "criteria", "timing_quality", "stop_reason", "conversations", "think_time_plan")
     window_fields = ("id", "scenario", "population", "phase", "start_ms", "end_ms", "planned_end_ms",
-        "duration_seconds", "planned_duration_seconds", "drain_seconds", "cut_short", "reason", "drain_reason", "status")
+        "duration_seconds", "planned_duration_seconds", "drain_seconds", "cut_short", "reason", "drain_reason", "status", "fairness")
     value = {key: data.get(key) for key in ("version", "window_policy", "settings", "population",
                                           "status", "worst_user", "interpretation")}
     value["windows"] = [{**{key: window.get(key) for key in window_fields},
@@ -1907,6 +2311,13 @@ def _multi_user_html(data: dict[str, Any], anchors: dict[str, str]) -> str:
         if window.get("phase") != "measurement":
             parts.append('<p>Warmup is excluded from per-user acceptance and delivered throughput.</p>')
             continue
+        fairness = window.get("fairness")
+        if fairness:
+            parts.append(f'<p><strong>Observed delivery fairness</strong> {_badge(fairness["status"])} · '
+                f'median / worst ratio: {_number(fairness.get("ratio"))}; limit: {_number(fairness.get("threshold"))}. '
+                f'Eligible users: {_e(", ".join(fairness.get("eligible_user_ids", [])) or "None")} / '
+                f'{len(fairness.get("compared_user_ids", []))} compared.</p>'
+                f'<p>{_e(" ".join(fairness.get("reasons", [])))}</p>')
         parts.append('<div class="table"><table><tr><th>User / profile</th><th>Outcome</th>'
                      '<th>Completed / sent / errors</th><th>Shared-window tok/s</th>'
                      '<th>Ready-to-first / completion p95 ms</th><th>Coverage / requests</th></tr>')
@@ -1914,6 +2325,12 @@ def _multi_user_html(data: dict[str, Any], anchors: dict[str, str]) -> str:
             outcome, latency = user.get("outcomes", {}), user.get("latency", {})
             links = ' '.join(f'<a href="#{anchors[rid]}">{_e(rid)}</a>'
                              for rid in user.get("request_ids", []) if rid in anchors)
+            for item in user.get("conversations", []):
+                links += (f'<p>{_e(item["id"])} · {_e(item["mode"])} · '
+                          f'{len(item["turns"])} / {item["planned_turns"]} turns. '
+                          f'{_e(item.get("stop_reason") or "Completed")}</p>' + ' '.join(
+                          f'<a href="#{anchors[rid]}">Turn {turn + 1}</a>'
+                          for turn, rid in enumerate(item["turns"]) if rid in anchors))
             pending = user.get("pending_wait")
             notes = " ".join(user.get("reasons", []) + user.get("coverage", {}).get("reasons", []))
             if pending:

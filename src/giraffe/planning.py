@@ -1093,7 +1093,8 @@ def request_plan(config: RunConfig | ConfigDraft, *,
             add(f"multi_user_{level}", None,
                 f"{level} persistent users share the run request slots for {settings.duration_seconds:g} s"
                 f" after {settings.warmup_seconds:g} s warmup; each request drains within its ordinary timeout.",
-                source="generated token-target prompts", kind="duration", title=f"Multi-user · {level} users")
+                source="isolated conversations" if settings.conversations else "generated token-target prompts",
+                kind="duration", title=f"Multi-user · {level} users")
             rows[-1].update(users=level, simultaneous_limit=config.concurrency,
                             configured_seconds=settings.duration_seconds + settings.warmup_seconds)
     if "sessions" in selected:
