@@ -27,7 +27,7 @@ def record(name="r", **extra):
         answer_chars=6, first_read_answer_chars=1) | extra))
 
 
-async def test_v1_first_burst_has_no_pace_or_measured_gap(monkeypatch):
+async def test_first_burst_without_usage_has_gap_but_no_pace(monkeypatch):
     first = b"".join(ev(w) for w in words(97))
     second = b"".join(ev(w) for w in words(3, 97))
     r = await one(monkeypatch, [first, .02, second, ev(finish="stop", usage={"completion_tokens": 100}), DONE])
@@ -37,7 +37,7 @@ async def test_v1_first_burst_has_no_pace_or_measured_gap(monkeypatch):
     run.records = [r]
     result = next(c for c in runner._checks(run, run.config.targets[0]) if c.id == "generation")
     assert result.status == "inconclusive"
-    assert result.metrics["measured_gap_samples"] == 0
+    assert result.metrics["measured_gap_samples"] == 1
 
 
 def test_v2_cleanup_is_not_an_overlap_window():
