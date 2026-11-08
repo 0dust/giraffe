@@ -55,6 +55,18 @@ def test_equal_delivered_tokens_use_common_window_not_individual_activity():
     assert source == before
 
 
+def test_local_preparation_failure_does_not_cover_a_missing_dispatched_record():
+    failed = record("user-01", status="failed", valid=False, dispatch_ms=None, timing_start_ms=None,
+                    error="request could not be prepared (ValueError)")
+    source = observation([failed], users=("user-01",))
+    user = row(summarize(source, [failed]))
+    assert user["outcomes"]["errors"] == 1
+    assert user["outcomes"]["missing_terminal"] == 1
+    assert user["criteria"]["max_error_percent"]["denominator"] == 2
+    assert user["criteria"]["max_error_percent"]["unknown"] == 1
+    assert user["latency"]["client_wait_ms"]["max"] is None
+
+
 def test_failure_during_drain_survives_healthy_peers_and_incomplete_window():
     records = [record("user-01", identity=f"ok-{i}", dispatch=i*80, end=i*80+50)
                for i in range(99)]
