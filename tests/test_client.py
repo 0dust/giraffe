@@ -14,6 +14,18 @@ def spec(**changes):
     )
 
 
+async def test_ordinary_nonstream_json_keeps_existing_duplicate_member_handling(monkeypatch):
+    body = (b'{"error":{"type":"upstream_failure"},"error":null,'
+            b'"choices":[{"message":{"role":"assistant","content":"42"},"finish_reason":"stop"}]}')
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, content=body)), **kw))
+    target = Target(name="local", url="http://local", model="test")
+    async with LLMClient(target, RunConfig(targets=[target])) as client:
+        record = await client.execute(spec(stream=False))
+    assert record.valid and record.output == "42"
+
+
 @pytest.mark.parametrize("route", ["direct", "configured_proxy", "environment_proxy"])
 async def test_noisy_neighbor_upload_evidence_requires_origin_form(route, monkeypatch):
     import threading
@@ -305,6 +317,31 @@ async def test_first_answer_waits_for_reasoning_and_excludes_trailing_stall(monk
     assert result.first_reasoning_ms < result.first_output_ms
     assert result.max_stream_gap_ms is None
     assert result.output == "42" and result.reasoning == "thinking"
+
+
+async def test_ordinary_stream_preserves_reasoning_after_finish(monkeypatch):
+    client, _, _ = setup_client(monkeypatch, [
+        event("42"), event(finish="stop"),
+        b'data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":5}}\n\n',
+        event(reasoning="late reasoning"), b"data: [DONE]\n\n",
+    ])
+    async with client:
+        result = await client.execute(spec())
+    assert result.valid and result.reasoning == "late reasoning"
+
+
+@pytest.mark.parametrize("inline", [False, True])
+@pytest.mark.parametrize("completion", [0, 3])
+async def test_reasoning_without_breakdown_preserves_zero_completion_usage(monkeypatch, inline, completion):
+    client, _, _ = setup_client(monkeypatch, [
+        event("<think>thinking</think>42" if inline else "42",
+              reasoning=None if inline else "thinking"),
+        event(finish="stop", usage={"completion_tokens": completion}), b"data: [DONE]\n\n",
+    ])
+    async with client:
+        result = await client.execute(spec())
+    assert result.valid and result.completion_tokens == completion
+    assert result.output_tokens == (0 if completion == 0 else None)
 
 
 async def test_generation_timing_ends_at_answer_not_finish_or_usage(monkeypatch):

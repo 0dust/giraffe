@@ -20,6 +20,7 @@ from giraffe.caps import (MAX_PLANNED_ARRIVALS, MAX_REQUEST_PACK_BYTES, MAX_REQU
 from giraffe.request_pack import INPUT_RETENTION_NOTICE, pack_settings
 
 CHECK_DESCRIPTIONS = {
+    "gateway_attribution": "Does read-only gateway evidence attribute marked request and token usage to each test identity?",
     "scale_down": "Do active answers survive an external replica removal, and can surviving replicas serve continued traffic?",
     "access": "Can Giraffe connect to your server and get an answer?",
     "serving": "Does the server return complete, valid answers without errors?",
@@ -41,6 +42,7 @@ CHECK_DESCRIPTIONS = {
 }
 
 CHECK_DETAILS = {
+    "gateway_attribution": "Opt-in LiteLLM spend-log checks using existing identity and observer credential references. Requests carry generated correlation markers. Missing, delayed, truncated or ambiguous evidence is inconclusive. Shared aggregate counters do not prove attribution. No gateway settings are changed.",
     "scale_down": "Runs a streaming cohort and continuous bounded follow-up traffic around one externally marked removal. Reports continuity, backend draining and remaining capacity separately. Backend lifecycle evidence is required to confirm removal; missing attribution or incomplete coverage remains inconclusive. Giraffe never removes replicas.",
     "access": "Sends ordinary inference through your endpoint, network and authentication settings. Connect timeout is min(request_timeout_seconds * 0.9, 10) seconds, inside the request deadline. Connection, TLS, proxy and unsupported-protocol errors and HTTP 401/403 identify transport or authentication failures. Interrupted ordinary requests leave the check inconclusive. Capacity and sustained traffic are exempt; other stress traffic exempts timeouts/cancellation but keeps real transport failures.",
     "serving": "Checks ordinary requests for server errors, empty final answers, invalid formats, unfinished streams and timeouts. Length-finished empty output needs reasoning text, stripped inline reasoning or positive reasoning-token usage to qualify as budget exhaustion; otherwise it fails. Reasoning that exhausts the output budget without an answer is counted separately as reasoning_budget_exhausted, excluded from error_rate, and makes serving inconclusive; raise max_output_tokens. Run stops leave interrupted checks inconclusive. Capacity and sustained stages are exempt; other stress traffic exempts timeouts and intentional cancellation, while genuine HTTP/protocol failures still count.",
@@ -61,7 +63,11 @@ CHECK_DETAILS = {
     "tools": "Checks response protocol, configured tool names and arguments, and optional assistant text requirements separately. Parallel calls match as an unordered multiset and conversation results use matched call IDs. Empty argument text means an empty object, except an empty last call cut off by the output limit remains unverified. Only final answer text satisfies content expectations; unclosed reasoning is inconclusive. Output truncation, including partial JSON numbers, is inconclusive unless complete calls independently violate the contract. Giraffe does not execute tools.",
 }
 
-CHECK_DESCRIPTIONS["multi_user"] = "Repeated independent users sharing the request limit."
+CHECK_DESCRIPTIONS["multi_user"] = "Persistent users, arrivals, bursts and recovery sharing the request limit."
+CHECK_DESCRIPTIONS["gateway_access"] = "Do the supplied gateway identities match declared allow and deny policies?"
+CHECK_DETAILS["gateway_access"] = "Opt-in LiteLLM chat-completion probes use explicit test identity references. Valid completions and recognized gateway authentication/model-access errors qualify allow/deny observations. Transport failures, unsupported errors and incomplete matrices remain unverified. No keys or permissions are changed; these cases do not certify tenant isolation."
+CHECK_DESCRIPTIONS["gateway_policy"] = "Does an explicitly declared quota or priority reservation reject one identity while peers continue?"
+CHECK_DETAILS["gateway_policy"] = "Opt-in LiteLLM key RPM and dynamic RPM reservation probes. Uses existing test identities, bounded request counts and an explicit policy window. Keeps rejected requests and peer outcomes. Missing provenance, actual work or overlap leaves priority unverified; timing differences never establish priority enforcement. Does not change gateway configuration."
 CHECK_DETAILS["multi_user"] = "Keeps each simulated user across repeated requests and population levels. Users pause without holding request slots. All users share the run budgets; per-user results use an explicit common measurement window, with warmup and late completions shown separately."
 
 CHECK_DESCRIPTIONS["load"] = "Workloads, request rates and bursts in one place."

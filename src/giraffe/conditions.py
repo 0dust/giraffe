@@ -12,6 +12,9 @@ from typing import Any
 
 
 _SCENARIOS = {
+    "gateway_access": ("Gateway access policy", "gateway_access"),
+    "gateway_policy": ("Gateway policy", "gateway_policy"),
+    "gateway_attribution": ("Gateway usage attribution", "gateway_attribution"),
     "scale_down_baseline": ("Scale-down baseline", "scale_down"),
     "scale_down_long": ("Active answers during removal", "scale_down"),
     "scale_down_followup": ("Traffic during and after removal", "scale_down"),
@@ -110,6 +113,11 @@ def condition_display_name(scenario: str, workload: Mapping[str, Any] | None = N
         elif prompt := re.fullmatch(r"consistency_.+_p(\d+)", scenario):
             label += f" · prompt {int(prompt[1]) + 1}"
     return label
+
+
+def scheduled_multi_user_window(scenario: str | None) -> bool:
+    return isinstance(scenario, str) and re.fullmatch(
+        r"multi_user_\d+_(?:arrivals|recovery_(?:control|sustained|lighter))", scenario) is not None
 
 
 def _identity(scenario: str, workload: Mapping[str, Any] | None = None) -> dict[str, Any]:
@@ -211,6 +219,9 @@ def _identity(scenario: str, workload: Mapping[str, Any] | None = None) -> dict[
 
 
 _PURPOSES = {
+    "gateway_access": "Compares declared allow and deny cases with recognized gateway responses.",
+    "gateway_policy": "Observes declared identity quotas or priority reservations and continued peer service.",
+    "gateway_attribution": "Compares marked identity requests with read-only gateway token attribution.",
     "multi_user": "Measures each persistent user over the same window while sharing request slots.",
     "scale_down": "Observe active answers and continued traffic across one external replica removal.",
     "load": "Measures selected request shapes under maintained concurrency, arrivals or bursts; compares delivery and per-response criteria.",
@@ -342,6 +353,7 @@ def planned_conditions(config: Any) -> list[dict[str, Any]]:
     Setup, calibration and warm-up remain request/check evidence only.
     """
     from .fixtures import builtin_fixtures
+    from .gateway_access import eligible_probe_count
     from .load_test import scheduled_count, settings_sets, test_points
     from .logprob_workload import corpus_width, sample_count
     from .planning import request_plan
@@ -350,6 +362,12 @@ def planned_conditions(config: Any) -> list[dict[str, Any]]:
 
     selected = set(config.checks)
     scenarios: dict[str, dict[str, Any]] = {}
+
+    def waiting(condition, planned, kind):
+        return {"condition": condition, "planned": planned, "planned_condition": True,
+            "planned_kind": kind if planned is not None else "unknown", "status": "waiting",
+            "sent": 0, "started": 0, "running": 0, "completed": 0, "failed": 0,
+            "not_sent": planned, "reason": None, "request_statuses": {}}
 
     def add(scenario, planned=None, kind="unknown", workload=None):
         condition = condition_for(scenario, workload, config)
@@ -360,10 +378,7 @@ def planned_conditions(config: Any) -> list[dict[str, Any]]:
                 previous["planned"] += planned
                 previous["not_sent"] = previous["planned"]
             return
-        scenarios[key] = {"condition": condition, "planned": planned, "planned_condition": True,
-            "planned_kind": kind if planned is not None else "unknown", "status": "waiting",
-            "sent": 0, "started": 0, "running": 0, "completed": 0, "failed": 0,
-            "not_sent": planned, "reason": None, "request_statuses": {}}
+        scenarios[key] = waiting(condition, planned, kind)
 
     # The request preview already accounts for shared initial work and finite
     # core batches; only rows that actually have a meaningful executor scenario
@@ -446,6 +461,13 @@ def planned_conditions(config: Any) -> list[dict[str, Any]]:
     if "arrivals" in selected and config.arrivals:
         add("arrival", config.arrivals.requests, "exact",
             {"requests_per_second": config.arrivals.requests_per_second})
+    if "multi_user" in selected and config.multi_user:
+        from .multi_user import _planned_observation
+
+        for window in _planned_observation(config.multi_user, include_offers=False)["windows"]:
+            if "scheduled_offers" in window:
+                add(window["id"], window["scheduled_offers"], "exact",
+                    {"population": window["population"], "phase": window["phase"]})
     if "sessions" in selected and config.sessions:
         settings = config.sessions
         count = (sum(len(item.turns) for item in workload_plan(settings.workloads, settings.sessions))
@@ -472,9 +494,14 @@ def planned_conditions(config: Any) -> list[dict[str, Any]]:
                 prefix = f"tools_{fixture.fixture_id}" if custom else "tools"
                 for mode in resolved_tool_modes(config):
                     add(f"{prefix}_{choice}_{mode}", 1, "exact")
-    return [condition_aggregate({"target": target.name, **summary})
-            for target in config.targets for summary in scenarios.values()
-            if summary["condition"]["check"] != "scale_down" or target.name == config.scale_down.target]
+    rows = []
+    for target in config.targets:
+        rows.extend(condition_aggregate({"target": target.name, **summary}) for summary in scenarios.values()
+                    if summary["condition"]["check"] != "scale_down" or target.name == config.scale_down.target)
+        if count := eligible_probe_count(config, target):
+            condition = condition_for("gateway_access", config=config)
+            rows.append(condition_aggregate({"target": target.name, **waiting(condition, count, "exact")}))
+    return rows
 
 
 def request_status(record: Mapping[str, Any]) -> str:
@@ -531,7 +558,7 @@ def condition_aggregate(summary: Mapping[str, Any], *, verdict: str | None = Non
     not_started = max(0, planned - started) if planned is not None else None
     reason = summary.get("reason")
     terminal = summary.get("status") not in {"waiting", "running"}
-    explicit = verdict or (summary.get("load_point_result") or {}).get("status")
+    explicit = verdict or summary.get("condition_verdict") or (summary.get("load_point_result") or {}).get("status")
     if running or not terminal and summary.get("status") == "running":
         status = "running"
     elif not terminal:
@@ -539,6 +566,8 @@ def condition_aggregate(summary: Mapping[str, Any], *, verdict: str | None = Non
     elif not started and ((summary.get("load_point_result") or {}).get("status") == "skipped"
                          or (summary.get("load_point_result") or {}).get("input_not_calibrated")):
         status = "skipped"
+    elif explicit in {"pending", "measured"}:
+        status = "inconclusive"
     elif explicit in {"pass", "fail", "inconclusive", "blocked", "skipped"}:
         status = {"pass": "passed", "fail": "failed", "blocked": "inconclusive"}.get(explicit, explicit)
     elif failed:
@@ -616,6 +645,24 @@ def aggregate_conditions(report: Any) -> list[dict[str, Any]]:
         for summary in observation.get("conditions", []):
             condition = summary.get("condition") or {}
             groups[target, condition.get("id")] = {**summary, "target": target}
+    check_rows = [plain(check) for check in checks]
+    verdicts = _condition_verdicts(check_rows)
+    for check in check_rows:
+        target = check.get("target")
+        metrics = check.get("metrics") or {}
+        for window in (metrics.get("multi_user") or {}).get("windows", []):
+            identifier = window.get("id")
+            if not scheduled_multi_user_window(identifier):
+                continue
+            planned = window.get("scheduled_offers", (window.get("offer_accounting") or {}).get("planned"))
+            if planned is None:
+                continue
+            key = target, identifier
+            summary = groups.setdefault(key, {"target": target, "condition": condition_for(identifier, window),
+                                              "status": "finished", "reason": window.get("reason")})
+            summary.update(planned=planned, planned_kind="exact", planned_condition=True)
+            if window.get("status"):
+                verdicts[key] = window["status"]
     counts = {}
     for item in records:
         record = plain(item)
@@ -627,8 +674,6 @@ def aggregate_conditions(report: Any) -> list[dict[str, Any]]:
         status = request_status(record)
         statuses = counts.setdefault(key, {})
         statuses[status] = statuses.get(status, 0) + 1
-    check_rows = [plain(check) for check in checks]
-    verdicts = _condition_verdicts(check_rows)
     # A check verdict is a condition verdict only when it owns one condition.
     # Matrix checks must retain their per-condition evidence instead.
     owners = {}

@@ -163,6 +163,8 @@ def _cohort_label(group, observation):
     point = first.load_point or {}
     check = next((name for name in first.check_ids if name in _PERFORMANCE_CHECKS), first.check_ids[0] if first.check_ids else "serving")
     check_label = CHECK_NAMES.get(check, check.replace("_", " ").capitalize())
+    if check == "multi_user" and first.workload.get("role"):
+        return check, condition_for(first.scenario, first.workload)["label"]
     if point:
         shape = point.get("shape") or point.get("workload")
         name = {
@@ -498,7 +500,10 @@ def _window_summary(report, target, window, records, series, observation):
     put("sampled_concurrency", list(dict.fromkeys(row["intended_concurrency"] for row in transitions if row.get("intended_concurrency") is not None and row.get("kind") != "drain")) or None,
         "Sampled concurrency", "requests", "Recorded schedule transitions only")
     rates = list(dict.fromkeys(row["intended_rate_rps"] for row in transitions if row.get("intended_rate_rps") is not None and row.get("kind") != "drain"))
-    put("offered_rate", rates or None, "Offered / scheduled arrival rate", "req/s", "Recorded arrival scheduler transitions; distinct from intended concurrency", state="measured" if rates else "not_applicable")
+    with_bursts = any(row.get("pattern") == "steady_with_bursts" for row in transitions)
+    put("offered_rate", rates or None, "Scheduled steady arrival rate" if with_bursts else "Offered / scheduled arrival rate",
+        "req/s", "Burst offers are counted separately in the Multi-user results" if with_bursts else
+        "Recorded arrival scheduler transitions; distinct from intended concurrency", state="measured" if rates else "not_applicable")
     _bind_existing(report, target, window, population, observation, put)
     _server_rows(report, target, window, observation, put, metrics)
     _baseline_rows(report, target, window, population, put)
@@ -543,10 +548,14 @@ def _bind_existing(report, target, window, records, observation, put):
     by_id = {c.id: c.metrics for c in checks}
     ids = {r.id for r in records}
     cohort = window["cohort_id"]
+    user_summary = by_id.get("multi_user", {}).get("multi_user", observation.get("multi_user", {}).get("summary", {}))
+    user_window = next((value for value in user_summary.get("windows", [])
+                        if value.get("phase") == "measurement" and value.get("id") == cohort), {})
     load = by_id.get("load", observation.get("load_test", {}))
     point_ids = {(row.load_point or {}).get("point_id") for row in records}
     points = [p for p in load.get("points", []) if str(p.get("id")) in point_ids]
-    stage_ids = {row.traffic_stage for row in records if row.traffic_stage is not None}
+    capacity_records = [row for row in records if "capacity" in row.check_ids and row.traffic_stage is not None]
+    stage_ids = {row.traffic_stage for row in capacity_records}
     stage_entries = [(s.get("stage_index", index), s) for index, s in enumerate(
         by_id.get("capacity", {}).get("traffic_stages", observation.get("capacity", [])))
         if isinstance(s, dict) and s.get("stage_index", index) in stage_ids]
@@ -557,10 +566,20 @@ def _bind_existing(report, target, window, records, observation, put):
     elif stages:
         delivery = [{key: s.get(key) for key in ("stage_index", "scheduled", "started", "dispatched", "dropped_local", "dropped_late", "local_drops", "late_drops", "not_offered", "reasons")}
                     for s in stages]
+    elif user_window.get("offer_accounting") and (window["kind"] == "full" or not window.get("includes_drain")):
+        offers = user_window.get("offers")
+        if window["kind"] == "stage" and offers is not None:
+            from .multi_user import _offer_counts
+            left, right = window["start_ms"], window["end_ms"]
+            counts = _offer_counts([offer for offer in offers if offer.get("scheduled_ms") is not None
+                                    and left <= offer["scheduled_ms"] < right])
+        else:
+            counts = user_window["offer_accounting"]
+        delivery = [{"id": cohort, **counts}]
     else:
         delivery = None
     put("drops", delivery, "Local drops / late drops / not offered", "requests", "Existing scoped scheduler ledger; unsent work is not an endpoint error",
-        samples=len(points)+len(stages), state="measured" if delivery else "not_applicable")
+        samples=len(delivery or ()), state="measured" if delivery else "not_applicable")
     accepted = [p for p in points if p.get("status") == "pass"]
     rate_findings = [p.get("rate") for p in accepted if p.get("rate") is not None and p.get("pattern") in {"constant", "poisson"} and not p.get("bursts")]
     rate_findings += [s.get("rate_rps") for s in stages if s.get("accepted") and s.get("rate_rps") is not None]
@@ -576,7 +595,7 @@ def _bind_existing(report, target, window, records, observation, put):
     limited = any(capacity_limits.get(key) is not None for key in ("first_output_ms", "latency_ms"))
     valid_counts, scored_counts = Counter(), Counter()
     if stage_entries:
-        for record in records:
+        for record in capacity_records:
             if record.valid and record.status == "completed":
                 valid_counts[record.traffic_stage] += 1
                 scored_counts[record.traffic_stage] += record.score is not None
@@ -662,12 +681,9 @@ def _bind_existing(report, target, window, records, observation, put):
         "Conversation completion rate", "ratio", "Completed / planned conversations from session lifecycle", samples=sessions.get("started_conversations", 0), state="measured" if planned else "not_applicable")
     put("user_fairness", sessions.get("users") or None, "Per-user generation pace / fairness", "tok/s", "Existing per-user estimates and equal-user weighting; missing coverage retained",
         samples=sessions.get("users_with_measured_generation", 0), state="estimated" if sessions.get("users") else "not_applicable")
-    user_summary = by_id.get("multi_user", {}).get("multi_user", observation.get("multi_user", {}).get("summary", {}))
-    user_windows = [value for value in user_summary.get("windows", [])
-                    if value.get("phase") == "measurement" and value.get("id") == cohort]
-    if user_windows:
-        users = user_windows[0].get("users", [])
-        eligible = user_windows[0].get("population", len(users))
+    if user_window:
+        users = user_window.get("users", [])
+        eligible = user_window.get("population", len(users))
         samples = sum(_number(user.get("output_tokens_per_second")) for user in users)
         complete = eligible > 0 and samples == eligible
         put("persistent_user_delivery", users, "Persistent user delivery", "tok/s",
@@ -805,12 +821,28 @@ def _baseline_rows(report, target, window, records, put):
     baseline = report.baseline
     entry = next((t for t in (baseline or {}).get("targets", []) if t.get("target") == target), {})
     cohort = window["cohort_id"]
-    scenarios = {r.scenario for r in records}
+    check_scenarios = {(check, r.scenario) for r in records for check in r.check_ids}
+    checks = {check for check, _ in check_scenarios}
     load_points = [r.load_point for r in records if r.load_point and "load" in r.check_ids]
+    user_requests = {r.id: (r.workload["user_id"], r.workload.get("cohort") or "")
+                     for r in records if "multi_user" in r.check_ids
+                     and r.workload.get("window_id") == cohort and r.workload.get("user_id")}
+    user_cohorts = set(user_requests.values())
 
     def matches(row):
-        if row.get("check") != "load":
-            return row.get("scenario") in scenarios or row.get("scenario") == cohort
+        check = row.get("check")
+        if check == "multi_user":
+            if window["kind"] != "full" or row.get("window_id") != cohort:
+                return False  # The comparison covers the whole user window.
+            user = row.get("user_id")
+            if "cohort" in row:
+                return (user, row["cohort"] or "") in user_cohorts
+            # Older timing rows identify the cohort through their request links.
+            linked = {user_requests.get(rid) for rid in row.get("evidence_ids") or ()}
+            return len(linked) == 1 and None not in linked and next(iter(linked))[0] == user
+        if check != "load":
+            scenario = row.get("scenario")
+            return (check, scenario) in check_scenarios or (check in checks and scenario == cohort)
         point = row.get("load_point") or {}
         fields = ("source", "type", "workload", "shape", "pattern", "level", "rate", "bursts")
         return bool(point) and any(
@@ -823,9 +855,11 @@ def _baseline_rows(report, target, window, records, put):
 
     # Existing comparisons already carry sample/shape/timing qualifications.
     comparisons = [r for r in entry.get("comparisons", []) if matches(r)]
+    capacity_stage_ids = {record.traffic_stage for record in records if "capacity" in record.check_ids}
     traffic = [row for index, row in enumerate(entry.get("traffic_capacity", {}).get("stages", []))
-               if index in {record.traffic_stage for record in records} and row.get("status") in {"pass", "fail"}]
-    mapping = (("baseline_throughput", "Throughput change", {"output_tokens_per_second"}),
+               if index in capacity_stage_ids and row.get("status") in {"pass", "fail"}]
+    mapping = (("baseline_throughput", "Throughput change",
+                {"output_tokens_per_second", "shared_window_output_tokens_per_second"}),
                ("baseline_timing", "Latency / first-output change", {"latency_ms", "first_output_ms", "max_stream_gap_ms"}),
                ("baseline_generation", "Generation pace change", {"generation_tokens_per_second"}),
                ("baseline_quality", "Error / correctness change", {"error_rate", "correctness_rate", "valid_completion_rate"}))
@@ -836,11 +870,13 @@ def _baseline_rows(report, target, window, records, put):
             qualified += [{"goodput_delta_rps": row.get("goodput_delta_rps"), "rate_rps": row.get("rate_rps"),
                            "kind": "qualified arrival goodput change", "status": row["status"]} for row in traffic
                           if row.get("goodput_delta_rps") is not None]
+        qualification = ("Shared-window delivery compares completed output per user in the common measurement interval."
+                         if key == "baseline_throughput" and window["kind"] == "full" and user_cohorts else
+                         "Output-token rates in existing comparisons are per-request end-to-end rates; goodput deltas use requests/s. No aggregate throughput delta is invented.")
         put(key, qualified or None, label, "% change / percentage points", "Existing like-for-like qualified baseline comparisons; per-check/scenario",
             samples=len(qualified), state="measured" if qualified else ("no_baseline" if baseline is None else "insufficient_evidence"),
             reason=None if qualified else ("No baseline attached." if baseline is None else "No comparable qualified baseline population for this scope."),
-            evidence=rows, comparable=bool(qualified),
-            qualification="Output-token rates in existing comparisons are per-request end-to-end rates; goodput deltas use requests/s. No aggregate throughput delta is invented.")
+            evidence=rows, comparable=bool(qualified), qualification=qualification)
     point_ids = {point.get("point_id") for point in load_points}
     capacity = [r for r in entry.get("load_test", {}).get("points", [])
                 if (r.get("current") or {}).get("id") in point_ids
@@ -867,7 +903,7 @@ def build_performance(report, *, target=None, window=None):
         from copy import deepcopy
         stored = deepcopy(report.performance)
         for entry in stored.get("targets", []):
-            records = sorted((r for r in report.requests if r.target == entry["target"]),
+            records = sorted((r for r in report.requests if r.target == entry["target"] and r.identity is None),
                              key=lambda r: (r.dispatch_ms is None, r.dispatch_ms or 0, r.started_at, r.id))
             entry["request_series"] = _request_series(records)
         return stored
@@ -882,7 +918,7 @@ def build_performance(report, *, target=None, window=None):
     } for item in config_targets if item.get("name") == name), {"name": name})} for name in names]
     targets = []
     for name in [selected] if selected is not None else []:
-        records = [r for r in report.requests if r.target == name]
+        records = [r for r in report.requests if r.target == name and r.identity is None]
         records.sort(key=lambda r: (r.dispatch_ms is None, r.dispatch_ms if r.dispatch_ms is not None else 0, r.started_at, r.id))
         series = _request_series(records)
         groups = defaultdict(list)

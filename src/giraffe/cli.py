@@ -747,7 +747,10 @@ def _main(argv: list[str] | None = None) -> int:
                 print("Configuration preview. No traffic was sent.")
                 print("Targets: " + ", ".join(target.name for target in config.targets))
                 print("Checks: " + ", ".join(config.checks))
-                print(f"Known requests per target: {plan['known_per_target']:,}")
+                if counts := plan.get("known_target_counts"):
+                    print("Known requests by target: " + ", ".join(f"{name}: {count:,}" for name, count in counts.items()))
+                else:
+                    print(f"Known requests per target: {plan['known_per_target']:,}")
                 print(f"Maximum requests: {format(config.max_requests, ',') if config.max_requests is not None else 'Not set'}")
                 for warning in plan["warnings"]:
                     print(f"Warning: {warning}")
@@ -952,11 +955,17 @@ def _main(argv: list[str] | None = None) -> int:
             if json_output:
                 emit("blocked", 3, message=str(error))
             return 3
-        if args.command == "run" and not args.skip_preflight:
+        # Explicit identity probes must not spend or require shared credentials
+        # before measuring their own gateway policy and attribution evidence.
+        from giraffe.identities import gateway_identities_only
+        gateway_only = gateway_identities_only(config.checks)
+        preflight_targets = [target for target in config.targets
+                             if not gateway_only or config.restart_target == target.name]
+        if args.command == "run" and not args.skip_preflight and preflight_targets:
             from giraffe.deployment import preparation_residency
             config._preparation_residency = asyncio.run(preparation_residency(config))
             async def preflight():
-                for target in config.targets:
+                for target in preflight_targets:
                     try:
                         await check_target(target, config)
                     except PreflightError as error:
@@ -1231,7 +1240,28 @@ def _print_result(report: RunReport, json_path: Path, html_path: Path | None,
             line = f"Performance · {target_name} · {label}"
         print(line)
     for check in report.checks:
+        policy = check.metrics.get("gateway_policy") if check.id == "gateway_policy" else None
+        if policy:
+            print(f"Gateway policy · {check.target} · {policy['settings'].get('capability', 'not configured')} · {policy['qualification']}")
+            for user in policy["users"]:
+                print(f"  {user['identity']}: {user['admitted']} admitted, {user['rejected']} rejected, "
+                      f"{user['completed']} completed / {user['planned']} offered cap; declared {user['declared_rpm']} RPM")
+            print("  " + policy["interpretation"])
+        if check.id == "gateway_attribution" and check.metrics.get("state") != "not_selected":
+            data = check.metrics
+            print(f"Gateway attribution · {check.target} · {data.get('state', 'unverified')} · "
+                  f"{data.get('matched_requests', 0)} matched / {data.get('observed_requests', 0)} observed requests")
+            for row in data.get("identities", []):
+                print(f"  {row['identity']} · {row['matched_requests']} matched · "
+                      f"{row['mismatched_requests']} mismatched · {row['unverified_requests']} unverified")
         users = check.metrics.get("multi_user") if check.id == "multi_user" else None
+        policy = check.metrics.get("gateway_access") if check.id == "gateway_access" else None
+        if policy:
+            print(f"Gateway access policy · {check.target}")
+            for case in policy.get("cases", []):
+                print(f"  {case['name']} / {case['identity']}: expected {case['expected']}, observed {case['observed']}"
+                      f" · {case['status']} · HTTP {case['http_status'] or 'not observed'} · {case['reason']}")
+            print("  " + policy["qualification"])
         if not users:
             continue
         print(f"Multi-user · {check.target} · shared-window delivered output")
@@ -1244,6 +1274,21 @@ def _print_result(report: RunReport, json_path: Path, html_path: Path | None,
             print(f"  {window['population']} users · {window.get('duration_seconds', 0):.3g} / {window['planned_duration_seconds']:g} planned seconds")
             if window.get("role"):
                 print("    " + " · ".join(str(window[key]) for key in ("scenario", "role", "trigger", "heavy_profile") if window.get(key)))
+            if counts := window.get("offer_accounting"):
+                print("    Scheduled and achieved traffic: " + " · ".join(f"{key}: {value}" for key, value in counts.items()))
+                if bursts := window.get("burst_offer_accounting"):
+                    print("    Burst offers: " + " · ".join(f"{key}: {value}" for key, value in bursts.items()))
+                for user in window["users"]:
+                    print(f"      {user['user_id']} / {user.get('cohort')} · scheduled/observed activation "
+                          f"{user.get('scheduled_activation_ms')} / {user.get('activated_ms')} ms · "
+                          + " · ".join(f"{key}: {value}" for key, value in user.get("offer_accounting", {}).items()))
+            if evidence := window.get("recovery"):
+                print(f"    Matched per-user recovery: {evidence['status']}")
+                for user in evidence["users"]:
+                    print(f"      {user['user_id']}: {user['status']} · {user['matched_samples']} matched samples · "
+                          f"slowdown {user['slowdown']} · {' '.join(user['reasons'])}")
+                    for label, values in user["phases"].items():
+                        print(f"        {label}: {values} · requests: {', '.join(user.get(label+'_request_ids', []))}")
             if evidence := window.get("interference"):
                 print(f"    Matched noisy-neighbor comparison: {evidence['status']}")
                 for reason in evidence.get("reasons", []):

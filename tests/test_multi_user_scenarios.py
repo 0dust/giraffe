@@ -19,6 +19,128 @@ PROFILE = {"short": {"input_tokens": 64, "output_tokens": 16},
            "long": {"input_tokens": 256, "output_tokens": 32}}
 
 
+@pytest.mark.parametrize("returned", [False, True])
+@pytest.mark.parametrize("stop_after_errors", [1, 20])
+@pytest.mark.parametrize("conversations", [False, True])
+def test_preparation_failure_is_reported_once_per_user_without_dispatch(
+        monkeypatch, returned, stop_after_errors, conversations):
+    from giraffe.models import RequestRecord
+    from tests.test_review26_phase4_accuracy import run_virtual
+    from tests.test_runner import FakeClient
+
+    calls = []
+
+    class PreparationClient(FakeClient):
+        _supports_dispatch_guard = True
+
+        async def execute(self, spec, **kwargs):
+            calls.append(spec.workload["user_id"])
+            assert len(calls) <= 2, "preparation failure was retried"
+            if not returned:
+                raise ValueError("secret-sk-123")
+            return RequestRecord(id=str(len(calls)), target=self.target.name, fixture_id=spec.fixture_id,
+                scenario=spec.scenario, check_ids=spec.check_ids, started_at=runner._now(),
+                status="failed", error="request failed (ValueError)")
+
+    async def scenario():
+        cfg = settings(levels=[2], duration_seconds=.3, profile=PROFILE,
+            think_time_seconds={"values": [0]},
+            **({"conversations": {"turns": ["Say hello.", "Repeat."], "max_tokens": 16}}
+               if conversations else {})).model_copy(update={
+                   "stop_after_errors": stop_after_errors, "max_requests": 2})
+        monkeypatch.setattr(runner, "LLMClient", PreparationClient)
+        events = []
+        report = await runner.run_suite(cfg, progress=events.append)
+        count = 1 if stop_after_errors == 1 else 2
+        assert len(calls) == len(set(calls)) == len(report.requests) == count
+        assert report.observations["request_budget_used"] == 0
+        assert "secret-sk-123" not in report.model_dump_json()
+        assert not any(event["event"] == "request_started" for event in events)
+        for item in report.requests:
+            assert item.status == "failed" and not item.valid
+            assert item.error == "request could not be prepared (ValueError)"
+            assert item.dispatch_ms is item.timing_start_ms is item.request_body_sent_ms is None
+            assert item.input_tokens is item.output_tokens is None
+            assert item.check_ids == ["multi_user"]
+            assert item.workload["user_id"] in calls
+        check = next(check for check in report.checks if check.id == "multi_user")
+        assert check.status == "fail"
+        summary = check.metrics["multi_user"]
+        assert summary["worst_user"]["user_id"] in check.summary
+        users = summary["windows"][0]["users"]
+        for user in users:
+            assert user["dispatched_count"] == 0
+            if user["user_id"] in calls:
+                assert user["status"] == "fail"
+                assert user["outcomes"]["errors"] == 1
+                assert user["criteria"]["max_error_percent"]["value"] == 100
+                assert user["stop_reason"] == "request could not be prepared"
+                assert user["pending_ready_ms"] is None
+        if stop_after_errors == 1:
+            assert report.abort_reason == "error threshold reached"
+
+    run_virtual(monkeypatch, scenario())
+
+
+def test_preparation_failure_stops_only_the_affected_user(monkeypatch):
+    from tests.test_review26_phase4_accuracy import run_virtual
+    from tests.test_runner import FakeClient
+
+    calls = []
+
+    class PreparationClient(FakeClient):
+        _supports_dispatch_guard = True
+
+        async def execute(self, spec, *, _before_send, **kwargs):
+            uid = spec.workload["user_id"]
+            calls.append(uid)
+            if uid == "user-01":
+                assert calls.count(uid) == 1, "preparation failure was retried"
+                raise ValueError("secret-sk-123")
+            _before_send()
+            return await super().execute(spec, **kwargs)
+
+    async def scenario():
+        cfg = settings(levels=[2], duration_seconds=.03, profile=PROFILE,
+                       think_time_seconds={"values": [0]})
+        state = runner._Run(cfg, None, None)
+        await execute(state, cfg.targets[0], PreparationClient(cfg.targets[0], cfg))
+        assert calls.count("user-01") == state.errors == 1
+        assert calls.count("user-02") > 1
+        assert state.budget_used == state.attempted == calls.count("user-02")
+        check = result(state, cfg.targets[0])
+        assert check.status == "fail"
+        assert check.metrics["multi_user"]["worst_user"]["user_id"] == "user-01"
+
+    run_virtual(monkeypatch, scenario())
+
+
+def test_preparation_failure_uses_nonzero_think_time_before_retrying(monkeypatch):
+    from tests.test_review26_phase4_accuracy import run_virtual
+    from tests.test_runner import FakeClient
+
+    calls = []
+
+    class PreparationClient(FakeClient):
+        _supports_dispatch_guard = True
+
+        async def execute(self, spec, **kwargs):
+            calls.append(asyncio.get_running_loop().time())
+            assert len(calls) <= 3, "preparation failure was retried without think time"
+            raise ValueError("secret-sk-123")
+
+    async def scenario():
+        cfg = settings(levels=[1], duration_seconds=.025, profile=PROFILE,
+                       think_time_seconds={"values": [.01]})
+        state = runner._Run(cfg, None, None)
+        await execute(state, cfg.targets[0], PreparationClient(cfg.targets[0], cfg))
+        assert calls == pytest.approx([calls[0], calls[0]+.01, calls[0]+.02])
+        assert state.errors == len(state.records) == 3
+        assert state.budget_used == state.attempted == 0
+
+    run_virtual(monkeypatch, scenario())
+
+
 def test_noisy_neighbors_plan_matches_short_users_and_preserves_roles():
     cfg = settings(levels=[3], scenarios=["noisy_neighbors"], noisy_neighbors={
         "heavy_user_ids": ["user-03"], "heavy_profiles": ["long_short", "short_long"],
@@ -108,6 +230,75 @@ def test_peer_lost_while_waiting_for_slot_does_not_dispatch_or_leave_pending_wai
         user = summarize(observation, state.records)["windows"][-1]["users"][1]
         assert user["pending_wait"] is None
         assert user["status"] == "inconclusive"
+
+    run_virtual(monkeypatch, run())
+
+
+def test_peer_trigger_is_refreshed_after_waiting_for_http_lane(monkeypatch):
+    import httpx
+
+    from giraffe.client import LLMClient
+    from giraffe.models import LoadTestSettings
+    from giraffe.multi_user import run_window
+    from giraffe.transport import HTTPClientPool
+    from tests.test_review26_phase4_accuracy import run_virtual
+
+    class Stream(httpx.AsyncByteStream):
+        def __init__(self, output_delay, tail):
+            self.output_delay = output_delay
+            self.tail = tail
+
+        async def __aiter__(self):
+            await asyncio.sleep(self.output_delay)
+            yield b'data: {"choices":[{"delta":{"content":"K7P4"}}]}\n\n'
+            yield b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+            yield b'data: [DONE]\n\n'
+            await asyncio.sleep(self.tail)
+            yield b': transport tail\n\n'
+
+    async def run():
+        cfg = settings(levels=[2], duration_seconds=.075, profile=PROFILE,
+            scenarios=["noisy_neighbors"], noisy_neighbors={"heavy_user_ids": ["user-02"],
+                "heavy_profiles": ["long_short"], "triggers": ["before_output"]}).model_copy(
+                    update={"concurrency": 2, "stream": True})
+        target = cfg.targets[0]
+        state = runner._Run(cfg, None, None)
+        sent = []
+
+        async def respond(request):
+            if request.method == "GET":
+                return httpx.Response(200, stream=Stream(0, 0))
+            sent.append(asyncio.get_running_loop().time())
+            return httpx.Response(200, stream=Stream(.01, .03) if len(sent) == 1 else Stream(.05, 0))
+
+        client = LLMClient(target, cfg)
+        pool = client._client = HTTPClientPool(lambda: httpx.AsyncClient(transport=httpx.MockTransport(respond)), 2)
+        # Keep one lane occupied while the initial trigger expires and the peer restarts.
+        held = await pool.send(pool.build_request("GET", target.url), stream=True)
+
+        async def release_lane():
+            await asyncio.sleep(.055)
+            await held.aclose()
+
+        release = asyncio.create_task(release_lane())
+        window = _planned_observation(cfg.multi_user)["windows"][-1]
+        calibration = {(size, "short_answer"): {"filler_chars": 100} for size in ("short", "long")}
+        try:
+            await run_window(state, target, client, cfg.multi_user,
+                             LoadTestSettings(profile=cfg.multi_user.profile), calibration, window)
+        finally:
+            await release
+            await client.__aexit__(None, None, None)
+
+        assert sent == pytest.approx([0, .04, .055])
+        assert len(state.records) == state.attempted == state.budget_used == 3
+        assert state.slots.qsize() == 2
+        heavy, = [record for record in state.records if record.workload["user_id"] == "user-02"]
+        assert heavy.dispatch_ms == heavy.workload["trigger_ms"] == pytest.approx(55)
+        assert heavy.workload["trigger_peer_ids"] == ["user-01"]
+        assert heavy.workload["matched_work_sequence"] == heavy.workload["request_sequence"] == 1
+        assert window["users"][1]["ready_count"] == 2
+        assert window["users"][1]["dispatched_count"] == 1
 
     run_virtual(monkeypatch, run())
 

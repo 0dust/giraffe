@@ -286,6 +286,36 @@ export function configureJudging(source, values, {allowInvalid=false}={}) {
   return config;
 }
 
+export function gatewayPolicySettings(config) {
+  return {auth_header:'Authorization',gateway:'litellm',capability:'key_rpm',gateway_version:null,affected_identity:'limited',
+    users:[{identity:'limited',requests:5,rpm:2,priority:null},{identity:'peer',requests:8,rpm:8,priority:null}],
+    duration_seconds:15,interval_seconds:.1,max_output_tokens:16,window_state:'unknown',
+    model_rpm:null,saturation_threshold:null,saturation_cache_seconds:null,named_reservations_confirmed:false,...structuredClone(config.gateway_policy || {})};
+}
+
+export function configureGatewayPolicy(source, values, {allowInvalid=false}={}) {
+  const config=structuredClone(source);
+  if(!values.has('gateway_policy_rendered'))return config;
+  const settings=gatewayPolicySettings(source);
+  for(const name of ['gateway','capability','affected_identity','window_state','gateway_version','auth_header']){
+    if(values.has('gateway_policy_'+name))settings[name]=values.get('gateway_policy_'+name)||null;
+  }
+  for(const name of ['duration_seconds','interval_seconds','max_output_tokens','model_rpm','saturation_threshold','saturation_cache_seconds']){
+    if(values.has('gateway_policy_'+name))settings[name]=numeric(values.get('gateway_policy_'+name),name,allowInvalid);
+  }
+  if(values.has('gateway_policy_named_reservations_confirmed'))settings.named_reservations_confirmed=values.get('gateway_policy_named_reservations_confirmed')==='true';
+  if(values.has('gateway_policy_users')){
+    settings.users=String(values.get('gateway_policy_users')).split('\n').filter(row=>row.trim()).map(row=>{
+      const [identity,requests,rpm,priority,...extra]=row.split(',').map(value=>value.trim());
+      if(extra.length&&!allowInvalid)throw new Error('Each policy user needs identity, request cap, RPM and optional priority tier.');
+      return {identity,requests:numeric(requests,'Request cap',allowInvalid),rpm:numeric(rpm,'RPM',allowInvalid),priority:priority||null};
+    });
+  }
+  if(source.gateway_policy==null&&sameConfig(settings,gatewayPolicySettings({})))return config;
+  config.gateway_policy=settings;
+  return config;
+}
+
 export function multiUserSettings(config, defaults) {
   const saved=config.multi_user || {}, result={...structuredClone(defaults),...structuredClone(saved)};
   result.profile=Object.fromEntries(loadSizes.map(size=>[size,{...defaults.profile[size],...saved.profile?.[size]}]));
@@ -293,6 +323,8 @@ export function multiUserSettings(config, defaults) {
   result.think_time_seconds={...defaults.think_time_seconds,...saved.think_time_seconds};
   result.noisy_neighbors={...defaults.noisy_neighbors,...saved.noisy_neighbors};
   result.cancellation={...defaults.cancellation,...saved.cancellation};
+  result.arrivals={...defaults.arrivals,...saved.arrivals};
+  result.recovery={...defaults.recovery,...saved.recovery};
   return result;
 }
 
@@ -315,9 +347,19 @@ export function configureMultiUser(source, values, defaults, {allowInvalid=false
   const number=(name,label)=>numeric(values.get('multi_user_'+name),label,allowInvalid);
   const list=(name,label)=>String(values.get('multi_user_'+name)||'').split(',').map(value=>numeric(value.trim(),label,allowInvalid));
   if(values.has('multi_user_scenarios_rendered')){
-    const selected=['repeated_requests','noisy_neighbors','cancellation'].filter(name=>values.get('multi_user_scenario_'+name)==='on');
+    const selected=['repeated_requests','noisy_neighbors','cancellation','arrivals','recovery'].filter(name=>values.get('multi_user_scenario_'+name)==='on');
     settings.scenarios=[...settings.scenarios.filter(name=>selected.includes(name)),...selected.filter(name=>!settings.scenarios.includes(name))];
   }
+  if(values.has('multi_user_arrivals_requests_per_second'))settings.arrivals.requests_per_second=number('arrivals_requests_per_second','Requests per second per user');
+  if(values.has('multi_user_arrivals_activations')){
+    const rows=String(values.get('multi_user_arrivals_activations')||'').trim();
+    settings.arrivals.activations=Object.fromEntries(rows?rows.split(',').map(row=>{const [id,seconds]=row.trim().split('@');return [id.trim(),numeric(seconds,'Activation seconds',allowInvalid)];}):[]);
+  }
+  if(values.has('multi_user_arrivals_bursts')){
+    const rows=String(values.get('multi_user_arrivals_bursts')||'').trim();
+    settings.arrivals.bursts=rows?rows.split(',').map(row=>{const [id,seconds,count,spacing]=row.trim().split('@');return {user_id:id.trim(),at_seconds:numeric(seconds,'Burst time',allowInvalid),requests:numeric(count,'Burst requests',allowInvalid),spacing_seconds:numeric(spacing||'0','Burst spacing',allowInvalid)};}):[];
+  }
+  for(const key of ['control_seconds','sustained_seconds','lighter_seconds','sustained_requests_per_second','lighter_requests_per_second','max_slowdown'])if(values.has('multi_user_recovery_'+key))settings.recovery[key]=number('recovery_'+key,key);
   for(const [field,group,options] of [['heavy_profiles','profile',['long_short','short_long','long_long']],['triggers','trigger',['before_output','during_stream']]]){
     if(!values.has('multi_user_noisy_neighbors_'+group+'s_rendered'))continue;
     const selected=options.filter(name=>values.get('multi_user_noisy_neighbors_'+group+'_'+name)==='on');
@@ -594,6 +636,71 @@ export function configureProfiles(source, values, defaults, {allowInvalid=false,
       errors:[{fields:['tool_checks.modes','stream'],msg:'Enable streaming on Connect or choose complete tool requests.'}],
     });
   }
+  return config;
+}
+
+function validIdentityReferences(value) {
+  const isObject=value=>value&&typeof value==='object'&&!Array.isArray(value);
+  if(!isObject(value))return false;
+  const matches=(value,pattern)=>typeof value==='string'&&value===value.trim()&&pattern.test(value);
+  const envReference=/^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
+  const reservedHeaders=['host','content-length','content-type','transfer-encoding','connection','accept','accept-encoding','expect','upgrade'];
+  const identities=Object.entries(value);
+  return identities.length<=32&&identities.every(([alias,identity])=>{
+    if(!matches(alias,/^[A-Za-z][A-Za-z0-9_-]{0,63}$/)||!isObject(identity)||
+      Object.keys(identity).some(key=>!['api_key_env','headers_env'].includes(key)))return false;
+    const {api_key_env:apiKey,headers_env:headers={}}=identity;
+    if((apiKey!=null&&apiKey!==''&&!matches(apiKey,envReference))||!isObject(headers))return false;
+    const names=Object.keys(headers).map(name=>name.toLowerCase());
+    return names.length<=16&&new Set(names).size===names.length&&!(apiKey&&names.includes('authorization'))&&
+      !names.some(name=>reservedHeaders.includes(name))&&Object.entries(headers).every(([name,ref])=>
+        matches(name,/^[A-Za-z][A-Za-z0-9-]{0,63}$/)&&matches(ref,envReference));
+  });
+}
+
+export function configureGatewayAccess(source, values, {allowInvalid=false,draft=null}={}) {
+  const config=structuredClone(source),selected=config.checks?.includes('gateway_access');
+  if(!selected)config.gateway_access=null;
+  if(!values.has('gateway_access_rendered'))return config;
+  if(draft||selected){
+    const raw=Object.fromEntries(['profile','cases','auth_header','request_timeout_seconds','max_output_tokens']
+      .map(key=>[key,String(values.get('gateway_access_'+key) || '')]));
+    if(draft){
+      // Only the selected validation path promotes raw Access fields into the payload.
+      draft.settings=raw;
+      config.gateway_access=null;
+    }else{
+      let cases;
+      try{
+        cases=raw.cases.split('\n').map(line=>line.trim()).filter(Boolean).map(line=>{
+          const parts=line.split(/\s+/);
+          if(parts.length!==3||!['allow','deny'].includes(parts[2]))throw new Error('Enter a case name, identity alias and allow or deny on each line.');
+          return {name:parts[0],identity:parts[1],expected:parts[2]};
+        });
+      }catch(error){
+        if(!allowInvalid)throw error;
+        cases=raw.cases;
+      }
+      config.gateway_access={profile:raw.profile||'unknown',cases,auth_header:raw.auth_header.trim()||null,
+        request_timeout_seconds:Number(raw.request_timeout_seconds),max_output_tokens:Number(raw.max_output_tokens)};
+    }
+  }
+  config.targets.forEach((target,index)=>{
+    const key='gateway_access_identities_'+index;
+    if(!values.has(key))return;
+    const text=String(values.get(key)||'{}');
+    try{
+      const value=JSON.parse(text);
+      if(!validIdentityReferences(value))throw new Error();
+      target.test_identities=value;
+    }
+    catch{
+      if(selected&&!allowInvalid)throw new Error('Environment references must be an object mapping identity aliases to api_key_env and headers_env.');
+      if(draft)(draft.identities ||= {})[index]=text;
+      else if(selected){target.test_identities=text;return;}
+      if(!validIdentityReferences(target.test_identities))delete target.test_identities;
+    }
+  });
   return config;
 }
 

@@ -31,6 +31,48 @@ def test_request_overrides_cannot_escape_token_or_concurrency_budget():
         RunConfig(targets=[Target(name="local", url="http://localhost", model="example")], request_options={"n": 100})
 
 
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
+@pytest.mark.parametrize("nested", [False, True])
+def test_request_options_reject_nonfinite_numbers_with_their_path(value, nested):
+    options = {"extra": [{"top_p": value}]} if nested else {"top_p": value}
+    path = "request_options.extra.0.top_p" if nested else "request_options.top_p"
+    with pytest.raises(ValidationError) as caught:
+        RunConfig(targets=[Target(name="local", url="http://localhost", model="example")],
+                  request_options=options)
+    assert f"{path} must be a finite number" in str(caught.value)
+
+
+def test_request_options_preserve_finite_numbers_and_other_json_values():
+    options = {"top_p": .5, "extra": [1, -2.5, True, False, "NaN", None, {"value": 1e308}]}
+    cfg = RunConfig(targets=[Target(name="local", url="http://localhost", model="example")],
+                    request_options=options)
+    assert cfg.request_options == options
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
+@pytest.mark.parametrize("source", ["request_pack", "tool_fixture", "tool_conversation"])
+def test_workload_request_options_reject_nonfinite_numbers(value, source):
+    from giraffe.tool_checks import default_tool_fixture
+    from tests.test_tool_conversations import fixture
+
+    options = {"extra": [{"top_p": value}]}
+    if source == "request_pack":
+        changes = {"request_source": "request_pack", "request_pack": {"version": 1, "cases": [{
+            "fixture_id": "one", "messages": [{"role": "user", "content": "hello"}],
+            "scorer": "none", "options": options}]}}
+        path = "request_pack.cases.0.options.extra.0.top_p"
+    elif source == "tool_fixture":
+        item = default_tool_fixture().model_dump(mode="python")
+        changes = {"tool_checks": {"fixtures": [{**item, "options": options}]}}
+        path = "tool_checks.fixtures.0.options.extra.0.top_p"
+    else:
+        changes = {"tool_checks": {"conversations": [fixture(options=options)]}}
+        path = "tool_checks.conversations.0.options.extra.0.top_p"
+    with pytest.raises(ValidationError) as caught:
+        RunConfig(targets=[Target(name="local", url="http://localhost", model="example")], **changes)
+    assert f"{path} must be a finite number" in str(caught.value)
+
+
 def test_explicit_checks_override_legacy_flags_and_round_trip():
     target = Target(name="local", url="http://localhost", model="example")
     default = RunConfig(targets=[target])
@@ -130,6 +172,7 @@ def test_workload_defaults_and_explicit_selection_preserve_disabled_configuratio
     assert draft.checks == []
     assert not draft.tool_calling
     assert set(CHECK_NAMES) - set(CORE_CHECKS) == {
+        "gateway_attribution", "gateway_policy", "gateway_access",
         "prefix", "sessions", "consistency", "tools", "multi_user"}
 
 

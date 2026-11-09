@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from copy import deepcopy
 from decimal import Decimal, ROUND_FLOOR
+from fractions import Fraction
 from functools import cached_property
 import math
 import re
@@ -41,10 +42,15 @@ CHECK_NAMES = {
     "prefix": "Prefix cache",
     "sessions": "Multi-turn sessions",
     "multi_user": "Multi-user",
+    "gateway_access": "Gateway access policy",
+    "gateway_policy": "Gateway quotas & priorities",
+    "gateway_attribution": "Gateway usage attribution",
     "consistency": "Answer consistency",
     "tools": "Tool calling",
 }
 CATALOGUE_NAMES = INTERNAL_CHECK_NAMES = CHECK_NAMES
+# These checks compare their own declared workload and evidence.
+SHARED_BASELINE_EXCLUDED_WORKLOADS = frozenset({"gateway_access", "gateway_attribution", "gateway_policy"})
 CORE_CHECKS = ("access", "serving", "first_output", "generation", "load", "context",
                "correctness", "json", "cancellation", "recovery", "gpu", "scale_down")
 DEFAULT_CHECKS = ("access", "serving", "correctness", "first_output")
@@ -856,6 +862,11 @@ def migrate_run_limits(value):
     return value, notes
 
 
+def scheduled_multi_user_slots(config) -> int:
+    """Return the local slot limit for a scheduled multi-user window."""
+    return config.concurrency or config.inherited_concurrency(config.default_concurrency)
+
+
 def required_concurrency(config) -> dict[str, Any]:
     """Conservative simultaneous target-request peak, independent of suite limits."""
     by_check = {}
@@ -869,7 +880,14 @@ def required_concurrency(config) -> dict[str, Any]:
             arrival = config.effective_arrivals()
             peak = arrival.max_in_flight if arrival else config.inherited_concurrency(config.default_concurrency)
         elif check == "multi_user":
-            peak = max(config.multi_user.levels)
+            scenarios = set(config.multi_user.scenarios)
+            scheduled = {"arrivals", "recovery"}
+            if scenarios - scheduled:
+                peak = max(config.multi_user.levels)
+            if scenarios & scheduled:
+                peak = max(peak, scheduled_multi_user_slots(config))
+        elif check == "gateway_policy":
+            peak = len(config.gateway_policy.users) if config.gateway_policy and config.gateway_policy.supported else 0
         elif check == "sessions":
             peak = min(config.sessions.concurrency, config.sessions.sessions)
         elif check == "consistency":
@@ -1098,6 +1116,57 @@ class MultiUserCriteria(Model):
     min_samples: StrictInt = Field(default=1, ge=1)
 
 
+class GatewayPolicyUser(Model):
+    identity: str = Field(pattern=r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
+    requests: StrictInt = Field(ge=1, le=100)
+    rpm: StrictInt = Field(ge=1, le=1000000)
+    priority: str | None = Field(default=None, pattern=r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
+
+
+class GatewayPolicy(Model):
+    auth_header: str = Field(default="Authorization", pattern=r"^[A-Za-z][A-Za-z0-9-]{0,63}$")
+    gateway: str = Field(default="litellm", min_length=1, max_length=64)
+    capability: str = Field(default="key_rpm", min_length=1, max_length=64)
+    gateway_version: str | None = Field(default=None, max_length=64)
+    affected_identity: str = Field(pattern=r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
+    users: list[GatewayPolicyUser] = Field(min_length=2, max_length=8)
+    duration_seconds: float = Field(default=15, gt=0, le=55)
+    interval_seconds: float = Field(default=.1, ge=.001, le=10)
+    max_output_tokens: StrictInt = Field(default=16, ge=1, le=256)
+    window_state: Literal["unknown", "isolated_fresh", "isolated_fresh_single_counter"] = "unknown"
+    model_rpm: StrictInt | None = Field(default=None, ge=1, le=1000000)
+    saturation_threshold: float | None = Field(default=None, ge=0, le=1)
+    saturation_cache_seconds: float | None = Field(default=None, ge=0, le=60)
+    named_reservations_confirmed: StrictBool = False
+
+    @property
+    def supported(self) -> bool:
+        return self.gateway == "litellm" and self.capability in {"key_rpm", "priority_rpm"}
+
+    @property
+    def custom_key_header(self) -> str | None:
+        return None if self.auth_header.lower() == "authorization" else self.auth_header
+
+    @model_validator(mode="after")
+    def valid_policy(self):
+        aliases = [user.identity for user in self.users]
+        if len(set(aliases)) != len(aliases) or self.affected_identity not in aliases:
+            raise ValueError("Policy users must be distinct and include the affected identity")
+        if not self.supported:
+            return self
+        if any(user.requests > user.rpm for user in self.users if user.identity != self.affected_identity):
+            raise ValueError("Peer offered request caps must stay within their declared RPM")
+        if self.capability == "priority_rpm":
+            tiers = [user.priority for user in self.users]
+            if None in tiers or len(set(tiers)) != len(tiers):
+                raise ValueError("Priority probes require a distinct declared tier for each identity")
+            if any(value is None for value in (self.model_rpm, self.saturation_threshold, self.saturation_cache_seconds)):
+                raise ValueError("Declare model RPM, saturation threshold and saturation cache seconds")
+            if sum(user.rpm for user in self.users) > self.model_rpm:
+                raise ValueError("Reserved RPM shares must not exceed model RPM")
+        return self
+
+
 class SessionSampling(Model):
     seed: StrictInt = Field(default=42, ge=0, le=2**32 - 1)
     think_time_seconds: SessionDistribution | None = None
@@ -1211,9 +1280,52 @@ class MultiUserCancellation(Model):
     cancel_after_chunks: StrictInt = Field(default=5, ge=1, le=1000)
 
 
+class MultiUserBurst(Model):
+    user_id: str = "user-01"
+    at_seconds: float = Field(default=1, ge=0, le=MAX_STAGE_SECONDS)
+    requests: StrictInt = Field(default=5, ge=1, le=MAX_BURST_SIZE)
+    spacing_seconds: float = Field(default=0, ge=0, le=MAX_STAGE_SECONDS)
+
+    def offer_offset(self, index: int) -> float:
+        return float(Fraction(str(self.at_seconds)) + index * Fraction(str(self.spacing_seconds)))
+
+
+def _steady_offer_count(duration: float, activation: float, rate: float) -> int:
+    # Count integer indices with activation + index / rate strictly before duration.
+    start = Fraction(str(activation))
+    frequency = Fraction(str(rate))
+    count = math.ceil((Fraction(str(duration)) - start) * frequency)
+    # The scheduled offset must still be inside the window after conversion to float.
+    if count > 0 and float(start + (count - 1) / frequency) >= duration:
+        return count - 1
+    return count
+
+
+class MultiUserArrivals(Model):
+    requests_per_second: float = Field(default=1, gt=0, le=1000)
+    activations: dict[str, Annotated[float, Field(ge=0, le=MAX_STAGE_SECONDS)]] = Field(default_factory=dict, max_length=32)
+    bursts: list[MultiUserBurst] = Field(default_factory=list, max_length=32)
+
+    def offer_count(self, duration: float, population: int) -> int:
+        steady = sum(_steady_offer_count(duration, self.activations.get(f"user-{index + 1:02d}", 0),
+                                        self.requests_per_second) for index in range(population))
+        return steady + sum(burst.requests for burst in self.bursts)
+
+
+class MultiUserRecovery(Model):
+    control_seconds: float = Field(default=5, gt=0, le=MAX_STAGE_SECONDS)
+    sustained_seconds: float = Field(default=15, gt=0, le=MAX_STAGE_SECONDS)
+    lighter_seconds: float = Field(default=5, gt=0, le=MAX_STAGE_SECONDS)
+    sustained_requests_per_second: float = Field(default=2, gt=0, le=1000)
+    lighter_requests_per_second: float = Field(default=.5, gt=0, le=1000)
+    max_slowdown: float | None = Field(default=None, ge=1)
+
+
 class MultiUser(Model):
-    scenarios: list[Literal["repeated_requests", "noisy_neighbors", "cancellation"]] = Field(
-        default_factory=lambda: ["repeated_requests"], min_length=1, max_length=3)
+    scenarios: list[Literal["repeated_requests", "noisy_neighbors", "cancellation", "arrivals", "recovery"]] = Field(
+        default_factory=lambda: ["repeated_requests"], min_length=1, max_length=5)
+    arrivals: MultiUserArrivals = Field(default_factory=MultiUserArrivals)
+    recovery: MultiUserRecovery = Field(default_factory=MultiUserRecovery)
     noisy_neighbors: MultiUserNeighbors = Field(default_factory=MultiUserNeighbors)
     cancellation: MultiUserCancellation = Field(default_factory=MultiUserCancellation)
     levels: list[Annotated[StrictInt, Field(ge=1, le=MAX_SIMULATED_USERS)]] = Field(
@@ -1234,9 +1346,29 @@ class MultiUser(Model):
             raise ValueError("multi-user scenarios must be distinct")
         if self.conversations and self.scenarios != ["repeated_requests"]:
             raise ValueError("conversation users support the repeated_requests scenario")
-        if any(s != "repeated_requests" for s in self.scenarios) and min(self.levels) < 2:
-            raise ValueError("noisy neighbors and cancellation require at least two users at every level")
+        if set(self.scenarios) & {"noisy_neighbors", "cancellation", "recovery"} and min(self.levels) < 2:
+            raise ValueError("noisy neighbors, cancellation and recovery require at least two users at every level")
         ids = {f"user-{index + 1:02d}" for index in range(min(self.levels))}
+        if "arrivals" in self.scenarios:
+            arrivals = self.arrivals
+            if not set(arrivals.activations) <= ids or any(b.user_id not in ids for b in arrivals.bursts):
+                raise ValueError("arrival and burst user IDs must exist at every population level")
+            if any(at >= self.duration_seconds for at in arrivals.activations.values()):
+                raise ValueError("user activations must precede the arrival window end")
+            if any(b.at_seconds < arrivals.activations.get(b.user_id, 0)
+                   or b.offer_offset(b.requests - 1) >= self.duration_seconds for b in arrivals.bursts):
+                raise ValueError("every burst must fall after its user activation and before the window end")
+            if arrivals.offer_count(self.duration_seconds, max(self.levels)) > MAX_PLANNED_ARRIVALS:
+                raise ValueError("multi-user arrival schedule exceeds the finite offer bound")
+        if "recovery" in self.scenarios:
+            recovery = self.recovery
+            if recovery.lighter_requests_per_second >= recovery.sustained_requests_per_second:
+                raise ValueError("recovery traffic must be lighter than sustained traffic")
+            if any(_steady_offer_count(seconds, 0, rate)*max(self.levels) > MAX_PLANNED_ARRIVALS for seconds, rate in (
+                    (recovery.control_seconds, recovery.lighter_requests_per_second),
+                    (recovery.sustained_seconds, recovery.sustained_requests_per_second),
+                    (recovery.lighter_seconds, recovery.lighter_requests_per_second))):
+                raise ValueError("multi-user recovery schedule exceeds the finite offer bound")
         if "cancellation" in self.scenarios and self.cancellation.user_id not in ids:
             raise ValueError("the cancellation user must exist at every population level")
         if "noisy_neighbors" in self.scenarios:
@@ -1314,6 +1446,83 @@ class Consistency(Model):
         return self
 
 
+class GatewayAccessCase(Model):
+    name: str = Field(pattern=r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
+    identity: str = Field(pattern=r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
+    expected: Literal["allow", "deny"]
+
+
+class GatewayAccess(Model):
+    profile: str = Field(default="unknown", pattern=r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
+    auth_header: str | None = Field(default=None, pattern=r"^[A-Za-z][A-Za-z0-9-]{0,63}$")
+    cases: list[GatewayAccessCase] = Field(default_factory=list, max_length=16)
+    request_timeout_seconds: float = Field(default=10, gt=0, le=60)
+    max_output_tokens: int = Field(default=16, ge=1, le=128)
+
+    @model_validator(mode="after")
+    def unique_cases(self):
+        if len({case.name for case in self.cases}) != len(self.cases):
+            raise ValueError("gateway access case names must be unique")
+        return self
+
+
+class TestIdentity(Model):
+    """Explicit credential references; an empty identity is anonymous."""
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+    api_key_env: str | None = Field(default=None, max_length=128)
+    headers_env: dict[str, str] = Field(default_factory=dict, max_length=16)
+
+    @model_validator(mode="after")
+    def validate_references(self):
+        refs = [*self.headers_env.values(), *([self.api_key_env] if self.api_key_env else [])]
+        if any(not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,127}", ref) for ref in refs):
+            raise ValueError("identity credentials must name environment variables")
+        names = [name.lower() for name in self.headers_env]
+        reserved = {"host", "content-length", "content-type", "transfer-encoding", "connection",
+                    "accept", "accept-encoding", "expect", "upgrade"}
+        if (len(set(names)) != len(names) or reserved.intersection(names)
+                or (self.api_key_env and "authorization" in names)
+                or any(not re.fullmatch(r"[A-Za-z][A-Za-z0-9-]{0,63}", name) for name in self.headers_env)):
+            raise ValueError("identity headers must be unique credential headers, not protocol headers")
+        return self
+
+
+class GatewayEvidence(TestIdentity):
+    profile: str = Field(default="litellm", min_length=1, max_length=64)
+    url: str
+
+    @field_validator("url")
+    @classmethod
+    def validate_url(cls, value):
+        from urllib.parse import urlsplit
+        parsed = urlsplit(value)
+        if (parsed.scheme not in {"http", "https"} or not parsed.hostname
+                or any((parsed.username, parsed.password, parsed.query, parsed.fragment))
+                or any(char.isspace() for char in value)):
+            raise ValueError("gateway evidence URL must be http(s) without credentials, query or fragment")
+        try:
+            valid_port = parsed.port != 0
+        except ValueError:
+            valid_port = False
+        if not valid_port:
+            raise ValueError("gateway evidence URL must have a valid port")
+        return value
+
+
+class GatewayAttribution(Model):
+    identities: list[str] = Field(min_length=1, max_length=32)
+    samples: int = Field(default=2, ge=1, le=16)
+    settle_seconds: float = Field(default=2, gt=0, le=30)
+
+    @field_validator("identities")
+    @classmethod
+    def validate_identities(cls, value):
+        if len(set(value)) != len(value) or any(not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", x) for x in value):
+            raise ValueError("attribution identities must be unique configured identity labels")
+        return value
+
+
 class Target(Model):
     tokenizer: str | None = Field(default=None, min_length=1,
         description="Prompt sizing tokenizer: null or auto resolves the served model name and falls back to builtin; builtin uses tiktoken o200k_base. A model ID or local directory remains an optional CLI override. Tokenizer assets download and cache locally; no inference is used for sizing.")
@@ -1325,6 +1534,8 @@ class Target(Model):
     model: str = Field(min_length=1)
     api_key_env: str | None = None
     headers_env: dict[str, str] = Field(default_factory=dict)
+    test_identities: dict[str, TestIdentity] = Field(default_factory=dict, max_length=32)
+    gateway: GatewayEvidence | None = None
     route: Literal["direct", "gateway", "replica"] = "direct"
     parent: str | None = None
     identity: dict[str, str] = Field(default_factory=dict)
@@ -1338,6 +1549,15 @@ class Target(Model):
     deployment: Deployment = Field(default_factory=Deployment)
     restart_command: list[str] | None = None
 
+    @model_serializer(mode="wrap")
+    def serialize_optional_identity_settings(self, handler):
+        result = handler(self)
+        if not self.test_identities:
+            result.pop("test_identities", None)
+        if self.gateway is None:
+            result.pop("gateway", None)
+        return result
+
     @field_validator("tokenizer", mode="before")
     @classmethod
     def trim_tokenizer(cls, value):
@@ -1346,6 +1566,9 @@ class Target(Model):
     @model_validator(mode="after")
     def validate_target(self) -> Target:
         from urllib.parse import urlsplit
+
+        if any(not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", name) for name in self.test_identities):
+            raise ValueError("test identity names must be short labels using letters, numbers, underscores or hyphens")
 
         parsed = urlsplit(self.url)
         if parsed.scheme not in {"http", "https"} or not parsed.hostname:
@@ -2236,6 +2459,9 @@ class RunConfig(Model):
     _concurrency_warnings: list[dict[str, Any]] = PrivateAttr(default_factory=list)
     sessions: Sessions | None = None
     multi_user: MultiUser | None = None
+    gateway_access: GatewayAccess | None = None
+    gateway_policy: GatewayPolicy | None = None
+    gateway_attribution: GatewayAttribution | None = None
     consistency: Consistency | None = None
     tool_calling: bool = False
     forced_tool_diagnostic: bool = False
@@ -2270,6 +2496,35 @@ class RunConfig(Model):
 
     @model_validator(mode="before")
     @classmethod
+    def finite_request_options(cls, value):
+        if not isinstance(value, dict):
+            return value
+
+        def visit(item, path):
+            if isinstance(item, dict):
+                for key, child in item.items():
+                    visit(child, f"{path}.{key}")
+            elif isinstance(item, list):
+                for index, child in enumerate(item):
+                    visit(child, f"{path}.{index}")
+            elif isinstance(item, float) and not math.isfinite(item):
+                raise ValueError(f"{path} must be a finite number")
+
+        visit(value.get("request_options"), "request_options")
+        for group, field in (("request_pack", "cases"), ("tool_checks", "fixtures"),
+                             ("tool_checks", "conversations")):
+            container = value.get(group)
+            if isinstance(container, BaseModel):
+                container = container.model_dump(mode="python")
+            items = container.get(field, []) if isinstance(container, dict) else []
+            if isinstance(items, list):
+                for index, item in enumerate(items):
+                    options = item.get("options") if isinstance(item, dict) else getattr(item, "options", None)
+                    visit(options, f"{group}.{field}.{index}.options")
+        return value
+
+    @model_validator(mode="before")
+    @classmethod
     def load_profile_defaults(cls, value):
         # Sparse profiles inherit missing dimensions, never a suite output ceiling.
         if not isinstance(value, dict):
@@ -2291,6 +2546,10 @@ class RunConfig(Model):
 
     @model_validator(mode="after")
     def validate_run(self) -> RunConfig:
+        if "gateway_policy" in self.checks and self.gateway_policy is not None and self.gateway_policy.supported:
+            for target in self.targets:
+                if any(user.identity not in target.test_identities for user in self.gateway_policy.users):
+                    raise ValueError("Every policy identity must be configured in each target's test_identities")
         if self.request_source == "request_pack":
             self.validate_request_pack_presence()
             if self.custom_fixtures:
@@ -2349,6 +2608,17 @@ class RunConfig(Model):
             if self.concurrency is not None and self.concurrency <= self.scale_down.long_cohort_size:
                 raise ValueError("scale_down requires a concurrency slot beyond its long cohort")
         self.resolve_concurrency()
+        if "multi_user" in self.checks and set(self.multi_user.scenarios) & {"arrivals", "recovery"}:
+            from giraffe.multi_user import _planned_observation
+            windows = _planned_observation(self.multi_user, include_offers=False)["windows"]
+            offers = sum(window.get("scheduled_offers", 0) for window in windows)*len(self.targets)
+            if offers > MAX_PLANNED_ARRIVALS:
+                raise PydanticCustomError("multi_user_offers",
+                    "Multi-user has {planned} total scheduled offers across population levels, phases and targets; "
+                    "the maximum is {maximum}. Reduce rates, durations, population levels or targets.",
+                    {"planned": offers, "maximum": MAX_PLANNED_ARRIVALS,
+                     "fields": ["multi_user.levels", "multi_user.arrivals.requests_per_second",
+                                "multi_user.recovery.sustained_requests_per_second", "targets"]})
         for check_id, options in self.test_options.items():
             if check_id not in CHECK_OPTION_FIELDS:
                 raise PydanticCustomError("check_options", f"unsupported test_options check: {check_id}",
@@ -2588,6 +2858,10 @@ class RunConfig(Model):
         result = handler(self)
         if "default_concurrency" not in self.model_fields_set:
             result.pop("default_concurrency", None)
+        if self.gateway_attribution is None:
+            result.pop("gateway_attribution", None)
+        if self.gateway_policy is None:
+            result.pop("gateway_policy", None)
         return result
 
     @field_serializer("limits")
@@ -2657,6 +2931,9 @@ class ConfigDraft(RunConfig):
 
 
 class RequestSpec(Model):
+    _gateway_access_credential_digest: bytes | None = PrivateAttr(default=None)
+    identity: str | None = Field(default=None, pattern=r"^[A-Za-z][A-Za-z0-9_-]{0,63}$",
+        description="Explicit gateway probe identity. Probes retain numeric response evidence, not response text.")
     condition_id: str | None = None
     fixture_id: str
     scenario: str
@@ -2680,6 +2957,13 @@ class RequestSpec(Model):
     requested_input_tokens: int | None = None
     requested_output_tokens: int | None = None
     workload: dict[str, Any] = Field(default_factory=dict)
+
+    @model_serializer(mode="wrap")
+    def serialize_optional_identity(self, handler):
+        result = handler(self)
+        if self.identity is None:
+            result.pop("identity", None)
+        return result
 
     @model_validator(mode="after")
     def validate_tool_expectation(self):
@@ -2732,8 +3016,46 @@ class EvaluationEvidence(PersistedModel):
         return _persisted_model_input(ToolExpectation, value)
 
 
+class GatewayResponseEvidence(PersistedModel):
+    _priority_model_group: str | None = PrivateAttr(default=None)
+    _response_cache_hit_reported: bool = PrivateAttr(default=False)
+    _saturation_bounds: tuple[Decimal, Decimal] | None = PrivateAttr(default=None)
+    _reported_saturation: tuple[Decimal, ...] = PrivateAttr(default=())
+    _model_tpm_unconfigured: bool = PrivateAttr(default=False)
+    _model_tpm: int | None = PrivateAttr(default=None)
+    _scoped_limits: dict[str, int | None] = PrivateAttr(default_factory=dict)
+    error_kind: Literal["authentication", "model_access", "rate_limit", "unknown"] | None = None
+    policy_rejection: Literal["key_rpm", "priority_pool", "model_capacity", "unknown"] | None = None
+    request_limit: int | None = Field(default=None, ge=0)
+    request_remaining: int | None = Field(default=None, ge=0)
+    token_limit: int | None = Field(default=None, ge=0)
+    token_remaining: int | None = Field(default=None, ge=0)
+    retry_after_seconds: float | None = Field(default=None, ge=0)
+    rate_limit_unit: Literal["requests", "tokens", "unknown"] | None = None
+    priority_matches: bool | None = None
+    limiter_version: Literal["v3"] | None = None
+    priority_request_limit: int | None = Field(default=None, ge=0)
+    model_rpm: int | None = Field(default=None, ge=0)
+    saturation_percent: float | None = Field(default=None, ge=0, le=100)
+
+
 class RequestRecord(PersistedModel):
+    identity: str | None = None
+    gateway_evidence: GatewayResponseEvidence | None = None
+
+    @model_serializer(mode="wrap")
+    def serialize_optional_evidence(self, handler):
+        result = handler(self)
+        for name in ("identity", "gateway_evidence", "requested_stream_logprobs", "requested_stream_usage"):
+            if getattr(self, name) is None:
+                result.pop(name, None)
+        return result
     _timing_started_monotonic: float | None = PrivateAttr(default=None)
+    _gateway_key_hash: str | None = PrivateAttr(default=None)
+    _gateway_terminal_usage: bool = PrivateAttr(default=False)
+    _gateway_access_routing_issue: str | None = PrivateAttr(default=None)
+    _gateway_access_refusal: bool = PrivateAttr(default=False)
+    _gateway_access_metered_reasoning: bool = PrivateAttr(default=False)
     _request_body_sent_monotonic: float | None = PrivateAttr(default=None)
     id: str
     target: str
@@ -2830,6 +3152,8 @@ class RequestRecord(PersistedModel):
     requested_input_tokens: int | None = None
     requested_output_tokens: int | None = None
     workload: dict[str, Any] = Field(default_factory=dict)
+    requested_stream_logprobs: StrictBool | None = None
+    requested_stream_usage: StrictBool | None = None
     answer_hash: str | None = None
     request_hash: str | None = None
     history_hash: str | None = None
@@ -3030,12 +3354,14 @@ class RunReport(PersistedModel):
         self._stored_derived = "performance" in self.model_fields_set
         if not (info.context or {}).get("metadata_only"):
             from .performance import build_performance
-            from .conditions import aggregate_conditions
+            from .conditions import aggregate_conditions, scheduled_multi_user_window
 
             missing = {"performance", "conditions"} - self.model_fields_set
             if "performance" in missing or self._stored_derived:
                 self.performance = build_performance(self)
-            if "conditions" in missing:
+            if "conditions" in missing or any(
+                    row.get("planned_kind") != "exact" and scheduled_multi_user_window(row.get("condition_id"))
+                    for row in self.conditions):
                 self.conditions = aggregate_conditions(self)
         return self
 
