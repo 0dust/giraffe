@@ -230,16 +230,18 @@ def test_budget_and_runtime_warning_sentences_are_readable_and_exact():
 
 
 @pytest.mark.parametrize("suite", ["quality", "responsiveness"])
-def test_ordinary_suites_learn_medium_ranges_from_five_small_runs(monkeypatch, suite):
+@pytest.mark.parametrize("seed_start", [0, 100])
+def test_ordinary_suites_learn_medium_ranges_from_five_small_runs(monkeypatch, suite, seed_start):
     checks = (["correctness", "json", "consistency"] if suite == "quality" else
               ["serving", "first_output", "generation", "correctness"])
     configured = RunConfig(targets=[TARGET], checks=checks)
 
     async def repeat():
         results = []
-        # Use a fixed consecutive sample, retaining the original first 20 cases.
+        # Keep all 200 consecutive seeds in two independently checked blocks so
+        # each test fits the CI watchdog, including with asyncio debug enabled.
         # Matching output allowances now pool the two serving fixtures together.
-        for seed in range(200):
+        for seed in range(seed_start, seed_start + 100):
             observations = {TARGET["name"]: []}
             for prior in range(5):
                 monkeypatch.setattr(runner, "LLMClient", recording_client(10000 + seed * 131 + (prior + 1) * 17,
