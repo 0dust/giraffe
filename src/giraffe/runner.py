@@ -674,7 +674,7 @@ class _Run:
                       *, slot_reserved=False, budget_reserved=False, deadline_override=None,
                       admission_deadline=None, prepared_admission=False, admission_check=None,
                       on_preparation_failure=None, budget_exempt=False, evaluate_record=None,
-                      finalize_record=None, request_parameters=None):
+                      finalize_record=None, request_parameters=None, lifecycle_observer=None):
         """Complete a request and persist its terminal evidence once.
 
         ``finalize_record`` synchronously adds scheduler-owned measurements before
@@ -843,9 +843,11 @@ class _Run:
                     deadline = asyncio.timeout(request_budget())
                 async with deadline:
                     if guard_transport:
-                        record = await client.execute(spec, first_output_event=event, _before_send=begin_attempt)
+                        record = await client.execute(spec, first_output_event=event, _before_send=begin_attempt,
+                            **({"lifecycle_observer": lifecycle_observer} if lifecycle_observer is not None else {}))
                     else:
-                        record = await client.execute(spec, first_output_event=event)
+                        record = await client.execute(spec, first_output_event=event,
+                            **({"lifecycle_observer": lifecycle_observer} if lifecycle_observer is not None else {}))
                 if token is None:
                     if record.status == "cancelled":
                         if task.cancelling() > cancellations:
@@ -1349,7 +1351,8 @@ async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attributio
         if reason and reason != "maximum request budget reached":
             run.unfinished[target.name].update(enabled)
             return
-        run.observations[target.name]["deployment"] = await deployment.snapshot(target, config, run.deadline, run.stop)
+        run.observations[target.name]["deployment"] = await deployment.snapshot(target, config, run.deadline, run.stop,
+                    **({"run_start": run.start} if "scale_down" in config.checks else {}))
         run.observations[target.name]["deployment"]["model_residency"] = {
             "before_preparation": run.preparation_residency.get(target.name, deployment.unknown_residency(target, "Initial observation unavailable.")),
             "after_preparation": deployment.unknown_residency(target, "Preparation did not reach the second observation."),
@@ -1608,6 +1611,10 @@ async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attributio
                 await run.group(target, client, probe_specs, "recovery",
                                 count=effective.samples, checks=["recovery"])
             run.finish_checks(target.name, {"recovery"})
+            if "scale_down" in enabled and config.scale_down.target == target.name:
+                from .scale_down import execute as execute_scale_down
+                await execute_scale_down(run, target, client, fixtures, collector_task=telemetry_task)
+                run.finish_checks(target.name, {"scale_down"})
             await workloads.execute(run, target, client, fixtures, defer_attribution=defer_attribution,
                                     defer_policy=defer_policy, defer_access=defer_access)
             run.finish_checks(target.name, enabled - {"gpu"})
@@ -1645,7 +1652,8 @@ async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attributio
             run.observations[target.name]["metrics"] = [_gpu_snapshot(snap) for snap in data["snapshots"]]
             current = run.observations[target.name]["deployment"]
             if current and (target.deployment.discovery != "none" or target.deployment.collector_url):
-                end = await deployment.snapshot(target, config, run.deadline, run.stop)
+                end = await deployment.snapshot(target, config, run.deadline, run.stop,
+                    **({"run_start": run.start} if "scale_down" in config.checks else {}))
                 run.observations[target.name]["deployment_history"].append(end)
                 observations = [current, *run.observations[target.name]["deployment_history"]]
                 initial_signature = deployment.observed_signature(current)
@@ -1877,6 +1885,11 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
     warm = [r for r in ordinary if r.scenario == "warm"]
     for check_id in CORE_CHECKS:
         title = CHECK_NAMES[check_id]
+        if check_id == "scale_down":
+            if check_id in run.config.checks:
+                from .scale_down import result as scale_down_result
+                result.append(scale_down_result(run, target))
+            continue
         if check_id == "load":
             from giraffe.load_test import result as load_result
             item = load_result(run, target) if check_id in run.config.checks else CheckResult(
@@ -2763,7 +2776,8 @@ def _verdict_summary(check, config, records, budget):
 
 
 async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | None = None,
-                    stop_event: asyncio.Event | None = None) -> RunReport:
+                    stop_event: asyncio.Event | None = None,
+                    on_scale_down_control: Callable | None = None) -> RunReport:
     from .local_tokenizer import ensure_tokenizers
     from .deployment import preparation_residency
     residency = config._preparation_residency
@@ -2774,7 +2788,7 @@ async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | Non
     with PhaseSampler("traffic") as sampler:
         try:
             return await _run_suite(config, progress=progress, stop_event=stop_event,
-                                    sampler=sampler, residency=residency)
+                                    sampler=sampler, residency=residency, on_scale_down_control=on_scale_down_control)
         except Exception:
             logger.exception("Unexpected suite failure")
             raise
@@ -2782,6 +2796,9 @@ async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | Non
             sampler.detach()
             if hasattr(sampler, "run"):
                 sampler.run.memory_sampling_done = True
+                control = getattr(sampler.run, "scale_down_control", None)
+                if control is not None and control.phase != "finished":
+                    control.set_phase("finished")
 
 
 async def _stop_judging(evaluation, run):
@@ -2810,7 +2827,7 @@ async def _stop_judging(evaluation, run):
             "duration_seconds": None, "stop_reason": "cancelled"}
 
 
-async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, residency) -> RunReport:
+async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, residency, on_scale_down_control=None) -> RunReport:
     """Run the built-in suite with one shared load budget and preserve partial evidence."""
     outer_cancellation = None
     suite_task = asyncio.current_task()
@@ -2842,9 +2859,18 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
     started_at, run_id = _now(), uuid.uuid4().hex
     run = _Run(config, progress, stop_event)
     run.run_id = run_id
+    sampler.run = run
+    if "scale_down" in config.checks:
+        from .scale_down import ScaleDownController
+        run.scale_down_control = ScaleDownController(run_id, config.scale_down.target,
+                                                     run_start=run.start, stop=run.stop)
+        run.scale_down_control.on_change = lambda status: run.emit(
+            "scale_down_updated", config.scale_down.target, "scale_down", scale_down={},
+            scale_down_snapshots=[], scale_down_control=status)
+        if on_scale_down_control:
+            on_scale_down_control(run.scale_down_control)
     run.preparation_residency = residency
     loop = asyncio.get_running_loop()
-    sampler.run = run
     run.rss_at_start_bytes = sampler.initial_rss_bytes
     samples = []
     def consume_samples():
@@ -2865,10 +2891,13 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
     fixtures = {key: [value] if isinstance(value, RequestSpec) else list(value)
                 for key, value in fixtures.items()}
     custom_hash = None
-    if config.custom_fixtures and "correctness" in config.checks:
+    if config.custom_fixtures and set(config.checks) & {"correctness", "scale_down"}:
         fixtures["correctness"].extend(load_custom_fixtures(config.custom_fixtures,
             legacy_max_output_tokens=config.legacy_custom_fixture_max_output_tokens))
         custom_hash = hashlib.sha256(Path(config.custom_fixtures).read_bytes()).hexdigest()
+    if "scale_down" in config.checks:
+        from .scale_down import resolve_fixtures
+        resolve_fixtures(config.scale_down, fixtures)
     sampler.sample()
     consume_samples()
 
@@ -3135,6 +3164,9 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
         from giraffe import gateway_json, gateway_policy, gateway_response
         workload_identity["gateway_policy_source_sha256"] = hashlib.sha256(b"".join(
             Path(module.__file__).read_bytes() for module in (gateway_policy, gateway_response, gateway_json))).hexdigest()
+    if "scale_down" in config.checks:
+        from giraffe import scale_down
+        workload_identity["scale_down_source_sha256"] = hashlib.sha256(Path(scale_down.__file__).read_bytes()).hexdigest()
     if "load" in config.checks:
         workload_identity["load_test_source_sha256"] = _load_test_workload_source_sha256()
     if "consistency" in config.checks and config.consistency and config.consistency.logprobs:

@@ -157,6 +157,14 @@ def parser() -> argparse.ArgumentParser:
     app.add_argument("--version", action="version", version=__version__)
     commands = app.add_subparsers(dest="command", required=True)
     commands.add_parser("describe", help="Print checks, defaults and the full configuration schema as JSON")
+    marker = commands.add_parser("mark-scale-down", help="Mark an external replica removal in an active run")
+    marker.add_argument("run_dir", type=Path)
+    marker.add_argument("--event-id", required=True)
+    marker.add_argument("--replica-id")
+    marker.add_argument("--source", default="operator")
+    marker.add_argument("--operator-at", help="Optional operator timestamp; retained separately from worker receipt time")
+    marker.add_argument("--wait-seconds", type=float, default=5)
+    marker.add_argument("--output-format", choices=["text", "json"], default="text")
     traces = commands.add_parser("sglang-traces", help="Collect local SGLang terminal traces (optional tracing extra)")
     traces.add_argument("--output", required=True, type=Path)
     traces.add_argument("--port", type=int, default=4318)
@@ -508,7 +516,8 @@ def _stage_name(scenario: str, config=None) -> str | None:
     return "Running checks"
 
 
-async def _run(config: RunConfig, *, json_progress: bool = False, verbose: bool = False, quiet: bool = False) -> RunReport:
+async def _run(config: RunConfig, *, json_progress: bool = False, verbose: bool = False, quiet: bool = False,
+               directory: Path | None = None) -> RunReport:
     from giraffe.runner import run_suite
 
     stop = asyncio.Event()
@@ -529,9 +538,12 @@ async def _run(config: RunConfig, *, json_progress: bool = False, verbose: bool 
             pass
     last = (None, None)
     last_update = 0.0
+    writer = adapter = sink_token = report = None
 
     def progress(event: dict) -> None:
         nonlocal last, last_update
+        if writer is not None:
+            writer.progress(event)
         if quiet:
             return
         if json_progress:
@@ -551,7 +563,22 @@ async def _run(config: RunConfig, *, json_progress: bool = False, verbose: bool 
             last_update = time.monotonic()
 
     try:
-        report = await run_suite(config, progress=progress, stop_event=stop)
+        options = {}
+        if directory is not None and "scale_down" in config.checks:
+            from giraffe.deployment import safe_config
+            from giraffe.evidence import EvidenceWriter
+            from giraffe.runner import record_sink
+            from giraffe.scale_down_control import ScaleDownFileControl
+
+            writer = EvidenceWriter(directory, manifest={"config": safe_config(config.model_dump(mode="json"))})
+            sink_token = record_sink.set(writer.record_finished)
+            adapter = ScaleDownFileControl(directory)
+            options["on_scale_down_control"] = adapter.bind
+        try:
+            report = await run_suite(config, progress=progress, stop_event=stop, **options)
+        except asyncio.CancelledError as error:
+            report = getattr(error, "giraffe_report", None)
+            raise
         if interrupted:
             # Cooperative signal stops return normally from the suite. Keep
             # their partial evidence on the same export path as task cancellation.
@@ -562,6 +589,27 @@ async def _run(config: RunConfig, *, json_progress: bool = False, verbose: bool 
     finally:
         for sig in installed:
             loop.remove_signal_handler(sig)
+        try:
+            if adapter is not None:
+                await adapter.close()
+        except Exception:
+            logger.exception("Scale-down status file could not be saved")
+            if report is not None:
+                report.warnings.append("Scale-down control status file could not be saved; inspect report evidence.")
+        finally:
+            if writer is not None:
+                from giraffe.runner import record_sink
+                record_sink.reset(sink_token)
+                try:
+                    await asyncio.to_thread(writer.close)
+                except Exception:
+                    logger.exception("CLI evidence writer could not finish")
+                    if report is not None:
+                        report.warnings.append("Live evidence journal could not finish; final report uses completed run state.")
+                if report is not None:
+                    report.observations["evidence_dropped_count"] = writer.dropped_count
+                    if writer.dropped_count:
+                        report.warnings.append(f"{writer.dropped_count} evidence records not written to evidence.jsonl")
 
 
 def _print_memory(resources: dict) -> None:
@@ -624,6 +672,21 @@ def _main(argv: list[str] | None = None) -> int:
         if arguments and arguments[0] in {"storage", "cleanup", "keep"}:
             replacement = {"storage": "list"}.get(arguments[0], arguments[0])
             print(f"Deprecated: giraffe {arguments[0]}; use giraffe runs {replacement}.", file=sys.stderr)
+        if args.command == "mark-scale-down":
+            from giraffe.scale_down_control import submit_marker
+            result = submit_marker(args.run_dir, event_id=args.event_id, replica_id=args.replica_id,
+                                   source=args.source, operator_at=args.operator_at, wait_seconds=args.wait_seconds)
+            exit_code = {"accepted": 0, "rejected": 1, "submitted_without_acknowledgment": 2}[result["outcome"]]
+            if json_output:
+                emit(result["outcome"], exit_code, acknowledgment=result["acknowledgment"])
+            else:
+                messages = {"accepted": "Removal marker accepted by the active run.",
+                    "rejected": "Removal marker rejected by the active run.",
+                    "submitted_without_acknowledgment": "Marker submitted without acknowledgment; inspect run status before retrying."}
+                print(messages[result["outcome"]])
+                if result["acknowledgment"] and result["acknowledgment"].get("reason"):
+                    print(result["acknowledgment"]["reason"])
+            return exit_code
         if args.command == "init":
             from giraffe.init_config import write_config
             write_config(args.output, engine=args.engine, url=args.url, force=args.force)
@@ -971,9 +1034,10 @@ def _main(argv: list[str] | None = None) -> int:
 
         async def run_with_partial_report():
             try:
-                report = await (_run(config, quiet=True) if getattr(args, "quiet", False) else
-                                _run(config, json_progress=True) if json_output else
-                                _run(config, verbose=True) if getattr(args, "verbose", False) else _run(config))
+                control = {"directory": directory} if "scale_down" in config.checks else {}
+                report = await (_run(config, quiet=True, **control) if getattr(args, "quiet", False) else
+                                _run(config, json_progress=True, **control) if json_output else
+                                _run(config, verbose=True, **control) if getattr(args, "verbose", False) else _run(config, **control))
             except asyncio.CancelledError as error:
                 report = getattr(error, "giraffe_report", None)
                 if report is None:
@@ -1025,7 +1089,8 @@ def _main(argv: list[str] | None = None) -> int:
             try:
                 with sampler:
                     json_path, html_path = write_report(report, directory, max_run_storage=args.max_run_storage,
-                                                       html=getattr(args, "html", False))
+                                                       html=getattr(args, "html", False),
+                                                       **({"preserve_evidence": True} if "scale_down" in config.checks else {}))
             except OSError as error:
                 logger.exception("CLI report export failed")
                 export_resources()

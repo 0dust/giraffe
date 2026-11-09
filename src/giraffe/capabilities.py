@@ -21,6 +21,7 @@ from giraffe.request_pack import INPUT_RETENTION_NOTICE, pack_settings
 
 CHECK_DESCRIPTIONS = {
     "gateway_attribution": "Does read-only gateway evidence attribute marked request and token usage to each test identity?",
+    "scale_down": "Do active answers survive an external replica removal, and can surviving replicas serve continued traffic?",
     "access": "Can Giraffe connect to your server and get an answer?",
     "serving": "Does the server return complete, valid answers without errors?",
     "first_output": "How long do users wait before an answer starts?",
@@ -42,6 +43,7 @@ CHECK_DESCRIPTIONS = {
 
 CHECK_DETAILS = {
     "gateway_attribution": "Opt-in LiteLLM spend-log checks using existing identity and observer credential references. Requests carry generated correlation markers. Missing, delayed, truncated or ambiguous evidence is inconclusive. Shared aggregate counters do not prove attribution. No gateway settings are changed.",
+    "scale_down": "Runs a streaming cohort and continuous bounded follow-up traffic around one externally marked removal. Reports continuity, backend draining and remaining capacity separately. Backend lifecycle evidence is required to confirm removal; missing attribution or incomplete coverage remains inconclusive. Giraffe never removes replicas.",
     "access": "Sends ordinary inference through your endpoint, network and authentication settings. Connect timeout is min(request_timeout_seconds * 0.9, 10) seconds, inside the request deadline. Connection, TLS, proxy and unsupported-protocol errors and HTTP 401/403 identify transport or authentication failures. Interrupted ordinary requests leave the check inconclusive. Capacity and sustained traffic are exempt; other stress traffic exempts timeouts/cancellation but keeps real transport failures.",
     "serving": "Checks ordinary requests for server errors, empty final answers, invalid formats, unfinished streams and timeouts. Length-finished empty output needs reasoning text, stripped inline reasoning or positive reasoning-token usage to qualify as budget exhaustion; otherwise it fails. Reasoning that exhausts the output budget without an answer is counted separately as reasoning_budget_exhausted, excluded from error_rate, and makes serving inconclusive; raise max_output_tokens. Run stops leave interrupted checks inconclusive. Capacity and sustained stages are exempt; other stress traffic exempts timeouts and intentional cancellation, while genuine HTTP/protocol failures still count.",
     "first_output": "Defaults to a 10,000 ms p95 acceptance limit; override with --first-output-ms or limits.first_output_ms. Measures the wait for final answer text on serial warm and generation requests, excluding inline and separate reasoning. Reports the cold first request separately. Requests with successful response headers that then fail or time out without output can establish a lower-bound violation. Concurrent correctness and other loaded traffic are excluded. Overlapping client scheduling delay makes affected timing inconclusive.",

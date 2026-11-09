@@ -128,6 +128,112 @@ async def test_answer_stream_counts_usage_and_preserves_finish(monkeypatch):
     assert received[0]["max_tokens"] == 7
 
 
+async def test_lifecycle_observer_reports_immutable_identity_and_real_stream_answer(monkeypatch):
+    from dataclasses import FrozenInstanceError
+
+    target = Target(name="local", url="http://local", model="test")
+    received = []
+    original = httpx.AsyncClient
+    chunks = [
+        b'data: {"id":"server-1","backend_id":"replica-B","choices":[{"delta":{"content":"42"},"finish_reason":null}]}\n\n',
+        event(" more"), event(finish="stop"), b"data: [DONE]\n\n",
+    ]
+    monkeypatch.setattr("giraffe.client.httpx.AsyncClient", lambda **kwargs: original(
+        transport=httpx.MockTransport(lambda _: httpx.Response(200,
+            headers={"x-replica-id": "replica-header", "content-type": "text/event-stream"},
+            stream=Chunks(chunks))), **kwargs))
+    async with LLMClient(target, RunConfig(targets=[target])) as client:
+        record = await client.execute(spec(), lifecycle_observer=received.append)
+    assert [item.kind for item in received] == ["started", "attribution", "attribution", "answer", "terminal"]
+    assert {item.request_id for item in received} == {record.id}
+    assert {item.target for item in received} == {"local"}
+    assert [item.monotonic_seconds for item in received] == sorted(item.monotonic_seconds for item in received)
+    assert received[1].backend_id == "replica-header"
+    assert received[2].server_request_id == "server-1"
+    assert received[2].backend_id == "replica-B"
+    assert received[-1].status == "completed" and received[-1].valid
+    assert received[-1].finish_reason == "stop" and received[-1].stream_terminated
+    with pytest.raises(FrozenInstanceError):
+        received[0].request_id = "changed"
+
+
+@pytest.mark.parametrize("content", ["empty", "split_reasoning", "open_reasoning", "tools"])
+async def test_lifecycle_observer_does_not_arm_without_streamed_answer(monkeypatch, content):
+    parts = {
+        "empty": [event(""), event(" "), event(reasoning="thinking")],
+        "split_reasoning": [event("<thi"), event("nk>private reasoning"), event("</think>")],
+        "open_reasoning": [event("<think>private reasoning")],
+        "tools": [tool_event({"tool_calls": [tool_call()]})],
+    }[content]
+    received = []
+    client, _, _ = setup_client(monkeypatch, [*parts, event(finish="stop"), b"data: [DONE]\n\n"])
+    async with client:
+        await client.execute(spec(), lifecycle_observer=received.append)
+    assert [item.kind for item in received] == ["started", "terminal"]
+
+
+async def test_lifecycle_observer_waits_for_answer_after_split_inline_reasoning(monkeypatch):
+    import asyncio
+
+    received = []
+    client, _, _ = setup_client(monkeypatch, [event("<thi"), event("nk>secret"), .02,
+        event("</think>"), .02, event("42"), event(finish="stop"), b"data: [DONE]\n\n"])
+    async with client:
+        task = asyncio.create_task(client.execute(spec(), lifecycle_observer=received.append))
+        await asyncio.sleep(.01)
+        assert [item.kind for item in received] == ["started"]
+        await task
+    assert [item.kind for item in received] == ["started", "answer", "terminal"]
+    assert received[1].monotonic_seconds - received[0].monotonic_seconds >= .03
+
+
+async def test_lifecycle_observer_does_not_arm_for_nonstream_answer(monkeypatch):
+    received = []
+    client, _, _ = setup_client(monkeypatch, stream=False, body={
+        "choices": [{"message": {"content": "42"}, "finish_reason": "stop"}]})
+    async with client:
+        record = await client.execute(spec(), lifecycle_observer=received.append)
+    assert record.valid
+    assert [item.kind for item in received] == ["started", "terminal"]
+    assert all(not item.stream for item in received)
+
+
+@pytest.mark.parametrize("termination", ["cancel", "timeout", "eof", "sse_error"])
+async def test_lifecycle_observer_preserves_partial_answer_and_one_terminal(monkeypatch, termination):
+    import asyncio
+
+    received = []
+    end = {"cancel": [.2], "timeout": [.2], "eof": [],
+           "sse_error": [b'event: error\ndata: {"error":"failed"}\n\n']}[termination]
+    client, response, _ = setup_client(monkeypatch, [event("42"), *end], timeout=.05)
+    signal = asyncio.Event()
+    async with client:
+        task = asyncio.create_task(client.execute(spec(), first_output_event=signal,
+                                                  lifecycle_observer=received.append))
+        await signal.wait()
+        if termination == "cancel":
+            task.cancel()
+        record = await task
+    assert [item.kind for item in received] == ["started", "answer", "terminal"]
+    assert received[-1].request_id == record.id and received[-1].status == record.status
+    assert received[-1].error == record.error and not received[-1].valid
+    assert record.output == "42" and response.closed
+
+
+async def test_lifecycle_observer_over_real_http_stream():
+    from tests.fake_endpoint import FakeEndpoint
+
+    received = []
+    with FakeEndpoint() as endpoint:
+        target = Target(name="local", url=endpoint.url, model="fake-model")
+        async with LLMClient(target, RunConfig(targets=[target])) as client:
+            record = await client.execute(spec(), lifecycle_observer=received.append)
+    assert record.valid
+    assert received[0].kind == "started" and received[-1].kind == "terminal"
+    assert len([item for item in received if item.kind == "answer"]) == 1
+    assert {item.request_id for item in received} == {record.id}
+
+
 class Chunks(httpx.AsyncByteStream):
     def __init__(self, chunks):
         self.parts = chunks

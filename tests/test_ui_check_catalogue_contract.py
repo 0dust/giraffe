@@ -20,6 +20,7 @@ NAMES = {
     'gateway_policy': 'Gateway quotas & priorities',
     'gateway_attribution': 'Gateway usage attribution',
     'gateway_access': 'Gateway access policy',
+    'scale_down': 'Scale-down continuity',
 }
 
 

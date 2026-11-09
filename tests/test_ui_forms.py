@@ -204,6 +204,7 @@ for(const preset of ['answers','concurrent','arrival','custom']){{
     assert.equal(controls.filter(input=>input.name===name).length,1,preset+': duplicate '+name);
   }}
   assert.deepEqual(controls.filter(input=>input.name==='check').map(input=>input.value).sort(),state.bootstrap.checks.map(check=>check.id).sort());
+  assert.equal(controls.filter(input=>input.name==='check').length,20);
   for(const name of ['max_requests','max_duration_seconds'])assert(controls.some(input=>input.name===name));
   if(preset==='concurrent'){{
     assert.equal((markup.match(/id="setup-dataset"/g)||[]).length,1);

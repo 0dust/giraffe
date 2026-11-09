@@ -194,16 +194,17 @@ def _comparison_manifest(manifest: dict) -> dict:
     return value
 
 
-_CONVERSATION_REVISIONS = {"persistent_users", "shared_conversations"}
+_CONVERSATION_REVISIONS = {"persistent_users", "shared_conversations", "scale_down_shared_conversations"}
 _COMPANION_REVISIONS = _CONVERSATION_REVISIONS | {
     "gateway_attribution", "gateway_conversations", "gateway_shared_first", "gateway_shared_targets_first",
     "gateway_policy", "policy_conversations", "policy_shared_first", "policy_shared_targets_first",
     "gateway_access", "gateway_access_policy", "access_conversations", "access_shared_first", "access_shared_targets_first",
     "policy_after_shared_workloads", "policy_after_all_shared_targets", "access_after_shared_workloads",
-    "access_deferred_policy", "access_after_all_shared_targets",
+    "access_deferred_policy", "access_after_all_shared_targets", "scale_down_gateway_access",
 }
 # Access changed optional dispatch after the shared workloads in these revisions.
-_MULTI_USER_COMPANION_REVISIONS = {"policy_after_all_shared_targets", "access_after_all_shared_targets"}
+_MULTI_USER_COMPANION_REVISIONS = {"policy_after_all_shared_targets", "access_after_all_shared_targets",
+                                   "scale_down_gateway_access"}
 _CONVERSATION_BRIDGE_CHECKS = {"prefix", "sessions", "consistency"}
 _CONVERSATION_LOAD_SOURCE = "9b694c97a39d449d8ea15b09a9aeb406bf835179c0882827685c4d7888687d36"
 _ACCESS_CONVERSATION_SOURCE = "9ff9179300b4012552a7bd6fd6ef0ae60c016b9023dba33ffabc9ca03783ac2d"
@@ -240,6 +241,8 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str, include_load
         resolved = RunConfig.model_validate({**config, "max_requests": None, "max_duration_seconds": None})
     except ValidationError:
         return None
+    if revision == "scale_down_registration" and not set(resolved.checks) <= {"sessions", "consistency"}:
+        return None
     fields = _baseline_workload_fields(resolved.checks, shared=shared)
     has_multi_user = "multi_user" in fields
     if has_multi_user and revision not in _MULTI_USER_COMPANION_REVISIONS:
@@ -249,9 +252,9 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str, include_load
         checks = set(resolved.checks)
         if shared:
             checks -= SHARED_BASELINE_EXCLUDED_WORKLOADS
-        if not checks <= _CONVERSATION_BRIDGE_CHECKS.union(CORE_CHECKS, {"tools"}):
+        if not checks <= _CONVERSATION_BRIDGE_CHECKS.union(set(CORE_CHECKS) - {"scale_down"}, {"tools"}):
             return None
-    if revision in {"issue45", "issue95", "issue95_pauses", "issue95_pause_evidence"} | _COMPANION_REVISIONS:
+    if revision in {"issue45", "issue95", "issue95_pauses", "issue95_pause_evidence", "scale_down_registration"} | _COMPANION_REVISIONS:
         unchanged_fields = {"sessions", "consistency"}
         if revision == "issue95_pause_evidence" or revision in _COMPANION_REVISIONS:
             # Optional user/gateway dispatch changed the shared file; these
@@ -310,6 +313,13 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str, include_load
             "access_after_all_shared_targets": "67da297a94f8a07f9ab21008c9c6ca87090a7fac3d30e4ff9a543e7491427667",
             "policy_after_shared_workloads": "49dcdfb6b173a93720e4e9e5a9bc54ffcea7580346d2ea0210e600e0779a03e6",
             "policy_after_all_shared_targets": "e4ddc7a7e8563f9ab3bba2fc42ad0232ee924c65f67d92dafd89c21025d202d0",
+            # Only scale-down registration differs from access_after_all_shared_targets.
+            "scale_down_gateway_access": "2c5cfa60063bd236302582d25e7fe37e7807b829f487168cd09407d37bd60e6e",
+            # Only the scale-down registry entry changed; session and text
+            # consistency request construction remains identical.
+            "scale_down_registration": "7c5a71d2036dc04a2fbbcaacfd8c55b07d1297b35c56ab79a21e04906d7fe8d0",
+            # The merged generator adds only scale-down registration to shared conversations.
+            "scale_down_shared_conversations": "48f32dc6cf3b56f8b9a275bdc0401b31ba71ea5084a09e237321039bc468613e",
         }[revision] if any(settings.values()) else None,
         "settings": settings,
     }
@@ -317,7 +327,9 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str, include_load
         identity.update(_multi_user_workload_identity())
     if (exact_conversation or has_multi_user) and "load" in resolved.checks:
         identity["load_test_source_sha256"] = (
-            _load_test_workload_source_sha256() if has_multi_user else _CONVERSATION_LOAD_SOURCE)
+            _load_test_workload_source_sha256() if has_multi_user else
+            "df3b7bbf30cab87d2e8c1c6dab8819f9cfe592b181407caa7c32af4c5f720cd4"
+            if revision == "scale_down_shared_conversations" else _CONVERSATION_LOAD_SOURCE)
     if sampled_sessions:
         identity["session_sampling_source_sha256"] = {
             "persistent_users": "2fab1370faeab7ddb91a7ae9c0e49520ee9a67e305441a0663877bb12bca24c3",
@@ -340,6 +352,8 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str, include_load
             "access_after_all_shared_targets": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
             "policy_after_shared_workloads": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
             "policy_after_all_shared_targets": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
+            "scale_down_gateway_access": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
+            "scale_down_shared_conversations": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
         }[revision]
     if "concurrency" in resolved.checks:
         identity["concurrent_load_source_sha256"] = {
@@ -381,6 +395,9 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str, include_load
             "access_after_all_shared_targets": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
             "policy_after_shared_workloads": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
             "policy_after_all_shared_targets": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
+            "scale_down_gateway_access": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
+            "scale_down_registration": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
+            "scale_down_shared_conversations": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
         }[revision]
     if "tools" in resolved.checks:
         from .tool_checks import resolved_tool_fixtures, resolved_tool_modes
@@ -402,7 +419,7 @@ def _same_run_limits_workload(current: dict, old: dict, *, fingerprint_key: str 
     shared = fingerprint_key == "shared_workload_fixture_sha256"
     matched_revisions = []
     for manifest in (current, old):
-        revisions = ({"phase2", "phase3", "review26", "caps26", "issue45", "issue95", "issue95_pauses", "issue95_pause_evidence"}
+        revisions = ({"phase2", "phase3", "review26", "caps26", "issue45", "issue95", "issue95_pauses", "issue95_pause_evidence", "scale_down_registration"}
                      | _COMPANION_REVISIONS) if "config_version" in manifest.get("config", {}) else {"legacy"}
         fingerprint = manifest.get("fixture_pack", {}).get(fingerprint_key)
         matched = {revision for revision in revisions
@@ -428,7 +445,8 @@ def _same_run_limits_workload(current: dict, old: dict, *, fingerprint_key: str 
 
 def _same_load_workload(current: dict, old: dict, *, fingerprint_key: str = "workload_fixture_sha256") -> bool:
     """Attest unchanged Load dispatch within exact source-equivalence groups."""
-    revisions = ("shared_conversations", "gateway_conversations",
+    revisions = ("shared_conversations", "scale_down_shared_conversations", "scale_down_gateway_access",
+                 "gateway_conversations",
                  "gateway_shared_first", "gateway_shared_targets_first",
                  "policy_conversations", "policy_shared_first", "policy_shared_targets_first",
                  "policy_after_shared_workloads", "policy_after_all_shared_targets",
@@ -2598,7 +2616,7 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
         qualified_user_probes = {row["scenario"] for row in user_rows if row.get("timing_exposure_qualified")}
         # Optional observations and checks without inference/acceptance cohorts
         # do not participate in baseline verdicts or sample-collection guidance.
-        non_request_checks = {"gpu"}
+        non_request_checks = {"gpu", "scale_down"}
         non_verdict_checks = non_request_checks | {
             check.id for run in (report, baseline) for check in run.checks
             if check.target == name and not check.required
@@ -2867,6 +2885,9 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
         load_failures = [row for row in (load_tests or {}).get("points", []) if row["status"] == "fail"]
         point_count = sum(row["status"] in {"pass", "fail"}
                           for row in (traffic or {}).get("stages", []) + (load_tests or {}).get("points", []))
+        if any(check.id == "scale_down" and check.target == name and check.status != "skipped"
+               for run in (report, baseline) for check in run.checks):
+            target_reasons.append("Automatic scale-down comparison is unsupported: separate external removals are not interchangeable traffic measurements.")
         verdict_reasons = access_reasons if access_only and current_access else target_reasons
         if failures or traffic_failures or load_failures:
             status = "fail"
@@ -4052,6 +4073,61 @@ def _check_timing_violation_ids(check: CheckResult) -> set[str]:
     return {rid for source in sources if isinstance(source, list) for rid in source if isinstance(rid, str)}
 
 
+_SCALE_DOWN_LABELS = {"continuity": "Client-visible continuity", "drain": "Backend drain semantics", "capacity": "Remaining capacity"}
+
+
+def _scale_down_html(check, report, anchors):
+    evidence = report.observations.get("targets", {}).get(check.target, {}).get("scale_down", {})
+    def links(ids):
+        return " ".join(f'<a href="#{anchors[rid]}">{_e(rid)}</a>' if rid in anchors else _e(rid) for rid in ids)
+    parts = ['<h4>Scale-down results</h4><table><tr><th>Result</th><th>Status</th><th>Evidence</th></tr>']
+    for key, label in _SCALE_DOWN_LABELS.items():
+        result = check.metrics.get("results", {}).get(key, {})
+        parts.append(f'<tr><td>{label}</td><td>{_badge(result.get("status", "inconclusive"))}</td>'
+                     f'<td>{_e(result.get("summary", "No result recorded."))}<p>{links(result.get("request_ids", []))}</p>'
+                     f'<p>{_e("; ".join(result.get("limitations", [])))}</p>'
+                     f'<p>Evidence IDs: {_e(", ".join(result.get("evidence_ids", [])))}</p></td></tr>')
+    parts.append('</table><details><summary>Event timeline</summary><p>Operator intent is not backend confirmation. '
+                 'Runner offsets and source clocks are separate; rows do not establish ordering across clocks.</p>')
+    marker = evidence.get("marker")
+    if marker:
+        parts.append(f'<p>Operator marker {_e(marker.get("event_id"))} · {_e(marker.get("source"))} · '
+                     f'intended replica {_e(marker.get("replica_id"))} · operator time {_e(marker.get("operator_at"))} · '
+                     f'runner receipt {_e(evidence.get("marker_received_ms"))} ms · '
+                     f'accepted {_e(evidence.get("marker_accepted_ms"))} ms</p>')
+    parts.append(f'<p>Runner offsets (ms): armed {_e(evidence.get("armed_ms"))}; '
+                 f'post window {_e(evidence.get("post_started_ms"))}–{_e(evidence.get("post_ended_ms"))}.</p>')
+    for name, label in (("baseline_request_ids", "Baseline"), ("long_request_ids", "Active answer cohort"), ("followup_request_ids", "Follow-up traffic")):
+        parts.append(f'<p>{label}: {links(evidence.get(name, []))}</p>')
+    parts.append('<table><tr><th>Request</th><th>Outcome</th><th>Dispatch offset (ms)</th>'
+                 '<th>First answer offset (ms)</th><th>Completion offset (ms)</th></tr>')
+    for record in report.requests:
+        if record.target == check.target and "scale_down" in record.check_ids:
+            parts.append(f'<tr><td>{links([record.id])}</td><td>{_e(record.status)} · {_e(record.finish_reason)} · '
+                         f'stream terminated: {_e(record.stream_terminated)}</td><td>{_e(record.dispatch_ms)}</td>'
+                         f'<td>{_e(evidence.get("answer_started_ms", {}).get(record.id))}</td><td>{_e(record.completed_ms)}</td></tr>')
+    parts.append('</table>')
+    seen = set()
+    for snapshot in evidence.get("snapshots", []):
+        export = snapshot.get("export", {})
+        parts.append(f'<h5>Source {_e(export.get("source"))} · clock {_e(export.get("clock_id"))}</h5>'
+                     f'<p>Collected in runner interval {_e(snapshot.get("collected_start_ms"))}–{_e(snapshot.get("collected_end_ms"))} ms; '
+                     f'mapped capture {_e(snapshot.get("capture_start_ms"))}–{_e(snapshot.get("capture_end_ms"))} ms; '
+                     f'source capture {_e(export.get("captured_at"))}; uncertainty {_e(export.get("clock_uncertainty_ms"))} ms.</p><ul>')
+        for event in export.get("events", []):
+            identity = (export.get("source"), export.get("clock_id"), json.dumps(event, sort_keys=True))
+            if identity in seen:
+                continue
+            seen.add(identity)
+            parts.append(f'<li>{_e(event.get("event_id"))}: {_e(event.get("kind"))} · sequence {_e(event.get("sequence"))} · '
+                         f'source time {_e(event.get("time_ms"))} ms · replica {_e(event.get("replica_id"))} · '
+                         f'attempt {_e(event.get("attempt_id"))} · outcome {_e(event.get("outcome"))} '
+                         f'{links([event["request_id"]]) if event.get("request_id") else ""}</li>')
+        parts.append(f'</ul><details><summary>Inventory and coverage</summary><pre>{_json({"inventories": export.get("inventories", []), "coverage": export.get("coverage", [])})}</pre></details>')
+    parts.append(f'<p>{_e("; ".join(evidence.get("limitations", [])))}</p></details>')
+    return "".join(parts)
+
+
 def _render(report: RunReport) -> str:
     from .performance import build_performance, refresh_performance
     from .performance_html import STYLE, render_performance
@@ -4155,6 +4231,8 @@ def _render(report: RunReport) -> str:
                             for rid in check.evidence_ids if rid in anchors)
         metrics = (f'<details><summary>Measurements</summary><pre>{_json(check.metrics)}</pre></details>'
                    if check.metrics else "")
+        if check.id == "scale_down":
+            metrics = _scale_down_html(check, report, anchors) + metrics
         if check.id == "load":
             metrics = _load_test_html(check.metrics) + metrics
         if check.id == "concurrency" and "load_types" in check.metrics:
@@ -4529,9 +4607,12 @@ def reproduction_export(report: RunReport) -> dict:
                                if check.id == "multi_user" and check.metrics.get("multi_user")}}
                if any(check.id == "multi_user" and check.metrics.get("multi_user") for check in retained.checks) else {}),
             "deployments": {name: obs.get("deployment") for name, obs in retained.observations.get("targets", {}).items()},
+            "scale_down_history": {name: obs["scale_down"] for name, obs in retained.observations.get("targets", {}).items() if "scale_down" in obs},
             "deployment_history": {name: obs.get("deployment_history", []) for name, obs in retained.observations.get("targets", {}).items()},
             "instructions": ["Supply secret environment-variable references locally.",
                 "Match suite and fixture hashes; supply any local fixture/metadata files.",
                 "Verify unknown server settings manually. This export cannot recreate inaccessible server state.",
                 "Imported launch arguments describe intent and are never executed by this export.",
-                "A saved failed run is a reference, not an approved deployment."]}
+                "A saved failed run is a reference, not an approved deployment."] +
+                (["Scale-down history is evidence only. A new run creates a fresh nonce and requires a new external removal marker."]
+                 if any("scale_down" in obs for obs in retained.observations.get("targets", {}).values()) else [])}

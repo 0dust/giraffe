@@ -195,6 +195,8 @@ def test_describe_has_full_authoritative_schema_without_traffic(monkeypatch, cap
     assert next(check for check in result["checks"] if check["id"] == "gateway_access")["optional"]
     assert "GatewayAccess" in result["config_schema"]["$defs"]
     assert any(check["id"] == "gateway_attribution" for check in result["checks"])
+    assert len(result["checks"]) == 20
+    assert any(check["id"] == "scale_down" for check in result["checks"])
     assert "runtime availability" in result["validation_note"]
 
 

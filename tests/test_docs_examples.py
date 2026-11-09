@@ -149,3 +149,30 @@ def test_sglang_example_uses_default_port_and_metrics_profile():
     assert target.url == 'http://127.0.0.1:30000/v1'
     assert target.metrics_profile == 'sglang'
     assert 'examples/sglang.yaml' in README
+
+
+def test_scale_down_example_resolves_existing_fixtures_and_keeps_followup_capacity():
+    from giraffe.fixtures import builtin_fixtures
+    from giraffe.models import required_concurrency
+    from giraffe.scale_down import resolve_fixtures
+
+    values = yaml.safe_load((ROOT / 'examples' / 'scale-down.yaml').read_text())
+    config = RunConfig.model_validate(values)
+    long, followup = resolve_fixtures(config.scale_down, builtin_fixtures(config))
+    assert long.fixture_id == config.scale_down.long_fixture
+    assert followup.fixture_id == config.scale_down.followup_fixture
+    assert required_concurrency(config)['peak'] > config.scale_down.long_cohort_size
+    assert config.scale_down.max_duration_seconds <= config.max_duration_seconds
+
+
+def test_documented_scale_down_custom_fixtures_load_with_existing_scorers(tmp_path):
+    from giraffe.fixtures import load_custom_fixtures
+
+    workloads = (ROOT / 'docs' / 'workloads.md').read_text()
+    section = workloads.split('## Scale-down continuity\n', 1)[1]
+    block = re.search(r'```json\n(.*?)```', section, re.DOTALL).group(1)
+    path = tmp_path / 'representative.json'
+    path.write_text(block)
+    fixtures = load_custom_fixtures(str(path))
+    assert [(fixture.fixture_id, fixture.scorer) for fixture in fixtures] == [
+        ('representative.long', 'contains'), ('representative.short', 'exact')]

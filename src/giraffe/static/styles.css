@@ -1348,6 +1348,7 @@ details.connection-row > .row-control .form-field > .field-label { display: flex
 @media (max-width: 600px) { .storage-line { align-items: flex-start; flex-direction: column; } }
 
 .resource-summary { margin: 24px 0; padding: 20px; display: grid; gap: 12px; }
+#scale-down-control { padding:20px; display:grid; gap:12px; }
 .resource-summary h2 { font-size: 18px; }
 .resource-summary .metric dd { font-size: 18px; }
 
@@ -1683,6 +1684,9 @@ main > #report-results { padding-top:20px; }
 .multi-user-results { min-width:0; padding:14px 0 20px; }
 .multi-user-results > .check-observations { padding:14px 0 20px; }
 .multi-user-results .metric-table { max-width:100%; overflow-x:auto; }
+.scale-down-results { min-width:0; max-width:100%; }
+.scale-down-results .request-table-scroll, .scale-down-results pre { max-width:100%; overflow-x:auto; }
+.scale-down-results .text-button { overflow-wrap:anywhere; }
 .finding-check-heading { display:flex; justify-content:space-between; gap:12px; align-items:center; }
 .finding-check-heading h2 { margin:0; font-size:15px; }
 .finding-check-heading button { text-align:left; font:inherit; }
@@ -1701,6 +1705,7 @@ main > #report-results { padding-top:20px; }
 .finding-expanded { margin-top:14px; border-top:1px solid var(--line); }
 .passed-checks > summary, .checks-not-selected > summary, .run-diagnostics > summary, .preparation-status > summary { padding:8px 0; cursor:pointer; color:var(--text-2); font-size:12px; }
 .passed-checks .finding-check { margin-top:8px; }
+.passed-checks { min-width:0; }
 .preparation-status { margin:4px 0; }
 .run-diagnostics { margin-top:20px; }
 .baseline-delta { margin:8px 0; font-size:13px; }

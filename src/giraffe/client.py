@@ -8,6 +8,7 @@ import codecs
 import json
 import hashlib
 from contextlib import aclosing
+from dataclasses import dataclass
 from http.cookiejar import CookieJar
 import os
 import re
@@ -16,7 +17,7 @@ import time
 import uuid
 from time import monotonic
 from datetime import datetime, timezone
-from typing import Any, AsyncIterator, Callable
+from typing import Any, AsyncIterator, Callable, Literal
 
 import httpx
 
@@ -46,6 +47,25 @@ _REASONING_TAG_PREFIX = re.compile("|".join(sorted(_REASONING_TAG_PREFIXES)), re
 _MAX_REASONING_TAG_PREFIX = max(map(len, _REASONING_TAG_PREFIXES))
 _SURROGATE = re.compile(r"[\ud800-\udfff]")
 REASONING_BUDGET_ERROR = "reasoning exhausted the output budget before an answer"
+
+
+@dataclass(frozen=True)
+class RequestLifecycleEvent:
+    """Transport observation; terminal scoring and run limits belong to the runner."""
+
+    kind: Literal["started", "answer", "attribution", "terminal"]
+    request_id: str
+    target: str
+    monotonic_seconds: float
+    stream: bool
+    backend_id: str | None = None
+    server_request_id: str | None = None
+    status: str | None = None
+    valid: bool | None = None
+    error: str | None = None
+    finish_reason: str | None = None
+    stream_terminated: bool | None = None
+    termination_reason: str | None = None
 
 
 def no_response_failure(record: RequestRecord, *, include_timeouts=True) -> bool:
@@ -529,15 +549,18 @@ class LLMClient:
 
     async def execute(
         self, spec: RequestSpec, *, first_output_event: asyncio.Event | None = None,
+        lifecycle_observer: Callable[[RequestLifecycleEvent], None] | None = None,
         _before_send: Callable[[], None] | None = None,
     ) -> RequestRecord:
         from .identities import identity_scope
         with identity_scope(spec.identity is not None):
-            return await self._execute(spec, first_output_event=first_output_event, _before_send=_before_send)
+            return await self._execute(spec, first_output_event=first_output_event,
+                                       lifecycle_observer=lifecycle_observer, _before_send=_before_send)
 
     async def _execute(
         self, spec: RequestSpec, *, first_output_event: asyncio.Event | None = None,
         _before_send: Callable[[], None] | None = None,
+        lifecycle_observer: Callable[[RequestLifecycleEvent], None] | None = None,
     ) -> RequestRecord:
         if self._client is None:
             raise RuntimeError("Use LLMClient as an async context manager")
@@ -670,6 +693,63 @@ class LLMClient:
         logprob_collector = LogprobCollector(spec.workload["top_logprobs"], self.logprob_budget) if spec.workload.get("logprobs") and stream else None
         assistant_content_present = False
         assistant_extras: dict[str, list[str]] = {}
+        answer_observed = False
+        answer_tail = ""
+        reasoning_stack: list[str] = []
+        lifecycle_attribution = (None, None)
+
+        def observe(kind):
+            if lifecycle_observer is not None:
+                terminal = kind == "terminal"
+                lifecycle_observer(RequestLifecycleEvent(
+                    kind=kind, request_id=record.id, target=record.target,
+                    monotonic_seconds=monotonic(), stream=stream,
+                    backend_id=record.backend_id, server_request_id=record.server_request_id,
+                    status=record.status if terminal else None,
+                    valid=record.valid if terminal else None,
+                    error=record.error if terminal else None,
+                    finish_reason=record.finish_reason if terminal else None,
+                    stream_terminated=record.stream_terminated if terminal else None,
+                    termination_reason=record.termination_reason if terminal else None))
+
+        def observe_attribution():
+            nonlocal lifecycle_attribution
+            current = (record.backend_id, record.server_request_id)
+            if lifecycle_observer is not None and current != lifecycle_attribution:
+                lifecycle_attribution = current
+                observe("attribution")
+
+        def observe_answer(text):
+            nonlocal answer_observed, answer_tail
+            if lifecycle_observer is None or answer_observed or not stream:
+                return
+            # Parse only new content, retaining at most one incomplete tag. Do
+            # not rescan an ever-growing reasoning response on every token.
+            text = answer_tail + text
+            answer_tail = ""
+            last_open = text.rfind("<")
+            if last_open >= 0 and any(tag.startswith(text[last_open:].lower()) for tag in (
+                "<think>", "</think>", "<thinking>", "</thinking>",
+                "<reasoning>", "</reasoning>")):
+                answer_tail, text = text[last_open:], text[:last_open]
+            cursor = 0
+            useful = False
+            for tag in _REASONING_TAG.finditer(text):
+                if not reasoning_stack and text[cursor:tag.start()].strip():
+                    useful = True
+                name = tag[2].lower()
+                if not tag[1]:
+                    reasoning_stack.append(name)
+                elif reasoning_stack and reasoning_stack[-1] == name:
+                    reasoning_stack.pop()
+                elif not reasoning_stack:
+                    useful = False  # Closing prompt-opened reasoning.
+                cursor = tag.end()
+            if not reasoning_stack and text[cursor:].strip():
+                useful = True
+            if useful and not reasoning_stack:
+                answer_observed = True
+                observe("answer")
 
         def stream_body_received(size):
             nonlocal read_id
@@ -768,6 +848,7 @@ class LLMClient:
             backend = data.get("backend_id")
             if isinstance(backend, str) and backend:
                 record.backend_id = backend
+            observe_attribution()
             usage = data.get("usage")
             completion_tokens = reasoning_tokens = None
             if isinstance(usage, dict):
@@ -942,6 +1023,8 @@ class LLMClient:
                     # Missing usage on a later content event invalidates this boundary.
                     content_reads[-1] = (content_reads[-1][0], now, read_id, completion_tokens, reasoning_tokens)
                 record.output += answer
+                if streaming:
+                    observe_answer(answer)
                 if answer.strip():
                     if record.first_output_ms is None:
                         record.first_output_ms = (now - start) * 1000
@@ -982,6 +1065,7 @@ class LLMClient:
                       spec.cancel_after_ms / 1000 if spec.cancel_after_ms else float("inf"))
         transport_started = _before_send is None
         try:
+            observe("started")
             async with asyncio.timeout(None if _before_send is not None else timeout) as request_deadline:
                 request = self._client.build_request(
                     "POST", completion_url(self.target.url), json=payload,
@@ -1039,6 +1123,7 @@ class LLMClient:
                     record.backend_id = response.headers.get("x-backend-id") or response.headers.get(
                         "x-replica-id",
                     )
+                    observe_attribution()
                     if not 200 <= response.status_code < 300:
                         error_body = await _limited_body(response, on_body=body_received)
                         if access_probe and response.status_code in (401, 403):
@@ -1350,6 +1435,7 @@ class LLMClient:
                 if record.workload.get("equality") == "whitespace":
                     answer = " ".join(answer.split())
                 record.answer_hash = hashlib.sha256(answer.encode()).hexdigest()
+            observe("terminal")
             if spec.identity is not None:
                 from .identities import discard_identity_response
                 discard_identity_response(record)

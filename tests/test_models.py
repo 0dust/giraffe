@@ -266,3 +266,42 @@ def test_legacy_migration_preserves_whether_parallelism_was_requested(legacy, ex
     assert config.default_concurrency == 4
     assert config.parallelism_requested('correctness') == explicit
     assert ('default_concurrency' in config.model_dump(mode='json')) == explicit
+
+
+@pytest.mark.parametrize("changes", [
+    {"concurrency": 1}, {"long_cohort_size": 3, "concurrency": 3},
+    {"long_cohort_size": 1, "min_overlap_samples": 2},
+    {"requests_per_second": float("nan")}, {"post_seconds": float("inf")},
+    {"event_timeout_seconds": 0}, {"grace_seconds": -1},
+])
+def test_scale_down_config_rejects_unbounded_or_starved_scenarios(changes):
+    from giraffe.models import ScaleDownConfig
+    with pytest.raises(ValidationError):
+        ScaleDownConfig(target="service", **changes)
+
+
+def test_scale_down_settings_are_optional_and_round_trip():
+    from giraffe.models import ScaleDownConfig
+    target = Target(name="service", url="http://localhost", model="model")
+    assert RunConfig(targets=[target]).scale_down is None
+    config = RunConfig(targets=[target], checks=["serving"], scale_down=ScaleDownConfig(target="service"))
+    assert RunConfig.model_validate(config.model_dump()).scale_down == config.scale_down
+
+
+def test_scale_down_arrival_bound_includes_baseline_samples():
+    from giraffe.models import ScaleDownConfig
+    # 99,999 follow-ups plus one long request already consume the finite cap.
+    with pytest.raises(ValueError, match='maximum planned arrivals'):
+        ScaleDownConfig(target='service', requests_per_second=9999.9, long_cohort_size=1,
+                        baseline_timeout_seconds=1, event_timeout_seconds=7,
+                        grace_seconds=1, post_seconds=1)
+
+
+def test_scale_down_selection_requires_a_bound_target_and_config():
+    target = dict(name='service', url='http://localhost/v1', model='test')
+    for settings in (None, dict(target='missing')):
+        with pytest.raises(ValueError, match='scale_down'):
+            RunConfig(targets=[target], checks=['scale_down'], scale_down=settings)
+    # Merely retaining scenario settings does not select the external exercise.
+    cfg = RunConfig(targets=[target], scale_down=dict(target='service'))
+    assert 'scale_down' not in cfg.checks
