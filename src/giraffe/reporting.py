@@ -17,7 +17,7 @@ import random
 import re
 import shutil
 import tempfile
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import ValidationError
 
@@ -492,10 +492,13 @@ def _metric_values(records: list[RequestRecord]) -> dict[str, list[float]]:
 def _output_work(records: list[RequestRecord]) -> dict[str, Any]:
     completed = [r for r in records if r.status == "completed" and r.valid]
     tokens = [r.output_tokens for r in completed if r.output_tokens is not None]
+    output_chars = [r.output_chars for r in completed]
     return {
         "valid_completions": len(completed),
-        "output_chars_p50": median([r.output_chars for r in completed]) if completed else None,
+        "output_chars_p50": median(output_chars) if output_chars else None,
+        "output_chars_p95": percentile(output_chars, .95) if output_chars else None,
         "reported_output_tokens_p50": median(tokens) if tokens else None,
+        "reported_output_tokens_p95": percentile(tokens, .95) if tokens else None,
         "reported_token_samples": len(tokens),
     }
 
@@ -517,8 +520,15 @@ def _output_observations(check, scenario, current_work, old_work):
     return observations
 
 
-def _different_output_work(current: dict[str, Any], old: dict[str, Any], threshold: float) -> bool:
-    for key in ("output_chars_p50", "reported_output_tokens_p50"):
+def _different_output_work(
+    current: dict[str, Any], old: dict[str, Any], threshold: float,
+    *, aggregation: Literal["median", "p95"] = "median",
+) -> bool:
+    suffix = "p95" if aggregation == "p95" else "p50"
+    for key in (f"output_chars_{suffix}", f"reported_output_tokens_{suffix}"):
+        sample_key = "valid_completions" if key.startswith("output_chars_") else "reported_token_samples"
+        if aggregation == "p95" and min(current[sample_key], old[sample_key]) < _P95_MIN_SAMPLES:
+            continue
         c, b = current[key], old[key]
         if c is not None and b is not None and c != b:
             if b == 0 or abs(c - b) * 100 / b > threshold:
@@ -1187,7 +1197,6 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                     for output in outputs:
                         output["load_point"] = load_point
                 observed_outputs.extend(outputs)
-                different_work = _different_output_work(current_work, old_work, threshold)
                 current_inputs = [r.input_tokens for r in current_records if r.valid and r.input_tokens is not None]
                 old_inputs = [r.input_tokens for r in old_records if r.valid and r.input_tokens is not None]
                 input_work_changed = bool(current_inputs and old_inputs and median(old_inputs)>0 and abs(median(current_inputs)-median(old_inputs))*100/median(old_inputs)>threshold)
@@ -1196,6 +1205,9 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                     if not values and not old_metrics[metric]:
                         continue
                     base_metric = metric.removesuffix("_p95_ms") + "_ms" if metric.endswith("_p95_ms") else metric
+                    aggregation = "p95" if metric.endswith("_p95_ms") else "median"
+                    different_work = _different_output_work(
+                        current_work, old_work, threshold, aggregation=aggregation)
                     row = _compare_metric(metric, values, old_metrics[metric],
                                           1 if check == "access" and metric in {"valid_completion_rate", "error_rate"}
                                           else max(minimum, _P95_MIN_SAMPLES) if metric.endswith("_p95_ms") else minimum,
@@ -1209,9 +1221,11 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                     if (input_work_changed or live_inputs_differ) and base_metric in {"latency_ms", "first_output_ms", "max_stream_gap_ms", "output_tokens_per_second", "generation_tokens_per_second"}:
                         warn("input_work_changed", "Observed input work or live generated histories differ; timing is not like-for-like.")
                     if different_work and base_metric in {"latency_ms", "max_stream_gap_ms", "output_tokens_per_second", "generation_tokens_per_second"}:
-                        warn("output_work_changed", "Actual generated output lengths differ materially: "
-                             f"median {old_work['reported_output_tokens_p50']} → {current_work['reported_output_tokens_p50']} tokens "
-                             f"and {old_work['output_chars_p50']} → {current_work['output_chars_p50']} characters. "
+                        suffix = "p95" if aggregation == "p95" else "p50"
+                        token_key, chars_key = f"reported_output_tokens_{suffix}", f"output_chars_{suffix}"
+                        warn("output_work_changed", f"Actual generated output {aggregation} lengths differ materially: "
+                             f"{old_work[token_key]} → {current_work[token_key]} tokens "
+                             f"and {old_work[chars_key]} → {current_work[chars_key]} characters. "
                              "These timings include different amounts of generated work; this does not establish a speed improvement or regression.")
                     if mix_changed:
                         warn("request_mix_changed", "Request work identity shares differ by more than 10 percentage points; observed aggregate values reflect different request mixes.")

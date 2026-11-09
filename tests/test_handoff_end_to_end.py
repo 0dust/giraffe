@@ -62,7 +62,8 @@ def assert_handoff_outcome(returncode, envelope, replay, original, *, compare):
             for row in target["comparisons"]:
                 if "worsening" not in row:
                     assert row["status"] == "inconclusive"
-                    assert max(row["current_samples"], row["baseline_samples"]) < baseline["min_samples"]
+                    minimum = max(baseline["min_samples"], 20) if row["metric"].endswith("p95_ms") else baseline["min_samples"]
+                    assert min(row["current_samples"], row["baseline_samples"]) < minimum
                     continue
                 affected = False
                 if row["metric"] in {"latency_ms", "first_output_ms", "max_stream_gap_ms",
