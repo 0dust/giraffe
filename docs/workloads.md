@@ -1218,7 +1218,10 @@ The version 1 lifecycle object has these fields:
 Every inventory contains `event_id`, nonnegative integer `sequence`, nonnegative
 `time_ms`, and a `replicas` array of at most 512 unique stable **incarnation IDs**. A restarted
 process must get a different ID. Include baseline inventory with at least two
-incarnations and inventory showing survivors after termination.
+incarnations and inventory showing survivors after termination. A source may
+report a failed or cancelled completion after termination for an attempt admitted
+before exit on that incarnation. Other lifecycle facts after termination
+contradict that history and leave its transition untrusted for all three verdicts.
 
 Every lifecycle fact contains `event_id`, `sequence`, `time_ms`, `kind` and
 `replica_id`. Supported kinds are `removal_requested`, `drain_effective`,
@@ -1228,7 +1231,11 @@ require `request_id` and `attempt_id`; completions report `outcome` as `complete
 server request ID returned with the response. The client records `x-replica-id`
 and the streaming response `id` as attribution hints; backend admissions establish
 which attempt actually reached the removed incarnation. Retries need distinct
-attempt IDs and cannot overwrite original admissions or completions.
+attempt IDs and cannot overwrite original admissions or completions. Each
+completion needs a matching admission for the same request and attempt on that
+incarnation; an unmatched completion invalidates drain coverage. Backend
+`cancelled` means the client went away, leaving drain completion inconclusive
+for that work rather than proving a deployment failure.
 
 Use one ordered sequence across the source history. Re-export unchanged facts
 with the same IDs, sequences and contents. `time_ms` uses the source's own clock
@@ -1249,7 +1256,9 @@ Start must not exceed end. A drain pass requires complete, gap-free, untruncated
 confirmed termination. With this schema, sequence zero is the known origin of the
 replica incarnation; a rolling interval starting later cannot rule out earlier
 unfinished work. Include unfinished attempts and failed completions. Coverage of only Giraffe traffic or sampled absence cannot establish
-that other traffic drained correctly. A replica count decrease, readiness change
+that other traffic drained correctly. Complete Giraffe-traffic coverage through
+termination can still prove that a Giraffe request was active at an abrupt exit
+for the client-visible continuity verdict. A replica count decrease, readiness change
 or deletion request is not process termination or an effective admission cutoff.
 
 All identifiers are nonempty strings up to 256 characters. Evidence remains a

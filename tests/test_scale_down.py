@@ -97,6 +97,98 @@ def test_contradictory_coverage_prevents_drain_completeness():
     assert result.metrics["results"]["drain"]["metrics"]["complete_coverage"] is False
 
 
+@pytest.mark.parametrize("request_id,attempt_id", [("ghost", "original"), ("long", "other")])
+def test_orphan_completion_contradicts_complete_drain_coverage(request_id, attempt_id):
+    settings, evidence, records = scenario()
+    latest = evidence["snapshots"][-1]["export"]
+    latest["events"][-1]["sequence"] = 7
+    latest["events"].insert(-1, dict(event_id="orphan", sequence=6, time_ms=350,
+        kind="request_completed", replica_id="b", request_id=request_id, attempt_id=attempt_id, outcome="failed"))
+    latest["through_sequence"] = latest["coverage"][0]["end_sequence"] = 7
+    latest["inventories"][0].update(event_id="inventory-7", sequence=7)
+    result = evaluate(settings, evidence, records)
+    assert statuses(result) == dict(continuity="pass", drain="inconclusive", capacity="pass")
+    drain = result.metrics["results"]["drain"]
+    assert "A backend completion has no matching admission on the removed incarnation; coverage is incomplete or conflicting." in drain["limitations"]
+    assert drain["metrics"]["complete_coverage"] is False
+
+
+@pytest.mark.parametrize("second_termination", [False, True])
+def test_lifecycle_after_termination_cannot_reuse_replica_incarnation(second_termination):
+    settings, evidence, records = scenario()
+    for snapshot in evidence["snapshots"]:
+        export = snapshot["export"] = deepcopy(snapshot["export"])
+        for event in export["events"]:
+            event["sequence"] *= 10
+        export["through_sequence"] *= 10
+        export["inventories"][0]["sequence"] *= 10
+        export["coverage"][0]["end_sequence"] *= 10
+        if not second_termination:
+            export["events"] = [e for e in export["events"] if e["kind"] != "replica_terminated"]
+        if export["through_sequence"] > 10:
+            export["events"].insert(0, dict(event_id="early-exit", sequence=15, time_ms=50,
+                                          kind="replica_terminated", replica_id="b"))
+    result = evaluate(settings, evidence, records)
+    assert statuses(result) == dict(continuity="inconclusive", drain="inconclusive", capacity="inconclusive")
+    for subresult in result.metrics["results"].values():
+        assert "Lifecycle facts follow process termination for the same replica incarnation." in subresult["limitations"]
+    assert result.metrics["results"]["continuity"]["metrics"]["transition_interval_ms"] is None
+
+
+@pytest.mark.parametrize("kind,outcome,request_id,attempt_id", [
+    ("request_admitted", None, "other", "original"),
+    ("drain_effective", None, None, None),
+    ("removal_requested", None, None, None),
+    ("replica_terminated", None, None, None),
+    ("request_completed", "completed", "long", "original"),
+    ("request_completed", "failed", "ghost", "original"),
+    ("request_completed", "cancelled", "long", "other"),
+])
+def test_contradictory_post_termination_facts_cannot_establish_transition(kind, outcome, request_id, attempt_id):
+    settings, evidence, records = scenario()
+    latest = evidence["snapshots"][-1]["export"]
+    latest["events"] = [e for e in latest["events"] if e["kind"] != "request_completed"]
+    event = dict(event_id="after-exit", sequence=7, time_ms=410, kind=kind, replica_id="b")
+    if request_id is not None:
+        event.update(request_id=request_id, attempt_id=attempt_id)
+    if outcome is not None:
+        event["outcome"] = outcome
+    latest["events"].append(event)
+    latest["through_sequence"] = latest["coverage"][0]["end_sequence"] = 7
+    result = evaluate(settings, evidence, records)
+    assert statuses(result) == dict(continuity="inconclusive", drain="inconclusive", capacity="inconclusive")
+    for subresult in result.metrics["results"].values():
+        assert "Lifecycle facts follow process termination for the same replica incarnation." in subresult["limitations"]
+    assert result.metrics["results"]["continuity"]["metrics"]["transition_interval_ms"] is None
+
+
+@pytest.mark.parametrize("client", ["other", "giraffe"])
+def test_backend_client_cancellation_does_not_fail_drain(client):
+    settings, evidence, records = scenario()
+    latest = evidence["snapshots"][-1]["export"]
+    if client == "giraffe":
+        latest["events"][3]["outcome"] = "cancelled"
+        records[1] = records[1].model_copy(update=dict(status="cancelled", valid=False, termination_reason="run_budget"))
+        evidence["stop_reason"] = "request budget"
+    else:
+        latest["events"][-1]["sequence"] = 8
+        latest["events"].extend([
+            dict(event_id="admit-other", sequence=0, time_ms=0, kind="request_admitted",
+                 replica_id="b", request_id="other", attempt_id="original"),
+            dict(event_id="cancel-other", sequence=6, time_ms=350, kind="request_completed",
+                 replica_id="b", request_id="other", attempt_id="original", outcome="cancelled"),
+        ])
+        latest["events"].sort(key=lambda event: event["sequence"])
+        latest["through_sequence"] = latest["coverage"][0]["end_sequence"] = 8
+        latest["inventories"][0].update(event_id="inventory-8", sequence=8)
+    result = evaluate(settings, evidence, records)
+    assert statuses(result) == dict(continuity="inconclusive" if client == "giraffe" else "pass",
+                                    drain="inconclusive", capacity="pass")
+    assert "Some admitted work was cancelled by its client; drain completion is not established for it." in result.metrics["results"]["drain"]["limitations"]
+    if client == "giraffe":
+        assert "Giraffe cancelled requests; those outcomes do not establish endpoint interruption." in result.metrics["results"]["continuity"]["limitations"]
+
+
 def test_output_budget_exhaustion_is_inconclusive_not_endpoint_failure():
     settings, evidence, records = scenario()
     records[2] = records[2].model_copy(update=dict(
@@ -336,8 +428,10 @@ def test_operator_marker_alone_cannot_establish_transition():
 def test_positive_admission_violation_survives_incomplete_coverage():
     settings, evidence, records = scenario()
     latest = evidence["snapshots"][-1]["export"]
-    latest["events"].append(dict(event_id="late", sequence=7, time_ms=450, kind="request_admitted", replica_id="b", request_id="other", attempt_id="late"))
-    latest["through_sequence"] = 7
+    latest["events"][-1]["sequence"] = 7
+    latest["events"].insert(-1, dict(event_id="late", sequence=6, time_ms=350, kind="request_admitted", replica_id="b", request_id="other", attempt_id="late"))
+    latest["through_sequence"] = latest["coverage"][0]["end_sequence"] = 7
+    latest["inventories"][0].update(event_id="inventory-7", sequence=7)
     latest["coverage"][0].update(complete=False, truncated=True)
     assert statuses(evaluate(settings, evidence, records))["drain"] == "fail"
 
@@ -394,7 +488,9 @@ def test_stale_initial_lifecycle_history_cannot_be_reused():
 
 def test_conflicting_event_id_cannot_manufacture_pass():
     settings, evidence, records = scenario()
+    evidence["snapshots"][-1]["export"]["events"] = deepcopy(evidence["snapshots"][-1]["export"]["events"])
     evidence["snapshots"][-1]["export"]["events"][2]["replica_id"] = "different"
+    assert "Conflicting lifecycle event ID." in _history(settings, ScaleDownEvidence.model_validate(evidence)).conflicts
     assert statuses(evaluate(settings, evidence, records))["drain"] == "inconclusive"
 
 
@@ -463,6 +559,72 @@ def test_abrupt_termination_without_drain_cutoff_fails_original_stream(completio
     assert statuses(result) == dict(continuity="fail", drain="fail", capacity="inconclusive")
     assert result.metrics["results"]["capacity"]["metrics"]["windows"]["post_removal"]["status"] == "pass"
     assert "cutoff" in result.metrics["results"]["drain"]["summary"]
+
+
+@pytest.mark.parametrize("outcome", ["failed", "cancelled"])
+@pytest.mark.parametrize("coverage", ["all", "giraffe", "incomplete"])
+def test_supervisor_failure_and_cancellation_after_termination_preserve_verdicts(outcome, coverage):
+    settings, evidence, records = scenario()
+    for snapshot in evidence["snapshots"]:
+        export = snapshot["export"]
+        export["events"] = [e for e in export["events"] if e["kind"] not in {"drain_effective", "request_completed"}]
+        export["coverage"][0].update(scope="all" if coverage == "all" else "giraffe", complete=coverage != "incomplete")
+    latest = evidence["snapshots"][-1]["export"]
+    latest["events"].append(dict(event_id="supervisor-completion", sequence=7, time_ms=410, kind="request_completed",
+                               replica_id="b", request_id="long", attempt_id="original", outcome=outcome))
+    latest["through_sequence"] = latest["coverage"][0]["end_sequence"] = 7
+    records[1] = records[1].model_copy(update=dict(status=outcome, valid=False, stream_terminated=False,
+        error="Server disconnected" if outcome == "failed" else None, finish_reason=None,
+        completed_ms=405 if outcome == "failed" else 450))
+    result = evaluate(settings, evidence, records)
+    expected = "fail" if outcome == "failed" else "inconclusive"
+    assert statuses(result) == dict(continuity=expected, drain=expected, capacity="inconclusive")
+    for subresult in result.metrics["results"].values():
+        assert "Lifecycle facts follow process termination for the same replica incarnation." not in subresult["limitations"]
+    drain = result.metrics["results"]["drain"]
+    if outcome == "failed":
+        assert "Admitted work was unfinished or unsuccessful when the replica terminated." in drain["summary"]
+    else:
+        assert "Some admitted work was cancelled by its client; drain completion is not established for it." in drain["limitations"]
+    assert result.metrics["results"]["capacity"]["metrics"]["windows"]["post_removal"]["status"] == "pass"
+
+
+@pytest.mark.parametrize("coverage,expected", [
+    ("all", dict(continuity="fail", drain="fail", capacity="inconclusive")),
+    ("giraffe", dict(continuity="fail", drain="inconclusive", capacity="inconclusive")),
+    ("incomplete", dict(continuity="inconclusive", drain="inconclusive", capacity="inconclusive")),
+    ("gap", dict(continuity="inconclusive", drain="inconclusive", capacity="inconclusive")),
+    ("truncated", dict(continuity="inconclusive", drain="inconclusive", capacity="inconclusive")),
+    ("rolling", dict(continuity="inconclusive", drain="inconclusive", capacity="inconclusive")),
+])
+def test_abrupt_kill_overlap_uses_complete_giraffe_traffic_coverage(coverage, expected):
+    settings, evidence, records = scenario()
+    for snapshot in evidence["snapshots"]:
+        export = snapshot["export"]
+        export["events"] = [e for e in export["events"] if e["kind"] not in {"drain_effective", "request_completed"}]
+        export["coverage"][0]["scope"] = "all" if coverage == "all" else "giraffe"
+    latest = evidence["snapshots"][-1]["export"]["coverage"][0]
+    if coverage == "incomplete":
+        latest["complete"] = False
+    elif coverage == "gap":
+        latest["gaps"] = [5]
+    elif coverage == "truncated":
+        latest["truncated"] = True
+    elif coverage == "rolling":
+        latest["start_sequence"] = 3
+    records[1] = records[1].model_copy(update=dict(status="failed", valid=False, stream_terminated=False,
+        error="Server disconnected", finish_reason=None, completed_ms=405))
+    result = evaluate(settings, evidence, records)
+    assert statuses(result) == expected
+    continuity = result.metrics["results"]["continuity"]
+    if expected["continuity"] == "fail":
+        assert continuity["request_ids"] == ["long"]
+        assert "Original requests failed or did not end with a valid terminal response." in continuity["summary"]
+    else:
+        assert continuity["request_ids"] == []
+        assert "Too few real answer streams span the confirmed transition." in continuity["limitations"]
+    if coverage != "all":
+        assert "Complete all-traffic admission and completion coverage through termination is unavailable." in result.metrics["results"]["drain"]["limitations"]
 
 
 def test_completed_before_abrupt_removal_does_not_claim_continuity():
@@ -543,13 +705,14 @@ def test_missing_scoped_timing_health_cannot_certify_or_attribute_limits():
 def test_conflicting_attempt_terminals_cannot_certify_drain():
     settings, evidence, records = scenario()
     latest = evidence["snapshots"][-1]["export"]
-    latest["events"].append(dict(event_id="contradictory", sequence=7, time_ms=500, kind="request_completed", replica_id="b", request_id="long", attempt_id="original", outcome="failed"))
-    latest["through_sequence"] = latest["coverage"][0]["end_sequence"] = 7
+    latest["events"][-1].update(sequence=8, time_ms=600)
+    latest["events"].insert(-1, dict(event_id="contradictory", sequence=6, time_ms=450, kind="request_completed", replica_id="b", request_id="long", attempt_id="original", outcome="failed"))
+    latest["through_sequence"] = latest["coverage"][0]["end_sequence"] = 8
+    latest["inventories"][0].update(event_id="inventory-8", sequence=8, time_ms=600)
     result = evaluate(settings, evidence, records)
     assert statuses(result)["drain"] == "inconclusive"
     assert "conflicting" in result.metrics["results"]["drain"]["summary"].lower()
-    latest["events"].append(dict(event_id="late-with-conflict", sequence=8, time_ms=600, kind="request_admitted", replica_id="b", request_id="other", attempt_id="late"))
-    latest["through_sequence"] = 8
+    latest["events"].insert(-1, dict(event_id="late-with-conflict", sequence=7, time_ms=500, kind="request_admitted", replica_id="b", request_id="other", attempt_id="late"))
     assert statuses(evaluate(settings, evidence, records))["drain"] == "fail"
 
 

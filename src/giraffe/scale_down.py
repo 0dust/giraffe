@@ -242,10 +242,19 @@ def evaluate_scale_down(settings: ScaleDownConfig, evidence: ScaleDownEvidence,
     removed_replicas = {e.replica_id for e in new_events if e.kind in {"drain_effective", "replica_terminated"}}
     replica_id = next(iter(removed_replicas)) if len(removed_replicas) == 1 else None
     selected = [e for e in history.events if e.replica_id == replica_id]
+    exits = [e for e in selected if e.kind == "replica_terminated"]
+    if exits:
+        admitted_before_exit = {(e.request_id, e.attempt_id) for e in selected
+                                if e.kind == "request_admitted" and e.sequence < exits[0].sequence}
+        # Supervisors can report failed or cancelled in-flight attempts after exit.
+        if any(e.sequence > exits[0].sequence and not (
+                e.kind == "request_completed" and e.outcome in {"failed", "cancelled"}
+                and (e.request_id, e.attempt_id) in admitted_before_exit) for e in selected):
+            shared.append("Lifecycle facts follow process termination for the same replica incarnation.")
+            new_events = []
     drains = [e for e in new_events if e.kind == "drain_effective" and e.replica_id == replica_id]
     drain = drains[0] if len(drains) == 1 else None
-    terminations = [e for e in new_events if e.kind == "replica_terminated" and e.replica_id == replica_id
-                    and (drain is None or e.sequence > drain.sequence)]
+    terminations = [e for e in new_events if e.kind == "replica_terminated" and e.replica_id == replica_id]
     terminated = terminations[0] if len(terminations) == 1 else None
     # Abrupt removal need not emit a drain cutoff. Process termination still
     # establishes a transition for client continuity and surviving capacity.
@@ -282,15 +291,17 @@ def evaluate_scale_down(settings: ScaleDownConfig, evidence: ScaleDownEvidence,
     def correlated(event, record):
         return event.request_id in {record.id, record.server_request_id} - {None}
 
+    admitted_attempts = {(e.request_id, e.attempt_id) for e in admissions}
+    orphan_completions = any(key not in admitted_attempts for key in completions)
     latest_coverage = history.snapshots[-1].export.coverage if history.snapshots else []
-    complete = not history.conflicts and any(c.replica_id == replica_id and c.complete and c.scope == "all"
-                   and not c.gaps and not c.truncated and c.start_sequence == 0
-                   and c.end_sequence >= terminated.sequence for c in latest_coverage) if terminated else False
     coverage_conflict = any(c.replica_id == replica_id and c.start_sequence <= terminated.sequence
                            and (c.truncated or any(0 <= gap <= terminated.sequence for gap in c.gaps))
                            for c in latest_coverage) if terminated else False
-    if coverage_conflict:
-        complete = False
+    coverage = [c for c in latest_coverage if c.replica_id == replica_id and c.complete
+                and not c.gaps and not c.truncated and c.start_sequence == 0
+                and c.end_sequence >= terminated.sequence] if terminated else []
+    giraffe_complete = not history.conflicts and not coverage_conflict and any(c.scope in {"all", "giraffe"} for c in coverage)
+    complete = giraffe_complete and not orphan_completions and any(c.scope == "all" for c in coverage)
 
     def active_attempts(record):
         if transition_fact is None:
@@ -306,7 +317,7 @@ def evaluate_scale_down(settings: ScaleDownConfig, evidence: ScaleDownEvidence,
 
     def source_proves_overlap(record):
         return any(any(e.sequence > transition_fact.sequence for e in done)
-                   or transition_fact == terminated and complete for _, done in active_attempts(record))
+                   or transition_fact == terminated and giraffe_complete for _, done in active_attempts(record))
 
     cohort = []
     if transition:
@@ -339,6 +350,8 @@ def evaluate_scale_down(settings: ScaleDownConfig, evidence: ScaleDownEvidence,
         drain_missing.append("Client and backend attribution conflict for an overlapping stream.")
     if coverage_conflict:
         drain_missing.append("Coverage claims for the removed replica conflict.")
+    if orphan_completions:
+        drain_missing.append("A backend completion has no matching admission on the removed incarnation; coverage is incomplete or conflicting.")
     if drain is None:
         drain_missing.append("The effective admission cutoff is unconfirmed.")
     if not attributed:
@@ -356,7 +369,9 @@ def evaluate_scale_down(settings: ScaleDownConfig, evidence: ScaleDownEvidence,
                 continue
             finished = [e for e in done if admitted.sequence < e.sequence < terminated.sequence and e.outcome == "completed"]
             if not finished:
-                if complete or any(e.sequence >= terminated.sequence or e.outcome in {"failed", "cancelled"} for e in done):
+                if any(e.outcome == "cancelled" for e in done):
+                    drain_missing.append("Some admitted work was cancelled by its client; drain completion is not established for it.")
+                elif complete or any(e.sequence >= terminated.sequence or e.outcome == "failed" for e in done):
                     drain_bad.append("Admitted work was unfinished or unsuccessful when the replica terminated.")
                 else:
                     drain_missing.append("Completion of admitted work is not established.")
