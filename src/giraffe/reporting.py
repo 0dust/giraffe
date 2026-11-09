@@ -201,6 +201,7 @@ _COMPANION_REVISIONS = _CONVERSATION_REVISIONS | {
     "gateway_access", "gateway_access_policy", "access_conversations", "access_shared_first", "access_shared_targets_first",
     "policy_after_shared_workloads", "policy_after_all_shared_targets", "access_after_shared_workloads",
     "access_deferred_policy", "access_after_all_shared_targets", "scale_down_gateway_access",
+    "output_budgets",
 }
 # Access changed optional dispatch after the shared workloads in these revisions.
 _MULTI_USER_COMPANION_REVISIONS = {"policy_after_all_shared_targets", "access_after_all_shared_targets",
@@ -233,6 +234,17 @@ def _baseline_workload_fields(checks, *, shared: bool) -> set[str]:
 def _run_limits_workload_identity(manifest: dict, *, revision: str, include_load: bool = False,
                                   shared: bool = False) -> dict | None:
     """Reconstruct only identities whose generator revision is known exactly."""
+    if revision == "output_budgets":
+        # Only prefixes changed in this shared generator revision. Reuse the
+        # predecessor's exact source/settings constraints for unchanged work;
+        # prefix requests need a new baseline, as do changed built-in hashes.
+        identity = _run_limits_workload_identity(
+            manifest, revision="scale_down_gateway_access", include_load=include_load, shared=shared)
+        if identity is None or "prefix" in identity["settings"]:
+            return None
+        if identity["generator_source_sha256"] is not None:
+            identity["generator_source_sha256"] = "a04c62a2e7b10ab0aef201cf5c283fe53df694d247ca5ce35caca1340a83f387"
+        return identity
     raw = manifest.get("config", {})
     legacy = revision == "legacy"
     try:
@@ -446,6 +458,7 @@ def _same_run_limits_workload(current: dict, old: dict, *, fingerprint_key: str 
 def _same_load_workload(current: dict, old: dict, *, fingerprint_key: str = "workload_fixture_sha256") -> bool:
     """Attest unchanged Load dispatch within exact source-equivalence groups."""
     revisions = ("shared_conversations", "scale_down_shared_conversations", "scale_down_gateway_access",
+                 "output_budgets",
                  "gateway_conversations",
                  "gateway_shared_first", "gateway_shared_targets_first",
                  "policy_conversations", "policy_shared_first", "policy_shared_targets_first",

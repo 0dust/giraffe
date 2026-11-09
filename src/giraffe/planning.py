@@ -760,13 +760,13 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
                 from giraffe.workloads import spec
                 settings = config.prefix
                 prefix_chars = len(label_prompt(settings.prefix_chars + 33 + 80)) + len("\nTrial 0000.")
-                specs = [spec("x" * prefix_chars, "prefix", "prefix", max_tokens=min(24, options.max_output_tokens))]
+                specs = [spec("x" * prefix_chars, "prefix", "prefix", max_tokens=options.max_output_tokens)]
                 history_chars = 0
                 for _ in range(settings.history_turns):
                     history_chars += len(label_prompt(96))
-                    if not prefix_admitted(history_chars, min(24, options.max_output_tokens), options.context_limit):
+                    if not prefix_admitted(history_chars, options.max_output_tokens, options.context_limit):
                         break
-                    specs.append(spec("x" * history_chars, "prefix", "prefix", max_tokens=min(24, options.max_output_tokens)))
+                    specs.append(spec("x" * history_chars, "prefix", "prefix", max_tokens=options.max_output_tokens))
                     history_chars += 4
             if name == "tools" and has_observations and not (config.tool_checks and config.tool_checks.conversations):
                 from giraffe.models import RequestSpec
@@ -1128,7 +1128,11 @@ def request_plan(config: RunConfig | ConfigDraft, *,
 
     if "context" in selected:
         context_options = config.effective_check("context")
-        context_shapes = builtin_fixtures(config.model_copy(update={**{key: value for key, value in context_options.items() if key != "limits"}, "context_limit": min(512, context_options["context_limit"])}))["context"]
+        # Bound preview construction without consuming the reserved output room.
+        preview_context = min(context_options["context_limit"], context_options["max_output_tokens"] + 512)
+        context_shapes = builtin_fixtures(config.model_copy(update={
+            **{key: value for key, value in context_options.items() if key != "limits"},
+            "context_limit": preview_context}))["context"]
         count = max(context_options["samples"], len(context_shapes))
         add("context_first_batch", count, "The first generated context batch.", title="Initial context cases")
         add("context", 0,
@@ -1189,7 +1193,7 @@ def request_plan(config: RunConfig | ConfigDraft, *,
     if "prefix" in selected:
         settings = config.prefix
         context_limit = config.effective_check("prefix")["context_limit"]
-        output_cap = min(24, config.max_output_tokens)
+        output_cap = config.max_output_tokens
         # Include the 32-character nonce, newline, filler/instruction and trial suffix.
         prefix_chars = len(label_prompt(settings.prefix_chars + 33 + 80)) + len("\nTrial 0000.")
         if not prefix_admitted(prefix_chars, output_cap, context_limit):

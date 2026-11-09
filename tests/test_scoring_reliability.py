@@ -104,7 +104,7 @@ def test_json_structural_comparison_normalizes_numbers_but_not_booleans(expected
 
 @pytest.mark.parametrize("context_limit", [128, 160, 200, 250, 512, 4096])
 def test_context_positions_have_meaningful_separation_or_explicit_reduced_coverage(context_limit):
-    specs = builtin_fixtures(config(context_limit=context_limit))["context"]
+    specs = builtin_fixtures(config(context_limit=context_limit, max_output_tokens=24))["context"]
     for size in ("short", "long"):
         group = [spec for spec in specs if spec.fixture_id.startswith(f"context.{size}.")]
         offsets = sorted(spec.messages[0]["content"].index("The box label is") for spec in group)

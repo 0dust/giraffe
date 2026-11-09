@@ -22,6 +22,17 @@ useful answer. The default p95 first-output limit is 10,000 ms; override it with
 Results appear in the terminal and in `runs/<timestamp>/report.json` and
 `report.html`. The command exits when done.
 
+Standard built-in answer fixtures, including `short.copy`, use `max_output_tokens` as their
+output allowance. For a reasoning model that exhausts its budget before answering,
+raise it with `--max-output-tokens 2048` or YAML `max_output_tokens: 2048`.
+Supported `test_options.<check>.max_output_tokens` values override that default;
+`access` has no separate output setting and shares the initial request's resolved
+serving/first-output allowance. Custom fixtures, request-pack cases, session turns
+and load profiles keep their own explicit budgets; consistency retains its
+documented default allowance. Intentional output-cap probes
+also retain their small limits. A larger allowance does not force a longer answer
+and still needs room alongside the prompt in the model's context window.
+
 Generate a saved configuration, then review its endpoint, model and limits:
 
 ```sh

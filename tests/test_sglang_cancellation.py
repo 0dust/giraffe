@@ -32,17 +32,20 @@ def cancelled(**changes):
                          client_cancelled_monotonic_ns=200).model_copy(update=changes)
 
 
-def test_sglang_fixtures_are_opt_in_versioned_and_respect_output_ceiling():
+@pytest.mark.parametrize("suite_cap,check_cap", [(2, None), (16, None), (2048, None), (16, 96), (16, 2048)])
+def test_sglang_fixtures_are_opt_in_versioned_and_respect_resolved_output_budget(suite_cap, check_cap):
     target = Target(name="local", url="http://localhost", model="tiny")
     assert "backend_cancellation" not in builtin_fixtures(RunConfig(targets=[target]))
-    fixtures = builtin_fixtures(RunConfig(
-        targets=[target], checks=["cancellation"], max_output_tokens=16,
-        test_options={"cancellation": {"backend_verification": "required", "cancel_after_chunks": 2}}))
+    configured = RunConfig(
+        targets=[target], checks=["cancellation"], max_output_tokens=suite_cap,
+        test_options={"cancellation": {"backend_verification": "required", "cancel_after_chunks": 2,
+                                       "max_output_tokens": check_cap}})
+    fixtures = builtin_fixtures(runner._check_config(configured, "cancellation"), check_id="cancellation")
     probe, followup = fixtures["backend_cancellation"]
-    assert probe.max_tokens == 16 and probe.cancel_after_chunks == 2
+    assert probe.max_tokens == (check_cap or suite_cap) and probe.cancel_after_chunks == 2
     assert probe.input_chars == len(probe.messages[0]["content"])
     assert probe.fixture_id.endswith(".v1") and followup.fixture_id.endswith(".v1")
-    assert followup.scorer == "none" and followup.max_tokens == 8
+    assert followup.scorer == "none" and followup.max_tokens == (check_cap or suite_cap)
 
 
 @pytest.mark.parametrize("reason,received,status", [

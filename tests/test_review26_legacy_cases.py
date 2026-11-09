@@ -1,4 +1,4 @@
-"""Request settings frozen from the reviewer's archived old main, not Phase 2."""
+"""Archived request fields stay stable apart from corrected output allowances."""
 
 import hashlib
 import json
@@ -27,7 +27,7 @@ def request_values(specs):
 
 
 @pytest.mark.parametrize('name', CASES)
-def test_legacy_explicit_timeout_request_settings_match_old_main(name):
+def test_legacy_settings_use_resolved_budgets_and_preserve_other_request_fields(name):
     case = CASES[name]
     # Freeze the archived 30 s default explicitly; new omitted timeouts are 300 s.
     config = migrated_configuration({'request_timeout_seconds': 30, **case['source']})
@@ -46,7 +46,24 @@ def test_legacy_explicit_timeout_request_settings_match_old_main(name):
             continue
         effective = _check_config(config, check)
         actual = builtin_fixtures(effective, check_id=check)
-        assert {group: request_values(actual[group]) for group in groups} == groups, check
+        historical_budgets = {row['max_tokens'] for rows in groups.values() for row in rows}
+        restored = {cap: builtin_fixtures(effective.model_copy(update={'max_output_tokens': cap}), check_id=check)
+                    for cap in historical_budgets}
+        for group, historical in groups.items():
+            assert bool(actual[group]) == bool(historical)
+            current_ids = {spec.fixture_id for spec in actual[group]}
+            historical_ids = {row['fixture_id'] for row in historical}
+            assert current_ids <= historical_ids if group == 'context' else current_ids == historical_ids
+            for spec in actual[group]:
+                expected_cap = (min(8, effective.max_output_tokens)
+                                if spec.fixture_id.startswith('limits.output_cap') else effective.max_output_tokens)
+                assert spec.max_tokens == expected_cap
+                assert spec.request_timeout_seconds == effective.request_timeout_seconds
+            # Keep the archive immutable. Restoring its allowance must recreate
+            # the saved prompt, including context space reserved for the answer.
+            replayed = [next(spec for spec in restored[row['max_tokens']][group]
+                             if spec.fixture_id == row['fixture_id']) for row in historical]
+            assert request_values(replayed) == historical, check
     if 'pack' in expected:
         assert request_values(pack_specs(config)) == expected['pack']
     old_checks = set(case['source'].get('checks', []))

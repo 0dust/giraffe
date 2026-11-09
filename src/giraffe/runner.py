@@ -1280,6 +1280,11 @@ async def _context_fixtures(run, target, client, fixtures, source=None):
             return _context_request(local, size, position, "context")
 
         result = await prepare_messages(run, target, "context_preparation", lambda chars: build(chars).messages, desired, tolerance=.01)
+        if result["status"] == "calibrated" and result["input_tokens"] + output_budget > config.context_limit:
+            result.update(status="unavailable", reason_code="context_window_exceeded", reason=(
+                f"The locally counted prompt ({result['input_tokens']} tokens) plus the configured output "
+                f"allowance ({output_budget} tokens) exceeds context_limit ({config.context_limit}). "
+                "Increase context_limit or reduce max_output_tokens for the context check."))
         evidence.append({key: value for key, value in result.items() if key != "messages"})
         if result["status"] != "calibrated":
             run.observations[target.name]["context_calibration"] = {
@@ -2525,9 +2530,16 @@ def _budget_guidance(config, check_id=None):
 def _output_budget_guidance(config, records, check_id):
     capped = [r for r in records if _reasoning_budget(r) or r.finish_reason == "length"]
     owner = "capacity" if config.request_source == "request_pack" and "capacity" in config.checks else check_id
+    value = config.max_output_tokens
+    if check_id in {"access", "serving", "first_output"}:
+        # These checks share requests. Name the selected setting that owns the
+        # effective allowance, including access which has no output override.
+        owner = next((name for name in ("serving", "first_output")
+                      if name in config.checks and config.test_options.get(name) is not None
+                      and config.test_options[name].max_output_tokens is not None), check_id)
+        value = config.effective_initial()["max_output_tokens"]
     options = config.test_options.get(owner)
     field = f"test_options.{owner}.max_output_tokens" if options and options.max_output_tokens is not None else "max_output_tokens"
-    value = config.max_output_tokens
     if check_id == "sessions":
         field, value = "sessions.max_tokens", config.sessions.max_tokens
         for index, workload in enumerate(config.sessions.workloads):

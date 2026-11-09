@@ -237,7 +237,9 @@ def test_ordinary_suites_learn_medium_ranges_from_five_small_runs(monkeypatch, s
 
     async def repeat():
         results = []
-        for seed in range(20):
+        # Use a fixed consecutive sample, retaining the original first 20 cases.
+        # Matching output allowances now pool the two serving fixtures together.
+        for seed in range(200):
             observations = {TARGET["name"]: []}
             for prior in range(5):
                 monkeypatch.setattr(runner, "LLMClient", recording_client(10000 + seed * 131 + (prior + 1) * 17,
@@ -253,7 +255,7 @@ def test_ordinary_suites_learn_medium_ranges_from_five_small_runs(monkeypatch, s
             assert any("based on 5 earlier runs of this endpoint" in note for note in plan["time_estimate_assumptions"])
             results.append((plan["confidence"], plan["estimated_low_seconds"], plan["estimated_high_seconds"], actual))
         medium = [row for row in results if row[0] == "medium"]
-        assert len(medium) >= 14, results
+        assert len(medium) >= math.ceil(.7 * len(results)), results
         assert sum(low <= actual <= high for _, low, high, actual in medium) >= math.ceil(.9 * len(medium)), medium
         assert statistics.median(high / actual for _, _, high, actual in medium) <= 1.6, medium
 
@@ -282,14 +284,20 @@ def test_recent_small_run_has_same_total_weight_as_large_older_run():
     assert [count for _, count in pooled["histogram_ms"]["buckets"]] == [153, 153]
 
 
-def test_plan_explains_recent_block_and_detected_drift():
+@pytest.mark.parametrize("matching_budget", [True, False])
+def test_plan_explains_recent_block_and_detected_drift_only_for_matching_budgets(matching_budget):
+    configured = RunConfig(targets=[TARGET], checks=["correctness"])
     entries = [measurement([value] * 50, cohort) for value, cohort in
                [(100, "new1"), (101, "new2"), (99, "new3"), (20, "old")]]
     for entry in entries:
         entry["batch_timing_coverage"] = 1
-        entry["output_cap"] = 24
-    configured = RunConfig(targets=[TARGET], checks=["correctness"])
+        entry["output_cap"] = configured.effective_check("correctness")["max_output_tokens"] if matching_budget else 24
     plan = request_plan(configured, observations={TARGET["name"]: entries})
+    if not matching_budget:
+        assert plan["confidence"] == "low"
+        assert plan["unknown_time_components"]
+        assert not any("Latency drift detected" in note for note in plan["time_estimate_assumptions"])
+        return
     assert plan["confidence"] == "medium"
     assert ("service · Answer correctness: based on 3 earlier runs of this endpoint. "
             "Latency drift detected; only the most recent consistent block is used.") in plan["time_estimate_assumptions"]
