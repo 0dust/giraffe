@@ -70,6 +70,8 @@ def test_policy_comparison_preserves_attribution_and_timing_sections():
 const common={aggregation:'observed',status:'fail',baseline_samples:1,current_samples:1};
 const rows=[{...common,check:'gateway_policy',metric:'policy_acceptance',
  baseline:'observed',current:'observed',reason:'Policy quota exceeded'},
+ {...common,check:'gateway_access',metric:'policy_acceptance',scenario:'allowed',
+ baseline:'deny',current:'allow',reason:'Access decision changed'},
  {...common,check:'gateway_attribution',metric:'attribution_outcome',scenario:'alice',
  baseline:'verified',current:'mismatch',reason:'Attribution mismatch'},
  {...common,check:'serving',metric:'latency_ms',aggregation:'median',
@@ -78,13 +80,14 @@ const result=report([],{baseline:{run_id:'reference',targets:[{target:'local',co
 const container=document.createElement('div');container.innerHTML=renderComparison(result);
 for(const [id,title,metric] of [
  ['gateway-policy-outcomes','Gateway policy outcomes','policy_acceptance'],
+ ['gateway-access-decisions','Gateway access decisions','policy_acceptance'],
  ['gateway-attribution-outcomes','Gateway attribution outcomes','attribution_outcome'],
  ['timing','Response timing','latency_ms']]){
  const section=container.querySelector('#results-'+id);
  assert.equal(section.querySelector('h3').textContent,title);
  assert.equal(section.querySelectorAll('[data-metric]').length,1);
  assert(section.querySelector('[data-metric="'+metric+'"]'));
- if(metric!=='policy_acceptance')assert.equal(section.querySelector('[data-metric] .hint'),null);
+ if(id!=='gateway-policy-outcomes')assert.equal(section.querySelector('[data-metric] .hint'),null);
 }
 const titles=Array.from(container.querySelectorAll('.comparison-section h3'),node=>node.textContent);
 assert.equal(titles.indexOf('Gateway policy outcomes'),titles.indexOf('Gateway attribution outcomes')+1);
