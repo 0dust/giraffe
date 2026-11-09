@@ -231,7 +231,7 @@ In the UI, open a completed run and choose **Save baseline** (fully passing runs
 
 ## Tests
 
-16 built-in checks. The four defaults are `access, serving, correctness, first_output`; select additional checks for your endpoint.
+The four defaults are `access, serving, correctness, first_output`; select additional checks for your endpoint.
 
 | Check · CLI ID | What it checks |
 | --- | --- |
@@ -251,6 +251,7 @@ In the UI, open a completed run and choose **Save baseline** (fully passing runs
 | Multi-user · `multi_user` | Persistent users sharing request slots, with individual delivery and timing outcomes |
 | Gateway quotas & priorities · `gateway_policy` | [Opt-in LiteLLM policy observations](docs/gateway-policy.md) with separate identities, bounded traffic and continued peer service |
 | Gateway usage attribution · `gateway_attribution` | Marked requests and final token counts matched to existing LiteLLM spend logs |
+| Gateway access policy · `gateway_access` | Declared allow/deny cases using existing test identity references |
 | Answer consistency · `consistency` | Answer agreement across repeated requests |
 | Tool calling · `tools` | Tool-call structure, names and expected arguments |
 
@@ -259,6 +260,12 @@ The catalog includes verdict checks and two server observations: **GPU metrics**
 Missing GPU telemetry and missing or inactive prefix caching do not change the
 verdict. GPU hardware faults and an exceeded configured temperature limit can
 still fail the run. Prefix cache never fails the run.
+
+Gateway access is an optional LiteLLM check with explicit expected allow and deny
+cases. Configure it in the UI or run the [example](examples/gateway-access.yaml)
+after supplying existing test identity environment references. Network failures
+and unsupported error formats remain unverified; no keys or privileges change.
+See the [access-policy guide](docs/gateway-access.md) for supported evidence and limits.
 
 Gateway attribution is optional and independent of simulated users. The bounded
 [LiteLLM example](examples/litellm-attribution.yaml) sends four requests using two

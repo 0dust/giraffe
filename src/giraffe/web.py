@@ -567,9 +567,10 @@ def _track_live_progress(job: dict, event: dict, max_requests: int | None) -> No
         plan = job.get("condition_plans", {}).get(key)
         if plan and plan.get("planned_reason"):
             summary = {**summary, "planned_reason": plan["planned_reason"]}
-        if plan and plan.get("planned") is not None and (summary.get("planned") is None or summary["planned"] < plan["planned"]):
-            # Some executors announce successive one-request groups. Keep the
-            # full configured condition denominator, without altering dispatch.
+        if (key[1] != "gateway_access" and plan and plan.get("planned") is not None
+                and (summary.get("planned") is None or summary["planned"] < plan["planned"])):
+            # Some executors announce successive one-request groups. Access
+            # requalifies credentials and announces the entire eligible set.
             summary = {**summary, "planned": plan["planned"], "planned_kind": plan["planned_kind"]}
         summary = {**summary, **{key: value for key, value in condition_aggregate(summary).items()
                    if key not in {"status", "lifecycle_status"}}}
@@ -731,7 +732,8 @@ def _merged_condition_rows(planned: list[dict], observed: list[dict], *, termina
         key = (observed_row.get("target"), (observed_row.get("condition") or {}).get("id"))
         prior = rows.get(key, {})
         row = {**prior, **observed_row}
-        if prior.get("planned") is not None and (row.get("planned") is None or row["planned"] < prior["planned"]):
+        if (key[1] != "gateway_access" and prior.get("planned") is not None
+                and (row.get("planned") is None or row["planned"] < prior["planned"])):
             row.update(planned=prior["planned"], planned_kind=prior["planned_kind"])
         rows[key] = row
     result = []

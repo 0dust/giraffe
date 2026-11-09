@@ -1190,6 +1190,13 @@ def _print_result(report: RunReport, json_path: Path, html_path: Path | None,
                 print(f"  {row['identity']} · {row['matched_requests']} matched · "
                       f"{row['mismatched_requests']} mismatched · {row['unverified_requests']} unverified")
         users = check.metrics.get("multi_user") if check.id == "multi_user" else None
+        policy = check.metrics.get("gateway_access") if check.id == "gateway_access" else None
+        if policy:
+            print(f"Gateway access policy · {check.target}")
+            for case in policy.get("cases", []):
+                print(f"  {case['name']} / {case['identity']}: expected {case['expected']}, observed {case['observed']}"
+                      f" · {case['status']} · HTTP {case['http_status'] or 'not observed'} · {case['reason']}")
+            print("  " + policy["qualification"])
         if not users:
             continue
         print(f"Multi-user · {check.target} · shared-window delivered output")
