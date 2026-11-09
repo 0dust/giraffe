@@ -12,6 +12,7 @@ from typing import Any
 
 
 _SCENARIOS = {
+    "gateway_policy": ("Gateway policy", "gateway_policy"),
     "gateway_attribution": ("Gateway usage attribution", "gateway_attribution"),
     "initial": ("First request", "access"),
     "readiness": ("Readiness", "access"),
@@ -214,6 +215,7 @@ def _identity(scenario: str, workload: Mapping[str, Any] | None = None) -> dict[
 
 
 _PURPOSES = {
+    "gateway_policy": "Observes declared identity quotas or priority reservations and continued peer service.",
     "gateway_attribution": "Compares marked identity requests with read-only gateway token attribution.",
     "multi_user": "Measures each persistent user over the same window while sharing request slots.",
     "load": "Measures selected request shapes under maintained concurrency, arrivals or bursts; compares delivery and per-response criteria.",

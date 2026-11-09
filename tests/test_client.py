@@ -14,6 +14,18 @@ def spec(**changes):
     )
 
 
+async def test_ordinary_nonstream_json_keeps_existing_duplicate_member_handling(monkeypatch):
+    body = (b'{"error":{"type":"upstream_failure"},"error":null,'
+            b'"choices":[{"message":{"role":"assistant","content":"42"},"finish_reason":"stop"}]}')
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, content=body)), **kw))
+    target = Target(name="local", url="http://local", model="test")
+    async with LLMClient(target, RunConfig(targets=[target])) as client:
+        record = await client.execute(spec(stream=False))
+    assert record.valid and record.output == "42"
+
+
 @pytest.mark.parametrize("route", ["direct", "configured_proxy", "environment_proxy"])
 async def test_noisy_neighbor_upload_evidence_requires_origin_form(route, monkeypatch):
     import threading
