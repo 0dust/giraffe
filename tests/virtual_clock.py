@@ -2,6 +2,7 @@
 
 import asyncio
 from importlib import import_module
+import math
 import sys
 import time
 from types import SimpleNamespace
@@ -32,6 +33,9 @@ class VirtualLoop(asyncio.SelectorEventLoop):
         if not self._ready and self._scheduled and not self._executor_pending:
             self.now = max(self.now, min((handle._when for handle in self._scheduled
                                           if not handle.cancelled()), default=self.now))
+        # asyncio runs timers strictly before now + resolution. On the
+        # virtual clock, even the next representable time is still future.
+        self._clock_resolution = math.ulp(self.now)
         super()._run_once()
 
 

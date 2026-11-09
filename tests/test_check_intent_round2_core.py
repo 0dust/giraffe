@@ -152,6 +152,38 @@ async def test_v5_tags_or_whitespace_are_not_first_generation(monkeypatch, separ
     assert r.generation_chunks == 1 and 15 <= r.first_reasoning_ms <= r.client_cancelled_ms
 
 
+@pytest.mark.parametrize(("parts", "raw_output", "reasoning", "status", "chunk_limit"), [
+    ([ev("<thi"), ev("nk>"), ev(reasoning="first"), ev(reasoning="second")],
+     "<think>", "firstsecond", "cancelled", 2),
+    ([ev("<think>first"), ev("</th"), ev("ink>"), ev("second")],
+     "<think>first</think>second", "", "cancelled", 2),
+    ([ev("one <th"), ev("ank you"), ev("three")],
+     "one <thank youthree", "", "cancelled", 3),
+    ([ev("<th"), ev("ank you")],
+     "<thank you", "", "cancelled", 2),
+    ([ev("text"), ev("<th") + ev(finish="stop") + DONE],
+     "text<th", "", "completed", 2),
+    ([ev("<ThInK"), ev(">answer") + ev("</th") + ev("ink>") + ev(" final") + ev(finish="stop") + DONE],
+     "<ThInK>answer</think> final", "", "completed", 2),
+])
+async def test_v5_generation_distinguishes_split_delimiters_and_literal_text(
+    monkeypatch, parts, raw_output, reasoning, status, chunk_limit,
+):
+    from giraffe.client import LLMClient
+
+    install(monkeypatch, lambda payload: parts + [ev("extra"), ev(finish="stop"), DONE])
+    config = cfg()
+    spec = RequestSpec(fixture_id="cancel", scenario="client_cancel", check_ids=[], messages=[],
+                       cancel_after_chunks=chunk_limit)
+    async with LLMClient(config.targets[0], config) as client:
+        result = await client.execute(spec)
+
+    assert result.status == status
+    assert result.output == raw_output and result.reasoning == reasoning
+    assert result.generation_chunks == chunk_limit
+    assert result.stream_terminated == (status == "completed")
+
+
 @pytest.mark.parametrize("shape", ["completed", "failed"])
 @pytest.mark.parametrize("evidence", ["none", "separate", "inline", "tokens"])
 def test_v6_budget_classifier_requires_reasoning(shape, evidence):
@@ -190,7 +222,7 @@ def test_v8_logprob_length_reason_is_explicit():
     "<think>a<reasoning>b</think>c</reasoning></think>ans", "hidden</think>ans",
     "prefix<think>a</think>suffix", "<think>unclosed"])
 def test_v10_answer_spans_follow_final_answer_depth(text):
-    spans = _answer_spans(text)
+    spans, _ = _answer_spans(text)
     assert "".join(text[a:b] for a, b in spans or ()).lstrip() == final_answer(text)[0]
 
 

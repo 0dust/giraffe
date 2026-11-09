@@ -632,7 +632,7 @@ def planned_arrivals(settings, point):
 
 
 def build_spec(
-    run, settings, point, shape, calibration, *, role="request", phase=None, progress=None, frozen_sources=None
+    run, settings, point, shape, calibration, *, role="request", phase=None, progress=None, frozen_sources=None, nonce=None
 ):
     size, output = shape.split("_")
     key = size, "short_answer" if output == "short" else "long_output"
@@ -678,6 +678,7 @@ def build_spec(
             details,
             calibration[key]["filler_chars"],
             request_timeout_seconds=settings.request_timeout_seconds,
+            nonce=nonce,
         )
         spec.condition_id = scenario
         prepared = calibration[key]

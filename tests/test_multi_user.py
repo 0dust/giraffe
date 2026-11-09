@@ -30,7 +30,7 @@ def test_selection_is_opt_in_and_population_does_not_clamp_to_slots():
     with pytest.raises(ValidationError):
         settings(duration_seconds=0)
     with pytest.raises(ValidationError):
-        settings(scenarios=["cancellation"])
+        settings(scenarios=["unknown"])
 
 
 def test_twenty_users_share_five_slots_and_repeat(monkeypatch):
