@@ -284,7 +284,7 @@ for(const check of bootstrap.checks){
 }
 syncTestControls();assert.equal(cards.filter(x=>!x.hidden).length,bootstrap.checks.length);
 state.catalogueFilter='all';syncTestControls();assert.equal(cards.filter(x=>!x.hidden).length,bootstrap.checks.length);
-state.catalogueCategory='server';syncTestControls();assert.equal(cards.filter(x=>!x.hidden).map(x=>x.id).sort().join(','),'cancellation,gateway_attribution,gpu,prefix');
+state.catalogueCategory='server';syncTestControls();assert.equal(cards.filter(x=>!x.hidden).map(x=>x.id).sort().join(','),checkGroups.find(x=>x.id==='server').checks.slice().sort().join(','));
 state.catalogueCategory='all';state.catalogueFilter='selected';syncTestControls();assert.equal(cards.filter(x=>!x.hidden).length,2);
 // Browse filters must not hide selected checks when returning to the run.
 state.catalogueCategory='server';state.catalogueSearch='gpu';syncTestControls();assert.equal(cards.filter(x=>!x.hidden).length,2);

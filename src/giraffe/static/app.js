@@ -1,4 +1,4 @@
-import {positiveBoundErrors, inferSetupPreset, configureLoadTest, loadTestIssues, loadTestSettings, loadFieldName, convertExpectedAnswer, datasetCaseFromValues, changeDatasetScorer, configureJudging, configureSessions, configureMultiUser, multiUserSettings, configureProfiles, parseLogprobSettings, parseToolFixtures, effectiveProfileDefaults, configureTests, configureRunLimits, limitValue, optionDefault, optionValue, sameConfig} from './form-config.mjs?v=20261028-results-merge-ci';
+import {positiveBoundErrors, inferSetupPreset, configureLoadTest, loadTestIssues, loadTestSettings, loadFieldName, convertExpectedAnswer, datasetCaseFromValues, changeDatasetScorer, configureJudging, configureSessions, configureMultiUser, multiUserSettings, configureGatewayPolicy, gatewayPolicySettings, configureProfiles, parseLogprobSettings, parseToolFixtures, effectiveProfileDefaults, configureTests, configureRunLimits, limitValue, optionDefault, optionValue, sameConfig} from './form-config.mjs?v=20261028-results-merge-ci';
 
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
@@ -1141,6 +1141,7 @@ function settingDestination(path) {
   if(root==='stream'){step=1;}
   else if(root==='retention'){step=3;}
   else if(root==='targets'){if(parts[1]!=='0')return {name:'config_editor',label:'advanced configuration'};name=parts[2]==='tokenizer'&&$('#new-run-form')?.elements.tokenizer?.value==='custom'?'tokenizer_custom':parts[2];step=1;}
+  else if(root==='gateway_policy'){return {name:'gateway_policy_'+(parts[1]==='users'?'users':parts[1]),check:'gateway_policy',step,label:'Gateway policy settings'};}
   else if(root==='multi_user'){
     const path=parts.slice(1);if(path[0]==='conversations'){
       const key=path[1];name='multi_user_conversation_'+(key||'profile');
@@ -1346,6 +1347,7 @@ function settingPath(name) {
   const check=state.bootstrap?.checks?.find(check=>name.startsWith(`test_${check.id}_`));
   if(check)return `test_options.${check.id}.${name.slice(check.id.length+6).replace(/^limit_/,'limits.')}`;
   if(name.startsWith('load_'))return loadSettingPath(name);
+  if(name.startsWith('gateway_policy_'))return 'gateway_policy.'+name.slice(15);
   if(name.startsWith('multi_user_')){const field=name.slice(11);if(field.startsWith('scenario_'))return 'multi_user.scenarios';if(field.startsWith('noisy_neighbors_')){const key=field.slice(16);return 'multi_user.noisy_neighbors.'+(key.startsWith('profile_')?'heavy_profiles':key.startsWith('trigger_')?'triggers':key);}if(field.startsWith('arrivals_'))return 'multi_user.arrivals.'+field.slice(9);if(field.startsWith('recovery_'))return 'multi_user.recovery.'+field.slice(9);if(field.startsWith('cancellation_'))return 'multi_user.cancellation.'+field.slice(13);if(field.startsWith('conversation_')){const key=field.slice(13),base='multi_user.conversations.';if(key==='sampling_seed')return base+'sampling.seed';const turn=key.match(/^turn_(\d+)$/);if(turn)return base+'turns.'+turn[1];const sample=key.match(/^(sample|weights)_(.+)$/);if(sample)return base+'sampling.'+sample[2]+'.'+(sample[1]==='weights'?'weights':'values');const task=key.match(/^task_(\d+)_(name|weight|cap|turn_(\d+))$/);if(task)return base+'workloads.'+task[1]+'.'+(task[2]==='cap'?'max_tokens':task[3]!==undefined?'turns.'+task[3]:task[2]);return base+key;}if(field.startsWith('profile_'))return 'multi_user.profile.'+field.slice(8).replace(/^(short|medium|long)_/,'$1.');if(field.startsWith('criteria_'))return 'multi_user.pass_criteria.'+field.slice(9);if(field.startsWith('think_time_'))return 'multi_user.think_time_seconds.'+field.slice(11);if(field.startsWith('shape_'))return 'multi_user.shapes';return 'multi_user.'+field;}
   const profile=name.match(/^profile_(arrivals|prefix|sessions|consistency|tools)_(.+)$/);
   if(profile)return `${profile[1]==='tools'?'tool_checks':profile[1]}.${profile[2]}`;
@@ -1403,9 +1405,10 @@ const checkGroups=[
   {id:'answers',title:'Answers',blurb:'Is the output right?',checks:['access','serving','correctness','json','context','tools']},
   {id:'speed',title:'Speed & load',blurb:'How fast, and under how much load?',checks:['first_output','generation','load','multi_user']},
   {id:'reliability',title:'Reliability',blurb:'Does it hold up over time?',checks:['recovery','sessions','consistency']},
-  {id:'server',title:'Diagnostics',blurb:'Evidence from the server itself.',checks:['cancellation','prefix','gpu','gateway_attribution']},
+  {id:'server',title:'Diagnostics',blurb:'Evidence from the server itself.',checks:['cancellation','prefix','gpu','gateway_attribution','gateway_policy']},
 ];
 const checkGuide={
+  gateway_policy:{name:'Gateway quotas & priorities',purpose:'Exercise a declared admission policy for separate test identities.',sends:'Bounded identical requests per identity through LiteLLM; no gateway configuration changes.',shows:'Affected-user rejections, continued peer service, actual work and evidence qualifications.'},
   gateway_attribution:{name:'Gateway usage attribution',purpose:'Compare each test identity’s final usage with gateway request logs.',sends:'Bounded marked requests using selected identities, followed by read-only evidence requests.',shows:'Matched, mismatched or unverified identity and token counts. Missing evidence stays inconclusive.',needs:'LiteLLM spend logs and identity environment-variable references'},
   multi_user:{name:'Multi-user',purpose:'See which users become slow or fail while sharing one endpoint.',sends:'Repeated user work, matched noisy neighbors or selected-user cancellation; all share the request limits.',shows:'Per-user delivery and qualified interference or cancellation observations.'},
   load:{name:'Load test',purpose:'Workloads, request rates and bursts in one place.',sends:'Selected workloads under maintained concurrency, arrivals and bursts.',shows:'Delivery, per-response criteria and highest tested accepted load.'},
@@ -1440,6 +1443,7 @@ function renderProfileEditor(check,config) {
   }
   if(key==='load')return renderLoadEditor(config);
   if(key==='multi_user')return renderMultiUserEditor(config);
+  if(key==='gateway_policy')return renderGatewayPolicyEditor(config);
   if(key==='sessions')return `<input type="hidden" name="profile_edits_sessions" value="[]">${renderSessionEditor(config)}<button type="button" class="text-button reset-profile" data-action="reset-profile" data-profile="sessions">Reset this profile</button>`;
   if(key==='tools'){
     const profile=config.tool_checks || {fixtures:[],modes:null},selected=profile.modes?.join(',') || '';
@@ -1478,6 +1482,7 @@ function checkCoverageWarning(check,config) {
 }
 function checkOverrideWarning() {return '';}
 function effectiveCheckSummary(check,config) {
+  if(check.id==='gateway_policy'){if(!config.gateway_policy)return 'Not configured · declare identities, policy and offered work';const s=gatewayPolicySettings(config);return `${s.capability} · ${s.users.length} identities · ${s.users.reduce((n,u)=>n+u.requests,0)} request cap · ${s.duration_seconds}s`;}
   if(check.id==='gateway_attribution'){const s=config.gateway_attribution;return s?.identities?.length?`${s.identities.length} identities · ${s.samples ?? 2} samples each · bounded read-only evidence`:'Not configured · select identities and an evidence endpoint in JSON';}
   if(check.id==='multi_user'){const s=multiUserSettings(config,state.bootstrap.multi_user.defaults);return `${s.levels.join(' → ')} users · ${config.concurrency==null?'No shared request ceiling':`${config.concurrency} shared request slots`} · ${s.duration_seconds}s per window · ${(s.scenarios||['repeated_requests']).map(human).join(', ')}`; }
   const parts=[];
@@ -1882,6 +1887,17 @@ function renderConcurrentResults(metrics) {
     const cases=m.cases?Object.values(m.cases).map(item=>`<div class="check-observations"><h4>${escape(item.title)} ${badge(item.status)}</h4><p>Requested input/output: ${item.requested_input_tokens==null?'Short prompt':number(item.requested_input_tokens)} / ${number(item.requested_output_tokens)} tokens. Minimum output: ${number(item.minimum_output_tokens)}.</p><p>Observed input: ${tokenRange(item.actual_input_tokens)}; output: ${tokenRange(item.actual_output_tokens)}. ${item.calibration_requests.length} input-sizing requests.</p>${item.coverage_gaps.length?`<p class="hint">${escape(item.coverage_gaps.join(' '))}</p>`:''}<details><summary>Each concurrency level and all measurements</summary><pre>${escape(JSON.stringify(item.levels,null,2))}</pre></details></div>`).join(''):'';
     return `<section class="check-observations concurrent-result" data-concurrent-scenario="${escape(name)}"><h3>${escape(scenario.title)} ${badge(scenario.status)}</h3><p>${escape(scenario.summary)}</p><dl class="metrics-grid">${metric('Completed / sent',`${number(m.completed)} / ${number(m.attempted)}`)}${metric('Failures / timeouts',`${number(m.failed)} / ${number(m.timed_out)}`)}${metric('Correct / scored',`${number(m.correct)} / ${number(m.scored)}`)}${metric('First output p95',ms(m.first_output_p95_ms))}${metric('Response p95',ms(m.p95_ms))}${metric('Longest stream pause',ms(m.max_stream_gap_ms))}${name==='streaming_fairness'?metric('Mixed / short-only latency',m.latency_ratio==null?'Unmeasured':`${number(m.latency_ratio,2)}×`)+metric('Observed streaming overlap',`${m.overlaps ?? 0} / ${m.pairs ?? 0}`):''}</dl>${cells?`<details><summary>${name==='size_matrix'?'Request shapes and concurrency cells':'Request groups'} (${Object.keys(m.buckets).length})</summary>${cells}</details>`:''}${pairs?`<details><summary>Interference comparisons (${m.comparisons.length})</summary>${pairs}</details>`:''}${cases}<details><summary>All scenario measurements and evidence IDs</summary><pre>${escape(JSON.stringify(scenario,null,2))}</pre></details></section>`;
   }).join('');
+}
+
+function renderGatewayPolicyEditor(config) {
+  const s=gatewayPolicySettings(config),numberField=(name,label,required=true)=>field('gateway_policy_'+name,label,s[name],{type:'number',step:'any',required});
+  const modes=[['key_rpm','Per-key RPM quota'],['priority_rpm','Dynamic RPM priority reservation']];
+  if(!modes.some(([value])=>value===s.capability))modes.push([s.capability,'Saved unsupported capability']);
+  return `<div data-gateway-policy-settings><input type="hidden" name="gateway_policy_rendered" value="1"><h4>Declared gateway policy</h4><p class="hint">Use existing test identities configured on the endpoint. <button type="button" class="text-button" data-config-tab="json">Edit identity environment references in configuration JSON</button>. Environment references stay local. Giraffe never changes keys, quotas or priorities.</p><div class="fields">${field('gateway_policy_gateway','Gateway',s.gateway,{required:true})}${field('gateway_policy_auth_header','Gateway authentication header',s.auth_header,{required:true,hint:'Must match the gateway header that carries the test key; credential values remain in environment references.'})}${selectField('gateway_policy_capability','Capability',modes.map(([value,label])=>`<option value="${escape(value)}" ${s.capability===value?'selected':''}>${label}</option>`).join(''))}${field('gateway_policy_gateway_version','Gateway version',s.gateway_version||'')}${field('gateway_policy_affected_identity','Affected identity',s.affected_identity,{required:true})}</div><label class="field"><span>Identity, request cap, declared RPM, priority tier</span><textarea name="gateway_policy_users" rows="4">${escape(s.users.map(u=>[u.identity,u.requests,u.rpm,u.priority||''].join(', ')).join('\n'))}</textarea><small class="hint">One identity per line. RPM means the key quota or reserved priority share. Use 2–8 identities; tiers are needed for priority checks.</small></label><div class="fields">${numberField('duration_seconds','Traffic duration (seconds)')}${numberField('interval_seconds','Pause after each request (seconds)')}${numberField('max_output_tokens','Output token cap')}${selectField('gateway_policy_window_state','Policy window',`<option value="unknown" ${s.window_state==='unknown'?'selected':''}>Unknown — report observations only</option><option value="isolated_fresh" ${s.window_state==='isolated_fresh'?'selected':''}>Operator confirms isolated fresh window</option><option value="isolated_fresh_single_counter" ${s.window_state==='isolated_fresh_single_counter'?'selected':''}>Operator confirms fresh window and one authoritative counter</option>`)}</div><p class="hint">A policy verdict requires one authoritative limiter counter throughout the fresh window. Confirm this only when probes reach one worker or all serving workers use the same verified backing store without local fallback or reset.</p><h4>Dynamic priority reservation</h4><p class="hint">Requires LiteLLM Enterprise dynamic rate limiter v3. A nonzero saturation cache leaves enforcement unverified. Priority is assessed from admission evidence and comparable actual work, never response speed.</p><div class="fields">${numberField('model_rpm','Model RPM',false)}${numberField('saturation_threshold','Saturation threshold (0–1)',false)}${numberField('saturation_cache_seconds','Saturation cache (seconds)',false)}${selectField('gateway_policy_named_reservations_confirmed','Named reservations',`<option value="false" ${s.named_reservations_confirmed?'':'selected'}>Unconfirmed</option><option value="true" ${s.named_reservations_confirmed?'selected':''}>Operator confirms distinct configured named reservations</option>`)}</div></div>`;
+}
+
+function renderGatewayPolicyResults(data) {
+  return `<section class="multi-user-results"><h3>Gateway policy · ${escape(data.qualification)}</h3><p>${escape(data.interpretation)}</p><div class="metric-table" tabindex="0" role="region" aria-label="Gateway policy identity outcomes"><table><thead><tr><th>Identity / tier</th><th>RPM</th><th>Admitted</th><th>Rejected</th><th>Completed / cap</th><th>Actual input tokens</th><th>Actual output tokens (including reasoning)</th></tr></thead><tbody>${data.users.map(u=>`<tr><td>${escape(u.identity)}<small>${escape(u.priority||'')}</small></td><td>${number(u.declared_rpm)}</td><td>${number(u.admitted)}</td><td>${number(u.rejected)}</td><td>${number(u.completed)} / ${number(u.planned)}</td><td>${escape(u.input_tokens.map(v=>v??'unknown').join(', '))}</td><td>${escape((u.completion_tokens||u.output_tokens).map(v=>v??'unknown').join(', '))}</td></tr>`).join('')}</tbody></table></div><p>Peer continuation: ${data.peer_continuation?'observed':'unverified'} · Overlap: ${data.overlap_observed?'observed':'unverified'} · Comparable work: ${data.comparable_actual_work?'observed':'unverified'}</p><details><summary>Policy settings and qualification</summary><pre>${escape(JSON.stringify(data,null,2))}</pre></details></section>`;
 }
 
 function renderMultiUserEditor(config) {
@@ -2937,6 +2953,7 @@ function readForm(allowEmpty=false) {
   config=configureProfiles(config,data,state.bootstrap.profile_defaults || {},{allowInvalid:allowEmpty,limits:state.bootstrap.limits});
   config=configureSessions(config,data,state.bootstrap.session_workloads.defaults,{allowInvalid:allowEmpty});
   config=configureMultiUser(config,data,state.bootstrap.multi_user?.defaults,{allowInvalid:allowEmpty});
+  config=configureGatewayPolicy(config,data,{allowInvalid:allowEmpty});
   config.restart_target=null;
   return {config,baseline_id:data.get('baseline_id') || null,mode:data.get('mode') || 'normal',restart_target:data.get('mode')==='cold-start'?data.get('restart_target'):null};
 }
@@ -3090,7 +3107,7 @@ function resultGuidance(report) {
 // Report navigation is scoped to this visit. Polls never override an explicit tab choice.
 let reportView={id:null,tab:null,explicit:false,wasLive:false,terminalSwitch:false,performance:null,target:null,window:null,error:'',pending:false,sequence:0,lastFetch:0};
 const reportSections=[['overview','Performance overview',null],['timing','Request timing',null],['throughput','Throughput & capacity','throughput_capacity'],['delivery','Load delivery','delivery'],['outcomes','Outcomes & quality','outcomes'],['tokens','Workload & tokens','token_accounting'],['effects','Conversations & workload effects','conversations'],['server','Server observations','server'],['baseline','Baseline comparison','baseline']];
-const comparisonSections=[['answers','Answers & correctness'],['timing','Response timing'],['delivery','Request completion'],['gateway-attribution-outcomes','Gateway attribution outcomes']];
+const comparisonSections=[['answers','Answers & correctness'],['timing','Response timing'],['delivery','Request completion'],['gateway-attribution-outcomes','Gateway attribution outcomes'],['gateway-policy-outcomes','Gateway policy outcomes']];
 const reportResultSections=[['comparison','Baseline comparison'],['acceptance','Pass / fail','comparison'],['load-acceptance','Tested load acceptance','comparison'],...comparisonSections.map(([id,label])=>[id,label,'comparison']),['checks','Checks & evidence'],['configuration','Run configuration'],['requests','All requests'],['resources','Peak memory (RAM)']];
 function reportRoute(hash=typeof location==='undefined'?'':location.hash) {
   const request=hash.match(/^#runs\/([^/]+)\/requests\/([^/]+)$/);
@@ -3757,7 +3774,7 @@ function renderCheck(check,report) {
     metrics.push(metric('Completed responses',`${m.completed ?? 0} / ${m.attempted ?? 0}`,'Completion and correctness are distinct'));
     if(check.id==='context')metrics.push(metric('Longest measured input',m.observed_max_input_tokens==null?'Not reported':`${number(m.observed_max_input_tokens)} tokens`,`Declared context: ${number(m.declared_context_limit)} tokens`));
     else metrics.push(metric('Response time · p95',ms(m.p95_ms),`${m.completed ?? 0} valid completions`));
-  }else if(check.id!=='multi_user'){
+  }else if(!['multi_user','gateway_policy'].includes(check.id)){
     metrics.push(metric('Requests completed',`${m.completed ?? 0} / ${m.attempted ?? 0}`,`${m.failed ?? 0} failed · ${m.timed_out ?? 0} timed out`));
     if(check.id==='first_output'){metrics.push(metric('Warmed first output · p95',ms(m.first_output_p95_ms),timingLimit('first_output_ms','No acceptance limit set')));metrics.push(metric('Initial first output',ms(m.initial?.first_output_p50_ms),'Recorded separately from warmed samples'));}
     else if(check.id==='capacity'&&m.traffic_stages){metrics.push(metric(m.request_pack?.control_status==='fail'?'Highest acceptable tested loaded rate · quiet failed':'Highest acceptable tested arrival rate',m.highest_acceptable_rate_rps==null?'Unconfirmed':`${number(m.highest_acceptable_rate_rps,2)} requests/s`,m.request_pack?.control_status==='fail'?'Loaded result only; quiet checks failed. Maximum capacity unknown.':'Highest tested acceptable rate; maximum capacity unknown'));metrics.push(metric('Rate stages',number(m.traffic_stages.length),'Each stage is offered independently, then drained'));}
@@ -3776,13 +3793,14 @@ function renderCheck(check,report) {
     if(current)metrics.push(metric('Generation pace · slowest (estimate)',m.generation_tokens_per_second_min==null?'Unmeasured':`${number(m.generation_tokens_per_second_min,1)} tok/s`,limits.min_output_tokens_per_second?`Every measurable request must reach ${limits.min_output_tokens_per_second} tok/s`:'No minimum generation rate set'));
     metrics.push(metric('End-to-end output rate · median',m.output_tokens_per_second_p50==null?'Not reported':`${number(m.output_tokens_per_second_p50,1)} tok/s`,current?'Includes waiting for first output; separate from generation pace':'Older report: the output-rate limit used this end-to-end definition'));
   }
-  const extras=Object.fromEntries(Object.entries(m).filter(([k,v])=>k!=='multi_user'&&!(check.id==='gateway_attribution'&&k==='identities')&&(typeof v==='object'&&v!==null || ['backend_cancellation','near_limit_coverage','tls','tls_expiry'].includes(k))));
+  const extras=Object.fromEntries(Object.entries(m).filter(([k,v])=>!['multi_user','gateway_policy'].includes(k)&&!(check.id==='gateway_attribution'&&k==='identities')&&(typeof v==='object'&&v!==null || ['backend_cancellation','near_limit_coverage','tls','tls_expiry'].includes(k))));
   return `<div class="check-detail-head"><div class="check-detail-heading"><h2>${escape(checkGuide[check.id]?.name || check.title)}</h2>${badge(check.status)}</div><p>${escape(check.summary)}</p>${!check.required?'<p class="hint">Optional check</p>':''}</div>
   ${check.id==='cancellation'&&check.status!=='skipped'?renderCancellationResults(m):''}
   ${check.status==='skipped'?`<div class="empty-state" style="padding:35px 24px"><p>${unselectedCheck(check,report)?'This check was not selected. No result is inferred.':'This check was skipped. The recorded reason is shown above; no passing result is inferred.'}</p></div>`:`<dl class="metrics-grid">${metrics.join('')}</dl>`}
   ${check.id==='cancellation'?`<div class="notice" style="margin:20px 24px 0">${escape(m.backend_cancellation?.summary || 'Backend cancellation was not verified.')} Physical device memory reclamation is not measured.</div>`:''}
   ${check.id==='recovery'?`<div class="notice" style="margin:20px 24px 0">Sustained traffic was configured for ${number(config.sustained_seconds,1)} seconds. Results describe this bounded observation period.</div>`:''}
   ${m.logprobs?renderLogprobResults(m.logprobs):''}
+  ${m.gateway_policy?renderGatewayPolicyResults(m.gateway_policy):''}
   ${check.id==='gateway_attribution'?renderGatewayAttributionResults(m):''}
   ${check.id==='multi_user'&&m.multi_user?renderMultiUserResults(m.multi_user):''}${check.id==='sessions'&&m.conversation_performance?renderSessionResults(m.conversation_performance):''}${check.id==='concurrency'?renderConcurrentResults(m):check.id==='load'?renderLoadTestResults(m):''}
   ${m.request_pack?renderPackResults(m.request_pack):''}
@@ -3856,7 +3874,8 @@ function comparisonOutputs(target) {
   return rows;
 }
 function comparisonChange(row) {
-  if(row.aggregation==='observed')return row.status==='inconclusive'?'Not comparable':row.current===row.baseline?'Same outcome':'Outcome changed';
+  if(row.metric==='attribution_outcome')return row.status==='inconclusive'?'Not comparable':row.current===row.baseline?'Same outcome':'Outcome changed';
+  if(row.metric==='policy_acceptance')return row.current===row.baseline?'Same qualification':'Qualification changed';
   if(row.current==null||row.baseline==null)return 'Not measured';
   const delta=row.current-row.baseline;
   if(delta===0)return 'No change';
@@ -3871,7 +3890,7 @@ function comparisonMetricLabel(row) {
 function comparisonWarnings(row) {
   return row.warnings?.length?row.warnings.map(w=>w.message):row.status==='inconclusive'?[row.reason||'Insufficient evidence to interpret this change.']:[];
 }
-function comparisonCategory(row){if(row.metric==='attribution_outcome')return 'gateway-attribution-outcomes';return ['correctness_rate','output_tokens','output_chars'].includes(row.metric)?'answers':['valid_completion_rate','error_rate'].includes(row.metric)?'delivery':'timing';}
+function comparisonCategory(row){if(row.metric==='attribution_outcome')return 'gateway-attribution-outcomes';if(row.metric==='policy_acceptance')return 'gateway-policy-outcomes';return ['correctness_rate','output_tokens','output_chars'].includes(row.metric)?'answers':['valid_completion_rate','error_rate'].includes(row.metric)?'delivery':'timing';}
 function comparisonWarningSummary(row) {
   const notes=[];
   for(const warning of row.warnings||[]){
@@ -3888,12 +3907,21 @@ function comparisonWarningSummary(row) {
   }
   return [...new Set(notes.length?notes:comparisonWarnings(row))];
 }
+function comparisonPolicyOutcomes(outcomes) {
+  if(!Array.isArray(outcomes))return '';
+  return outcomes.map(user=>`<div><small>${escape(user.identity)} · ${number(user.admitted)} admitted · ${number(user.rejected)} rejected</small></div>`).join('');
+}
 function comparisonTable(rows) {
   return `<div class="comparison-values">${rows.map(row=>{
     const warnings=comparisonWarnings(row),shortWarnings=comparisonWarningSummary(row),commonWindow=row.aggregation==='common_window';
-    const aggregation=row.aggregation==='observed'?'Observed outcome':commonWindow?'Common window':row.aggregation==='mean'?'Rate':'Median';
-    const label=commonWindow?(row.status==='fail'?'Observed decrease':warnings.length?'Warning':'Observed'):row.descriptive?'Observed':row.status==='fail'?'Regression detected':warnings.length?'Warning':'No material regression';
-    return `<article class="comparison-measurement" data-metric="${escape(row.metric)}"><div class="comparison-measurement-heading"><h4>${escape(comparisonMetricLabel(row))}</h4><small>${aggregation} · ${escape(label)}</small></div><dl class="comparison-value-grid"><div><dt>Baseline</dt><dd>${comparisonValue(row,row.baseline)}</dd><small>n=${number(row.baseline_samples)}</small></div><div><dt>Current</dt><dd>${comparisonValue(row,row.current)}</dd><small>n=${number(row.current_samples)}</small></div><div><dt>Change</dt><dd>${comparisonChange(row)}</dd></div></dl>${commonWindow&&row.method?`<p class="hint">${escape(row.method)}</p>`:''}${warnings.length?`<div class="comparison-brief-warning">${shortWarnings.map(w=>`<p>${escape(w)}</p>`).join('')}<details class="comparison-support"><summary>Why this warning?</summary><ul>${warnings.map(w=>`<li>${escape(w)}</li>`).join('')}</ul></details></div>`:''}${row.worsening_interval_95?`<details class="comparison-statistics"><summary>Statistical details</summary><p>95% interval for worsening: ${row.worsening_interval_95.map(v=>number(v,1)).join(' to ')} ${row.change_unit==='percentage_points'?'percentage points':'%'}. Threshold: ${number(row.threshold,1)} ${row.change_unit==='percentage_points'?'percentage points':'%'}. Warnings still apply.</p></details>`:''}</article>`;
+    const showReason=row.metric==='policy_acceptance'&&['fail','inconclusive'].includes(row.status)&&typeof row.reason==='string'&&row.reason.trim()&&!warnings.some(warning=>typeof warning==='string'&&warning.trim()===row.reason.trim());
+    const aggregation=commonWindow?'Common window':row.aggregation==='observed'?(row.metric==='attribution_outcome'?'Observed outcome':'Policy evidence'):row.aggregation==='mean'?'Rate':'Median';
+    let label;
+    if(row.aggregation==='observed')label=row.status==='fail'?'Observed failure':warnings.length?'Unverified':'Observed';
+    else if(commonWindow)label=row.status==='fail'?'Observed decrease':warnings.length?'Warning':'Observed';
+    else if(row.descriptive)label='Observed';
+    else label=row.status==='fail'?'Regression detected':warnings.length?'Warning':'No material regression';
+    return `<article class="comparison-measurement" data-metric="${escape(row.metric)}"><div class="comparison-measurement-heading"><h4>${escape(comparisonMetricLabel(row))}</h4><small>${aggregation} · ${escape(label)}</small></div><dl class="comparison-value-grid"><div><dt>Baseline</dt><dd>${comparisonValue(row,row.baseline)}</dd><small>n=${number(row.baseline_samples)}</small>${row.metric==='policy_acceptance'?comparisonPolicyOutcomes(row.baseline_outcomes):''}</div><div><dt>Current</dt><dd>${comparisonValue(row,row.current)}</dd><small>n=${number(row.current_samples)}</small>${row.metric==='policy_acceptance'?comparisonPolicyOutcomes(row.current_outcomes):''}</div><div><dt>Change</dt><dd>${comparisonChange(row)}</dd></div></dl>${showReason?`<p class="hint">${escape(row.reason)}</p>`:''}${commonWindow&&row.method?`<p class="hint">${escape(row.method)}</p>`:''}${warnings.length?`<div class="comparison-brief-warning">${shortWarnings.map(w=>`<p>${escape(w)}</p>`).join('')}<details class="comparison-support"><summary>Why this warning?</summary><ul>${warnings.map(w=>`<li>${escape(w)}</li>`).join('')}</ul></details></div>`:''}${row.worsening_interval_95?`<details class="comparison-statistics"><summary>Statistical details</summary><p>95% interval for worsening: ${row.worsening_interval_95.map(v=>number(v,1)).join(' to ')} ${row.change_unit==='percentage_points'?'percentage points':'%'}. Threshold: ${number(row.threshold,1)} ${row.change_unit==='percentage_points'?'percentage points':'%'}. Warnings still apply.</p></details>`:''}</article>`;
   }).join('')}</div>`;
 }
 function comparisonCohort(row){return row.load_point?['source','type','workload','shape','pattern','level','rate','bursts','phase','role'].map(name=>row.load_point[name]):row.scenario;}

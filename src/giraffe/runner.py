@@ -28,6 +28,7 @@ from .conditions import condition_aggregate, condition_for, request_status, sche
 from .deployment import fixture_hash
 from .fixtures import (FIXTURE_VERSION, builtin_fixtures, load_custom_fixtures,
                        score_response, traffic_fixtures, deterministic_options, reasoning_budget)
+from .identities import gateway_identities_only
 from .overlap import NEEDS_STREAM, max_evidenced_overlap, scheduling_delay_windows
 from .request_pack import pack_identity, pack_preview, pack_specs
 from .stats import percentile
@@ -302,8 +303,8 @@ class _Run:
         self.conditions = {}
         from .conditions import planned_conditions
         self.planned_condition_ids = {(row["target"], row["condition_id"]) for row in planned_conditions(config)}
-        from .planning import request_plan, token_evidence_request_reserve
-        self.planned_request_reserve_per_target = token_evidence_request_reserve(request_plan(config)["rows"])
+        from .planning import request_plan
+        self.request_plan_rows = request_plan(config)["rows"]
         self.endpoint_health = {t.name: {"first_attempt_seconds": None, "last_response_seconds": None,
             "consecutive_failures": 0, "failure_request_ids": [], "abort_reason": None} for t in config.targets}
         self._retired_endpoint_watchdogs: set[str] = set()
@@ -318,6 +319,20 @@ class _Run:
                     "timeout_seconds": config.metrics_timeout_seconds,
                     "max_samples": config.metrics_max_samples,
                     "max_series": config.metrics_max_series, "collection_gaps_seconds": []})
+
+    def runtime_gateway_request_counts(self, target):
+        from .gateway_policy import credential_issue
+
+        runtime_counts = {}
+        policy = self.config.gateway_policy
+        if "gateway_policy" in self.config.checks and policy and policy.supported and credential_issue(policy, target):
+            runtime_counts["gateway_policy"] = 0
+        return runtime_counts
+
+    def token_evidence_reserve(self, target):
+        from .planning import token_evidence_request_reserve
+
+        return token_evidence_request_reserve(self.request_plan_rows, target=target.name)
 
     def _condition(self, target, scenario, workload=None, *, request_parameters=None):
         condition = condition_for(scenario, workload or {}, self.config, request_parameters=request_parameters)
@@ -1302,10 +1317,12 @@ def _deferred_identity_client(run, target):
                      max_connections=run.connection_limits[target.name], **tls_options)
 
 
-async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attribution=False):
+async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attribution=False, defer_policy=False):
     config, enabled = run.config, set(run.config.checks)
     if defer_attribution:
         enabled.discard("gateway_attribution")
+    if defer_policy:
+        enabled.discard("gateway_policy")
     telemetry_task = None
     telemetry_stop = asyncio.Event()
     from giraffe import deployment, telemetry, workloads
@@ -1327,11 +1344,10 @@ async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attributio
         if enabled == {"gpu"} and config.restart_target != target.name:
             await _metrics(run, target, "start")
             return
-        from .identities import gateway_identities_only
         gateway_only = config.restart_target != target.name and gateway_identities_only(enabled)
         client_target = _identity_only_target(target) if gateway_only else target
         async with LLMClient(client_target, config, max_connections=run.connection_limits[target.name]) as client:
-            if defer_attribution and (context := getattr(client, "tls_context", None)) is not None:
+            if (defer_attribution or defer_policy) and (context := getattr(client, "tls_context", None)) is not None:
                 run.deferred_tls_contexts[target.name] = context
             client.logprob_budget = run.logprob_budget
             client.on_response = lambda: run.endpoint_response(target.name)
@@ -1390,9 +1406,10 @@ async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attributio
                 run.preparation(target.name, "performance_evidence_probe", "Checking streamed token and usage evidence", "running")
                 client.on_response = None
                 probe_count = 0
+                planned_reserve = run.token_evidence_reserve(target)
                 while (run.allowed(target.name) and time.monotonic() < probe_end
                        and (run.remaining(target.name) is None or run.remaining(target.name) > max(
-                           1, run.planned_request_reserve_per_target - (run.budget_counts[target.name] - probe_count)))):
+                           1, planned_reserve - (run.budget_counts[target.name] - probe_count)))):
                     spec = client.token_evidence_probe()
                     if spec is None:
                         break
@@ -1495,16 +1512,16 @@ async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attributio
             if "recovery" in enabled:
                 effective = _check_config(config, "recovery")
                 probe_specs = builtin_fixtures(effective, check_id="recovery")["sustained"]
-                from .planning import request_plan
-                later = [name for name in config.checks
-                         if (name not in CORE_CHECKS or name == "load") and name != "gateway_attribution"]
-                later_plan = request_plan(config.model_copy(update={"checks": later, "restart_target": None}))
+                from .planning import recovery_later_reserves
+                later_reserve, has_later_work = recovery_later_reserves(
+                    config, runtime_counts_by_target={target.name: run.runtime_gateway_request_counts(target)},
+                )[target.name]
                 if "cancellation" in enabled and not run.stop_reason(target.name):
                     cleanup = config.effective_check("cancellation")["cleanup_seconds"]
                     await asyncio.sleep(max(0, min(5, cleanup, run.deadline - time.monotonic())))
                 remaining = run.remaining(target.name)
                 if remaining is None or remaining > (
-                        later_plan["minimum_reserved_per_target"] + 2 * effective.samples
+                        later_reserve + 2 * effective.samples
                         + max(effective.limits.min_samples, effective.concurrency*2)):
                     # Uncounted warm-up so the baseline is not the probe fixture's cold first use.
                     await run.request(target, client, probe_specs[0].model_copy(update={
@@ -1512,10 +1529,10 @@ async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attributio
                 await run.group(target, client, probe_specs, "recovery_baseline",
                                 count=effective.samples, checks=["recovery"])
                 remaining = run.remaining(target.name)
-                reserved = later_plan["minimum_reserved_per_target"] + effective.samples
+                reserved = later_reserve + effective.samples
                 # Preserve later fixed work and probes; cap the remaining share
                 # only when another selected check still needs request budget.
-                allowance = (max(0, min(remaining // 2 if later else remaining, remaining-reserved))
+                allowance = (max(0, min(remaining // 2 if has_later_work else remaining, remaining-reserved))
                              if remaining is not None else None)
                 run.observations[target.name]["sustained_budget"] = {
                     "allowance": allowance, "reserved_later": reserved,
@@ -1573,7 +1590,8 @@ async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attributio
                 await run.group(target, client, probe_specs, "recovery",
                                 count=effective.samples, checks=["recovery"])
             run.finish_checks(target.name, {"recovery"})
-            await workloads.execute(run, target, client, fixtures, defer_attribution=defer_attribution)
+            await workloads.execute(run, target, client, fixtures, defer_attribution=defer_attribution,
+                                    defer_policy=defer_policy)
             run.finish_checks(target.name, enabled - {"gpu"})
     except asyncio.CancelledError:
         gateway_deadline = run.duration_limit_scope == "gateway" and run.reason == "maximum run duration reached"
@@ -1637,6 +1655,35 @@ async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attributio
             raise
         except Exception as exc:
             _target_error(run, target, enabled, exc)
+
+
+async def _deferred_policy(run, target):
+    from .gateway_policy import execute
+
+    check = "gateway_policy"
+    observations = run.observations[target.name]
+    reason = run.stop_reason(target.name)
+    if (reason and reason != "maximum request budget reached" or observations.get("client_error")):
+        run.mark_unfinished(target.name, {check})
+        return
+    restart = observations["restart"]
+    if run.config.restart_target == target.name and (not restart or restart["status"] != "ready"):
+        run.finish_checks(target.name, {check})
+        return
+    run.emit("scenario_started", target.name, check)
+    try:
+        async with _deferred_identity_client(run, target) as client:
+            await execute(run, target, client)
+    except asyncio.CancelledError:
+        run.mark_unfinished(target.name, {check})
+        raise
+    except Exception as exc:
+        logger.error("Internal gateway policy error (%s)", type(exc).__name__)
+        observations.setdefault(check, {}).update(
+            execution_error="Gateway policy could not complete.")
+    finally:
+        run.finish_checks(target.name, {check})
+        run.emit("scenario_finished", target.name, check)
 
 
 async def _deferred_attribution(run, target):
@@ -2776,13 +2823,24 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
     consume_samples()
 
     from .gateway_attribution import deferred_for_shared_targets
+    from .gateway_policy import deferred_for_shared_targets as defer_gateway_policy
+
     defer_attribution = deferred_for_shared_targets(config)
+    defer_policy = defer_gateway_policy(config)
 
     async def shared_target(target):
+        deferred = {}
         if defer_attribution:
-            await _target(run, target, fixtures, defer_attribution=True)
-        else:
-            await _target(run, target, fixtures)
+            deferred["defer_attribution"] = True
+        if defer_policy:
+            deferred["defer_policy"] = True
+        await _target(run, target, fixtures, **deferred)
+
+    async def check_policy(target):
+        await _deferred_policy(run, target)
+
+    async def attribute(target):
+        await _deferred_attribution(run, target)
 
     async def target_task(target, execute):
         task = asyncio.create_task(execute(target))
@@ -2804,11 +2862,13 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
 
         return [asyncio.create_task(sequential())]
 
-    async def shared_then_attribution():
-        async def attribute(target):
-            await _deferred_attribution(run, target)
-
-        for execute in (shared_target, attribute):
+    async def shared_then_gateway():
+        phases = [shared_target]
+        if defer_policy:
+            phases.append(check_policy)
+        if defer_attribution:
+            phases.append(attribute)
+        for execute in phases:
             with (nullcontext() if execute is shared_target else run.gateway_limit_phase()):
                 phase = start_targets(execute)
                 try:
@@ -2819,7 +2879,7 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
                             task.cancel()
                     await asyncio.gather(*phase, return_exceptions=True)
 
-    tasks = ([asyncio.create_task(shared_then_attribution())] if defer_attribution
+    tasks = ([asyncio.create_task(shared_then_gateway())] if defer_attribution or defer_policy
              else start_targets(shared_target))
     monitor = asyncio.create_task(run.monitor(tasks))
     try:
@@ -3002,6 +3062,10 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
         from giraffe import multi_user, multi_user_metrics, load_test, concurrent_load, session_sampling, traffic
         workload_identity["multi_user_source_sha256"] = hashlib.sha256(b"".join(Path(m.__file__).read_bytes() for m in (multi_user, multi_user_metrics, load_test, concurrent_load, session_sampling, traffic))).hexdigest()
         workload_identity["multi_user_window_policy"] = multi_user.WINDOW_POLICY
+    if "gateway_policy" in config.checks:
+        from giraffe import gateway_json, gateway_policy, gateway_response
+        workload_identity["gateway_policy_source_sha256"] = hashlib.sha256(b"".join(
+            Path(module.__file__).read_bytes() for module in (gateway_policy, gateway_response, gateway_json))).hexdigest()
     if "load" in config.checks:
         from giraffe import load_test, concurrent_load, traffic
         workload_identity["load_test_source_sha256"] = hashlib.sha256(b"".join(Path(m.__file__).read_bytes() for m in (load_test, concurrent_load, traffic))).hexdigest()
@@ -3046,6 +3110,8 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
                 "invocation": {"source": "python_api", "argv": None},
                 "config_migration_notes": list(config._migration_notes),
                 "timing_measurement_version": 3,
+                **({"gateway_policy_source_sha256": workload_identity["gateway_policy_source_sha256"]}
+                   if "gateway_policy_source_sha256" in workload_identity else {}),
                 **({"request_pack": pack_identity(config)} if run.pack_specs else {}),
                 "workload_selection": {key: "selected" if key in public_config.checks else "not selected"
                                        for key in PUBLIC_CHECK_NAMES if key not in CORE_CHECKS},
@@ -3080,8 +3146,13 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
     memory_required_interrupted = any(check.required and (check.target, check.id)
                                      in run.memory_interrupted_checks for check in checks)
     verdict_reason = run.reason
-    if verdict_reason == "maximum request budget reached" and not any(run.unfinished.values()):
-        verdict_reason = None
+    if verdict_reason == "maximum request budget reached":
+        unfinished = set().union(*run.unfinished.values())
+        # A limit reached only during optional gateway work leaves the
+        # completed shared checks eligible for baseline comparison.
+        if not unfinished or (not gateway_identities_only(config.checks)
+                              and unfinished <= SHARED_BASELINE_EXCLUDED_WORKLOADS):
+            verdict_reason = None
     if run.memory_stop_reason and verdict_reason == run.memory_stop_reason and not memory_required_interrupted:
         verdict_reason = None
     report = RunReport(run_id=run_id, suite_version=__version__,

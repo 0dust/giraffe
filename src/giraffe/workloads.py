@@ -21,6 +21,7 @@ WORKLOAD_CHECKS = {
     "prefix": {"prefix"},
     "sessions": {"sessions"},
     "multi_user": {"multi_user"},
+    "gateway_policy": {"gateway_policy"},
     "gateway_attribution": {"gateway_attribution"},
     "consistency": {"consistency"}, "tool_calling": {"tools"},
     "forced_tool_diagnostic": {"tools"}, "tool_checks": {"tools"},
@@ -510,9 +511,10 @@ async def tools(run, target, client):
                     run.finish_condition(target.name, scenario, request.workload, reason=reason)
 
 
-async def execute(run, target, client, fixtures, *, defer_attribution=False):
+async def execute(run, target, client, fixtures, *, defer_attribution=False, defer_policy=False):
     from giraffe.load_test import execute as load_test
     from giraffe.multi_user import execute as multi_user
+    from giraffe.gateway_policy import execute as gateway_policy
     from giraffe.gateway_attribution import execute as gateway_attribution
     for field, callback in (
         ("prefix", prefixes),
@@ -521,14 +523,15 @@ async def execute(run, target, client, fixtures, *, defer_attribution=False):
         ("sessions", sessions),
         ("consistency", consistency),
         ("tool_calling", tools),
+        ("gateway_policy", gateway_policy),
         ("gateway_attribution", gateway_attribution),
     ):
-        if defer_attribution and field == "gateway_attribution":
+        if (defer_attribution and field == "gateway_attribution") or (defer_policy and field == "gateway_policy"):
             continue
         selected = WORKLOAD_CHECKS[field].intersection(run.config.checks)
         if selected and (getattr(run.config, field) or field == "gateway_attribution"):
             run.emit("scenario_started", target.name, field)
-            if field not in {"load_test", "multi_user", "gateway_attribution"} and not run.allowed(target.name):
+            if field not in {"load_test", "multi_user", "gateway_attribution", "gateway_policy"} and not run.allowed(target.name):
                 run.unfinished[target.name].update(selected)
                 continue
             if field in {"arrivals", "consistency"}:
@@ -546,6 +549,10 @@ def results(run, target, stats, violations, missing_timing, *, saturated=False):
     result = []
     selected = set(config.checks) - set(CORE_CHECKS)
     for check in CHECK_NAMES:
+        if check == "gateway_policy" and check in selected:
+            from giraffe.gateway_policy import result as policy_result
+            result.append(policy_result(run, target))
+            continue
         if check == "gateway_attribution":
             if check in selected or config.gateway_attribution is not None or target.gateway is not None:
                 from giraffe.gateway_attribution import result as gateway_result
