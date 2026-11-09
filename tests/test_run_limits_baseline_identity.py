@@ -19,6 +19,7 @@ LEGACY_LOAD = "33b66f3784ad9613db082fa1f00a2f3292fc910b9f842bd3fe018340a0fe7aa7"
 PRE_MULTI_USER_GENERATOR = "ab5875f7c635f8f454429a88aac87d52ce3a141a84bcf7b936fa737ffa41fe83"
 PRE_NONCE_LOAD = "9b694c97a39d449d8ea15b09a9aeb406bf835179c0882827685c4d7888687d36"
 NONCE_ONLY_LOAD = "df3b7bbf30cab87d2e8c1c6dab8819f9cfe592b181407caa7c32af4c5f720cd4"
+NONCE_LOAD_GENERATOR = "d9a9e921584262148e06b636f0e8f195b7e530fd2a69c5e98f013359cf947ede"
 INTERIM_LOAD_SOURCES = (
     "113325dd5cffa04626cc7be7ee93bc6e9be67335531288bc329b3542a155c92a",
     "788f4c8f0b14421d5fc00f8b32c0ffcef79c04c647730767cb44b16584ed4aa4",
@@ -37,7 +38,7 @@ def load_reports(*, load_source=None, old_source=PRE_NONCE_LOAD):
                                    for m in (load_test, concurrent_load, traffic))).hexdigest()
     for report, digest in ((current, load_source or source), (old, old_source)):
         report.manifest["fixture_pack"]["workload_fixture_sha256"] = fixture_hash({
-            "generator_source_sha256": workloads.FIXTURE_SOURCE_SHA256,
+            "generator_source_sha256": NONCE_LOAD_GENERATOR,
             "settings": settings, "load_test_source_sha256": digest})
     return current, old, settings
 
@@ -82,7 +83,7 @@ def test_interim_load_sources_remain_comparable_to_each_other():
 @pytest.mark.parametrize("change", ["generator", "source", "settings", "missing_settings", "multi_user", "builtin"])
 def test_load_source_compatibility_does_not_hide_unattested_work(change):
     current, old, settings = load_reports(load_source=NONCE_ONLY_LOAD)
-    identity = {"generator_source_sha256": workloads.FIXTURE_SOURCE_SHA256,
+    identity = {"generator_source_sha256": NONCE_LOAD_GENERATOR,
                 "settings": settings,
                 "load_test_source_sha256": "9b694c97a39d449d8ea15b09a9aeb406bf835179c0882827685c4d7888687d36"}
     if change == "generator":
@@ -237,15 +238,26 @@ def test_source_bridge_requires_an_explicitly_attested_generator_revision(monkey
 def test_unchanged_text_generator_has_reviewed_identity_table_entry():
     configured = RunConfig(targets=[{"name": "local", "url": "http://localhost", "model": "test"}],
                            checks=["consistency"])
-    identity = _run_limits_workload_identity({"config": configured.model_dump(mode="json")}, revision="shared_conversations")
-    actual = {
-        "generator_source_sha256": hashlib.sha256(Path(workloads.__file__).read_bytes()).hexdigest(),
-    }
-    assert identity is not None, IDENTITY_TABLE_GUIDANCE
-    for field, digest in actual.items():
-        assert identity[field] == digest, (
-            f"{field} changed: review request-level compatibility and update/extend "
-            "_run_limits_workload_identity in src/giraffe/reporting.py; do not bridge changed workloads.")
+    manifest = {"config": configured.model_dump(mode="json")}
+    attestations = [_run_limits_workload_identity(manifest, revision=revision)
+                    for revision in ("gateway_shared_first", "gateway_shared_targets_first")]
+    actual = hashlib.sha256(Path(workloads.__file__).read_bytes()).hexdigest()
+    assert any(identity and identity["generator_source_sha256"] == actual for identity in attestations), (
+        "generator_source_sha256 changed: review request-level compatibility and update/extend "
+        "_run_limits_workload_identity in src/giraffe/reporting.py; do not bridge changed workloads.")
+
+
+@pytest.mark.parametrize("check", ["sessions", "consistency", "prefix"])
+def test_gateway_dispatch_preserves_core_predecessor_specialist_baselines(check):
+    current, old, _, _ = reports(check)
+    old.manifest["config"] = deepcopy(current.manifest["config"])
+    predecessor = _run_limits_workload_identity(old.manifest, revision="shared_conversations")
+    assert predecessor["generator_source_sha256"] == "d9a9e921584262148e06b636f0e8f195b7e530fd2a69c5e98f013359cf947ede"
+    old.manifest["fixture_pack"]["workload_fixture_sha256"] = fixture_hash(predecessor)
+    before = old.model_dump_json()
+    assert _settings_reasons(current, old) == []
+    assert _settings_reasons(old, current) == []
+    assert old.model_dump_json() == before
 
 
 def test_presampling_generator_identity_retains_the_original_session_settings():
@@ -467,7 +479,7 @@ def test_core_companion_bridge_does_not_extend_to_earlier_generator_revisions():
     assert "Fixture pack identity differs." in _settings_reasons(current, old)
 
 
-@pytest.mark.parametrize("revision", ["persistent_users", "shared_conversations"])
+@pytest.mark.parametrize("revision", ["persistent_users", "shared_conversations", "gateway_attribution", "gateway_conversations"])
 def test_conversation_wiring_does_not_bridge_multi_user_workloads(revision):
     configured = RunConfig(targets=[{"name": "local", "url": "http://localhost", "model": "test"}],
                            checks=["multi_user"])
@@ -498,7 +510,7 @@ def test_sampled_session_bridge_rejects_unknown_sampling_sources(which):
     current, old = sampled_reports("performance")
     report = current if which == "current" else old
     identity = _run_limits_workload_identity(report.manifest,
-        revision="shared_conversations" if which == "current" else "persistent_users")
+        revision="gateway_conversations" if which == "current" else "persistent_users")
     identity["session_sampling_source_sha256"] = "unreviewed-sampler"
     report.manifest["fixture_pack"]["workload_fixture_sha256"] = fixture_hash(identity)
     assert "Fixture pack identity differs." in _settings_reasons(current, old)
@@ -507,6 +519,6 @@ def test_sampled_session_bridge_rejects_unknown_sampling_sources(which):
 def test_sampled_session_bridge_rejects_changed_sampling_settings():
     current, old = sampled_reports("performance")
     current.manifest["config"]["sessions"]["sampling"]["seed"] += 1
-    identity = _run_limits_workload_identity(current.manifest, revision="shared_conversations")
+    identity = _run_limits_workload_identity(current.manifest, revision="gateway_conversations")
     current.manifest["fixture_pack"]["workload_fixture_sha256"] = fixture_hash(identity)
     assert "Fixture pack identity differs." in _settings_reasons(current, old)

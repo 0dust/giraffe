@@ -172,6 +172,7 @@ def test_workload_defaults_and_explicit_selection_preserve_disabled_configuratio
     assert draft.checks == []
     assert not draft.tool_calling
     assert set(CHECK_NAMES) - set(CORE_CHECKS) == {
+        "gateway_attribution",
         "prefix", "sessions", "consistency", "tools", "multi_user"}
 
 

@@ -1,0 +1,29 @@
+# Requires an existing LiteLLM gateway with virtual keys and database spend logs.
+# Set these environment variables locally; never paste their values into this file.
+config_version: 2
+concurrency: 1
+targets:
+  - name: gateway
+    url: http://localhost:4000/v1
+    model: your-served-model
+    route: gateway
+    tokenizer: builtin
+    test_identities:
+      alice:
+        api_key_env: LITELLM_ALICE_KEY
+      bob:
+        api_key_env: LITELLM_BOB_KEY
+    gateway:
+      profile: litellm
+      url: http://localhost:4000/spend/logs/v2
+      api_key_env: LITELLM_OBSERVER_KEY
+checks: [gateway_attribution]
+gateway_attribution:
+  identities: [alice, bob]
+  samples: 2
+  settle_seconds: 5
+max_requests: 4
+max_duration_seconds: 45
+request_timeout_seconds: 8
+max_output_tokens: 16
+stream: true
