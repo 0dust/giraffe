@@ -35,6 +35,56 @@ async def test_local_sizing_counts_complete_prompt_and_discloses_provenance():
 
 
 @pytest.mark.usefixtures("local_tokenizer")
+@pytest.mark.parametrize("offset", [-4, 4])
+async def test_explicit_token_range_constrains_sizing_tolerance(offset):
+    run, target, _ = run_and_target()
+    result = await sizing.prepare_messages(run, target, "context", lambda n: [
+        {"role": "user", "content": "x" * (4 + n + (offset if n else 0))}],
+        100, tolerance=.01, accepted_token_range=(100, 100))
+    assert result["status"] == "calibrated"
+    assert result["input_tokens"] == 100
+    assert result["attempts"] > 2  # The first estimate is within tolerance but outside the bound.
+
+
+@pytest.mark.usefixtures("local_tokenizer")
+async def test_explicit_token_range_rejects_minimum_prompt_that_does_not_fit():
+    run, target, _ = run_and_target()
+    def build(n):
+        return [{"role": "user", "content": "x" * (400 + n)}]
+    result = await sizing.prepare_messages(run, target, "context", build, 90,
+                                          accepted_token_range=(80, 90))
+    assert result["status"] == "unavailable"
+    assert result["input_tokens"] == 100
+    assert result["attempts"] == 1
+    inherited = await sizing.prepare_messages(run, target, "load", build, 90)
+    assert inherited["status"] == "calibrated"
+    assert inherited["reason_code"] == "minimum_prompt_length"
+
+
+@pytest.mark.usefixtures("local_tokenizer")
+async def test_explicit_token_range_accepts_minimum_prompt_above_target_that_still_fits():
+    run, target, _ = run_and_target()
+    result = await sizing.prepare_messages(run, target, "context", lambda n: [
+        {"role": "user", "content": "x" * (400 + n)}],
+        90, accepted_token_range=(80, 110))
+    assert result["status"] == "calibrated"
+    assert result["input_tokens"] == 100
+    assert result["reason_code"] == "minimum_prompt_length"
+    assert result["attempts"] == 1
+
+
+@pytest.mark.usefixtures("local_tokenizer")
+async def test_unrealizable_exact_token_range_stays_bounded_and_unavailable():
+    run, target, _ = run_and_target()
+    result = await sizing.prepare_messages(run, target, "context", lambda n: [
+        {"role": "user", "content": "x" * (8 * (n // 4))}],
+        99, accepted_token_range=(99, 99))
+    assert result["status"] == "unavailable"
+    assert result["attempts"] <= sizing.MAX_SIZING_ATTEMPTS
+    assert not result.get("messages")
+
+
+@pytest.mark.usefixtures("local_tokenizer")
 async def test_load_and_stress_do_not_send_calibration_requests():
     c = config()
     c.load_test.schedule.duration_seconds = .04

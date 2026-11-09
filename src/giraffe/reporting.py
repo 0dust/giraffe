@@ -831,9 +831,15 @@ def _settings_reasons(report: RunReport, baseline: RunReport, *, details: dict[s
             fingerprint_key = shared_key
             current_pack, old_pack = ({**pack, "workload_fixture_sha256": pack[fingerprint_key]}
                                       for pack in (current_pack, old_pack))
-        if has_identity and (_same_run_limits_workload(*sources, fingerprint_key=fingerprint_key)
-                             or _same_load_workload(*sources, fingerprint_key=fingerprint_key)):
+        same_load = has_identity and _same_load_workload(*sources, fingerprint_key=fingerprint_key)
+        if has_identity and (_same_run_limits_workload(*sources, fingerprint_key=fingerprint_key) or same_load):
             inactive.add("workload_fixture_sha256")
+        if same_load and all(set(config.get("checks", [])) == {"load"} and not config.get("restart_target")
+                             for config in (current_config, old_config)):
+            # Generated Load owns its prompts and caps. Its attested identity
+            # covers those requests; without restart readiness, built-ins were
+            # never sent. Do not infer absence from retention-filtered records.
+            inactive.add("builtin_sha256")
         if (not has_identity or {key: value for key, value in current_pack.items() if key not in inactive}
                 != {key: value for key, value in old_pack.items() if key not in inactive}):
             reasons.append("Fixture pack identity differs.")

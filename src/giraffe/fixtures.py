@@ -25,6 +25,7 @@ from giraffe.tool_schema import (MAX_TOOL_JSON_BYTES, ToolSchemaBudgetExceeded, 
                                 bounded_tool_schema)
 
 FIXTURE_VERSION = "0.3.0"
+CONTEXT_SIZING_VERSION = "full-window-v1"
 SUITE_VERSION = "0.3.0"
 _RESERVED_OPTIONS = {"model", "messages", "stream", "max_tokens", "max_completion_tokens", "n"}
 _CONTEXT_POSITION_SEPARATION = 32
@@ -78,7 +79,7 @@ def _request(
     )
 
 
-def _context_request(config: RunConfig, size: str, position: str, check_id: str | None = None) -> RequestSpec:
+def _context_request(config: RunConfig, size: str, position: str) -> RequestSpec:
     """Reserve output/template space and bound ASCII input conservatively.
 
     A character budget deliberately avoids claiming an exact token budget. Even
@@ -119,7 +120,7 @@ def _context_request(config: RunConfig, size: str, position: str, check_id: str 
     )
 
 
-def builtin_fixtures(config: RunConfig, *, check_id: str | None = None) -> dict[str, list[RequestSpec]]:
+def builtin_fixtures(config: RunConfig) -> dict[str, list[RequestSpec]]:
     """Return reproducible fixtures; the runner reuses them across load levels.
 
     The runner must enforce the shared request/time/concurrency budget. Fixtures
@@ -150,7 +151,7 @@ def builtin_fixtures(config: RunConfig, *, check_id: str | None = None) -> dict[
         ),
     ]
     context = [
-        _context_request(config, size, position, check_id)
+        _context_request(config, size, position)
         for size in ("short", "long")
         for position in ("beginning", "middle", "end")
     ]
@@ -263,7 +264,7 @@ def builtin_fixtures(config: RunConfig, *, check_id: str | None = None) -> dict[
     return fixtures
 
 
-def traffic_fixtures(config: RunConfig, *, check_id: str | None = None) -> dict[str, list[RequestSpec]]:
+def traffic_fixtures(config: RunConfig) -> dict[str, list[RequestSpec]]:
     """Three reproducible request shapes with complete local answer scoring.
 
     Lengths describe characters and words, not tokenizer-dependent token counts.
@@ -279,7 +280,7 @@ def traffic_fixtures(config: RunConfig, *, check_id: str | None = None) -> dict[
     answer = " ".join(word_bank[index % len(word_bank)]
                       for index in range(traffic.long_output_words))
     groups = {
-        "short": builtin_fixtures(config, check_id=check_id)["short"],
+        "short": builtin_fixtures(config)["short"],
         "long_input": [_request("traffic.long_input", "capacity", ["capacity"],
                                 prefix + filler + suffix, expected="L8N2",
                                 max_tokens=config.max_output_tokens,

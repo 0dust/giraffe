@@ -33,6 +33,27 @@ documented default allowance. Intentional output-cap probes
 also retain their small limits. A larger allowance does not force a longer answer
 and still needs room alongside the prompt in the model's context window.
 
+The optional context check verifies recall at 80% of the full declared window.
+Its output allowance must leave at least that much input space; reserving more
+than 20% of the window makes this coverage impossible. For example, a 2,048-token
+output allowance in a 4,096-token window cannot establish near-limit recall.
+Use a context-specific allowance that still lets the model finish its answer:
+
+```yaml
+max_output_tokens: 2048
+test_options:
+  context:
+    max_output_tokens: 512
+```
+
+The optional prefix check also reserves the global output allowance. The default
+`prefix.prefix_chars: 8192` does not fit a 4,096-token window with a 2,048-token
+output allowance, so no prefix requests are sent. Reduce `prefix.prefix_chars`
+or the global `max_output_tokens`, or set `test_options.prefix.context_limit` to
+a larger window only if the model supports it. Prefix has no separate output
+allowance setting. Validate or preview the configuration to see these warnings
+before sending traffic.
+
 Generate a saved configuration, then review its endpoint, model and limits:
 
 ```sh

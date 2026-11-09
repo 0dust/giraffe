@@ -1260,7 +1260,7 @@ async def _finish_gpu_observation(run, target):
 
 async def _context_fixtures(run, target, client, fixtures, source=None):
     """Size recall cases locally with the target tokenizer, without inference."""
-    from .fixtures import _context_request
+    from .fixtures import CONTEXT_SIZING_VERSION, _context_request
     from .local_tokenizer import prepare_messages
 
     config = _check_config(run.config, "context")
@@ -1268,7 +1268,11 @@ async def _context_fixtures(run, target, client, fixtures, source=None):
     for original in fixtures["context"]:
         _, size, position, *_ = original.fixture_id.split(".")
         output_budget = original.max_tokens or config.max_output_tokens
-        desired = max(1, int((config.context_limit - output_budget) * .85))
+        available = config.context_limit - output_budget
+        near_limit = math.ceil(config.context_limit * .8)
+        # Reach the full-window coverage threshold without spending output room.
+        desired = max(1, min(int(config.context_limit * .85), available))
+        minimum = near_limit if size == "long" and available >= near_limit else 1
         if size != "long":
             desired = max(1, desired // 3)
 
@@ -1277,18 +1281,21 @@ async def _context_fixtures(run, target, client, fixtures, source=None):
             # determines that allowance using the complete rendered chat prompt.
             allowance = chars if size == "long" else chars * 3
             local = config.model_copy(update={"context_limit": max(128, allowance + output_budget + 32)})
-            return _context_request(local, size, position, "context")
+            return _context_request(local, size, position)
 
-        result = await prepare_messages(run, target, "context_preparation", lambda chars: build(chars).messages, desired, tolerance=.01)
-        if result["status"] == "calibrated" and result["input_tokens"] + output_budget > config.context_limit:
+        result = await prepare_messages(run, target, "context_preparation", lambda chars: build(chars).messages,
+                                        desired, tolerance=.01, accepted_token_range=(minimum, max(0, available)))
+        if result.get("input_tokens") is not None and result["input_tokens"] > available and result["filler_chars"] == 0:
             result.update(status="unavailable", reason_code="context_window_exceeded", reason=(
-                f"The locally counted prompt ({result['input_tokens']} tokens) plus the configured output "
+                f"The minimum locally counted prompt ({result['input_tokens']} tokens) plus the configured output "
                 f"allowance ({output_budget} tokens) exceeds context_limit ({config.context_limit}). "
-                "Increase context_limit or reduce max_output_tokens for the context check."))
+                "Reduce test_options.context.max_output_tokens, or increase test_options.context.context_limit "
+                "only if the server supports that window."))
         evidence.append({key: value for key, value in result.items() if key != "messages"})
         if result["status"] != "calibrated":
             run.observations[target.name]["context_calibration"] = {
-                "status": "unavailable", "reason": result["reason"], "method": "local_tokenizer", "preparations": evidence}
+                "status": "unavailable", "reason": result["reason"], "method": "local_tokenizer",
+                "sizing_version": CONTEXT_SIZING_VERSION, "preparations": evidence}
             run.mark_unfinished(target.name, {"context"})
             return []
         spec = build(result["filler_chars"])
@@ -1299,7 +1306,8 @@ async def _context_fixtures(run, target, client, fixtures, source=None):
                              tokenizer=result["tokenizer"], context_group=f"{desired} target tokens")
         prepared.append(spec)
     run.observations[target.name]["context_calibration"] = {
-        "status": "sized_locally", "method": "local_tokenizer", "preparations": evidence}
+        "status": "sized_locally", "method": "local_tokenizer", "sizing_version": CONTEXT_SIZING_VERSION,
+        "preparations": evidence}
     return prepared
 
 
@@ -1391,7 +1399,7 @@ async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attributio
             if enabled & {"access", "serving", "first_output", "generation"} or restart:
                 response = config.effective_initial()
                 response_config = config.model_copy(update={key: response[key] for key in ("samples", "max_output_tokens", "request_timeout_seconds")})
-                initial_specs = builtin_fixtures(response_config, check_id="serving")["short"]
+                initial_specs = builtin_fixtures(response_config)["short"]
                 if restart and restart["status"] == "hook_completed":
                     ready_deadline = min(run.deadline, time.monotonic() + config.readiness_timeout_seconds)
                     backoff = .1
@@ -1452,17 +1460,17 @@ async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attributio
                 await deployment.model_residency(target, config, deadline=run.deadline, stop=run.stop))
             if enabled & {"serving", "first_output"}:
                 response = config.effective_response()
-                response_specs = builtin_fixtures(config.model_copy(update={key: response[key] for key in ("samples", "max_output_tokens", "request_timeout_seconds")}), check_id="serving")["short"]
+                response_specs = builtin_fixtures(config.model_copy(update={key: response[key] for key in ("samples", "max_output_tokens", "request_timeout_seconds")}))["short"]
                 await run.group(target, client, response_specs, "warm", count=response["samples"])
             run.finish_checks(target.name, {"serving", "first_output"})
             if "generation" in enabled:
                 effective = _check_config(config, "generation")
-                await run.group(target, client, builtin_fixtures(effective, check_id="generation")["generation"], "generation",
+                await run.group(target, client, builtin_fixtures(effective)["generation"], "generation",
                                 count=effective.samples, checks=["generation"])
             run.finish_checks(target.name, {"generation"})
             if "context" in enabled:
                 effective = _check_config(config, "context")
-                check_fixtures = builtin_fixtures(effective, check_id="context")
+                check_fixtures = builtin_fixtures(effective)
                 context_fixtures = await _context_fixtures(run, target, client, check_fixtures)
                 count = max(effective.samples, len(check_fixtures["context"]))
                 if context_fixtures:
@@ -1486,7 +1494,7 @@ async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attributio
                         run.finish_checks(target.name, {check_id})
                         continue
                     effective = _check_config(config, check_id)
-                    check_fixtures = builtin_fixtures(effective, check_id=check_id)
+                    check_fixtures = builtin_fixtures(effective)
                     if check_id == "correctness":
                         # Explicit custom request settings belong to their fixture.
                         check_fixtures[check_id].extend(spec.model_copy(update={
@@ -1503,7 +1511,7 @@ async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attributio
             if "cancellation" in enabled:
                 effective = _check_config(config, "cancellation")
                 options = config.effective_check("cancellation")
-                cancellation_fixtures = builtin_fixtures(effective, check_id="cancellation")
+                cancellation_fixtures = builtin_fixtures(effective)
                 normal = [spec.model_copy(update={"scorer": "none", "options": deterministic_options(config, spec.options)})
                                  if spec.fixture_id.startswith("limits.stop.") else spec
                                  for spec in cancellation_fixtures["limits"] if spec.cancel_after_ms is None
@@ -1537,7 +1545,7 @@ async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attributio
             run.finish_checks(target.name, {"cancellation"})
             if "recovery" in enabled:
                 effective = _check_config(config, "recovery")
-                probe_specs = builtin_fixtures(effective, check_id="recovery")["sustained"]
+                probe_specs = builtin_fixtures(effective)["sustained"]
                 from .planning import recovery_later_reserves
                 later_reserve, has_later_work = recovery_later_reserves(
                     config, runtime_counts_by_target={target.name: run.runtime_gateway_request_counts(target)},
@@ -1563,7 +1571,7 @@ async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attributio
                 run.observations[target.name]["sustained_budget"] = {
                     "allowance": allowance, "reserved_later": reserved,
                     "policy": "reserve fixed later work and probes; half quota cap only with later checks"}
-                heavy = traffic_fixtures(effective, check_id="recovery")
+                heavy = traffic_fixtures(effective)
                 heavy_specs = heavy["long_input"] + heavy["long_output"]
                 end = min(run.deadline, time.monotonic() + effective.sustained_seconds)
                 dispatched, exhausted = 0, False
@@ -2168,6 +2176,13 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                 status, summary = "inconclusive", "Some fixtures lack a score because inference or answer evaluation did not complete."
                 if metrics["cancelled"]:
                     metrics["reason_code"] = "cancelled"
+            elif (check_id == "context" and not metrics["near_limit_coverage"]
+                  and config.context_limit - config.max_output_tokens < math.ceil(config.context_limit * .8)):
+                metrics["reason_code"] = "context_output_reservation"
+                status, summary = "inconclusive", (
+                    f"The configured output allowance ({config.max_output_tokens} tokens) leaves "
+                    f"{max(0, config.context_limit - config.max_output_tokens)} input tokens, "
+                    f"below the {math.ceil(config.context_limit * .8)} tokens required for 80% context coverage.")
             elif check_id == "context" and metrics["reduced_position_coverage"]:
                 status, summary = "inconclusive", "reduced fact-position coverage (context_limit too small)"
             elif check_id == "context" and not metrics["near_limit_coverage"]:
@@ -2735,6 +2750,10 @@ def _verdict_summary(check, config, records, budget):
                   f"and allow the whole rate plan to finish. {budget}")
     elif check.status == "inconclusive" and any(_reasoning_budget(r) for r in records):
         remedy = _output_budget_guidance(config, records, check.id)
+    elif check.id == "context" and reason == "context_output_reservation":
+        maximum = config.context_limit - math.ceil(config.context_limit * .8)
+        remedy = (f"set test_options.context.max_output_tokens to at most {maximum} while leaving enough output tokens "
+                  "for a complete answer, or increase test_options.context.context_limit only if the server supports that window")
     elif check.id == "context":
         remedy = (f"set context_limit to the server's actual token window (currently {config.context_limit}), "
                   "enable prompt token usage reporting and rerun all fact positions with enough output tokens for complete answers")

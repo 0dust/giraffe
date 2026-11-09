@@ -45,9 +45,9 @@ def test_legacy_settings_use_resolved_budgets_and_preserve_other_request_fields(
         if check in {'capacity', 'arrivals', 'concurrency'}:
             continue
         effective = _check_config(config, check)
-        actual = builtin_fixtures(effective, check_id=check)
+        actual = builtin_fixtures(effective)
         historical_budgets = {row['max_tokens'] for rows in groups.values() for row in rows}
-        restored = {cap: builtin_fixtures(effective.model_copy(update={'max_output_tokens': cap}), check_id=check)
+        restored = {cap: builtin_fixtures(effective.model_copy(update={'max_output_tokens': cap}))
                     for cap in historical_budgets}
         for group, historical in groups.items():
             assert bool(actual[group]) == bool(historical)

@@ -35,9 +35,9 @@ def test_historical_inputs_use_resolved_budgets_and_preserve_other_request_field
         def build(settings):
             if check == '_suite_traffic':
                 return traffic_fixtures(settings)
-            built = builtin_fixtures(settings, check_id=None if check.startswith('_suite_') else check)
+            built = builtin_fixtures(settings)
             if check in {'capacity', 'recovery'}:
-                built.update(traffic_fixtures(settings, check_id=check))
+                built.update(traffic_fixtures(settings))
             return built
 
         current = build(effective)

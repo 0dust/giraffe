@@ -40,7 +40,7 @@ def test_sglang_fixtures_are_opt_in_versioned_and_respect_resolved_output_budget
         targets=[target], checks=["cancellation"], max_output_tokens=suite_cap,
         test_options={"cancellation": {"backend_verification": "required", "cancel_after_chunks": 2,
                                        "max_output_tokens": check_cap}})
-    fixtures = builtin_fixtures(runner._check_config(configured, "cancellation"), check_id="cancellation")
+    fixtures = builtin_fixtures(runner._check_config(configured, "cancellation"))
     probe, followup = fixtures["backend_cancellation"]
     assert probe.max_tokens == (check_cap or suite_cap) and probe.cancel_after_chunks == 2
     assert probe.input_chars == len(probe.messages[0]["content"])

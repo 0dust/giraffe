@@ -271,12 +271,14 @@ def _progress(run, target, scenario, status, **metadata):
         run.preparation(target.name, scenario, "Preparing input locally", status, **metadata)
 
 
-async def prepare_messages(run, target, scenario, build_messages, target_tokens, *, tolerance=.1, content_only=False):
+async def prepare_messages(run, target, scenario, build_messages, target_tokens, *, tolerance=.1, content_only=False,
+                           accepted_token_range=None):
     """Size a message builder accepting a filler-character count, without inference.
 
     Returns the messages actually counted, local token count, provenance and the
     filler size. No character estimate is accepted as token evidence. Unavailable
     tokenizers are cached for this run, preventing repeated expensive failures.
+    An optional inclusive token range also constrains tolerance and minimum prompts.
     """
     setup = getattr(target, "_tokenizer_setup", {})
     tokenizer = setup.get("tokenizer") or getattr(target, "tokenizer", None) or BUILTIN
@@ -332,7 +334,9 @@ async def prepare_messages(run, target, scenario, build_messages, target_tokens,
                 result.update(input_tokens=tokens, filler_chars=filler, attempts=attempt + 1)
                 _progress(run, target, scenario, "running", tokenizer=tokenizer,
                           input_tokens=tokens, target_tokens=target_tokens, attempt=attempt + 1)
-                if abs(tokens - target_tokens) <= max(1, target_tokens * tolerance) or (filler == 0 and tokens > target_tokens):
+                within_range = accepted_token_range is None or accepted_token_range[0] <= tokens <= accepted_token_range[1]
+                if within_range and (abs(tokens - target_tokens) <= max(1, target_tokens * tolerance)
+                                     or (filler == 0 and tokens > target_tokens)):
                     floor = filler == 0 and tokens > target_tokens
                     result.update(status="calibrated", reason_code="minimum_prompt_length" if floor else None,
                                   reason=(f"Input target {target_tokens} is below the minimum prompt length "

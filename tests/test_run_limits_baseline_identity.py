@@ -98,6 +98,8 @@ def test_load_source_compatibility_does_not_hide_unattested_work(change):
     elif change == "multi_user":
         old.manifest["config"]["checks"].append("multi_user")
     else:
+        for report in (current, old):
+            report.manifest["config"]["checks"].append("serving")
         old.manifest["fixture_pack"]["builtin_sha256"] = "changed"
     old.manifest["fixture_pack"]["workload_fixture_sha256"] = fixture_hash(identity)
     assert "Fixture pack identity differs." in _settings_reasons(current, old)

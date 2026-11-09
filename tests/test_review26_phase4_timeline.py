@@ -127,6 +127,13 @@ async def test_context_observations_use_actual_calibrated_buckets(monkeypatch):
     recovered = calibrated_context_fixtures(measured, "service", configured)
     assert {spec.fixture_id: spec.input_chars for spec in recovered} == {
         row.fixture_id: row.input_chars for row in saved.requests if "context" in row.check_ids}
+    from giraffe.fixtures import CONTEXT_SIZING_VERSION
+    assert all(row["context_profile"]["sizing_version"] == CONTEXT_SIZING_VERSION for row in measured["service"])
+    assert calibrated_context_fixtures(measured, "service", configured, cohort="another") is None
+    assert calibrated_context_fixtures(measured, "service", configured.model_copy(update={"context_limit": 8192})) is None
+    wrong_fixtures = {"service": [dict(row, context_profile={**row["context_profile"],
+        "fixture_version": "other"}) for row in measured["service"]]}
+    assert calibrated_context_fixtures(wrong_fixtures, "service", configured) is None
     changed = configured.model_copy(deep=True)
     changed.targets[0].tokenizer = "different/tokenizer"
     assert calibrated_context_fixtures(measured, "service", changed) is None
@@ -140,18 +147,37 @@ async def test_context_observations_use_actual_calibrated_buckets(monkeypatch):
     assert {item["id"] for item in unknown["unknown_time_components"]} == {"context_first_batch"}
 
 
+@pytest.mark.parametrize("sizing_version", [None, "old-policy"])
+async def test_context_history_without_current_sizing_policy_cannot_supply_timing(monkeypatch, sizing_version):
+    from giraffe.latency import calibrated_context_fixtures
+
+    monkeypatch.setattr(runner, "LLMClient", FakeClient)
+    configured = config(checks=["context"], context_limit=4096, max_output_tokens=512)
+    saved = await runner.run_suite(configured)
+    calibration = saved.observations["targets"]["service"]["context_calibration"]
+    if sizing_version is None:
+        calibration.pop("sizing_version", None)
+    else:
+        calibration["sizing_version"] = sizing_version
+    measured = observations(saved)
+    assert calibrated_context_fixtures(measured, "service", configured) is None
+    plan = request_plan(configured, observations=measured)
+    assert plan["time_components"] == []
+    assert {item["id"] for item in plan["unknown_time_components"]} == {"context_first_batch"}
+    assert all(row["context_profile"].get("sizing_version") == sizing_version for row in measured["service"])
+
+
 def test_one_component_cannot_mix_fixture_latencies_from_different_runs():
     configured = config(checks=["correctness"], samples=4)
-    fixtures = builtin_fixtures(configured, check_id="correctness")["correctness"]
+    fixtures = builtin_fixtures(configured)["correctness"]
     # Supply distinct output caps to require two cohorts within one gather.
     fixtures[1].max_tokens = fixtures[0].max_tokens * 2
     from giraffe import planning
     original = planning.builtin_fixtures
     with pytest.MonkeyPatch.context() as patch:
-        def custom(configuration, **kwargs):
-            result = original(configuration, **kwargs)
-            if kwargs.get("check_id") == "correctness":
-                result["correctness"] = fixtures
+        def custom(configuration):
+            result = original(configuration)
+            result["correctness"] = fixtures
             return result
         patch.setattr(planning, "builtin_fixtures", custom)
         measured = {"service": [{"family": "correctness", "concurrency": 4, "stream": True,

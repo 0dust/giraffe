@@ -110,7 +110,7 @@ def test_context_fixture_uses_its_check_output_and_context_window():
                        test_options={'context': {'max_output_tokens': 96, 'context_limit': 512,
                                                 'request_timeout_seconds': 45}})
     effective = runner._check_config(config, 'context')
-    specs = builtin_fixtures(effective, check_id='context')['context']
+    specs = builtin_fixtures(effective)['context']
     assert specs and all(spec.max_tokens == 96 for spec in specs)
     assert all(spec.request_timeout_seconds == 45 for spec in specs)
     assert max(spec.input_chars for spec in specs) <= 512 - 96 - 32

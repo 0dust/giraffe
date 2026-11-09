@@ -701,6 +701,56 @@ async def test_context_sizing_is_local_and_records_reproduction(checks):
     assert not any(r.scenario == "context_calibration" for r in report.requests)
 
 
+@pytest.mark.parametrize("context_limit,output_budget", [
+    (4096, 256), (4096, 512), (2048, 128), (2304, 128),
+    (32768, 2048), (40960, 2048), (4096, 800), (4096, 819),
+])
+async def test_context_reaches_full_window_coverage_when_output_reservation_fits(context_limit, output_budget):
+    report = await runner.run_suite(config(checks=["context"], context_limit=context_limit,
+                                          max_output_tokens=output_budget))
+    result = check(report, "context")
+    assert result.status == "pass", result.summary
+    assert result.metrics["near_limit_coverage"]
+    long_requests = [record for record in report.requests if record.fixture_id.startswith("context.long.")]
+    assert {record.fixture_id.split(".")[2] for record in long_requests} == {"beginning", "middle", "end"}
+    assert all(record.input_tokens >= context_limit * .8 for record in long_requests)
+    assert all(record.workload["calibrated_input_tokens"] + output_budget <= context_limit for record in report.requests)
+    assert all(record.requested_max_tokens == output_budget for record in report.requests)
+
+
+@pytest.mark.parametrize("context_limit,output_budget", [(4096, 2048), (4096, 820), (4096, 4000), (4096, 4024)])
+async def test_context_reports_when_output_reservation_prevents_near_limit_coverage(context_limit, output_budget):
+    report = await runner.run_suite(config(checks=["context"], context_limit=context_limit,
+                                          max_output_tokens=output_budget))
+    result = check(report, "context")
+    assert result.status == "inconclusive"
+    assert not result.metrics["near_limit_coverage"]
+    assert result.metrics["reason_code"] == "context_output_reservation"
+    assert str(output_budget) in result.summary
+    assert "test_options.context.max_output_tokens" in result.summary
+    if output_budget == 4024:
+        assert result.metrics["reduced_position_coverage"]
+        assert result.metrics["correct"] == result.metrics["scored"] > 0
+    assert all(record.workload["calibrated_input_tokens"] + output_budget <= context_limit for record in report.requests)
+
+
+async def test_output_reservation_does_not_hide_failed_context_answers(client):
+    client.bad_target = "service"
+    report = await runner.run_suite(config(checks=["context"], context_limit=4096, max_output_tokens=2048))
+    assert check(report, "context").status == "fail"
+    assert check(report, "context").metrics["correct"] == 0
+
+
+@pytest.mark.parametrize("output_budget", [4096, 8192])
+async def test_context_output_budget_leaving_no_prompt_room_sends_no_requests(output_budget):
+    report = await runner.run_suite(config(checks=["context"], context_limit=4096, max_output_tokens=output_budget))
+    result = check(report, "context")
+    assert result.status == "inconclusive"
+    assert "test_options.context.max_output_tokens" in result.summary
+    assert str(output_budget) in result.summary
+    assert not report.requests
+
+
 async def test_context_reserves_configured_output_budget_and_reports_impossible_prompt(client):
     from giraffe.planning import request_plan
 
@@ -712,6 +762,8 @@ async def test_context_reserves_configured_output_budget_and_reports_impossible_
     assert planned["requests_per_target"] == len(requests)
     assert all(record.requested_max_tokens == 2048 for record in requests)
     assert all(record.input_tokens + record.requested_max_tokens <= 4096 for record in requests)
+    assert check(report, "context").status == "inconclusive"
+    assert check(report, "context").metrics["reason_code"] == "context_output_reservation"
 
     impossible = await runner.run_suite(config(checks=["context"], context_limit=128, max_output_tokens=128))
     result = check(impossible, "context")

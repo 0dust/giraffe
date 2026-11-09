@@ -39,7 +39,7 @@ def tail(p50, p90, *, n=200):
 def observations(configuration, check="correctness", *, p50=10, p90=20, concurrency=None):
     options = configuration.effective_check(check)
     effective = configuration.model_copy(update={key: value for key, value in options.items() if key != "limits"})
-    fixtures = builtin_fixtures(effective, check_id=check)[check]
+    fixtures = builtin_fixtures(effective)[check]
     concurrency = concurrency or options.get("concurrency", 1)
     return {target.name: [{"family": check, "concurrency": concurrency, "stream": spec.stream,
                            "output_cap": spec.max_tokens, "input_bucket": input_bucket(spec.input_chars),
@@ -418,7 +418,7 @@ def test_finite_gather_batches_use_slowest_comparable_fixture_per_batch(monkeypa
     from giraffe import planning
 
     configured = config(checks=["serving"], samples=3)
-    generated = builtin_fixtures(configured, check_id="serving")
+    generated = builtin_fixtures(configured)
     # Distinct input shapes keep separate latency cohorts even when both use
     # the same configured output allowance.
     generated["short"][1] = generated["short"][1].model_copy(update={"input_chars": 2048})
