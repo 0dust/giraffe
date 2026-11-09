@@ -369,9 +369,11 @@ def evaluate_scale_down(settings: ScaleDownConfig, evidence: ScaleDownEvidence,
                 continue
             finished = [e for e in done if admitted.sequence < e.sequence < terminated.sequence and e.outcome == "completed"]
             if not finished:
+                unknown_outcome = any(admitted.sequence < e.sequence < terminated.sequence
+                                      and e.outcome is None for e in done)
                 if any(e.outcome == "cancelled" for e in done):
                     drain_missing.append("Some admitted work was cancelled by its client; drain completion is not established for it.")
-                elif complete or any(e.sequence >= terminated.sequence or e.outcome == "failed" for e in done):
+                elif (complete and not unknown_outcome) or any(e.sequence >= terminated.sequence or e.outcome == "failed" for e in done):
                     drain_bad.append("Admitted work was unfinished or unsuccessful when the replica terminated.")
                 else:
                     drain_missing.append("Completion of admitted work is not established.")

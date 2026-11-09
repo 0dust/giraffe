@@ -57,6 +57,42 @@ def test_complete_graceful_evidence_passes_each_result():
     assert "long" in result.metrics["results"]["continuity"]["request_ids"]
 
 
+@pytest.mark.parametrize("outcome_field", [{}, {"outcome": None}], ids=["omitted", "null"])
+def test_unknown_backend_completion_outcome_is_inconclusive(outcome_field):
+    settings, evidence, records = scenario()
+    completion = evidence["snapshots"][-1]["export"]["events"][3]
+    completion.pop("outcome")
+    completion.update(outcome_field)
+
+    result = evaluate(settings, evidence, records)
+
+    assert statuses(result) == dict(continuity="pass", drain="inconclusive", capacity="pass")
+    drain = result.metrics["results"]["drain"]
+    assert drain["metrics"]["complete_coverage"] is True
+    assert "Completion of admitted work is not established." in drain["limitations"]
+
+
+@pytest.mark.parametrize("other_completion", ["failed", "missing"])
+def test_unknown_completion_outcome_does_not_hide_other_unfinished_work(other_completion):
+    settings, evidence, records = scenario()
+    latest = evidence["snapshots"][-1]["export"]
+    latest["events"][3].pop("outcome")
+    for snapshot in evidence["snapshots"]:
+        snapshot["export"]["events"].append(dict(event_id="admit-other", sequence=0,
+            time_ms=0, kind="request_admitted", replica_id="b", request_id="other", attempt_id="original"))
+    next(event for event in latest["events"] if event["kind"] == "replica_terminated")["sequence"] = 7
+    if other_completion == "failed":
+        latest["events"].append(dict(event_id="failed-other", sequence=6, time_ms=350,
+            kind="request_completed", replica_id="b", request_id="other", attempt_id="original", outcome="failed"))
+    latest["through_sequence"] = latest["coverage"][0]["end_sequence"] = 7
+    latest["inventories"][0].update(event_id="inventory-7", sequence=7)
+
+    result = evaluate(settings, evidence, records)
+
+    assert statuses(result) == dict(continuity="pass", drain="fail", capacity="pass")
+    assert "Admitted work was unfinished or unsuccessful when the replica terminated." in result.metrics["results"]["drain"]["summary"]
+
+
 def test_unobserved_removal_does_not_cascade_into_baseline_limitations():
     settings, evidence, records = scenario()
     for snapshot in evidence["snapshots"]:
