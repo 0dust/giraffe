@@ -21,7 +21,7 @@ from typing import Any, AsyncIterator, Callable
 import httpx
 
 from .caps import (
-    MAX_SERVER_ID_CHARS, MAX_TOOL_CALLS,
+    MAX_GATEWAY_USAGE_TOKENS, MAX_SERVER_ID_CHARS, MAX_TOKEN_EVIDENCE_PROBE_ATTEMPTS, MAX_TOOL_CALLS,
 )
 from giraffe.models import RequestRecord, RequestSpec, RunConfig, Target
 from giraffe.logprobs import LogprobBudget, LogprobCollector
@@ -44,6 +44,7 @@ _REASONING_TAG_PREFIXES = {tag[:size] for name in _REASONING_TAG_NAMES
                           for tag in (f"<{name}>", f"</{name}>") for size in range(1, len(tag))}
 _REASONING_TAG_PREFIX = re.compile("|".join(sorted(_REASONING_TAG_PREFIXES)), re.IGNORECASE)
 _MAX_REASONING_TAG_PREFIX = max(map(len, _REASONING_TAG_PREFIXES))
+_SURROGATE = re.compile(r"[\ud800-\udfff]")
 REASONING_BUDGET_ERROR = "reasoning exhausted the output budget before an answer"
 
 
@@ -163,11 +164,18 @@ async def _sse_events(
         raise _ProtocolError("unterminated SSE event at end of response")
 
 
-def _object(payload: str | bytes) -> dict[str, Any]:
-    try:
-        value = json.loads(payload)
-    except (ValueError, UnicodeDecodeError) as exc:
-        raise _ProtocolError("malformed JSON in response") from exc
+def _object(payload: str | bytes, *, strict_gateway_json: bool = False) -> dict[str, Any]:
+    if strict_gateway_json:
+        from .gateway_json import parse_gateway_json
+
+        value = parse_gateway_json(payload)
+        if value is None:
+            raise _ProtocolError("malformed JSON in response")
+    else:
+        try:
+            value = json.loads(payload)
+        except (ValueError, RecursionError) as exc:
+            raise _ProtocolError("malformed JSON in response") from exc
     if not isinstance(value, dict):
         raise _ProtocolError("response must contain a JSON object")
     if value.get("error") is not None:
@@ -181,11 +189,50 @@ def _text(value: Any) -> str:
         return ""
     if not isinstance(value, str):
         raise _ProtocolError("response content must be text")
+    if not value.isascii() and _SURROGATE.search(value):
+        raise _ProtocolError("response text contains invalid Unicode")
     return value
+
+
+def _has_post_finish_delta_payload(delta: dict[str, Any]) -> bool:
+    """Qualify marked usage only when later choice deltas carry no new output."""
+    metadata = {"audio": {"id", "expires_at"}, "function_call": set(),
+                "provider_specific_fields": {"annotations", "citations"}}
+    empty = (None, "", [], {})
+    for field, value in delta.items():
+        if field in {"annotations", "citations"} or (field == "role" and value == "assistant"):
+            continue
+        if field in metadata and isinstance(value, dict):
+            if any(name not in metadata[field] and part not in empty for name, part in value.items()):
+                return True
+        elif value not in empty:
+            return True
+    return False
 
 
 def _token_count(value: Any) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def _gateway_token_count(value: Any) -> int | None:
+    count = _token_count(value)
+    if count is not None and count > MAX_GATEWAY_USAGE_TOKENS:
+        raise _ProtocolError("token usage exceeded the gateway evidence limit")
+    return count
+
+
+def _gateway_usage_total(usage: dict[str, Any]) -> int | None:
+    if "total_tokens" not in usage:
+        return None
+    total = _gateway_token_count(usage["total_tokens"])
+    if total is None:
+        raise _ProtocolError("invalid total usage in gateway response")
+    return total
+
+
+def _check_gateway_usage_total(prompt: int | None, completion: int | None, total: int | None) -> None:
+    if total is not None and prompt is not None and completion is not None and total != prompt + completion:
+        raise _ProtocolError("inconsistent total usage in gateway response")
 
 
 def _rejected_evidence_field(body: bytes) -> str | None:
@@ -311,7 +358,8 @@ class LLMClient:
     reports_response_activity = True
     _supports_dispatch_guard = True
 
-    def __init__(self, target: Target, config: RunConfig, *, max_connections: int | None = None):
+    def __init__(self, target: Target, config: RunConfig, *, max_connections: int | None = None,
+                 _tls_context: ssl.SSLContext | None = None):
         self.target = target
         self.config = config
         if max_connections is None:
@@ -322,6 +370,7 @@ class LLMClient:
         self.max_connections = max_connections
         self.logprob_budget = LogprobBudget()
         self._client: httpx.AsyncClient | HTTPClientPool | None = None
+        self._tls_context = _tls_context
         self._stream_drains: set[asyncio.Task[None]] = set()
         self.on_response = None
         self._evidence_fields = {"logprobs", "stream_options"}
@@ -335,7 +384,8 @@ class LLMClient:
         Only an explicit optional-field rejection permits another setup probe.
         Measured requests are never retried or used to discover compatibility.
         """
-        if self._evidence_probe_finished or self._evidence_probe_attempts >= 3 or not self.config.stream:
+        if (self._evidence_probe_finished or self._evidence_probe_attempts >= MAX_TOKEN_EVIDENCE_PROBE_ATTEMPTS
+                or not self.config.stream):
             return None
         self._evidence_probe_attempts += 1
         options = {}
@@ -356,7 +406,8 @@ class LLMClient:
             self._evidence_fields.discard(field)
             self.token_evidence["logprobs" if field == "logprobs" else "usage"] = "rejected"
             self.token_evidence.update(status="probing", reason=f"Endpoint rejected {rejected} (HTTP {record.http_status}).")
-            self._evidence_probe_finished = not self._evidence_fields or self._evidence_probe_attempts >= 3
+            self._evidence_probe_finished = (not self._evidence_fields
+                                            or self._evidence_probe_attempts >= MAX_TOKEN_EVIDENCE_PROBE_ATTEMPTS)
         else:
             self._evidence_probe_finished = True
             completed = record.http_status == 200 and record.stream_terminated
@@ -376,14 +427,27 @@ class LLMClient:
     def _request_headers(self) -> dict[str, str]:
         return _headers(self.target)
 
+    @property
+    def tls_context(self) -> ssl.SSLContext:
+        if self._client is None or self._tls_context is None:
+            raise RuntimeError("Use LLMClient as an async context manager")
+        return self._tls_context
+
     def _create_client(self) -> HTTPClientPool:
         # HTTPX loads TLS certificates even for HTTP endpoints. Keep that
         # synchronous setup away from concurrent inference and the heartbeat.
         headers = self._request_headers()
-        verify = (ssl.create_default_context(cafile=self.config.ca_bundle)
-                  if self.config.ca_bundle else
-                  httpx.create_ssl_context(verify=True, trust_env=True))
-        cookies = CookieJar()
+        verify = self._tls_context
+        if verify is None:
+            verify = (ssl.create_default_context(cafile=self.config.ca_bundle)
+                      if self.config.ca_bundle else
+                      httpx.create_ssl_context(verify=True, trust_env=True))
+            self._tls_context = verify
+        if self.target.test_identities:
+            from .identities import IdentityCookieJar
+            cookies = IdentityCookieJar()
+        else:
+            cookies = CookieJar()
 
         def factory():
             return httpx.AsyncClient(
@@ -423,6 +487,7 @@ class LLMClient:
             if self._client is not None:
                 await self._client.aclose()
                 self._client = None
+                self._tls_context = None
 
     @staticmethod
     async def _drain_stream(
@@ -466,12 +531,21 @@ class LLMClient:
         self, spec: RequestSpec, *, first_output_event: asyncio.Event | None = None,
         _before_send: Callable[[], None] | None = None,
     ) -> RequestRecord:
+        from .identities import identity_scope
+        with identity_scope(spec.identity is not None):
+            return await self._execute(spec, first_output_event=first_output_event, _before_send=_before_send)
+
+    async def _execute(
+        self, spec: RequestSpec, *, first_output_event: asyncio.Event | None = None,
+        _before_send: Callable[[], None] | None = None,
+    ) -> RequestRecord:
         if self._client is None:
             raise RuntimeError("Use LLMClient as an async context manager")
         preparation_start = time.perf_counter()
         stream = spec.stream if spec.workload.get("logprobs") else self.config.stream and spec.stream
         budget = spec.max_tokens if spec.max_tokens is not None else self.config.max_output_tokens
         record = RequestRecord(
+            identity=spec.identity,
             id=uuid.uuid4().hex, target=self.target.name, fixture_id=spec.fixture_id,
             scenario=spec.scenario, check_ids=spec.check_ids,
             started_at=datetime.now(timezone.utc).isoformat(), status="failed",
@@ -480,10 +554,31 @@ class LLMClient:
                 "No qualifying streamed generated-content event was observed." if stream else
                 "Non-streamed replies do not provide first-token arrival timing."),
         )
+        selected_headers = None
+        attribution = spec.identity is not None and "gateway_attribution" in spec.check_ids
+        if spec.identity is not None:
+            from .identities import identity_headers
+            try:
+                selected_headers = identity_headers(self.target, spec.identity)
+            except ValueError:
+                record.error = "Test identity credentials are unavailable."
+                return record
+            if attribution:
+                from .identities import litellm_key_fingerprint
+
+                record._gateway_key_hash = litellm_key_fingerprint(selected_headers)
+                selected_headers = dict(httpx.Headers(selected_headers))
+                selected_headers["x-litellm-trace-id"] = spec.workload["gateway_run"]
+                selected_headers["x-litellm-session-id"] = spec.workload["gateway_run"]
+                selected_headers["x-litellm-spend-logs-metadata"] = json.dumps({
+                    "giraffe_run": spec.workload["gateway_run"], "giraffe_request": record.id})
         payload = {
             key: value for key, value in (self.config.request_options | spec.options).items()
             if key not in _RESERVED_OPTIONS and value is not None
         }
+        if attribution:
+            # LiteLLM can log an explicit caller session instead of the trace header.
+            payload["litellm_session_id"] = spec.workload["gateway_run"]
         payload.update(model=self.target.model, messages=spec.messages, stream=stream,
                        max_tokens=budget, n=1)
         if spec.scorer == "tool":
@@ -499,7 +594,8 @@ class LLMClient:
         if stream and isinstance(options, dict) and options.get("continuous_usage_stats") is True:
             payload["stream_options"] = {"include_usage": True, **options}
         probing = spec.workload.get("performance_evidence_probe")
-        if stream and not probing:
+        # The shared key may route to a different backend from marked identities.
+        if stream and not probing and not attribution:
             if self.token_evidence["usage"] == "supported":
                 options = payload.setdefault("stream_options", {})
                 if isinstance(options, dict):
@@ -513,11 +609,17 @@ class LLMClient:
                     payload["logprobs"] = True
                     payload.setdefault("top_logprobs", 0)
         record.workload = dict(spec.workload)
-        if not probing and self._evidence_probe_attempts:
+        requested_logprobs = payload.get("logprobs") is True
+        stream_options = payload.get("stream_options")
+        requested_usage = isinstance(stream_options, dict) and stream_options.get("include_usage") is True
+        if stream and not probing and not attribution:
+            record.requested_stream_logprobs = requested_logprobs
+            record.requested_stream_usage = requested_usage
+        if not probing and not attribution and self._evidence_probe_attempts:
             record.workload["token_evidence"] = dict(self.token_evidence)
             evidence = record.workload["token_evidence"]
-            evidence["requested_logprobs"] = payload.get("logprobs") is True
-            evidence["requested_usage"] = isinstance(payload.get("stream_options"), dict) and payload["stream_options"].get("include_usage") is True
+            evidence["requested_logprobs"] = requested_logprobs
+            evidence["requested_usage"] = requested_usage
             if not stream:
                 evidence["logprobs"] = "non_streamed"
             if stream and not evidence["requested_logprobs"] and evidence["logprobs"] == "supported":
@@ -527,7 +629,7 @@ class LLMClient:
 
         def body_received(size):
             record.response_body_bytes += size
-            if self.on_response is not None:
+            if self.on_response is not None and spec.identity is None:
                 self.on_response()
         record.request_hash = hashlib.sha256(json.dumps({
             "messages": spec.messages, "options": {k: v for k, v in payload.items() if k not in {"model", "messages"}},
@@ -658,19 +760,22 @@ class LLMClient:
             usage = data.get("usage")
             completion_tokens = reasoning_tokens = None
             if isinstance(usage, dict):
-                record.input_tokens = _token_count(usage.get("prompt_tokens"))
-                completion_tokens = _token_count(usage.get("completion_tokens"))
-                record.completion_tokens = completion_tokens
-                record.output_tokens = record.completion_tokens
+                count = _gateway_token_count if attribution else _token_count
+                prompt_tokens = count(usage.get("prompt_tokens"))
+                completion_tokens = count(usage.get("completion_tokens"))
                 cached = usage.get("prompt_tokens_details")
-                if isinstance(cached, dict):
-                    record.cached_prompt_tokens = _token_count(cached.get("cached_tokens"))
-                    if record.cached_prompt_tokens is not None:
-                        record.cache_source = "usage.prompt_tokens_details.cached_tokens"
+                cached_tokens = count(cached.get("cached_tokens")) if isinstance(cached, dict) else None
                 details = usage.get("completion_tokens_details")
-                reasoning_tokens = _token_count(details.get("reasoning_tokens")) if isinstance(
-                    details, dict,
-                ) else None
+                reasoning_tokens = count(details.get("reasoning_tokens")) if isinstance(details, dict) else None
+                if attribution:
+                    # Even a provisional frame must not supply unbounded counters.
+                    _gateway_token_count(usage.get("total_tokens"))
+                record.input_tokens = prompt_tokens
+                record.completion_tokens = record.output_tokens = completion_tokens
+                if isinstance(cached, dict):
+                    record.cached_prompt_tokens = cached_tokens
+                    if cached_tokens is not None:
+                        record.cache_source = "usage.prompt_tokens_details.cached_tokens"
                 record.reasoning_tokens = reasoning_tokens
                 if record.output_tokens is not None and reasoning_tokens is not None:
                     record.output_tokens = max(0, record.output_tokens - reasoning_tokens)
@@ -722,6 +827,11 @@ class LLMClient:
                     record.assistant_message = {"role": "assistant", **content}
                 else:
                     assistant_content_present |= isinstance(content.get("content"), str)
+            if (attribution and streaming and record.finish_reason is not None
+                    and _has_post_finish_delta_payload(content)):
+                record._gateway_terminal_usage = False
+                kind = "reasoning" if content.get("reasoning_content") or content.get("reasoning") else "generated"
+                raise _ProtocolError(f"{kind} content arrived after the finish reason")
             answer = _text(content.get("content"))
             if logprob_collector is not None:
                 logprob_collector.add(choice.get("logprobs"))
@@ -844,6 +954,11 @@ class LLMClient:
                 request = self._client.build_request(
                     "POST", completion_url(self.target.url), json=payload,
                     timeout=httpx.Timeout(None, connect=min(request_timeout * .9, 10)))
+                if selected_headers is not None:
+                    # Building through HTTPX merges default headers and cookies.
+                    # Rebuild the complete headers from this identity instead.
+                    request.headers = httpx.Request("POST", request.url, json=payload,
+                                                    headers=selected_headers).headers
                 if spec.workload.get("scenario") == "noisy_neighbors" and spec.workload.get("role") == "probe":
                     sending_post = False
 
@@ -883,11 +998,16 @@ class LLMClient:
                 events = None
                 try:
                     record.http_status = response.status_code
+                    if spec.identity is not None:
+                        from .gateway_response import response_evidence
+                        record.gateway_evidence = response_evidence(response.status_code, headers=response.headers)
                     record.backend_id = response.headers.get("x-backend-id") or response.headers.get(
                         "x-replica-id",
                     )
                     if not 200 <= response.status_code < 300:
                         error_body = await _limited_body(response, on_body=body_received)
+                        if spec.identity is not None:
+                            record.gateway_evidence = response_evidence(response.status_code, error_body, response.headers)
                         if spec.scenario == "connection" and response.status_code in {400, 404, 422}:
                             # Keep only the classification, never arbitrary server error text.
                             body = error_body.decode("utf-8", errors="replace").lower()
@@ -933,6 +1053,7 @@ class LLMClient:
                             _object(await _limited_body(response, on_body=body_received))
                             raise _ProtocolError("endpoint returned JSON instead of an SSE stream")
                         chunk_limit = spec.cancel_after_chunks
+                        terminal_usage = (None, None, None)
                         events = _sse_events(response, on_read=stream_body_received,
                                              mark_read_end=chunk_limit is not None or confirmed_progress)
                         async for event_type, event, observed_at in events:
@@ -960,7 +1081,19 @@ class LLMClient:
                                 record.stream_end_ms = (observed_at - start) * 1000
                                 record.stream_terminated = True
                                 break
-                            receive(_object(event), streaming=True, observed_at=observed_at)
+                            data = _object(event, strict_gateway_json=True) if attribution else _object(event)
+                            receive(data, streaming=True, observed_at=observed_at)
+                            usage = data.get("usage")
+                            if attribution and record.finish_reason is not None and isinstance(usage, dict):
+                                counts = (record.input_tokens, record.completion_tokens, _gateway_usage_total(usage))
+                                if any(previous is not None and current is not None and previous != current
+                                       for previous, current in zip(terminal_usage, counts)):
+                                    record._gateway_terminal_usage = False
+                                    raise _ProtocolError("conflicting terminal usage in gateway response")
+                                terminal_usage = tuple(current if current is not None else previous
+                                                       for previous, current in zip(terminal_usage, counts))
+                                _check_gateway_usage_total(*terminal_usage)
+                                record._gateway_terminal_usage = None not in counts[:2]
                         if not record.stream_terminated:
                             raise _ProtocolError("SSE stream ended without [DONE]")
                     else:
@@ -968,7 +1101,11 @@ class LLMClient:
                             record.stream_end_ms = (at - start) * 1000
                         body = await _limited_body(response, on_read=body_read, on_body=body_received)
                         observed_at = start + record.stream_end_ms / 1000 if record.stream_end_ms is not None else time.perf_counter()
-                        receive(_object(body), streaming=False, observed_at=observed_at)
+                        data = _object(body, strict_gateway_json=True) if attribution else _object(body)
+                        receive(data, streaming=False, observed_at=observed_at)
+                        usage = data.get("usage")
+                        if attribution and isinstance(usage, dict):
+                            _check_gateway_usage_total(record.input_tokens, record.completion_tokens, _gateway_usage_total(usage))
                         record.stream_terminated = True
                     if record.finish_reason is None:
                         raise _ProtocolError("response ended without a completion finish reason")
@@ -1036,7 +1173,8 @@ class LLMClient:
         except UnicodeDecodeError:
             record.error = "response contains invalid UTF-8"
         except (httpx.HTTPError, OSError, ValueError) as exc:
-            logger.debug("Endpoint request failed", exc_info=True)
+            if spec.identity is None:
+                logger.debug("Endpoint request failed", exc_info=True)
             record.error = f"request failed ({type(exc).__name__})"
         finally:
             if transport_started and logprob_collector is not None and record.logprob_evidence is None:
@@ -1157,4 +1295,7 @@ class LLMClient:
                 if record.workload.get("equality") == "whitespace":
                     answer = " ".join(answer.split())
                 record.answer_hash = hashlib.sha256(answer.encode()).hexdigest()
+            if spec.identity is not None:
+                from .identities import discard_identity_response
+                discard_identity_response(record)
         return record

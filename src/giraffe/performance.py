@@ -903,7 +903,7 @@ def build_performance(report, *, target=None, window=None):
         from copy import deepcopy
         stored = deepcopy(report.performance)
         for entry in stored.get("targets", []):
-            records = sorted((r for r in report.requests if r.target == entry["target"]),
+            records = sorted((r for r in report.requests if r.target == entry["target"] and r.identity is None),
                              key=lambda r: (r.dispatch_ms is None, r.dispatch_ms or 0, r.started_at, r.id))
             entry["request_series"] = _request_series(records)
         return stored
@@ -918,7 +918,7 @@ def build_performance(report, *, target=None, window=None):
     } for item in config_targets if item.get("name") == name), {"name": name})} for name in names]
     targets = []
     for name in [selected] if selected is not None else []:
-        records = [r for r in report.requests if r.target == name]
+        records = [r for r in report.requests if r.target == name and r.identity is None]
         records.sort(key=lambda r: (r.dispatch_ms is None, r.dispatch_ms if r.dispatch_ms is not None else 0, r.started_at, r.id))
         series = _request_series(records)
         groups = defaultdict(list)

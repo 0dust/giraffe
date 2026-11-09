@@ -201,6 +201,31 @@ async def test_first_answer_waits_for_reasoning_and_excludes_trailing_stall(monk
     assert result.output == "42" and result.reasoning == "thinking"
 
 
+async def test_ordinary_stream_preserves_reasoning_after_finish(monkeypatch):
+    client, _, _ = setup_client(monkeypatch, [
+        event("42"), event(finish="stop"),
+        b'data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":5}}\n\n',
+        event(reasoning="late reasoning"), b"data: [DONE]\n\n",
+    ])
+    async with client:
+        result = await client.execute(spec())
+    assert result.valid and result.reasoning == "late reasoning"
+
+
+@pytest.mark.parametrize("inline", [False, True])
+@pytest.mark.parametrize("completion", [0, 3])
+async def test_reasoning_without_breakdown_preserves_zero_completion_usage(monkeypatch, inline, completion):
+    client, _, _ = setup_client(monkeypatch, [
+        event("<think>thinking</think>42" if inline else "42",
+              reasoning=None if inline else "thinking"),
+        event(finish="stop", usage={"completion_tokens": completion}), b"data: [DONE]\n\n",
+    ])
+    async with client:
+        result = await client.execute(spec())
+    assert result.valid and result.completion_tokens == completion
+    assert result.output_tokens == (0 if completion == 0 else None)
+
+
 async def test_generation_timing_ends_at_answer_not_finish_or_usage(monkeypatch):
     from types import SimpleNamespace
 

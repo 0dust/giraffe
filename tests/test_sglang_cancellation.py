@@ -320,13 +320,26 @@ async def test_runner_preserves_probe_evidence_and_honest_coverage(monkeypatch, 
     ({"metrics_profile": "sglang"}, {"trace_file": "/missing/traces"}, True, "inconclusive"),
     ({"metrics_profile": "sglang"}, {}, False, "inconclusive"),
 ])
-async def test_unavailable_backend_evidence_never_passes_or_dispatches_requests(target, options, stream, expected):
+async def test_unavailable_backend_evidence_never_passes_or_dispatches_requests(
+    monkeypatch, target, options, stream, expected,
+):
+    def respond(request):
+        return httpx.Response(404 if request.url.path == "/metrics" else 503)
+
+    transport = httpx.MockTransport(respond)
+    original = httpx.AsyncClient
+
+    def mock_client(**kwargs):
+        kwargs["trust_env"] = False
+        return original(**kwargs, transport=transport)
+
+    monkeypatch.setattr(httpx, "AsyncClient", mock_client)
     report = await runner.run_suite(RunConfig(
         targets=[{"name": "local", "url": "http://localhost:1", "model": "tiny"} | target],
         checks=["cancellation"], stream=stream,
-        max_requests=8, max_duration_seconds=.5,
+        max_requests=8, max_duration_seconds=5,
         test_options={"cancellation": {"backend_verification": "required"} | options}))
     check = next(c for c in report.checks if c.id == "cancellation")
     assert check.metrics["backend_cancellation"]["status"] == expected
-    assert not any(r.scenario == "backend_cancel" for r in report.requests)
+    assert not any(r.scenario.startswith("backend_cancel") for r in report.requests)
     assert "cancellation" not in DEFAULT_CHECKS
