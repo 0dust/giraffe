@@ -100,6 +100,48 @@ def burst_config(constant=False, poisson=False):
     return RunConfig.model_validate(v)
 
 
+@pytest.mark.parametrize("stall_at", ["build", "refusal"])
+def test_ordinary_load_keeps_scheduler_lag_at_initial_admission(monkeypatch, stall_at):
+    from giraffe import load_test
+    from giraffe.models import RequestSpec
+    from tests.test_review26_phase4_accuracy import run_virtual
+    from tests.test_runner import FakeClient
+
+    async def run():
+        cfg = burst_config()
+        cfg.load_test.schedule.duration_seconds = 1
+        cfg.load_test.patterns.bursts.size = 2
+        cfg.load_test.patterns.bursts.first_seconds = 0
+        target = cfg.targets[0]
+        state = _Run(cfg, None, None)
+        point, = load_points(cfg.load_test)
+        loop = asyncio.get_running_loop()
+
+        def build(*args):
+            if stall_at == "build":
+                loop.now += .110
+            return RequestSpec(fixture_id="short", scenario=point["id"], check_ids=["load"],
+                               messages=[{"role": "user", "content": "x"}], load_point=dict(point))
+
+        async def refuse(*args, **kwargs):
+            loop.now += .110
+            return None
+
+        monkeypatch.setattr(load_test, "build_spec", build)
+        if stall_at == "refusal":
+            monkeypatch.setattr(state, "request", refuse)
+        records = await load_test.arrival_window(state, target, FakeClient(target, cfg), cfg.load_test, point, {})
+        assert [offer["outcome"] for offer in point["offers"]] == [
+            "started" if stall_at == "build" else "not_offered", "dropped_late",
+        ]
+        assert [offer["scheduler_lag_ms"] for offer in point["offers"]] == pytest.approx([0, 110])
+        assert state.attempted == len(records) == (stall_at == "build")
+        if records:
+            assert records[0].dispatch_lag_ms == pytest.approx(110)
+
+    run_virtual(monkeypatch, run())
+
+
 @pytest.mark.parametrize(
     "constant,poisson,expected,tests",
     [(False, False, 160, 1), (False, True, 760, 1), (True, True, 1520, 2)],

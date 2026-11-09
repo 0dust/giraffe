@@ -56,3 +56,30 @@ multi_user:
 # This schedules eight five-second control/probe windows and one cancellation
 # window. Missing overlap, actual lengths or samples leaves evidence inconclusive.
 # Follow-up success does not prove backend compute or memory release.
+
+# For arrivals and recovery, replace multi_user with the block below.
+# Three users share the same five slots. User-03 joins after five seconds;
+# user-01 bursts while incumbents continue. Recovery then replays matched work.
+# multi_user:
+#   scenarios: [arrivals, recovery]
+#   levels: [3]
+#   shapes: [short_long]
+#   duration_seconds: 15
+#   arrivals:
+#     requests_per_second: 0.5
+#     activations: {user-03: 5}
+#     bursts:
+#       - {user_id: user-01, at_seconds: 8, requests: 3, spacing_seconds: 0}
+#   recovery:
+#     control_seconds: 10
+#     sustained_seconds: 20
+#     lighter_seconds: 10
+#     sustained_requests_per_second: 1
+#     lighter_requests_per_second: 0.5
+#     max_slowdown: 1.5
+#   pass_criteria:
+#     min_samples: 2
+#     max_error_percent: 0
+# These schedules consume 114 offers plus any preparation/warmup. Local drops
+# consume offered-request budget, but never become fabricated endpoint attempts.
+# Reduce rates or raise the shared slot cap if the generator cannot deliver them.

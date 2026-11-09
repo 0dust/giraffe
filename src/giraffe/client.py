@@ -16,7 +16,7 @@ import time
 import uuid
 from time import monotonic
 from datetime import datetime, timezone
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Callable
 
 import httpx
 
@@ -309,6 +309,7 @@ class _StreamGeneration:
 
 class LLMClient:
     reports_response_activity = True
+    _supports_dispatch_guard = True
 
     def __init__(self, target: Target, config: RunConfig, *, max_connections: int | None = None):
         self.target = target
@@ -463,6 +464,7 @@ class LLMClient:
 
     async def execute(
         self, spec: RequestSpec, *, first_output_event: asyncio.Event | None = None,
+        _before_send: Callable[[], None] | None = None,
     ) -> RequestRecord:
         if self._client is None:
             raise RuntimeError("Use LLMClient as an async context manager")
@@ -836,8 +838,9 @@ class LLMClient:
         )
         timeout = min(request_timeout,
                       spec.cancel_after_ms / 1000 if spec.cancel_after_ms else float("inf"))
+        transport_started = _before_send is None
         try:
-            async with asyncio.timeout(timeout):
+            async with asyncio.timeout(None if _before_send is not None else timeout) as request_deadline:
                 request = self._client.build_request(
                     "POST", completion_url(self.target.url), json=payload,
                     timeout=httpx.Timeout(None, connect=min(request_timeout * .9, 10)))
@@ -859,7 +862,24 @@ class LLMClient:
                             sending_post = False
 
                     request.extensions["trace"] = observe_send
-                response = await self._client.send(request, stream=True)
+                if _before_send is not None:
+                    def begin_transport():
+                        nonlocal start, transport_started
+                        _before_send()
+                        transport_started = True
+                        start = time.perf_counter()
+                        record._timing_started_monotonic = monotonic()
+                        record.started_at = datetime.now(timezone.utc).isoformat()
+                        record.client_preparation_ms = (start - preparation_start) * 1000
+                        request_deadline.reschedule(asyncio.get_running_loop().time() + timeout)
+
+                    if isinstance(self._client, HTTPClientPool):
+                        response = await self._client.send(request, stream=True, _before_send=begin_transport)
+                    else:
+                        begin_transport()
+                        response = await self._client.send(request, stream=True)
+                else:
+                    response = await self._client.send(request, stream=True)
                 events = None
                 try:
                     record.http_status = response.status_code
@@ -1019,7 +1039,7 @@ class LLMClient:
             logger.debug("Endpoint request failed", exc_info=True)
             record.error = f"request failed ({type(exc).__name__})"
         finally:
-            if logprob_collector is not None and record.logprob_evidence is None:
+            if transport_started and logprob_collector is not None and record.logprob_evidence is None:
                 evidence = logprob_collector.finish(record.output)
                 if not record.valid and evidence.status == "available":
                     evidence = evidence.model_copy(update={"status": "incomplete", "reason": "Response did not complete validly."})

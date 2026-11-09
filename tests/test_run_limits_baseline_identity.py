@@ -17,15 +17,25 @@ from tests.test_reporting import make_report
 LEGACY_GENERATOR = "4aa7fb48fa4be4a51b3341f34d86755dcfcca5c1043d1d362205d006115eccb0"
 LEGACY_LOAD = "33b66f3784ad9613db082fa1f00a2f3292fc910b9f842bd3fe018340a0fe7aa7"
 PRE_MULTI_USER_GENERATOR = "ab5875f7c635f8f454429a88aac87d52ce3a141a84bcf7b936fa737ffa41fe83"
+PRE_NONCE_LOAD = "9b694c97a39d449d8ea15b09a9aeb406bf835179c0882827685c4d7888687d36"
+NONCE_ONLY_LOAD = "df3b7bbf30cab87d2e8c1c6dab8819f9cfe592b181407caa7c32af4c5f720cd4"
+INTERIM_LOAD_SOURCES = (
+    "113325dd5cffa04626cc7be7ee93bc6e9be67335531288bc329b3542a155c92a",
+    "788f4c8f0b14421d5fc00f8b32c0ffcef79c04c647730767cb44b16584ed4aa4",
+    "4caab6e7a9eb457a5ceddf272112c434a97c101a2c27c3943f8a4155fb71bdb0",
+    "3c8a5f9d0154e7f174b96005258e34c925614fbbd3546e10ffb831616b7f9bdd",
+    "9f8084f595656375f3f32b0cbcdc473a5d69c06909530c1c243ac77e72481c4b",
+    "25a9937e5ce84572a64e26de759f6c97d0fd182b2620aaa91d876a2bf6669eac",
+)
 
 
-def load_reports():
+def load_reports(*, load_source=None, old_source=PRE_NONCE_LOAD):
     from giraffe import load_test, traffic
     current, old, settings, _ = reports("load")
     old.manifest["config"] = deepcopy(current.manifest["config"])
     source = hashlib.sha256(b"".join(Path(m.__file__).read_bytes()
                                    for m in (load_test, concurrent_load, traffic))).hexdigest()
-    for report, digest in ((current, source), (old, "9b694c97a39d449d8ea15b09a9aeb406bf835179c0882827685c4d7888687d36")):
+    for report, digest in ((current, load_source or source), (old, old_source)):
         report.manifest["fixture_pack"]["workload_fixture_sha256"] = fixture_hash({
             "generator_source_sha256": workloads.FIXTURE_SOURCE_SHA256,
             "settings": settings, "load_test_source_sha256": digest})
@@ -34,7 +44,7 @@ def load_reports():
 
 @pytest.mark.parametrize("additional_checks", [[], ["access"]], ids=["load", "access-and-load"])
 def test_ordinary_load_baseline_survives_optional_nonce_builder_argument(additional_checks):
-    current, old, _ = load_reports()
+    current, old, _ = load_reports(load_source=NONCE_ONLY_LOAD)
     for report in (current, old):
         config = report.manifest["config"]
         config["checks"].extend(additional_checks)
@@ -44,9 +54,34 @@ def test_ordinary_load_baseline_survives_optional_nonce_builder_argument(additio
     assert _settings_reasons(old, current) == []
 
 
+@pytest.mark.parametrize("additional_checks", [[], ["access"]], ids=["load", "access-and-load"])
+@pytest.mark.parametrize("old_source", [PRE_NONCE_LOAD, NONCE_ONLY_LOAD], ids=["before-nonce", "before-explicit-stage"])
+def test_ordinary_load_baseline_survives_explicit_multi_user_stage(additional_checks, old_source):
+    current, old, _ = load_reports(old_source=old_source)
+    for report in (current, old):
+        report.manifest["config"]["checks"].extend(additional_checks)
+    assert current.manifest["fixture_pack"] != old.manifest["fixture_pack"]
+    assert _settings_reasons(current, old) == []
+    assert _settings_reasons(old, current) == []
+
+
+@pytest.mark.parametrize("old_source", INTERIM_LOAD_SOURCES)
+def test_post_build_admission_guard_requires_new_load_baseline(old_source):
+    current, old, _ = load_reports(old_source=old_source)
+    assert "Fixture pack identity differs." in _settings_reasons(current, old)
+    assert "Fixture pack identity differs." in _settings_reasons(old, current)
+
+
+def test_interim_load_sources_remain_comparable_to_each_other():
+    current, old, _ = load_reports(load_source=INTERIM_LOAD_SOURCES[-1], old_source=INTERIM_LOAD_SOURCES[0])
+    assert current.manifest["fixture_pack"] != old.manifest["fixture_pack"]
+    assert _settings_reasons(current, old) == []
+    assert _settings_reasons(old, current) == []
+
+
 @pytest.mark.parametrize("change", ["generator", "source", "settings", "missing_settings", "multi_user", "builtin"])
 def test_load_source_compatibility_does_not_hide_unattested_work(change):
-    current, old, settings = load_reports()
+    current, old, settings = load_reports(load_source=NONCE_ONLY_LOAD)
     identity = {"generator_source_sha256": workloads.FIXTURE_SOURCE_SHA256,
                 "settings": settings,
                 "load_test_source_sha256": "9b694c97a39d449d8ea15b09a9aeb406bf835179c0882827685c4d7888687d36"}
