@@ -2,15 +2,63 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import random
 import time
+import uuid
+from copy import deepcopy
 
-from giraffe.concurrent_load import calibrate
+from giraffe.concurrent_load import OutputProgress, calibrate
 from giraffe.load_test import _shape_sources, build_spec
 from giraffe.models import CheckResult, LoadTestSettings
 
 
 WINDOW_POLICY = "completed-output-v1"
+
+
+class _UserOutputProgress(OutputProgress):
+    requires_confirmed_answer = True
+    first_token = False
+    finished = False
+
+    def __init__(self, changed, expire_trigger_admissions):
+        super().__init__(changed)
+        self.expire_trigger_admissions = expire_trigger_admissions
+
+    def on_first_token(self):
+        self.first_token = True
+        self.expire_trigger_admissions()
+        self.changed.set()
+
+    def set(self):
+        super().set()
+        self.expire_trigger_admissions()
+
+    def on_answer_reset(self):
+        self.first = False
+        self.chunks = 0
+        self.expire_trigger_admissions()
+        self.changed.set()
+
+    def on_stream_finished(self):
+        self.finished = True
+        self.expire_trigger_admissions()
+        self.changed.set()
+
+
+def _matched_work_sha256(spec, *, nonce=None):
+    messages = spec.messages
+    if nonce and messages:
+        first = messages[0]
+        content = first.get("content")
+        prefix = f"Request {nonce}."
+        # Remove only the generated cache-busting prefix from the identity.
+        if isinstance(content, str) and content.startswith(prefix):
+            messages = [{**first, "content": content[len(prefix):]}, *messages[1:]]
+    return hashlib.sha256(json.dumps({"messages": messages, "options": spec.options,
+        "max_tokens": spec.max_tokens, "requested_input_tokens": spec.requested_input_tokens,
+        "scorer": spec.scorer, "expected": spec.expected}, sort_keys=True).encode()).hexdigest()
 
 
 def population_plan(settings):
@@ -54,7 +102,7 @@ def _relative(run, now=None):
 
 
 async def run_window(run, target, client, settings, load_settings, calibration, window, *,
-                     sources_by_profile=None, prepared_inputs=None):
+                     sources_by_profile=None, prepared_inputs=None, sequences=None):
     """Close admission at the common cutoff; admitted work keeps its own timeout."""
     start = time.monotonic()
     intended_end = start + window["planned_duration_seconds"]
@@ -66,6 +114,38 @@ async def run_window(run, target, client, settings, load_settings, calibration, 
                         "phase": window["phase"]}, planned=None, planned_kind="duration")
     closed = False
     admission_closed = asyncio.Event()
+    changed = asyncio.Event()
+    active = {}
+    trigger_waiters = {}
+    sequences = sequences if sequences is not None else {}
+
+    def trigger_peers():
+        return [uid for uid, progress in active.items() if not progress.finished
+                and uid not in window.get("heavy_user_ids", [])
+                and (not (progress.first_token or progress.first)
+                     if window.get("trigger") == "before_output" else progress.chunks >= 2)]
+
+    def cancellation_peers():
+        return [uid for uid, progress in active.items() if progress.first and not progress.finished]
+
+    def expire_trigger_admissions():
+        if not trigger_waiters or closed or time.monotonic() >= cutoff:
+            return
+        peers = trigger_peers() if window["role"] == "probe" else cancellation_peers()
+        if not peers:
+            for user in trigger_waiters.values():
+                user["pending_ready_ms"] = None
+
+    async def wait_for_trigger(eligible_peers):
+        while not closed and time.monotonic() < cutoff:
+            changed.clear()
+            if eligible_peers():
+                return True
+            try:
+                await asyncio.wait_for(changed.wait(), max(.0001, cutoff - time.monotonic()))
+            except TimeoutError:
+                break
+        return False
 
     def close(reason=None):
         nonlocal closed
@@ -73,6 +153,7 @@ async def run_window(run, target, client, settings, load_settings, calibration, 
             return
         closed = True
         admission_closed.set()
+        changed.set()
         end = min(time.monotonic(), cutoff)
         window.update(end_ms=_relative(run, end), duration_seconds=max(0, end - start),
                       cut_short=end < intended_end, reason=reason)
@@ -98,41 +179,84 @@ async def run_window(run, target, client, settings, load_settings, calibration, 
         sequence, conversation_sequence = 0, 0
         preceding_pause = 0
 
-        async def send(spec, finalize=None):
+        async def send(spec, finalize=None, *, nonce=None):
             nonlocal sequence
             if closed or time.monotonic() >= cutoff:
                 return None
             sequence += 1
-            ready = _relative(run)
-            user["ready_count"] += 1
-            user["pending_ready_ms"] = ready
             spec.check_ids = ["multi_user"]
             spec.load_point = None
             spec.workload.update(user_id=user["user_id"], population=window["population"],
                 profile=user["profile"], scenario=window["scenario"], phase=window["phase"],
-                window_id=scenario, request_sequence=sequence, ready_ms=ready,
+                window_id=scenario, request_sequence=sequence,
                 think_time_seconds=preceding_pause)
+            if window.get("role"):
+                spec.workload.update(role=window["role"], matched_work_sequence=sequence,
+                    trigger=window.get("trigger"), heavy_profile=window.get("heavy_profile"),
+                    matched_work_sha256=_matched_work_sha256(spec, nonce=nonce))
+                sequences[user["user_id"]] = sequences.get(user["user_id"], 0) + 1
+                spec.workload["request_sequence"] = sequences[user["user_id"]]
+            selected = window.get("selected_user_id") == user["user_id"] and window["phase"] == "measurement"
+            cancel_first = selected and sequence == 1
+            if selected:
+                spec.workload["cancellation_role"] = "selected" if cancel_first else "followup"
+                if cancel_first:
+                    spec.cancel_after_chunks = settings.cancellation.cancel_after_chunks
+            progress = _UserOutputProgress(changed, expire_trigger_admissions)
+            heavy = window.get("role") == "probe" and user["user_id"] in window.get("heavy_user_ids", [])
+            eligible_peers = cancellation_peers if cancel_first else trigger_peers if heavy else None
             if settings.conversations:
                 spec.scenario = scenario
                 spec.workload["conversation_sequence"] = conversation_sequence
-            async with run.slot(False, cutoff) as admitted:
-                if not admitted or closed or time.monotonic() >= cutoff:
+
+            def dispatched():
+                user["dispatched_count"] += 1
+                user["pending_ready_ms"] = None
+                trigger_waiters.pop(user["user_id"], None)
+                active[user["user_id"]] = progress
+                if heavy:
+                    spec.workload.update(trigger=window["trigger"], trigger_ms=_relative(run),
+                                         trigger_peer_ids=peers)
+                changed.set()
+
+            def finalized(record):
+                if finalize:
+                    finalize(record)
+                user["request_ids"].append(record.id)
+
+            while not closed and time.monotonic() < cutoff:
+                if eligible_peers and not await wait_for_trigger(eligible_peers):
                     return None
-                if not run.allowed(target.name):
-                    close(run.stop_reason(target.name) or "target request allowance exhausted")
+                if closed or time.monotonic() >= cutoff:
                     return None
-
-                def dispatched():
-                    user["dispatched_count"] += 1
-                    user["pending_ready_ms"] = None
-
-                def finalized(record):
-                    if finalize:
-                        finalize(record)
-                    user["request_ids"].append(record.id)
-
-                return await run.request(target, client, spec, slot_reserved=True, admission_deadline=cutoff,
-                                         on_start=dispatched, finalize_record=finalized)
+                # Scenario coordination precedes eligibility for shared admission.
+                ready = _relative(run)
+                user["ready_count"] += 1
+                user["pending_ready_ms"] = ready
+                spec.workload["ready_ms"] = ready
+                if eligible_peers:
+                    trigger_waiters[user["user_id"]] = user
+                try:
+                    async with run.slot(False, cutoff) as admitted:
+                        if not admitted or closed or time.monotonic() >= cutoff:
+                            return None
+                        if not run.allowed(target.name):
+                            close(run.stop_reason(target.name) or "target request allowance exhausted")
+                            return None
+                        peers = eligible_peers() if eligible_peers else []
+                        if eligible_peers and (not peers or user["pending_ready_ms"] is None):
+                            # An expired trigger cannot carry admission wait into a new opportunity.
+                            user["pending_ready_ms"] = None
+                            continue
+                        try:
+                            return await run.request(target, client, spec, slot_reserved=True, admission_deadline=cutoff,
+                                                     event=progress, on_start=dispatched, finalize_record=finalized)
+                        finally:
+                            active.pop(user["user_id"], None)
+                            expire_trigger_admissions()
+                            changed.set()
+                finally:
+                    trigger_waiters.pop(user["user_id"], None)
 
         while not closed and time.monotonic() < cutoff:
             if not run.allowed(target.name):
@@ -168,9 +292,13 @@ async def run_window(run, target, client, settings, load_settings, calibration, 
                 point = {"id": scenario, "type": "combinations", "workload": "combinations",
                          "pattern": "concurrent", "level": window["population"], "rate": None,
                          "bursts": False, "source": "primary", "_source_index": sequence}
+                nonce = uuid.uuid4().hex if window.get("role") else None
                 spec = build_spec(run, load_settings, point, user["profile"], calibration,
-                                  frozen_sources=(sources_by_profile or {}).get(user["profile"]))
-                await send(spec)
+                                  frozen_sources=(sources_by_profile or {}).get(user["profile"]),
+                                  nonce=nonce)
+                record = await send(spec, nonce=nonce)
+                if record is None and time.monotonic() >= cutoff:
+                    break
                 pause_sequence = sequence
             preceding_pause = random.Random(f"{settings.seed}:pause:{user['user_id']}:{pause_sequence}").choices(
                 settings.think_time_seconds.values, weights=settings.think_time_seconds.weights)[0]
@@ -181,7 +309,12 @@ async def run_window(run, target, client, settings, load_settings, calibration, 
         user["stop_reason"] = window["reason"] or user.get("stop_reason")
 
     order = list(window["users"])
-    random.Random(f"{settings.seed}:launch:{window['population']}:{window['phase']}").shuffle(order)
+    launch_seed = f"{settings.seed}:launch:{window['population']}:{window['phase']}"
+    if window.get("role"):
+        # Adding heavy users must not reshuffle the matched short-user order.
+        order.sort(key=lambda user: random.Random(f"{launch_seed}:{user['user_id']}").random())
+    else:
+        random.Random(launch_seed).shuffle(order)
     tasks = [asyncio.create_task(user_loop(user)) for user in order]
     try:
         pending = set(tasks)
@@ -232,12 +365,44 @@ def _planned_observation(settings):
     population = population_plan(settings)
     windows = []
     for level in settings.levels:
-        if settings.warmup_seconds:
-            windows.append(_window(level, "warmup", settings.warmup_seconds, population))
-        windows.append(_window(level, "measurement", settings.duration_seconds, population))
+        if "repeated_requests" in settings.scenarios:
+            if settings.warmup_seconds:
+                windows.append(_window(level, "warmup", settings.warmup_seconds, population))
+            windows.append(_window(level, "measurement", settings.duration_seconds, population))
+        if "noisy_neighbors" in settings.scenarios:
+            neighbors = settings.noisy_neighbors
+            heavy_ids = neighbors.heavy_user_ids or [user["user_id"] for user in population[:neighbors.heavy_user_count]]
+            for profile in neighbors.heavy_profiles:
+                for trigger in neighbors.triggers:
+                    control_id = f"multi_user_{level}_neighbors_{profile}_{trigger}_control"
+                    for role in ("control", "probe"):
+                        window = _window(level, "measurement", settings.duration_seconds, population)
+                        window.update(id=f"multi_user_{level}_neighbors_{profile}_{trigger}_{role}",
+                                      scenario="noisy_neighbors", role=role, trigger=trigger,
+                                      heavy_profile=profile, heavy_user_ids=heavy_ids, control_window_id=control_id)
+                        window["users"] = [dict(user, profile=profile if user["user_id"] in heavy_ids else "short_short")
+                                           for user in window["users"] if role == "probe" or user["user_id"] not in heavy_ids]
+                        windows.append(window)
+        if "cancellation" in settings.scenarios:
+            window = _window(level, "measurement", settings.duration_seconds, population)
+            window.update(id=f"multi_user_{level}_cancellation", scenario="cancellation", role="cancellation",
+                          selected_user_id=settings.cancellation.user_id)
+            for user in window["users"]:
+                user["profile"] = "short_long"
+            windows.append(window)
     if settings.conversations:
         for window in windows:
             window["scenario"] = "repeated_conversations"
+    if settings.warmup_seconds:
+        expanded = []
+        for window in windows:
+            if window.get("role"):
+                warmup = deepcopy(window)
+                warmup.update(id=window["id"] + "_warmup", phase="warmup",
+                              planned_duration_seconds=settings.warmup_seconds)
+                expanded.append(warmup)
+            expanded.append(window)
+        windows = expanded
     return {"version": 1, "window_policy": WINDOW_POLICY,
             "settings": settings.model_dump(mode="json"), "population": population,
             "windows": windows, "calibrations": []}
@@ -246,7 +411,7 @@ def _planned_observation(settings):
 async def execute(run, target, client):
     settings = run.config.multi_user
     observation = _planned_observation(settings)
-    population, windows = observation["population"], observation["windows"]
+    windows = observation["windows"]
     run.observations[target.name]["multi_user"] = observation
     for window in windows:
         run.plan_condition(target.name, window["id"],
@@ -260,8 +425,9 @@ async def execute(run, target, client):
             legacy_max_output_tokens=run.config.legacy_custom_fixture_max_output_tokens)
     sources = run.pack_specs or getattr(run, "load_custom_specs", [])
     # Resolve candidates once from saved inputs, never from later peer results.
+    profiles = {user["profile"] for window in windows for user in window["users"]}
     sources_by_profile = {profile: tuple(_shape_sources(load_settings, profile.split("_")[0], sources))
-                          for profile in {user["profile"] for user in population}} if sources and not settings.conversations else {}
+                          for profile in profiles} if sources and not settings.conversations else {}
     calibration = {}
     prepared_inputs = {}
     reason = None
@@ -276,7 +442,7 @@ async def execute(run, target, client):
                 turn_counts = conversation.sampling.turn_count
                 max_turns = max(value for index, value in enumerate(turn_counts.values)
                     if turn_counts.weights is None or turn_counts.weights[index] > 0) if turn_counts else None
-                assigned_tasks = sorted({user["conversation_workload"] for user in population})
+                assigned_tasks = sorted({user["conversation_workload"] for window in windows for user in window["users"]})
                 for index in assigned_tasks:
                     task = conversation.workloads[index]
                     for prompt in task.turns[:int(max_turns) if max_turns is not None else None]:
@@ -287,7 +453,7 @@ async def execute(run, target, client):
                             if key not in prepared_inputs:
                                 prepared_inputs[key] = await prepare_session_input(run, target, prompt, tokens)
         elif not (run.pack_specs or getattr(run, "load_custom_specs", [])):
-            for shape in sorted({user["profile"] for user in population}):
+            for shape in sorted(profiles):
                 if not run.allowed(target.name):
                     reason = run.stop_reason(target.name) or "target request allowance exhausted"
                     break
@@ -299,6 +465,7 @@ async def execute(run, target, client):
                 if calibration[key]["status"] not in {"calibrated"}:
                     reason = calibration[key].get("reason") or "input preparation unavailable"
                     break
+        sequences = {}
         for window in windows:
             if reason or not run.allowed(target.name):
                 reason = reason or run.stop_reason(target.name) or "target request allowance exhausted"
@@ -308,7 +475,7 @@ async def execute(run, target, client):
                 run.mark_unfinished(target.name, ["multi_user"])
                 continue
             await run_window(run, target, client, settings, load_settings, calibration, window,
-                             sources_by_profile=sources_by_profile, prepared_inputs=prepared_inputs)
+                             sources_by_profile=sources_by_profile, prepared_inputs=prepared_inputs, sequences=sequences)
     finally:
         from giraffe.overlap import scheduling_delay_windows
         observation["scheduling_delay_windows"] = [
@@ -341,14 +508,27 @@ def result(run, target):
     if status == "measured":
         message = "Per-user delivery measured; no acceptance criteria selected."
     elif status == "fail":
-        worst = summary["worst_user"]
+        messages = []
+        if summary["failed_user_windows"]:
+            worst = summary["worst_user"]
+            messages.append(f"{summary['failed_user_windows']} user measurements failed; "
+                            f"{worst['user_id']} at {worst['population']} users: " + " ".join(worst["reasons"]))
         fairness_failures = [window["fairness"] for window in summary["windows"]
-                             if window.get("fairness", {}).get("status") == "fail"]
-        message = (f"{summary['failed_user_windows']} user measurements failed; "
-                   f"{worst['user_id']} at {worst['population']} users: "
-                   + " ".join(worst["reasons"])) if summary["failed_user_windows"] else "Observed delivery fairness failed."
+                             if not window.get("role") and window.get("fairness", {}).get("status") == "fail"]
         if fairness_failures:
-            message += " " + " ".join(reason for result in fairness_failures for reason in result["reasons"])
+            messages.append("Observed delivery fairness failed. " + " ".join(
+                reason for evidence in fairness_failures for reason in evidence["reasons"]))
+        interference_failures = [user for window in summary["windows"]
+                                 for user in window.get("interference", {}).get("users", []) if user["status"] == "fail"]
+        if interference_failures:
+            messages.append("Observed noisy-neighbor interference failed. " + " ".join(
+                f"{user['user_id']}: {' '.join(user['reasons'])}" for user in interference_failures))
+        for window in summary["windows"]:
+            followup = window.get("cancellation", {}).get("followup", {})
+            if followup.get("status") == "fail":
+                messages.append("Same-user cancellation follow-up failed for "
+                                + window["cancellation"]["selected_user_id"] + ".")
+        message = " ".join(messages)
     elif status == "pass":
         message = "Every measured user met the selected criteria over the common windows."
     else:

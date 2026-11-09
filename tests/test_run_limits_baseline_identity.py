@@ -19,6 +19,54 @@ LEGACY_LOAD = "33b66f3784ad9613db082fa1f00a2f3292fc910b9f842bd3fe018340a0fe7aa7"
 PRE_MULTI_USER_GENERATOR = "ab5875f7c635f8f454429a88aac87d52ce3a141a84bcf7b936fa737ffa41fe83"
 
 
+def load_reports():
+    from giraffe import load_test, traffic
+    current, old, settings, _ = reports("load")
+    old.manifest["config"] = deepcopy(current.manifest["config"])
+    source = hashlib.sha256(b"".join(Path(m.__file__).read_bytes()
+                                   for m in (load_test, concurrent_load, traffic))).hexdigest()
+    for report, digest in ((current, source), (old, "9b694c97a39d449d8ea15b09a9aeb406bf835179c0882827685c4d7888687d36")):
+        report.manifest["fixture_pack"]["workload_fixture_sha256"] = fixture_hash({
+            "generator_source_sha256": workloads.FIXTURE_SOURCE_SHA256,
+            "settings": settings, "load_test_source_sha256": digest})
+    return current, old, settings
+
+
+@pytest.mark.parametrize("additional_checks", [[], ["access"]], ids=["load", "access-and-load"])
+def test_ordinary_load_baseline_survives_optional_nonce_builder_argument(additional_checks):
+    current, old, _ = load_reports()
+    for report in (current, old):
+        config = report.manifest["config"]
+        config["checks"].extend(additional_checks)
+        assert RunConfig.model_validate(config).checks == ["load", *additional_checks]
+    assert current.manifest["fixture_pack"] != old.manifest["fixture_pack"]
+    assert _settings_reasons(current, old) == []
+    assert _settings_reasons(old, current) == []
+
+
+@pytest.mark.parametrize("change", ["generator", "source", "settings", "missing_settings", "multi_user", "builtin"])
+def test_load_source_compatibility_does_not_hide_unattested_work(change):
+    current, old, settings = load_reports()
+    identity = {"generator_source_sha256": workloads.FIXTURE_SOURCE_SHA256,
+                "settings": settings,
+                "load_test_source_sha256": "9b694c97a39d449d8ea15b09a9aeb406bf835179c0882827685c4d7888687d36"}
+    if change == "generator":
+        identity["generator_source_sha256"] = "unknown"
+    elif change == "source":
+        identity["load_test_source_sha256"] = "unknown"
+    elif change == "settings":
+        old.manifest["config"]["load_test"]["profile"]["short"]["input_tokens"] += 1
+        identity["settings"] = {"load_test": old.manifest["config"]["load_test"]}
+    elif change == "missing_settings":
+        del old.manifest["config"]["load_test"]
+    elif change == "multi_user":
+        old.manifest["config"]["checks"].append("multi_user")
+    else:
+        old.manifest["fixture_pack"]["builtin_sha256"] = "changed"
+    old.manifest["fixture_pack"]["workload_fixture_sha256"] = fixture_hash(identity)
+    assert "Fixture pack identity differs." in _settings_reasons(current, old)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("load", [False, True], ids=["quick-check", "load"])
 async def test_browser_safety_limits_preserve_real_baseline_comparability(load):

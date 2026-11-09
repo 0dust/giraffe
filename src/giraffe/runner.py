@@ -650,7 +650,7 @@ class _Run:
                     on_start()
                 self.emit("request_started", target.name, spec.scenario,
                           request_slot=request_slot, fixture_id=spec.fixture_id,
-                          **({"user": {key: spec.workload[key] for key in ("user_id", "population", "profile", "window_id", "phase", "request_sequence", "session_id", "turn_id", "conversation_sequence") if key in spec.workload}} if "multi_user" in spec.check_ids else {}),
+                          **({"user": {key: spec.workload[key] for key in ("user_id", "population", "profile", "window_id", "phase", "request_sequence", "session_id", "turn_id", "conversation_sequence", "role", "matched_work_sequence", "trigger", "heavy_profile", "cancellation_role") if key in spec.workload}} if "multi_user" in spec.check_ids else {}),
                           input_chars=request_parameters["input_chars"], requested_max_tokens=output_cap,
                           requested_input_tokens=spec.requested_input_tokens,
                           condition_id=condition_id, condition_summary=dict(condition) if condition else None)
@@ -743,12 +743,14 @@ class _Run:
                     record.termination_reason = "request_timeout"
                     record.termination_limit_seconds = record.request_timeout_seconds
                 elif not record.termination_reason:
-                    record.termination_reason = "intentional_cancellation" if spec.cancel_after_ms or spec.cancel_after_chunks else "workload_cancelled"
+                    record.termination_reason = "intentional_cancellation" if spec.cancel_after_ms else "workload_cancelled"
                     record.termination_limit_seconds = spec.cancel_after_ms / 1000 if spec.cancel_after_ms else None
             record.condition_id = condition_id
             record.dispatch_ms = (started-self.start)*1000
             record.timing_start_ms = ((record._timing_started_monotonic - self.start) * 1000
                 if record._timing_started_monotonic is not None else record.dispatch_ms)
+            if record._request_body_sent_monotonic is not None:
+                record.request_body_sent_ms = (record._request_body_sent_monotonic - self.start) * 1000
             record.completed_ms = (time.monotonic()-self.start)*1000
             record.workload = {**spec.workload, **record.workload}
             record.load_point = dict(spec.load_point) if spec.load_point else None
@@ -757,8 +759,9 @@ class _Run:
             record.scheduled_ms = spec.workload.get("scheduled_ms")
             record.client_wait_ms = max(0, record.dispatch_ms-record.scheduled_ms) if record.scheduled_ms is not None else None
             record.overlap = overlap
-            intentional = ((spec.cancel_after_ms is not None or spec.cancel_after_chunks is not None)
-                           and record.status == "cancelled") or (
+            intentional = (record.status == "cancelled" and record.termination_reason in {
+                "generation_chunk_limit", "intentional_cancellation", "intentional_cancellation_deadline",
+            }) or (
                 timeout_override is not None and record.status == "timeout")
             record.intentional = intentional
             propagating_error = False
@@ -818,12 +821,13 @@ class _Run:
                               condition_id=condition_id, condition_summary=dict(condition) if condition else None,
                               input_chars=request_parameters["input_chars"], requested_max_tokens=output_cap,
                               requested_input_tokens=spec.requested_input_tokens,
-                              **({"user": {key: spec.workload[key] for key in ("user_id", "population", "profile", "window_id", "phase", "request_sequence", "session_id", "turn_id", "conversation_sequence") if key in spec.workload}} if "multi_user" in spec.check_ids else {}),
+                              **({"user": {key: spec.workload[key] for key in ("user_id", "population", "profile", "window_id", "phase", "request_sequence", "session_id", "turn_id", "conversation_sequence", "role", "matched_work_sequence", "trigger", "heavy_profile", "cancellation_role") if key in spec.workload}} if "multi_user" in spec.check_ids else {}),
                               request_slot=request_slot, request=record.model_dump(mode="json", include={
                                   "id", "target", "fixture_id", "scenario", "condition_id", "intentional", "status", "valid", "score",
                                   "elapsed_ms", "first_output_ms", "check_ids", "http_status",
                                   "request_timeout_seconds", "termination_reason", "termination_limit_seconds",
                                   "started_at", "dispatch_ms", "completed_ms", "timing_start_ms",
+                                  *({"request_body_sent_ms"} if record.request_body_sent_ms is not None else ()),
                                   "timing_schema", "first_token_ms", "first_reasoning_ms", "last_output_ms",
                                   "stream", "stream_end_ms", "answer_reads", "answer_chunks", "answer_chars",
                                   "first_read_answer_chars", "first_read_output_tokens", "last_read_output_tokens",
