@@ -57,6 +57,7 @@ def test_all_checks_have_local_settings_and_one_question_source():
     browser_logic(r"""
 const original=JSON.stringify(config),markup=renderCheckSelection(config);
 assert.equal((markup.match(/data-test-card="/g)||[]).length,bootstrap.checks.length);
+assert.equal((markup.match(/data-test-card="/g)||[]).length,20);
 for(const check of bootstrap.checks){
   assert.equal((markup.match(new RegExp('data-test-card="'+check.id+'"','g'))||[]).length,1);
   const row=renderTestCard(check,config);assert.match(row,/<dt>Sends<\/dt>/);assert.match(row,/<dt>Shows<\/dt>/);
@@ -283,6 +284,7 @@ for(const check of bootstrap.checks){
   nodes['[data-test-card="'+check.id+'"]']=card;cards.push(card);
 }
 syncTestControls();assert.equal(cards.filter(x=>!x.hidden).length,bootstrap.checks.length);
+assert.equal(cards.filter(x=>!x.hidden).length,20);
 state.catalogueFilter='all';syncTestControls();assert.equal(cards.filter(x=>!x.hidden).length,bootstrap.checks.length);
 state.catalogueCategory='server';syncTestControls();assert.equal(cards.filter(x=>!x.hidden).map(x=>x.id).sort().join(','),'cancellation,gateway_access,gateway_attribution,gateway_policy,gpu,prefix');
 state.catalogueCategory='all';state.catalogueFilter='selected';syncTestControls();assert.equal(cards.filter(x=>!x.hidden).length,2);
@@ -291,6 +293,7 @@ state.catalogueCategory='server';state.catalogueSearch='gpu';syncTestControls();
 state.catalogueCategory='all';
 state.catalogueFilter='all';state.catalogueSearch='concurrent conversations';syncTestControls();assert.equal(cards.filter(x=>!x.hidden)[0].id,'sessions');
 revealCatalogueCheck('prefix');assert.equal(state.openTest,'prefix');assert.equal(cards.filter(x=>!x.hidden).length,bootstrap.checks.length);
+assert.equal(cards.filter(x=>!x.hidden).length,20);
 assert.equal(JSON.stringify(config),original);
 """)
 

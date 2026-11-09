@@ -288,3 +288,155 @@ conditions[0].aggregate_status='passed';conditions[0].running=0;conditions[0].co
 assert.match($('#condition-selection').textContent,/Second condition/);assert.equal($$('.condition-spot')[0],first);assert.equal($$('.condition-spot')[1],second);
 conditions[1].aggregate_status='passed';conditions[1].running=0;conditions[1].completed=1;draw();assert.match($('#condition-selection').textContent,/Second condition/);
 """, dom=True)
+
+
+def test_scale_down_setup_is_opt_in_and_round_trips_dedicated_settings():
+    run_render_checks(r"""
+const config={...structuredClone(bootstrap.defaults),targets:[{name:'local'}],scale_down:null};
+assert(!config.checks.includes('scale_down'));
+assert(checkGroups.find(group=>group.id==='reliability').checks.includes('scale_down'));
+const html=renderScaleDownEditor(config);assert.match(html,/scale_down_target/);assert.match(html,/externally/);
+const data=new Map([['scale_down_target','local'],['scale_down_concurrency','8'],['scale_down_grace_anchor','drain_effective']]);
+const changed=configureScaleDown({...config,checks:['scale_down']},data);
+assert.equal(changed.scale_down.target,'local');assert.equal(changed.scale_down.concurrency,8);assert.equal(changed.scale_down.grace_anchor,'drain_effective');
+assert(!changed.test_options?.scale_down);
+assert.equal(config.scale_down,null);
+""")
+
+
+def test_scale_down_live_action_requires_armed_active_run_and_shows_actual_ack():
+    run_render_checks(r"""
+const d={id:'live',state:'running',scale_down_control:{target:'local',nonce:'fresh',phase:'armed'}};
+assert.match(renderScaleDownControl(d),/data-action="mark-scale-down"/);
+assert.match(renderScaleDownControl(d),/not backend confirmation/);
+assert.doesNotMatch(renderScaleDownControl({...d,state:'completed'}),/data-action="mark-scale-down"/);
+assert.doesNotMatch(renderScaleDownControl({...d,scale_down_control:{...d.scale_down_control,phase:'baseline'}}),/data-action="mark-scale-down"/);
+assert.match(renderScaleDownControl({...d,scale_down_control:{...d.scale_down_control,acknowledgment:{accepted:false,reason:'Wrong nonce'}}}),/Rejected.*Wrong nonce/);
+const c=check('scale_down','fail',{metrics:{results:{continuity:{status:'fail',summary:'Original interrupted',request_ids:['original']},drain:{status:'inconclusive',summary:'Missing coverage'},capacity:{status:'pass',summary:'Later traffic succeeded',request_ids:['later']}}}});
+const html=renderScaleDownResults(c,report([c],{requests:[{id:'original'},{id:'later'}]}));
+for(const text of ['Client-visible continuity','Backend drain semantics','Remaining capacity','Original interrupted','Later traffic succeeded','data-request="original"','data-request="later"'])assert(html.includes(text));
+""")
+
+
+def test_scale_down_marker_delivery_keeps_worker_rejections_and_retries_same_event():
+    from tests.test_ux_catalogue import browser_logic
+    browser_logic(r"""
+state.detail={id:'active/job',state:'running',scale_down_control:{target:'local',nonce:'fresh',phase:'armed'}};
+renderLive=()=>{};
+nodes['#field-scale_down_replica_marker']={value:'replica-b'};
+nodes['#field-scale_down_marker_source']={value:'operator-test'};
+let calls=[];
+api=async(path,options)=>{calls.push([path,JSON.parse(options.body)]);return {accepted:false,reason:'No longer armed'};};
+await markScaleDown();
+assert.equal(calls[0][0],'/api/runs/active%2Fjob/scale-down/event');
+assert.equal(calls[0][1].nonce,'fresh');assert.equal(calls[0][1].replica_id,'replica-b');
+assert.equal(state.scaleDownSubmission.ack.accepted,false);
+assert.match(renderScaleDownControl(state.detail),/Rejected: No longer armed/);
+api=async(path,options)=>{calls.push([path,JSON.parse(options.body)]);throw new Error('Connection lost');};
+await markScaleDown();const lost=calls.at(-1)[1].event_id;
+assert.match(renderScaleDownControl(state.detail),/Acknowledgment unavailable/);
+api=async(path,options)=>{calls.push([path,JSON.parse(options.body)]);return {accepted:true};};
+await markScaleDown();assert.equal(calls.at(-1)[1].event_id,lost);
+assert.match(renderScaleDownControl(state.detail),/Accepted: Removal marker recorded/);
+assert.doesNotMatch(renderScaleDownControl(state.detail),/data-action="mark-scale-down"/);
+state.scaleDownSubmission.ack={accepted:false,reason:'Old rejection'};state.detail.scale_down_control.acknowledgment={accepted:true};
+assert.match(renderScaleDownControl(state.detail),/Accepted: Removal marker recorded/);
+state.detail.state='completed';await markScaleDown();assert.equal(calls.length,3);
+""")
+
+
+def test_scale_down_catalogue_and_settings_preserve_inactive_drafts():
+    from tests.test_ux_catalogue import browser_logic
+    browser_logic(r"""
+const markup=renderCheckSelection(config);
+assert.equal((markup.match(/data-test-card="scale_down"/g)||[]).length,1);
+assert(!config.checks.includes('scale_down'));
+const d=new FormData();d.append('check','scale_down');d.set('test_mode_scale_down','custom');
+d.set('scale_down_target','local');d.set('scale_down_concurrency','6');d.set('scale_down_long_cohort_size','3');
+let changed=configureScaleDown(configureTests(config,d,bootstrap.checks,config.traffic),d);
+assert.equal(changed.scale_down.concurrency,6);assert(!changed.test_options.scale_down);
+d.delete('check');d.append('check','access');changed=configureScaleDown(configureTests(changed,d,bootstrap.checks,config.traffic),d);
+assert.equal(changed.scale_down.long_cohort_size,3);assert(!changed.checks.includes('scale_down'));
+const row=renderTestCard(bootstrap.checks.find(c=>c.id==='scale_down'),changed);
+assert.match(row,/Saved draft/);assert.match(row,/name="scale_down_concurrency"[^>]*value="6"/);
+assert.equal(settingDestination('scale_down.grace_seconds').name,'scale_down_grace_seconds');
+assert.equal(settingPath('scale_down_grace_seconds'),'scale_down.grace_seconds');
+""")
+
+
+def test_scale_down_late_ack_cannot_replace_a_new_runs_submission():
+    from tests.test_ux_catalogue import browser_logic
+    browser_logic(r"""
+renderLive=()=>{};let finishOld;
+state.detail={id:'old',state:'running',scale_down_control:{target:'local',nonce:'old-nonce',phase:'armed'}};
+api=async()=>new Promise(resolve=>finishOld=resolve);
+const pending=markScaleDown();
+state.detail={id:'new',state:'running',scale_down_control:{target:'local',nonce:'new-nonce',phase:'armed'}};
+api=async()=>({accepted:true,event_id:'new-event'});
+await markScaleDown();assert.equal(state.scaleDownSubmission.id,'new');
+finishOld({accepted:false,reason:'Old run ended'});await pending;
+assert.equal(state.scaleDownSubmission.id,'new');assert.equal(state.scaleDownSubmission.ack.accepted,true);
+""")
+
+
+def test_standalone_scale_down_is_readonly_and_explains_cli_marking():
+    from tests.test_ux_catalogue import browser_logic
+    browser_logic(r"""
+state.detail={id:'cli-run',state:'running',stoppable:false,scale_down_control:{target:'local',nonce:'fresh',phase:'armed'}};
+const html=renderScaleDownControl(state.detail);
+assert.match(html,/Armed/);assert.match(html,/giraffe mark-scale-down/);assert.match(html,/--event-id/);
+assert.doesNotMatch(html,/data-action="mark-scale-down"|name="scale_down_marker_source"/);
+let sent=false;api=async()=>{sent=true;};renderLive=()=>{};
+await markScaleDown();assert.equal(sent,false);
+""")
+
+
+def test_scale_down_validation_rejection_allows_corrected_marker_and_new_event():
+    from tests.test_ux_catalogue import browser_logic
+    browser_logic(r"""
+state.detail={id:'live',state:'running',scale_down_control:{target:'local',nonce:'fresh',phase:'armed'}};
+renderLive=()=>{};const sent=[];
+nodes['#field-scale_down_marker_source']={value:'x'.repeat(257)};
+api=async(path,options)=>{sent.push(JSON.parse(options.body));throw Object.assign(new Error('Source is too long'),{status:422});};
+await markScaleDown();assert.match(renderScaleDownControl(state.detail),/rejected/i);
+assert.doesNotMatch(renderScaleDownControl(state.detail),/Retry to check the same marker/);
+nodes['#field-scale_down_marker_source'].value='corrected-source';
+api=async(path,options)=>{sent.push(JSON.parse(options.body));return {accepted:true};};
+await markScaleDown();assert.equal(sent.length,2);assert.equal(sent[1].source,'corrected-source');
+assert.notEqual(sent[1].event_id,sent[0].event_id);
+""")
+
+
+def test_scale_down_late_ack_preserves_new_and_runs_navigation():
+    from tests.test_ux_catalogue import browser_logic
+    browser_logic(r"""
+for(const destination of ['#new','#runs'])for(const routeFinished of [false,true]){
+ state.scaleDownSubmission=null;
+ state.detail={id:'live',state:'running',scale_down_control:{target:'local',nonce:'fresh',phase:'armed'}};
+ state.reportRouteActive=true;location.hash='#runs/live';
+ let draws=0,finish;renderLive=()=>{draws++;};api=async()=>new Promise(resolve=>finish=resolve);
+ const pending=markScaleDown();assert.equal(draws,1);
+ location.hash=destination;
+ if(routeFinished){state.reportRouteActive=false;state.routeVersion++;}
+ finish({accepted:true});await pending;
+ assert.equal(draws,1,'late ACK must not redraw '+destination);
+ assert.equal(location.hash,destination);assert.equal(state.scaleDownSubmission.ack.accepted,true);
+}
+state.scaleDownSubmission=null;state.reportRouteActive=true;location.hash='#runs/live';
+let draws=0;renderLive=()=>{draws++;};api=async()=>({accepted:true});
+await markScaleDown();assert.equal(draws,2,'current live route still renders its ACK');
+""")
+
+
+def test_scale_down_ack_timeout_retries_the_original_marker_even_after_input_edits():
+    from tests.test_ux_catalogue import browser_logic
+    browser_logic(r"""
+state.detail={id:'live',state:'running',scale_down_control:{target:'local',nonce:'fresh',phase:'armed'}};
+renderLive=()=>{};const sent=[];
+nodes['#field-scale_down_marker_source']={value:'first-source'};
+api=async(path,options)=>{sent.push(JSON.parse(options.body));throw Object.assign(new Error('No worker acknowledgment received'),{status:504});};
+await markScaleDown();assert.match(renderScaleDownControl(state.detail),/Retry to check the same marker/);
+nodes['#field-scale_down_marker_source'].value='changed-after-timeout';
+api=async(path,options)=>{sent.push(JSON.parse(options.body));return {accepted:true};};
+await markScaleDown();assert.deepEqual(sent[1],sent[0]);
+""")

@@ -16,7 +16,8 @@ import time
 
 from pydantic import ValidationError
 
-from .models import CHECK_NAMES, CheckResult, RequestRecord, RunReport
+from .caps import MAX_SANITIZE_ITEMS
+from .models import MAX_SCALE_DOWN_SNAPSHOTS, CHECK_NAMES, CheckResult, RequestRecord, RunReport
 from .storage import fsync_directory
 
 logger = logging.getLogger(__name__)
@@ -100,14 +101,16 @@ class EvidenceWriter:
 
     def progress(self, event: dict) -> None:
         if (event.get("event", "").startswith(("check_", "condition_"))
-                                 or event.get("check") or event.get("condition_summary")):
+                                 or event.get("check") or event.get("condition_summary")
+                                 or event.get("event") == "scale_down_updated"):
             if self._closed or self._error is not None:
                 self.dropped_count += 1
                 return
             # Request bodies have their own record line; do not traverse or duplicate
             # them when persisting a condition transition alongside a completion.
             value = {key: child for key, child in event.items() if key != "request"}
-            for key in ("condition", "condition_summary"):
+            for key in ("condition", "condition_summary", "scale_down",
+                        "scale_down_snapshots", "scale_down_control"):
                 if key in value:
                     value[key] = deepcopy(value[key])
             self._enqueue(("progress", value))
@@ -215,6 +218,7 @@ def recover_evidence(directory: Path | str, meta: dict, *, pause=None) -> RunRep
     except FileNotFoundError:
         return None
     header, records, checks, conditions = {}, {}, {}, {}
+    scale_down = {}
     dropped = meta.get("evidence_dropped_count", 0)
     with stream:
         for line in stream:
@@ -234,6 +238,8 @@ def recover_evidence(directory: Path | str, meta: dict, *, pause=None) -> RunRep
                     records[record.id] = record
                 elif value.get("type") == "progress":
                     event = value["progress"]
+                    if event.get("event") == "scale_down_updated":
+                        _recover_scale_down_event(scale_down, event)
                     if isinstance(event.get("check"), dict):
                         check = CheckResult.model_validate(event["check"])
                         checks[(check.target, check.id)] = check
@@ -249,6 +255,8 @@ def recover_evidence(directory: Path | str, meta: dict, *, pause=None) -> RunRep
     config = manifest.get("config", {})
     for target in config.get("targets", []):
         for check_id in config.get("checks", []):
+            if check_id == "scale_down" and target["name"] != (config.get("scale_down") or {}).get("target"):
+                continue
             checks.setdefault((target["name"], check_id), CheckResult(id=check_id, target=target["name"],
                 title=CHECK_NAMES.get(check_id, check_id), status="inconclusive", summary=""))
     for record in records.values():
@@ -265,11 +273,108 @@ def recover_evidence(directory: Path | str, meta: dict, *, pause=None) -> RunRep
         condition = {**condition, "condition": condition.get("condition") or {"id": condition_id},
                      "status": "interrupted", "reason": reason}
         targets.setdefault(target, {"conditions": []})["conditions"].append(condition)
+    settings = config.get("scale_down")
+    if "scale_down" in config.get("checks", []) and isinstance(settings, dict) and isinstance(settings.get("target"), str):
+        scale_down.setdefault(settings["target"], {"snapshots": [], "limitations": []})
+    for target, recovered in scale_down.items():
+        evidence, check = _recovered_scale_down(config, target, recovered, list(records.values()), dropped)
+        targets.setdefault(target, {})["scale_down"] = evidence
+        if check is not None:
+            checks[(target, "scale_down")] = check
+    from .models import overall_status
     return RunReport(run_id=header.get("run_id", meta.get("run_id", directory.name)),
         started_at=header.get("started_at", meta.get("started_at", datetime.now(timezone.utc).isoformat())),
-        finished_at=datetime.now(timezone.utc).isoformat(), overall="inconclusive", manifest=manifest,
+        finished_at=datetime.now(timezone.utc).isoformat(), overall=overall_status(list(checks.values()), reason), manifest=manifest,
         requests=list(records.values()), checks=list(checks.values()),
         abort_reason=reason, warnings=["Judge scores are missing for recovered request evidence."] +
             ([f"{dropped} evidence records not written to evidence.jsonl"] if dropped else []),
         observations={"interrupted": True, "judge_scores_missing": True, "evidence_dropped_count": dropped,
                       "targets": targets})
+
+
+def _recover_scale_down_event(targets: dict, event: dict) -> None:
+    """Merge validated metadata and bounded deltas; acknowledgments can arrive first."""
+    from .models import ScaleDownEvidence, ScaleDownSnapshot
+    target = event.get("target")
+    if not isinstance(target, str):
+        return
+    value = targets.setdefault(target, {"snapshots": [], "limitations": []})
+
+    def limitation(message):
+        if message not in value["limitations"]:
+            value["limitations"] = value["limitations"][:MAX_SANITIZE_ITEMS - 2] + [message]
+
+    metadata = event.get("scale_down")
+    try:
+        validated = ScaleDownEvidence.model_validate(metadata)
+        parsed = validated.model_dump(mode="json", exclude_unset=True, exclude={"snapshots"})
+        if validated.marker is not None:
+            parsed["marker"] = validated.marker.model_dump(mode="json")
+    except (ValueError, TypeError):
+        limitation("Invalid recovered scale-down metadata.")
+    else:
+        previous_limitations = value["limitations"]
+        accepted = {key: value.get(key) for key in ("marker", "marker_received_ms", "marker_accepted_ms")}
+        if accepted["marker_accepted_ms"] is not None and any(
+                key in parsed and parsed[key] != child for key, child in accepted.items()):
+            parsed.update(accepted)
+            limitation("Conflicting recovered removal marker; preserved the accepted marker.")
+            previous_limitations = value["limitations"]
+        value.update(parsed)
+        value["limitations"] = list(dict.fromkeys(previous_limitations + value.get("limitations", [])))[:MAX_SANITIZE_ITEMS - 1]
+    snapshots = event.get("scale_down_snapshots", [])
+    if not isinstance(snapshots, list):
+        limitation("Invalid recovered lifecycle snapshot delta.")
+        snapshots = []
+    for snapshot in snapshots:
+        try:
+            parsed = ScaleDownSnapshot.model_validate(snapshot).model_dump(mode="json")
+        except (ValueError, TypeError):
+            limitation("Invalid recovered lifecycle snapshot.")
+            continue
+        if len(value["snapshots"]) < MAX_SCALE_DOWN_SNAPSHOTS:
+            value["snapshots"].append(parsed)
+        else:
+            limitation("Recovered lifecycle snapshots exceeded the evidence limit.")
+    control = event.get("scale_down_control")
+    ack = control.get("acknowledgment") if isinstance(control, dict) else None
+    if isinstance(ack, dict) and ack.get("accepted") is True:
+        try:
+            parsed = ScaleDownEvidence(marker=ack["marker"], marker_received_ms=ack["received_ms"],
+                                       marker_accepted_ms=ack["accepted_ms"])
+            if parsed.marker is None or parsed.marker.target != target or parsed.marker_accepted_ms is None:
+                raise ValueError("Marker must identify the target and an acceptance time")
+        except (ValueError, TypeError, KeyError):
+            limitation("Invalid recovered marker acknowledgment.")
+        else:
+            if value.get("marker_accepted_ms") is not None and value.get("marker") != parsed.marker.model_dump(mode="json"):
+                limitation("Conflicting recovered removal marker; preserved the accepted marker.")
+            else:
+                value.update(parsed.model_dump(mode="json", include={"marker", "marker_received_ms", "marker_accepted_ms"}))
+
+
+def _recovered_scale_down(config, target, value, records, dropped):
+    from .models import Limits, ScaleDownConfig, ScaleDownEvidence
+    from .scale_down import evaluate_scale_down
+    limitation = "Recovered run has incomplete lifecycle and request coverage."
+    if dropped:
+        limitation += f" {dropped} journal records were not written."
+    value["limitations"] = value.get("limitations", [])[:MAX_SANITIZE_ITEMS - 1] + [limitation]
+    try:
+        evidence = ScaleDownEvidence.model_validate(value)
+        settings = ScaleDownConfig.model_validate(config.get("scale_down"))
+        if settings.target != target:
+            return value, None
+        check = evaluate_scale_down(settings, evidence, records, Limits.model_validate(config.get("limits") or {}))
+    except (ValueError, TypeError):
+        return value, None
+    # The evaluator retains positive violations even with missing coverage.
+    # Interrupted recovery cannot certify a complete event history.
+    for result in check.metrics["results"].values():
+        if result["status"] == "pass":
+            result.update(status="inconclusive", summary=limitation)
+        if limitation not in result["limitations"]:
+            result["limitations"].append(limitation)
+    check.status = "fail" if any(r["status"] == "fail" for r in check.metrics["results"].values()) else "inconclusive"
+    check.summary = "; ".join(f"{key}: {result['status']}" for key, result in check.metrics["results"].items())
+    return evidence.model_dump(mode="json"), check

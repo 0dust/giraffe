@@ -15,6 +15,9 @@ _SCENARIOS = {
     "gateway_access": ("Gateway access policy", "gateway_access"),
     "gateway_policy": ("Gateway policy", "gateway_policy"),
     "gateway_attribution": ("Gateway usage attribution", "gateway_attribution"),
+    "scale_down_baseline": ("Scale-down baseline", "scale_down"),
+    "scale_down_long": ("Active answers during removal", "scale_down"),
+    "scale_down_followup": ("Traffic during and after removal", "scale_down"),
     "initial": ("First request", "access"),
     "readiness": ("Readiness", "access"),
     "warm": ("Warm-up", "serving"),
@@ -220,6 +223,7 @@ _PURPOSES = {
     "gateway_policy": "Observes declared identity quotas or priority reservations and continued peer service.",
     "gateway_attribution": "Compares marked identity requests with read-only gateway token attribution.",
     "multi_user": "Measures each persistent user over the same window while sharing request slots.",
+    "scale_down": "Observe active answers and continued traffic across one external replica removal.",
     "load": "Measures selected request shapes under maintained concurrency, arrivals or bursts; compares delivery and per-response criteria.",
     "concurrency": "Measures serving under sustained request concurrency with individually replenished slots.",
     "access": "Checks that the server is reachable and can answer a request.",
@@ -401,6 +405,10 @@ def planned_conditions(config: Any) -> list[dict[str, Any]]:
         if count != 0:
             add(identifier, count, kind)
 
+    if "scale_down" in selected and config.scale_down:
+        add("scale_down_baseline", config.scale_down.min_baseline_samples, "upper_bound")
+        add("scale_down_long", config.scale_down.long_cohort_size, "upper_bound")
+        add("scale_down_followup")
     if "cancellation" in selected:
         options = config.effective_check("cancellation")
         fixtures = builtin_fixtures(config, check_id="cancellation")["limits"]
@@ -488,7 +496,8 @@ def planned_conditions(config: Any) -> list[dict[str, Any]]:
                     add(f"{prefix}_{choice}_{mode}", 1, "exact")
     rows = []
     for target in config.targets:
-        rows.extend(condition_aggregate({"target": target.name, **summary}) for summary in scenarios.values())
+        rows.extend(condition_aggregate({"target": target.name, **summary}) for summary in scenarios.values()
+                    if summary["condition"]["check"] != "scale_down" or target.name == config.scale_down.target)
         if count := eligible_probe_count(config, target):
             condition = condition_for("gateway_access", config=config)
             rows.append(condition_aggregate({"target": target.name, **waiting(condition, count, "exact")}))

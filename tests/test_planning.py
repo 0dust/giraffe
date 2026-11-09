@@ -350,7 +350,7 @@ def test_every_check_has_an_explained_row_and_planning_has_no_execution_side_eff
     monkeypatch.setattr(os, "getenv", forbidden)
     monkeypatch.setattr(subprocess, "run", forbidden)
     monkeypatch.setattr("giraffe.fixtures.load_custom_fixtures", forbidden)
-    configuration = config(checks=list(CHECK_NAMES))
+    configuration = config(checks=list(CHECK_NAMES), scale_down={"target": "local"})
     result = plan(configuration)
     rows = {row["id"]: row for row in result["rows"]}
     assert set(CHECK_NAMES) - {"load", "multi_user"} <= rows.keys()
@@ -576,3 +576,16 @@ def test_saved_question_shape_warning_is_exposed_in_shared_plan_before_running()
     assert warning['msg'] in result['warnings']
     assert warning['msg'] in result['load_test']['saved_shape_warnings']
     assert next(row for row in result['rows'] if row['id'] == 'load_combinations')['source'] == 'your dataset'
+
+
+def test_scale_down_preview_exposes_finite_selected_target_bounds_and_global_ceilings():
+    configuration = config(checks=['scale_down'], max_requests=3, max_duration_seconds=5,
+                           scale_down={'target': 'local'})
+    preview = plan(configuration)
+    row = next(row for row in preview['rows'] if row['id'] == 'scale_down')
+    assert row['target'] == 'local'
+    assert row['max_requests'] == 194
+    assert row['max_duration_seconds'] == 220
+    assert row['effective_request_upper_bound'] == 3
+    assert row['effective_duration_upper_bound'] == 5
+    assert preview['required_concurrency']['by_check']['scale_down'] == 4

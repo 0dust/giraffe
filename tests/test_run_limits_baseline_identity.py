@@ -243,11 +243,15 @@ def test_unchanged_text_generator_has_reviewed_identity_table_entry():
                     for revision in ("gateway_shared_first", "gateway_shared_targets_first",
                                      "policy_shared_first", "policy_shared_targets_first", "policy_after_shared_workloads",
                                      "policy_after_all_shared_targets", "access_shared_first", "access_shared_targets_first",
-                                     "access_after_shared_workloads", "access_deferred_policy", "access_after_all_shared_targets")]
+                                     "access_after_shared_workloads", "access_deferred_policy", "access_after_all_shared_targets",
+                                     "scale_down_registration", "scale_down_shared_conversations", "scale_down_gateway_access")]
     actual = hashlib.sha256(Path(workloads.__file__).read_bytes()).hexdigest()
     assert any(identity and identity["generator_source_sha256"] == actual for identity in attestations), (
         "generator_source_sha256 changed: review request-level compatibility and update/extend "
         "_run_limits_workload_identity in src/giraffe/reporting.py; do not bridge changed workloads.")
+    identity = _run_limits_workload_identity(manifest, revision="scale_down_gateway_access")
+    assert identity is not None, IDENTITY_TABLE_GUIDANCE
+    assert identity["generator_source_sha256"] == actual, IDENTITY_TABLE_GUIDANCE
 
 
 @pytest.mark.parametrize("check", ["sessions", "consistency", "prefix"])
@@ -279,7 +283,7 @@ def test_presampling_generator_identity_retains_the_original_session_settings():
     assert _settings_reasons(current, old) == []
 
 
-@pytest.mark.parametrize("revision", ["legacy", "issue45", "issue95", "issue95_pauses", "issue95_pause_evidence"])
+@pytest.mark.parametrize("revision", ["legacy", "issue45", "issue95", "issue95_pauses", "issue95_pause_evidence", "scale_down_registration"])
 def test_sampled_sessions_are_never_attested_as_unchanged_historical_traffic(revision):
     current, _, _, _ = reports()
     current.manifest["config"]["sessions"].update(
@@ -303,7 +307,8 @@ def test_replaced_load_generator_is_not_bridged_to_historical_workload(check):
 
 
 @pytest.mark.parametrize("response_mode", ["stream", "complete"])
-def test_streaming_logprob_generator_is_not_bridged_to_historical_evidence(response_mode):
+@pytest.mark.parametrize("generator_revision", ["issue45", "scale_down_gateway_access"])
+def test_streaming_logprob_generator_is_not_bridged_to_historical_evidence(response_mode, generator_revision):
     current, old, _, _ = reports("consistency")
     configured = RunConfig(targets=[{"name": "local", "url": "http://localhost", "model": "test"}],
                            checks=["consistency"], consistency={"logprobs": {"response_mode": "complete"}})
@@ -314,6 +319,8 @@ def test_streaming_logprob_generator_is_not_bridged_to_historical_evidence(respo
     configured.consistency.logprobs.response_mode = response_mode
     current.manifest["config"] = configured.model_dump(mode="json")
     identity = deepcopy(historical)
+    identity["generator_source_sha256"] = _run_limits_workload_identity(
+        current.manifest, revision=generator_revision)["generator_source_sha256"]
     identity["settings"]["consistency"] = configured.consistency.model_dump(mode="json")
     identity["logprob_source_sha256"] = hashlib.sha256(
         Path(logprobs.__file__).read_bytes() + Path(logprob_workload.__file__).read_bytes()).hexdigest()
@@ -591,7 +598,7 @@ def test_core_companion_bridge_does_not_extend_to_earlier_generator_revisions():
     assert "Fixture pack identity differs." in _settings_reasons(current, old)
 
 
-@pytest.mark.parametrize("revision", ["persistent_users", "shared_conversations", "gateway_attribution", "gateway_conversations"])
+@pytest.mark.parametrize("revision", ["persistent_users", "shared_conversations", "gateway_attribution", "gateway_conversations", "scale_down_shared_conversations"])
 def test_conversation_wiring_does_not_bridge_multi_user_workloads(revision):
     configured = RunConfig(targets=[{"name": "local", "url": "http://localhost", "model": "test"}],
                            checks=["multi_user"])
@@ -748,3 +755,18 @@ async def test_exact_policy_predecessor_preserves_measured_multi_user(monkeypatc
             changed.manifest["config"]["multi_user"] = value["multi_user"]
         changed.manifest["fixture_pack"][fingerprint] = fixture_hash({**identity, field: value})
         assert "Fixture pack identity differs." in _settings_reasons(current, changed), field
+
+
+def test_reviewed_registration_keeps_the_previous_generator_identity():
+    current, _, _, _ = reports("consistency")
+    previous = _run_limits_workload_identity(current.manifest, revision="issue95_pause_evidence")
+    assert previous["generator_source_sha256"] == "ab5875f7c635f8f454429a88aac87d52ce3a141a84bcf7b936fa737ffa41fe83"
+
+
+@pytest.mark.parametrize("checks", [["scale_down"], ["sessions", "scale_down"], ["consistency", "scale_down"]])
+@pytest.mark.parametrize("revision", ["scale_down_registration", "persistent_users", "shared_conversations", "scale_down_shared_conversations", "scale_down_gateway_access"])
+def test_scale_down_registration_does_not_attest_external_removal_workloads(checks, revision):
+    config = RunConfig(targets=[{"name": "local", "url": "http://localhost", "model": "test"}],
+                       checks=checks, scale_down={"target": "local"})
+    assert _run_limits_workload_identity({"config": config.model_dump(mode="json")},
+                                        revision=revision) is None
