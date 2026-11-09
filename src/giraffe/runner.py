@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import math
+import re
 import platform
 import socket
 import time
@@ -22,7 +23,7 @@ import httpx
 
 from . import __version__
 from .client import LLMClient, no_response_failure
-from .conditions import condition_aggregate, condition_for, request_status
+from .conditions import condition_aggregate, condition_for, request_status, scheduled_multi_user_window
 from .deployment import fixture_hash
 from .fixtures import (FIXTURE_VERSION, builtin_fixtures, load_custom_fixtures,
                        score_response, traffic_fixtures, deterministic_options, reasoning_budget)
@@ -43,6 +44,11 @@ logger = logging.getLogger(__name__)
 # A context-local sink lets web runs persist evidence without changing request()
 # or sharing a writer between concurrent CLI invocations.
 record_sink = ContextVar("giraffe_record_sink", default=lambda record: None)
+
+
+class _DispatchRefused(Exception):
+    """The scheduled request never entered transport."""
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -104,7 +110,9 @@ def _stats(records: list[RequestRecord]) -> dict:
 
 
 def _stress(scenario):
+    # Scheduled warmup traffic shares stress accounting with its measurement window.
     return (scenario.startswith(("traffic_stage_", "context", "fairness_", "bucket_", "mixed_", "arrival", "stress_", "load_"))
+            or scheduled_multi_user_window(scenario.removesuffix("_warmup"))
             or scenario in {"sustained", "recovery", "recovery_baseline", "recovery_prime", "limits",
                             "stop_control", "client_cancel", "client_deadline", "backend_cancel",
                             "cancellation_probe", "cancellation_baseline"})
@@ -360,6 +368,8 @@ class _Run:
     def emit_condition(self, event, scenario, row):
         # Keep the global completed progress counter separate from condition totals.
         aggregate = condition_aggregate(row)
+        if event == "condition_finished" and row.get("condition_verdict") == "pending":
+            event = "condition_scoring"
         self.emit(event, row["target"], scenario, condition_summary={**row, "aggregate_status": aggregate["status"],
                   **{key: aggregate[key] for key in ("condition_id", "check_id", "name", "concurrency_description", "not_started", "reasons")}},
                   **{k: v for k, v in row.items() if k not in {"target", "completed"}})
@@ -373,7 +383,7 @@ class _Run:
             return "request budget reached"
         return fallback
 
-    def finish_condition(self, target, scenario, workload=None, reason=None, load_point_result=None):
+    def finish_condition(self, target, scenario, workload=None, reason=None, load_point_result=None, *, verdict=None):
         key = (target, condition_for(scenario, workload or {}, self.config)["id"])
         row = self.conditions.get(key)
         if row is None:
@@ -384,6 +394,10 @@ class _Run:
         row["status"] = "finished"
         if load_point_result is not None:
             row["load_point_result"] = dict(load_point_result)
+        if scheduled_multi_user_window(scenario):
+            # These windows have a verdict only after Multi-user qualifies the
+            # complete offer ledger and any cross-window recovery evidence.
+            row["condition_verdict"] = verdict or row.get("condition_verdict") or "pending"
         self.emit_condition("condition_finished", scenario, row)
 
     def record_finished(self, record: RequestRecord) -> None:
@@ -566,13 +580,17 @@ class _Run:
                 self.release_slot()
 
     async def request(self, target, client, spec, event=None, on_start=None, timeout_override=None,
-                      *, slot_reserved=False, budget_reserved=False, deadline_override=None, admission_deadline=None, budget_exempt=False, evaluate_record=None, finalize_record=None, request_parameters=None):
+                      *, slot_reserved=False, budget_reserved=False, deadline_override=None,
+                      admission_deadline=None, prepared_admission=False, admission_check=None,
+                      budget_exempt=False, evaluate_record=None, finalize_record=None, request_parameters=None):
         """Complete a request and persist its terminal evidence once.
 
         ``finalize_record`` synchronously adds scheduler-owned measurements before
         the evidence snapshot, including cancellation and postprocessing failures.
         ``admission_deadline`` closes dispatch only; admitted requests retain
         their ordinary timeout, unlike ``deadline_override``.
+        With ``prepared_admission``, HTTP preparation precedes admission and progress.
+        ``admission_check`` checks caller-owned eligibility before committing an attempt.
         """
         check_ids = [name for name in spec.check_ids if name in self.config.checks
                      and (not _stress(spec.scenario) or name not in {"access", "serving", "first_output", "generation"})
@@ -609,51 +627,68 @@ class _Run:
                             condition_for(condition_scenario, spec.workload, self.config)["id"])
             if condition is None or condition["status"] != "running":
                 condition = self.start_condition(target.name, condition_scenario, spec.workload, request_parameters=request_parameters)
-            if admission_deadline is not None:
-                # Condition construction/progress may take time. Sample the
-                # dispatch boundary after that setup, before taking any budget
-                # or recording an HTTP attempt that may never be sent.
-                started_at = _now()
-                started = time.monotonic()
-                if started >= slot_deadline:
-                    if started >= self.deadline:
+            def admission_clock():
+                reason = self.stop_reason(target.name)
+                stopping = reason not in {None, "maximum request budget reached"}
+                now = time.monotonic()
+                if now >= slot_deadline or stopping:
+                    if now >= self.deadline or stopping:
                         self.mark_unfinished(target.name, _scenario_checks(spec))
-                    return None
-                if not budget_reserved and not budget_exempt and not self.reserve_offer(target.name):
-                    self.mark_unfinished(target.name, _scenario_checks(spec))
-                    return None
-                self.attempted += 1
-            if condition is not None:
-                condition["sent"] += 1
-                condition["started"] += 1
-                condition["running"] += 1
-                if condition["planned"] is not None:
-                    condition["not_sent"] = max(0, condition["planned"] - condition["sent"])
-            request_slot = self.attempted - 1
-            self.counts[target.name] += 1
-            if not readiness and not evidence_probe:
-                self.endpoint_attempt(target.name)
+                    raise _DispatchRefused
+                if admission_check is not None and not admission_check():
+                    raise _DispatchRefused
+                return now
+
+            guard_admission = admission_deadline is not None and (budget_reserved or prepared_admission)
+            guard_transport = guard_admission and getattr(client, "_supports_dispatch_guard", False) is True
             key = (target.name, spec.scenario)
-            self.active[key] += 1
-            self.peak[key] = max(self.peak[key], self.active[key])
             global_deadline = False
             deadline = None
             intentional_deadline_applies = False
-            if admission_deadline is None:
-                started, started_at = time.monotonic(), _now()
-            token = self.inflight.start(target.name)
+            request_slot = started = started_at = token = timeout = None
             failure = None
             task = asyncio.current_task()
             cancellations = task.cancelling()
-            try:
-                if on_start:
-                    on_start()
+            pending_start = None
+            start_progress_error = None
+            completed_before_progress = None
+            overlap = 0
+
+            def preparation_failure(kind):
+                if task.cancelling() > cancellations:
+                    raise asyncio.CancelledError
+                if self.stop.is_set() or time.monotonic() >= slot_deadline or deadline is not None and deadline.expired():
+                    if self.stop.is_set() or time.monotonic() >= self.deadline:
+                        self.mark_unfinished(target.name, _scenario_checks(spec))
+                    return None
+                if budget_reserved and not budget_exempt:
+                    self.budget_used -= 1
+                    self.budget_counts[target.name] -= 1
+                return RequestRecord(
+                    id=uuid.uuid4().hex, target=target.name, fixture_id=spec.fixture_id,
+                    scenario=spec.scenario, check_ids=spec.check_ids, started_at=_now(),
+                    status="failed", valid=False, error=f"request could not be prepared ({kind})",
+                    input_chars=spec.input_chars, requested_max_tokens=output_cap, stream=spec.stream,
+                )
+
+            def emit_start():
                 self.emit("request_started", target.name, spec.scenario,
                           request_slot=request_slot, fixture_id=spec.fixture_id,
-                          **({"user": {key: spec.workload[key] for key in ("user_id", "population", "profile", "window_id", "phase", "request_sequence", "session_id", "turn_id", "conversation_sequence", "role", "matched_work_sequence", "trigger", "heavy_profile", "cancellation_role") if key in spec.workload}} if "multi_user" in spec.check_ids else {}),
+                          **({"user": {key: spec.workload[key] for key in ("user_id", "population", "profile", "window_id", "phase", "request_sequence", "session_id", "turn_id", "conversation_sequence", "role", "matched_work_sequence", "trigger", "heavy_profile", "cancellation_role", "cohort", "origin", "work_sequence", "activation_seconds") if key in spec.workload}} if "multi_user" in spec.check_ids else {}),
                           input_chars=request_parameters["input_chars"], requested_max_tokens=output_cap,
                           requested_input_tokens=spec.requested_input_tokens,
                           condition_id=condition_id, condition_summary=dict(condition) if condition else None)
+
+            def emit_scheduled_start():
+                nonlocal pending_start, start_progress_error
+                pending_start = None
+                try:
+                    emit_start()
+                except (Exception, asyncio.CancelledError) as exc:
+                    start_progress_error = exc
+
+            def request_budget():
+                nonlocal timeout_override, intentional_deadline_applies, global_deadline, timeout
                 request_timeout = (spec.request_timeout_seconds if spec.request_timeout_seconds is not None
                                    else self.config.request_timeout_seconds)
                 if deadline_override is not None:
@@ -662,53 +697,133 @@ class _Run:
                 intentional_deadline_applies = timeout_override is not None and timeout_override < request_timeout
                 remaining = self.deadline - time.monotonic()
                 global_deadline = remaining <= min(request_timeout, timeout_override or request_timeout)
-                timeout = max(.001, min(request_timeout,
-                                        timeout_override or request_timeout,
-                                        self.deadline - time.monotonic()))
-                deadline = asyncio.timeout(timeout)
+                timeout = max(.001, min(request_timeout, timeout_override or request_timeout, remaining))
+                return timeout
+
+            def begin_attempt():
+                nonlocal started, started_at, request_slot, token, pending_start
+                if admission_deadline is not None:
+                    started = admission_clock()
+                    if not budget_reserved and not budget_exempt and not self.reserve_offer(target.name):
+                        self.mark_unfinished(target.name, _scenario_checks(spec))
+                        raise _DispatchRefused
+                    self.attempted += 1
+                if condition is not None:
+                    condition["sent"] += 1
+                    condition["started"] += 1
+                    condition["running"] += 1
+                    if condition["planned"] is not None:
+                        condition["not_sent"] = max(0, condition["planned"] - condition["sent"])
+                request_slot = self.attempted - 1
+                self.counts[target.name] += 1
+                if not readiness and not evidence_probe:
+                    self.endpoint_attempt(target.name)
+                self.active[key] += 1
+                self.peak[key] = max(self.peak[key], self.active[key])
+                if admission_deadline is None:
+                    started = time.monotonic()
+                started_at = _now()
+                token = self.inflight.start(target.name)
+                if on_start:
+                    on_start()
+                if guard_admission and self.progress:
+                    # An admitted request enters transport before yielding to
+                    # public progress. A synchronous observer cannot hold it
+                    # past the checked admission boundary before dispatch.
+                    pending_start = task.get_loop().call_soon(emit_scheduled_start)
+                else:
+                    emit_start()
+                if guard_transport:
+                    deadline.reschedule(min(self.deadline, task.get_loop().time() + request_budget()))
+
+            try:
+                if guard_transport:
+                    # Keep the run bound during preparation. The transport hook
+                    # commits the attempt and starts its request timeout.
+                    admission_clock()
+                    deadline = asyncio.timeout_at(self.deadline)
+                else:
+                    begin_attempt()
+                    deadline = asyncio.timeout(request_budget())
                 async with deadline:
-                    record = await client.execute(spec, first_output_event=event)
-                if deadline.expired():
+                    if guard_transport:
+                        record = await client.execute(spec, first_output_event=event, _before_send=begin_attempt)
+                    else:
+                        record = await client.execute(spec, first_output_event=event)
+                if token is None:
+                    if record.status == "cancelled":
+                        if task.cancelling() > cancellations:
+                            raise asyncio.CancelledError
+                        if time.monotonic() >= self.deadline:
+                            self.mark_unfinished(target.name, _scenario_checks(spec))
+                        return None
+                    kind = re.fullmatch(r"request (?:failed|timeout) \(([A-Za-z_]\w*)\)", record.error or "")
+                    record = preparation_failure(kind[1] if kind else "Exception")
+                    if record is None:
+                        return None
+                elif deadline.expired():
                     record.status, record.valid = ("cancelled" if global_deadline else "timeout"), False
                     record.error = "maximum run duration reached" if global_deadline else (
                         "intentional request deadline" if timeout_override else "request deadline exceeded")
+            except _DispatchRefused:
+                return None
             except (asyncio.CancelledError, TimeoutError) as exc:
-                if isinstance(exc, asyncio.CancelledError) and task.cancelling() > cancellations:
-                    failure = exc
-                run_deadline_expired = global_deadline and deadline is not None and deadline.expired()
-                record = RequestRecord(
-                    id=uuid.uuid4().hex, target=target.name, fixture_id=spec.fixture_id,
-                    scenario=spec.scenario, check_ids=spec.check_ids, started_at=started_at,
-                    status="cancelled" if isinstance(exc, asyncio.CancelledError) or run_deadline_expired else "timeout",
-                    error="run cancelled" if isinstance(exc, asyncio.CancelledError)
-                    else ("maximum run duration reached" if run_deadline_expired else "request deadline exceeded"), elapsed_ms=(time.monotonic()-started)*1000,
-                    input_chars=spec.input_chars, requested_max_tokens=output_cap, stream=spec.stream,
-                )
+                if token is None:
+                    if isinstance(exc, asyncio.CancelledError):
+                        raise
+                    record = preparation_failure(type(exc).__name__)
+                    if record is None:
+                        return None
+                else:
+                    if isinstance(exc, asyncio.CancelledError) and task.cancelling() > cancellations:
+                        failure = exc
+                    run_deadline_expired = global_deadline and deadline is not None and deadline.expired()
+                    record = RequestRecord(
+                        id=uuid.uuid4().hex, target=target.name, fixture_id=spec.fixture_id,
+                        scenario=spec.scenario, check_ids=spec.check_ids, started_at=started_at,
+                        status="cancelled" if isinstance(exc, asyncio.CancelledError) or run_deadline_expired else "timeout",
+                        error="run cancelled" if isinstance(exc, asyncio.CancelledError)
+                        else ("maximum run duration reached" if run_deadline_expired else "request deadline exceeded"), elapsed_ms=(time.monotonic()-started)*1000,
+                        input_chars=spec.input_chars, requested_max_tokens=output_cap, stream=spec.stream,
+                    )
             except Exception as exc:
-                if not isinstance(exc, (httpx.HTTPError, OSError)):
-                    failure = exc
-                # Exception text can contain credential-bearing URLs from transports.
-                record = RequestRecord(
-                    id=uuid.uuid4().hex, target=target.name, fixture_id=spec.fixture_id,
-                    scenario=spec.scenario, check_ids=spec.check_ids, started_at=started_at,
-                    status="failed", error=f"client failure ({type(exc).__name__})",
-                    elapsed_ms=(time.monotonic()-started)*1000,
-                    input_chars=spec.input_chars, requested_max_tokens=output_cap,
-                )
+                if token is None:
+                    record = preparation_failure(type(exc).__name__)
+                    if record is None:
+                        return None
+                else:
+                    if not isinstance(exc, (httpx.HTTPError, OSError)):
+                        failure = exc
+                    # Exception text can contain credential-bearing URLs from transports.
+                    record = RequestRecord(
+                        id=uuid.uuid4().hex, target=target.name, fixture_id=spec.fixture_id,
+                        scenario=spec.scenario, check_ids=spec.check_ids, started_at=started_at,
+                        status="failed", error=f"client failure ({type(exc).__name__})",
+                        elapsed_ms=(time.monotonic()-started)*1000,
+                        input_chars=spec.input_chars, requested_max_tokens=output_cap,
+                    )
             finally:
-                self.active[key] -= 1
-                overlap = self.inflight.finish(target.name, token)
+                if token is not None:
+                    self.active[key] -= 1
+                    overlap = self.inflight.finish(target.name, token)
+                if pending_start is not None:
+                    # An immediate transport result must still emit its start
+                    # before the terminal progress event.
+                    completed_before_progress = _now(), (time.monotonic()-self.start)*1000
+                    pending_start.cancel()
+                    emit_scheduled_start()
             # The transport catches cancellation to preserve partial output. Restore
             # propagation here, after completing the record and its live condition.
             if task.cancelling() > cancellations and failure is None:
                 failure = asyncio.CancelledError()
                 record.status, record.valid = "cancelled", False
+            failure = failure or start_progress_error
             if isinstance(failure, asyncio.CancelledError):
                 failure.giraffe_record = record
             # A transport may catch cancellation to preserve partial streamed output.
             if time.monotonic() >= self.deadline and record.status == "cancelled":
                 record.error = "maximum run duration reached"
-            record.completed_at = _now()
+            record.completed_at = completed_before_progress[0] if completed_before_progress else _now()
             record.request_timeout_seconds = spec.request_timeout_seconds or self.config.request_timeout_seconds
             if record.status in {"timeout", "cancelled"}:
                 try:
@@ -746,18 +861,20 @@ class _Run:
                     record.termination_reason = "intentional_cancellation" if spec.cancel_after_ms else "workload_cancelled"
                     record.termination_limit_seconds = spec.cancel_after_ms / 1000 if spec.cancel_after_ms else None
             record.condition_id = condition_id
-            record.dispatch_ms = (started-self.start)*1000
+            record.dispatch_ms = (started-self.start)*1000 if token is not None else None
             record.timing_start_ms = ((record._timing_started_monotonic - self.start) * 1000
                 if record._timing_started_monotonic is not None else record.dispatch_ms)
             if record._request_body_sent_monotonic is not None:
                 record.request_body_sent_ms = (record._request_body_sent_monotonic - self.start) * 1000
-            record.completed_ms = (time.monotonic()-self.start)*1000
+            record.completed_ms = (completed_before_progress[1] if completed_before_progress
+                                   else (time.monotonic()-self.start)*1000)
             record.workload = {**spec.workload, **record.workload}
             record.load_point = dict(spec.load_point) if spec.load_point else None
             record.requested_input_tokens = spec.requested_input_tokens
             record.requested_output_tokens = spec.requested_output_tokens
             record.scheduled_ms = spec.workload.get("scheduled_ms")
-            record.client_wait_ms = max(0, record.dispatch_ms-record.scheduled_ms) if record.scheduled_ms is not None else None
+            record.client_wait_ms = (max(0, record.dispatch_ms-record.scheduled_ms)
+                if record.scheduled_ms is not None and record.dispatch_ms is not None else None)
             record.overlap = overlap
             intentional = (record.status == "cancelled" and record.termination_reason in {
                 "generation_chunk_limit", "intentional_cancellation", "intentional_cancellation_deadline",
@@ -782,7 +899,7 @@ class _Run:
                 if (not evidence_probe and not getattr(client, "reports_response_activity", False)
                         and (record.response_body_bytes or record.chunks or record.output or record.reasoning)):
                     self.endpoint_response(target.name)
-                if (not readiness and not evidence_probe and no_response_failure(record, include_timeouts=not _stress(spec.scenario))
+                if (token is not None and not readiness and not evidence_probe and no_response_failure(record, include_timeouts=not _stress(spec.scenario))
                         and not intentional and timeout_override is None
                         and deadline_override is None and spec.cancel_after_ms is None
                         and spec.cancel_after_chunks is None and not self.stop.is_set()
@@ -806,7 +923,7 @@ class _Run:
                 if budget_exempt:
                     self.observations[target.name].setdefault("readiness_requests", []).append(record.id)
                 if condition is not None:
-                    condition["running"] -= 1
+                    condition["running"] -= int(token is not None)
                     condition["completed"] += 1
                     condition["failed"] += int(_request_failed(record))
                     result_status = request_status(record.model_dump(include={"status", "score", "valid"}))
@@ -821,7 +938,7 @@ class _Run:
                               condition_id=condition_id, condition_summary=dict(condition) if condition else None,
                               input_chars=request_parameters["input_chars"], requested_max_tokens=output_cap,
                               requested_input_tokens=spec.requested_input_tokens,
-                              **({"user": {key: spec.workload[key] for key in ("user_id", "population", "profile", "window_id", "phase", "request_sequence", "session_id", "turn_id", "conversation_sequence", "role", "matched_work_sequence", "trigger", "heavy_profile", "cancellation_role") if key in spec.workload}} if "multi_user" in spec.check_ids else {}),
+                              **({"user": {key: spec.workload[key] for key in ("user_id", "population", "profile", "window_id", "phase", "request_sequence", "session_id", "turn_id", "conversation_sequence", "role", "matched_work_sequence", "trigger", "heavy_profile", "cancellation_role", "cohort", "origin", "work_sequence", "activation_seconds") if key in spec.workload}} if "multi_user" in spec.check_ids else {}),
                               request_slot=request_slot, request=record.model_dump(mode="json", include={
                                   "id", "target", "fixture_id", "scenario", "condition_id", "intentional", "status", "valid", "score",
                                   "elapsed_ms", "first_output_ms", "check_ids", "http_status",
@@ -1494,7 +1611,8 @@ def _pack_results(run: _Run, target: Target) -> dict:
     delays = scheduling_delay_windows(run)
     for case, spec in zip(cases, run.pack_specs, strict=True):
         loaded = [r for r in run.records if r.target == target.name and r.fixture_id == spec.fixture_id
-                  and (r.traffic_stage is not None or r.scenario == "pack_loaded" or bool(r.load_point))]
+                  and (r.scenario == "pack_loaded" or bool(r.load_point)
+                       or ("capacity" in r.check_ids and r.traffic_stage is not None))]
         stats = _stats(loaded)
         accuracy = stats["correct"] / stats["scored"] if stats["scored"] else None
         failed = accuracy is not None and accuracy < limits.min_correctness
@@ -1544,7 +1662,7 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
         records = [r for r in ordinary if check_id in r.check_ids]
         if check_id == "correctness" and run.pack_specs:
             records = [r for r in all_records if r.scenario in {"pack_control", "pack_loaded"}
-                       or r.traffic_stage is not None or bool(r.load_point)]
+                       or bool(r.load_point) or ("capacity" in r.check_ids and r.traffic_stage is not None)]
             limits = limits.model_copy(update={"min_samples": 1})
         if check_id == "capacity":
             records = [r for r in records if r.traffic_stage is not None]
@@ -2698,8 +2816,8 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
         workload_identity["session_sampling_source_sha256"] = hashlib.sha256(
             Path(session_sampling.__file__).read_bytes()).hexdigest()
     if "multi_user" in config.checks:
-        from giraffe import multi_user, multi_user_metrics, load_test, concurrent_load, session_sampling
-        workload_identity["multi_user_source_sha256"] = hashlib.sha256(b"".join(Path(m.__file__).read_bytes() for m in (multi_user, multi_user_metrics, load_test, concurrent_load, session_sampling))).hexdigest()
+        from giraffe import multi_user, multi_user_metrics, load_test, concurrent_load, session_sampling, traffic
+        workload_identity["multi_user_source_sha256"] = hashlib.sha256(b"".join(Path(m.__file__).read_bytes() for m in (multi_user, multi_user_metrics, load_test, concurrent_load, session_sampling, traffic))).hexdigest()
         workload_identity["multi_user_window_policy"] = multi_user.WINDOW_POLICY
     if "load" in config.checks:
         from giraffe import load_test, concurrent_load, traffic

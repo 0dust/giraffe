@@ -202,13 +202,15 @@ async def test_slower_upgrade_reduces_accepted_rate_as_http_queue_grows(monkeypa
             candidate_payloads=endpoint.requests[len(baseline_payloads):]
             assert endpoint.metrics_reads == 4
             assert endpoint.peak_active >= 3
+        for report,payloads in ((baseline,baseline_payloads),(candidate,candidate_payloads)):
+            assert_http_arrival_accounting(report,payloads,[6,30],other_requests=1,tolerance_ms=2000)
+            assert all(record.valid and record.score is True for record in traffic_records(report))
         if not host_caused_verdicts(baseline) and not host_caused_verdicts(candidate):
             break
     else:
         pytest.fail("Every attempt had host-caused verdicts: "
                     f"{host_caused_verdicts(baseline) + host_caused_verdicts(candidate)}")
-    for report,payloads in ((baseline,baseline_payloads),(candidate,candidate_payloads)):
-        assert_http_arrival_accounting(report,payloads,[6,30],other_requests=1,tolerance_ms=2000)
+    for report in (baseline,candidate):
         assert all(p['late_arrivals'] == 0 and p['dispatched'] == p['scheduled'] for p in capacity(report).metrics['points'])
     old,current=capacity(baseline).metrics,capacity(candidate).metrics
     assert old['highest_accepted'][0]['value'] == 50 and current['highest_accepted'][0]['value'] == 10
@@ -219,7 +221,6 @@ async def test_slower_upgrade_reduces_accepted_rate_as_http_queue_grows(monkeypa
     assert high['not_sent']==high['late_arrivals']==0
     assert hg['completion_p95_ms'] > lg['completion_p95_ms']*3
     assert hg['correct_work_per_second'] < hg['completed_requests_per_second']
-    assert all(r.valid and r.score is True for r in traffic_records(candidate))
     compared=compare_baseline(candidate,baseline)
     assert compared.baseline['status']=='fail' and compared.overall=='fail'
 

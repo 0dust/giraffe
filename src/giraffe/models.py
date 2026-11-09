@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from copy import deepcopy
 from decimal import Decimal, ROUND_FLOOR
+from fractions import Fraction
 from functools import cached_property
 import math
 import re
@@ -855,6 +856,11 @@ def migrate_run_limits(value):
     return value, notes
 
 
+def scheduled_multi_user_slots(config) -> int:
+    """Return the local slot limit for a scheduled multi-user window."""
+    return config.concurrency or config.inherited_concurrency(config.default_concurrency)
+
+
 def required_concurrency(config) -> dict[str, Any]:
     """Conservative simultaneous target-request peak, independent of suite limits."""
     by_check = {}
@@ -868,7 +874,12 @@ def required_concurrency(config) -> dict[str, Any]:
             arrival = config.effective_arrivals()
             peak = arrival.max_in_flight if arrival else config.inherited_concurrency(config.default_concurrency)
         elif check == "multi_user":
-            peak = max(config.multi_user.levels)
+            scenarios = set(config.multi_user.scenarios)
+            scheduled = {"arrivals", "recovery"}
+            if scenarios - scheduled:
+                peak = max(config.multi_user.levels)
+            if scenarios & scheduled:
+                peak = max(peak, scheduled_multi_user_slots(config))
         elif check == "sessions":
             peak = min(config.sessions.concurrency, config.sessions.sessions)
         elif check == "consistency":
@@ -1208,9 +1219,52 @@ class MultiUserCancellation(Model):
     cancel_after_chunks: StrictInt = Field(default=5, ge=1, le=1000)
 
 
+class MultiUserBurst(Model):
+    user_id: str = "user-01"
+    at_seconds: float = Field(default=1, ge=0, le=MAX_STAGE_SECONDS)
+    requests: StrictInt = Field(default=5, ge=1, le=MAX_BURST_SIZE)
+    spacing_seconds: float = Field(default=0, ge=0, le=MAX_STAGE_SECONDS)
+
+    def offer_offset(self, index: int) -> float:
+        return float(Fraction(str(self.at_seconds)) + index * Fraction(str(self.spacing_seconds)))
+
+
+def _steady_offer_count(duration: float, activation: float, rate: float) -> int:
+    # Count integer indices with activation + index / rate strictly before duration.
+    start = Fraction(str(activation))
+    frequency = Fraction(str(rate))
+    count = math.ceil((Fraction(str(duration)) - start) * frequency)
+    # The scheduled offset must still be inside the window after conversion to float.
+    if count > 0 and float(start + (count - 1) / frequency) >= duration:
+        return count - 1
+    return count
+
+
+class MultiUserArrivals(Model):
+    requests_per_second: float = Field(default=1, gt=0, le=1000)
+    activations: dict[str, Annotated[float, Field(ge=0, le=MAX_STAGE_SECONDS)]] = Field(default_factory=dict, max_length=32)
+    bursts: list[MultiUserBurst] = Field(default_factory=list, max_length=32)
+
+    def offer_count(self, duration: float, population: int) -> int:
+        steady = sum(_steady_offer_count(duration, self.activations.get(f"user-{index + 1:02d}", 0),
+                                        self.requests_per_second) for index in range(population))
+        return steady + sum(burst.requests for burst in self.bursts)
+
+
+class MultiUserRecovery(Model):
+    control_seconds: float = Field(default=5, gt=0, le=MAX_STAGE_SECONDS)
+    sustained_seconds: float = Field(default=15, gt=0, le=MAX_STAGE_SECONDS)
+    lighter_seconds: float = Field(default=5, gt=0, le=MAX_STAGE_SECONDS)
+    sustained_requests_per_second: float = Field(default=2, gt=0, le=1000)
+    lighter_requests_per_second: float = Field(default=.5, gt=0, le=1000)
+    max_slowdown: float | None = Field(default=None, ge=1)
+
+
 class MultiUser(Model):
-    scenarios: list[Literal["repeated_requests", "noisy_neighbors", "cancellation"]] = Field(
-        default_factory=lambda: ["repeated_requests"], min_length=1, max_length=3)
+    scenarios: list[Literal["repeated_requests", "noisy_neighbors", "cancellation", "arrivals", "recovery"]] = Field(
+        default_factory=lambda: ["repeated_requests"], min_length=1, max_length=5)
+    arrivals: MultiUserArrivals = Field(default_factory=MultiUserArrivals)
+    recovery: MultiUserRecovery = Field(default_factory=MultiUserRecovery)
     noisy_neighbors: MultiUserNeighbors = Field(default_factory=MultiUserNeighbors)
     cancellation: MultiUserCancellation = Field(default_factory=MultiUserCancellation)
     levels: list[Annotated[StrictInt, Field(ge=1, le=MAX_SIMULATED_USERS)]] = Field(
@@ -1231,9 +1285,29 @@ class MultiUser(Model):
             raise ValueError("multi-user scenarios must be distinct")
         if self.conversations and self.scenarios != ["repeated_requests"]:
             raise ValueError("conversation users support the repeated_requests scenario")
-        if any(s != "repeated_requests" for s in self.scenarios) and min(self.levels) < 2:
-            raise ValueError("noisy neighbors and cancellation require at least two users at every level")
+        if set(self.scenarios) & {"noisy_neighbors", "cancellation", "recovery"} and min(self.levels) < 2:
+            raise ValueError("noisy neighbors, cancellation and recovery require at least two users at every level")
         ids = {f"user-{index + 1:02d}" for index in range(min(self.levels))}
+        if "arrivals" in self.scenarios:
+            arrivals = self.arrivals
+            if not set(arrivals.activations) <= ids or any(b.user_id not in ids for b in arrivals.bursts):
+                raise ValueError("arrival and burst user IDs must exist at every population level")
+            if any(at >= self.duration_seconds for at in arrivals.activations.values()):
+                raise ValueError("user activations must precede the arrival window end")
+            if any(b.at_seconds < arrivals.activations.get(b.user_id, 0)
+                   or b.offer_offset(b.requests - 1) >= self.duration_seconds for b in arrivals.bursts):
+                raise ValueError("every burst must fall after its user activation and before the window end")
+            if arrivals.offer_count(self.duration_seconds, max(self.levels)) > MAX_PLANNED_ARRIVALS:
+                raise ValueError("multi-user arrival schedule exceeds the finite offer bound")
+        if "recovery" in self.scenarios:
+            recovery = self.recovery
+            if recovery.lighter_requests_per_second >= recovery.sustained_requests_per_second:
+                raise ValueError("recovery traffic must be lighter than sustained traffic")
+            if any(_steady_offer_count(seconds, 0, rate)*max(self.levels) > MAX_PLANNED_ARRIVALS for seconds, rate in (
+                    (recovery.control_seconds, recovery.lighter_requests_per_second),
+                    (recovery.sustained_seconds, recovery.sustained_requests_per_second),
+                    (recovery.lighter_seconds, recovery.lighter_requests_per_second))):
+                raise ValueError("multi-user recovery schedule exceeds the finite offer bound")
         if "cancellation" in self.scenarios and self.cancellation.user_id not in ids:
             raise ValueError("the cancellation user must exist at every population level")
         if "noisy_neighbors" in self.scenarios:
@@ -2091,6 +2165,35 @@ class RunConfig(Model):
 
     @model_validator(mode="before")
     @classmethod
+    def finite_request_options(cls, value):
+        if not isinstance(value, dict):
+            return value
+
+        def visit(item, path):
+            if isinstance(item, dict):
+                for key, child in item.items():
+                    visit(child, f"{path}.{key}")
+            elif isinstance(item, list):
+                for index, child in enumerate(item):
+                    visit(child, f"{path}.{index}")
+            elif isinstance(item, float) and not math.isfinite(item):
+                raise ValueError(f"{path} must be a finite number")
+
+        visit(value.get("request_options"), "request_options")
+        for group, field in (("request_pack", "cases"), ("tool_checks", "fixtures"),
+                             ("tool_checks", "conversations")):
+            container = value.get(group)
+            if isinstance(container, BaseModel):
+                container = container.model_dump(mode="python")
+            items = container.get(field, []) if isinstance(container, dict) else []
+            if isinstance(items, list):
+                for index, item in enumerate(items):
+                    options = item.get("options") if isinstance(item, dict) else getattr(item, "options", None)
+                    visit(options, f"{group}.{field}.{index}.options")
+        return value
+
+    @model_validator(mode="before")
+    @classmethod
     def load_profile_defaults(cls, value):
         # Sparse profiles inherit missing dimensions, never a suite output ceiling.
         if not isinstance(value, dict):
@@ -2161,6 +2264,17 @@ class RunConfig(Model):
             raise ValueError("Unknown check name(s): " + ", ".join(sorted(set(self.checks) - set(CHECK_NAMES)))
                              + ". Valid names: " + ", ".join(CHECK_NAMES))
         self.resolve_concurrency()
+        if "multi_user" in self.checks and set(self.multi_user.scenarios) & {"arrivals", "recovery"}:
+            from giraffe.multi_user import _planned_observation
+            windows = _planned_observation(self.multi_user, include_offers=False)["windows"]
+            offers = sum(window.get("scheduled_offers", 0) for window in windows)*len(self.targets)
+            if offers > MAX_PLANNED_ARRIVALS:
+                raise PydanticCustomError("multi_user_offers",
+                    "Multi-user has {planned} total scheduled offers across population levels, phases and targets; "
+                    "the maximum is {maximum}. Reduce rates, durations, population levels or targets.",
+                    {"planned": offers, "maximum": MAX_PLANNED_ARRIVALS,
+                     "fields": ["multi_user.levels", "multi_user.arrivals.requests_per_second",
+                                "multi_user.recovery.sustained_requests_per_second", "targets"]})
         for check_id, options in self.test_options.items():
             if check_id not in CHECK_OPTION_FIELDS:
                 raise PydanticCustomError("check_options", f"unsupported test_options check: {check_id}",
@@ -2842,12 +2956,14 @@ class RunReport(PersistedModel):
         self._stored_derived = "performance" in self.model_fields_set
         if not (info.context or {}).get("metadata_only"):
             from .performance import build_performance
-            from .conditions import aggregate_conditions
+            from .conditions import aggregate_conditions, scheduled_multi_user_window
 
             missing = {"performance", "conditions"} - self.model_fields_set
             if "performance" in missing or self._stored_derived:
                 self.performance = build_performance(self)
-            if "conditions" in missing:
+            if "conditions" in missing or any(
+                    row.get("planned_kind") != "exact" and scheduled_multi_user_window(row.get("condition_id"))
+                    for row in self.conditions):
                 self.conditions = aggregate_conditions(self)
         return self
 
