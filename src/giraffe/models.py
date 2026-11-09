@@ -17,7 +17,7 @@ from pydantic import BeforeValidator, TypeAdapter, ValidationError, StrictInt, f
 from . import __version__
 from .caps import (MAX_SIMULTANEOUS_REQUESTS, MAX_ARRIVAL_REQUESTS, MAX_BURST_SIZE,
                    MAX_PENDING_ARRIVALS, MAX_TRAFFIC_RATE, MAX_ARRIVAL_RATE, MAX_STAGES,
-                   MAX_STAGE_SECONDS, MAX_SESSIONS,
+                   MAX_STAGE_SECONDS, MAX_SESSIONS, MAX_SIMULATED_USERS,
                    MAX_SESSION_TURNS, MAX_SESSION_TURN_CHARS, MAX_TOOL_CONFIG_BYTES, MAX_TOOL_RESULT_BYTES,
                    MAX_TOOL_CALLS, MAX_TOOL_NAME_CHARS, MAX_DEPLOYMENT_SCOPE_CHARS, MAX_PLANNED_ARRIVALS, MAX_REQUEST_PACK_BYTES, MAX_REQUEST_PACK_CASES,
                    MAX_SANITIZE_ITEMS, MAX_SANITIZE_STRING_CHARS)
@@ -40,6 +40,7 @@ CHECK_NAMES = {
     "gpu": "GPU metrics",
     "prefix": "Prefix cache",
     "sessions": "Multi-turn sessions",
+    "multi_user": "Multi-user",
     "consistency": "Answer consistency",
     "tools": "Tool calling",
 }
@@ -713,7 +714,7 @@ def migrate_run_limits(value):
         checks.extend([*(["json"] if value.get("structured_json") else []),
                        *(["gpu"] if value.get("metrics") else [])])
         checks.extend(check for field, check in (("arrivals", "arrivals"), ("prefix", "prefix"),
-                                                ("sessions", "sessions"), ("consistency", "consistency"),
+                                                ("sessions", "sessions"), ("multi_user", "multi_user"), ("consistency", "consistency"),
                                                 ("tool_calling", "tools"), ("tool_checks", "tools"))
                       if value.get(field) is not None and (field != "tool_calling" or value[field]))
         value["checks"] = list(dict.fromkeys(checks))
@@ -867,6 +868,8 @@ def required_concurrency(config) -> dict[str, Any]:
         elif check == "arrivals":
             arrival = config.effective_arrivals()
             peak = arrival.max_in_flight if arrival else config.inherited_concurrency(config.default_concurrency)
+        elif check == "multi_user":
+            peak = max(config.multi_user.levels)
         elif check == "sessions":
             peak = min(config.sessions.concurrency, config.sessions.sessions)
         elif check == "consistency":
@@ -1086,6 +1089,15 @@ class SessionDistribution(Model):
         return self
 
 
+class MultiUserCriteria(Model):
+    max_first_answer_ms: float | None = Field(default=None, gt=0)
+    max_completion_ms: float | None = Field(default=None, gt=0)
+    max_error_percent: float | None = Field(default=0, ge=0, le=100)
+    min_output_tokens_per_second: float | None = Field(default=None, gt=0)
+    max_throughput_ratio: float | None = Field(default=None, ge=1)
+    min_samples: StrictInt = Field(default=1, ge=1)
+
+
 class SessionSampling(Model):
     seed: StrictInt = Field(default=42, ge=0, le=2**32 - 1)
     think_time_seconds: SessionDistribution | None = None
@@ -1139,11 +1151,9 @@ def session_workload_presets() -> list[SessionWorkload]:
     ]
 
 
-class Sessions(Model):
+class ConversationSettings(Model):
     profile: Literal["correctness", "performance"] = "correctness"
     modes: list[Literal["fixed", "live"]] = Field(default_factory=lambda: ["fixed", "live"])
-    sessions: int = Field(default=5, ge=1, le=MAX_SESSIONS)
-    concurrency: int = Field(default=2, ge=1, le=MAX_SIMULTANEOUS_REQUESTS)
     turns: list[Annotated[str, Field(min_length=1, max_length=MAX_SESSION_TURN_CHARS)]] = Field(min_length=2, max_length=MAX_SESSION_TURNS, default_factory=lambda: [
         "Remember the name assigned to this conversation and reply with that name only.",
         SESSION_REPEAT_PROMPT])
@@ -1178,6 +1188,70 @@ class Sessions(Model):
             raise ValueError("select distinct fixed/live session modes")
         if not 2 <= len(self.turns) <= MAX_SESSION_TURNS or any(not t.strip() or len(t) > MAX_SESSION_TURN_CHARS for t in self.turns):
             raise ValueError(f"sessions need 2..{MAX_SESSION_TURNS} non-empty bounded user turns")
+        return self
+
+
+class Sessions(ConversationSettings):
+    sessions: int = Field(default=5, ge=1, le=MAX_SESSIONS)
+    concurrency: int = Field(default=2, ge=1, le=MAX_SIMULTANEOUS_REQUESTS)
+
+
+class MultiUserNeighbors(Model):
+    heavy_user_ids: list[str] | None = Field(default=None, min_length=1, max_length=31)
+    heavy_user_count: StrictInt = Field(default=1, ge=1, le=31)
+    heavy_profiles: list[Literal["long_short", "short_long", "long_long"]] = Field(
+        default_factory=lambda: ["long_short", "short_long"], min_length=1, max_length=3)
+    triggers: list[Literal["before_output", "during_stream"]] = Field(
+        default_factory=lambda: ["before_output", "during_stream"], min_length=1, max_length=2)
+    max_slowdown: float | None = Field(default=None, ge=1)
+
+
+class MultiUserCancellation(Model):
+    user_id: str = "user-01"
+    cancel_after_chunks: StrictInt = Field(default=5, ge=1, le=1000)
+
+
+class MultiUser(Model):
+    scenarios: list[Literal["repeated_requests", "noisy_neighbors", "cancellation"]] = Field(
+        default_factory=lambda: ["repeated_requests"], min_length=1, max_length=3)
+    noisy_neighbors: MultiUserNeighbors = Field(default_factory=MultiUserNeighbors)
+    cancellation: MultiUserCancellation = Field(default_factory=MultiUserCancellation)
+    levels: list[Annotated[StrictInt, Field(ge=1, le=MAX_SIMULATED_USERS)]] = Field(
+        default_factory=lambda: [1, 5, 20], min_length=1, max_length=MAX_SIMULATED_USERS)
+    profile: LoadTestProfile = Field(default_factory=LoadTestProfile)
+    shapes: list[Literal[*SHAPES]] = Field(default_factory=lambda: ["short_short"], min_length=1, max_length=9)
+    seed: StrictInt = Field(default=42, ge=0, le=2**32 - 1)
+    think_time_seconds: SessionDistribution = Field(default_factory=lambda: SessionDistribution(values=[0]))
+    warmup_seconds: float = Field(default=0, ge=0, le=MAX_STAGE_SECONDS)
+    duration_seconds: float = Field(default=15, gt=0, le=MAX_STAGE_SECONDS)
+    conversations: ConversationSettings | None = None
+    fairness_tolerance_percent: float = Field(default=10, ge=0, le=100)
+    pass_criteria: MultiUserCriteria = Field(default_factory=MultiUserCriteria)
+
+    @model_validator(mode="after")
+    def valid_population(self):
+        if len(set(self.scenarios)) != len(self.scenarios):
+            raise ValueError("multi-user scenarios must be distinct")
+        if self.conversations and self.scenarios != ["repeated_requests"]:
+            raise ValueError("conversation users support the repeated_requests scenario")
+        if any(s != "repeated_requests" for s in self.scenarios) and min(self.levels) < 2:
+            raise ValueError("noisy neighbors and cancellation require at least two users at every level")
+        ids = {f"user-{index + 1:02d}" for index in range(min(self.levels))}
+        if "cancellation" in self.scenarios and self.cancellation.user_id not in ids:
+            raise ValueError("the cancellation user must exist at every population level")
+        if "noisy_neighbors" in self.scenarios:
+            heavy = self.noisy_neighbors
+            if heavy.heavy_user_ids is not None:
+                if len(set(heavy.heavy_user_ids)) != len(heavy.heavy_user_ids) or not set(heavy.heavy_user_ids) < ids:
+                    raise ValueError("heavy user IDs must be distinct, exist at every level and leave a short user")
+            elif heavy.heavy_user_count >= min(self.levels):
+                raise ValueError("heavy user count must leave at least one short user")
+            if len(set(heavy.heavy_profiles)) != len(heavy.heavy_profiles) or len(set(heavy.triggers)) != len(heavy.triggers):
+                raise ValueError("heavy profiles and interference triggers must be distinct")
+        if len(set(self.levels)) != len(self.levels) or len(set(self.shapes)) != len(self.shapes):
+            raise ValueError("multi-user levels and shapes must be distinct")
+        if any(value > 60 for value in self.think_time_seconds.values):
+            raise ValueError("multi-user think times must be between 0 and 60 seconds")
         return self
 
 
@@ -1323,6 +1397,7 @@ class Limits(Model):
     recovery_max_ratio: float | None = Field(default=None, gt=1)
     gpu_max_temperature_c: float | None = Field(default=None, gt=0)
     regression_percent: float = Field(default=20, ge=0)
+    regression_rate_points: float = Field(default=5, ge=0)
     min_samples: int = Field(default=5, ge=2)
 
 
@@ -2160,6 +2235,7 @@ class RunConfig(Model):
     _migration_notes: list[str] = PrivateAttr(default_factory=list)
     _concurrency_warnings: list[dict[str, Any]] = PrivateAttr(default_factory=list)
     sessions: Sessions | None = None
+    multi_user: MultiUser | None = None
     consistency: Consistency | None = None
     tool_calling: bool = False
     forced_tool_diagnostic: bool = False
@@ -2232,7 +2308,7 @@ class RunConfig(Model):
             self.checks = [*self.checks, *(["json"] if self.structured_json else []),
                            *(["gpu"] if self.metrics else [])]
             for field, check in (("arrivals", "arrivals"), ("prefix", "prefix"),
-                                 ("sessions", "sessions"),
+                                 ("sessions", "sessions"), ("multi_user", "multi_user"),
                                  ("consistency", "consistency"), ("tool_calling", "tools"),
                                  ("tool_checks", "tools")):
                 if getattr(self, field):
@@ -2251,6 +2327,8 @@ class RunConfig(Model):
             self.arrivals = Arrival()
         if "prefix" in self.checks and self.prefix is None:
             self.prefix = Prefix()
+        if "multi_user" in self.checks and self.multi_user is None:
+            self.multi_user = MultiUser()
         if "sessions" in self.checks and self.sessions is None:
             self.sessions = Sessions(max_tokens=min(32, self.max_output_tokens))
         if "consistency" in self.checks and self.consistency is None:
@@ -2654,12 +2732,9 @@ class EvaluationEvidence(PersistedModel):
         return _persisted_model_input(ToolExpectation, value)
 
 
-# Coarse bursts cannot establish a reliable answer-token generation rate.
-MAX_TOKENS_PER_READ = 16
-
-
 class RequestRecord(PersistedModel):
     _timing_started_monotonic: float | None = PrivateAttr(default=None)
+    _request_body_sent_monotonic: float | None = PrivateAttr(default=None)
     id: str
     target: str
     fixture_id: str
@@ -2688,6 +2763,8 @@ class RequestRecord(PersistedModel):
     first_token_reason: str | None = "Timing schema predates client content-event collection."
     output_events: list[dict[str, Any]] = Field(default_factory=list)
     output_events_truncated: bool = False
+    # The second useful answer SSE event may arrive in the first answer read.
+    second_answer_event_ms: float | None = Field(default=None, ge=0)
     answer_read_timestamps_ms: list[float] = Field(default_factory=list)
     reasoning_read_timestamps_ms: list[float] = Field(default_factory=list)
     read_timestamps_truncated: bool = False
@@ -2698,6 +2775,9 @@ class RequestRecord(PersistedModel):
     answer_reads: int = 0
     answer_chars: int = 0
     first_read_answer_chars: int = 0
+    first_read_output_tokens: int | None = Field(default=None, strict=True, ge=0)
+    last_read_output_tokens: int | None = Field(default=None, strict=True, ge=0)
+    read_output_tokens_source: Literal["usage", "logprobs"] | None = None
     first_reasoning_ms: float | None = None
     max_stream_gap_ms: float | None = None
     completion_tokens: int | None = None
@@ -2741,6 +2821,7 @@ class RequestRecord(PersistedModel):
     dispatch_ms: float | None = None
     completed_ms: float | None = None
     timing_start_ms: float | None = None
+    request_body_sent_ms: float | None = None
     client_preparation_ms: float = 0
     scheduled_ms: float | None = None
     client_wait_ms: float | None = None
@@ -2773,9 +2854,19 @@ class RequestRecord(PersistedModel):
 
     @property
     def tpot_estimate_ms(self) -> float | None:
-        """Reciprocal of the existing character-allocation generation estimate."""
+        """Reciprocal of client-observed pace from reported answer-read counts."""
         pace = self.generation_tokens_per_second if self.timing_schema else None
         return 1000 / pace if pace is not None and pace > 0 else None
+
+    @property
+    def streamed_answer_tokens(self) -> int | None:
+        events = [event for event in self.output_events if event["kind"] == "answer"]
+        if self.output_tokens is None or any(event.get("token_count") is None for event in events):
+            return None
+        tokens = sum(event["token_count"] for event in events)
+        if tokens == self.output_tokens or (self.finish_reason == "stop" and tokens == self.output_tokens - 1):
+            return tokens
+        return None
 
     @property
     def tpot_direct_reason(self) -> str | None:
@@ -2787,7 +2878,7 @@ class RequestRecord(PersistedModel):
             return "A valid completed answer and matching usage are required."
         if self.output_tokens is None:
             return "Answer-token usage is missing or includes unseparated reasoning."
-        if self.output_tokens <= 1:
+        if self.output_tokens <= 1 or self.streamed_answer_tokens == 1:
             return "Single-token answers have no subsequent-token interval."
         if self.output_events_truncated or self.read_timestamps_truncated:
             return "Receipt-event evidence was truncated; collect a shorter response."
@@ -2796,8 +2887,7 @@ class RequestRecord(PersistedModel):
         events = [event for event in self.output_events if event["kind"] == "answer"]
         if not events or events[0].get("token_count") != 1:
             return "The first answer event is not proven to contain exactly one token; collect aligned streamed logprobs."
-        if (any(event.get("token_count") is None for event in events)
-                or sum(event["token_count"] for event in events) != self.output_tokens):
+        if self.streamed_answer_tokens is None:
             return "Streamed token-boundary evidence does not match answer usage."
         if (len(events) < 2 or len({event["read_id"] for event in events}) != len(events)
                 or events[-1]["at_ms"] <= events[0]["at_ms"]):
@@ -2814,7 +2904,7 @@ class RequestRecord(PersistedModel):
         if self.tpot_direct_reason is not None:
             return None
         events = [event for event in self.output_events if event["kind"] == "answer"]
-        return (events[-1]["at_ms"] - events[0]["at_ms"]) / (self.output_tokens - 1)
+        return (events[-1]["at_ms"] - events[0]["at_ms"]) / (self.streamed_answer_tokens - 1)
 
     @property
     def itl_reason(self) -> str | None:
@@ -2839,41 +2929,27 @@ class RequestRecord(PersistedModel):
         return not (self.stream and self.answer_reads <= 1 and self.completion_tokens in (1, 2))
 
     @property
-    def first_read_tokens(self) -> float | None:
-        chars = self.answer_chars or (self.output_chars if not self.reasoning_stripped else 0)
-        if self.output_tokens is None or chars <= 0 or self.first_read_answer_chars <= 0:
-            return None
-        return max(1.0, self.output_tokens * self.first_read_answer_chars / chars)
-
-    @property
     def measured_stream_gap(self) -> bool:
-        first = self.first_read_tokens
-        return (self.stream and self.answer_reads >= 2 and self.max_stream_gap_ms is not None
-                and first is not None and first <= MAX_TOKENS_PER_READ)
+        return self.stream and self.answer_reads >= 2 and self.max_stream_gap_ms is not None
 
     @property
     def generation_tokens_per_second(self) -> float | None:
-        """Client-observed estimate; streamed reads are not individual tokens.
+        """Client-observed pace from reported counts at answer-read boundaries.
 
-        Exclude tokens in the first answer read and time before it. Waiting for
-        usage, finish markers or stream cleanup must not slow generation.
-        Single-read, non-streamed, buffered (> MAX_TOKENS_PER_READ per read) or
-        reasoning answers without a reported reasoning token count lack this evidence.
+        Counts describe server-generated tokens, not individual token arrival times.
+        Exclude the whole first read and any tokens reported only in later trailers.
+        Legacy/final-only usage cannot reconstruct either boundary.
         """
-        reads = self.answer_reads
+        first, last = self.first_read_output_tokens, self.last_read_output_tokens
         if (not self.valid or self.status != "completed" or not self.stream
                 or self.output_tokens is None or self.output_tokens <= 1
-                or reads < 2 or self.first_output_ms is None
+                or self.answer_reads < 2 or self.first_output_ms is None
                 or self.last_output_ms is None or self.last_output_ms <= self.first_output_ms
+                or first is None or last is None or not 0 < first < last <= self.output_tokens
+                or self.tool_calls
                 or ((self.reasoning_stripped or self.reasoning.strip()) and not self.reasoning_tokens)):
             return None
-        first = self.first_read_tokens
-        if first is None or first > MAX_TOKENS_PER_READ:
-            return None
-        later = self.output_tokens - first
-        if later <= 0 or later / (reads - 1) > MAX_TOKENS_PER_READ:
-            return None
-        return later * 1000 / (self.last_output_ms - self.first_output_ms)
+        return (last - first) * 1000 / (self.last_output_ms - self.first_output_ms)
 
 
 class CheckResult(PersistedModel):

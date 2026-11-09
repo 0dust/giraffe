@@ -2,7 +2,7 @@
 
 [Documentation index](README.md) · [Running and baselines](running.md)
 
-The public catalog has 15 checks. **Load test** combines the former concurrency,
+The public catalog has 16 checks. **Load test** combines the former concurrency,
 capacity and arrival checks. Workloads share configured run-wide request, duration
 and concurrency ceilings; Load test has its own token profile and request timeout.
 The [expanded example](../examples/workloads.yaml) includes legacy load settings
@@ -229,11 +229,11 @@ timeout. Shared request and duration limits still apply.
 
 Load test reports each workload/pattern/level separately; a passing setting does
 not establish the behavior of untested settings or erase a failure elsewhere.
-Answer timing ends at the last answer chunk: finish/usage messages, `[DONE]` and
+Answer timing ends at the last answer-bearing client read: finish/usage messages, `[DONE]` and
 connection cleanup do not extend generation time or stream gaps. A streamed
-single-chunk answer with reported `completion_tokens <= 2` has no possible
-inter-chunk gap and is exempt from missing-gap evidence. Longer or unknown-length
-single-chunk answers still lack timing evidence (they may have been buffered).
+single-read answer with reported `completion_tokens <= 2` has no possible
+stream gap and is exempt from missing-gap evidence. Longer or unknown-length
+single-read answers still lack timing evidence (they may have been buffered).
 
 Recovery first records light probes, then refills up to its effective check
 concurrency with
@@ -304,6 +304,73 @@ then one inference verifies readiness. Poll observations and the inference probe
 are recorded separately and consume neither the shared request budget nor the
 error allowance.
 
+## Streaming generation pace
+
+Generation pace is a client-observed estimate using output token counts at the
+first and last answer-bearing client reads:
+
+```text
+(last_read_output_tokens - first_read_output_tokens)
+/ seconds between first and last answer read
+```
+
+Several tokens can arrive in one SSE event, and several events can arrive in one
+client read. Giraffe groups events received together and uses the count on the
+last content event in each group. This excludes the whole first batch. Prompt
+waiting, trailing usage/finish messages, `[DONE]` and connection cleanup do not
+extend the measured interval or add tokens to its numerator. Large batches with
+valid counts can establish an average pace, but not individual token arrival
+times or smooth streaming.
+
+### Token-count sources
+
+Giraffe uses the first source available for a response and records it as
+`read_output_tokens_source`:
+
+1. `usage`: cumulative server usage on streamed events (opt-in, below).
+2. `logprobs`: streamed logprob entries. Giraffe probes logprob support and,
+   on plain-text requests, sends `logprobs: true` and `top_logprobs: 0`
+   automatically. Each entry is one generated token, so the count at a read is
+   the number of answer logprob entries received up to it. Setting `logprobs`
+   explicitly in `request_options` disables the automatic request.
+
+Some servers, including Ollama, count the end-of-sequence token in
+`completion_tokens` without streaming it. When a response finished with `stop`
+and usage is exactly one more than the streamed logprob tokens, Giraffe treats
+that token as unstreamed and uses the streamed count for per-token timing.
+
+For a server that supports cumulative usage on streamed events, add:
+
+```yaml
+request_options:
+  stream_options:
+    include_usage: true
+    continuous_usage_stats: true
+```
+
+This is an explicit opt-in extension, not a standard supported by every
+OpenAI-compatible endpoint. Confirm support in your server's documentation; see
+[NVIDIA's description of per-chunk usage](https://docs.nvidia.com/aiperf/reference/command-line-options#--per-chunk-usage).
+Giraffe does not enable the extension automatically.
+
+Final-only usage without streamed logprobs cannot establish earlier batch counts.
+Missing, invalid or decreasing counts leave generation pace unmeasured; Giraffe
+does not infer them from characters or SSE event counts. Counts must cover the
+same output scope at both boundaries. Reasoning needs a usable reasoning-token
+breakdown, and mixed text/tool responses cannot establish this pace. Server
+counts can include control tokens and need not equal tokenization of visible text.
+Network buffering also affects arrival times, so this is not an exact server
+decoding measurement.
+
+`limits.min_output_tokens_per_second` (or Load test's
+`pass_criteria.min_generation_tokens_per_second`) requires sufficient measurable
+responses; otherwise the result is inconclusive. Non-streamed, single-read and
+incomplete responses cannot establish a rate. First-answer, total-time and
+stream-pause measurements remain independent of token counts. End-to-end output
+rate uses total output usage divided by total request time and remains separate.
+Older request records without boundary counts cannot establish the corrected
+generation pace, while their saved timing and total usage remain readable.
+
 ## Workload settings and evidence
 
 | Setting | Behavior | Evidence and limitations |
@@ -331,9 +398,10 @@ sample counts. Failures, timeouts, cancellation, unknown lengths and finish reas
 appear alongside them. Aggregate
 requests/s and output tokens/s use first dispatch through last completion in that
 scenario, including error time in the window. Missing output usage leaves aggregate
-token throughput unknown. Per-request generation pace remains a client-observed
-estimate between first/last answer chunks, separate from end-to-end throughput and
-server TTFT statistics.
+token throughput unknown. Per-request generation pace uses cumulative server
+counts at the first and last answer-bearing client reads, separate from
+end-to-end throughput and server TTFT statistics. See
+[streaming generation pace](#streaming-generation-pace) for required token counts.
 
 Timing acceptance uses the same generator scheduling-lag qualification for core
 and additional workloads. If the generator cannot keep up, configured timing
@@ -966,6 +1034,99 @@ discovery is `unknown`. These observations do not prove a cold start or explain 
 slow first response. A separately requested UI connection test may already have
 loaded the model before the run starts. A deliberate restart may also change state
 between observations. This is one endpoint’s inventory, not proof about every replica.
+
+
+## Persistent multi-user work
+
+The opt-in **Multi-user** check keeps a stable simulated user across repeated independent requests or fresh conversations. Start with [multi-user.yaml](../examples/multi-user.yaml):
+
+```sh
+giraffe run --config examples/multi-user.yaml --output runs/multi-user --html
+```
+
+Set the endpoint and model first. All simulated users share its optional `api_key_env`; these are workload identities, not separate credentials. Select repeated work, noisy neighbors or cancellation with `multi_user.scenarios`. Arrivals and recovery remain separate follow-up work.
+
+`multi_user.levels` selects populations of 1–32 users independently of the run's `concurrency` ceiling. The example runs 1, 5 and 20 users behind five shared request slots. Each user sends one request at a time, waits for completion and then pauses. Sleeping users hold no request slot. `think_time_seconds.values` and optional `weights` reuse the session distribution format; `seed` makes each user's profile and pause sequence reproducible across levels. `shapes` selects the existing short/medium/long input-output combinations; `profile` accepts the existing increasing token-size profile. Requests keep the run's request timeout and all existing global budgets.
+
+Each population has a common measurement window. Optional `warmup_seconds` traffic uses the same budgets and fully drains before measurement begins. New requests stop at the measurement cutoff; admitted requests can drain within their ordinary timeout and the global deadline. A request ready before cutoff but still waiting for a slot is retained as undispatched work.
+
+Per-user delivered throughput is **known valid output tokens completed inside the common measurement window divided by that window's actual seconds**. Equal delivered tokens therefore produce equal rates even when users had different active times. Late completions, partial output and missing usage are shown separately. Missing usage on an eligible completion makes exact throughput unknown; a user that never dispatched has known zero delivery and unexercised acceptance. This rate includes thinking and waiting; it is separate from generation pace.
+
+Optional `max_first_answer_ms` and `max_completion_ms` apply from the time a user is ready, including local admission wait. Dispatch-to-answer timings remain available in JSON and inspection. Every nonintentional admitted attempt enters timing attainment, including errors and requests that fail during drain. One user's failure is not hidden by healthy peers. A pending admission wait that already exceeds a selected timing limit is a client-admission breach when timing evidence is qualified; shorter waits at cutoff remain censored. Interrupted windows cannot pass, and incomplete throughput evidence is not an established throughput shortfall.
+
+`max_error_percent` defaults to zero; set it to `null` to omit that criterion. `min_output_tokens_per_second` is optional and measures shared-window delivery, not generation speed. `min_samples` requires that many valid responses for each user. With all acceptance thresholds set to `null`, results are measurements and the check remains inconclusive rather than claiming acceptance.
+
+CLI output, the UI, HTML, JSON and reproduction exports retain every planned user, including those with no requests. Results identify the worst served user and link user rows to their request evidence. Response retention still controls bodies and reasoning. Baselines compare each user at the same population and profile; changing population, shapes, seed, duration or window policy prevents a passing comparison. Shared-window rate changes are observed changes without a cross-run confidence interval. Reproduction exports include user settings, plans and compact outcomes, but do not recreate inaccessible server state.
+
+### Qualified delivery fairness
+
+Set `multi_user.pass_criteria.max_throughput_ratio` to compare **median user throughput / worst user throughput** against a maximum (at least 1). Without a threshold, fairness remains a measurement. A one-user level still contributes to per-user criteria, and the fairness threshold requires a level with at least two users. A zero or unknown worst throughput leaves the ratio undefined. Other selected per-user criteria retain their own failures even when fairness evidence is inconclusive.
+
+Every compared user needs sufficient valid in-window samples, known input/output usage, equivalent active exposure, the same work and pause plans, and qualified streamed overlap with another user. Users need not all overlap at once: twenty users can be compared behind five request slots. The eligible population and concrete qualification reasons appear beside the ratio in CLI, UI, HTML, JSON and exports. `fairness_tolerance_percent` defaults to 10 and applies to differences in actual median token lengths, per-request token length mixes, and active exposure. For length mixes, it bounds the average token difference between corresponding percentiles as a percentage of the smaller mean. Qualification includes total generated tokens and, when requests report cache reuse, uncached input. Throughput still counts answer tokens. An unserved user, early EOS before the requested output shape, incomplete work or client scheduling delay prevents a fairness verdict. Conversations can finish below their output cap when their actual work is comparable. Independently sampled variable pauses or conversation lengths do not establish equal work. The result describes observed delivery fairness; it does not establish a server scheduling defect.
+
+### Repeated conversations
+
+Set `multi_user.conversations` to use the existing conversation settings. Omit it or set it to `null` for independent requests. The Multi-user editor exposes both choices. For example:
+
+```yaml
+multi_user:
+  levels: [2, 5]
+  duration_seconds: 30
+  think_time_seconds: {values: [1]}
+  conversations:
+    profile: correctness
+    modes: [fixed, live]
+    max_tokens: 32
+    delay_seconds: 0.5
+    turns:
+      - Remember the conversation name.
+      - Repeat the original name.
+```
+
+Each user alternates the selected modes across fresh conversations. Fixed histories use the conversation's seeded answer; live histories use actual preceding answers. The outer `think_time_seconds` pauses between conversations, while `delay_seconds` or `sampling.think_time_seconds` pauses between turns. None holds a request slot while sleeping. The optional conversation `sampling` uses the same seed, weighted pause/input/output/turn-count distributions as Sessions; input/output/turn-count sampling requires `profile: performance` with `modes: [live]` and selected `workloads`. Task weights assign each persistent user a stable task independently of population and peer completion order. Performance replies are unscored.
+
+A failed, cancelled or truncated turn stops its conversation without a substitute answer. Truncated conversation output counts as partial output and a request error; it cannot qualify as valid delivered work. The user can then start a fresh conversation, subject to the shared budgets and stop rules. If no turn can be dispatched (for example, its first prompt exceeds the history admission ceiling), that user stops instead of repeatedly attempting the same impossible history. Every conversation has a distinct ID and request/turn links under the same user. Conversation summaries and links survive response retention. Copied live assistant replies are omitted from saved request inputs unless `retention: all`; bodies kept by `retention: failures` remain attached to their original requests. Existing Sessions counts and concurrency semantics remain unchanged.
+
+Reproduction and baseline identity include fairness criteria, comparability tolerance, conversation settings and generator sources. Changed work or window policies cannot pass a baseline comparison. Live history can vary between runs; actual shape and hash evidence remain authoritative.
+
+### Matched noisy neighbors
+
+Select `noisy_neighbors` to compare each short user's responses with its own short-only control. Every selected heavy profile and trigger gets a control window followed by a probe window of `duration_seconds` each. Short users retain their IDs, matched logical work and pause plans. The probe adds the selected heavy users, subject to the same request slots and run budgets. These scenarios use independent requests; `conversations` must be absent or `null`.
+
+For example, replace the `multi_user` block in [multi-user.yaml](../examples/multi-user.yaml) with:
+
+```yaml
+multi_user:
+  scenarios: [noisy_neighbors, cancellation]
+  levels: [3]
+  duration_seconds: 5
+  think_time_seconds: {values: [0.1]}
+  noisy_neighbors:
+    heavy_user_ids: [user-03]
+    heavy_profiles: [long_short, short_long]
+    triggers: [before_output, during_stream]
+    max_slowdown: 1.5
+  cancellation:
+    user_id: user-03
+    cancel_after_chunks: 5
+  pass_criteria:
+    min_samples: 2
+    max_error_percent: 0
+```
+
+`heavy_user_ids` selects explicit persistent IDs. Omit it to select the first `heavy_user_count` users (default 1). Every selected level must contain the heavy users and at least one short user. Each `heavy_profiles` entry selects long input (`long_short`), long output (`short_long`), or both (`long_long`); sizes come from the existing `profile` token settings. Short users use `short_short`.
+
+`before_output` dispatches heavy work while a short request has started but has not produced output. `during_stream` waits for short-user streaming progress. A requested trigger is not proof that overlap occurred: the report retains actual dispatch, output, lengths and matched request evidence. Fast short responses, early completion of heavy work, mismatched input/output lengths, missing usage, insufficient samples, client timing interference or an exhausted budget leave the comparison inconclusive. The tolerance for comparable actual lengths and exposure is `fairness_tolerance_percent`.
+
+Each short-user comparison shows the control/probe sample associations, actual median input/output lengths, completion slowdown, first-answer and stream-gap changes, and output change. Each pair must have comparable actual lengths and compatible reported cache use to count. When cache usage is reported, long-input competitors need enough uncached tokens to qualify as long input and at least half their input must be uncached. Generated requests vary their prefix nonce while preserving the matched work identity. `max_slowdown` optionally limits the matched completion-time ratio. Omitting it measures the difference without claiming acceptance. Per-user errors and selected latency criteria remain visible even if the interference comparison is inconclusive. These measurements describe observed interference under the tested workload; they do not identify a particular server scheduling cause.
+
+### Cancel one user while peers continue
+
+Select `cancellation` to interrupt the selected user's first long-output response after `cancel_after_chunks` generation chunks carrying answer or reasoning content and then send another request under that user's original ID. Other users continue their work. Every population level needs at least two users and must include `cancellation.user_id`.
+
+Results separately qualify the selected cancellation, peer output across cancellation, and same-user follow-up. A response that ends before the cancellation opportunity, missing peer overlap, or incomplete follow-up stays inconclusive. Successful follow-up alone does not establish that the backend released compute or memory. Run Stop still terminates the whole run; undispatched work remains distinct from HTTP attempts and partial responses follow the configured retention policy.
+
+The UI, CLI, HTML, JSON and reproduction export expose the same scenario observations and request associations. Baselines keep control/probe roles, trigger and heavy profile separate, and refuse passing comparisons when scenario configuration, work identity or window policies differ. Give the run enough time and requests for every selected window: the example above schedules eight five-second noisy-neighbor windows plus one five-second cancellation window, followed by any needed drain time. Real-engine conclusions still require runs against the intended endpoint, model and hardware.
 
 ## Scale-down continuity
 

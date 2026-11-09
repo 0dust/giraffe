@@ -124,6 +124,16 @@ giraffe run --config giraffe.yaml \
 
 Giraffe reads the run settings from YAML; `--output` chooses where to save the results, and `--html` adds an HTML report.
 
+**Measuring generation pace:** Giraffe needs token counts at streamed answer
+boundaries, not just a final token total. When your server streams logprobs, as
+Ollama does, Giraffe detects this and uses them automatically. Otherwise, on a
+compatible server such as vLLM, enable
+`request_options.stream_options.include_usage: true` and
+`request_options.stream_options.continuous_usage_stats: true`. Without either,
+generation pace remains unmeasured and a required minimum rate stays inconclusive;
+first-answer time, stream pauses and total response time still work. See
+[streaming generation pace](docs/workloads.md#streaming-generation-pace).
+
 ## CI and GitHub Actions
 
 Use `--quiet --junit junit.xml --summary-md summary.md` for CI output. Saved
@@ -221,7 +231,7 @@ In the UI, open a completed run and choose **Save baseline** (fully passing runs
 
 ## Tests
 
-15 built-in checks. The four defaults are `access, serving, correctness, first_output`; select additional checks for your endpoint.
+16 built-in checks. The four defaults are `access, serving, correctness, first_output`; select additional checks for your endpoint.
 
 | Check · CLI ID | What it checks |
 | --- | --- |
@@ -239,6 +249,7 @@ In the UI, open a completed run and choose **Save baseline** (fully passing runs
 | GPU metrics · `gpu` | Available GPU telemetry |
 | Prefix cache · `prefix` | Reported cache reuse against independent controls |
 | Multi-turn sessions · `sessions` | Recall and timing across concurrent conversations |
+| Multi-user · `multi_user` | Persistent users sharing request slots, with individual delivery and timing outcomes |
 | Answer consistency · `consistency` | Answer agreement across repeated requests |
 | Tool calling · `tools` | Tool-call structure, names and expected arguments |
 

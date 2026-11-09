@@ -5,7 +5,7 @@ import pytest
 from giraffe.models import CheckResult
 from giraffe import runner
 from tests.test_load_test_phase_a import config as load_config
-from tests.test_review26_phase4_accuracy import run_virtual
+from tests.virtual_clock import run_virtual
 from tests.test_runner import FakeClient
 
 pytestmark = pytest.mark.usefixtures("local_tokenizer")

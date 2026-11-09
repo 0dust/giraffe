@@ -402,7 +402,7 @@ async def test_bootstrap_has_blank_model_and_no_automatic_traffic(tmp_path, monk
         result = (await client.get("/api/bootstrap")).json()
         assert result["config"]["targets"][0]["model"] == ""
         assert result["config"]["restart_target"] is None
-        assert len(result["checks"]) == 16
+        assert len(result["checks"]) == 17
         assert next(check for check in result["checks"] if check["id"] == "scale_down")["optional"] is True
         assert "scale_down" not in result["config"]["checks"]
         assert result["config"]["scale_down"] is None

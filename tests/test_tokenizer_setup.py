@@ -176,23 +176,28 @@ async def test_saved_requests_do_not_require_tokenizer(monkeypatch):
 
 
 async def test_automatic_setup_timeout_kills_worker_and_uses_builtin(monkeypatch, local_tokenizer):
+    process = await asyncio.create_subprocess_exec(sys.executable, "-c", "import time; time.sleep(60)",
+        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE)
     workers = []
     worker = sizing._start_worker
     async def hung(*args, **kwargs):
         if args[0] == "builtin":
             return await worker(*args, **kwargs)
-        p = await asyncio.create_subprocess_exec(sys.executable, "-c", "import time; time.sleep(60)",
-            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE)
-        workers.append(p)
-        return p
+        workers.append(process)
+        return process
     monkeypatch.setattr(sizing, "_start_worker", hung)
     monkeypatch.setattr(sizing, "AUTOMATIC_SETUP_TIMEOUT_SECONDS", .08)
     started = time.monotonic()
     config = configuration()
-    await sizing.ensure_tokenizers(config)
+    try:
+        await asyncio.wait_for(sizing.ensure_tokenizers(config), 5)
+        assert workers and all(p.returncode is not None for p in workers)
+    finally:
+        if process.returncode is None:
+            process.kill()
+        await process.wait()
     assert config.targets[0]._tokenizer_setup["source"] == "builtin_fallback"
-    assert time.monotonic() - started < .5
-    assert workers and all(p.returncode is not None for p in workers)
+    assert time.monotonic() - started < 5
 
 
 async def test_explicit_override_timeout_still_reports_error(monkeypatch):

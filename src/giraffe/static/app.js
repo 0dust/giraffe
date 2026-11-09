@@ -1,4 +1,4 @@
-import {positiveBoundErrors, inferSetupPreset, configureLoadTest, loadTestIssues, loadTestSettings, loadFieldName, convertExpectedAnswer, datasetCaseFromValues, changeDatasetScorer, configureJudging, configureSessions, configureProfiles, parseLogprobSettings, parseToolFixtures, effectiveProfileDefaults, configureTests, configureRunLimits, limitValue, optionDefault, optionValue, sameConfig} from './form-config.mjs?v=20261028-results-merge-ci';
+import {positiveBoundErrors, inferSetupPreset, configureLoadTest, loadTestIssues, loadTestSettings, loadFieldName, convertExpectedAnswer, datasetCaseFromValues, changeDatasetScorer, configureJudging, configureSessions, configureMultiUser, multiUserSettings, configureProfiles, parseLogprobSettings, parseToolFixtures, effectiveProfileDefaults, configureTests, configureRunLimits, limitValue, optionDefault, optionValue, sameConfig} from './form-config.mjs?v=20261028-results-merge-ci';
 
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
@@ -25,7 +25,7 @@ function updateAPIKeySummary() {
   $('.row-value',summary).textContent=key?'Set for this tab':ref||'Not set';
 }
 const state = {bootstrap:null, runs:[], storage:null, storageUnavailable:false, cleanup:null, cleanupResult:null, baselines:[], detail:null, mosaicFollow:true, config:null, active:null, diskActive:null, routeVersion:0, poll:null, tab:'checks', selectedCheck:null, checkNavigatorOpen:false, filter:'all', historySearch:'', comparisonFilter:null, comparisonCheck:'all', submitting:false, openTest:null, configView:'form', jsonDraft:null, jsonBase:null, configRevision:0, configBusy:false, showAvailableTests:false, formMode:'normal', formRestartTarget:null, requestPreview:null, previewSequence:0, planTimer:null, setupPreset:null, catalogueFilter:'all', catalogueCategory:'all', catalogueSearch:'', setupStep:1, returnToReview:false, modelDiscovery:null, modelDiscoverySequence:0, autoModel:null, datasetSelection:[], datasetImportSequence:0, judgeEditorOpen:null, datasetImport:null, datasetEditor:null, datasetTry:null, migrationNotes:[], dismissedMigrationNotes:[], loadPanels:{}, limitValues:{}, jsonValidation:null};
-const statusLabels = {pass:'Passed',fail:'Failed',failed:'Failed',timeout:'Timed out',inconclusive:'Inconclusive',skipped:'Not run',idle:'Unused',blocked:'Blocked',running:'Running',queued:'Queued',reserved:'Reserved',stopping:'Stopping',error:'Runner error',completed:'Finished',stopped:'Stopped',cancelled:'Cancelled',interrupted:'Interrupted'};
+const statusLabels = {not_applicable:'Not applicable',measured:'Measured',warmup:'Warmup',pass:'Passed',fail:'Failed',failed:'Failed',timeout:'Timed out',inconclusive:'Inconclusive',skipped:'Not run',idle:'Unused',blocked:'Blocked',running:'Running',queued:'Queued',reserved:'Reserved',stopping:'Stopping',error:'Runner error',completed:'Finished',stopped:'Stopped',cancelled:'Cancelled',interrupted:'Interrupted'};
 const statusIcons = {pass:'✓',fail:'×',failed:'×',timeout:'◷',inconclusive:'?',skipped:'–',idle:'○',blocked:'!',running:'·',queued:'○',reserved:'○',stopping:'·',error:'×',completed:'✓',stopped:'⊘',cancelled:'⊘',interrupted:'!'};
 const order = {fail:0,blocked:1,inconclusive:2,pass:3,skipped:4};
 const icon = (name) => ({plus:'<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 4v12M4 10h12"/></svg>',arrow:'<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 10h12m-5-5 5 5-5 5"/></svg>',repeat:'<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M15 6A6 6 0 1 0 16 12M15 2v5h-5"/></svg>',stop:'<svg viewBox="0 0 20 20" aria-hidden="true"><rect x="5" y="5" width="10" height="10"/></svg>'}[name] || '');
@@ -601,7 +601,18 @@ function renderRequestTermination(record) {
   return `<section class="request-termination"><h3>Request limits &amp; stop reason</h3><dl class="metrics-grid">${metric('Configured request timeout',timeout==null?'Not recorded':elapsed(timeout))}${reason?metric('Stop reason',labels[reason] || human(reason)):''}${limit!=null?metric('Effective deadline',elapsed(limit),'May be shortened by the remaining run duration or an intentional probe'):''}</dl>${record.error?`<p class="hint">${escape(record.error)}</p>`:''}</section>`;
 }
 function requestLabel(record,records,condition=conditionInfo(record),positions) {return `${condition.label}. ${requestIdentity(record,records,condition,positions)} · ${statusLabels[requestStatus(record)] || record.status} · ${requestTiming(record)}`;}
-function requestIdentityContent(record,records) {return `${escape(requestIdentity(record,records))} · <span class="mono">${escape(record.id || (inProgress(requestStatus(record))?'Request ID pending':'Request ID not recorded'))}</span> · ${escape(statusLabels[requestStatus(record)] || record.status)} · ${requestTiming(record)}`;}
+function requestIdentityContent(record,records) {
+  const workload=record.workload;
+  let identity='';
+  if(workload?.user_id){
+    const {conversation_sequence:conversation,turn_id:turn}=workload;
+    identity=`${escape(workload.user_id)} · ${number(workload.population)} users · `;
+    if(Number.isInteger(conversation)&&conversation>0&&Number.isInteger(turn)&&turn>=0){
+      identity+=`Conversation ${number(conversation)} · Turn ${number(turn+1)} · `;
+    }
+  }
+  return `${identity}${escape(requestIdentity(record,records))} · <span class="mono">${escape(record.id || (inProgress(requestStatus(record))?'Request ID pending':'Request ID not recorded'))}</span> · ${escape(statusLabels[requestStatus(record)] || record.status)} · ${requestTiming(record)}`;
+}
 function renderRequestContext(record,records) {
   const condition=conditionInfo(record),p=condition.parameters,value=v=>Array.isArray(v)?v.map(n=>number(n)).join('–'):v==null?'Not recorded':number(v),chars=record.input_chars>0?record.input_chars:(p.input_chars ?? record.input_chars),tokens=record.requested_input_tokens ?? record.workload?.requested_input_tokens ?? (typeof chars==='number'?Math.ceil(chars/4):p.input_tokens_approx),cap=record.requested_max_tokens || p.output_tokens;
   return `<p class="request-identity">${requestIdentityContent(record,records)}</p><section class="request-sent"><h3>What was sent</h3><dl class="metrics-grid">${metric('Prompt size',`${value(chars)} characters · ~${value(tokens)} tokens`,'Approximate tokens; not server-reported usage')}${metric('Output cap',`${value(cap)} tokens`)}${metric('Concurrency',p.concurrency==null?'Not recorded':`${value(p.concurrency)} at once`)}${metric('Same prompt',condition.summary?.planned===1?'Single request':p.same_prompt===true?'Yes · repeated across this test':p.same_prompt===false?(p.repetitions_per_prompt?`Different prompts · each repeated ${value(p.repetitions_per_prompt)} times`:'No · inputs vary across this test'):'Not recorded in this legacy report')}</dl>${record.evaluation?.messages?.some(message=>typeof message.content==='string'&&message.content.trim())?'<p><button type="button" class="text-button" data-action="request-input">View input messages</button></p>':''}</section><p class="hint request-internal"><small>Internal ID: <span class="mono">${escape(record.scenario || '')}${record.fixture_id?` · ${escape(record.fixture_id)}`:''}</span></small></p>`;
@@ -1024,7 +1035,7 @@ function renderRuns() {
   if(focusId){const control=$('#'+focusId);control?.focus({preventScroll:true});if(selection&&selection[0]!=null)control?.setSelectionRange?.(...selection);}
 }
 const numericFields=['context_limit','concurrency','max_requests','max_memory_mb','max_duration_seconds','request_timeout_seconds','max_output_tokens'].map(name=>[name]);
-const limitFields=[['first_output_ms','First output maximum','ms'],['latency_ms','Response time maximum','ms'],['stream_gap_ms','Stream pause maximum','ms'],['min_output_tokens_per_second','Minimum generation rate','tokens / second after first output (estimate)'],['fairness_max_ratio','Mixed-load slowdown','ratio, greater than 1']];
+const limitFields=[['first_output_ms','First output maximum','ms'],['latency_ms','Response time maximum','ms'],['stream_gap_ms','Stream pause maximum','ms'],['min_output_tokens_per_second','Minimum generation rate','tokens / second after first output; needs streamed token counts (logprobs or cumulative usage)'],['fairness_max_ratio','Mixed-load slowdown','ratio, greater than 1']];
 const fieldDescriptions={
   url:{hint:'Address of your LLM server.',help:'Use the address Giraffe can reach, such as http://localhost:11434/v1 for Ollama or http://localhost:8000/v1 for vLLM. Giraffe connects to an existing server; it does not start or install a model.'},
   model:{hint:'Model name used by your server.',help:'Use an exact model name from your server, including its tag or alias. For Ollama, use a name from ollama list. The model must already be installed.'},
@@ -1067,7 +1078,8 @@ const fieldDescriptions={
   limit_fairness_max_ratio:{help:'How much slower a short answer may become when long requests run alongside it. A value of 2 allows up to twice the short-only response time. Use a number greater than 1.'},
   limit_max_error_rate:{help:'The largest allowed share of failed, timed-out or invalid responses. Enter a percentage from 0 to 100: 5 means 5%. Intentional cancellation probes are treated separately.'},
   limit_min_correctness:{help:'The smallest allowed share of correct answers among scored requests. Enter a percentage from 0 to 100: 95 means 95%. Missing or unscored answers can leave a test inconclusive.'},
-  limit_regression_percent:{help:'How much a result may worsen compared with a saved baseline before Giraffe flags a material regression. Timing changes use percent; rate changes use percentage points. Too few comparable samples can leave the comparison inconclusive.'},
+  limit_regression_percent:{help:'How much a timing or output-rate result may worsen compared with a saved baseline before Giraffe flags a material regression. Too few comparable samples can leave the comparison inconclusive.'},
+  limit_regression_rate_points:{help:'How many percentage points a rate metric may worsen compared with a saved baseline before Giraffe flags a material regression. Too few comparable samples can leave the comparison inconclusive.'},
   limit_min_samples:{help:'The minimum number of usable measurements needed to judge a result. Fewer samples produce an inconclusive result rather than a pass.'},
   test_samples:{help:'How many sample requests this test should try. Some tests need extra requests to cover every case. Leave blank to use the run setting.'},
   test_concurrency:{help:'How many requests this test asks to run at the same time. An accepted value is not demonstrated delivery capacity. Leave blank to inherit this check’s default.'},
@@ -1129,6 +1141,16 @@ function settingDestination(path) {
   if(root==='stream'){step=1;}
   else if(root==='retention'){step=3;}
   else if(root==='targets'){if(parts[1]!=='0')return {name:'config_editor',label:'advanced configuration'};name=parts[2]==='tokenizer'&&$('#new-run-form')?.elements.tokenizer?.value==='custom'?'tokenizer_custom':parts[2];step=1;}
+  else if(root==='multi_user'){
+    const path=parts.slice(1);if(path[0]==='conversations'){
+      const key=path[1];name='multi_user_conversation_'+(key||'profile');
+      if(key==='sampling')name+='_'+(path[2]==='seed'?'seed':path[2]||'seed');
+      if(key==='sampling'&&path[2]!=='seed')name='multi_user_conversation_'+(path[3]==='weights'?'weights_':'sample_')+(path[2]||'think_time_seconds');
+      if(key==='turns')name='multi_user_conversation_turn_'+(path[2]||0);
+      if(key==='workloads')name='multi_user_conversation_task_'+(path[2]||0)+'_'+({max_tokens:'cap',turns:'turn_'+(path[4]||0)}[path[3]]||path[3]||'name');
+    }else if(path[0]==='scenarios')name='multi_user_scenario_repeated_requests';else if(path[0]==='noisy_neighbors'){const key=path[1];name='multi_user_noisy_neighbors_'+(key==='heavy_profiles'?'profile_long_short':key==='triggers'?'trigger_before_output':key||'heavy_user_ids');}else if(path[0]==='levels')name='multi_user_levels';else if(path[0]==='shapes')name='multi_user_shape_short_short';else if(path[0]==='think_time_seconds')name='multi_user_think_time_'+(path[1]==='weights'?'weights':'values');else name='multi_user_'+path.join('_').replace(/^pass_criteria_/,'criteria_');
+    return {name,check:'multi_user',step,label:'Multi-user settings'};
+  }
   else if(root==='load_test'){
     check='load';
     if(parts[1]==='migrated_tests')return {name:'config_editor',step,label:'imported load settings'};
@@ -1162,7 +1184,7 @@ function settingDestination(path) {
   else if(['arrivals','prefix','sessions','consistency'].includes(root)){check=root;name=`profile_${root}_${parts[1]}`;}
   else if(root==='traffic'){check='capacity';name=`traffic_${parts[1]}`;}
   else if(root==='tool_checks'){check='tools';name=`profile_tools_${parts[1]}`;}
-  else if(root==='limits'){name=`limit_${parts[1]}`;if(parts[1]==='regression_percent')step=3;}
+  else if(root==='limits'){name=`limit_${parts[1]}`;if(['regression_percent','regression_rate_points'].includes(parts[1]))step=3;}
   else if(root==='judging')name=parts[1]==='judges'?`judge_${parts[2]}_${parts[3]}`:`judging_${parts[1]}`;
   else if(root==='config')name='config_editor';
   const labels={session_sampling_seed:'sampling seed',session_sample_think_time_seconds:'pause values',session_sample_input_tokens:'input message lengths',session_sample_output_tokens:'output cap values',session_sample_turn_count:'turns per conversation',max_memory_mb:'Maximum memory',concurrency:'Simultaneous limit',max_duration_seconds:'Maximum duration',request_timeout_seconds:'request timeout',max_output_tokens:'output cap',max_requests:'Maximum requests',load_schedule_levels:'concurrency levels',load_schedule_duration_seconds:'send new requests for',load_combinations_enabled:'load types',load_combinations_selected_short_short:'combinations',load_mixed_shares_short_short:'mixed request shares',load_interference_enabled:'stream interference',load_stress_large_input:'stress cases',traffic_rates:'rates',traffic_duration_seconds:'seconds per rate',traffic_max_in_flight:'capacity requests at once',config_editor:'advanced configuration',sessions_max_tokens:'output cap per turn',sessions_count:'total conversations',sessions_delay:'pause between turns'};
@@ -1326,6 +1348,7 @@ function settingPath(name) {
   const check=state.bootstrap?.checks?.find(check=>name.startsWith(`test_${check.id}_`));
   if(check)return `test_options.${check.id}.${name.slice(check.id.length+6).replace(/^limit_/,'limits.')}`;
   if(name.startsWith('load_'))return loadSettingPath(name);
+  if(name.startsWith('multi_user_')){const field=name.slice(11);if(field.startsWith('scenario_'))return 'multi_user.scenarios';if(field.startsWith('noisy_neighbors_')){const key=field.slice(16);return 'multi_user.noisy_neighbors.'+(key.startsWith('profile_')?'heavy_profiles':key.startsWith('trigger_')?'triggers':key);}if(field.startsWith('cancellation_'))return 'multi_user.cancellation.'+field.slice(13);if(field.startsWith('conversation_')){const key=field.slice(13),base='multi_user.conversations.';if(key==='sampling_seed')return base+'sampling.seed';const turn=key.match(/^turn_(\d+)$/);if(turn)return base+'turns.'+turn[1];const sample=key.match(/^(sample|weights)_(.+)$/);if(sample)return base+'sampling.'+sample[2]+'.'+(sample[1]==='weights'?'weights':'values');const task=key.match(/^task_(\d+)_(name|weight|cap|turn_(\d+))$/);if(task)return base+'workloads.'+task[1]+'.'+(task[2]==='cap'?'max_tokens':task[3]!==undefined?'turns.'+task[3]:task[2]);return base+key;}if(field.startsWith('profile_'))return 'multi_user.profile.'+field.slice(8).replace(/^(short|medium|long)_/,'$1.');if(field.startsWith('criteria_'))return 'multi_user.pass_criteria.'+field.slice(9);if(field.startsWith('think_time_'))return 'multi_user.think_time_seconds.'+field.slice(11);if(field.startsWith('shape_'))return 'multi_user.shapes';return 'multi_user.'+field;}
   const profile=name.match(/^profile_(arrivals|prefix|sessions|consistency|tools)_(.+)$/);
   if(profile)return `${profile[1]==='tools'?'tool_checks':profile[1]}.${profile[2]}`;
   const aliases={sessions_count:'sessions.sessions',sessions_delay:'sessions.delay_seconds',sessions_max_tokens:'sessions.max_tokens',example_max_tokens:'request_pack.cases[].max_tokens',example_weight:'request_pack.cases[].weight'};
@@ -1380,11 +1403,12 @@ function schemaField(name,value,schema,{label,hint,help,helpKey=name,placeholder
 }
 const checkGroups=[
   {id:'answers',title:'Answers',blurb:'Is the output right?',checks:['access','serving','correctness','json','context','tools']},
-  {id:'speed',title:'Speed & load',blurb:'How fast, and under how much load?',checks:['first_output','generation','load']},
+  {id:'speed',title:'Speed & load',blurb:'How fast, and under how much load?',checks:['first_output','generation','load','multi_user']},
   {id:'reliability',title:'Reliability',blurb:'Does it hold up over time?',checks:['recovery','sessions','consistency','scale_down']},
   {id:'server',title:'Diagnostics',blurb:'Evidence from the server itself.',checks:['cancellation','prefix','gpu']},
 ];
 const checkGuide={
+  multi_user:{name:'Multi-user',purpose:'See which users become slow or fail while sharing one endpoint.',sends:'Repeated user work, matched noisy neighbors or selected-user cancellation; all share the request limits.',shows:'Per-user delivery and qualified interference or cancellation observations.'},
   scale_down:{name:'Scale-down continuity',purpose:'Observe active answers during an external replica removal.',sends:'A long streaming cohort and bounded follow-up traffic.',shows:'Client-visible continuity, backend drain semantics and remaining capacity separately.',needs:'Streaming, at least two replicas, and read-only lifecycle evidence'},
   load:{name:'Load test',purpose:'Workloads, request rates and bursts in one place.',sends:'Selected workloads under maintained concurrency, arrivals and bursts.',shows:'Delivery, per-response criteria and highest tested accepted load.'},
   access:{name:'Endpoint response',purpose:'Can this endpoint return an answer?',sends:'One short generated request, shared with timing checks.',shows:'Whether the endpoint, authentication and model produce a valid answer.'},
@@ -1394,7 +1418,7 @@ const checkGuide={
   context:{name:'Context recall',purpose:'Find out whether facts survive inside long questions.',sends:'Known facts placed at different positions and lengths in generated questions.',shows:'Recall at the exercised lengths. Use your server’s configured context limit.',needs:'Check the server context limit'},
   tools:{name:'Tool-call correctness',purpose:'Check tool calls and any required assistant text. Nothing is run.',sends:'Configured fixtures can require none, auto, required or a named tool. The built-in weather check uses automatic selection. Optional legacy forced-choice diagnostics run separately.',shows:'Separate protocol, choice compliance, argument schema, task and assistant text outcomes against configured expectations.',needs:'Tool-capable model and endpoint'},
   first_output:{name:'First answer',purpose:'Measure how long users wait before useful answer text arrives.',sends:'One initial request and repeated short requests, shared with response-health checks.',shows:'Initial and subsequent answer delays, separate from reasoning text.',needs:'Streaming enabled'},
-  generation:{name:'Generation',purpose:'Measure completion speed and interruptions in streamed answers.',sends:'Repeated requests to reproduce a generated passage.',shows:'Response time, stream pauses and generation rate when usage data supports it.',needs:'Streaming for pause measurements'},
+  generation:{name:'Generation',purpose:'Measure completion speed and interruptions in streamed answers.',sends:'Repeated requests to reproduce a generated passage.',shows:'Response time, stream pauses and client-observed generation pace when streamed token counts support it.',needs:'Streaming for pauses; compatible cumulative usage for generation pace'},
   capacity:{name:'Capacity under load',purpose:'See when increasing request rates causes slow, incorrect or dropped answers.',sends:'New requests at each configured rate, using generated examples or your own questions.',shows:'Correct answers, latency and drops at each tested rate. Set a time target to judge acceptable capacity for this workload.'},
   concurrency:{name:'Concurrent load',purpose:'Compare request shapes and interference at sustained concurrency levels.',sends:'Selected load types replenish individual request slots for each configured sending window.',shows:'A verdict per test point, delivered and evidenced concurrency, timing, throughput and actual token lengths.'},
   buckets:{name:'Request sizes',purpose:'Compare short and long questions and answers at different loads.',sends:'Nine question-length and answer-cap combinations at every concurrency level.',shows:'Response quality and timing for each size and load. Caps do not guarantee answer length.'},
@@ -1414,6 +1438,7 @@ function renderProfileEditor(check,config) {
   const key=check.id;
   if(key==='scale_down')return renderScaleDownEditor(config);
   if(key==='load')return renderLoadEditor(config);
+  if(key==='multi_user')return renderMultiUserEditor(config);
   if(key==='sessions')return `<input type="hidden" name="profile_edits_sessions" value="[]">${renderSessionEditor(config)}<button type="button" class="text-button reset-profile" data-action="reset-profile" data-profile="sessions">Reset this profile</button>`;
   if(key==='tools'){
     const profile=config.tool_checks || {fixtures:[],modes:null},selected=profile.modes?.join(',') || '';
@@ -1452,6 +1477,7 @@ function checkCoverageWarning(check,config) {
 }
 function checkOverrideWarning() {return '';}
 function effectiveCheckSummary(check,config) {
+  if(check.id==='multi_user'){const s=multiUserSettings(config,state.bootstrap.multi_user.defaults);return `${s.levels.join(' → ')} users · ${config.concurrency==null?'No shared request ceiling':`${config.concurrency} shared request slots`} · ${s.duration_seconds}s per window · ${(s.scenarios||['repeated_requests']).map(human).join(', ')}`; }
   if(check.id==='scale_down'){const s=scaleDownSettings(config);return `${s.target} · ${s.long_cohort_size} long stream${s.long_cohort_size===1?'':'s'} · ${s.requests_per_second} follow-up requests/s · ${s.grace_seconds}s grace from ${human(s.grace_anchor)}`;}
   const parts=[];
   const timeout=check.id==='load'?loadSettings(config).request_timeout_seconds:check.id==='gpu'?null:optionValue(config,check,'request_timeout_seconds') ?? config.request_timeout_seconds;
@@ -1545,7 +1571,8 @@ function testSettingsLabel(check,config) {
   if(check.id==='scale_down')return config.scale_down?(config.checks.includes('scale_down')?'Configured':'Saved draft'):'';
   const custom=Object.keys(config.test_options?.[check.id] || {}).length>0||
     (check.id==='capacity'&&!sameConfig(config.traffic,state.bootstrap.config.traffic))||
-    (check.id==='load'&&!sameConfig(loadSettings(config),loadSettings({...config,load_test:null})));
+    (check.id==='load'&&!sameConfig(loadSettings(config),loadSettings({...config,load_test:null})))||
+    (check.id==='multi_user'&&config.multi_user!=null&&!sameConfig(multiUserSettings(config,state.bootstrap.multi_user.defaults),state.bootstrap.multi_user.defaults));
   return custom?(config.checks.includes(check.id)?'Overrides':'Saved overrides'):'';
 }
 function checkSettingValue(name,value) {
@@ -1665,7 +1692,7 @@ function renderTestCard(check,config) {
   <p class="hint draft-notice" ${selected?'hidden':''}>Saved draft · select this check to run it.</p>
   ${guide.needs?`<p class="check-prerequisite"><strong>Needs:</strong> ${escape(guide.needs)}.</p>`:''}${check.id==='load'?'':questionSource}${check.id==='gpu'?'<p class="hint">Metrics are collected automatically. Add exporter addresses in Connection settings.</p>':''}
   <div class="test-settings${requestFields.length===1&&criteriaFields.length===1?' simple-primary-settings':''}" data-test-settings="${check.id}">
-  ${check.option_fields.length||check.limit_fields.length||check.id==='load'?`<button type="button" class="text-button reset-test" data-reset-test="${check.id}" aria-label="${check.id==='load'?'Reset workload settings':'Reset overrides'} for ${escape(guide.name)}" ${custom||check.id==='load'?'':'hidden'}>${check.id==='load'?'Reset workload settings':'Reset overrides'}</button>`:''}${inactiveControls}
+  ${check.option_fields.length||check.limit_fields.length||['load','multi_user'].includes(check.id)?`<button type="button" class="text-button reset-test" data-reset-test="${check.id}" aria-label="${check.id==='load'?'Reset workload settings':'Reset overrides'} for ${escape(guide.name)}" ${custom||['load','multi_user'].includes(check.id)?'':'hidden'}>${check.id==='load'?'Reset workload settings':'Reset overrides'}</button>`:''}${inactiveControls}
   ${requests?`${requestFields.length>1?'<h4>Requests</h4>':''}<fieldset class="fields check-request-fields">${requests}</fieldset>`:''}
   ${inherited?`<details class="check-advanced check-run-overrides"><summary>Override run defaults</summary><fieldset class="fields">${inherited}</fieldset></details>`:''}
   ${diagnostics?`<details class="check-advanced"><summary>Server verification & cleanup</summary><fieldset class="fields">${diagnostics}</fieldset></details>`:''}
@@ -1910,6 +1937,98 @@ function renderConcurrentResults(metrics) {
   }).join('');
 }
 
+function renderMultiUserEditor(config) {
+  const s=multiUserSettings(config,state.bootstrap.multi_user.defaults);
+  const numeric=(name,label,value,extra={})=>field('multi_user_'+name,label,value,{type:'number',step:'any',required:true,...extra});
+  const criteria=[['max_first_answer_ms','First answer limit per request (ms)'],['max_completion_ms','Completion limit per request (ms)'],['max_error_percent','Errors allowed per user (%)'],['min_output_tokens_per_second','Minimum shared-window output per user (tokens/s)']];
+  return `<div data-multi-user-settings><input type="hidden" name="multi_user_rendered" value="1"><h4>Persistent users</h4><p class="hint">Each user sends requests or conversations sequentially, then pauses. User count is separate from the shared request limit. All users use the configured endpoint credentials.</p><div class="fields">${field('multi_user_levels','User population levels',s.levels.join(', '),{required:true,hint:'Distinct whole numbers from 1 to 32, separated by commas. Each level runs separately.'})}${numeric('duration_seconds','Measurement duration per window (seconds)',s.duration_seconds)}${numeric('warmup_seconds','Warmup per window (seconds)',s.warmup_seconds)}${numeric('seed','Assignment seed',s.seed,{step:1})}</div><p class="hint">${escape(config.concurrency==null?'Shared request ceiling is not set.':`${config.concurrency} shared request slots across the run.`)} Users waiting or pausing hold no request slot. <button type="button" class="text-button" data-action="edit-setting" data-setting-path="concurrency">Edit shared request limit</button></p>${renderMultiUserScenarioEditor(s)}${renderMultiUserConversationEditor(s)}<h4>Independent request profiles</h4><p class="hint">Used when independent requests are selected. Each user keeps one seeded profile across levels. Output sizes are caps; actual token counts and early completion are reported.</p><fieldset class="fields"><legend>Assign users to these input → output sizes</legend>${loadShapes.map(shape=>`<label class="test-selection"><input type="checkbox" name="multi_user_shape_${shape}" ${s.shapes.includes(shape)?'checked':''}><span>${escape(loadShapeLabel(shape))}</span></label>`).join('')}</fieldset><div class="fields">${loadSizes.map(size=>numeric(`profile_${size}_input_tokens`,`${human(size)} input tokens`,s.profile[size].input_tokens,{step:1})+numeric(`profile_${size}_output_tokens`,`${human(size)} output cap`,s.profile[size].output_tokens,{step:1})).join('')}</div><h4>Pause between requests or conversations</h4><div class="fields">${field('multi_user_think_time_values','Pause values (seconds)',s.think_time_seconds.values.join(', '),{required:true,hint:'Use one value for a fixed pause, or several values from 0 to 60 for seeded sampling.'})}${field('multi_user_think_time_weights','Pause weights (optional)',s.think_time_seconds.weights?.join(', ')||'',{hint:'One positive weight per value; blank gives each value equal weight.'})}</div><h4>Per-user pass criteria</h4><p class="hint">Blank limits measure only. Every user must meet each selected criterion. Response limits include local slot waiting; errors and drain-time failures stay visible.</p><div class="fields">${criteria.map(([name,label])=>numeric('criteria_'+name,label,s.pass_criteria[name],{required:false,placeholder:'Measure only'})).join('')}${numeric('criteria_min_samples','Minimum valid responses per user',s.pass_criteria.min_samples,{step:1})}</div><p class="hint">Throughput counts completed valid output inside the common measurement window. Warmup, late output and interrupted coverage are reported separately. Fairness measures observed delivery, not the cause of a server scheduling difference.</p><h4>Observed delivery fairness</h4><div class="fields">${numeric('criteria_max_throughput_ratio','Maximum median / worst throughput ratio',s.pass_criteria.max_throughput_ratio,{required:false,placeholder:'Measure only'})}${numeric('fairness_tolerance_percent','Comparable token length and exposure tolerance (%)',s.fairness_tolerance_percent)}</div><p class="hint">Fairness requires comparable work, pauses and active exposure, enough samples and qualified streaming overlap for every user. Missing usage, early EOS, unequal plans and unserved users cannot pass.</p></div>`;
+}
+
+function renderMultiUserScenarioEditor(settings) {
+  const neighbors=settings.noisy_neighbors,cancellation=settings.cancellation;
+  const input=(name,label,value,options={})=>field('multi_user_'+name,label,value,options);
+  const options=(prefix,items,selected)=>items.map(([value,label])=>`<label class="test-selection"><input type="checkbox" name="multi_user_${prefix}_${value}" ${selected.includes(value)?'checked':''}><span>${escape(label)}</span></label>`).join('');
+  return `<h4>Scenarios</h4><input type="hidden" name="multi_user_scenarios_rendered" value="1"><fieldset class="fields"><legend>Choose user scenarios</legend>${options('scenario',[['repeated_requests','Repeated user work'],['noisy_neighbors','Noisy neighbors'],['cancellation','Cancel one user while peers continue']],settings.scenarios)}</fieldset><p class="hint">Noisy neighbors and cancellation use independent requests and require at least two users at every level. Each selected comparison runs its own common window.</p><details class="setup-disclosure"><summary>Noisy-neighbor settings</summary><p class="hint">Short users replay their own logical work in short-only control and heavy-user windows. Actual work and overlap must qualify before a comparison can pass.</p><div class="fields">${input('noisy_neighbors_heavy_user_ids','Heavy user IDs (optional)',neighbors.heavy_user_ids?.join(', ')||'',{hint:'Comma-separated IDs such as user-01, user-02. Blank selects the count below.'})}${input('noisy_neighbors_heavy_user_count','Heavy user count',neighbors.heavy_user_count,{type:'number',step:1})}${input('noisy_neighbors_max_slowdown','Maximum short-user slowdown (optional)',neighbors.max_slowdown,{type:'number',step:'any',placeholder:'Measure only'})}</div><input type="hidden" name="multi_user_noisy_neighbors_profiles_rendered" value="1"><fieldset class="fields"><legend>Heavy profiles (each runs separately)</legend>${options('noisy_neighbors_profile',[['long_short','Long input → short output'],['short_long','Short input → long output'],['long_long','Long input → long output']],neighbors.heavy_profiles)}</fieldset><input type="hidden" name="multi_user_noisy_neighbors_triggers_rendered" value="1"><fieldset class="fields"><legend>Heavy-request timing (each runs separately)</legend>${options('noisy_neighbors_trigger',[['before_output','Before short-user output'],['during_stream','During short-user streaming']],neighbors.triggers)}</fieldset></details><details class="setup-disclosure"><summary>Selected cancellation settings</summary><div class="fields">${input('cancellation_user_id','User to cancel',cancellation.user_id,{required:true})}${input('cancellation_cancel_after_chunks','Cancel after output chunks',cancellation.cancel_after_chunks,{type:'number',step:1})}</div><p class="hint">Cancel one long response, keep peers running, then send another request for that same user. Cancellation, continued peer output and follow-up are qualified separately. Follow-up does not establish backend compute or memory release.</p></details>`;
+}
+
+function renderMultiUserScenarioResults(window) {
+  const links=ids=>(ids||[]).map(id=>`<button type="button" class="text-button" data-request="${escape(id)}">${escape(id)}</button>`).join(' ');
+  let markup='';
+  if(window.interference){
+    const evidence=window.interference;
+    markup+=`<h5>Matched noisy-neighbor comparison ${badge(evidence.status)}</h5><p>${escape(evidence.trigger)} · ${escape(loadShapeLabel(evidence.heavy_profile))} · heavy users: ${escape(evidence.heavy_user_ids?.join(', ')||'None')}. ${escape(evidence.reasons?.join(' ')||'')}</p><div class="metric-table" tabindex="0" role="region" aria-label="Matched short-user interference"><table><thead><tr><th>Short user / qualification</th><th>Matched samples / slowdown</th><th>First answer / completion / stream gap change</th><th>Actual input / output medians (control → probe)</th><th>Output change / request evidence</th></tr></thead><tbody>${(evidence.users||[]).map(user=>`<tr><th scope="row">${escape(user.user_id)} ${badge(user.status)}<small>${escape(user.reasons?.join(' ')||'Qualified comparison')}</small></th><td>${number(user.matched_samples)} / ${user.slowdown==null?'Unknown':number(user.slowdown,2)+'×'}</td><td>${ms(user.first_answer_change_ms)} / ${ms(user.completion_change_ms)} / ${ms(user.stream_gap_change_ms)}</td><td>${number(user.control_input_median_tokens)} → ${number(user.probe_input_median_tokens)} / ${number(user.control_output_median_tokens)} → ${number(user.probe_output_median_tokens)}<br>Heavy input / output medians: ${number(user.heavy_input_median_tokens)} / ${number(user.heavy_output_median_tokens)} tokens</td><td>${number(user.output_tokens_change)} tokens<details><summary>Matched requests</summary><p>Control: ${links(user.control_request_ids)}</p><p>Probe: ${links(user.probe_request_ids)}</p><p>Heavy: ${links(user.heavy_request_ids)}</p></details></td></tr>`).join('')}</tbody></table></div>`;
+  }
+  if(window.cancellation){
+    const evidence=window.cancellation;
+    markup+=`<h5>Selected request cancellation · ${escape(evidence.selected_user_id)} ${badge(evidence.status)}</h5>${[['cancellation','Selected request cancellation'],['peer_continuation','Peer continuation'],['followup','Same-user follow-up']].map(([key,label])=>{const item=evidence[key]||{};return `<p><strong>${label}</strong> ${badge(item.status||'inconclusive')} · ${escape(item.reasons?.join(' ')||'')} ${links(item.request_ids)}</p>`;}).join('')}<p class="hint">Backend compute and memory release: unverified. Follow-up success only establishes client-observed service.</p>`;
+  }
+  return markup;
+}
+
+function renderUserRecallTurns(prefix,turns) {
+  const bounds=state.bootstrap.limits['multi_user.conversations.turns'];
+  // HTML drops the first textarea newline, so include one before the prompt.
+  return `<h5>Recall prompts</h5>
+  <input type="hidden" name="${prefix}original_turns" value="${escape(JSON.stringify(turns))}">
+  <input type="hidden" name="${prefix}turn_count" value="${turns.length}">
+  ${turns.map((turn,index)=>textField(prefix+'turn_'+index,`Turn ${index+1}`,'\n'+turn,{rows:3,maxLength:bounds.items.maxLength})).join('')}
+  <div class="actions"><button type="button" class="text-button" data-action="user-add-recall-turn" ${turns.length>=bounds.maxItems?'disabled':''}>Add turn</button>
+  <button type="button" class="text-button" data-action="user-remove-recall-turn" ${turns.length<=bounds.minItems?'disabled':''}>Remove last turn</button></div>`;
+}
+
+function renderMultiUserConversationEditor(settings) {
+  const defaults=state.bootstrap.session_workloads,conversation={...defaults.defaults,...settings.conversations};
+  const profile=settings.conversations?.profile||'requests',saved=conversation.workloads||[];
+  const tasks=[...saved,...defaults.presets.filter(item=>!saved.some(row=>row.name===item.name))];
+  const prefix='multi_user_conversation_';
+  const input=(name,label,value,options={})=>field(prefix+name,label,value,options);
+  return `<h4>User work</h4>${selectField(prefix+'profile','What each user repeats',[['requests','Independent requests'],['correctness','Name-recall conversations'],['performance','Live task conversations']].map(([value,label])=>`<option value="${value}" ${profile===value?'selected':''}>${label}</option>`).join(''))}<div data-user-conversations ${profile==='requests'?'hidden':''}><p class="hint">A completed or failed conversation ends its own history. The same user starts a fresh conversation after the pause below. Global run limits still apply.</p><div data-user-recall ${profile==='performance'?'hidden':''}>${selectField(prefix+'modes','Conversation history',[['fixed','Prewritten replies'],['live','Replies from this run'],['fixed,live','Alternate (fixed first)'],['live,fixed','Alternate (live first)']].map(([value,label])=>`<option value="${value}" ${conversation.modes.join(',')===value?'selected':''}>${label}</option>`).join(''))}${renderUserRecallTurns(prefix,conversation.turns)}</div><div class="fields">${input('max_tokens','Output cap per turn',conversation.max_tokens,{type:'number',step:1})}${input('delay_seconds','Pause between turns (seconds)',conversation.delay_seconds,{type:'number',step:'any'})}</div><div data-user-tasks ${profile==='performance'?'':'hidden'}><h5>Conversation tasks</h5><p class="hint">Weights assign each persistent user a task. Responses are unscored; this measures performance.</p><input type="hidden" name="${prefix}task_count" value="${tasks.length}">${tasks.map((task,index)=>`<details class="setup-disclosure"><summary>${escape(task.name)}</summary><label><input type="checkbox" name="${prefix}task_${index}_enabled" ${saved.some(row=>row.name===task.name)||(profile!=='performance'&&!saved.length)?'checked':''}> Include task</label><div class="fields">${input(`task_${index}_name`,'Task name',task.name)}${input(`task_${index}_weight`,'Task assignment weight',task.weight,{type:'number',step:'any'})}${input(`task_${index}_cap`,'Task output cap (optional)',task.max_tokens,{type:'number',step:1})}</div><input type="hidden" name="${prefix}task_${index}_original_turns" value="${escape(JSON.stringify(task.turns))}"><input type="hidden" name="${prefix}task_${index}_turn_count" value="${task.turns.length}">${task.turns.map((turn,j)=>textField(prefix+`task_${index}_turn_${j}`,`Turn ${j+1}`,turn)).join('')}<div class="actions"><button type="button" class="text-button" data-action="user-add-turn" data-task-index="${index}">Add turn</button><button type="button" class="text-button" data-action="user-remove-turn" data-task-index="${index}">Remove last turn</button><button type="button" class="text-button" data-action="user-remove-task" data-task-index="${index}">Remove task</button></div></details>`).join('')}<button type="button" class="text-button" data-action="user-add-task">Add custom task</button></div><details class="setup-disclosure"><summary>Sample pauses, lengths and turn counts</summary><p class="hint">Comma-separated values and optional matching weights. Length and turn-count sampling applies to live tasks. Inputs are prepared before traffic. Unequal sampled work cannot pass fairness.</p>${input('sampling_seed','Conversation sampling seed',conversation.sampling?.seed??settings.seed,{type:'number',step:1})}${[['think_time_seconds','Pause values (seconds)'],['input_tokens','New user message lengths (tokens)'],['output_tokens','Output cap values (tokens)'],['turn_count','Turns per conversation']].map(([key,label])=>`<div class="fields">${input('sample_'+key,label,conversation.sampling?.[key]?.values?.join(', ')||'')}${input('weights_'+key,'Weights (optional)',conversation.sampling?.[key]?.weights?.join(', ')||'')}</div>`).join('')}</details></div>`;
+}
+
+function editUserRecall(action) {
+  captureFormDraft();
+  const conversation=state.config.multi_user?.conversations;
+  if(conversation?.profile!=='correctness')return;
+  const turns=conversation.turns,bounds=state.bootstrap.limits['multi_user.conversations.turns'];
+  if(action==='user-add-recall-turn'&&turns.length<bounds.maxItems){
+    turns.push(state.bootstrap.session_workloads.defaults.turns.at(-1));
+  }
+  else if(action==='user-remove-recall-turn'&&turns.length>bounds.minItems)turns.pop();
+  else return;
+  configChanged();state.jsonDraft=null;state.jsonBase=null;renderNew();
+  $(`#field-multi_user_conversation_turn_${turns.length-1}`)?.focus({preventScroll:true});
+}
+
+function editUserConversation(action,index) {
+  const form=$('#new-run-form');
+  captureFormDraft();
+  const tasks=state.config.multi_user?.conversations?.workloads;
+  if(!tasks)return;
+  if(action==='user-add-task'){
+    let suffix=1;while(tasks.some(item=>item.name===`custom-${suffix}`))suffix++;
+    tasks.push({name:`custom-${suffix}`,weight:1,max_tokens:null,turns:['Explain a topic in detail.','Build on your previous answer.']});
+  }else{
+    // The draft contains only checked rows, in form order.
+    const checked=row=>form.elements[`multi_user_conversation_task_${row}_enabled`]?.checked;
+    let position=0;
+    for(let row=0;row<index;row++)if(checked(row))position++;
+    const task=checked(index)?tasks[position]:null;
+    if(!task){toast('Select this task before editing it.');return;}
+    if(action==='user-add-turn'&&task.turns.length<state.bootstrap.limits['sessions.workloads[].turns'].maxItems)task.turns.push('Build on your previous answer.');
+    if(action==='user-remove-turn'&&task.turns.length>2)task.turns.pop();
+    if(action==='user-remove-task')tasks.splice(position,1);
+  }
+  configChanged();state.jsonDraft=null;state.jsonBase=null;renderNew();
+}
+
+function renderMultiUserResults(summary) {
+  const rate=value=>value==null?'Unknown':`${number(value,2)} tok/s`,worst=summary.worst_user;
+  return `<section class="check-observations multi-user-results"><h3>Persistent users</h3>${worst?`<p><strong>Worst served user: ${escape(worst.user_id)}</strong> · ${number(worst.population)} users · ${badge(worst.status)} · ${rate(worst.output_tokens_per_second)}</p>${worst.reasons?.length?`<p class="hint">${escape(worst.reasons.join(' '))}</p>`:''}`:''}<p class="hint">${escape(summary.interpretation)}</p>${(summary.windows||[]).map(window=>{
+    if(window.phase!=='measurement')return `<details><summary>${number(window.population)} users · warmup</summary><p>${elapsed(window.duration_seconds)} observed; excluded from measurement. ${escape(window.reason||window.drain_reason||'')}</p></details>`;
+    return `<section class="check-observations"><h4>${number(window.population)} users · ${escape([window.scenario,window.role,window.trigger,window.heavy_profile].filter(Boolean).join(" · "))} ${badge(window.status)}</h4>${renderMultiUserScenarioResults(window)}<p>Common measurement window: ${elapsed(window.duration_seconds)} actual / ${elapsed(window.planned_duration_seconds)} planned. Drain: ${elapsed(window.drain_seconds)}. ${escape(window.reason||window.drain_reason||'')}</p>${window.fairness?`<p><strong>Observed delivery fairness</strong> ${badge(window.fairness.status)} · median / worst ratio: ${number(window.fairness.ratio)} · limit: ${number(window.fairness.threshold)}. Eligible users: ${escape(window.fairness.eligible_user_ids?.join(', ')||'None')} / ${number(window.fairness.compared_user_ids?.length)} compared.</p><p class="hint">${escape(window.fairness.reasons?.join(' ')||'Comparable work and exposure with qualified overlap.')}</p>`:''}<div class="metric-table" tabindex="0" role="region" aria-label="Individual outcomes at ${number(window.population)} users"><table><caption class="sr-only">Individual outcomes at ${number(window.population)} users</caption><thead><tr><th>User / profile</th><th>Completed / sent</th><th>Errors</th><th>Shared-window output</th><th>First answer p95</th><th>Completion p95</th><th>Coverage / outcome</th><th>Request evidence</th></tr></thead><tbody>${(window.users||[]).map(user=>`<tr><th scope="row">${escape(user.user_id)}<small>${escape(user.profile?.startsWith('conversation:')?'Conversation · '+human(user.profile.slice(13)):loadShapeLabel(user.profile))}</small></th><td>${number(user.outcomes?.completed)} / ${number(user.outcomes?.attempted)}</td><td>${number(user.outcomes?.errors)}</td><td>${rate(user.output_tokens_per_second)}<small>${number(user.known_output_tokens)} known tokens · ${number(user.missing_usage_count)} missing usage</small></td><td>${ms(user.latency?.ready_first_answer_ms?.p95)}</td><td>${ms(user.latency?.ready_completion_ms?.p95)}</td><td>${badge(user.status)}<small>${escape(user.coverage?.status)} · ${number(user.coverage?.valid_samples)} / ${number(user.coverage?.required_samples)} valid samples</small>${user.reasons?.length?`<small>${escape(user.reasons.join(' '))}</small>`:''}${user.pending_wait?`<small>Pending admission wait: ${ms(user.pending_wait.wait_ms)} · ${escape(user.pending_wait.status.replaceAll('_',' '))}</small>`:''}</td><td>${user.request_ids?.length?`<details><summary>${counted(user.request_ids.length,'request')}</summary><div class="actions">${user.request_ids.map((id,index)=>`<button type="button" class="text-button" data-request="${escape(id)}">Request ${index+1}</button>`).join(' ')}</div></details>`:'No request dispatched'}${user.conversations?.length?`<details><summary>${counted(user.conversations.length,'conversation')}</summary>${user.conversations.map(item=>`<p>${escape(item.id)} · ${escape(item.mode)} · ${number(item.turns.length)} / ${number(item.planned_turns)} turns. ${escape(item.stop_reason||'Completed')}</p><div class="actions">${item.turns.map((id,index)=>`<button type="button" class="text-button" data-request="${escape(id)}">Turn ${index+1}</button>`).join(' ')}</div>`).join('')}</details>`:''}<details><summary>Timing and coverage</summary><p>Dispatch-to-completion p95: ${ms(user.latency?.dispatch_completion_ms?.p95)}. Local admission wait p95: ${ms(user.latency?.client_wait_ms?.p95)}.</p><p>Late output: ${number(user.late_output_tokens)} known tokens (${number(user.late_missing_usage_count)} missing usage). Partial output: ${number(user.partial_output_tokens)} known tokens (${number(user.partial_missing_usage_count)} missing usage).</p><pre>${escape(JSON.stringify({criteria:user.criteria,coverage:user.coverage,lengths:user.lengths,finish_reasons:user.finish_reasons},null,2))}</pre></details></td></tr>`).join('')}</tbody></table></div></section>`;
+  }).join('')}</section>`;
+}
+
 function renderSessionResults(performance) {
   const rate=value=>value==null?'Unmeasured':`${number(value,1)} tok/s`;
   const columns=row=>`<td>${row.completed ?? 0} / ${row.attempted ?? 0}</td><td>${rate(row.generation_tokens_per_second_mean)}</td><td>${rate(row.generation_tokens_per_second_p50)}</td><td>${rate(row.generation_tokens_per_second_p10)}</td><td>${ms(row.first_output_p95_ms)}</td><td>${ms(row.p95_ms)}</td><td>${ms(row.max_stream_gap_ms)}</td><td>${row.unmeasured_generation_requests ?? 0}</td><td>${row.capped_responses ?? 0}</td>`;
@@ -2008,6 +2127,12 @@ function syncTestControls() {
       const warning=$(selector,card);if(warning)warning.hidden=!(selected||open)||!warning.textContent;
     }
     for(const fieldset of $$('fieldset',editor))fieldset.disabled=!open;
+  }
+  const userProfile=form.elements.multi_user_conversation_profile;
+  if(userProfile){
+    $('[data-user-conversations]',form).hidden=userProfile.value==='requests';
+    $('[data-user-recall]',form).hidden=userProfile.value==='performance';
+    $('[data-user-tasks]',form).hidden=userProfile.value!=='performance';
   }
   const sessionProfile=form.elements.sessions_profile;
   if(sessionProfile){
@@ -2798,7 +2923,7 @@ function renderNew(preset=inferSetupPreset(state.config,{limits:state.bootstrap?
   <section class="setup-step-content" id="setup-panel-3" data-setup-panel="3" aria-label="Review and run" hidden>
   <section class="setup-section" id="setup-review"><h2 class="sr-only">Run configuration</h2><div class="setup-body">
   <div class="review-main"><div id="run-bounds"></div>
-  <details class="setup-disclosure" id="execution-settings"><summary>Saved evidence, baseline & restart options</summary><div class="details-content"><div class="fields">${selectField('retention','Keep response text',['failures','all','none'].map(mode=>`<option value="${mode}" ${mode===(c.retention||'failures')?'selected':''}>${{failures:'Failures only',all:'All',none:'None'}[mode]}</option>`).join(''),{hint:'',help:'Questions and expected answers are always saved with the run. This setting controls whether response text and evaluator reasons are kept. Timings, status and scores are always saved. It does not cap disk use; storage limits do.'})}${field('name','Endpoint name',target.name,{required:true,placeholder:'local'})}${selectField('mode','Server startup','<option value="normal">Use the running server</option><option value="cold-start">Restart one server before testing</option>')}<div id="restart-controls" hidden>${selectField('restart_target','Server to restart',(c.targets || []).map(t=>`<option value="${escape(t.name)}">${escape(t.name)}</option>`).join(''))}<p class="hint" id="restart-hook"></p><p class="hint">Runs only the restart command already configured for this server.</p></div><div>${selectField('baseline_id','Compare with baseline',baselineOptions(state.prefillBaseline || ''))}${schemaField('limit_regression_percent',limits.regression_percent,state.bootstrap.limits_schema.properties.regression_percent,{label:'Regression threshold (%)',hint:''})}</div></div></div></details>
+  <details class="setup-disclosure" id="execution-settings"><summary>Saved evidence, baseline & restart options</summary><div class="details-content"><div class="fields">${selectField('retention','Keep response text',['failures','all','none'].map(mode=>`<option value="${mode}" ${mode===(c.retention||'failures')?'selected':''}>${{failures:'Failures only',all:'All',none:'None'}[mode]}</option>`).join(''),{hint:'',help:'Questions and expected answers are always saved with the run. This setting controls whether response text and evaluator reasons are kept. Timings, status and scores are always saved. It does not cap disk use; storage limits do.'})}${field('name','Endpoint name',target.name,{required:true,placeholder:'local'})}${selectField('mode','Server startup','<option value="normal">Use the running server</option><option value="cold-start">Restart one server before testing</option>')}<div id="restart-controls" hidden>${selectField('restart_target','Server to restart',(c.targets || []).map(t=>`<option value="${escape(t.name)}">${escape(t.name)}</option>`).join(''))}<p class="hint" id="restart-hook"></p><p class="hint">Runs only the restart command already configured for this server.</p></div><div>${selectField('baseline_id','Compare with baseline',baselineOptions(state.prefillBaseline || ''))}${schemaField('limit_regression_percent',limits.regression_percent,state.bootstrap.limits_schema.properties.regression_percent,{label:'Timing regression threshold (%)',hint:''})}${schemaField('limit_regression_rate_points',limits.regression_rate_points,state.bootstrap.limits_schema.properties.regression_rate_points,{label:'Rate regression threshold (percentage points)',hint:''})}</div></div></div></details>
   </div><section id="request-plan" class="request-plan review-section"></section><div id="setup-history" hidden></div>
   </div></section></section></div>
 <section class="panel form-section" id="config-panel-json" role="tabpanel" aria-labelledby="config-tab-json" hidden><h2>Run configuration</h2><p class="hint">Apply changes before returning to the form.</p>${renderField('config_editor','Configuration · JSON',`<textarea class="config-editor" id="config-editor" spellcheck="false">${escape(state.jsonDraft ?? JSON.stringify(c,null,2))}</textarea>`,{controlId:'config-editor',hint:'',help:[fieldDescription('config_editor').help,inputRetentionNotice].join(' ')})}<div class="editor-actions"><button class="button small" type="button" data-action="apply-config">Apply changes</button><span class="hint" id="json-status" role="status"></span></div></section><aside id="run-blueprint" class="run-blueprint" tabindex="0" aria-label="Run plan" hidden></aside>
@@ -2832,7 +2957,7 @@ function readForm(allowEmpty=false) {
   for(const name of ['max_requests','max_duration_seconds','concurrency'])if(form.elements[`${name}_enabled`])data.set(`${name}_enabled`,form.elements[`${name}_enabled`].checked?'on':'off');
   config=configureRunLimits(config,data,{allowInvalid:allowEmpty});
   config.limits ||= {};
-  for(const key of [...limitFields.map(x=>x[0]),'max_error_rate','min_correctness','min_samples','regression_percent']){if(!data.has(`limit_${key}`))continue;const v=data.get(`limit_${key}`);config.limits[key]=v===''?null:Number(v)/(['max_error_rate','min_correctness'].includes(key)?100:1);}
+  for(const key of [...limitFields.map(x=>x[0]),'max_error_rate','min_correctness','min_samples','regression_percent','regression_rate_points']){if(!data.has(`limit_${key}`))continue;const v=data.get(`limit_${key}`);config.limits[key]=v===''?null:Number(v)/(['max_error_rate','min_correctness'].includes(key)?100:1);}
   if(form.elements.samples)config.samples=Number(form.elements.samples.value);
   if(form.elements.retention)config.retention=form.elements.retention.value;
   if(form.elements.stream)config.stream=form.elements.stream.value==='true';
@@ -2844,6 +2969,7 @@ function readForm(allowEmpty=false) {
   config=configureJudging(config,data,{allowInvalid:allowEmpty});
   config=configureProfiles(config,data,state.bootstrap.profile_defaults || {},{allowInvalid:allowEmpty,limits:state.bootstrap.limits});
   config=configureSessions(config,data,state.bootstrap.session_workloads.defaults,{allowInvalid:allowEmpty});
+  config=configureMultiUser(config,data,state.bootstrap.multi_user?.defaults,{allowInvalid:allowEmpty});
   config.restart_target=null;
   return {config,baseline_id:data.get('baseline_id') || null,mode:data.get('mode') || 'normal',restart_target:data.get('mode')==='cold-start'?data.get('restart_target'):null};
 }
@@ -3080,6 +3206,14 @@ function selectedPerformance() {
   const data=reportView.performance,target=data?.targets?.find(item=>item.target===(reportView.target||data.selected_target||data.default_target))||data?.targets?.[0];
   const windowId=reportView.window||target?.selected_window||target?.default_window;
   return {data,target,window:target?.windows?.find(item=>item.id===windowId),summary:target?.summaries?.[windowId]};
+}
+function syncPerformanceSelection() {
+  const {target,window}=selectedPerformance();
+  // Patching option attributes does not reset a select's live selection.
+  const targetValue=reportView.pending&&reportView.target?reportView.target:target?.target;
+  for(const [id,value] of [['performance-target',targetValue],['performance-window',window?.id]]){
+    const select=$('#'+id);if(select&&value!=null)select.value=value;
+  }
 }
 function measurementLabel(window) {
   const bounds=window.start_ms==null?'bounds unavailable':`${number(window.start_ms/1000,2)}–${number(window.end_ms/1000,2)} s`;
@@ -3447,7 +3581,7 @@ function renderDetail() {
   if(!report){
     const hadTestDialog=$('#test-dialog')?.open;if(hadTestDialog)closeConditionDialog({reveal:false});
     const summary=d.summary,records=d.live_requests||[],partial=summaryReport(d);
-    patchHTML($('#main'),`<div class="page-heading"><div><div class="eyebrow">Run ${escape(d.id)}</div><h1>${userStopped(partial)?'Stopped by you':'Run could not finish'}</h1>${userStopped(partial)?renderGuidance(partial,d):`<p>${summary?'Only a summary was saved; request evidence may be unavailable.':'No report was saved. Review the error and settings before trying again.'}</p>`}</div></div>${notice(d.error || 'The runner did not produce a report.','error')}${renderReportToolbar()}${renderPerformance()}<section id="report-results" role="tabpanel" aria-labelledby="tab-results" data-live-key="report-results" ${reportView.tab==='results'?'':'hidden'}>${summary?`<section class="panel saved-summary"><h2>Saved summary</h2><p>Recorded overall: ${escape(statusLabels[summary.overall] || summary.overall)} · ${number(summary.request_count)} requests</p><section id="result-content">${renderChecks(partial)}</section></section>`:'<section class="panel check-verdict-summary"><h2>Checks & evidence</h2><p>No final check verdicts were saved.</p></section>'}${renderTests(records,{conditions:d.live_conditions||[],live:false})}${renderLiveLoadResults(d)}${renderAllRequests(records)}${renderDiagnostics(null,d)}</section><div class="actions">${keepButton()}${summary?resultActions(partial):''}<button class="button" data-action="rerun">Run again</button><a class="button" href="#runs">Back to runs</a></div>`);if(hadTestDialog)$(`#tab-${reportView.tab}`)?.focus({preventScroll:true});return;
+    patchHTML($('#main'),`<div class="page-heading"><div><div class="eyebrow">Run ${escape(d.id)}</div><h1>${userStopped(partial)?'Stopped by you':'Run could not finish'}</h1>${userStopped(partial)?renderGuidance(partial,d):`<p>${summary?'Only a summary was saved; request evidence may be unavailable.':'No report was saved. Review the error and settings before trying again.'}</p>`}</div></div>${notice(d.error || 'The runner did not produce a report.','error')}${renderReportToolbar()}${renderPerformance()}<section id="report-results" role="tabpanel" aria-labelledby="tab-results" data-live-key="report-results" ${reportView.tab==='results'?'':'hidden'}>${summary?`<section class="panel saved-summary"><h2>Saved summary</h2><p>Recorded overall: ${escape(statusLabels[summary.overall] || summary.overall)} · ${number(summary.request_count)} requests</p><section id="result-content">${renderChecks(partial)}</section></section>`:'<section class="panel check-verdict-summary"><h2>Checks & evidence</h2><p>No final check verdicts were saved.</p></section>'}${renderTests(records,{conditions:d.live_conditions||[],live:false})}${renderLiveLoadResults(d)}${renderAllRequests(records)}${renderDiagnostics(null,d)}</section><div class="actions">${keepButton()}${summary?resultActions(partial):''}<button class="button" data-action="rerun">Run again</button><a class="button" href="#runs">Back to runs</a></div>`);syncPerformanceSelection();if(hadTestDialog)$(`#tab-${reportView.tab}`)?.focus({preventScroll:true});return;
   }
   const config=reportConfig(report),checks=report.checks.filter(c=>c.id!=='baseline');
   const required=checks.filter(c=>c.required);
@@ -3467,7 +3601,7 @@ function renderDetail() {
   <details class="report-reference condition-reference"><summary>Test conditions</summary>${renderTests(report.requests,{report})}</details>
   <section id="results-requests" class="report-result-section">${renderAllRequests(orderedRequests(report))}</section><section id="results-resources" class="report-result-section">${renderDiagnostics(report,d)}</section></section>
   <div class="actions" style="margin-top:24px">${keepButton()}<a class="button small" href="${runPath(d.id)}/report.html" download>Download HTML report</a><a class="button small" href="${runPath(d.id)}/report.json" download>Download JSON</a>${savedBaseline?`<button class="button small" data-action="compare-run">Compare a new run with this baseline</button><button class="button small" data-action="baseline-dialog">Save again under another name</button>`:!completePass&&d.state==='completed'?'<button class="button small" data-action="baseline-dialog">Save as reference baseline</button>':''}</div>`);
-  syncComparisonFilters();refreshConditionDialog();loadFindingEvidence();
+  syncPerformanceSelection();syncComparisonFilters();refreshConditionDialog();loadFindingEvidence();
 }
 function renderDiagnostics(report,detail) {
   return `<details class="run-diagnostics"><summary>Run diagnostics</summary><p>Internal run ID: <code>${escape(report?.run_id || 'Not recorded')}</code></p>${renderResources(report,detail)}</details>`;
@@ -3653,7 +3787,7 @@ function renderCheck(check,report) {
     metrics.push(metric('Completed responses',`${m.completed ?? 0} / ${m.attempted ?? 0}`,'Completion and correctness are distinct'));
     if(check.id==='context')metrics.push(metric('Longest measured input',m.observed_max_input_tokens==null?'Not reported':`${number(m.observed_max_input_tokens)} tokens`,`Declared context: ${number(m.declared_context_limit)} tokens`));
     else metrics.push(metric('Response time · p95',ms(m.p95_ms),`${m.completed ?? 0} valid completions`));
-  }else{
+  }else if(check.id!=='multi_user'){
     metrics.push(metric('Requests completed',`${m.completed ?? 0} / ${m.attempted ?? 0}`,`${m.failed ?? 0} failed · ${m.timed_out ?? 0} timed out`));
     if(check.id==='first_output'){metrics.push(metric('Warmed first output · p95',ms(m.first_output_p95_ms),timingLimit('first_output_ms','No acceptance limit set')));metrics.push(metric('Initial first output',ms(m.initial?.first_output_p50_ms),'Recorded separately from warmed samples'));}
     else if(check.id==='capacity'&&m.traffic_stages){metrics.push(metric(m.request_pack?.control_status==='fail'?'Highest acceptable tested loaded rate · quiet failed':'Highest acceptable tested arrival rate',m.highest_acceptable_rate_rps==null?'Unconfirmed':`${number(m.highest_acceptable_rate_rps,2)} requests/s`,m.request_pack?.control_status==='fail'?'Loaded result only; quiet checks failed. Maximum capacity unknown.':'Highest tested acceptable rate; maximum capacity unknown'));metrics.push(metric('Rate stages',number(m.traffic_stages.length),'Each stage is offered independently, then drained'));}
@@ -3668,23 +3802,23 @@ function renderCheck(check,report) {
   }
   if(check.id==='generation'){
     const current=Object.hasOwn(m,'generation_rate_samples');
-    metrics.push(metric('Generation pace · median (estimate)',m.generation_tokens_per_second_p50==null?'Unmeasured':`${number(m.generation_tokens_per_second_p50,1)} tok/s`,current?`${m.generation_rate_samples} measured samples; excludes waiting for first output`:'Older report: generation timing was not recorded'));
+    metrics.push(metric('Generation pace · median (estimate)',m.generation_tokens_per_second_p50==null?'Unmeasured':`${number(m.generation_tokens_per_second_p50,1)} tok/s`,current?`${m.generation_rate_samples} measured samples; client-observed estimate excluding waiting for first output`:'Older report: generation timing was not recorded'));
     if(current)metrics.push(metric('Generation pace · slowest (estimate)',m.generation_tokens_per_second_min==null?'Unmeasured':`${number(m.generation_tokens_per_second_min,1)} tok/s`,limits.min_output_tokens_per_second?`Every measurable request must reach ${limits.min_output_tokens_per_second} tok/s`:'No minimum generation rate set'));
     metrics.push(metric('End-to-end output rate · median',m.output_tokens_per_second_p50==null?'Not reported':`${number(m.output_tokens_per_second_p50,1)} tok/s`,current?'Includes waiting for first output; separate from generation pace':'Older report: the output-rate limit used this end-to-end definition'));
   }
-  const extras=Object.fromEntries(Object.entries(m).filter(([k,v])=>typeof v==='object'&&v!==null || ['backend_cancellation','near_limit_coverage','tls','tls_expiry'].includes(k)));
+  const extras=Object.fromEntries(Object.entries(m).filter(([k,v])=>k!=='multi_user'&&(typeof v==='object'&&v!==null || ['backend_cancellation','near_limit_coverage','tls','tls_expiry'].includes(k))));
   return `<div class="check-detail-head"><div class="check-detail-heading"><h2>${escape(checkGuide[check.id]?.name || check.title)}</h2>${badge(check.status)}</div><p>${escape(check.summary)}</p>${!check.required?'<p class="hint">Optional check</p>':''}</div>
   ${check.id==='cancellation'&&check.status!=='skipped'?renderCancellationResults(m):''}
   ${check.status==='skipped'?`<div class="empty-state" style="padding:35px 24px"><p>${unselectedCheck(check,report)?'This check was not selected. No result is inferred.':'This check was skipped. The recorded reason is shown above; no passing result is inferred.'}</p></div>`:`<dl class="metrics-grid">${metrics.join('')}</dl>`}
   ${check.id==='cancellation'?`<div class="notice" style="margin:20px 24px 0">${escape(m.backend_cancellation?.summary || 'Backend cancellation was not verified.')} Physical device memory reclamation is not measured.</div>`:''}
   ${check.id==='recovery'?`<div class="notice" style="margin:20px 24px 0">Sustained traffic was configured for ${number(config.sustained_seconds,1)} seconds. Results describe this bounded observation period.</div>`:''}
   ${m.logprobs?renderLogprobResults(m.logprobs):''}
-  ${check.id==='sessions'&&m.conversation_performance?renderSessionResults(m.conversation_performance):''}${check.id==='concurrency'?renderConcurrentResults(m):check.id==='load'?renderLoadTestResults(m):''}
+  ${check.id==='multi_user'&&m.multi_user?renderMultiUserResults(m.multi_user):''}${check.id==='sessions'&&m.conversation_performance?renderSessionResults(m.conversation_performance):''}${check.id==='concurrency'?renderConcurrentResults(m):check.id==='load'?renderLoadTestResults(m):''}
   ${m.request_pack?renderPackResults(m.request_pack):''}
   ${check.id==='capacity'&&m.traffic_stages?renderTrafficStages(m.traffic_stages,m.request_pack):''}
   ${check.id==='capacity'&&m.levels?`<div class="metric-table"><table><thead><tr><th>Load</th><th>Achieved</th><th>Correct</th><th>p95</th></tr></thead><tbody>${Object.entries(m.levels).map(([k,v])=>`<tr><td class="mono">${escape(k)}</td><td>${number(v.achieved_concurrency)}</td><td>${v.correct ?? 0} / ${v.scored ?? 0}</td><td class="mono">${ms(v.p95_ms)}</td></tr>`).join('')}</tbody></table></div>`:''}
   ${check.id==='gpu'&&m.snapshots?renderGpuSnapshots(m.snapshots):''}
-  ${records.length?`<div class="evidence-title"><span>Requests</span><span class="hint">${state.failingRequestsOnly?`${sorted.length} failing · `:''}${records.length} recorded · incorrect and failed first</span></div><div class="evidence-table"><table><thead><tr><th>Test / request</th><th>Response</th><th>Answer</th><th>Time</th></tr></thead><tbody>${sorted.map(r=>`<tr><td><button class="text-button" data-request="${escape(r.id)}">${escape(requestQuestion(r,report))}</button><small>${escape(scenarioLabel(r,report))}</small><small>${escape(requestIdentity(r,report.requests,undefined,positions))}</small></td><td>${escape(r.status)}${violations.has(r.id)?`<small${check.status==='pass'?' class="hint"':''}>${escape(timingFailureReason(r,check,report,violations))}</small>`:''}${isProbe(r)?'<small class="request-probe">Deliberate probe</small>':''}</td><td>${r.score===false?`<span class="status fail">Incorrect</span>${renderInlineAnswer(r,report,{loading:false})}`:r.score===true?'<span class="status pass">Correct</span>':'<span class="dim">Unscored</span>'}</td><td class="mono nowrap">${ms(r.elapsed_ms)}</td></tr>`).join('')}</tbody></table></div>`:check.status==='skipped'?'':'<div class="check-observations hint">No request evidence was recorded for this check.</div>'}
+  ${records.length&&check.id!=='multi_user'?`<div class="evidence-title"><span>Requests</span><span class="hint">${state.failingRequestsOnly?`${sorted.length} failing · `:''}${records.length} recorded · incorrect and failed first</span></div><div class="evidence-table"><table><thead><tr><th>Test / request</th><th>Response</th><th>Answer</th><th>Time</th></tr></thead><tbody>${sorted.map(r=>`<tr><td><button class="text-button" data-request="${escape(r.id)}">${escape(requestQuestion(r,report))}</button><small>${escape(scenarioLabel(r,report))}</small><small>${escape(requestIdentity(r,report.requests,undefined,positions))}</small></td><td>${escape(r.status)}${violations.has(r.id)?`<small${check.status==='pass'?' class="hint"':''}>${escape(timingFailureReason(r,check,report,violations))}</small>`:''}${isProbe(r)?'<small class="request-probe">Deliberate probe</small>':''}</td><td>${r.score===false?`<span class="status fail">Incorrect</span>${renderInlineAnswer(r,report,{loading:false})}`:r.score===true?'<span class="status pass">Correct</span>':'<span class="dim">Unscored</span>'}</td><td class="mono nowrap">${ms(r.elapsed_ms)}</td></tr>`).join('')}</tbody></table></div>`:check.status==='skipped'||check.id==='multi_user'?'':'<div class="check-observations hint">No request evidence was recorded for this check.</div>'}
   ${Object.keys(extras).length?`<details class="check-observations"><summary>More measurements</summary><pre>${escape(JSON.stringify(extras,null,2))}</pre></details>`:''}`;
 }
 function renderGpuSnapshots(snapshots){return snapshots.map(snapshot=>`<div class="metric-table"><h3>${escape(human(snapshot.phase))} <span class="hint">${date(snapshot.collected_at)}</span></h3>${snapshot.reason?`<p class="hint" style="margin:12px 0">${escape(snapshot.reason)}</p>`:''}${snapshot.unavailable?.length?`<p class="hint" style="margin:12px 0">Unavailable: ${snapshot.unavailable.map(human).map(escape).join(', ')}</p>`:''}${snapshot.samples?.length?`<table><thead><tr><th>Metric</th><th>Value</th><th>Freshness</th></tr></thead><tbody>${snapshot.samples.map(s=>`<tr><td>${escape(s.name)}<small>${escape(s.labels)}</small></td><td class="mono">${number(s.value,3)}</td><td>${s.stale?'Stale':s.age_seconds==null?'Scrape only':`${number(s.age_seconds,1)}s old`}</td></tr>`).join('')}</tbody></table>`:''}</div>`).join('');}
@@ -3780,9 +3914,10 @@ function comparisonWarningSummary(row) {
 }
 function comparisonTable(rows) {
   return `<div class="comparison-values">${rows.map(row=>{
-    const warnings=comparisonWarnings(row),shortWarnings=comparisonWarningSummary(row);
-    const label=row.descriptive?'Observed':row.status==='fail'?'Regression detected':warnings.length?'Warning':'No material regression';
-    return `<article class="comparison-measurement" data-metric="${escape(row.metric)}"><div class="comparison-measurement-heading"><h4>${escape(comparisonMetricLabel(row))}</h4><small>${row.aggregation==='mean'?'Rate':'Median'} · ${escape(label)}</small></div><dl class="comparison-value-grid"><div><dt>Baseline</dt><dd>${comparisonValue(row,row.baseline)}</dd><small>n=${number(row.baseline_samples)}</small></div><div><dt>Current</dt><dd>${comparisonValue(row,row.current)}</dd><small>n=${number(row.current_samples)}</small></div><div><dt>Change</dt><dd>${comparisonChange(row)}</dd></div></dl>${warnings.length?`<div class="comparison-brief-warning">${shortWarnings.map(w=>`<p>${escape(w)}</p>`).join('')}<details class="comparison-support"><summary>Why this warning?</summary><ul>${warnings.map(w=>`<li>${escape(w)}</li>`).join('')}</ul></details></div>`:''}${row.worsening_interval_95?`<details class="comparison-statistics"><summary>Statistical details</summary><p>95% interval for worsening: ${row.worsening_interval_95.map(v=>number(v,1)).join(' to ')} ${row.change_unit==='percentage_points'?'percentage points':'%'}. Threshold: ${number(row.threshold,1)} ${row.change_unit==='percentage_points'?'percentage points':'%'}. Warnings still apply.</p></details>`:''}</article>`;
+    const warnings=comparisonWarnings(row),shortWarnings=comparisonWarningSummary(row),commonWindow=row.aggregation==='common_window';
+    const aggregation=commonWindow?'Common window':row.aggregation==='mean'?'Rate':'Median';
+    const label=commonWindow?(row.status==='fail'?'Observed decrease':warnings.length?'Warning':'Observed'):row.descriptive?'Observed':row.status==='fail'?'Regression detected':warnings.length?'Warning':'No material regression';
+    return `<article class="comparison-measurement" data-metric="${escape(row.metric)}"><div class="comparison-measurement-heading"><h4>${escape(comparisonMetricLabel(row))}</h4><small>${aggregation} · ${escape(label)}</small></div><dl class="comparison-value-grid"><div><dt>Baseline</dt><dd>${comparisonValue(row,row.baseline)}</dd><small>n=${number(row.baseline_samples)}</small></div><div><dt>Current</dt><dd>${comparisonValue(row,row.current)}</dd><small>n=${number(row.current_samples)}</small></div><div><dt>Change</dt><dd>${comparisonChange(row)}</dd></div></dl>${commonWindow&&row.method?`<p class="hint">${escape(row.method)}</p>`:''}${warnings.length?`<div class="comparison-brief-warning">${shortWarnings.map(w=>`<p>${escape(w)}</p>`).join('')}<details class="comparison-support"><summary>Why this warning?</summary><ul>${warnings.map(w=>`<li>${escape(w)}</li>`).join('')}</ul></details></div>`:''}${row.worsening_interval_95?`<details class="comparison-statistics"><summary>Statistical details</summary><p>95% interval for worsening: ${row.worsening_interval_95.map(v=>number(v,1)).join(' to ')} ${row.change_unit==='percentage_points'?'percentage points':'%'}. Threshold: ${number(row.threshold,1)} ${row.change_unit==='percentage_points'?'percentage points':'%'}. Warnings still apply.</p></details>`:''}</article>`;
   }).join('')}</div>`;
 }
 function comparisonCohort(row){return row.load_point?['source','type','workload','shape','pattern','level','rate','bursts','phase','role'].map(name=>row.load_point[name]):row.scenario;}
@@ -3870,7 +4005,7 @@ function renderLive() {
   <aside class="panel run-preview">${renderPhases(d.phases || events)}<h3>${judging?'Evaluation limits':'Limits'}</h3>${judging?'<p>Separate limits apply to the configured judges.</p>':''}<dl class="bound-list">${bounds.map(([k,v])=>`<div><dt>${escape(k)}</dt><dd>${escape(v)}</dd></div>`).join('')}</dl><hr><p class="hint">${judging?'Incomplete panels, evaluation failures and ties leave answers unscored.':'Finished requests include responses, failures, timeouts and cancellations. Scheduled requests can also use budget without reaching the server.'}</p></aside></div><div id="live-error" class="error-message" role="alert" ${liveError?'':'hidden'}>${escape(liveError)}</div>${renderAllRequests(d.live_requests || [],{budget:c.max_requests,live:true,budgetUsed:progress.budget_used ?? started,attempted:started,droppedOffers:progress.dropped_offers || 0})}${renderDiagnostics(d.report,d)}</section>`,{landing:true});
   const dialog=$('#request-dialog'),status=dialog?.open?$('.live-request-status',dialog):null,record=status&&(d.live_requests || []).find(r=>String(r.slot)===status.dataset.statusSlot);
   if(record){if(status.getAttribute('data-request-id')!==String(record.id || '')){cancelLandings(status);status.setAttribute('data-request-id',record.id || '');}patchHTML(status,badge(requestStatus(record)),{landing:true});const identity=$('.request-identity',dialog);if(identity)patchHTML(identity,identity.getAttribute('data-condition-request-context')?conditionEvidenceIdentityText(JSON.parse(identity.getAttribute('data-condition-request-context'))):requestIdentityContent(record,d.live_requests));}
-  refreshSpotTip();refreshConditionDialog();loadDetailPlan();scheduleStopConfirmationReset();
+  syncPerformanceSelection();refreshSpotTip();refreshConditionDialog();loadDetailPlan();scheduleStopConfirmationReset();
 }
 function renderJudgement(judgement) {
   if(!judgement)return '';
@@ -4064,6 +4199,11 @@ async function startNewRun(){
   if(location.hash!=='#new'){location.hash='#new';return;}
   renderNew();enterRoute();window.scrollTo?.({top:0,left:0,behavior:'instant'});
 }
+function normalizeRateThreshold(config){
+  const result=clone(config),defaultValue=state.bootstrap.limits_schema?.properties?.regression_rate_points?.default;
+  if(defaultValue!==undefined){result.limits ||= {};if(result.limits.regression_rate_points==null)result.limits.regression_rate_points=defaultValue;}
+  return result;
+}
 async function rerun(){
   const version=state.routeVersion;let source=state.detail.report?.manifest?.config || state.detail.config;
   if(!source){toast('No configuration was saved for this run.');return;}
@@ -4072,6 +4212,7 @@ async function rerun(){
     try{const result=await api('/api/config/draft',{method:'POST',body:JSON.stringify(source)});if(version!==state.routeVersion)return;source=result.config;notes=result.migration_notes;}
     catch(error){toast(error.message);return;}
   }
+  source=normalizeRateThreshold(source);
   replaceMigrationNotes(notes);state.config=clone(source);state.autoModel=null;state.setupStep=1;invalidateModelDiscovery();state.datasetSelection=[];state.config.restart_target=null;state.formMode='normal';state.formRestartTarget=null;state.jsonDraft=null;state.jsonBase=null;state.configView='form';configChanged();state.prefillBaseline=state.detail.baseline_id || '';location.hash='#new';
 }
 function portableConfig(payload) {return {...payload.config,restart_target:payload.mode==='cold-start'?payload.restart_target:null};}
@@ -4087,10 +4228,10 @@ async function restoreDraft() {
   try{
     const draft=JSON.parse(sessionStorage.getItem('giraffe-draft-v1'));
     const legacy=draft?.config?.config_version==null;
-    if(draft&&draft.config?.targets?.length&&(legacy||sameConfig(draft.bootstrap,state.bootstrap.config))){
+    if(draft&&draft.config?.targets?.length&&(legacy||sameConfig(draft.bootstrap&&normalizeRateThreshold(draft.bootstrap),normalizeRateThreshold(state.bootstrap.config)))){
       let config=draft.config,notes=[];
       if(legacy){const result=await api('/api/config/draft',{method:'POST',body:JSON.stringify(config)});config=result.config;notes=result.migration_notes || [];}
-      state.config=config;state.dismissedMigrationNotes=draft.dismissedMigrationNotes || [];
+      state.config=normalizeRateThreshold(config);state.dismissedMigrationNotes=draft.dismissedMigrationNotes || [];
       state.migrationNotes=[...new Set([...(draft.migrationNotes || []),...state.dismissedMigrationNotes,...notes])];
     }else sessionStorage.removeItem('giraffe-draft-v1');
   }catch{}
@@ -4268,6 +4409,7 @@ document.addEventListener('click',async(event)=>{
   const done=event.target.closest('[data-done-test]')?.dataset.doneTest;
   if(done){toggleTestEditor(done,true);return;}
   const reset=event.target.closest('[data-reset-test]')?.dataset.resetTest;
+  if(reset==='multi_user'){captureFormDraft();delete state.config.multi_user;delete state.config.test_options?.multi_user;state.jsonDraft=null;state.jsonBase=null;configChanged();renderNew();return;}
   if(reset==='load'){captureFormDraft();replaceMigrationNotes();delete state.config.load_test;state.loadPanels={};delete state.config.test_options?.load;state.jsonDraft=null;state.jsonBase=null;configChanged();renderNew();return;}
   if(reset){configChanged();if(state.config.test_options)delete state.config.test_options[reset];const form=$('#new-run-form');form.elements[`test_mode_${reset}`].value='default';refreshInheritedFields(reset);syncTestControls();updateBounds();return;}
   if(action==='use-check-concurrency'){
@@ -4352,6 +4494,8 @@ document.addEventListener('click',async(event)=>{
       else{state.catalogueFilter='selected';state.catalogueCategory='all';state.catalogueSearch='';state.openTest=null;const search=$('#check-search');if(search)search.value='';syncTestControls();$('[data-catalogue-filter="selected"]')?.focus();}
     }catch(error){configError(error);}return;
   }
+  if(action==='user-add-recall-turn'||action==='user-remove-recall-turn'){editUserRecall(action);return;}
+  if(['user-add-task','user-remove-task','user-add-turn','user-remove-turn'].includes(action)){editUserConversation(action,Number(event.target.closest('[data-task-index]')?.dataset.taskIndex));return;}
   if(['add-session-workload','remove-session-workload','add-session-turn','remove-session-turn'].includes(action)){editSessionWorkload(action,event.target.closest('[data-session-index]')?.dataset.sessionIndex);return;}
   if(action==='toggle-available-tests'){state.showAvailableTests=!state.showAvailableTests;syncTestControls();return;}
   if(action==='select-group'){

@@ -452,6 +452,13 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
                         # timeout after sending stops, even without timing samples.
                         item["coverage_high_seconds"] = item["high_seconds"]
                 continue
+            if name.startswith("multi_user_"):
+                settings = config.multi_user
+                phases = row.get("window_count", 1 + bool(settings.warmup_seconds))
+                fixed(target.name, row, row.get("configured_seconds", settings.duration_seconds + settings.warmup_seconds),
+                      "multi_user.duration_seconds", count=phases,
+                      timeout=config.request_timeout_seconds)
+                continue
             if name == "capacity":
                 settings = config.effective_traffic()
                 options = effective("capacity")
@@ -1097,6 +1104,21 @@ def request_plan(config: RunConfig | ConfigDraft, *,
                 "msg":"Expected scheduled Load test requests exceed the total request budget; some tests will be truncated.",
                 "values":{"expected_scheduled_requests":load_plan["expected_scheduled_requests"]*target_count,"max_requests":config.max_requests}})
         warnings.extend(w["msg"] for w in load_warnings)
+    if "multi_user" in selected:
+        from giraffe.multi_user import _planned_observation
+        settings = config.multi_user
+        windows = _planned_observation(settings)["windows"]
+        for level in settings.levels:
+            phases = [window for window in windows if window["population"] == level]
+            seconds = sum(window["planned_duration_seconds"] for window in phases)
+            add(f"multi_user_{level}", None,
+                f"{level} persistent users share the run request slots for {settings.duration_seconds:g} s"
+                f" after {settings.warmup_seconds:g} s warmup per window; {len(phases)} windows total "
+                f"({seconds:g} s). Each request drains within its ordinary timeout.",
+                source="isolated conversations" if settings.conversations else "generated token-target prompts",
+                kind="duration", title=f"Multi-user · {level} users")
+            rows[-1].update(users=level, simultaneous_limit=config.concurrency,
+                            configured_seconds=seconds, window_count=len(phases), scenarios=settings.scenarios)
     if "sessions" in selected:
         settings = config.sessions
         if settings.profile == "performance":
@@ -1307,7 +1329,10 @@ def request_plan(config: RunConfig | ConfigDraft, *,
                                          else config.effective_check(check)) for check in config.checks},
             "initial_request_settings": config.effective_initial(),
             "baseline_comparison": {"regression_percent": config.limits.regression_percent,
-                                    "field": "limits.regression_percent"},
+                                    "regression_rate_points": config.limits.regression_rate_points,
+                                    "field": "limits.regression_percent",
+                                    "fields": {"timing": "limits.regression_percent",
+                                               "rates": "limits.regression_rate_points"}},
             "configured_load_seconds": load_plan.get("configured_load_seconds", 0),
             "load_warnings": load_warnings, "concurrency_warnings": concurrency_warnings,
             "capacity_warnings": capacity_warnings,

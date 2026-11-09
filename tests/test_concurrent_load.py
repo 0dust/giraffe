@@ -346,7 +346,7 @@ async def test_interference_alternates_and_triggers_after_chunks():
 @pytest.mark.parametrize("slowdown,limit,status", [(2, 1.5, "fail"), (1.1, 1.5, "pass"), (1.1, None, "inconclusive")])
 def test_interference_slowdown_scoring(slowdown, limit, status, monkeypatch):
     from giraffe import runner
-    from tests.test_review26_phase4_accuracy import run_virtual
+    from tests.virtual_clock import run_virtual
 
     # Slowdown now compares matched completion times in independent windows.
     c = configuration(load={'combinations': {'enabled': False}, 'interference': {'enabled': True}, 'schedule': {'levels': [2]}})

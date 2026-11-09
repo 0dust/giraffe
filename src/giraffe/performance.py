@@ -116,7 +116,7 @@ def completion_buckets(records, start_ms, end_ms):
             "partial_bucket_disclosure": "Final bucket uses its actual duration; counts are not requests/s."}
 
 
-_PERFORMANCE_CHECKS = {"load", "concurrency", "capacity", "arrivals", "sessions", "buckets"}
+_PERFORMANCE_CHECKS = {"load", "concurrency", "capacity", "arrivals", "sessions", "multi_user", "buckets"}
 
 
 def _cohort(record):
@@ -127,6 +127,8 @@ def _cohort(record):
     """
     from .conditions import condition_for
 
+    if "multi_user" in record.check_ids and record.workload.get("window_id"):
+        return str(record.workload["window_id"])
     point = record.load_point or {}
     identity = str(point.get("point_id") or record.condition_id
                    or condition_for(record.scenario, record.workload)["id"])
@@ -351,9 +353,8 @@ def _window_summary(report, target, window, records, series, observation):
     maximum_gaps = gaps + [r.max_stream_gap_ms for r in good if r.max_stream_gap_ms is not None]
     put("longest_stream_pause", max(maximum_gaps, default=None), "Longest stream pause", "ms",
         "Maximum gap between answer network reads; not token ITL", samples=len(maximum_gaps))
-    # The saved generation estimate predates versioned token-event evidence.
-    # Its existing property enforces valid, completed, unbuffered streaming
-    # evidence; only direct/token-event metrics require the newer schema.
+    # Generation pace requires cumulative usage at both answer-read boundaries.
+    # Direct/token-event metrics additionally require the newer timing schema.
     generation_rates = [r.generation_tokens_per_second for r in good]
     legacy_rates = [r.generation_tokens_per_second for r in good if getattr(r, "timing_schema", 0) < 1]
     legacy_source = "; from saved generation-rate estimate; older run" if any(rate is not None for rate in legacy_rates) else ""
@@ -365,7 +366,7 @@ def _window_summary(report, target, window, records, series, observation):
     metrics["tpot"] = {**selected_tpot, "id": "tpot", "label": "Time per output token (TPOT)"}
     metrics["tpot_direct"]["exclusion_reasons"] = dict(Counter(r.tpot_direct_reason for r in good if r.tpot_direct_reason))
     dist("generation_pace", generation_rates, "Generation pace", "tok/s",
-         "Answer streaming estimate; first-read tokens estimated by character share" + legacy_source, state="estimated")
+         "Client-observed pace from server token counts (cumulative usage or streamed logprobs) at first/last answer reads" + legacy_source, state="estimated")
     itl = [gap for r in modern for gap in (getattr(r, "itl_ms", None) or [])]
     evidence_states = Counter(r.workload.get("token_evidence", {}).get("logprobs", "not_recorded") for r in good)
     if good and not any(r.stream for r in good):
@@ -661,6 +662,20 @@ def _bind_existing(report, target, window, records, observation, put):
         "Conversation completion rate", "ratio", "Completed / planned conversations from session lifecycle", samples=sessions.get("started_conversations", 0), state="measured" if planned else "not_applicable")
     put("user_fairness", sessions.get("users") or None, "Per-user generation pace / fairness", "tok/s", "Existing per-user estimates and equal-user weighting; missing coverage retained",
         samples=sessions.get("users_with_measured_generation", 0), state="estimated" if sessions.get("users") else "not_applicable")
+    user_summary = by_id.get("multi_user", {}).get("multi_user", observation.get("multi_user", {}).get("summary", {}))
+    user_windows = [value for value in user_summary.get("windows", [])
+                    if value.get("phase") == "measurement" and value.get("id") == cohort]
+    if user_windows:
+        users = user_windows[0].get("users", [])
+        eligible = user_windows[0].get("population", len(users))
+        samples = sum(_number(user.get("output_tokens_per_second")) for user in users)
+        complete = eligible > 0 and samples == eligible
+        put("persistent_user_delivery", users, "Persistent user delivery", "tok/s",
+            "Completed valid output tokens inside the common user window / its actual duration; all planned users retained",
+            samples=samples, eligible=eligible,
+            state="measured" if complete else "insufficient_evidence",
+            reason=None if complete else "Not every planned user has a known shared-window output rate.",
+            window_policy=user_summary.get("window_policy"))
     matched = [p for p in points if p.get("interference")]
     legacy = by_id.get("concurrency", {}).get("load_types", {}).get("interference", {}).get("points", [])
     interference = [p.get("interference") for p in matched] or [p.get("interference", p) for p in legacy if ids.intersection(p.get("request_ids", []))]

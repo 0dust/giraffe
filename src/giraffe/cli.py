@@ -293,7 +293,7 @@ Exit codes:
         run.add_argument("--proxy", help="HTTP proxy URL")
         for option in ("first-output-ms", "latency-ms", "stream-gap-ms",
                        "min-output-tokens-per-second", "max-error-rate", "min-correctness",
-                       "regression-percent"):
+                       "regression-percent", "regression-rate-points"):
             run.add_argument("--" + option, type=float, help="Threshold for " + option.replace("-", " "))
         run.add_argument("--baseline", type=Path, help="Compare to this explicitly saved report")
         run.add_argument("--output", type=Path, help="New report directory (never overwrites a run)")
@@ -337,7 +337,7 @@ Exit codes:
     report.add_argument("--output", type=Path, metavar="PATH")
     export = commands.add_parser("export", help="Print a sanitized reproduction snapshot as JSON")
     export.add_argument("report", type=Path)
-    inspect = commands.add_parser("inspect", help="Print recorded deployment/telemetry and comparison JSON")
+    inspect = commands.add_parser("inspect", help="Print recorded deployment, per-user outcomes, telemetry and comparison JSON")
     inspect.add_argument("report", type=Path)
     baseline = commands.add_parser("baseline", help="Explicitly save a run for future comparisons")
     actions = baseline.add_subparsers(dest="action", required=True)
@@ -1230,6 +1230,74 @@ def _print_result(report: RunReport, json_path: Path, html_path: Path | None,
             label = window.get("workload_label") or _stage_name(window_id.removeprefix("full:"))
             line = f"Performance · {target_name} · {label}"
         print(line)
+    for check in report.checks:
+        users = check.metrics.get("multi_user") if check.id == "multi_user" else None
+        if not users:
+            continue
+        print(f"Multi-user · {check.target} · shared-window delivered output")
+        worst = users.get("worst_user")
+        if worst:
+            print(f"  Worst served user: {worst['user_id']} at {worst['population']} users · {worst['status']}")
+        for window in users.get("windows", []):
+            if window.get("phase") != "measurement":
+                continue
+            print(f"  {window['population']} users · {window.get('duration_seconds', 0):.3g} / {window['planned_duration_seconds']:g} planned seconds")
+            if window.get("role"):
+                print("    " + " · ".join(str(window[key]) for key in ("scenario", "role", "trigger", "heavy_profile") if window.get(key)))
+            if evidence := window.get("interference"):
+                print(f"    Matched noisy-neighbor comparison: {evidence['status']}")
+                for reason in evidence.get("reasons", []):
+                    print(f"      {reason}")
+                for user in evidence.get("users", []):
+                    print(f"      {user['user_id']}: {user['status']} · {user.get('matched_samples', 0)} matched samples · "
+                          f"slowdown {user.get('slowdown')} · first/completion/gap change "
+                          f"{user.get('first_answer_change_ms')} / {user.get('completion_change_ms')} / "
+                          f"{user.get('stream_gap_change_ms')} ms · output change {user.get('output_tokens_change')} tokens")
+                    print(f"        Actual input medians {user.get('control_input_median_tokens')} → {user.get('probe_input_median_tokens')}; "
+                          f"output medians {user.get('control_output_median_tokens')} → {user.get('probe_output_median_tokens')}")
+                    print(f"        Heavy input / output medians: {user.get('heavy_input_median_tokens')} / "
+                          f"{user.get('heavy_output_median_tokens')} tokens")
+                    for reason in user.get("reasons", []):
+                        print(f"        {reason}")
+                    for name in ("control_request_ids", "probe_request_ids", "heavy_request_ids"):
+                        print(f"        {name}: {', '.join(user.get(name, [])) or 'none'}")
+            if evidence := window.get("cancellation"):
+                print(f"    Selected user: {evidence.get('selected_user_id')} · {evidence['status']}")
+                for key, label in (("cancellation", "Selected request cancellation"),
+                                   ("peer_continuation", "Peer continuation"), ("followup", "Same-user follow-up")):
+                    item = evidence.get(key, {})
+                    print(f"      {label}: {item.get('status', 'inconclusive')} · "
+                          f"{' '.join(item.get('reasons', []))} · requests: {', '.join(item.get('request_ids', [])) or 'none'}")
+                print("      Backend compute and memory release: unverified")
+            fairness = window.get("fairness")
+            if fairness:
+                ratio = fairness.get("ratio")
+                status = "not applicable" if fairness["status"] == "not_applicable" else fairness["status"]
+                print(f"    Observed delivery fairness: {status} · "
+                      f"median / worst ratio {ratio if ratio is not None else 'undefined'} · "
+                      f"limit {fairness.get('threshold')} · "
+                      f"eligible users {', '.join(fairness.get('eligible_user_ids', [])) or 'none'} / "
+                      f"{len(fairness.get('compared_user_ids', []))} compared")
+                for reason in fairness.get("reasons", []):
+                    print(f"      {reason}")
+            for user in window.get("users", []):
+                rate = user.get("output_tokens_per_second")
+                delivery = f"{rate:.3g} tok/s" if rate is not None else "unknown tok/s"
+                outcome = user.get("outcomes", {})
+                latency = user.get("latency", {})
+                first = latency.get("ready_first_answer_ms", {}).get("p95")
+                completion = latency.get("ready_completion_ms", {}).get("p95")
+                timing = " / ".join(f"{value:.3g}" if value is not None else "unknown" for value in (first, completion))
+                print(f"    {user['user_id']} · {user['profile']} · {user['status']} · {delivery} · "
+                      f"{outcome.get('completed', 0)}/{outcome.get('attempted', 0)} completed · "
+                      f"{outcome.get('errors', 0)} errors · ready first/completion p95 {timing} ms · "
+                      f"{user.get('coverage', {}).get('status', 'unknown')}")
+                for item in user.get("conversations", []):
+                    print(f"      Conversation {item['id']} · {item['mode']} · "
+                          f"{len(item['turns'])}/{item['planned_turns']} turns · "
+                          f"{item.get('stop_reason') or 'completed'}")
+                    for turn, request_id in enumerate(item["turns"]):
+                        print(f"        Turn {turn + 1}: {request_id}")
     unselected = []
     for check in report.checks:
         if check.status == "skipped" and check.summary.rstrip(".") in {"Not selected", "Not selected for this run"}:

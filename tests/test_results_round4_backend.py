@@ -64,16 +64,19 @@ def test_timing_only_runner_checks_record_failing_request_ids(check, monkeypatch
     assert all(row.score is True and row.valid for row in run.records)
 
 
-def test_compact_report_keeps_pause_and_generation_measurements():
+@pytest.mark.parametrize("reported_boundaries", [True, False])
+def test_compact_report_keeps_pause_and_generation_measurements(reported_boundaries):
     report = make_report(count=1)
-    report.requests = [record()]
+    report.requests = [record(first_read_output_tokens=5, last_read_output_tokens=10)
+                       if reported_boundaries else record()]
     report.requests[0].max_stream_gap_ms = 6000
     row = _api_report(report)['requests'][0]
     assert row['max_stream_gap_ms'] == 6000
     assert row['arrival_elapsed_ms'] == 300
     assert row['arrival_first_output_ms'] == 5
     assert row['generation_tokens_per_second'] == report.requests[0].generation_tokens_per_second
-    assert row['generation_tokens_per_second'] > 0
+    assert row['generation_tokens_per_second'] == (pytest.approx(5 * 1000 / (299 - 5))
+                                                  if reported_boundaries else None)
     assert 'output' not in row and 'evaluation' not in row
 
 

@@ -312,8 +312,9 @@ def test_every_check_has_an_explained_row_and_planning_has_no_execution_side_eff
     configuration = config(checks=list(CHECK_NAMES), scale_down={"target": "local"})
     result = plan(configuration)
     rows = {row["id"]: row for row in result["rows"]}
-    assert set(CHECK_NAMES) - {"load"} <= rows.keys()
+    assert set(CHECK_NAMES) - {"load", "multi_user"} <= rows.keys()
     assert {"load_combinations", "load_calibration"} <= rows.keys()
+    assert {f"multi_user_{level}" for level in configuration.multi_user.levels} <= rows.keys()
     assert all(row["source"] and row["summary"] for row in rows.values())
     assert result["count_kind"] == "bounded"
 
@@ -489,7 +490,7 @@ def test_load_budget_action_excludes_local_preparation_and_groups_visible_names(
 def test_load_dataset_controls_count_matches_real_runner_without_extra_loaded_pass(monkeypatch):
     from collections import Counter
     from giraffe import runner
-    from tests.test_review26_phase4_accuracy import run_virtual
+    from tests.virtual_clock import run_virtual
     from tests.test_runner import FakeClient
 
     async def scenario():

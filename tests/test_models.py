@@ -130,12 +130,12 @@ def test_workload_defaults_and_explicit_selection_preserve_disabled_configuratio
     assert draft.checks == []
     assert not draft.tool_calling
     assert set(CHECK_NAMES) - set(CORE_CHECKS) == {
-        "prefix", "sessions", "consistency", "tools"}
+        "prefix", "sessions", "consistency", "tools", "multi_user"}
 
 
 @pytest.mark.parametrize("check_id,field", [
     ("load", "load_test"), ("prefix", "prefix"), ("sessions", "sessions"), ("consistency", "consistency"),
-    ("tools", "tool_calling"),
+    ("tools", "tool_calling"), ("multi_user", "multi_user"),
 ])
 def test_selected_extended_workloads_get_safe_defaults(check_id, field):
     config = RunConfig(targets=[Target(name="local", url="http://localhost", model="test")],

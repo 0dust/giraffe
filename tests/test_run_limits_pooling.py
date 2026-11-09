@@ -14,7 +14,8 @@ from giraffe.latency import comparable_latency, latency_summary, load_observatio
 from giraffe.models import RunConfig
 from giraffe.planning import request_plan
 from tests.test_run_limits_phase4_latency import record, report, save_summary
-from tests.test_review26_phase4_accuracy import recording_client, run_virtual, TARGET
+from tests.test_review26_phase4_accuracy import recording_client, TARGET
+from tests.virtual_clock import run_virtual
 
 
 MATCH = dict(family="correctness", concurrency=4, stream=True, output_cap=128, input_bucket="chars:0-255")

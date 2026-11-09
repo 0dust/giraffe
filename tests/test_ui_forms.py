@@ -153,7 +153,7 @@ import * as formConfig from {json.dumps((static / 'form-config.mjs').as_uri())};
 const nodes={{}},controls=[],listeners={{}},snapshots=[];
 const decode=value=>(value || '').replace(/&quot;/g,'"').replace(/&#39;/g,"'").replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&amp;/g,'&');
 const attr=(tag,key)=>decode(tag.match(new RegExp('(?:^|\\s)'+key+'="([^"]*)"'))?.[1]);
-const form={{elements:{{}},querySelectorAll:()=>controls.filter(input=>/^(test_|traffic_|load_)/.test(input.name))}};
+const form={{elements:{{}},querySelectorAll:()=>controls.filter(input=>/^(test_|traffic_|load_|multi_user_)/.test(input.name))}};
 let html='';
 nodes['#main']={{get innerHTML(){{return html;}},set innerHTML(value){{
   html=value;controls.length=0;form.elements={{}};
@@ -203,7 +203,7 @@ for(const preset of ['answers','concurrent','arrival','custom']){{
     if(['check','setup_goal','setup_load','request_source','session_pause_mode'].includes(name))continue;
     assert.equal(controls.filter(input=>input.name===name).length,1,preset+': duplicate '+name);
   }}
-  assert.equal(controls.filter(input=>input.name==='check').length,16);
+  assert.equal(controls.filter(input=>input.name==='check').length,17);
   for(const name of ['max_requests','max_duration_seconds'])assert(controls.some(input=>input.name===name));
   if(preset==='concurrent'){{
     assert.equal((markup.match(/id="setup-dataset"/g)||[]).length,1);
@@ -302,8 +302,8 @@ def test_field_help_preserves_labels_and_escapes_details():
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
-import {{optionDefault,optionValue,limitValue,sameConfig,effectiveProfileDefaults,loadTestSettings,loadFieldName}} from {json.dumps((static / 'form-config.mjs').as_uri())};
-const context={{structuredClone,optionDefault,optionValue,limitValue,sameConfig,effectiveProfileDefaults,loadTestSettings,loadFieldName,
+import {{optionDefault,optionValue,limitValue,sameConfig,effectiveProfileDefaults,loadTestSettings,loadFieldName,multiUserSettings}} from {json.dumps((static / 'form-config.mjs').as_uri())};
+const context={{structuredClone,optionDefault,optionValue,limitValue,sameConfig,effectiveProfileDefaults,loadTestSettings,loadFieldName,multiUserSettings,
   document:{{addEventListener(){{}}}},window:{{addEventListener(){{}}}}}};
 const source=fs.readFileSync({json.dumps(str(static / 'app.js'))},'utf8')
   .replace(/^import .*?;\\n/,'').replace(/\\ninit\\(\\);\\s*$/,'');

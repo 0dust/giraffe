@@ -108,7 +108,7 @@ async def test_recovery_without_timing_acceptance_limit_passes_correct_answers(e
 
 
 def test_recovery_refills_workers_while_slow_peer_is_still_running(endpoint, monkeypatch):
-    from tests.test_review26_phase4_accuracy import run_virtual
+    from tests.virtual_clock import run_virtual
 
     async def scenario():
         monkeypatch.setattr("tests.test_load_reliability.time", runner.time)
@@ -146,7 +146,7 @@ async def test_recovery_reserves_later_fixed_checks_and_caps_remaining_budget_sh
 
 
 def test_recovery_tiny_load_allowance_cannot_claim_configured_concurrency(endpoint, monkeypatch):
-    from tests.test_review26_phase4_accuracy import run_virtual
+    from tests.virtual_clock import run_virtual
 
     async def scenario():
         monkeypatch.setattr("tests.test_load_reliability.time", runner.time)
