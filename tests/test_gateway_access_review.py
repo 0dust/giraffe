@@ -282,7 +282,8 @@ async def test_access_plan_attribution_limit_covers_target_scoped_compatibility(
             rows.append({"request_id": str(len(rows)), "session_id": marker, "status": "success",
                 "metadata": {"spend_logs_metadata": json.loads(request.headers["x-litellm-spend-logs-metadata"])},
                 "api_key": hashlib.sha256(b"allow-secret").hexdigest(), "total_tokens": 8, **usage})
-        elif payload["max_tokens"] == 1:
+        elif (payload["max_tokens"] == 16
+              and payload["messages"] == [{"role": "user", "content": "Reply with 1."}]):
             compatibility[request.url.host] += 1
             if compatibility[request.url.host] <= 2:
                 return httpx.Response(400, json={"error": {"param": "logprobs"}})
