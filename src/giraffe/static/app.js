@@ -3980,7 +3980,7 @@ function comparisonChange(row) {
   return `${percent>0?'+':''}${number(percent,1)}%`;
 }
 function comparisonMetricLabel(row) {
-  return ({attribution_outcome:'Attribution outcome',correctness_rate:'Correct answers',valid_completion_rate:'Completed valid responses',error_rate:'Request errors',latency_ms:'Full response time',first_output_ms:'First useful output',max_stream_gap_ms:'Longest pause per response',output_tokens_per_second:'Output rate, including initial wait',generation_tokens_per_second:'Generation pace',output_tokens:'Answer length · tokens',output_chars:'Answer length · characters'})[row.metric]||human(row.metric);
+  return ({attribution_outcome:'Attribution outcome',correctness_rate:'Correct answers',valid_completion_rate:'Completed valid responses',error_rate:'Request errors',latency_ms:'Full response time',latency_p95_ms:'Full response time · p95',first_output_ms:'First useful output',first_output_p95_ms:'First useful output · p95',max_stream_gap_ms:'Longest pause per response',max_stream_gap_p95_ms:'Longest pause per response · p95',output_tokens_per_second:'Output rate, including initial wait',generation_tokens_per_second:'Generation pace',output_tokens:'Answer length · tokens',output_chars:'Answer length · characters'})[row.metric]||human(row.metric);
 }
 function comparisonWarnings(row) {
   return row.warnings?.length?row.warnings.map(w=>w.message):row.status==='inconclusive'?[row.reason||'Insufficient evidence to interpret this change.']:[];
@@ -3990,8 +3990,9 @@ function comparisonWarningSummary(row) {
   const notes=[];
   for(const warning of row.warnings||[]){
     if(warning.code==='output_work_changed'){
-      const before=row.output_work?.baseline?.reported_output_tokens_p50,after=row.output_work?.current?.reported_output_tokens_p50;
-      notes.push(before!=null&&after!=null?`Answer length changed: ${number(before)} → ${number(after)} tokens.`:'Answer lengths differ.');
+      const key=row.aggregation==='p95'?'reported_output_tokens_p95':'reported_output_tokens_p50';
+      const before=row.output_work?.baseline?.[key],after=row.output_work?.current?.[key];
+      notes.push(before!=null&&after!=null&&before!==after?`Answer length changed${row.aggregation==='p95'?' (p95)':''}: ${number(before)} → ${number(after)} tokens.`:'Answer lengths differ.');
     }else if(warning.code==='client_delayed'){
       for(const [name,q] of Object.entries(row.timing_quality||{}))if(q.status==='client_delayed')notes.push(q.scope==='legacy_run_maximum'?`${name} recorded a run-wide Giraffe delay; request-level overlap was not recorded.`:`Giraffe delays affected ${q.affected_requests}/${q.total_requests} ${name.toLowerCase()} requests.`);
     }else if(warning.code==='sample_uncertainty')notes.push('Sample uncertainty limits this assessment.');
@@ -4010,7 +4011,7 @@ function comparisonTable(rows) {
   return `<div class="comparison-values">${rows.map(row=>{
     const warnings=comparisonWarnings(row),shortWarnings=comparisonWarningSummary(row),commonWindow=row.aggregation==='common_window';
     const showReason=row.check==='gateway_policy'&&row.metric==='policy_acceptance'&&['fail','inconclusive'].includes(row.status)&&typeof row.reason==='string'&&row.reason.trim()&&!warnings.some(warning=>typeof warning==='string'&&warning.trim()===row.reason.trim());
-    const aggregation=commonWindow?'Common window':row.aggregation==='observed'?(row.metric==='attribution_outcome'?'Observed outcome':'Policy evidence'):row.aggregation==='mean'?'Rate':'Median';
+    const aggregation=commonWindow?'Common window':row.aggregation==='observed'?(row.metric==='attribution_outcome'?'Observed outcome':'Policy evidence'):({mean:'Rate',p95:'P95'}[row.aggregation]||'Median');
     let label;
     if(row.aggregation==='observed')label=row.status==='fail'?'Observed failure':warnings.length?'Unverified':'Observed';
     else if(commonWindow)label=row.status==='fail'?'Observed decrease':warnings.length?'Warning':'Observed';

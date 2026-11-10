@@ -196,6 +196,13 @@ Use **Change baseline** to compare the same measurements against another saved
 reference. Saved baselines and request evidence remain unchanged; incompatible
 workloads or insufficient evidence still produce inconclusive results.
 
+Timing comparisons include both the median and p95 for full response time, first
+useful output, and the longest pause per response. A qualified regression in
+either can fail the baseline check. P95 needs at least 20 measured samples in
+each run (or the configured minimum, if higher); small runs retain their median
+comparisons. P95 uses the same workload, client-timing, and uncertainty checks,
+and also checks for changes in the tails of observed input and output lengths.
+
 The local API provides the same operation: `POST /api/runs/{run_id}/compare`
 with `{"baseline_id": "<saved-baseline-id>"}`. List references with
 `GET /api/baselines`. Only completed reports can be compared.

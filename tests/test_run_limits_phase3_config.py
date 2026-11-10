@@ -17,7 +17,7 @@ def config(**updates):
 
 
 @pytest.mark.parametrize("check", ["serving", "first_output", "generation", "context", "correctness",
-                                  "json", "cancellation", "recovery", "load", "consistency", "tools"])
+                                  "json", "cancellation", "recovery", "load", "consistency", "tools", "prefix"])
 def test_per_check_request_settings_can_exceed_suite_defaults(check):
     if check == "load":
         configured = config(checks=[check], max_output_tokens=16, request_timeout_seconds=1,
@@ -36,7 +36,7 @@ def test_per_check_request_settings_can_exceed_suite_defaults(check):
 
 @pytest.mark.parametrize("check,field", [("sessions", "concurrency"), ("sessions", "max_output_tokens"),
                                          ("arrivals", "concurrency"), ("capacity", "concurrency"),
-                                         ("prefix", "max_output_tokens"), ("concurrency", "max_output_tokens")])
+                                         ("concurrency", "max_output_tokens")])
 def test_dedicated_request_fields_have_no_second_override(check, field):
     assert field not in CHECK_OPTION_FIELDS[check]
     with pytest.raises(ValidationError, match="unsupported options"):
