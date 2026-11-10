@@ -89,11 +89,27 @@ def test_reasoning_without_usage_breakdown_explains_generation_limit(
     assert result.metrics["missing_timing_metrics"] == ["generation_tokens_per_second"]
     assert "reasoning-token usage breakdown" in result.finding_summary
     assert "reports reasoning-token usage separately" in result.summary
-    assert "enable streamed logprobs" not in result.summary
+    # Separated reasoning usage alone cannot yield pace without counts at answer reads.
+    assert ("enable streamed logprobs" in result.summary) is not streamed_logprobs
+    assert "disable response buffering" not in result.summary
     assert all(record.output_tokens is None for record in records)
     assert result.remediation == {"action": "review_check", "check": "generation",
                                   "code": "unseparated_reasoning_tokens"}
     assert CheckResult.model_validate_json(result.model_dump_json()) == result
+
+
+def test_reasoning_limit_keeps_remedy_for_other_missing_timing():
+    records = [answer(str(index), "generation", reasoning="thinking", output_tokens=None,
+        completion_tokens=11, read_output_tokens_source="logprobs", max_stream_gap_ms=None,
+        answer_reads=1) for index in range(2)]
+
+    result = assess("generation", records, min_output_tokens_per_second=1, stream_gap_ms=500)
+
+    assert result.metrics["missing_timing_metrics"] == ["generation_tokens_per_second", "stream_gap_ms"]
+    assert result.metrics["reason_code"] == "unseparated_reasoning_tokens"
+    assert "reports reasoning-token usage separately" in result.summary
+    assert "disable response buffering along the route" in result.summary
+    assert "enable streamed logprobs" not in result.summary
 
 
 def test_reasoning_without_any_usage_retains_stream_evidence_remedy():
