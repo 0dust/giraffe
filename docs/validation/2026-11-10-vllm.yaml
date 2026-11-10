@@ -1,0 +1,13 @@
+# Live Linux GPU run for docs/validation/2026-11-10.md: examples/vllm.yaml with the
+# endpoint and served model filled in.
+config_version: 2
+targets:
+  - name: vllm
+    url: http://127.0.0.1:8000/v1
+    model: Qwen/Qwen2.5-1.5B-Instruct
+    metrics_profile: vllm-v1
+    metrics_url: http://127.0.0.1:8000/metrics
+request_options:
+  stream_options:
+    include_usage: true
+    continuous_usage_stats: true
