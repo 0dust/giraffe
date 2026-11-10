@@ -8,6 +8,8 @@ import httpx
 import pytest
 from fastapi import HTTPException
 
+from giraffe.models import RunConfig, Target
+from giraffe.preflight import check_target
 from giraffe.web import ConnectionTest, check_connection
 from tests.test_web import browser, config, report, successful_runner
 
@@ -60,6 +62,35 @@ async def test_explicit_model_sends_one_bounded_request_and_preserves_auth(monke
                        "stream": False, "max_tokens": 32, "n": 1, "temperature": 0}
     assert clients[0]["follow_redirects"] is False and clients[0]["trust_env"] is True
     assert "private" not in str(result)
+
+
+async def test_preflight_omits_configured_stream_options(monkeypatch):
+    def respond(request):
+        payload = json.loads(request.content)
+        if payload.get("stream_options") and not payload["stream"]:
+            return httpx.Response(400, json={"error": {
+                "message": "Stream options can only be defined when `stream=True`.",
+                "param": "stream_options",
+            }})
+        return httpx.Response(200, json=answer())
+
+    requests, _ = endpoint(monkeypatch, respond)
+    target = Target(name="vllm", url="http://server/v1", model="model")
+    run_config = RunConfig(targets=[target], stream=True, request_options={
+        "temperature": 0,
+        "stream_options": {"include_usage": True, "continuous_usage_stats": True},
+    })
+    result = await check_target(target, run_config)
+
+    assert result["status"] == "connected"
+    assert len(requests) == 1
+    payload = json.loads(requests[0].content)
+    assert payload["stream"] is False and payload["temperature"] == 0
+    assert "stream_options" not in payload
+    assert run_config.stream is True
+    assert run_config.request_options["stream_options"] == {
+        "include_usage": True, "continuous_usage_stats": True,
+    }
 
 
 async def test_single_model_is_discovered_once_and_then_probed(monkeypatch):

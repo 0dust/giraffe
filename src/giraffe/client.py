@@ -615,6 +615,8 @@ class LLMClient:
             payload["litellm_session_id"] = spec.workload["gateway_run"]
         payload.update(model=self.target.model, messages=spec.messages, stream=stream,
                        max_tokens=budget, n=1)
+        if not stream:
+            payload.pop("stream_options", None)
         if spec.scorer == "tool":
             if spec.tool_expectation and spec.tool_expectation.choice:
                 payload["tools"] = spec.tool_expectation.tools
