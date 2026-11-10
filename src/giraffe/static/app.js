@@ -2891,7 +2891,7 @@ async function testConnection() {
   state.modelDiscovery={key,route,status:'pending',models:[],message:'Checking your endpoint. A model may take a moment to load…'};renderModelDiscovery();
   try{
     const api_key=apiKeyFor(url.value);
-    const result=await api('/api/targets/test-connection',{method:'POST',body:JSON.stringify({...JSON.parse(key),...(api_key?{api_key}:{})})});
+    const result=await api('/api/targets/test-connection',{method:'POST',body:JSON.stringify({...JSON.parse(key),...(state.autoModel&&state.autoModel===JSON.parse(key).model?{discovered:true}:{}),...(api_key?{api_key}:{})})});
     if(sequence!==state.modelDiscoverySequence||route!==state.routeVersion||key!==modelDiscoveryKey())return;
     if(['connected','unverified'].includes(result.status)){
       if(!JSON.parse(key).model)state.autoModel=result.model;

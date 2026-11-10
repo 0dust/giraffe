@@ -14,7 +14,7 @@ from pydantic import Field, SecretStr, field_validator, model_validator
 from .caps import (
     MAX_PREFLIGHT_BODY_BYTES, MAX_PREFLIGHT_HEADER_CHARS,
 )
-from giraffe.client import LLMClient, _headers, completion_url
+from giraffe.client import NO_ANSWER_ERROR, REASONING_BUDGET_ERROR, LLMClient, _headers, completion_url
 from giraffe.models import Model, RequestSpec, RunConfig, Target
 
 
@@ -25,7 +25,7 @@ class PreflightError(Exception):
     def __init__(self, message: str, *, blocking: bool = True, no_answer: bool = False):
         super().__init__(message)
         self.blocking = blocking
-        # The server completed the request, but the bounded test ended without a visible answer.
+        # The server completed a well-formed response, but it carried no visible answer.
         self.no_answer = no_answer
 
 
@@ -98,6 +98,8 @@ class TokenizerSelection(Model):
 
 class ConnectionTest(ModelDiscovery):
     model: str | None = None
+    # True when the model name was filled in by an earlier discovery, not typed.
+    discovered: bool = False
     request_options: dict = Field(default_factory=dict)
 
     @field_validator("model", "api_key_env", mode="before")
@@ -202,9 +204,10 @@ async def check_connection(body: ConnectionTest) -> dict:
             try:
                 return await check_target(config.targets[0], config)
             except PreflightError as error:
-                if body.model or not error.no_answer:
+                if not error.no_answer or (body.model and not body.discovered):
                     raise
-                # Discovery succeeded; an inconclusive answer test must not discard its result.
+                # Discovery succeeded, now or before a retry; an answerless test must not
+                # discard its result.
                 return {"status": "unverified", "model": model, "models": [model],
                         "message": f'Found "{model}". The 32-token test ended before the model '
                                    "produced a visible answer. Choose checks to continue, "
@@ -287,6 +290,7 @@ async def check_target(target: Target, config: RunConfig) -> dict:
             message = ("The server responded but did not return a usable answer within the "
                        "32-token test. Check the model's settings or continue with its name.")
         raise PreflightError(message, blocking=blocking,
-                             no_answer=record.http_status is not None and 200 <= record.http_status < 300)
+                             no_answer=record.http_status is not None and 200 <= record.http_status < 300
+                             and record.error in {REASONING_BUDGET_ERROR, NO_ANSWER_ERROR})
     return {"status": "connected", "model": target.model, "latency_ms": round(record.elapsed_ms, 1),
             "message": "The model returned an answer. Your endpoint is ready for checks."}

@@ -133,10 +133,38 @@ async def test_discovered_model_survives_an_answerless_test(monkeypatch):
     assert result["model"] == "qwen3:0.6b" and result["models"] == ["qwen3:0.6b"]
     assert 'Found "qwen3:0.6b"' in result["message"] and "Choose checks" in result["message"]
     assert [request.method for request in requests] == ["GET", "POST"]
-    # A typed model has nothing to preserve, so the advisory error is unchanged.
+    # Retrying sends the filled-in name; the same response must not turn into an error.
+    retry = await check_connection(ConnectionTest(url="http://server", model="qwen3:0.6b", discovered=True))
+    assert retry == result
+    # A name the user typed has nothing to preserve, so the advisory error is unchanged.
     with pytest.raises(HTTPException) as error:
         await check_connection(ConnectionTest(url="http://server", model="qwen3:0.6b"))
     assert error.value.status_code == 422 and "usable answer" in error.value.detail
+
+
+async def test_empty_completed_answer_keeps_the_discovered_model(monkeypatch):
+    empty = {"choices": [{"message": {"content": ""}, "finish_reason": "stop"}]}
+    endpoint(monkeypatch, lambda request: httpx.Response(200, json={"data": [{"id": "only-model"}]})
+             if request.method == "GET" else httpx.Response(200, json=empty))
+    result = await check_connection(ConnectionTest(url="http://server"))
+    assert result["status"] == "unverified" and result["model"] == "only-model"
+
+
+@pytest.mark.parametrize("model,discovered", [(None, False), ("only-model", True)])
+@pytest.mark.parametrize("response", [
+    lambda: httpx.Response(200, text="private malformed body"),
+    lambda: httpx.Response(200, json={"choices": [{"message": {"content": "OK"}, "finish_reason": 7}]}),
+    lambda: httpx.Response(200, json={"choices": [{"message": {"content": "OK"}}]}),
+    lambda: httpx.Response(200, json={"choices": [{"message": {"content": ""}, "finish_reason": "content_filter"}]}),
+    lambda: httpx.Response(200, json={"error": {"message": "private failure"}}),
+])
+async def test_protocol_failures_stay_errors_not_unverified(monkeypatch, model, discovered, response):
+    endpoint(monkeypatch, lambda request: httpx.Response(200, json={"data": [{"id": "only-model"}]})
+             if request.method == "GET" else response())
+    with pytest.raises(HTTPException) as error:
+        await check_connection(ConnectionTest(url="http://server", model=model, discovered=discovered))
+    assert error.value.status_code == 422 and "usable answer" in error.value.detail
+    assert "private" not in error.value.detail
 
 
 @pytest.mark.parametrize("status", [400, 500])
