@@ -116,7 +116,7 @@ async def test_web_preview_and_cli_use_recent_summary_from_selected_runs_directo
 
     config = configuration()
     # Include all actual fixture sizes/caps so every finite group has a match.
-    specs = builtin_fixtures(config, check_id="correctness")["correctness"]
+    specs = builtin_fixtures(config)["correctness"]
     current = report(config)
     current.finished_at = datetime.now(timezone.utc).isoformat()
     current.requests = [RequestRecord(id=str(index), target="local", fixture_id=spec.fixture_id,

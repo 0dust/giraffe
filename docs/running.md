@@ -22,6 +22,48 @@ useful answer. The default p95 first-output limit is 10,000 ms; override it with
 Results appear in the terminal and in `runs/<timestamp>/report.json` and
 `report.html`. The command exits when done.
 
+Standard built-in answer fixtures, including `short.copy`, use `max_output_tokens` as their
+output allowance. For a reasoning model that exhausts its budget before answering,
+raise it with `--max-output-tokens 2048` or YAML `max_output_tokens: 2048`.
+Supported `test_options.<check>.max_output_tokens` values override that default;
+`access` has no separate output setting and shares the initial request's resolved
+serving/first-output allowance. Custom fixtures, request-pack cases, session turns
+and load profiles keep their own explicit budgets; consistency retains its
+documented default allowance. Only the intentional output-cap probe
+(`limits.output_cap`) retains its small limit. The backend-cancellation probe and
+its follow-up (`limits.backend_cancel`, `limits.backend_cancel.followup`, formerly
+128 and 8 tokens) now use the resolved cancellation allowance, so a raised
+`max_output_tokens` lets a reasoning model stream before the probe is cancelled. A larger allowance does not force a longer answer
+and still needs room alongside the prompt in the model's context window.
+
+The optional context check verifies recall at 80% of the full declared window.
+Its output allowance must leave at least that much input space; reserving more
+than 20% of the window makes this coverage impossible. For example, a 2,048-token
+output allowance in a 4,096-token window cannot establish near-limit recall.
+Use a context-specific allowance that still lets the model finish its answer:
+
+```yaml
+max_output_tokens: 2048
+test_options:
+  context:
+    max_output_tokens: 512
+```
+
+The optional prefix check also reserves the global output allowance. The default
+`prefix.prefix_chars: 8192` does not fit a 4,096-token window with a 2,048-token
+output allowance, so no prefix requests are sent. Reduce `prefix.prefix_chars`
+or the global `max_output_tokens`, set a prefix-specific allowance with
+`test_options.prefix.max_output_tokens`, or set `test_options.prefix.context_limit`
+to a larger window only if the model supports it. Validate or preview the
+configuration to see these warnings before sending traffic.
+
+```yaml
+max_output_tokens: 2048
+test_options:
+  prefix:
+    max_output_tokens: 32
+```
+
 Generate a saved configuration, then review its endpoint, model and limits:
 
 ```sh
