@@ -2022,6 +2022,18 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
             elif check_id == "generation" and _missing_timing(records, limits.model_copy(update={"first_output_ms": None})):
                 metrics["missing_timing_metrics"] = _missing_timing(records, limits.model_copy(update={"first_output_ms": None}))
                 status, summary = "inconclusive", "Configured generation limits cannot be checked with available stream or token measurements."
+                # Name the reasoning accounting limit only when usage arrived without
+                # a breakdown for every unpaced answer; missing usage or other gaps
+                # keep the stream/usage evidence remedy.
+                unpaced = [r for r in records if r.valid and r.status == "completed" and r.stream
+                           and r.generation_tokens_per_second is None]
+                if ("generation_tokens_per_second" in metrics["missing_timing_metrics"] and unpaced
+                        and all(r.output_tokens is None and r.completion_tokens is not None
+                                and not r.reasoning_tokens
+                                and (r.reasoning.strip() or r.reasoning_stripped) for r in unpaced)):
+                    metrics["reason_code"] = "unseparated_reasoning_tokens"
+                    summary = ("Reasoning output has no usable reasoning-token usage breakdown; "
+                               "answer generation pace cannot be measured.")
             elif (check_id == "generation" and limits.min_output_tokens_per_second is not None
                   and metrics["generation_rate_samples"] < limits.min_samples):
                 status, summary = "inconclusive", "Too few measurable streamed answers to assess generation pace."
@@ -2745,6 +2757,10 @@ def _verdict_summary(check, config, records, budget):
                   "disable response buffering along the route, and rerun the same workload; raising client concurrency alone cannot make a serial server process requests in parallel")
     elif check.id == "cancellation" and not config.stream:
         remedy = "enable streaming (stream: true, omit --nonstream) so the client can observe output and interrupt the request, then rerun cancellation"
+    elif reason == "unseparated_reasoning_tokens":
+        remedy = ("use a server that reports reasoning-token usage separately from total completion usage, "
+                  "or configure the model to answer without reasoning; streamed reasoning logprobs alone "
+                  "cannot account for hidden control tokens, so they do not establish answer-token usage")
     elif any(word in text for word in ("stream", "timing", "measurable", "measured", "token measurements", "first-output baseline")) and check.status == "inconclusive":
         usage_guidance = ("enable streamed logprobs or cumulative completion token usage alongside streamed content "
                           "(request_options.stream_options.continuous_usage_stats: true on a compatible server); "
