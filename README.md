@@ -48,7 +48,7 @@ Install [`giraffe-llm` from PyPI](https://pypi.org/project/giraffe-llm/) in a vi
 ```sh
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install "giraffe-llm==0.1.0a1"
+python -m pip install "giraffe-llm==0.1.0a2"
 ```
 
 ### 2. Start your run
