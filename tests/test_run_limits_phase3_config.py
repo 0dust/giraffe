@@ -43,6 +43,13 @@ def test_dedicated_request_fields_have_no_second_override(check, field):
         config(checks=[], test_options={check: {field: 4}})
 
 
+def test_prefix_output_allowance_is_a_supported_check_option():
+    assert "max_output_tokens" in CHECK_OPTION_FIELDS["prefix"]
+    configured = config(checks=["prefix"], max_output_tokens=2048, test_options={"prefix": {"max_output_tokens": 8}})
+    assert configured.effective_check("prefix")["max_output_tokens"] == 8
+    assert RunConfig.model_validate(configured.model_dump()).effective_check("prefix") == configured.effective_check("prefix")
+
+
 def test_endpoint_response_owns_warm_samples_and_shared_request_settings():
     configured = config(checks=["access", "serving", "first_output"], samples=2,
                         test_options={"serving": {"samples": 9, "max_output_tokens": 256},

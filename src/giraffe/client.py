@@ -47,6 +47,7 @@ _REASONING_TAG_PREFIX = re.compile("|".join(sorted(_REASONING_TAG_PREFIXES)), re
 _MAX_REASONING_TAG_PREFIX = max(map(len, _REASONING_TAG_PREFIXES))
 _SURROGATE = re.compile(r"[\ud800-\udfff]")
 REASONING_BUDGET_ERROR = "reasoning exhausted the output budget before an answer"
+NO_ANSWER_ERROR = "response contained no useful answer output"
 
 
 @dataclass(frozen=True)
@@ -1275,9 +1276,9 @@ class LLMClient:
                             # serving failure, but also not an answer.
                             record.status, record.error = "completed", REASONING_BUDGET_ERROR
                             return record
-                        raise _ProtocolError("response contained no useful answer output")
+                        raise _ProtocolError(NO_ANSWER_ERROR)
                     if record.first_output_ms is None:
-                        raise _ProtocolError("response contained no useful answer output")
+                        raise _ProtocolError(NO_ANSWER_ERROR)
                     if conversation and stream:
                         record.assistant_message = {"role": "assistant",
                             "content": record.output if assistant_content_present else None,

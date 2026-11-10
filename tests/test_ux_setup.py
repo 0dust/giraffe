@@ -264,7 +264,7 @@ const first=testConnection();
 assert.equal(calls[0].path,'/api/targets/test-connection');
 assert.equal(calls[0].body.api_key_env,'FIRST_KEY');
 assert.equal(calls[0].body.headers_env['X-Gateway-Key'],'GATEWAY_KEY');
-assert.equal(calls[0].body.model,'manual-model');assert.equal(calls[0].body.ca_bundle,'/ca.pem');
+assert.equal(calls[0].body.model,'manual-model');assert.equal(calls[0].body.discovered,undefined);assert.equal(calls[0].body.ca_bundle,'/ca.pem');
 assert.equal(calls[0].body.proxy,'http://proxy:80');assert.equal(calls[0].body.request_options.temperature,0);
 assert(nodes['[data-action="test-connection"]'].disabled);
 form.elements.url.value='http://second/v1';invalidateModelDiscovery();
@@ -465,6 +465,16 @@ model.value='';await listeners.input({target:model});checkEmpty();assert(primary
 // Both connection outcomes refresh the hint and preserve the visible next action.
 api=async()=>({status:'connected',model:'detected-model'});await testConnection();checkReady();
 assert.equal(model.value,'detected-model');
+model.value='';await listeners.input({target:model});checkEmpty();
+// An answerless short test keeps the model the server reported and leaves the next step open.
+api=async()=>({status:'unverified',model:'thinking-model',models:['thinking-model'],message:'Found "thinking-model".'});await testConnection();checkReady();
+assert.equal(model.value,'thinking-model');assert.equal(state.autoModel,'thinking-model');assert.equal(state.config.targets[0].model,'thinking-model');
+assert.equal(state.modelDiscovery.status,'unverified');assert.equal(nodes['#model-discovery-status'].textContent,'Found "thinking-model".');
+assert.equal(nodes['[data-action="test-connection"]'].textContent,'Connect');
+// Retrying with the filled-in name keeps the neutral result and the next step.
+let retried;api=async(path,options)=>{retried=JSON.parse(options.body);return {status:'unverified',model:'thinking-model',models:['thinking-model'],message:'Still no visible answer.'};};await testConnection();checkReady();
+assert.equal(retried.model,'thinking-model');assert.equal(retried.discovered,true);assert.equal(model.value,'thinking-model');assert.equal(state.autoModel,'thinking-model');
+assert.equal(state.modelDiscovery.status,'unverified');assert.equal(nodes['#model-discovery-status'].textContent,'Still no visible answer.');
 model.value='';await listeners.input({target:model});checkEmpty();
 api=async()=>{throw new Error('Endpoint unavailable');};await testConnection();checkEmpty();
 assert.equal(state.modelDiscovery.status,'error');assert(nodes['#connection-options'].open);

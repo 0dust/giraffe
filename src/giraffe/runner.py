@@ -2612,6 +2612,11 @@ def _output_budget_guidance(config, records, check_id):
             "or configure the model to produce the final answer within its requested cap, then rerun")
 
 
+_READ_COUNT_GUIDANCE = ("enable streamed logprobs or cumulative completion token usage alongside streamed content "
+                        "(request_options.stream_options.continuous_usage_stats: true on a compatible server); "
+                        "final-only usage cannot establish generation pace")
+
+
 def _verdict_summary(check, config, records, budget):
 
     summary, metrics, limits = check.summary, check.metrics, config.limits
@@ -2808,10 +2813,15 @@ def _verdict_summary(check, config, records, budget):
         remedy = ("use a server that reports reasoning-token usage separately from total completion usage, "
                   "or configure the model to answer without reasoning; streamed reasoning logprobs alone "
                   "cannot account for hidden control tokens, so they do not establish answer-token usage")
+        # Separated reasoning usage is necessary, not sufficient: pace also needs
+        # token counts at answer reads, and other missing timings keep their remedy.
+        if any(check.id in r.check_ids and r.valid and r.status == "completed" and r.stream
+               and r.read_output_tokens_source is None for r in records):
+            remedy += "; also " + _READ_COUNT_GUIDANCE
+        if set(metrics.get("missing_timing_metrics", [])) - {"generation_tokens_per_second"}:
+            remedy += "; disable response buffering along the route so the other configured timing limits can be measured"
     elif any(word in text for word in ("stream", "timing", "measurable", "measured", "token measurements", "first-output baseline")) and check.status == "inconclusive":
-        usage_guidance = ("enable streamed logprobs or cumulative completion token usage alongside streamed content "
-                          "(request_options.stream_options.continuous_usage_stats: true on a compatible server); "
-                          "final-only usage cannot establish generation pace; "
+        usage_guidance = (_READ_COUNT_GUIDANCE + "; "
                           if "generation_tokens_per_second" in metrics.get("missing_timing_metrics", []) else "")
         remedy = (f"enable streaming (stream: true, omit --nonstream), disable response buffering along the route; "
                   f"{usage_guidance}"
