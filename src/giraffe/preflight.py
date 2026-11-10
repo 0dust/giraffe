@@ -22,9 +22,11 @@ logger = logging.getLogger(__name__)
 
 
 class PreflightError(Exception):
-    def __init__(self, message: str, *, blocking: bool = True):
+    def __init__(self, message: str, *, blocking: bool = True, no_answer: bool = False):
         super().__init__(message)
         self.blocking = blocking
+        # The server completed the request, but the bounded test ended without a visible answer.
+        self.no_answer = no_answer
 
 
 class _PreflightClient(LLMClient):
@@ -197,7 +199,16 @@ async def check_connection(body: ConnectionTest) -> dict:
                             if models else discovered["message"]}
                 model = models[0]
             config = body.configuration(model, request_options=body.request_options)
-            return await check_target(config.targets[0], config)
+            try:
+                return await check_target(config.targets[0], config)
+            except PreflightError as error:
+                if body.model or not error.no_answer:
+                    raise
+                # Discovery succeeded; an inconclusive answer test must not discard its result.
+                return {"status": "unverified", "model": model, "models": [model],
+                        "message": f'Found "{model}". The 32-token test ended before the model '
+                                   "produced a visible answer. Choose checks to continue, "
+                                   "or retry the connection test."}
     except TimeoutError:
         raise PreflightError("Connection test timed out after 15 seconds. "
                             "Check that the model is loaded, then try again.") from None
@@ -275,6 +286,7 @@ async def check_target(target: Target, config: RunConfig) -> dict:
         else:
             message = ("The server responded but did not return a usable answer within the "
                        "32-token test. Check the model's settings or continue with its name.")
-        raise PreflightError(message, blocking=blocking)
+        raise PreflightError(message, blocking=blocking,
+                             no_answer=record.http_status is not None and 200 <= record.http_status < 300)
     return {"status": "connected", "model": target.model, "latency_ms": round(record.elapsed_ms, 1),
             "message": "The model returned an answer. Your endpoint is ready for checks."}

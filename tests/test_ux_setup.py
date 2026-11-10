@@ -466,6 +466,12 @@ model.value='';await listeners.input({target:model});checkEmpty();assert(primary
 api=async()=>({status:'connected',model:'detected-model'});await testConnection();checkReady();
 assert.equal(model.value,'detected-model');
 model.value='';await listeners.input({target:model});checkEmpty();
+// An answerless short test keeps the model the server reported and leaves the next step open.
+api=async()=>({status:'unverified',model:'thinking-model',models:['thinking-model'],message:'Found "thinking-model".'});await testConnection();checkReady();
+assert.equal(model.value,'thinking-model');assert.equal(state.autoModel,'thinking-model');assert.equal(state.config.targets[0].model,'thinking-model');
+assert.equal(state.modelDiscovery.status,'unverified');assert.equal(nodes['#model-discovery-status'].textContent,'Found "thinking-model".');
+assert.equal(nodes['[data-action="test-connection"]'].textContent,'Connect');
+model.value='';await listeners.input({target:model});checkEmpty();
 api=async()=>{throw new Error('Endpoint unavailable');};await testConnection();checkEmpty();
 assert.equal(state.modelDiscovery.status,'error');assert(nodes['#connection-options'].open);
 model.value='manual-after-failure';await listeners.input({target:model});checkReady();

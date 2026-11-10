@@ -122,6 +122,32 @@ async def test_model_choice_or_manual_entry_never_sends_inference(monkeypatch, r
     assert "private" not in str(result)
 
 
+async def test_discovered_model_survives_an_answerless_test(monkeypatch):
+    # A thinking model can spend the whole 32-token budget on reasoning.
+    reasoning = {"choices": [{"message": {"content": "", "reasoning_content": "Let me think"},
+                              "finish_reason": "length"}]}
+    requests, _ = endpoint(monkeypatch, lambda request: httpx.Response(200, json={"data": [{"id": "qwen3:0.6b"}]})
+                           if request.method == "GET" else httpx.Response(200, json=reasoning))
+    result = await check_connection(ConnectionTest(url="http://server"))
+    assert result["status"] == "unverified"
+    assert result["model"] == "qwen3:0.6b" and result["models"] == ["qwen3:0.6b"]
+    assert 'Found "qwen3:0.6b"' in result["message"] and "Choose checks" in result["message"]
+    assert [request.method for request in requests] == ["GET", "POST"]
+    # A typed model has nothing to preserve, so the advisory error is unchanged.
+    with pytest.raises(HTTPException) as error:
+        await check_connection(ConnectionTest(url="http://server", model="qwen3:0.6b"))
+    assert error.value.status_code == 422 and "usable answer" in error.value.detail
+
+
+@pytest.mark.parametrize("status", [400, 500])
+async def test_discovered_model_is_not_kept_when_the_server_rejects_the_test(monkeypatch, status):
+    endpoint(monkeypatch, lambda request: httpx.Response(200, json={"data": [{"id": "only-model"}]})
+             if request.method == "GET" else httpx.Response(status, text="private failure"))
+    with pytest.raises(HTTPException) as error:
+        await check_connection(ConnectionTest(url="http://server"))
+    assert error.value.status_code == 422 and "private" not in error.value.detail
+
+
 @pytest.mark.parametrize("model", [None, "manual-model"])
 @pytest.mark.parametrize("status", [401, 403])
 async def test_denied_auth_is_actionable_and_does_not_retry(monkeypatch, model, status):
