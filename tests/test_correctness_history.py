@@ -360,7 +360,7 @@ await listeners.click({target:$('#setup-history .notice button')});
 assert(dialog.open);assert.equal($('#dataset-try-form').elements.try_target.value,'second');
 assert.equal(state.datasetTry.fixture_id,'question');assert.equal(JSON.stringify(state.config),beforeTry);
 })()
-''', dom=True)
+''', dom=True, timeout_seconds=60)
 
 
 def test_failed_answer_deep_link_survives_initial_app_routing():

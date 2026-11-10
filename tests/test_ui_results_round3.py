@@ -5,6 +5,23 @@ from tests.test_ui_report_tabs import PERFORMANCE
 from tests.test_ux_results import run_render_checks
 
 
+def test_tail_comparison_labels_and_work_warnings_use_p95():
+    run_render_checks(r"""
+for(const [metric,label] of [['latency_p95_ms','Full response time'],['first_output_p95_ms','First useful output'],['max_stream_gap_p95_ms','Longest pause per response']]){
+ const row={metric,aggregation:'p95',status:'fail',baseline:100,current:1000};
+ const html=comparisonTable([row]);
+ assert(html.includes(`${label} · p95`));
+ assert(html.includes('P95 · Regression detected'));
+ assert(!html.includes('Median'));
+ row.status='inconclusive';row.warnings=[{code:'output_work_changed',message:'P95 output lengths differ.'}];
+ row.output_work={baseline:{reported_output_tokens_p50:10,reported_output_tokens_p95:10},current:{reported_output_tokens_p50:10,reported_output_tokens_p95:100}};
+ const warning=comparisonTable([row]);
+ assert(warning.includes('Answer length changed (p95): 10 → 100 tokens.'));
+ assert(!warning.includes('10 → 10 tokens.'));
+}
+""")
+
+
 def test_stop_confirmation_timer_cannot_redraw_a_different_route():
     run_render_checks(r"""
 (async()=>{

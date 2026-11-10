@@ -15,8 +15,8 @@ def workload_records(records):
 
 
 def workload_payloads(payloads):
-    # HTTP fixture payloads have no scenario field. Only the exact one-token
+    # HTTP fixture payloads have no scenario field. Only the exact bounded
     # capability request is excluded; all actual workload payloads stay asserted.
     return [value for value in payloads if not (
-        value.get("max_tokens") == 1 and value.get("messages") == [
+        value.get("max_tokens") == 16 and value.get("messages") == [
             {"role": "user", "content": "Reply with 1."}])]

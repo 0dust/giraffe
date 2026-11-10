@@ -72,7 +72,8 @@ class HTTPClientPool:
     def build_request(self, *args, **kwargs) -> httpx.Request:
         return self._first.build_request(*args, **kwargs)
 
-    async def send(self, request: httpx.Request, *, stream: bool = False) -> httpx.Response:
+    async def send(self, request: httpx.Request, *, stream: bool = False,
+                   _before_send: Callable[[], None] | None = None) -> httpx.Response:
         if self._closed:
             raise RuntimeError("Cannot send a request after the client is closed")
         await self._slots.acquire()
@@ -85,6 +86,8 @@ class HTTPClientPool:
             else:
                 client = self._factory()
                 self._clients.append(client)
+            if _before_send is not None:
+                _before_send()
             response = await client.send(request, stream=stream)
         except BaseException as error:
             try:

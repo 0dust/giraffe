@@ -191,11 +191,11 @@ async def test_reasoning_budget_records_make_serving_and_first_output_inconclusi
         limits=Limits(min_samples=5, first_output_ms=200), stop_after_errors=2))
     serving, first = check(report, "serving"), check(report, "first_output")
     assert serving.status == "inconclusive"
-    assert "increasing max_output_tokens alone will not" in serving.summary
+    assert "raise max_output_tokens" in serving.summary
     assert serving.metrics["reasoning_budget_exhausted"] == serving.metrics["attempted"] > 0
     assert serving.metrics["failed"] == 0
     assert first.status == "inconclusive"
-    assert "increasing max_output_tokens alone will not" in first.summary
+    assert "raise max_output_tokens" in first.summary
     assert report.abort_reason is None and report.overall != "pass"
 
 
@@ -344,7 +344,15 @@ async def test_intentional_cancellation_does_not_mark_run_unfinished():
     run = runner._Run(config, None, None)
     spec = builtin_fixtures(config)["short"][0].model_copy(update={
         "scenario": "warm", "check_ids": ["serving"], "cancel_after_chunks": 1})
-    await run.request(config.targets[0], FakeClient(status="cancelled"), spec)
+
+    class ChunkCancelled(FakeClient):
+        async def execute(self, spec, **kwargs):
+            record = await super().execute(spec, **kwargs)
+            record.termination_reason = "generation_chunk_limit"
+            return record
+
+    record = await run.request(config.targets[0], ChunkCancelled(status="cancelled"), spec)
+    assert record.intentional
     assert not run.unfinished["t"] and run.reason is None and run.errors == 0
 
 

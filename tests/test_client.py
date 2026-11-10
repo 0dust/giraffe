@@ -14,6 +14,111 @@ def spec(**changes):
     )
 
 
+@pytest.mark.parametrize("option_source", ["config", "request"])
+@pytest.mark.parametrize("config_stream,request_stream", [(False, True), (True, False), (True, True)])
+async def test_stream_options_follow_effective_stream_mode(
+    monkeypatch, option_source, config_stream, request_stream,
+):
+    calls = []
+
+    def respond(request):
+        payload = json.loads(request.content)
+        calls.append(payload)
+        if payload.get("stream_options") and not payload["stream"]:
+            return httpx.Response(400, json={"error": {
+                "message": "Stream options can only be defined when `stream=True`.",
+                "param": "stream_options",
+            }})
+        if payload["stream"]:
+            chunk = {"choices": [{"delta": {"content": "42"}, "finish_reason": "stop"}]}
+            return httpx.Response(200, text=f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n",
+                                  headers={"content-type": "text/event-stream"})
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": "42"}, "finish_reason": "stop"}],
+        })
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(
+        transport=httpx.MockTransport(respond), **kw))
+    options = {"temperature": 0, "stream_options": {
+        "include_usage": True, "continuous_usage_stats": True,
+    }}
+    target = Target(name="local", url="http://local", model="test")
+    config = RunConfig(targets=[target], stream=config_stream,
+                       request_options=options if option_source == "config" else {})
+    request = spec(stream=request_stream, options=options if option_source == "request" else {})
+    async with LLMClient(target, config) as client:
+        record = await client.execute(request)
+
+    assert record.valid and record.http_status == 200 and record.output == "42"
+    assert len(calls) == 1 and calls[0]["temperature"] == 0
+    assert calls[0]["stream"] is (config_stream and request_stream)
+    if calls[0]["stream"]:
+        assert calls[0]["stream_options"] == options["stream_options"]
+    else:
+        assert "stream_options" not in calls[0]
+    assert options == {"temperature": 0, "stream_options": {
+        "include_usage": True, "continuous_usage_stats": True,
+    }}
+    assert config.request_options == (options if option_source == "config" else {})
+    assert request.options == (options if option_source == "request" else {})
+
+
+async def test_ordinary_nonstream_json_keeps_existing_duplicate_member_handling(monkeypatch):
+    body = (b'{"error":{"type":"upstream_failure"},"error":null,'
+            b'"choices":[{"message":{"role":"assistant","content":"42"},"finish_reason":"stop"}]}')
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, content=body)), **kw))
+    target = Target(name="local", url="http://local", model="test")
+    async with LLMClient(target, RunConfig(targets=[target])) as client:
+        record = await client.execute(spec(stream=False))
+    assert record.valid and record.output == "42"
+
+
+@pytest.mark.parametrize("route", ["direct", "configured_proxy", "environment_proxy"])
+async def test_noisy_neighbor_upload_evidence_requires_origin_form(route, monkeypatch):
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    paths = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            paths.append(self.path)
+            self.rfile.read(int(self.headers["Content-Length"]))
+            body = b'{"choices":[{"message":{"content":"42"},"finish_reason":"stop"}]}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args):
+            pass
+
+    for name in ("http_proxy", "HTTP_PROXY", "all_proxy", "ALL_PROXY", "no_proxy", "NO_PROXY"):
+        monkeypatch.delenv(name, raising=False)
+    with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": .01})
+        thread.start()
+        try:
+            local_url = f"http://127.0.0.1:{server.server_port}"
+            target = Target(name="local", url=local_url if route == "direct" else "http://origin.invalid", model="test")
+            if route == "environment_proxy":
+                monkeypatch.setenv("HTTP_PROXY", local_url)
+            config = RunConfig(targets=[target], proxy=local_url if route == "configured_proxy" else None)
+            async with LLMClient(target, config) as client:
+                record = await client.execute(spec(stream=False, workload={"scenario": "noisy_neighbors", "role": "probe"}))
+        finally:
+            server.shutdown()
+            thread.join()
+
+    assert record.valid
+    assert paths == ["/v1/chat/completions" if route == "direct" else "http://origin.invalid/v1/chat/completions"]
+    assert (record._request_body_sent_monotonic is not None) == (route == "direct")
+
+
 async def test_client_setup_keeps_event_loop_responsive(monkeypatch):
     import asyncio
     import threading
@@ -71,6 +176,112 @@ async def test_answer_stream_counts_usage_and_preserves_finish(monkeypatch):
     assert record.finish_reason == "stop" and record.stream_terminated
     assert record.first_output_ms is not None
     assert received[0]["max_tokens"] == 7
+
+
+async def test_lifecycle_observer_reports_immutable_identity_and_real_stream_answer(monkeypatch):
+    from dataclasses import FrozenInstanceError
+
+    target = Target(name="local", url="http://local", model="test")
+    received = []
+    original = httpx.AsyncClient
+    chunks = [
+        b'data: {"id":"server-1","backend_id":"replica-B","choices":[{"delta":{"content":"42"},"finish_reason":null}]}\n\n',
+        event(" more"), event(finish="stop"), b"data: [DONE]\n\n",
+    ]
+    monkeypatch.setattr("giraffe.client.httpx.AsyncClient", lambda **kwargs: original(
+        transport=httpx.MockTransport(lambda _: httpx.Response(200,
+            headers={"x-replica-id": "replica-header", "content-type": "text/event-stream"},
+            stream=Chunks(chunks))), **kwargs))
+    async with LLMClient(target, RunConfig(targets=[target])) as client:
+        record = await client.execute(spec(), lifecycle_observer=received.append)
+    assert [item.kind for item in received] == ["started", "attribution", "attribution", "answer", "terminal"]
+    assert {item.request_id for item in received} == {record.id}
+    assert {item.target for item in received} == {"local"}
+    assert [item.monotonic_seconds for item in received] == sorted(item.monotonic_seconds for item in received)
+    assert received[1].backend_id == "replica-header"
+    assert received[2].server_request_id == "server-1"
+    assert received[2].backend_id == "replica-B"
+    assert received[-1].status == "completed" and received[-1].valid
+    assert received[-1].finish_reason == "stop" and received[-1].stream_terminated
+    with pytest.raises(FrozenInstanceError):
+        received[0].request_id = "changed"
+
+
+@pytest.mark.parametrize("content", ["empty", "split_reasoning", "open_reasoning", "tools"])
+async def test_lifecycle_observer_does_not_arm_without_streamed_answer(monkeypatch, content):
+    parts = {
+        "empty": [event(""), event(" "), event(reasoning="thinking")],
+        "split_reasoning": [event("<thi"), event("nk>private reasoning"), event("</think>")],
+        "open_reasoning": [event("<think>private reasoning")],
+        "tools": [tool_event({"tool_calls": [tool_call()]})],
+    }[content]
+    received = []
+    client, _, _ = setup_client(monkeypatch, [*parts, event(finish="stop"), b"data: [DONE]\n\n"])
+    async with client:
+        await client.execute(spec(), lifecycle_observer=received.append)
+    assert [item.kind for item in received] == ["started", "terminal"]
+
+
+async def test_lifecycle_observer_waits_for_answer_after_split_inline_reasoning(monkeypatch):
+    import asyncio
+
+    received = []
+    client, _, _ = setup_client(monkeypatch, [event("<thi"), event("nk>secret"), .02,
+        event("</think>"), .02, event("42"), event(finish="stop"), b"data: [DONE]\n\n"])
+    async with client:
+        task = asyncio.create_task(client.execute(spec(), lifecycle_observer=received.append))
+        await asyncio.sleep(.01)
+        assert [item.kind for item in received] == ["started"]
+        await task
+    assert [item.kind for item in received] == ["started", "answer", "terminal"]
+    assert received[1].monotonic_seconds - received[0].monotonic_seconds >= .03
+
+
+async def test_lifecycle_observer_does_not_arm_for_nonstream_answer(monkeypatch):
+    received = []
+    client, _, _ = setup_client(monkeypatch, stream=False, body={
+        "choices": [{"message": {"content": "42"}, "finish_reason": "stop"}]})
+    async with client:
+        record = await client.execute(spec(), lifecycle_observer=received.append)
+    assert record.valid
+    assert [item.kind for item in received] == ["started", "terminal"]
+    assert all(not item.stream for item in received)
+
+
+@pytest.mark.parametrize("termination", ["cancel", "timeout", "eof", "sse_error"])
+async def test_lifecycle_observer_preserves_partial_answer_and_one_terminal(monkeypatch, termination):
+    import asyncio
+
+    received = []
+    end = {"cancel": [.2], "timeout": [.2], "eof": [],
+           "sse_error": [b'event: error\ndata: {"error":"failed"}\n\n']}[termination]
+    client, response, _ = setup_client(monkeypatch, [event("42"), *end], timeout=.05)
+    signal = asyncio.Event()
+    async with client:
+        task = asyncio.create_task(client.execute(spec(), first_output_event=signal,
+                                                  lifecycle_observer=received.append))
+        await signal.wait()
+        if termination == "cancel":
+            task.cancel()
+        record = await task
+    assert [item.kind for item in received] == ["started", "answer", "terminal"]
+    assert received[-1].request_id == record.id and received[-1].status == record.status
+    assert received[-1].error == record.error and not received[-1].valid
+    assert record.output == "42" and response.closed
+
+
+async def test_lifecycle_observer_over_real_http_stream():
+    from tests.fake_endpoint import FakeEndpoint
+
+    received = []
+    with FakeEndpoint() as endpoint:
+        target = Target(name="local", url=endpoint.url, model="fake-model")
+        async with LLMClient(target, RunConfig(targets=[target])) as client:
+            record = await client.execute(spec(), lifecycle_observer=received.append)
+    assert record.valid
+    assert received[0].kind == "started" and received[-1].kind == "terminal"
+    assert len([item for item in received if item.kind == "answer"]) == 1
+    assert {item.request_id for item in received} == {record.id}
 
 
 class Chunks(httpx.AsyncByteStream):
@@ -156,6 +367,31 @@ async def test_first_answer_waits_for_reasoning_and_excludes_trailing_stall(monk
     assert result.first_reasoning_ms < result.first_output_ms
     assert result.max_stream_gap_ms is None
     assert result.output == "42" and result.reasoning == "thinking"
+
+
+async def test_ordinary_stream_preserves_reasoning_after_finish(monkeypatch):
+    client, _, _ = setup_client(monkeypatch, [
+        event("42"), event(finish="stop"),
+        b'data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":5}}\n\n',
+        event(reasoning="late reasoning"), b"data: [DONE]\n\n",
+    ])
+    async with client:
+        result = await client.execute(spec())
+    assert result.valid and result.reasoning == "late reasoning"
+
+
+@pytest.mark.parametrize("inline", [False, True])
+@pytest.mark.parametrize("completion", [0, 3])
+async def test_reasoning_without_breakdown_preserves_zero_completion_usage(monkeypatch, inline, completion):
+    client, _, _ = setup_client(monkeypatch, [
+        event("<think>thinking</think>42" if inline else "42",
+              reasoning=None if inline else "thinking"),
+        event(finish="stop", usage={"completion_tokens": completion}), b"data: [DONE]\n\n",
+    ])
+    async with client:
+        result = await client.execute(spec())
+    assert result.valid and result.completion_tokens == completion
+    assert result.output_tokens == (0 if completion == 0 else None)
 
 
 async def test_generation_timing_ends_at_answer_not_finish_or_usage(monkeypatch):
@@ -815,6 +1051,8 @@ async def test_execute_closes_untransferred_sse_iterator_before_return(monkeypat
             payload = "{" if failure == "protocol" else json.dumps(
                 {"choices": [{"delta": {"content": "42"}, "finish_reason": None}]})
             yield "message", payload, time.perf_counter()
+            if kwargs.get("mark_read_end"):
+                yield None, "", time.perf_counter()
             await asyncio.Event().wait()
         finally:
             closed.set()

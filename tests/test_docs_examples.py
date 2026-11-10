@@ -63,7 +63,7 @@ def test_readme_quickstart_uses_shared_defaults_and_model_discovery():
     assert 'git clone' not in install
     assert 'python3 -m venv .venv' in install
     assert 'source .venv/bin/activate' in install
-    assert 'python -m pip install "giraffe-llm==0.1.0a1"' in install
+    assert 'python -m pip install "giraffe-llm==0.1.0a2"' in install
     block = README.split('### 2. Start your run\n', 1)[1].split('\n### ', 1)[0]
     command = next(line for line in block.splitlines() if line.startswith('giraffe run '))
     assert command == 'giraffe run --url http://127.0.0.1:11434/v1 --html'
@@ -149,3 +149,30 @@ def test_sglang_example_uses_default_port_and_metrics_profile():
     assert target.url == 'http://127.0.0.1:30000/v1'
     assert target.metrics_profile == 'sglang'
     assert 'examples/sglang.yaml' in README
+
+
+def test_scale_down_example_resolves_existing_fixtures_and_keeps_followup_capacity():
+    from giraffe.fixtures import builtin_fixtures
+    from giraffe.models import required_concurrency
+    from giraffe.scale_down import resolve_fixtures
+
+    values = yaml.safe_load((ROOT / 'examples' / 'scale-down.yaml').read_text())
+    config = RunConfig.model_validate(values)
+    long, followup = resolve_fixtures(config.scale_down, builtin_fixtures(config))
+    assert long.fixture_id == config.scale_down.long_fixture
+    assert followup.fixture_id == config.scale_down.followup_fixture
+    assert required_concurrency(config)['peak'] > config.scale_down.long_cohort_size
+    assert config.scale_down.max_duration_seconds <= config.max_duration_seconds
+
+
+def test_documented_scale_down_custom_fixtures_load_with_existing_scorers(tmp_path):
+    from giraffe.fixtures import load_custom_fixtures
+
+    workloads = (ROOT / 'docs' / 'workloads.md').read_text()
+    section = workloads.split('## Scale-down continuity\n', 1)[1]
+    block = re.search(r'```json\n(.*?)```', section, re.DOTALL).group(1)
+    path = tmp_path / 'representative.json'
+    path.write_text(block)
+    fixtures = load_custom_fixtures(str(path))
+    assert [(fixture.fixture_id, fixture.scorer) for fixture in fixtures] == [
+        ('representative.long', 'contains'), ('representative.short', 'exact')]

@@ -39,7 +39,7 @@ def tail(p50, p90, *, n=200):
 def observations(configuration, check="correctness", *, p50=10, p90=20, concurrency=None):
     options = configuration.effective_check(check)
     effective = configuration.model_copy(update={key: value for key, value in options.items() if key != "limits"})
-    fixtures = builtin_fixtures(effective, check_id=check)[check]
+    fixtures = builtin_fixtures(effective)[check]
     concurrency = concurrency or options.get("concurrency", 1)
     return {target.name: [{"family": check, "concurrency": concurrency, "stream": spec.stream,
                            "output_cap": spec.max_tokens, "input_bucket": input_bucket(spec.input_chars),
@@ -414,9 +414,16 @@ async def test_concurrent_load_plan_windows_and_calibration_bounds_match_inproce
     assert len(run.records) > calibration_count
 
 
-def test_finite_gather_batches_use_slowest_comparable_fixture_per_batch():
+def test_finite_gather_batches_use_slowest_comparable_fixture_per_batch(monkeypatch):
+    from giraffe import planning
+
     configured = config(checks=["serving"], samples=3)
-    fixtures = builtin_fixtures(configured, check_id="serving")["short"]
+    generated = builtin_fixtures(configured)
+    # Distinct input shapes keep separate latency cohorts even when both use
+    # the same configured output allowance.
+    generated["short"][1] = generated["short"][1].model_copy(update={"input_chars": 2048})
+    monkeypatch.setattr(planning, "builtin_fixtures", lambda *args, **kwargs: generated)
+    fixtures = generated["short"]
     measured = {"service": [{"family": "serving", "concurrency": 1, "stream": configured.stream,
         "output_cap": spec.max_tokens, "input_bucket": input_bucket(spec.input_chars),
         **tail(delay, 2 * delay)} for spec, delay in zip(fixtures, [10, 100])]}
@@ -490,7 +497,7 @@ def test_validation_preview_does_not_build_large_effective_fixture_inputs(monkey
 
     monkeypatch.setattr(planning, "builtin_fixtures", fixture_call)
     request_plan(configured)
-    assert calls == [(128, {}), (512, {})]
+    assert calls == [(128, {}), (configured.max_output_tokens + 512, {})]
 
 
 def test_overlapping_targets_keep_concurrency_bounds_while_refilling(monkeypatch):

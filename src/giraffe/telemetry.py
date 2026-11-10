@@ -18,6 +18,7 @@ from .caps import (
     MAX_METRICS_LABEL_CHARS,
 )
 from giraffe.deployment import sanitize
+from .models import MAX_SCALE_DOWN_SNAPSHOTS
 
 logger = logging.getLogger(__name__)
 
@@ -561,11 +562,28 @@ def _remember_discovery(run, target, result):
 
 
 async def sample_during(run, target, *, stop_event: asyncio.Event):
+    from giraffe.deployment import scale_down_enabled, snapshot
+
     data = run.observations[target.name]["serving_telemetry"]
+    lifecycle_enabled = scale_down_enabled(target, run.config)
+    lifecycle_history = (run.observations[target.name].setdefault("scale_down_deployment_history", [])
+                         if lifecycle_enabled else None)
+    lifecycle_limit = min(run.config.metrics_max_samples, MAX_SCALE_DOWN_SNAPSHOTS)
+
+    def lifecycle_limit_reached():
+        if lifecycle_history is not None:
+            if not lifecycle_history:
+                lifecycle_history.append({"scale_down_limitations": []})
+            limitations = lifecycle_history[-1].setdefault("scale_down_limitations", [])
+            reason = "Lifecycle polling reached the configured sample limit."
+            if reason not in limitations:
+                limitations.append(reason)
+
     last = None
     while not stop_event.is_set() and not run.stop.is_set() and time.monotonic() < run.deadline:
         if len(data["snapshots"]) >= run.config.metrics_max_samples - 1:
             data["sample_limit_reached"] = True
+            lifecycle_limit_reached()
             return
         phase = (
             ",".join(
@@ -580,15 +598,21 @@ async def sample_during(run, target, *, stop_event: asyncio.Event):
             data["collection_gaps_seconds"].append(snap["elapsed_seconds"] - last)
         last = snap["elapsed_seconds"]
         data["snapshots"].append(snap)
+        deployment_history = run.observations[target.name]["deployment_history"]
+        collect_lifecycle = lifecycle_history is not None and len(lifecycle_history) < lifecycle_limit
         if (
             not stop_event.is_set() and target.deployment.collector_url
-            and len(run.observations[target.name]["deployment_history"]) < MAX_DEPLOYMENT_HISTORY
+            and (len(deployment_history) < MAX_DEPLOYMENT_HISTORY or collect_lifecycle)
         ):
-            from giraffe.deployment import snapshot
-
-            run.observations[target.name]["deployment_history"].append(
-                await snapshot(target, run.config, run.deadline, run.stop)
-            )
+            kwargs = {"run_start": run.start} if lifecycle_enabled else {}
+            observed = await snapshot(target, run.config, run.deadline, run.stop, **kwargs)
+            if len(deployment_history) < MAX_DEPLOYMENT_HISTORY:
+                deployment_history.append(observed)
+            if collect_lifecycle:
+                lifecycle_history.append({key: observed[key] for key in
+                    ("scale_down_lifecycle", "scale_down_limitations") if key in observed})
+            elif lifecycle_enabled:
+                lifecycle_limit_reached()
         # A transport cancellation scope can consume Task.cancel() while
         # finishing a scrape. The target's explicit stop still ends sampling
         # before another interval wait, without stopping peer targets.

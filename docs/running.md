@@ -22,6 +22,48 @@ useful answer. The default p95 first-output limit is 10,000 ms; override it with
 Results appear in the terminal and in `runs/<timestamp>/report.json` and
 `report.html`. The command exits when done.
 
+Standard built-in answer fixtures, including `short.copy`, use `max_output_tokens` as their
+output allowance. For a reasoning model that exhausts its budget before answering,
+raise it with `--max-output-tokens 2048` or YAML `max_output_tokens: 2048`.
+Supported `test_options.<check>.max_output_tokens` values override that default;
+`access` has no separate output setting and shares the initial request's resolved
+serving/first-output allowance. Custom fixtures, request-pack cases, session turns
+and load profiles keep their own explicit budgets; consistency retains its
+documented default allowance. Only the intentional output-cap probe
+(`limits.output_cap`) retains its small limit. The backend-cancellation probe and
+its follow-up (`limits.backend_cancel`, `limits.backend_cancel.followup`, formerly
+128 and 8 tokens) now use the resolved cancellation allowance, so a raised
+`max_output_tokens` lets a reasoning model stream before the probe is cancelled. A larger allowance does not force a longer answer
+and still needs room alongside the prompt in the model's context window.
+
+The optional context check verifies recall at 80% of the full declared window.
+Its output allowance must leave at least that much input space; reserving more
+than 20% of the window makes this coverage impossible. For example, a 2,048-token
+output allowance in a 4,096-token window cannot establish near-limit recall.
+Use a context-specific allowance that still lets the model finish its answer:
+
+```yaml
+max_output_tokens: 2048
+test_options:
+  context:
+    max_output_tokens: 512
+```
+
+The optional prefix check also reserves the global output allowance. The default
+`prefix.prefix_chars: 8192` does not fit a 4,096-token window with a 2,048-token
+output allowance, so no prefix requests are sent. Reduce `prefix.prefix_chars`
+or the global `max_output_tokens`, set a prefix-specific allowance with
+`test_options.prefix.max_output_tokens`, or set `test_options.prefix.context_limit`
+to a larger window only if the model supports it. Validate or preview the
+configuration to see these warnings before sending traffic.
+
+```yaml
+max_output_tokens: 2048
+test_options:
+  prefix:
+    max_output_tokens: 32
+```
+
 Generate a saved configuration, then review its endpoint, model and limits:
 
 ```sh
@@ -154,6 +196,13 @@ Use **Change baseline** to compare the same measurements against another saved
 reference. Saved baselines and request evidence remain unchanged; incompatible
 workloads or insufficient evidence still produce inconclusive results.
 
+Timing comparisons include both the median and p95 for full response time, first
+useful output, and the longest pause per response. A qualified regression in
+either can fail the baseline check. P95 needs at least 20 measured samples in
+each run (or the configured minimum, if higher); small runs retain their median
+comparisons. P95 uses the same workload, client-timing, and uncertainty checks,
+and also checks for changes in the tails of observed input and output lengths.
+
 The local API provides the same operation: `POST /api/runs/{run_id}/compare`
 with `{"baseline_id": "<saved-baseline-id>"}`. List references with
 `GET /api/baselines`. Only completed reports can be compared.
@@ -187,6 +236,9 @@ Incompatible workloads leave metric comparison inconclusive. See
 The **Baseline comparison** panel shows all measurements by default: baseline,
 current, and change. Changes are signed as
 current minus baseline; correctness and other rates use percentage points.
+Timing and output-rate regressions use `limits.regression_percent`; error,
+correctness, and other percentage rates use `limits.regression_rate_points`
+(5 percentage points by default).
 Answer lengths are observations, not better/worse judgments.
 
 **Pass / fail** reports acceptance separately. A failed
@@ -292,7 +344,7 @@ config-only. These options moved from ordinary help into the advanced group:
   `--request-pack`, `--retention`, `--ca-bundle`, `--proxy`.
 - `--first-output-ms`, `--latency-ms`, `--stream-gap-ms`,
   `--min-output-tokens-per-second`, `--max-error-rate`, `--min-correctness`,
-  `--regression-percent`, `--save-config`.
+  `--regression-percent`, `--regression-rate-points`, `--save-config`.
 - `--max-total-storage`, `--min-free-disk`, `--max-run-storage`,
   `--auto-cleanup-keep-latest`, `--auto-cleanup-older-than`,
   `--auto-cleanup-max-total`, `--runs-dir`.
@@ -361,3 +413,62 @@ tokenizer. Explicitly configuring an HF tokenizer without the extra fails with
 an install hint; automatic resolution silently falls back to built-in sizing.
 The UI verifies a typed **Token ID / tokenizer** before continuing. **Automatic**
 and **builtin** need no setup check; Automatic resolves when the run starts.
+
+## Scale-down continuity
+
+Use `examples/scale-down.yaml` for an existing endpoint with at least two replica
+incarnations. Set its model, inference URL and read-only `collector_url`, and
+choose traffic and grace settings appropriate to that deployment. The
+[workload guide](workloads.md#scale-down-continuity) specifies the evidence schema
+and fixture requirements.
+
+```sh
+giraffe validate --config examples/scale-down.yaml
+giraffe preview --config examples/scale-down.yaml
+giraffe run --config examples/scale-down.yaml --html
+```
+
+Preview reports the scenario's worst-case request/time allowance and any tighter
+global limits. During the run, wait for **armed**: baseline answers succeeded and
+real long-answer text has arrived. Keep those answers active through the removal.
+The operator performs one removal externally and marks it in the active run;
+Giraffe never chooses, provisions or deletes a replica. The marker is intent, not
+proof that draining or process termination occurred.
+
+For a standalone CLI run, use its live run directory:
+
+```sh
+giraffe mark-scale-down RUN_DIR --event-id removal-1 --replica-id REPLICA_INCARNATION --source operator --wait-seconds 5
+```
+
+The command reads the live nonce and target, submits a bounded atomic marker, and
+waits for the worker acknowledgment. **Accepted**, **rejected** and
+**submitted without acknowledgment** are different outcomes. Repeating an
+accepted event returns its original acknowledgment; a conflicting event cannot
+replace it. An early rejection can be retried with the same event ID after the
+scenario arms, and the retry waits for its own worker acknowledgment. An unarmed,
+finished, wrong-target or old-nonce submission is rejected. One marker is accepted
+per scenario.
+
+In the UI, configure the scale-down check, wait for its armed state and use
+**Mark removal**. The API equivalent is
+`POST /api/runs/{identifier}/scale-down/event`; use the current `nonce` and `target`
+from live run status, with this JSON body:
+
+```json
+{"event_id":"removal-1","nonce":"CURRENT_RUN_NONCE","target":"service","replica_id":"REPLICA_INCARNATION","source":"operator"}
+```
+
+`replica_id` is optional when unknown; complete backend evidence must still
+identify one removed incarnation. Optional `operator_at` records operator time;
+the CLI equivalent is `--operator-at 2026-11-05T12:34:56+00:00`. It defaults to
+null; use the same timestamp when retrying an accepted event. Worker receipt and
+acceptance times remain separate. Existing API authentication
+and origin restrictions apply.
+
+Inspect all three result rows and their request/event evidence in the live view
+and saved report. A failed original response remains a failure even if subsequent
+traffic succeeds. A client budget cancellation is labeled separately. Historical
+reproduction preserves the prior evidence but starts with a fresh nonce and
+requires a new external event. Automatic baseline comparison between different
+external removals is unsupported.

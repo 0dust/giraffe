@@ -8,6 +8,8 @@ import httpx
 import pytest
 from fastapi import HTTPException
 
+from giraffe.models import RunConfig, Target
+from giraffe.preflight import check_target
 from giraffe.web import ConnectionTest, check_connection
 from tests.test_web import browser, config, report, successful_runner
 
@@ -62,6 +64,35 @@ async def test_explicit_model_sends_one_bounded_request_and_preserves_auth(monke
     assert "private" not in str(result)
 
 
+async def test_preflight_omits_configured_stream_options(monkeypatch):
+    def respond(request):
+        payload = json.loads(request.content)
+        if payload.get("stream_options") and not payload["stream"]:
+            return httpx.Response(400, json={"error": {
+                "message": "Stream options can only be defined when `stream=True`.",
+                "param": "stream_options",
+            }})
+        return httpx.Response(200, json=answer())
+
+    requests, _ = endpoint(monkeypatch, respond)
+    target = Target(name="vllm", url="http://server/v1", model="model")
+    run_config = RunConfig(targets=[target], stream=True, request_options={
+        "temperature": 0,
+        "stream_options": {"include_usage": True, "continuous_usage_stats": True},
+    })
+    result = await check_target(target, run_config)
+
+    assert result["status"] == "connected"
+    assert len(requests) == 1
+    payload = json.loads(requests[0].content)
+    assert payload["stream"] is False and payload["temperature"] == 0
+    assert "stream_options" not in payload
+    assert run_config.stream is True
+    assert run_config.request_options["stream_options"] == {
+        "include_usage": True, "continuous_usage_stats": True,
+    }
+
+
 async def test_single_model_is_discovered_once_and_then_probed(monkeypatch):
     requests, _ = endpoint(monkeypatch, lambda request: httpx.Response(
         200, json={"data": [{"id": "only-model"}, {"id": "only-model"}]}
@@ -89,6 +120,60 @@ async def test_model_choice_or_manual_entry_never_sends_inference(monkeypatch, r
     assert result["status"] == "needs_model" and result["models"] == models
     assert len(requests) == 1 and requests[0].method == "GET"
     assert "private" not in str(result)
+
+
+async def test_discovered_model_survives_an_answerless_test(monkeypatch):
+    # A thinking model can spend the whole 32-token budget on reasoning.
+    reasoning = {"choices": [{"message": {"content": "", "reasoning_content": "Let me think"},
+                              "finish_reason": "length"}]}
+    requests, _ = endpoint(monkeypatch, lambda request: httpx.Response(200, json={"data": [{"id": "qwen3:0.6b"}]})
+                           if request.method == "GET" else httpx.Response(200, json=reasoning))
+    result = await check_connection(ConnectionTest(url="http://server"))
+    assert result["status"] == "unverified"
+    assert result["model"] == "qwen3:0.6b" and result["models"] == ["qwen3:0.6b"]
+    assert 'Found "qwen3:0.6b"' in result["message"] and "Choose checks" in result["message"]
+    assert [request.method for request in requests] == ["GET", "POST"]
+    # Retrying sends the filled-in name; the same response must not turn into an error.
+    retry = await check_connection(ConnectionTest(url="http://server", model="qwen3:0.6b", discovered=True))
+    assert retry == result
+    # A name the user typed has nothing to preserve, so the advisory error is unchanged.
+    with pytest.raises(HTTPException) as error:
+        await check_connection(ConnectionTest(url="http://server", model="qwen3:0.6b"))
+    assert error.value.status_code == 422 and "usable answer" in error.value.detail
+
+
+async def test_empty_completed_answer_keeps_the_discovered_model(monkeypatch):
+    empty = {"choices": [{"message": {"content": ""}, "finish_reason": "stop"}]}
+    endpoint(monkeypatch, lambda request: httpx.Response(200, json={"data": [{"id": "only-model"}]})
+             if request.method == "GET" else httpx.Response(200, json=empty))
+    result = await check_connection(ConnectionTest(url="http://server"))
+    assert result["status"] == "unverified" and result["model"] == "only-model"
+
+
+@pytest.mark.parametrize("model,discovered", [(None, False), ("only-model", True)])
+@pytest.mark.parametrize("response", [
+    lambda: httpx.Response(200, text="private malformed body"),
+    lambda: httpx.Response(200, json={"choices": [{"message": {"content": "OK"}, "finish_reason": 7}]}),
+    lambda: httpx.Response(200, json={"choices": [{"message": {"content": "OK"}}]}),
+    lambda: httpx.Response(200, json={"choices": [{"message": {"content": ""}, "finish_reason": "content_filter"}]}),
+    lambda: httpx.Response(200, json={"error": {"message": "private failure"}}),
+])
+async def test_protocol_failures_stay_errors_not_unverified(monkeypatch, model, discovered, response):
+    endpoint(monkeypatch, lambda request: httpx.Response(200, json={"data": [{"id": "only-model"}]})
+             if request.method == "GET" else response())
+    with pytest.raises(HTTPException) as error:
+        await check_connection(ConnectionTest(url="http://server", model=model, discovered=discovered))
+    assert error.value.status_code == 422 and "usable answer" in error.value.detail
+    assert "private" not in error.value.detail
+
+
+@pytest.mark.parametrize("status", [400, 500])
+async def test_discovered_model_is_not_kept_when_the_server_rejects_the_test(monkeypatch, status):
+    endpoint(monkeypatch, lambda request: httpx.Response(200, json={"data": [{"id": "only-model"}]})
+             if request.method == "GET" else httpx.Response(status, text="private failure"))
+    with pytest.raises(HTTPException) as error:
+        await check_connection(ConnectionTest(url="http://server"))
+    assert error.value.status_code == 422 and "private" not in error.value.detail
 
 
 @pytest.mark.parametrize("model", [None, "manual-model"])

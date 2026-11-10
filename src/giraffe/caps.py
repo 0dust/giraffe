@@ -46,6 +46,8 @@ MAX_MIGRATION_NOTES = 1000
 MAX_BASELINE_NAME_CHARS = 120
 MAX_DATASET_PREVIEW_ROWS = 5
 MAX_TOOL_CALLS = 16
+MAX_TOKEN_EVIDENCE_PROBE_ATTEMPTS = 3
+MAX_GATEWAY_USAGE_TOKENS = 10**12
 MAX_TOOL_NAME_CHARS = 64
 MAX_HTML_PREVIEW_CHARS = 1200
 MAX_HTML_JSON_PREVIEW_CHARS = 6000
@@ -85,6 +87,8 @@ def cap_policy(path):
     path = path.removesuffix("[]")
     name = path.rsplit(".", 1)[-1]
     label = _CAP_LABELS.get(name, name.replace("_", " ").capitalize())
+    if path == "multi_user.levels":
+        return "User population levels", "implementation constraint", "the supported population of 1–32 users, independently of shared request slots"
     if path.startswith("load_test."):
         label = {"rates": "Rates (requests/second)", "size": "Burst size (requests)",
                  "first_seconds": "First burst after (seconds)", "gap_seconds": "Time between bursts (seconds)",
@@ -168,3 +172,5 @@ def cap_explanations(limits):
     if help_text:
         explanations[prefix] = {"label": "Probability evidence", "help": help_text}
     return explanations
+
+MAX_SIMULATED_USERS = 32

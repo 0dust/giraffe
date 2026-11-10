@@ -15,8 +15,12 @@ NAMES = {
     'correctness': 'Answer correctness', 'json': 'JSON correctness',
     'cancellation': 'Cancellation & limits', 'recovery': 'Recovery after load',
     'gpu': 'GPU metrics', 'prefix': 'Prefix cache',
-    'sessions': 'Multi-turn sessions', 'consistency': 'Answer consistency',
+    'sessions': 'Multi-turn sessions', 'multi_user': 'Multi-user', 'consistency': 'Answer consistency',
     'tools': 'Tool calling',
+    'gateway_policy': 'Gateway quotas & priorities',
+    'gateway_attribution': 'Gateway usage attribution',
+    'gateway_access': 'Gateway access policy',
+    'scale_down': 'Scale-down continuity',
 }
 
 

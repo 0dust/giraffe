@@ -14,7 +14,7 @@ from giraffe.latency import latency_summary
 from giraffe.models import RunConfig
 from giraffe.planning import request_plan
 from tests.test_runner import FakeClient
-from tests.virtual_clock import run_virtual
+from tests.virtual_clock import VirtualLoop, run_virtual
 
 
 pytestmark = pytest.mark.usefixtures("local_tokenizer")
@@ -76,6 +76,20 @@ CASES = {
                  "overlap_models": True, "checks": ["correctness"],
                  "test_options": {"correctness": {"samples": 128, "concurrency": 4}}},
 }
+
+
+def test_virtual_loop_does_not_fire_timer_one_ulp_early():
+    async def measure():
+        await asyncio.sleep(.25)
+        loop = asyncio.get_running_loop()
+        deadline = math.nextafter(loop.time(), math.inf)
+        observed = loop.create_future()
+        loop.call_at(deadline, lambda: observed.set_result(loop.time()))
+        loop.call_soon(lambda: None)
+        assert await observed == deadline
+
+    with asyncio.Runner(loop_factory=VirtualLoop) as execution:
+        execution.run(measure())
 
 
 def test_virtual_clock_waits_for_executor_work(monkeypatch):

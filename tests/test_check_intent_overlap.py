@@ -14,6 +14,8 @@ from giraffe.overlap import evidenced_overlap, output_window, peak_evidenced_con
 from giraffe.runner import _Run, _checks, _missing_timing, _pack_results, _stats, _timing_violations, run_suite
 from giraffe.workloads import results, spec
 from tests.fake_endpoint import FakeEndpoint
+from tests.measurement_clock import MeasurementClock
+from tests.virtual_clock import run_virtual
 
 
 def configuration(**extra):
@@ -277,6 +279,7 @@ class StreamEndpoint:
     def __init__(self, monkeypatch, serial):
         import httpx
         from giraffe.client import LLMClient
+        self.clock = MeasurementClock(monkeypatch)
         self.lock = asyncio.Lock() if serial else None
         async def enter(client):
             client._client = httpx.AsyncClient(transport=httpx.MockTransport(self.handle))
@@ -300,7 +303,7 @@ class StreamEndpoint:
         usage = {'prompt_tokens': len(prompt.split()) + 8, 'completion_tokens': len(pieces)}
         if self.lock:
             await self.lock.acquire()
-        await asyncio.sleep(.003)
+        await asyncio.sleep(0)
         endpoint = self
         class Stream(httpx.AsyncByteStream):
             released = False
@@ -313,8 +316,10 @@ class StreamEndpoint:
                 try:
                     for piece in pieces:
                         yield ('data: ' + json.dumps({'model': 'fake-model', 'choices': [{'delta': {'content': piece}}]}) + '\n\n').encode()
-                        await asyncio.sleep(.001)
-                    await asyncio.sleep(.01)
+                        await asyncio.sleep(0)
+                    # Keep an observable interval after the single answer chunk.
+                    # The yield lets parallel streams emit before either completes.
+                    endpoint.clock.advance(.01)
                     yield ('data: ' + json.dumps({'choices': [{'delta': {}, 'finish_reason': finish}], 'usage': usage}) + '\n\ndata: [DONE]\n\n').encode()
                 finally:
                     await self.aclose()
@@ -324,7 +329,7 @@ class StreamEndpoint:
 
 
 @pytest.mark.parametrize('serial', [False, True])
-async def test_single_chunk_packs_and_sessions_have_repeatable_evidence(monkeypatch, serial):
+def test_single_chunk_packs_and_sessions_have_repeatable_evidence(monkeypatch, serial):
     endpoint = StreamEndpoint(monkeypatch, serial)
     settings = configuration(targets=[{'name': 'local', 'url': endpoint.url, 'model': 'fake-model'}],
         checks=['correctness', 'sessions'], request_source='request_pack',
@@ -332,22 +337,27 @@ async def test_single_chunk_packs_and_sessions_have_repeatable_evidence(monkeypa
             {'fixture_id': f'question-{index}', 'messages': [{'role': 'user', 'content': f'Return 42 for question {index}'}],
              'scorer': 'exact', 'expected': '42'} for index in range(6)]},
         sessions={'sessions': 2, 'concurrency': 2, 'modes': ['live']})
-    for _ in range(5):
-        report = await run_suite(settings)
-        expected = 'inconclusive' if serial else 'pass'
-        for result in report.checks:
-            if result.id in settings.checks:
-                assert result.status == expected, (result.id, result.summary, result.metrics)
-            if result.id == 'correctness':
-                pack = result.metrics['request_pack']
-                assert pack['control_status'] == 'pass'
-                assert pack['loaded_status'] == expected
-                assert all((case['loaded']['evidenced_overlap'] == 1 if serial else
-                            case['loaded']['evidenced_overlap'] >= 2) for case in pack['cases'])
-            if result.id == 'sessions':
-                assert (result.metrics['evidenced_session_overlap'] == 1 if serial else
-                        result.metrics['evidenced_session_overlap'] >= 2)
-        assert all(r.answer_chunks == 1 for r in report.requests)
+
+    async def scenario():
+        for _ in range(5):
+            report = await run_suite(settings)
+            expected = 'inconclusive' if serial else 'pass'
+            for result in report.checks:
+                if result.id in settings.checks:
+                    assert result.status == expected, (result.id, result.summary, result.metrics)
+                if result.id == 'correctness':
+                    pack = result.metrics['request_pack']
+                    assert pack['control_status'] == 'pass'
+                    assert pack['loaded_status'] == expected
+                    assert all((case['loaded']['evidenced_overlap'] == 1 if serial else
+                                case['loaded']['evidenced_overlap'] >= 2) for case in pack['cases'])
+                if result.id == 'sessions':
+                    assert (result.metrics['evidenced_session_overlap'] == 1 if serial else
+                            result.metrics['evidenced_session_overlap'] >= 2)
+            assert all(r.answer_chunks == 1 for r in report.requests)
+
+    # Virtual time keeps the two workers' ~11 ms stream windows aligned regardless of host load.
+    run_virtual(monkeypatch, scenario())
 
 
 @pytest.mark.parametrize('levels,expected', [([1], 'pass'), ([1, 2], 'inconclusive')])

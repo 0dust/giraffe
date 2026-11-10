@@ -97,6 +97,47 @@ def test_readiness_is_excluded_and_unmeasured_target_work_stays_separate():
     assert overlap["unknown_time_components"] == result["unknown_time_components"]
 
 
+@pytest.mark.parametrize("overlap,bound", [(False, 34), (True, 30)])
+def test_restart_setup_replaces_initial_connection_allowance(overlap, bound):
+    result = plan(config(checks=["access"], restart_target="local", overlap_models=overlap, stream=False,
+                         request_timeout_seconds=10, readiness_timeout_seconds=20,
+                         test_options={"access": {"request_timeout_seconds": 4}},
+                         targets=[{"name": "local", "url": "http://localhost:1", "model": "a",
+                                   "restart_command": ["restart-service"]},
+                                  {"name": "other", "url": "http://localhost:2", "model": "b"}]))
+
+    assert result["estimated_high_seconds"] == 0
+    assert result["budget_high_seconds"] == bound
+    assert [(item["target"], item["id"], item["high_seconds"]) for item in result["time_timeline"]] == [
+        ("local", "restart_hook", 10), ("local", "restart_readiness", 20), ("other", "initial", 4)]
+
+
+@pytest.mark.parametrize("cap,eligible", [(None, True), (6, False), (7, True)])
+def test_streamed_restart_compatibility_allowance_depends_on_target_quota(cap, eligible):
+    result = plan(config(checks=["access", "serving"], samples=2, stream=True,
+                         restart_target="local", request_timeout_seconds=10, readiness_timeout_seconds=20,
+                         max_requests=cap,
+                         targets=[{"name": "local", "url": "http://localhost:1", "model": "a",
+                                   "restart_command": ["restart-service"]},
+                                  {"name": "other", "url": "http://localhost:2", "model": "b"}]))
+    setup = [(item["target"], item["id"], item["high_seconds"])
+             for item in result["time_timeline"] if item["kind"] == "setup"]
+    expected = [("local", "restart_hook", 10), ("local", "restart_readiness", 20)]
+    if eligible:
+        expected.append(("local", "performance_evidence_probe", 10))
+    assert setup == [*expected, ("other", "initial", 10)]
+    assert result["budget_high_seconds"] == (50 if eligible else 40)
+    assert result["estimated_high_seconds"] is None
+
+
+def test_deadline_remedy_omits_minimum_when_the_estimate_fits_the_failed_cap():
+    from giraffe.runner import _deadline_guidance, _deadline_remediation
+
+    configuration = config(checks=["access"], request_timeout_seconds=10, max_duration_seconds=10)
+    assert _deadline_remediation(configuration) == {"action": "set_limit", "limit": "max_duration"}
+    assert _deadline_guidance(configuration) == "Increase --max-duration (current 10 s) or select fewer checks."
+
+
 def test_context_unknown_timeout_bounds_and_sessions_include_fixed_pauses():
     result = plan(config(checks=["context"], samples=2, request_timeout_seconds=10))
     first = next(row["requests_per_target"] for row in result["rows"] if row["id"] == "context_first_batch")
@@ -309,11 +350,12 @@ def test_every_check_has_an_explained_row_and_planning_has_no_execution_side_eff
     monkeypatch.setattr(os, "getenv", forbidden)
     monkeypatch.setattr(subprocess, "run", forbidden)
     monkeypatch.setattr("giraffe.fixtures.load_custom_fixtures", forbidden)
-    configuration = config(checks=list(CHECK_NAMES))
+    configuration = config(checks=list(CHECK_NAMES), scale_down={"target": "local"})
     result = plan(configuration)
     rows = {row["id"]: row for row in result["rows"]}
-    assert set(CHECK_NAMES) - {"load"} <= rows.keys()
+    assert set(CHECK_NAMES) - {"load", "multi_user"} <= rows.keys()
     assert {"load_combinations", "load_calibration"} <= rows.keys()
+    assert {f"multi_user_{level}" for level in configuration.multi_user.levels} <= rows.keys()
     assert all(row["source"] and row["summary"] for row in rows.values())
     assert result["count_kind"] == "bounded"
 
@@ -534,3 +576,16 @@ def test_saved_question_shape_warning_is_exposed_in_shared_plan_before_running()
     assert warning['msg'] in result['warnings']
     assert warning['msg'] in result['load_test']['saved_shape_warnings']
     assert next(row for row in result['rows'] if row['id'] == 'load_combinations')['source'] == 'your dataset'
+
+
+def test_scale_down_preview_exposes_finite_selected_target_bounds_and_global_ceilings():
+    configuration = config(checks=['scale_down'], max_requests=3, max_duration_seconds=5,
+                           scale_down={'target': 'local'})
+    preview = plan(configuration)
+    row = next(row for row in preview['rows'] if row['id'] == 'scale_down')
+    assert row['target'] == 'local'
+    assert row['max_requests'] == 194
+    assert row['max_duration_seconds'] == 220
+    assert row['effective_request_upper_bound'] == 3
+    assert row['effective_duration_upper_bound'] == 5
+    assert preview['required_concurrency']['by_check']['scale_down'] == 4
