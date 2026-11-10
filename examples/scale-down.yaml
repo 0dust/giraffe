@@ -1,0 +1,30 @@
+config_version: 2
+# Use an existing two-or-more-replica endpoint and a read-only lifecycle exporter.
+# Giraffe sends traffic and observes one removal; an operator removes the replica.
+targets:
+  - name: service
+    url: http://127.0.0.1:8000/v1
+    model: your-model
+    deployment:
+      collector_url: http://127.0.0.1:9090/configuration
+checks: [scale_down]
+stream: true
+max_requests: 250
+max_duration_seconds: 240
+metrics_interval_seconds: 0.5
+scale_down:
+  target: service
+  long_fixture: generation.copy.v1
+  followup_fixture: short.copy.v2
+  requests_per_second: 1
+  concurrency: 4
+  long_cohort_size: 2
+  min_baseline_samples: 2
+  min_overlap_samples: 1
+  min_post_samples: 5
+  baseline_timeout_seconds: 30
+  event_timeout_seconds: 120
+  grace_seconds: 30
+  grace_anchor: drain_effective
+  post_seconds: 10
+  completion_seconds: 30

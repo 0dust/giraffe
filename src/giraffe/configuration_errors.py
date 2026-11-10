@@ -27,7 +27,7 @@ def configuration_errors(items: list[dict], body: Any) -> list[dict]:
     labels = {"max_requests": "Maximum requests", "concurrency": "Simultaneous limit", "max_output_tokens": "Output cap (tokens)",
               "request_timeout_seconds": "Request timeout (seconds)",
               "max_duration_seconds": "Maximum duration", "max_memory_mb": "Maximum memory", "concurrent_load.schedule.levels": "Concurrency levels",
-              "consistency.levels": "Concurrency levels", "sessions.concurrency": "Session concurrency",
+              "multi_user.levels": "User population levels", "consistency.levels": "Concurrency levels", "sessions.concurrency": "Session concurrency",
               "traffic.max_in_flight": "Capacity requests at once"}
 
     def numeric(value):

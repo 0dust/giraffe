@@ -192,10 +192,15 @@ async def test_phase_deadline_and_user_stop_bound_pending_work(monkeypatch, canc
 
     clients = transport(monkeypatch, handler)
     records = [record(i) for i in range(30)]
-    async with asyncio.timeout(.5):
-        summary = await judge_records(configuration(3, concurrency=2, max_duration_seconds=.02),
+    # Stop is set by the first request, so give client initialization time to
+    # finish without the phase deadline competing with that signal.
+    phase_duration = 60 if cancel else .02
+    async with asyncio.timeout(5):
+        summary = await judge_records(configuration(3, concurrency=2, max_duration_seconds=phase_duration),
                                       records, [fixture()], stop_event=stop)
     assert peak <= 2 and started <= 2 and active == 0
+    if cancel:
+        assert started > 0
     assert summary["judge_calls_total"] == 90
     assert all(item.score is None for item in records)
     categories = {vote.error_category for item in records for vote in item.judgement.votes}

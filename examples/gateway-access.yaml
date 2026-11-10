@@ -1,0 +1,30 @@
+# Use an existing LiteLLM endpoint/model and existing test identities.
+# Supply GIRAFFE_ALLOWED_KEY and GIRAFFE_DENIED_KEY in the local environment.
+# The denied identity must be known to be invalid or denied this model.
+# Run: giraffe run --config examples/gateway-access.yaml
+config_version: 2
+targets:
+  - name: gateway
+    url: http://localhost:4000/v1
+    model: your-served-model
+    route: gateway
+    tokenizer: builtin
+    test_identities:
+      allowed:
+        api_key_env: GIRAFFE_ALLOWED_KEY
+      denied:
+        api_key_env: GIRAFFE_DENIED_KEY
+checks: [gateway_access]
+gateway_access:
+  profile: litellm
+  request_timeout_seconds: 10
+  max_output_tokens: 16
+  cases:
+    - name: allowed-model
+      identity: allowed
+      expected: allow
+    - name: denied-model
+      identity: denied
+      expected: deny
+max_requests: 2
+max_duration_seconds: 30

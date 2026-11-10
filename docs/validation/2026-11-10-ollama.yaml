@@ -1,0 +1,6 @@
+# Live Linux GPU run for docs/validation/2026-11-10.md.
+config_version: 2
+targets:
+  - name: ollama
+    url: http://127.0.0.1:11434/v1
+    model: qwen2.5:1.5b

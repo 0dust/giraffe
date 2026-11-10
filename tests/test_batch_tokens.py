@@ -283,3 +283,33 @@ def test_saved_record_without_read_token_source_loads():
         check_ids=["generation"], started_at="now", status="completed")
     saved = RequestRecord.model_validate(sample.model_dump(exclude={"read_output_tokens_source"}))
     assert saved.read_output_tokens_source is None
+
+
+async def test_aligned_reasoning_logprobs_preserve_evidence_without_inventing_usage(monkeypatch):
+    result, _ = await execute(monkeypatch, [
+        chunk(reasoning="think more", tokens=["think", " more"]),
+        chunk("a", tokens=["a"]), chunk("b", tokens=["b"]),
+        chunk(count=9, finish="stop"), DONE])
+    assert result.output_events[0]["token_count"] == 2
+    assert result.output_events[0]["token_count_source"] == "choice.logprobs.content"
+    assert result.completion_tokens == 9
+    assert result.reasoning_tokens is None and result.output_tokens is None
+    assert result.read_output_tokens_source == "logprobs"
+    assert result.generation_tokens_per_second is None
+
+
+@pytest.mark.parametrize("tokens,answer", [
+    (["think", "a"], None),  # Ollama can attach a following answer's tokens here.
+    (["<think>", "think"], None),  # Hidden tags have no classified text boundary.
+    (["think"], "think"),  # Identical answer/reasoning text cannot identify ownership.
+    (["think", "a"], "a"),
+    (["different"], None),
+])
+async def test_ambiguous_reasoning_logprobs_do_not_get_attributed(monkeypatch, tokens, answer):
+    result, _ = await execute(monkeypatch, [
+        chunk(answer, reasoning="think", tokens=tokens),
+        chunk("b", tokens=["b"]), chunk(count=9, finish="stop"), DONE])
+    assert all(event["token_count"] is None for event in result.output_events
+               if event["sequence"] == 0)
+    assert result.reasoning_tokens is None and result.output_tokens is None
+    assert result.generation_tokens_per_second is None

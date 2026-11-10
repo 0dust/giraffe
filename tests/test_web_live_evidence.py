@@ -105,32 +105,33 @@ async def test_unexpected_run_failure_has_traceback_and_matching_error_id(tmp_pa
 
 
 async def test_evicted_cursor_requires_reset_and_current_cursor_only_gets_new_events(tmp_path, monkeypatch):
-    ready = threading.Event()
+    delta_window = 8
+    evicted = 3
+    event_count = delta_window + evicted
+    monkeypatch.setattr("giraffe.web._DELTA_WINDOW", delta_window)
 
     async def waiting(configuration, *, progress, stop_event):
-        for index in range(17000):
+        for index in range(event_count):
             progress({"event": "progress", "completed": index})
-        ready.set()
         await stop_event.wait()
         return report(configuration, cancelled=True)
 
     monkeypatch.setattr("giraffe.web.run_suite", waiting)
     async with browser(tmp_path) as client:
         identifier = await start(client)
-        assert await asyncio.to_thread(ready.wait, 2)
         path = f"/api/runs/{identifier}"
-        for _ in range(200):
-            current = (await client.get(path)).json()
-            if current["seq"] == 17000:
-                break
-            await asyncio.sleep(.005)
+        async with asyncio.timeout(5):
+            while (await client.get(path)).json()["seq"] < event_count:
+                await asyncio.sleep(.005)
         stale = (await client.get(path + "/events?after=0")).json()
-        assert stale["reset"] and stale["seq"] == 17000
+        assert stale["reset"] and stale["seq"] == event_count
         assert not stale["events"] and not stale["records"]
-        retained = (await client.get(path + "/events?after=616")).json()
-        assert not retained["reset"] and len(retained["events"]) == 16384
-        assert retained["events"][0]["seq"] == 617
-        invalid = (await client.get(path + "/events?after=17001")).json()
+        boundary = (await client.get(path + f"/events?after={evicted - 1}")).json()
+        assert boundary["reset"]
+        retained = (await client.get(path + f"/events?after={evicted}")).json()
+        assert not retained["reset"] and len(retained["events"]) == delta_window
+        assert retained["events"][0]["seq"] == evicted + 1
+        invalid = (await client.get(path + f"/events?after={event_count + 1}")).json()
         assert invalid["reset"]
         assert (await client.get(path + "/events?after=-1")).status_code == 422
         await client.post(path + "/cancel", json={})

@@ -63,6 +63,11 @@ def install(monkeypatch, body_for):
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
 
 
+def install_handler(monkeypatch, handler):
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _HTTPX_CLIENT(
+        transport=httpx.MockTransport(handler), **kw))
+
+
 def cfg(**kw):
     values = dict(targets=[Target(name="t", model="m", url="http://local")], checks=["serving"],
                   samples=6, concurrency=1, max_requests=100, max_duration_seconds=30,
@@ -283,6 +288,114 @@ async def test_rate_limit_wait_honors_extended_window():
     await task
 
 
+async def test_runner_cooldown_starts_before_slow_rate_limit_body(monkeypatch):
+    import time
+
+    target = Target(name="t", model="m", url="http://local")
+    config = cfg(concurrency=2, stream=False, stop_after_errors=5, request_timeout_seconds=2)
+    run = runner._Run(config, None, None)
+    body_started = asyncio.Event()
+    dispatches = []
+
+    class SlowBody(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            body_started.set()
+            await asyncio.sleep(.15)
+            yield b'{"error":"limited"}'
+
+        async def aclose(self):
+            pass
+
+    def respond(_request):
+        dispatches.append(time.monotonic())
+        if len(dispatches) == 1:
+            return httpx.Response(429, headers={"Retry-After": "0.35"}, stream=SlowBody())
+        return httpx.Response(200, json={"choices": [{
+            "message": {"content": "42"}, "finish_reason": "stop",
+        }]})
+
+    install_handler(monkeypatch, respond)
+    spec = RequestSpec(fixture_id="f", scenario="warm", check_ids=["serving"], stream=False,
+                       messages=[{"role": "user", "content": "hi"}])
+    async with LLMClient(target, config) as client:
+        first = asyncio.create_task(run.request(target, client, spec))
+        await body_started.wait()
+        second = asyncio.create_task(run.request(target, client, spec))
+        await asyncio.sleep(.1)
+        assert len(dispatches) == 1
+        first_record, second_record = await asyncio.gather(first, second)
+
+    assert first_record.rate_limited and second_record.valid
+    assert dispatches[1] - dispatches[0] >= .3
+
+
+async def test_runner_uses_fallback_and_stops_on_headerless_rate_limit(monkeypatch):
+    import time
+
+    target = Target(name="t", model="m", url="http://local")
+    config = cfg(concurrency=2, stream=False, stop_after_errors=1)
+    run = runner._Run(config, None, None)
+    dispatches = []
+    install_handler(monkeypatch, lambda _request: (
+        dispatches.append(time.monotonic()) or httpx.Response(429, json={"error": "limited"})))
+    spec = RequestSpec(fixture_id="f", scenario="warm", check_ids=["serving"], stream=False,
+                       messages=[{"role": "user", "content": "hi"}])
+    started = time.monotonic()
+    async with LLMClient(target, config) as client:
+        record = await run.request(target, client, spec)
+        dropped = await run.request(target, client, spec)
+
+    assert record.rate_limited and record.retry_after_seconds is None
+    assert dropped is None and len(dispatches) == 1
+    assert run.errors == 0 and run.reason == "rate limit threshold reached"
+    assert run.rate_limit_until["t"] >= started + .9
+
+
+async def test_runner_counts_consecutive_rate_limits_after_reading_error_bodies(monkeypatch):
+    target = Target(name="t", model="m", url="http://local")
+    config = cfg(concurrency=2, stream=False, stop_after_errors=2)
+    run = runner._Run(config, None, None)
+    dispatches = []
+    install_handler(monkeypatch, lambda _request: (
+        dispatches.append(None) or httpx.Response(429, json={"error": "limited"})))
+    spec = RequestSpec(fixture_id="f", scenario="warm", check_ids=["serving"], stream=False,
+                       messages=[{"role": "user", "content": "hi"}])
+
+    async with LLMClient(target, config) as client:
+        first = await run.request(target, client, spec)
+        assert run.rate_limit_failures["t"] == 1
+        second = await run.request(target, client, spec)
+        dropped = await run.request(target, client, spec)
+
+    assert first.rate_limited and second.rate_limited
+    assert dropped is None and len(dispatches) == 2
+    assert run.rate_limit_failures["t"] == 2
+    assert run.reason == "rate limit threshold reached"
+
+
+async def test_runner_drops_cooldown_wait_that_exceeds_window_deadline(monkeypatch):
+    import time
+
+    target = Target(name="t", model="m", url="http://local")
+    config = cfg(stream=False)
+    run = runner._Run(config, None, None)
+    dispatches = []
+    install_handler(monkeypatch, lambda _request: (
+        dispatches.append(time.monotonic()) or httpx.Response(200, json={"choices": [{
+            "message": {"content": "42"}, "finish_reason": "stop",
+        }]})))
+    spec = RequestSpec(fixture_id="f", scenario="warm", check_ids=["serving"], stream=False,
+                       messages=[{"role": "user", "content": "hi"}])
+    run.rate_limit_until["t"] = time.monotonic() + .2
+    latest_dispatch = time.monotonic() + .05
+    async with LLMClient(target, config) as client:
+        async with run.slot(False) as admitted:
+            assert admitted
+            record = await run.request(target, client, spec, slot_reserved=True,
+                                       latest_dispatch_deadline=latest_dispatch)
+
+    assert record is None and not dispatches
+    assert run.attempted == run.budget_used == 0
 
 
 async def test_first_output_counts_timed_out_request_without_output(monkeypatch):
@@ -383,7 +496,15 @@ async def test_intentional_cancellation_does_not_mark_run_unfinished():
     run = runner._Run(config, None, None)
     spec = builtin_fixtures(config)["short"][0].model_copy(update={
         "scenario": "warm", "check_ids": ["serving"], "cancel_after_chunks": 1})
-    await run.request(config.targets[0], FakeClient(status="cancelled"), spec)
+
+    class ChunkCancelled(FakeClient):
+        async def execute(self, spec, **kwargs):
+            record = await super().execute(spec, **kwargs)
+            record.termination_reason = "generation_chunk_limit"
+            return record
+
+    record = await run.request(config.targets[0], ChunkCancelled(status="cancelled"), spec)
+    assert record.intentional
     assert not run.unfinished["t"] and run.reason is None and run.errors == 0
 
 

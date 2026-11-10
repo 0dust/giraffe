@@ -1,0 +1,85 @@
+config_version: 2
+# Simulated users share one endpoint and the same optional API-key reference.
+targets:
+  - name: local
+    url: http://127.0.0.1:8000/v1
+    model: your-model
+    # api_key_env: LLM_API_KEY
+checks: [multi_user]
+concurrency: 5
+max_requests: 2000
+max_duration_seconds: 120
+request_timeout_seconds: 10
+multi_user:
+  scenarios: [repeated_requests]
+  levels: [1, 5, 20]
+  shapes: [short_short]
+  seed: 42
+  duration_seconds: 15
+  warmup_seconds: 0
+  think_time_seconds:
+    values: [0.25]
+  pass_criteria:
+    max_first_answer_ms: 2000
+    max_completion_ms: 10000
+    max_error_percent: 0
+    min_samples: 2
+
+# Optional equal-work criterion (measurement only when omitted):
+# multi_user.pass_criteria.max_throughput_ratio: 1.5
+# multi_user.fairness_tolerance_percent: 10
+# To repeat isolated conversations, add under multi_user:
+# conversations:
+#   modes: [fixed, live]
+#   max_tokens: 32
+#   delay_seconds: 0.5
+# See docs/workloads.md for live tasks and sampled turns.
+
+# To test competing users and local cancellation, replace the multi_user block
+# with the following. Keep the endpoint, checks and shared run limits above.
+# multi_user:
+#   scenarios: [noisy_neighbors, cancellation]
+#   levels: [3]
+#   duration_seconds: 5
+#   think_time_seconds: {values: [0.1]}
+#   noisy_neighbors:
+#     heavy_user_ids: [user-03]
+#     heavy_profiles: [long_short, short_long]
+#     triggers: [before_output, during_stream]
+#     max_slowdown: 1.5
+#   cancellation:
+#     user_id: user-03
+#     cancel_after_chunks: 5
+#   pass_criteria:
+#     min_samples: 2
+#     max_error_percent: 0
+# This schedules eight five-second control/probe windows and one cancellation
+# window. Missing overlap, actual lengths or samples leaves evidence inconclusive.
+# Follow-up success does not prove backend compute or memory release.
+
+# For arrivals and recovery, replace multi_user with the block below.
+# Three users share the same five slots. User-03 joins after five seconds;
+# user-01 bursts while incumbents continue. Recovery then replays matched work.
+# multi_user:
+#   scenarios: [arrivals, recovery]
+#   levels: [3]
+#   shapes: [short_long]
+#   duration_seconds: 15
+#   arrivals:
+#     requests_per_second: 0.5
+#     activations: {user-03: 5}
+#     bursts:
+#       - {user_id: user-01, at_seconds: 8, requests: 3, spacing_seconds: 0}
+#   recovery:
+#     control_seconds: 10
+#     sustained_seconds: 20
+#     lighter_seconds: 10
+#     sustained_requests_per_second: 1
+#     lighter_requests_per_second: 0.5
+#     max_slowdown: 1.5
+#   pass_criteria:
+#     min_samples: 2
+#     max_error_percent: 0
+# These schedules consume 114 offers plus any preparation/warmup. Local drops
+# consume offered-request budget, but never become fabricated endpoint attempts.
+# Reduce rates or raise the shared slot cap if the generator cannot deliver them.

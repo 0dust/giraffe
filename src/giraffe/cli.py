@@ -157,6 +157,14 @@ def parser() -> argparse.ArgumentParser:
     app.add_argument("--version", action="version", version=__version__)
     commands = app.add_subparsers(dest="command", required=True)
     commands.add_parser("describe", help="Print checks, defaults and the full configuration schema as JSON")
+    marker = commands.add_parser("mark-scale-down", help="Mark an external replica removal in an active run")
+    marker.add_argument("run_dir", type=Path)
+    marker.add_argument("--event-id", required=True)
+    marker.add_argument("--replica-id")
+    marker.add_argument("--source", default="operator")
+    marker.add_argument("--operator-at", help="Optional operator timestamp; retained separately from worker receipt time")
+    marker.add_argument("--wait-seconds", type=float, default=5)
+    marker.add_argument("--output-format", choices=["text", "json"], default="text")
     traces = commands.add_parser("sglang-traces", help="Collect local SGLang terminal traces (optional tracing extra)")
     traces.add_argument("--output", required=True, type=Path)
     traces.add_argument("--port", type=int, default=4318)
@@ -285,7 +293,7 @@ Exit codes:
         run.add_argument("--proxy", help="HTTP proxy URL")
         for option in ("first-output-ms", "latency-ms", "stream-gap-ms",
                        "min-output-tokens-per-second", "max-error-rate", "min-correctness",
-                       "regression-percent"):
+                       "regression-percent", "regression-rate-points"):
             run.add_argument("--" + option, type=float, help="Threshold for " + option.replace("-", " "))
         run.add_argument("--baseline", type=Path, help="Compare to this explicitly saved report")
         run.add_argument("--output", type=Path, help="New report directory (never overwrites a run)")
@@ -329,7 +337,7 @@ Exit codes:
     report.add_argument("--output", type=Path, metavar="PATH")
     export = commands.add_parser("export", help="Print a sanitized reproduction snapshot as JSON")
     export.add_argument("report", type=Path)
-    inspect = commands.add_parser("inspect", help="Print recorded deployment/telemetry and comparison JSON")
+    inspect = commands.add_parser("inspect", help="Print recorded deployment, per-user outcomes, telemetry and comparison JSON")
     inspect.add_argument("report", type=Path)
     baseline = commands.add_parser("baseline", help="Explicitly save a run for future comparisons")
     actions = baseline.add_subparsers(dest="action", required=True)
@@ -508,7 +516,8 @@ def _stage_name(scenario: str, config=None) -> str | None:
     return "Running checks"
 
 
-async def _run(config: RunConfig, *, json_progress: bool = False, verbose: bool = False, quiet: bool = False) -> RunReport:
+async def _run(config: RunConfig, *, json_progress: bool = False, verbose: bool = False, quiet: bool = False,
+               directory: Path | None = None) -> RunReport:
     from giraffe.runner import run_suite
 
     stop = asyncio.Event()
@@ -529,9 +538,12 @@ async def _run(config: RunConfig, *, json_progress: bool = False, verbose: bool 
             pass
     last = (None, None)
     last_update = 0.0
+    writer = adapter = sink_token = report = None
 
     def progress(event: dict) -> None:
         nonlocal last, last_update
+        if writer is not None:
+            writer.progress(event)
         if quiet:
             return
         if json_progress:
@@ -551,7 +563,22 @@ async def _run(config: RunConfig, *, json_progress: bool = False, verbose: bool 
             last_update = time.monotonic()
 
     try:
-        report = await run_suite(config, progress=progress, stop_event=stop)
+        options = {}
+        if directory is not None and "scale_down" in config.checks:
+            from giraffe.deployment import safe_config
+            from giraffe.evidence import EvidenceWriter
+            from giraffe.runner import record_sink
+            from giraffe.scale_down_control import ScaleDownFileControl
+
+            writer = EvidenceWriter(directory, manifest={"config": safe_config(config.model_dump(mode="json"))})
+            sink_token = record_sink.set(writer.record_finished)
+            adapter = ScaleDownFileControl(directory)
+            options["on_scale_down_control"] = adapter.bind
+        try:
+            report = await run_suite(config, progress=progress, stop_event=stop, **options)
+        except asyncio.CancelledError as error:
+            report = getattr(error, "giraffe_report", None)
+            raise
         if interrupted:
             # Cooperative signal stops return normally from the suite. Keep
             # their partial evidence on the same export path as task cancellation.
@@ -562,6 +589,27 @@ async def _run(config: RunConfig, *, json_progress: bool = False, verbose: bool 
     finally:
         for sig in installed:
             loop.remove_signal_handler(sig)
+        try:
+            if adapter is not None:
+                await adapter.close()
+        except Exception:
+            logger.exception("Scale-down status file could not be saved")
+            if report is not None:
+                report.warnings.append("Scale-down control status file could not be saved; inspect report evidence.")
+        finally:
+            if writer is not None:
+                from giraffe.runner import record_sink
+                record_sink.reset(sink_token)
+                try:
+                    await asyncio.to_thread(writer.close)
+                except Exception:
+                    logger.exception("CLI evidence writer could not finish")
+                    if report is not None:
+                        report.warnings.append("Live evidence journal could not finish; final report uses completed run state.")
+                if report is not None:
+                    report.observations["evidence_dropped_count"] = writer.dropped_count
+                    if writer.dropped_count:
+                        report.warnings.append(f"{writer.dropped_count} evidence records not written to evidence.jsonl")
 
 
 def _print_memory(resources: dict) -> None:
@@ -624,6 +672,21 @@ def _main(argv: list[str] | None = None) -> int:
         if arguments and arguments[0] in {"storage", "cleanup", "keep"}:
             replacement = {"storage": "list"}.get(arguments[0], arguments[0])
             print(f"Deprecated: giraffe {arguments[0]}; use giraffe runs {replacement}.", file=sys.stderr)
+        if args.command == "mark-scale-down":
+            from giraffe.scale_down_control import submit_marker
+            result = submit_marker(args.run_dir, event_id=args.event_id, replica_id=args.replica_id,
+                                   source=args.source, operator_at=args.operator_at, wait_seconds=args.wait_seconds)
+            exit_code = {"accepted": 0, "rejected": 1, "submitted_without_acknowledgment": 2}[result["outcome"]]
+            if json_output:
+                emit(result["outcome"], exit_code, acknowledgment=result["acknowledgment"])
+            else:
+                messages = {"accepted": "Removal marker accepted by the active run.",
+                    "rejected": "Removal marker rejected by the active run.",
+                    "submitted_without_acknowledgment": "Marker submitted without acknowledgment; inspect run status before retrying."}
+                print(messages[result["outcome"]])
+                if result["acknowledgment"] and result["acknowledgment"].get("reason"):
+                    print(result["acknowledgment"]["reason"])
+            return exit_code
         if args.command == "init":
             from giraffe.init_config import write_config
             write_config(args.output, engine=args.engine, url=args.url, force=args.force)
@@ -684,7 +747,10 @@ def _main(argv: list[str] | None = None) -> int:
                 print("Configuration preview. No traffic was sent.")
                 print("Targets: " + ", ".join(target.name for target in config.targets))
                 print("Checks: " + ", ".join(config.checks))
-                print(f"Known requests per target: {plan['known_per_target']:,}")
+                if counts := plan.get("known_target_counts"):
+                    print("Known requests by target: " + ", ".join(f"{name}: {count:,}" for name, count in counts.items()))
+                else:
+                    print(f"Known requests per target: {plan['known_per_target']:,}")
                 print(f"Maximum requests: {format(config.max_requests, ',') if config.max_requests is not None else 'Not set'}")
                 for warning in plan["warnings"]:
                     print(f"Warning: {warning}")
@@ -889,11 +955,17 @@ def _main(argv: list[str] | None = None) -> int:
             if json_output:
                 emit("blocked", 3, message=str(error))
             return 3
-        if args.command == "run" and not args.skip_preflight:
+        # Explicit identity probes must not spend or require shared credentials
+        # before measuring their own gateway policy and attribution evidence.
+        from giraffe.identities import gateway_identities_only
+        gateway_only = gateway_identities_only(config.checks)
+        preflight_targets = [target for target in config.targets
+                             if not gateway_only or config.restart_target == target.name]
+        if args.command == "run" and not args.skip_preflight and preflight_targets:
             from giraffe.deployment import preparation_residency
             config._preparation_residency = asyncio.run(preparation_residency(config))
             async def preflight():
-                for target in config.targets:
+                for target in preflight_targets:
                     try:
                         await check_target(target, config)
                     except PreflightError as error:
@@ -962,9 +1034,10 @@ def _main(argv: list[str] | None = None) -> int:
 
         async def run_with_partial_report():
             try:
-                report = await (_run(config, quiet=True) if getattr(args, "quiet", False) else
-                                _run(config, json_progress=True) if json_output else
-                                _run(config, verbose=True) if getattr(args, "verbose", False) else _run(config))
+                control = {"directory": directory} if "scale_down" in config.checks else {}
+                report = await (_run(config, quiet=True, **control) if getattr(args, "quiet", False) else
+                                _run(config, json_progress=True, **control) if json_output else
+                                _run(config, verbose=True, **control) if getattr(args, "verbose", False) else _run(config, **control))
             except asyncio.CancelledError as error:
                 report = getattr(error, "giraffe_report", None)
                 if report is None:
@@ -1016,7 +1089,8 @@ def _main(argv: list[str] | None = None) -> int:
             try:
                 with sampler:
                     json_path, html_path = write_report(report, directory, max_run_storage=args.max_run_storage,
-                                                       html=getattr(args, "html", False))
+                                                       html=getattr(args, "html", False),
+                                                       **({"preserve_evidence": True} if "scale_down" in config.checks else {}))
             except OSError as error:
                 logger.exception("CLI report export failed")
                 export_resources()
@@ -1165,6 +1239,110 @@ def _print_result(report: RunReport, json_path: Path, html_path: Path | None,
             label = window.get("workload_label") or _stage_name(window_id.removeprefix("full:"))
             line = f"Performance · {target_name} · {label}"
         print(line)
+    for check in report.checks:
+        policy = check.metrics.get("gateway_policy") if check.id == "gateway_policy" else None
+        if policy:
+            print(f"Gateway policy · {check.target} · {policy['settings'].get('capability', 'not configured')} · {policy['qualification']}")
+            for user in policy["users"]:
+                print(f"  {user['identity']}: {user['admitted']} admitted, {user['rejected']} rejected, "
+                      f"{user['completed']} completed / {user['planned']} offered cap; declared {user['declared_rpm']} RPM")
+            print("  " + policy["interpretation"])
+        if check.id == "gateway_attribution" and check.metrics.get("state") != "not_selected":
+            data = check.metrics
+            print(f"Gateway attribution · {check.target} · {data.get('state', 'unverified')} · "
+                  f"{data.get('matched_requests', 0)} matched / {data.get('observed_requests', 0)} observed requests")
+            for row in data.get("identities", []):
+                print(f"  {row['identity']} · {row['matched_requests']} matched · "
+                      f"{row['mismatched_requests']} mismatched · {row['unverified_requests']} unverified")
+        users = check.metrics.get("multi_user") if check.id == "multi_user" else None
+        policy = check.metrics.get("gateway_access") if check.id == "gateway_access" else None
+        if policy:
+            print(f"Gateway access policy · {check.target}")
+            for case in policy.get("cases", []):
+                print(f"  {case['name']} / {case['identity']}: expected {case['expected']}, observed {case['observed']}"
+                      f" · {case['status']} · HTTP {case['http_status'] or 'not observed'} · {case['reason']}")
+            print("  " + policy["qualification"])
+        if not users:
+            continue
+        print(f"Multi-user · {check.target} · shared-window delivered output")
+        worst = users.get("worst_user")
+        if worst:
+            print(f"  Worst served user: {worst['user_id']} at {worst['population']} users · {worst['status']}")
+        for window in users.get("windows", []):
+            if window.get("phase") != "measurement":
+                continue
+            print(f"  {window['population']} users · {window.get('duration_seconds', 0):.3g} / {window['planned_duration_seconds']:g} planned seconds")
+            if window.get("role"):
+                print("    " + " · ".join(str(window[key]) for key in ("scenario", "role", "trigger", "heavy_profile") if window.get(key)))
+            if counts := window.get("offer_accounting"):
+                print("    Scheduled and achieved traffic: " + " · ".join(f"{key}: {value}" for key, value in counts.items()))
+                if bursts := window.get("burst_offer_accounting"):
+                    print("    Burst offers: " + " · ".join(f"{key}: {value}" for key, value in bursts.items()))
+                for user in window["users"]:
+                    print(f"      {user['user_id']} / {user.get('cohort')} · scheduled/observed activation "
+                          f"{user.get('scheduled_activation_ms')} / {user.get('activated_ms')} ms · "
+                          + " · ".join(f"{key}: {value}" for key, value in user.get("offer_accounting", {}).items()))
+            if evidence := window.get("recovery"):
+                print(f"    Matched per-user recovery: {evidence['status']}")
+                for user in evidence["users"]:
+                    print(f"      {user['user_id']}: {user['status']} · {user['matched_samples']} matched samples · "
+                          f"slowdown {user['slowdown']} · {' '.join(user['reasons'])}")
+                    for label, values in user["phases"].items():
+                        print(f"        {label}: {values} · requests: {', '.join(user.get(label+'_request_ids', []))}")
+            if evidence := window.get("interference"):
+                print(f"    Matched noisy-neighbor comparison: {evidence['status']}")
+                for reason in evidence.get("reasons", []):
+                    print(f"      {reason}")
+                for user in evidence.get("users", []):
+                    print(f"      {user['user_id']}: {user['status']} · {user.get('matched_samples', 0)} matched samples · "
+                          f"slowdown {user.get('slowdown')} · first/completion/gap change "
+                          f"{user.get('first_answer_change_ms')} / {user.get('completion_change_ms')} / "
+                          f"{user.get('stream_gap_change_ms')} ms · output change {user.get('output_tokens_change')} tokens")
+                    print(f"        Actual input medians {user.get('control_input_median_tokens')} → {user.get('probe_input_median_tokens')}; "
+                          f"output medians {user.get('control_output_median_tokens')} → {user.get('probe_output_median_tokens')}")
+                    print(f"        Heavy input / output medians: {user.get('heavy_input_median_tokens')} / "
+                          f"{user.get('heavy_output_median_tokens')} tokens")
+                    for reason in user.get("reasons", []):
+                        print(f"        {reason}")
+                    for name in ("control_request_ids", "probe_request_ids", "heavy_request_ids"):
+                        print(f"        {name}: {', '.join(user.get(name, [])) or 'none'}")
+            if evidence := window.get("cancellation"):
+                print(f"    Selected user: {evidence.get('selected_user_id')} · {evidence['status']}")
+                for key, label in (("cancellation", "Selected request cancellation"),
+                                   ("peer_continuation", "Peer continuation"), ("followup", "Same-user follow-up")):
+                    item = evidence.get(key, {})
+                    print(f"      {label}: {item.get('status', 'inconclusive')} · "
+                          f"{' '.join(item.get('reasons', []))} · requests: {', '.join(item.get('request_ids', [])) or 'none'}")
+                print("      Backend compute and memory release: unverified")
+            fairness = window.get("fairness")
+            if fairness:
+                ratio = fairness.get("ratio")
+                status = "not applicable" if fairness["status"] == "not_applicable" else fairness["status"]
+                print(f"    Observed delivery fairness: {status} · "
+                      f"median / worst ratio {ratio if ratio is not None else 'undefined'} · "
+                      f"limit {fairness.get('threshold')} · "
+                      f"eligible users {', '.join(fairness.get('eligible_user_ids', [])) or 'none'} / "
+                      f"{len(fairness.get('compared_user_ids', []))} compared")
+                for reason in fairness.get("reasons", []):
+                    print(f"      {reason}")
+            for user in window.get("users", []):
+                rate = user.get("output_tokens_per_second")
+                delivery = f"{rate:.3g} tok/s" if rate is not None else "unknown tok/s"
+                outcome = user.get("outcomes", {})
+                latency = user.get("latency", {})
+                first = latency.get("ready_first_answer_ms", {}).get("p95")
+                completion = latency.get("ready_completion_ms", {}).get("p95")
+                timing = " / ".join(f"{value:.3g}" if value is not None else "unknown" for value in (first, completion))
+                print(f"    {user['user_id']} · {user['profile']} · {user['status']} · {delivery} · "
+                      f"{outcome.get('completed', 0)}/{outcome.get('attempted', 0)} completed · "
+                      f"{outcome.get('errors', 0)} errors · ready first/completion p95 {timing} ms · "
+                      f"{user.get('coverage', {}).get('status', 'unknown')}")
+                for item in user.get("conversations", []):
+                    print(f"      Conversation {item['id']} · {item['mode']} · "
+                          f"{len(item['turns'])}/{item['planned_turns']} turns · "
+                          f"{item.get('stop_reason') or 'completed'}")
+                    for turn, request_id in enumerate(item["turns"]):
+                        print(f"        Turn {turn + 1}: {request_id}")
     unselected = []
     for check in report.checks:
         if check.status == "skipped" and check.summary.rstrip(".") in {"Not selected", "Not selected for this run"}:

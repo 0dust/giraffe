@@ -402,7 +402,13 @@ async def test_bootstrap_has_blank_model_and_no_automatic_traffic(tmp_path, monk
         result = (await client.get("/api/bootstrap")).json()
         assert result["config"]["targets"][0]["model"] == ""
         assert result["config"]["restart_target"] is None
-        assert len(result["checks"]) == 15
+        from giraffe.models import CHECK_NAMES
+        assert {check["id"] for check in result["checks"]} == set(CHECK_NAMES)
+        assert any(check["id"] == "gateway_attribution" for check in result["checks"])
+        assert len(result["checks"]) == 20
+        assert next(check for check in result["checks"] if check["id"] == "scale_down")["optional"] is True
+        assert "scale_down" not in result["config"]["checks"]
+        assert result["config"]["scale_down"] is None
         assert {c["id"] for c in result["checks"] if not c["optional"]} == set(DEFAULT_CHECKS)
         assert result["active_run_id"] is None
         assert (await client.get("/api/runs")).json()["runs"] == []

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from copy import deepcopy
 from decimal import Decimal, ROUND_FLOOR
+from fractions import Fraction
 from functools import cached_property
 import math
 import re
@@ -17,7 +18,7 @@ from pydantic import BeforeValidator, TypeAdapter, ValidationError, StrictInt, f
 from . import __version__
 from .caps import (MAX_SIMULTANEOUS_REQUESTS, MAX_ARRIVAL_REQUESTS, MAX_BURST_SIZE,
                    MAX_PENDING_ARRIVALS, MAX_TRAFFIC_RATE, MAX_ARRIVAL_RATE, MAX_STAGES,
-                   MAX_STAGE_SECONDS, MAX_SESSIONS,
+                   MAX_STAGE_SECONDS, MAX_SESSIONS, MAX_SIMULATED_USERS,
                    MAX_SESSION_TURNS, MAX_SESSION_TURN_CHARS, MAX_TOOL_CONFIG_BYTES, MAX_TOOL_RESULT_BYTES,
                    MAX_TOOL_CALLS, MAX_TOOL_NAME_CHARS, MAX_DEPLOYMENT_SCOPE_CHARS, MAX_PLANNED_ARRIVALS, MAX_REQUEST_PACK_BYTES, MAX_REQUEST_PACK_CASES,
                    MAX_SANITIZE_ITEMS, MAX_SANITIZE_STRING_CHARS)
@@ -31,6 +32,7 @@ CHECK_NAMES = {
     "first_output": "Time to first answer",
     "generation": "Generation speed",
     "load": "Load test",
+    "scale_down": "Scale-down continuity",
     "context": "Long-context recall",
     "correctness": "Answer correctness",
     "json": "JSON correctness",
@@ -39,12 +41,18 @@ CHECK_NAMES = {
     "gpu": "GPU metrics",
     "prefix": "Prefix cache",
     "sessions": "Multi-turn sessions",
+    "multi_user": "Multi-user",
+    "gateway_access": "Gateway access policy",
+    "gateway_policy": "Gateway quotas & priorities",
+    "gateway_attribution": "Gateway usage attribution",
     "consistency": "Answer consistency",
     "tools": "Tool calling",
 }
 CATALOGUE_NAMES = INTERNAL_CHECK_NAMES = CHECK_NAMES
+# These checks compare their own declared workload and evidence.
+SHARED_BASELINE_EXCLUDED_WORKLOADS = frozenset({"gateway_access", "gateway_attribution", "gateway_policy"})
 CORE_CHECKS = ("access", "serving", "first_output", "generation", "load", "context",
-               "correctness", "json", "cancellation", "recovery", "gpu")
+               "correctness", "json", "cancellation", "recovery", "gpu", "scale_down")
 DEFAULT_CHECKS = ("access", "serving", "correctness", "first_output")
 # Saved pre-v2 files with no selection retain their historical workload.
 _LEGACY_DEFAULT_CHECKS = ("access", "serving", "first_output", "generation", "load",
@@ -712,7 +720,7 @@ def migrate_run_limits(value):
         checks.extend([*(["json"] if value.get("structured_json") else []),
                        *(["gpu"] if value.get("metrics") else [])])
         checks.extend(check for field, check in (("arrivals", "arrivals"), ("prefix", "prefix"),
-                                                ("sessions", "sessions"), ("consistency", "consistency"),
+                                                ("sessions", "sessions"), ("multi_user", "multi_user"), ("consistency", "consistency"),
                                                 ("tool_calling", "tools"), ("tool_checks", "tools"))
                       if value.get(field) is not None and (field != "tool_calling" or value[field]))
         value["checks"] = list(dict.fromkeys(checks))
@@ -854,6 +862,11 @@ def migrate_run_limits(value):
     return value, notes
 
 
+def scheduled_multi_user_slots(config) -> int:
+    """Return the local slot limit for a scheduled multi-user window."""
+    return config.concurrency or config.inherited_concurrency(config.default_concurrency)
+
+
 def required_concurrency(config) -> dict[str, Any]:
     """Conservative simultaneous target-request peak, independent of suite limits."""
     by_check = {}
@@ -866,10 +879,21 @@ def required_concurrency(config) -> dict[str, Any]:
         elif check == "arrivals":
             arrival = config.effective_arrivals()
             peak = arrival.max_in_flight if arrival else config.inherited_concurrency(config.default_concurrency)
+        elif check == "multi_user":
+            scenarios = set(config.multi_user.scenarios)
+            scheduled = {"arrivals", "recovery"}
+            if scenarios - scheduled:
+                peak = max(config.multi_user.levels)
+            if scenarios & scheduled:
+                peak = max(peak, scheduled_multi_user_slots(config))
+        elif check == "gateway_policy":
+            peak = len(config.gateway_policy.users) if config.gateway_policy and config.gateway_policy.supported else 0
         elif check == "sessions":
             peak = min(config.sessions.concurrency, config.sessions.sessions)
         elif check == "consistency":
             peak = max([1, *config.consistency.levels])
+        elif check == "scale_down" and config.scale_down:
+            peak = config.scale_down.concurrency
         elif check == "load":
             from giraffe.load_test import required_slots
             peak = required_slots(config)
@@ -1083,6 +1107,66 @@ class SessionDistribution(Model):
         return self
 
 
+class MultiUserCriteria(Model):
+    max_first_answer_ms: float | None = Field(default=None, gt=0)
+    max_completion_ms: float | None = Field(default=None, gt=0)
+    max_error_percent: float | None = Field(default=0, ge=0, le=100)
+    min_output_tokens_per_second: float | None = Field(default=None, gt=0)
+    max_throughput_ratio: float | None = Field(default=None, ge=1)
+    min_samples: StrictInt = Field(default=1, ge=1)
+
+
+class GatewayPolicyUser(Model):
+    identity: str = Field(pattern=r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
+    requests: StrictInt = Field(ge=1, le=100)
+    rpm: StrictInt = Field(ge=1, le=1000000)
+    priority: str | None = Field(default=None, pattern=r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
+
+
+class GatewayPolicy(Model):
+    auth_header: str = Field(default="Authorization", pattern=r"^[A-Za-z][A-Za-z0-9-]{0,63}$")
+    gateway: str = Field(default="litellm", min_length=1, max_length=64)
+    capability: str = Field(default="key_rpm", min_length=1, max_length=64)
+    gateway_version: str | None = Field(default=None, max_length=64)
+    affected_identity: str = Field(pattern=r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
+    users: list[GatewayPolicyUser] = Field(min_length=2, max_length=8)
+    duration_seconds: float = Field(default=15, gt=0, le=55)
+    interval_seconds: float = Field(default=.1, ge=.001, le=10)
+    max_output_tokens: StrictInt = Field(default=16, ge=1, le=256)
+    window_state: Literal["unknown", "isolated_fresh", "isolated_fresh_single_counter"] = "unknown"
+    model_rpm: StrictInt | None = Field(default=None, ge=1, le=1000000)
+    saturation_threshold: float | None = Field(default=None, ge=0, le=1)
+    saturation_cache_seconds: float | None = Field(default=None, ge=0, le=60)
+    named_reservations_confirmed: StrictBool = False
+
+    @property
+    def supported(self) -> bool:
+        return self.gateway == "litellm" and self.capability in {"key_rpm", "priority_rpm"}
+
+    @property
+    def custom_key_header(self) -> str | None:
+        return None if self.auth_header.lower() == "authorization" else self.auth_header
+
+    @model_validator(mode="after")
+    def valid_policy(self):
+        aliases = [user.identity for user in self.users]
+        if len(set(aliases)) != len(aliases) or self.affected_identity not in aliases:
+            raise ValueError("Policy users must be distinct and include the affected identity")
+        if not self.supported:
+            return self
+        if any(user.requests > user.rpm for user in self.users if user.identity != self.affected_identity):
+            raise ValueError("Peer offered request caps must stay within their declared RPM")
+        if self.capability == "priority_rpm":
+            tiers = [user.priority for user in self.users]
+            if None in tiers or len(set(tiers)) != len(tiers):
+                raise ValueError("Priority probes require a distinct declared tier for each identity")
+            if any(value is None for value in (self.model_rpm, self.saturation_threshold, self.saturation_cache_seconds)):
+                raise ValueError("Declare model RPM, saturation threshold and saturation cache seconds")
+            if sum(user.rpm for user in self.users) > self.model_rpm:
+                raise ValueError("Reserved RPM shares must not exceed model RPM")
+        return self
+
+
 class SessionSampling(Model):
     seed: StrictInt = Field(default=42, ge=0, le=2**32 - 1)
     think_time_seconds: SessionDistribution | None = None
@@ -1136,11 +1220,9 @@ def session_workload_presets() -> list[SessionWorkload]:
     ]
 
 
-class Sessions(Model):
+class ConversationSettings(Model):
     profile: Literal["correctness", "performance"] = "correctness"
     modes: list[Literal["fixed", "live"]] = Field(default_factory=lambda: ["fixed", "live"])
-    sessions: int = Field(default=5, ge=1, le=MAX_SESSIONS)
-    concurrency: int = Field(default=2, ge=1, le=MAX_SIMULTANEOUS_REQUESTS)
     turns: list[Annotated[str, Field(min_length=1, max_length=MAX_SESSION_TURN_CHARS)]] = Field(min_length=2, max_length=MAX_SESSION_TURNS, default_factory=lambda: [
         "Remember the name assigned to this conversation and reply with that name only.",
         SESSION_REPEAT_PROMPT])
@@ -1175,6 +1257,133 @@ class Sessions(Model):
             raise ValueError("select distinct fixed/live session modes")
         if not 2 <= len(self.turns) <= MAX_SESSION_TURNS or any(not t.strip() or len(t) > MAX_SESSION_TURN_CHARS for t in self.turns):
             raise ValueError(f"sessions need 2..{MAX_SESSION_TURNS} non-empty bounded user turns")
+        return self
+
+
+class Sessions(ConversationSettings):
+    sessions: int = Field(default=5, ge=1, le=MAX_SESSIONS)
+    concurrency: int = Field(default=2, ge=1, le=MAX_SIMULTANEOUS_REQUESTS)
+
+
+class MultiUserNeighbors(Model):
+    heavy_user_ids: list[str] | None = Field(default=None, min_length=1, max_length=31)
+    heavy_user_count: StrictInt = Field(default=1, ge=1, le=31)
+    heavy_profiles: list[Literal["long_short", "short_long", "long_long"]] = Field(
+        default_factory=lambda: ["long_short", "short_long"], min_length=1, max_length=3)
+    triggers: list[Literal["before_output", "during_stream"]] = Field(
+        default_factory=lambda: ["before_output", "during_stream"], min_length=1, max_length=2)
+    max_slowdown: float | None = Field(default=None, ge=1)
+
+
+class MultiUserCancellation(Model):
+    user_id: str = "user-01"
+    cancel_after_chunks: StrictInt = Field(default=5, ge=1, le=1000)
+
+
+class MultiUserBurst(Model):
+    user_id: str = "user-01"
+    at_seconds: float = Field(default=1, ge=0, le=MAX_STAGE_SECONDS)
+    requests: StrictInt = Field(default=5, ge=1, le=MAX_BURST_SIZE)
+    spacing_seconds: float = Field(default=0, ge=0, le=MAX_STAGE_SECONDS)
+
+    def offer_offset(self, index: int) -> float:
+        return float(Fraction(str(self.at_seconds)) + index * Fraction(str(self.spacing_seconds)))
+
+
+def _steady_offer_count(duration: float, activation: float, rate: float) -> int:
+    # Count integer indices with activation + index / rate strictly before duration.
+    start = Fraction(str(activation))
+    frequency = Fraction(str(rate))
+    count = math.ceil((Fraction(str(duration)) - start) * frequency)
+    # The scheduled offset must still be inside the window after conversion to float.
+    if count > 0 and float(start + (count - 1) / frequency) >= duration:
+        return count - 1
+    return count
+
+
+class MultiUserArrivals(Model):
+    requests_per_second: float = Field(default=1, gt=0, le=1000)
+    activations: dict[str, Annotated[float, Field(ge=0, le=MAX_STAGE_SECONDS)]] = Field(default_factory=dict, max_length=32)
+    bursts: list[MultiUserBurst] = Field(default_factory=list, max_length=32)
+
+    def offer_count(self, duration: float, population: int) -> int:
+        steady = sum(_steady_offer_count(duration, self.activations.get(f"user-{index + 1:02d}", 0),
+                                        self.requests_per_second) for index in range(population))
+        return steady + sum(burst.requests for burst in self.bursts)
+
+
+class MultiUserRecovery(Model):
+    control_seconds: float = Field(default=5, gt=0, le=MAX_STAGE_SECONDS)
+    sustained_seconds: float = Field(default=15, gt=0, le=MAX_STAGE_SECONDS)
+    lighter_seconds: float = Field(default=5, gt=0, le=MAX_STAGE_SECONDS)
+    sustained_requests_per_second: float = Field(default=2, gt=0, le=1000)
+    lighter_requests_per_second: float = Field(default=.5, gt=0, le=1000)
+    max_slowdown: float | None = Field(default=None, ge=1)
+
+
+class MultiUser(Model):
+    scenarios: list[Literal["repeated_requests", "noisy_neighbors", "cancellation", "arrivals", "recovery"]] = Field(
+        default_factory=lambda: ["repeated_requests"], min_length=1, max_length=5)
+    arrivals: MultiUserArrivals = Field(default_factory=MultiUserArrivals)
+    recovery: MultiUserRecovery = Field(default_factory=MultiUserRecovery)
+    noisy_neighbors: MultiUserNeighbors = Field(default_factory=MultiUserNeighbors)
+    cancellation: MultiUserCancellation = Field(default_factory=MultiUserCancellation)
+    levels: list[Annotated[StrictInt, Field(ge=1, le=MAX_SIMULATED_USERS)]] = Field(
+        default_factory=lambda: [1, 5, 20], min_length=1, max_length=MAX_SIMULATED_USERS)
+    profile: LoadTestProfile = Field(default_factory=LoadTestProfile)
+    shapes: list[Literal[*SHAPES]] = Field(default_factory=lambda: ["short_short"], min_length=1, max_length=9)
+    seed: StrictInt = Field(default=42, ge=0, le=2**32 - 1)
+    think_time_seconds: SessionDistribution = Field(default_factory=lambda: SessionDistribution(values=[0]))
+    warmup_seconds: float = Field(default=0, ge=0, le=MAX_STAGE_SECONDS)
+    duration_seconds: float = Field(default=15, gt=0, le=MAX_STAGE_SECONDS)
+    conversations: ConversationSettings | None = None
+    fairness_tolerance_percent: float = Field(default=10, ge=0, le=100)
+    pass_criteria: MultiUserCriteria = Field(default_factory=MultiUserCriteria)
+
+    @model_validator(mode="after")
+    def valid_population(self):
+        if len(set(self.scenarios)) != len(self.scenarios):
+            raise ValueError("multi-user scenarios must be distinct")
+        if self.conversations and self.scenarios != ["repeated_requests"]:
+            raise ValueError("conversation users support the repeated_requests scenario")
+        if set(self.scenarios) & {"noisy_neighbors", "cancellation", "recovery"} and min(self.levels) < 2:
+            raise ValueError("noisy neighbors, cancellation and recovery require at least two users at every level")
+        ids = {f"user-{index + 1:02d}" for index in range(min(self.levels))}
+        if "arrivals" in self.scenarios:
+            arrivals = self.arrivals
+            if not set(arrivals.activations) <= ids or any(b.user_id not in ids for b in arrivals.bursts):
+                raise ValueError("arrival and burst user IDs must exist at every population level")
+            if any(at >= self.duration_seconds for at in arrivals.activations.values()):
+                raise ValueError("user activations must precede the arrival window end")
+            if any(b.at_seconds < arrivals.activations.get(b.user_id, 0)
+                   or b.offer_offset(b.requests - 1) >= self.duration_seconds for b in arrivals.bursts):
+                raise ValueError("every burst must fall after its user activation and before the window end")
+            if arrivals.offer_count(self.duration_seconds, max(self.levels)) > MAX_PLANNED_ARRIVALS:
+                raise ValueError("multi-user arrival schedule exceeds the finite offer bound")
+        if "recovery" in self.scenarios:
+            recovery = self.recovery
+            if recovery.lighter_requests_per_second >= recovery.sustained_requests_per_second:
+                raise ValueError("recovery traffic must be lighter than sustained traffic")
+            if any(_steady_offer_count(seconds, 0, rate)*max(self.levels) > MAX_PLANNED_ARRIVALS for seconds, rate in (
+                    (recovery.control_seconds, recovery.lighter_requests_per_second),
+                    (recovery.sustained_seconds, recovery.sustained_requests_per_second),
+                    (recovery.lighter_seconds, recovery.lighter_requests_per_second))):
+                raise ValueError("multi-user recovery schedule exceeds the finite offer bound")
+        if "cancellation" in self.scenarios and self.cancellation.user_id not in ids:
+            raise ValueError("the cancellation user must exist at every population level")
+        if "noisy_neighbors" in self.scenarios:
+            heavy = self.noisy_neighbors
+            if heavy.heavy_user_ids is not None:
+                if len(set(heavy.heavy_user_ids)) != len(heavy.heavy_user_ids) or not set(heavy.heavy_user_ids) < ids:
+                    raise ValueError("heavy user IDs must be distinct, exist at every level and leave a short user")
+            elif heavy.heavy_user_count >= min(self.levels):
+                raise ValueError("heavy user count must leave at least one short user")
+            if len(set(heavy.heavy_profiles)) != len(heavy.heavy_profiles) or len(set(heavy.triggers)) != len(heavy.triggers):
+                raise ValueError("heavy profiles and interference triggers must be distinct")
+        if len(set(self.levels)) != len(self.levels) or len(set(self.shapes)) != len(self.shapes):
+            raise ValueError("multi-user levels and shapes must be distinct")
+        if any(value > 60 for value in self.think_time_seconds.values):
+            raise ValueError("multi-user think times must be between 0 and 60 seconds")
         return self
 
 
@@ -1237,6 +1446,83 @@ class Consistency(Model):
         return self
 
 
+class GatewayAccessCase(Model):
+    name: str = Field(pattern=r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
+    identity: str = Field(pattern=r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
+    expected: Literal["allow", "deny"]
+
+
+class GatewayAccess(Model):
+    profile: str = Field(default="unknown", pattern=r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
+    auth_header: str | None = Field(default=None, pattern=r"^[A-Za-z][A-Za-z0-9-]{0,63}$")
+    cases: list[GatewayAccessCase] = Field(default_factory=list, max_length=16)
+    request_timeout_seconds: float = Field(default=10, gt=0, le=60)
+    max_output_tokens: int = Field(default=16, ge=1, le=128)
+
+    @model_validator(mode="after")
+    def unique_cases(self):
+        if len({case.name for case in self.cases}) != len(self.cases):
+            raise ValueError("gateway access case names must be unique")
+        return self
+
+
+class TestIdentity(Model):
+    """Explicit credential references; an empty identity is anonymous."""
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+    api_key_env: str | None = Field(default=None, max_length=128)
+    headers_env: dict[str, str] = Field(default_factory=dict, max_length=16)
+
+    @model_validator(mode="after")
+    def validate_references(self):
+        refs = [*self.headers_env.values(), *([self.api_key_env] if self.api_key_env else [])]
+        if any(not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,127}", ref) for ref in refs):
+            raise ValueError("identity credentials must name environment variables")
+        names = [name.lower() for name in self.headers_env]
+        reserved = {"host", "content-length", "content-type", "transfer-encoding", "connection",
+                    "accept", "accept-encoding", "expect", "upgrade"}
+        if (len(set(names)) != len(names) or reserved.intersection(names)
+                or (self.api_key_env and "authorization" in names)
+                or any(not re.fullmatch(r"[A-Za-z][A-Za-z0-9-]{0,63}", name) for name in self.headers_env)):
+            raise ValueError("identity headers must be unique credential headers, not protocol headers")
+        return self
+
+
+class GatewayEvidence(TestIdentity):
+    profile: str = Field(default="litellm", min_length=1, max_length=64)
+    url: str
+
+    @field_validator("url")
+    @classmethod
+    def validate_url(cls, value):
+        from urllib.parse import urlsplit
+        parsed = urlsplit(value)
+        if (parsed.scheme not in {"http", "https"} or not parsed.hostname
+                or any((parsed.username, parsed.password, parsed.query, parsed.fragment))
+                or any(char.isspace() for char in value)):
+            raise ValueError("gateway evidence URL must be http(s) without credentials, query or fragment")
+        try:
+            valid_port = parsed.port != 0
+        except ValueError:
+            valid_port = False
+        if not valid_port:
+            raise ValueError("gateway evidence URL must have a valid port")
+        return value
+
+
+class GatewayAttribution(Model):
+    identities: list[str] = Field(min_length=1, max_length=32)
+    samples: int = Field(default=2, ge=1, le=16)
+    settle_seconds: float = Field(default=2, gt=0, le=30)
+
+    @field_validator("identities")
+    @classmethod
+    def validate_identities(cls, value):
+        if len(set(value)) != len(value) or any(not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", x) for x in value):
+            raise ValueError("attribution identities must be unique configured identity labels")
+        return value
+
+
 class Target(Model):
     tokenizer: str | None = Field(default=None, min_length=1,
         description="Prompt sizing tokenizer: null or auto resolves the served model name and falls back to builtin; builtin uses tiktoken o200k_base. A model ID or local directory remains an optional CLI override. Tokenizer assets download and cache locally; no inference is used for sizing.")
@@ -1248,6 +1534,8 @@ class Target(Model):
     model: str = Field(min_length=1)
     api_key_env: str | None = None
     headers_env: dict[str, str] = Field(default_factory=dict)
+    test_identities: dict[str, TestIdentity] = Field(default_factory=dict, max_length=32)
+    gateway: GatewayEvidence | None = None
     route: Literal["direct", "gateway", "replica"] = "direct"
     parent: str | None = None
     identity: dict[str, str] = Field(default_factory=dict)
@@ -1261,6 +1549,15 @@ class Target(Model):
     deployment: Deployment = Field(default_factory=Deployment)
     restart_command: list[str] | None = None
 
+    @model_serializer(mode="wrap")
+    def serialize_optional_identity_settings(self, handler):
+        result = handler(self)
+        if not self.test_identities:
+            result.pop("test_identities", None)
+        if self.gateway is None:
+            result.pop("gateway", None)
+        return result
+
     @field_validator("tokenizer", mode="before")
     @classmethod
     def trim_tokenizer(cls, value):
@@ -1269,6 +1566,9 @@ class Target(Model):
     @model_validator(mode="after")
     def validate_target(self) -> Target:
         from urllib.parse import urlsplit
+
+        if any(not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", name) for name in self.test_identities):
+            raise ValueError("test identity names must be short labels using letters, numbers, underscores or hyphens")
 
         parsed = urlsplit(self.url)
         if parsed.scheme not in {"http", "https"} or not parsed.hostname:
@@ -1320,6 +1620,7 @@ class Limits(Model):
     recovery_max_ratio: float | None = Field(default=None, gt=1)
     gpu_max_temperature_c: float | None = Field(default=None, gt=0)
     regression_percent: float = Field(default=20, ge=0)
+    regression_rate_points: float = Field(default=5, ge=0)
     min_samples: int = Field(default=5, ge=2)
 
 
@@ -1939,6 +2240,181 @@ class RequestJudgement(PersistedModel):
     votes: list[JudgeVote] = Field(default_factory=list)
 
 
+class ScaleDownConfig(Model):
+    """One externally controlled replica removal with finite traffic windows."""
+    target: str = Field(min_length=1, max_length=256)
+    long_fixture: str = Field(default="generation.copy.v1", min_length=1, max_length=256)
+    followup_fixture: str = Field(default="short.copy.v2", min_length=1, max_length=256)
+    requests_per_second: float = Field(default=1, gt=0, le=MAX_TRAFFIC_RATE)
+    concurrency: int = Field(default=4, ge=2, le=MAX_SIMULTANEOUS_REQUESTS, strict=True)
+    long_cohort_size: int = Field(default=2, ge=1, le=MAX_SIMULTANEOUS_REQUESTS - 1, strict=True)
+    min_baseline_samples: int = Field(default=2, ge=1, le=MAX_ARRIVAL_REQUESTS, strict=True)
+    min_overlap_samples: int = Field(default=1, ge=1, le=MAX_SIMULTANEOUS_REQUESTS - 1, strict=True)
+    min_post_samples: int = Field(default=5, ge=1, le=MAX_ARRIVAL_REQUESTS, strict=True,
+                                  description="Minimum valid follow-up responses in each drain and post-exit window.")
+    baseline_timeout_seconds: float = Field(default=30, gt=0, le=MAX_STAGE_SECONDS)
+    event_timeout_seconds: float = Field(default=120, gt=0, le=MAX_STAGE_SECONDS)
+    grace_seconds: float = Field(default=30, gt=0, le=MAX_STAGE_SECONDS)
+    grace_anchor: Literal["removal_requested", "drain_effective"] = "drain_effective"
+    post_seconds: float = Field(default=10, gt=0, le=MAX_STAGE_SECONDS)
+    completion_seconds: float = Field(default=30, gt=0, le=MAX_STAGE_SECONDS)
+
+    @model_validator(mode="after")
+    def bounded_scenario(self):
+        if self.concurrency <= self.long_cohort_size:
+            raise ValueError("scale_down concurrency must leave at least one slot beyond the long cohort")
+        if self.max_sending_seconds > MAX_STAGE_SECONDS:
+            raise ValueError("scale_down sending windows exceed the maximum stage duration")
+        if self.min_overlap_samples > self.long_cohort_size:
+            raise ValueError("scale_down long cohort must cover min_overlap_samples")
+        if self.max_requests > MAX_PLANNED_ARRIVALS:
+            raise ValueError("scale_down exceeds the maximum planned arrivals")
+        return self
+
+    @property
+    def max_requests(self) -> int:
+        return self.min_baseline_samples + self.long_cohort_size + math.ceil(self.requests_per_second * self.max_sending_seconds)
+
+    @property
+    def max_sending_seconds(self) -> float:
+        return self.baseline_timeout_seconds + self.event_timeout_seconds + self.grace_seconds + self.post_seconds
+
+    @property
+    def max_duration_seconds(self) -> float:
+        return self.max_sending_seconds + self.completion_seconds
+
+
+MAX_SCALE_DOWN_SNAPSHOTS = 4096
+ScaleDownIdentifier = Annotated[str, Field(min_length=1, max_length=256)]
+
+
+class ScaleDownMarker(Model):
+    """Operator intent; never a backend lifecycle fact."""
+    event_id: ScaleDownIdentifier
+    nonce: ScaleDownIdentifier
+    target: ScaleDownIdentifier
+    replica_id: ScaleDownIdentifier | None = None
+    source: ScaleDownIdentifier
+    operator_at: str | None = Field(default=None, max_length=128)
+
+
+class ScaleDownLifecycleFact(Model):
+    event_id: ScaleDownIdentifier
+    sequence: int = Field(ge=0, strict=True)
+    time_ms: float = Field(ge=0, description="Time in the export's source clock, not runner monotonic time.")
+    kind: Literal["removal_requested", "drain_effective", "request_admitted", "request_completed", "replica_terminated"]
+    replica_id: ScaleDownIdentifier
+    request_id: ScaleDownIdentifier | None = None
+    attempt_id: ScaleDownIdentifier | None = None
+    outcome: Literal["completed", "failed", "cancelled"] | None = None
+
+    @model_validator(mode="after")
+    def attempt_identity(self):
+        if self.kind in {"request_admitted", "request_completed"} and (self.request_id is None or self.attempt_id is None):
+            raise ValueError("request lifecycle facts require request_id and attempt_id")
+        return self
+
+
+class ScaleDownInventory(Model):
+    event_id: ScaleDownIdentifier
+    sequence: int = Field(ge=0, strict=True)
+    time_ms: float = Field(ge=0)
+    replicas: list[ScaleDownIdentifier] = Field(max_length=MAX_SIMULTANEOUS_REQUESTS)
+
+    @field_validator("replicas")
+    @classmethod
+    def unique_incarnations(cls, values):
+        if len(values) != len(set(values)):
+            raise ValueError("replica inventory requires unique incarnation IDs")
+        return values
+
+
+class ScaleDownCoverage(Model):
+    replica_id: ScaleDownIdentifier
+    start_sequence: int = Field(ge=0, strict=True)
+    end_sequence: int = Field(ge=0, strict=True)
+    complete: StrictBool = False
+    scope: Literal["all", "giraffe"] = "giraffe"
+    gaps: list[Annotated[int, Field(ge=0, strict=True)]] = Field(default_factory=list, max_length=MAX_SANITIZE_ITEMS)
+    truncated: StrictBool = False
+
+    @model_validator(mode="after")
+    def ordered_interval(self):
+        if self.start_sequence > self.end_sequence:
+            raise ValueError("coverage start_sequence must not exceed end_sequence")
+        return self
+
+
+class ScaleDownLifecycleExport(Model):
+    """Explicit collector claims, separate from ordinary deployment metadata."""
+    schema_version: Literal[1] = 1
+    target: ScaleDownIdentifier
+    source: ScaleDownIdentifier
+    clock_id: ScaleDownIdentifier
+    through_sequence: int = Field(ge=0, strict=True)
+    captured_at: str | None = Field(default=None, max_length=128,
+        description="UTC ISO timestamp when the source sampled this export; absent means unmapped time.")
+    clock_uncertainty_ms: float | None = Field(default=None, ge=0, le=60000,
+        description="Upper bound on source UTC clock error; required for a UTC-to-runner mapping.")
+    inventories: list[ScaleDownInventory] = Field(default_factory=list, max_length=MAX_SANITIZE_ITEMS)
+    events: list[ScaleDownLifecycleFact] = Field(default_factory=list, max_length=MAX_SANITIZE_ITEMS)
+    coverage: list[ScaleDownCoverage] = Field(default_factory=list, max_length=MAX_SANITIZE_ITEMS)
+
+
+class ScaleDownSnapshot(Model):
+    collected_start_ms: float = Field(ge=0)
+    collected_end_ms: float = Field(ge=0)
+    capture_start_ms: float | None = Field(default=None, ge=0,
+        description="Earliest source capture in runner monotonic offsets, mapped by the collector, never accepted from export JSON.")
+    capture_end_ms: float | None = Field(default=None, ge=0,
+        description="Latest source capture in runner monotonic offsets; absent mapping cannot establish request overlap.")
+    export: ScaleDownLifecycleExport
+
+    @model_validator(mode="after")
+    def ordered_capture(self):
+        if self.collected_start_ms > self.collected_end_ms:
+            raise ValueError("collector interval is reversed")
+        if (self.capture_start_ms is None) != (self.capture_end_ms is None):
+            raise ValueError("both capture interval bounds are required")
+        if self.capture_start_ms is not None and self.capture_start_ms > self.capture_end_ms:
+            raise ValueError("capture interval is reversed")
+        return self
+
+
+class ScaleDownEvidence(Model):
+    schema_version: Literal[1] = 1
+    timing_health: dict[str, Any] | None = Field(default=None,
+        description="Existing client timing-health snapshot frozen at the scenario boundary; retained for offline qualification.")
+    timing_threshold_ms: float | None = Field(default=None, ge=0,
+        description="Existing timing qualification threshold frozen with the scenario health snapshot.")
+    armed_ms: float | None = Field(default=None, ge=0)
+    marker: ScaleDownMarker | None = None
+    marker_accepted_ms: float | None = Field(default=None, ge=0)
+    marker_received_ms: float | None = Field(default=None, ge=0)
+    snapshots: list[ScaleDownSnapshot] = Field(default_factory=list, max_length=MAX_SCALE_DOWN_SNAPSHOTS)
+    baseline_request_ids: list[ScaleDownIdentifier] = Field(default_factory=list, max_length=MAX_PLANNED_ARRIVALS)
+    long_request_ids: list[ScaleDownIdentifier] = Field(default_factory=list, max_length=MAX_SIMULTANEOUS_REQUESTS)
+    followup_request_ids: list[ScaleDownIdentifier] = Field(default_factory=list, max_length=MAX_PLANNED_ARRIVALS)
+    attribution_conflict_request_ids: list[ScaleDownIdentifier] = Field(default_factory=list,
+        max_length=MAX_SIMULTANEOUS_REQUESTS + MAX_PLANNED_ARRIVALS)
+    answer_started_ms: dict[ScaleDownIdentifier, Annotated[float, Field(ge=0)]] = Field(default_factory=dict,
+        description="First real answer content observed by the client callback, in runner monotonic offsets.")
+    post_started_ms: float | None = Field(default=None, ge=0)
+    post_ended_ms: float | None = Field(default=None, ge=0)
+    dropped_post_requests: int = Field(default=0, ge=0, strict=True)
+    stop_reason: str | None = Field(default=None, max_length=1024)
+    limitations: list[str] = Field(default_factory=list, max_length=MAX_SANITIZE_ITEMS)
+
+
+class ScaleDownSubresult(Model):
+    status: Literal["pass", "fail", "inconclusive"]
+    summary: str
+    evidence_ids: list[str] = Field(default_factory=list)
+    request_ids: list[str] = Field(default_factory=list)
+    limitations: list[str] = Field(default_factory=list)
+    metrics: dict[str, Any] = Field(default_factory=dict)
+
+
 class RunConfig(Model):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False, hide_input_in_errors=True)
     targets: list[Target] = Field(min_length=1)
@@ -1974,6 +2450,7 @@ class RunConfig(Model):
     metrics_max_series: int = Field(default=128, ge=1, le=1024)
     cache_pressure_threshold: float = Field(default=.9, gt=0, le=1)
     arrivals: Arrival | None = None
+    scale_down: ScaleDownConfig | None = None
     prefix: Prefix | None = None
     concurrent_load: ConcurrentLoad = Field(default_factory=ConcurrentLoad)
     load_test: LoadTest = Field(default_factory=LoadTest)
@@ -1981,6 +2458,10 @@ class RunConfig(Model):
     _migration_notes: list[str] = PrivateAttr(default_factory=list)
     _concurrency_warnings: list[dict[str, Any]] = PrivateAttr(default_factory=list)
     sessions: Sessions | None = None
+    multi_user: MultiUser | None = None
+    gateway_access: GatewayAccess | None = None
+    gateway_policy: GatewayPolicy | None = None
+    gateway_attribution: GatewayAttribution | None = None
     consistency: Consistency | None = None
     tool_calling: bool = False
     forced_tool_diagnostic: bool = False
@@ -2015,6 +2496,35 @@ class RunConfig(Model):
 
     @model_validator(mode="before")
     @classmethod
+    def finite_request_options(cls, value):
+        if not isinstance(value, dict):
+            return value
+
+        def visit(item, path):
+            if isinstance(item, dict):
+                for key, child in item.items():
+                    visit(child, f"{path}.{key}")
+            elif isinstance(item, list):
+                for index, child in enumerate(item):
+                    visit(child, f"{path}.{index}")
+            elif isinstance(item, float) and not math.isfinite(item):
+                raise ValueError(f"{path} must be a finite number")
+
+        visit(value.get("request_options"), "request_options")
+        for group, field in (("request_pack", "cases"), ("tool_checks", "fixtures"),
+                             ("tool_checks", "conversations")):
+            container = value.get(group)
+            if isinstance(container, BaseModel):
+                container = container.model_dump(mode="python")
+            items = container.get(field, []) if isinstance(container, dict) else []
+            if isinstance(items, list):
+                for index, item in enumerate(items):
+                    options = item.get("options") if isinstance(item, dict) else getattr(item, "options", None)
+                    visit(options, f"{group}.{field}.{index}.options")
+        return value
+
+    @model_validator(mode="before")
+    @classmethod
     def load_profile_defaults(cls, value):
         # Sparse profiles inherit missing dimensions, never a suite output ceiling.
         if not isinstance(value, dict):
@@ -2036,6 +2546,10 @@ class RunConfig(Model):
 
     @model_validator(mode="after")
     def validate_run(self) -> RunConfig:
+        if "gateway_policy" in self.checks and self.gateway_policy is not None and self.gateway_policy.supported:
+            for target in self.targets:
+                if any(user.identity not in target.test_identities for user in self.gateway_policy.users):
+                    raise ValueError("Every policy identity must be configured in each target's test_identities")
         if self.request_source == "request_pack":
             self.validate_request_pack_presence()
             if self.custom_fixtures:
@@ -2053,7 +2567,7 @@ class RunConfig(Model):
             self.checks = [*self.checks, *(["json"] if self.structured_json else []),
                            *(["gpu"] if self.metrics else [])]
             for field, check in (("arrivals", "arrivals"), ("prefix", "prefix"),
-                                 ("sessions", "sessions"),
+                                 ("sessions", "sessions"), ("multi_user", "multi_user"),
                                  ("consistency", "consistency"), ("tool_calling", "tools"),
                                  ("tool_checks", "tools")):
                 if getattr(self, field):
@@ -2072,6 +2586,8 @@ class RunConfig(Model):
             self.arrivals = Arrival()
         if "prefix" in self.checks and self.prefix is None:
             self.prefix = Prefix()
+        if "multi_user" in self.checks and self.multi_user is None:
+            self.multi_user = MultiUser()
         if "sessions" in self.checks and self.sessions is None:
             self.sessions = Sessions(max_tokens=min(32, self.max_output_tokens))
         if "consistency" in self.checks and self.consistency is None:
@@ -2082,7 +2598,27 @@ class RunConfig(Model):
         if set(self.checks) - set(CHECK_NAMES):
             raise ValueError("Unknown check name(s): " + ", ".join(sorted(set(self.checks) - set(CHECK_NAMES)))
                              + ". Valid names: " + ", ".join(CHECK_NAMES))
+        if "scale_down" in self.checks:
+            if self.scale_down is None:
+                raise ValueError("scale_down requires its scenario configuration")
+            if self.scale_down.target not in names:
+                raise ValueError("scale_down target must name a configured target")
+            if not self.stream:
+                raise ValueError("scale_down requires streaming")
+            if self.concurrency is not None and self.concurrency <= self.scale_down.long_cohort_size:
+                raise ValueError("scale_down requires a concurrency slot beyond its long cohort")
         self.resolve_concurrency()
+        if "multi_user" in self.checks and set(self.multi_user.scenarios) & {"arrivals", "recovery"}:
+            from giraffe.multi_user import _planned_observation
+            windows = _planned_observation(self.multi_user, include_offers=False)["windows"]
+            offers = sum(window.get("scheduled_offers", 0) for window in windows)*len(self.targets)
+            if offers > MAX_PLANNED_ARRIVALS:
+                raise PydanticCustomError("multi_user_offers",
+                    "Multi-user has {planned} total scheduled offers across population levels, phases and targets; "
+                    "the maximum is {maximum}. Reduce rates, durations, population levels or targets.",
+                    {"planned": offers, "maximum": MAX_PLANNED_ARRIVALS,
+                     "fields": ["multi_user.levels", "multi_user.arrivals.requests_per_second",
+                                "multi_user.recovery.sustained_requests_per_second", "targets"]})
         for check_id, options in self.test_options.items():
             if check_id not in CHECK_OPTION_FIELDS:
                 raise PydanticCustomError("check_options", f"unsupported test_options check: {check_id}",
@@ -2322,6 +2858,10 @@ class RunConfig(Model):
         result = handler(self)
         if "default_concurrency" not in self.model_fields_set:
             result.pop("default_concurrency", None)
+        if self.gateway_attribution is None:
+            result.pop("gateway_attribution", None)
+        if self.gateway_policy is None:
+            result.pop("gateway_policy", None)
         return result
 
     @field_serializer("limits")
@@ -2391,6 +2931,9 @@ class ConfigDraft(RunConfig):
 
 
 class RequestSpec(Model):
+    _gateway_access_credential_digest: bytes | None = PrivateAttr(default=None)
+    identity: str | None = Field(default=None, pattern=r"^[A-Za-z][A-Za-z0-9_-]{0,63}$",
+        description="Explicit gateway probe identity. Probes retain numeric response evidence, not response text.")
     condition_id: str | None = None
     fixture_id: str
     scenario: str
@@ -2414,6 +2957,13 @@ class RequestSpec(Model):
     requested_input_tokens: int | None = None
     requested_output_tokens: int | None = None
     workload: dict[str, Any] = Field(default_factory=dict)
+
+    @model_serializer(mode="wrap")
+    def serialize_optional_identity(self, handler):
+        result = handler(self)
+        if self.identity is None:
+            result.pop("identity", None)
+        return result
 
     @model_validator(mode="after")
     def validate_tool_expectation(self):
@@ -2466,8 +3016,47 @@ class EvaluationEvidence(PersistedModel):
         return _persisted_model_input(ToolExpectation, value)
 
 
+class GatewayResponseEvidence(PersistedModel):
+    _priority_model_group: str | None = PrivateAttr(default=None)
+    _response_cache_hit_reported: bool = PrivateAttr(default=False)
+    _saturation_bounds: tuple[Decimal, Decimal] | None = PrivateAttr(default=None)
+    _reported_saturation: tuple[Decimal, ...] = PrivateAttr(default=())
+    _model_tpm_unconfigured: bool = PrivateAttr(default=False)
+    _model_tpm: int | None = PrivateAttr(default=None)
+    _scoped_limits: dict[str, int | None] = PrivateAttr(default_factory=dict)
+    error_kind: Literal["authentication", "model_access", "rate_limit", "unknown"] | None = None
+    policy_rejection: Literal["key_rpm", "priority_pool", "model_capacity", "unknown"] | None = None
+    request_limit: int | None = Field(default=None, ge=0)
+    request_remaining: int | None = Field(default=None, ge=0)
+    token_limit: int | None = Field(default=None, ge=0)
+    token_remaining: int | None = Field(default=None, ge=0)
+    retry_after_seconds: float | None = Field(default=None, ge=0)
+    rate_limit_unit: Literal["requests", "tokens", "unknown"] | None = None
+    priority_matches: bool | None = None
+    limiter_version: Literal["v3"] | None = None
+    priority_request_limit: int | None = Field(default=None, ge=0)
+    model_rpm: int | None = Field(default=None, ge=0)
+    saturation_percent: float | None = Field(default=None, ge=0, le=100)
+
+
 class RequestRecord(PersistedModel):
+    identity: str | None = None
+    gateway_evidence: GatewayResponseEvidence | None = None
+
+    @model_serializer(mode="wrap")
+    def serialize_optional_evidence(self, handler):
+        result = handler(self)
+        for name in ("identity", "gateway_evidence", "requested_stream_logprobs", "requested_stream_usage"):
+            if getattr(self, name) is None:
+                result.pop(name, None)
+        return result
     _timing_started_monotonic: float | None = PrivateAttr(default=None)
+    _gateway_key_hash: str | None = PrivateAttr(default=None)
+    _gateway_terminal_usage: bool = PrivateAttr(default=False)
+    _gateway_access_routing_issue: str | None = PrivateAttr(default=None)
+    _gateway_access_refusal: bool = PrivateAttr(default=False)
+    _gateway_access_metered_reasoning: bool = PrivateAttr(default=False)
+    _request_body_sent_monotonic: float | None = PrivateAttr(default=None)
     id: str
     target: str
     fixture_id: str
@@ -2498,6 +3087,8 @@ class RequestRecord(PersistedModel):
     first_token_reason: str | None = "Timing schema predates client content-event collection."
     output_events: list[dict[str, Any]] = Field(default_factory=list)
     output_events_truncated: bool = False
+    # The second useful answer SSE event may arrive in the first answer read.
+    second_answer_event_ms: float | None = Field(default=None, ge=0)
     answer_read_timestamps_ms: list[float] = Field(default_factory=list)
     reasoning_read_timestamps_ms: list[float] = Field(default_factory=list)
     read_timestamps_truncated: bool = False
@@ -2554,6 +3145,7 @@ class RequestRecord(PersistedModel):
     dispatch_ms: float | None = None
     completed_ms: float | None = None
     timing_start_ms: float | None = None
+    request_body_sent_ms: float | None = None
     client_preparation_ms: float = 0
     scheduled_ms: float | None = None
     client_wait_ms: float | None = None
@@ -2562,6 +3154,8 @@ class RequestRecord(PersistedModel):
     requested_input_tokens: int | None = None
     requested_output_tokens: int | None = None
     workload: dict[str, Any] = Field(default_factory=dict)
+    requested_stream_logprobs: StrictBool | None = None
+    requested_stream_usage: StrictBool | None = None
     answer_hash: str | None = None
     request_hash: str | None = None
     history_hash: str | None = None
@@ -2762,12 +3356,14 @@ class RunReport(PersistedModel):
         self._stored_derived = "performance" in self.model_fields_set
         if not (info.context or {}).get("metadata_only"):
             from .performance import build_performance
-            from .conditions import aggregate_conditions
+            from .conditions import aggregate_conditions, scheduled_multi_user_window
 
             missing = {"performance", "conditions"} - self.model_fields_set
             if "performance" in missing or self._stored_derived:
                 self.performance = build_performance(self)
-            if "conditions" in missing:
+            if "conditions" in missing or any(
+                    row.get("planned_kind") != "exact" and scheduled_multi_user_window(row.get("condition_id"))
+                    for row in self.conditions):
                 self.conditions = aggregate_conditions(self)
         return self
 

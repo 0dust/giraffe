@@ -44,6 +44,7 @@ class FakeClient:
         cls.scenarios.append((self.target.name, spec.scenario))
         started = time.monotonic()
         status = "completed"
+        termination_reason = None
         try:
             await asyncio.sleep(cls.delay / 2)
             if first_output_event is not None and cls.useful_event:
@@ -54,6 +55,8 @@ class FakeClient:
                 await asyncio.sleep(cls.delay / 2)
             if spec.cancel_after_ms is not None or spec.cancel_after_chunks is not None:
                 status = "cancelled"
+                termination_reason = ("generation_chunk_limit" if spec.cancel_after_chunks is not None
+                                      else "intentional_cancellation_deadline")
         except asyncio.CancelledError:
             # Mirrors the real transport, preserving partial evidence on close.
             status = "cancelled"
@@ -83,7 +86,8 @@ class FakeClient:
             answer_reads=2 if spec.stream else 0, first_read_answer_chars=max(1, len(output)//2),
             chunks=2, stream=spec.stream, stream_terminated=True,
             finish_reason=None if status == "cancelled" else "stop",
-            client_cancelled_at_ns=time.time_ns() if spec.cancel_after_chunks and status == "cancelled" else None,
+            termination_reason=termination_reason,
+            client_cancelled_at_ns=time.time_ns() if termination_reason == "generation_chunk_limit" else None,
             requested_max_tokens=spec.max_tokens or 128,
             max_stream_gap_ms=500 if cls.bad_mixed_gap and spec.scenario == "fairness_short" else 2,
         )
@@ -1441,6 +1445,28 @@ async def test_correctness_only_pack_uses_quiet_and_concurrent_pass_and_case_cov
     assert len(report.requests) == 4 and result.status == "pass"
     assert not result.metrics.get("low_confidence", False)
     assert result.metrics["request_pack"]["coverage_complete"]
+
+
+async def test_pack_correctness_ignores_scheduled_multi_user_answers(client, monkeypatch):
+    execute = client.execute
+
+    async def wrong_arrivals(self, spec, **kwargs):
+        record = await execute(self, spec, **kwargs)
+        if spec.check_ids == ["multi_user"]:
+            record.output = "wrong"
+        return record
+
+    monkeypatch.setattr(client, "execute", wrong_arrivals)
+    report = await runner.run_suite(pack_config(checks=["correctness", "multi_user"], multi_user={
+        "levels": [2], "scenarios": ["arrivals"], "duration_seconds": .2,
+        "arrivals": {"requests_per_second": 5}}))
+    arrivals = [row for row in report.requests if "multi_user" in row.check_ids]
+    assert len(arrivals) == 2
+    assert all(row.score is False and row.traffic_stage is None for row in arrivals)
+    correctness = check(report, "correctness")
+    assert correctness.status == "pass"
+    assert correctness.metrics["attempted"] == correctness.metrics["correct"] == 4
+    assert all(case["loaded"]["attempted"] == 1 for case in correctness.metrics["request_pack"]["cases"])
 
 
 async def test_pack_quiet_budget_shortfall_prevents_acceptable_load_claim():

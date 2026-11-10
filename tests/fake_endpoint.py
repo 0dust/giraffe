@@ -26,8 +26,10 @@ class FakeEndpoint:
         fault_contains: str | None = None,
         service_slots: int | None = None,
         cached_tokens: int | None = None,
+        response_delay=None,
     ):
         self.cached_tokens = cached_tokens
+        self.response_delay = response_delay
         self.mode = mode
         self.first_token_delay = first_token_delay
         self.chunk_delay = chunk_delay
@@ -267,7 +269,8 @@ class FakeEndpoint:
                         result['observation_id'] = 'invented-observation'
                     text = json.dumps(result)
                 if results and mode == 'conversation_timeout':
-                    time.sleep(0.2)
+                    # Hang until the endpoint exits so the client deadline always fires first.
+                    endpoint._stop.wait(30)
                 finish = 'length' if results and mode in {'conversation_truncated', 'conversation_repeat_truncated'} else 'tool_calls' if calls else 'stop'
                 extras = {'reasoning_content': 'Need weather.'} if mode == 'conversation_reasoning' else {}
                 if mode == 'conversation_unknown_field':
@@ -298,7 +301,8 @@ class FakeEndpoint:
                         'function': {'name': c['function']['name'][4:],
                         'arguments': c['function']['arguments'][3:]}} for i, c in reversed(list(enumerate(calls)))]})
                     if results and mode == 'conversation_repeat_timeout':
-                        time.sleep(0.2)
+                        # Hang until the endpoint exits so the client deadline always fires first.
+                        endpoint._stop.wait(30)
                 event({'content': text[3:] if text else None}, finish)
                 if not (results and mode == 'conversation_eof'):
                     self.wfile.write(b'data: [DONE]\n\n')
@@ -349,6 +353,8 @@ class FakeEndpoint:
                     self.wfile.flush()
 
             def _completion(self, payload: dict[str, Any]) -> None:
+                if endpoint.response_delay:
+                    endpoint._stop.wait(endpoint.response_delay(payload))
                 prompt = "\n".join(message.get("content") or "" for message in payload["messages"])
                 applies = endpoint.fault_contains is None or endpoint.fault_contains in prompt
                 mode = endpoint.mode if applies else "healthy"

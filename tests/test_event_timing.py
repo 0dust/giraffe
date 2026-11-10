@@ -1,4 +1,5 @@
 """Socket-free, synthetic SSE endpoint with deterministic receipt timestamps."""
+import asyncio
 import json
 from types import SimpleNamespace
 
@@ -6,6 +7,7 @@ import httpx
 import pytest
 
 from giraffe.client import LLMClient
+from giraffe.concurrent_load import OutputProgress
 from giraffe.models import RequestRecord, RequestSpec, RunConfig, Target
 
 
@@ -40,7 +42,7 @@ class TimedStream(httpx.AsyncByteStream):
         self.closed = True
 
 
-async def execute(monkeypatch, events, *, stream=True, body=None, **spec_options):
+async def execute(monkeypatch, events, *, stream=True, body=None, progress=None, **spec_options):
     from giraffe import client as module
 
     clock = [0.0]
@@ -54,7 +56,8 @@ async def execute(monkeypatch, events, *, stream=True, body=None, **spec_options
         client._client = http
         try:
             record = await client.execute(RequestSpec(fixture_id="synthetic", scenario="serving",
-                check_ids=["serving"], messages=[{"role": "user", "content": "synthetic"}], **spec_options))
+                check_ids=["serving"], messages=[{"role": "user", "content": "synthetic"}], **spec_options),
+                first_output_event=progress)
         finally:
             await client.__aexit__()  # Join transport cleanup as a real client owner does.
     return record, source
@@ -154,12 +157,14 @@ async def test_reasoning_only_and_nonstreamed_are_honest(monkeypatch):
     assert record.output_events == [] and record.itl_ms is None and record.tpot_direct_ms is None
 
 
-async def test_bounded_evidence_discloses_loss_and_invalidates_distribution(monkeypatch):
-    monkeypatch.setattr("giraffe.client._MAX_OUTPUT_EVENTS", 2)
+@pytest.mark.parametrize(("event_cap", "second_answer"), [(1, None), (2, 200)])
+async def test_bounded_evidence_discloses_loss_and_invalidates_distribution(monkeypatch, event_cap, second_answer):
+    monkeypatch.setattr("giraffe.client._MAX_OUTPUT_EVENTS", event_cap)
     record, _ = await execute(monkeypatch, [(.1, sse({"content": "A"}, tokens=["A"])),
         (.2, sse({"content": "B"}, tokens=["B"])), (.3, sse({"content": "C"}, tokens=["C"])),
         (.4, sse(finish="stop", usage={"completion_tokens": 3})), (.5, b"data: [DONE]\n\n")])
-    assert len(record.output_events) == 2 and record.output_events_truncated
+    assert len(record.output_events) == event_cap and record.output_events_truncated
+    assert record.second_answer_event_ms == second_answer
     assert record.first_token_ms == 100
     assert record.itl_ms is None and record.tpot_direct_ms is None
 
@@ -171,6 +176,60 @@ def test_legacy_records_do_not_gain_new_timing_evidence():
     assert record.timing_schema == 0 and record.first_token_ms is None
     assert record.itl_ms is None and record.tpot_direct_ms is None and record.tpot_estimate_ms is None
     assert record.read_gaps_ms is None
+
+
+@pytest.mark.parametrize("intervening_reasoning", [False, True])
+async def test_literal_tag_prefix_keeps_first_token_receipt_time(monkeypatch, intervening_reasoning):
+    events = [(.1, sse({"content": "<"}, tokens=["<"]))]
+    if intervening_reasoning:
+        events.append((.2, sse({"reasoning_content": "thinking"})))
+    events += [(.4, sse({"content": "3"}, tokens=["3"])), (.5, sse(finish="stop")),
+               (.6, b"data: [DONE]\n\n")]
+    record, _ = await execute(monkeypatch, events)
+    assert record.valid and record.output == "<3"
+    assert record.first_token_ms == record.first_output_ms == 100
+    assert record.answer_read_timestamps_ms == [100, 400]
+    assert [e["at_ms"] for e in record.output_events if e["kind"] == "answer"] == [100, 400]
+
+
+@pytest.mark.parametrize("suffix", [None, "3"])
+async def test_load_progress_reports_literal_prefix_on_its_original_delta(monkeypatch, suffix):
+    progress = OutputProgress(asyncio.Event())
+
+    def events():
+        yield .1, sse({"content": "<"})
+        assert progress.first and progress.chunks == 1
+        if suffix is not None:
+            yield .4, sse({"content": suffix})
+            assert progress.chunks == 2
+        yield .5, sse(finish="stop")
+        assert progress.chunks == (1 if suffix is None else 2)
+        yield .6, b"data: [DONE]\n\n"
+
+    record, _ = await execute(monkeypatch, events(), progress=progress)
+    assert record.valid and record.first_token_ms == 100
+    assert record.answer_chunks == progress.chunks
+
+
+@pytest.mark.parametrize("split_prefix", [False, True])
+async def test_multi_user_progress_does_not_signal_answer_on_finish(monkeypatch, split_prefix):
+    from giraffe.multi_user import _UserOutputProgress
+
+    progress = _UserOutputProgress(asyncio.Event(), lambda: None)
+
+    def events():
+        if split_prefix:
+            yield .1, sse({"content": "<"})
+            assert not progress.first_token and not progress.first and progress.chunks == 0
+            yield .2, sse(finish="stop")
+        else:
+            yield .1, sse({"content": "A"}) + sse({"content": "B"}) + sse(finish="stop")
+        assert progress.finished and not progress.first and progress.chunks == 0
+        yield .3, b"data: [DONE]\n\n"
+
+    record, _ = await execute(monkeypatch, events(), progress=progress)
+    assert record.valid and record.first_token_ms == 100
+    assert record.answer_chunks == (1 if split_prefix else 2)
 
 
 async def test_inline_reasoning_classifies_reads_and_keeps_ttft(monkeypatch):
@@ -185,6 +244,49 @@ async def test_inline_reasoning_classifies_reads_and_keeps_ttft(monkeypatch):
     assert record.answer_read_timestamps_ms == [300, 500]
     assert [event["kind"] for event in record.output_events] == ["reasoning", "answer", "answer"]
     assert record.itl_ms is None and record.tpot_direct_ms is None
+
+
+@pytest.mark.parametrize("same_read", [True, False])
+async def test_orphan_reasoning_close_reclassifies_live_answer_progress(monkeypatch, same_read):
+    from giraffe.multi_user import _UserOutputProgress
+
+    progress = _UserOutputProgress(asyncio.Event(), lambda: None)
+    hidden = sse({"content": "thought A"}) + sse({"content": "thought B</th"})
+    first_answer = sse({"content": "ink>K7P4"})
+    second_answer = sse({"content": " 42"})
+
+    def events():
+        if same_read:
+            yield .1, hidden + first_answer
+        else:
+            yield .1, hidden
+            assert progress.first and progress.chunks == 2
+            yield .2, first_answer
+        assert progress.first_token and progress.first and progress.chunks == 1
+        yield .4, second_answer
+        assert progress.chunks == 2
+        yield .5, sse(finish="stop")
+        yield .6, b"data: [DONE]\n\n"
+
+    record, _ = await execute(monkeypatch, events(), progress=progress)
+    assert record.valid
+    assert record.generation_chunks == 4 and record.answer_chunks == 2
+    assert record.first_token_ms == record.first_reasoning_ms == 100
+    assert record.first_output_ms == (100 if same_read else 200)
+    assert record.second_answer_event_ms == 400
+
+
+@pytest.mark.parametrize(("completion", "expected"), [(0, 0), (3, None), (None, None)])
+async def test_explicit_reasoning_preserves_only_known_zero_completion_usage(monkeypatch, completion, expected):
+    record, _ = await execute(monkeypatch, [
+        (.1, sse({"content": "A", "reasoning_content": "thinking"})),
+        (.2, sse({"content": "B"})),
+        (.3, sse(finish="stop", usage={"completion_tokens": completion,
+            "completion_tokens_details": {"reasoning_tokens": 0}})),
+        (.4, b"data: [DONE]\n\n"),
+    ])
+    assert record.valid and record.answer_chunks == 2
+    assert record.output_tokens == expected
 
 
 async def test_later_multitoken_event_supports_mean_tpot_but_not_itl(monkeypatch):
@@ -232,6 +334,7 @@ async def test_whitespace_generated_content_precedes_useful_output(monkeypatch):
     record, _ = await execute(monkeypatch, [(.1, sse({"content": " "})),
         (.4, sse({"content": "A"})), (.5, sse(finish="stop")), (.6, b"data: [DONE]\n\n")])
     assert record.first_token_ms == 100 and record.first_output_ms == 400
+    assert record.second_answer_event_ms is None
 
 
 async def test_read_evidence_cap_marks_read_distribution_unavailable(monkeypatch):
@@ -248,7 +351,7 @@ async def test_saved_record_roundtrip_keeps_token_arrival_evidence(monkeypatch):
         (.5, sse({"content": "B"}, tokens=["B"])),
         (.6, sse(finish="stop", usage={"completion_tokens": 2})), (.7, b"data: [DONE]\n\n")])
     saved = RequestRecord.model_validate_json(record.model_dump_json())
-    assert saved.first_token_ms == 100
+    assert saved.first_token_ms == 100 and saved.second_answer_event_ms == 500
     assert saved.itl_ms == [400] and saved.tpot_direct_ms == 400
     assert saved.read_output_tokens_source == "logprobs"
     assert saved.output_events[0]["token_count_source"] == "choice.logprobs.content"

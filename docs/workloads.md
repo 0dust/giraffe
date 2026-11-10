@@ -2,7 +2,7 @@
 
 [Documentation index](README.md) · [Running and baselines](running.md)
 
-The public catalog has 15 checks. **Load test** combines the former concurrency,
+The public catalog has 16 checks. **Load test** combines the former concurrency,
 capacity and arrival checks. Workloads share configured run-wide request, duration
 and concurrency ceilings; Load test has its own token profile and request timeout.
 The [expanded example](../examples/workloads.yaml) includes legacy load settings
@@ -359,6 +359,13 @@ does not infer them from characters or SSE event counts. Counts must cover the
 same output scope at both boundaries. Reasoning needs a usable reasoning-token
 breakdown, and mixed text/tool responses cannot establish this pace. Server
 counts can include control tokens and need not equal tokenization of visible text.
+Aligned reasoning logprobs establish stream support but do not replace that usage
+breakdown: servers can omit thinking tags and other control tokens from the
+stream while including them in completion usage. When reasoning usage is not
+separated, Giraffe leaves answer generation pace unmeasured and identifies this
+accounting limit. Use a server that reports reasoning-token usage separately, or
+configure the model to answer without reasoning. Generation pace remains an
+answer-only metric; it does not combine reasoning and answer tokens.
 Network buffering also affects arrival times, so this is not an exact server
 decoding measurement.
 
@@ -1034,3 +1041,253 @@ discovery is `unknown`. These observations do not prove a cold start or explain 
 slow first response. A separately requested UI connection test may already have
 loaded the model before the run starts. A deliberate restart may also change state
 between observations. This is one endpoint’s inventory, not proof about every replica.
+
+
+## Persistent multi-user work
+
+The opt-in **Multi-user** check keeps a stable simulated user across repeated independent requests or fresh conversations. Start with [multi-user.yaml](../examples/multi-user.yaml):
+
+```sh
+giraffe run --config examples/multi-user.yaml --output runs/multi-user --html
+```
+
+Set the endpoint and model first. All simulated users share its optional `api_key_env`; these are workload identities, not separate credentials. Select repeated work, noisy neighbors, cancellation, arrivals or recovery with `multi_user.scenarios`.
+
+`multi_user.levels` selects populations of 1–32 users independently of the run's `concurrency` ceiling. The example runs 1, 5 and 20 users behind five shared request slots. Each user sends one request at a time, waits for completion and then pauses. Sleeping users hold no request slot. `think_time_seconds.values` and optional `weights` reuse the session distribution format; `seed` makes each user's profile and pause sequence reproducible across levels. `shapes` selects the existing short/medium/long input-output combinations; `profile` accepts the existing increasing token-size profile. Requests keep the run's request timeout and all existing global budgets.
+
+Each population has a common measurement window. Optional `warmup_seconds` traffic uses the same budgets and fully drains before measurement begins. New requests stop at the measurement cutoff; admitted requests can drain within their ordinary timeout and the global deadline. A request ready before cutoff but still waiting for a slot is retained as undispatched work.
+
+Per-user delivered throughput is **known valid output tokens completed inside the common measurement window divided by that window's actual seconds**. Equal delivered tokens therefore produce equal rates even when users had different active times. Late completions, partial output and missing usage are shown separately. Missing usage on an eligible completion makes exact throughput unknown; a user that never dispatched has known zero delivery and unexercised acceptance. This rate includes thinking and waiting; it is separate from generation pace.
+
+Optional `max_first_answer_ms` and `max_completion_ms` apply from the time a user is ready, including local admission wait. Dispatch-to-answer timings remain available in JSON and inspection. Every nonintentional admitted attempt enters timing attainment, including errors and requests that fail during drain. One user's failure is not hidden by healthy peers. A pending admission wait that already exceeds a selected timing limit is a client-admission breach when timing evidence is qualified; shorter waits at cutoff remain censored. Interrupted windows cannot pass, and incomplete throughput evidence is not an established throughput shortfall.
+
+`max_error_percent` defaults to zero; set it to `null` to omit that criterion. `min_output_tokens_per_second` is optional and measures shared-window delivery, not generation speed. `min_samples` requires that many valid responses for each user. With all acceptance thresholds set to `null`, results are measurements and the check remains inconclusive rather than claiming acceptance.
+
+CLI output, the UI, HTML, JSON and reproduction exports retain every planned user, including those with no requests. Results identify the worst served user and link user rows to their request evidence. Response retention still controls bodies and reasoning. Baselines compare each user at the same population and profile; changing population, shapes, seed, duration or window policy prevents a passing comparison. Shared-window rate changes are observed changes without a cross-run confidence interval. Reproduction exports include user settings, plans and compact outcomes, but do not recreate inaccessible server state.
+
+### Qualified delivery fairness
+
+Set `multi_user.pass_criteria.max_throughput_ratio` to compare **median user throughput / worst user throughput** against a maximum (at least 1). Without a threshold, fairness remains a measurement. A one-user level still contributes to per-user criteria, and the fairness threshold requires a level with at least two users. A zero or unknown worst throughput leaves the ratio undefined. Other selected per-user criteria retain their own failures even when fairness evidence is inconclusive.
+
+Every compared user needs sufficient valid in-window samples, known input/output usage, equivalent active exposure, the same work and pause plans, and qualified streamed overlap with another user. Users need not all overlap at once: twenty users can be compared behind five request slots. The eligible population and concrete qualification reasons appear beside the ratio in CLI, UI, HTML, JSON and exports. `fairness_tolerance_percent` defaults to 10 and applies to differences in actual median token lengths, per-request token length mixes, and active exposure. For length mixes, it bounds the average token difference between corresponding percentiles as a percentage of the smaller mean. Qualification includes total generated tokens and, when requests report cache reuse, uncached input. Throughput still counts answer tokens. An unserved user, early EOS before the requested output shape, incomplete work or client scheduling delay prevents a fairness verdict. Conversations can finish below their output cap when their actual work is comparable. Independently sampled variable pauses or conversation lengths do not establish equal work. The result describes observed delivery fairness; it does not establish a server scheduling defect.
+
+### Repeated conversations
+
+Set `multi_user.conversations` to use the existing conversation settings. Omit it or set it to `null` for independent requests. The Multi-user editor exposes both choices. For example:
+
+```yaml
+multi_user:
+  levels: [2, 5]
+  duration_seconds: 30
+  think_time_seconds: {values: [1]}
+  conversations:
+    profile: correctness
+    modes: [fixed, live]
+    max_tokens: 32
+    delay_seconds: 0.5
+    turns:
+      - Remember the conversation name.
+      - Repeat the original name.
+```
+
+Each user alternates the selected modes across fresh conversations. Fixed histories use the conversation's seeded answer; live histories use actual preceding answers. The outer `think_time_seconds` pauses between conversations, while `delay_seconds` or `sampling.think_time_seconds` pauses between turns. None holds a request slot while sleeping. The optional conversation `sampling` uses the same seed, weighted pause/input/output/turn-count distributions as Sessions; input/output/turn-count sampling requires `profile: performance` with `modes: [live]` and selected `workloads`. Task weights assign each persistent user a stable task independently of population and peer completion order. Performance replies are unscored.
+
+A failed, cancelled or truncated turn stops its conversation without a substitute answer. Truncated conversation output counts as partial output and a request error; it cannot qualify as valid delivered work. The user can then start a fresh conversation, subject to the shared budgets and stop rules. If no turn can be dispatched (for example, its first prompt exceeds the history admission ceiling), that user stops instead of repeatedly attempting the same impossible history. Every conversation has a distinct ID and request/turn links under the same user. Conversation summaries and links survive response retention. Copied live assistant replies are omitted from saved request inputs unless `retention: all`; bodies kept by `retention: failures` remain attached to their original requests. Existing Sessions counts and concurrency semantics remain unchanged.
+
+Reproduction and baseline identity include fairness criteria, comparability tolerance, conversation settings and generator sources. Changed work or window policies cannot pass a baseline comparison. Live history can vary between runs; actual shape and hash evidence remain authoritative.
+
+### Matched noisy neighbors
+
+Select `noisy_neighbors` to compare each short user's responses with its own short-only control. Every selected heavy profile and trigger gets a control window followed by a probe window of `duration_seconds` each. Short users retain their IDs, matched logical work and pause plans. The probe adds the selected heavy users, subject to the same request slots and run budgets. These scenarios use independent requests; `conversations` must be absent or `null`.
+
+For example, replace the `multi_user` block in [multi-user.yaml](../examples/multi-user.yaml) with:
+
+```yaml
+multi_user:
+  scenarios: [noisy_neighbors, cancellation]
+  levels: [3]
+  duration_seconds: 5
+  think_time_seconds: {values: [0.1]}
+  noisy_neighbors:
+    heavy_user_ids: [user-03]
+    heavy_profiles: [long_short, short_long]
+    triggers: [before_output, during_stream]
+    max_slowdown: 1.5
+  cancellation:
+    user_id: user-03
+    cancel_after_chunks: 5
+  pass_criteria:
+    min_samples: 2
+    max_error_percent: 0
+```
+
+`heavy_user_ids` selects explicit persistent IDs. Omit it to select the first `heavy_user_count` users (default 1). Every selected level must contain the heavy users and at least one short user. Each `heavy_profiles` entry selects long input (`long_short`), long output (`short_long`), or both (`long_long`); sizes come from the existing `profile` token settings. Short users use `short_short`.
+
+`before_output` dispatches heavy work while a short request has started but has not produced output. `during_stream` waits for short-user streaming progress. A requested trigger is not proof that overlap occurred: the report retains actual dispatch, output, lengths and matched request evidence. Fast short responses, early completion of heavy work, mismatched input/output lengths, missing usage, insufficient samples, client timing interference or an exhausted budget leave the comparison inconclusive. The tolerance for comparable actual lengths and exposure is `fairness_tolerance_percent`.
+
+Each short-user comparison shows the control/probe sample associations, actual median input/output lengths, completion slowdown, first-answer and stream-gap changes, and output change. Each pair must have comparable actual lengths and compatible reported cache use to count. When cache usage is reported, long-input competitors need enough uncached tokens to qualify as long input and at least half their input must be uncached. Generated requests vary their prefix nonce while preserving the matched work identity. `max_slowdown` optionally limits the matched completion-time ratio. Omitting it measures the difference without claiming acceptance. Per-user errors and selected latency criteria remain visible even if the interference comparison is inconclusive. These measurements describe observed interference under the tested workload; they do not identify a particular server scheduling cause.
+
+### Cancel one user while peers continue
+
+Select `cancellation` to interrupt the selected user's first long-output response after `cancel_after_chunks` generation chunks carrying answer or reasoning content and then send another request under that user's original ID. Other users continue their work. Every population level needs at least two users and must include `cancellation.user_id`.
+
+Results separately qualify the selected cancellation, peer output across cancellation, and same-user follow-up. A response that ends before the cancellation opportunity, missing peer overlap, or incomplete follow-up stays inconclusive. Successful follow-up alone does not establish that the backend released compute or memory. Run Stop still terminates the whole run; undispatched work remains distinct from HTTP attempts and partial responses follow the configured retention policy.
+
+The UI, CLI, HTML, JSON and reproduction export expose the same scenario observations and request associations. Baselines keep control/probe roles, trigger and heavy profile separate, and refuse passing comparisons when scenario configuration, work identity or window policies differ. Give the run enough time and requests for every selected window: the example above schedules eight five-second noisy-neighbor windows plus one five-second cancellation window, followed by any needed drain time. Real-engine conclusions still require runs against the intended endpoint, model and hardware.
+
+### Newcomers and selected-user bursts
+
+Select `arrivals` and set `arrivals.requests_per_second` per user. Users normally activate at zero; `activations: {user-03: 5}` starts that user's finite independent-request schedule five seconds into the window. Existing user sequences continue. Add `bursts: [{user_id: user-01, at_seconds: 8, requests: 3, spacing_seconds: 0}]` to offer three independent requests together. They may overlap under the shared cap, including when the population has only one user. Conversations retain their sequential execution and cannot use scheduled arrivals.
+
+The finite offer ledger preserves identity, cohort, intended time and outcome even when a request is never sent. Planned work equals offered plus not offered; offered work equals dispatched plus local drops, late drops and unissued work. Local drops consume offer budget without inventing HTTP attempts. Generator stalls discard already-due offers instead of creating catch-up bursts. A reserved offer that never dispatches is unissued; work beyond the budget/stop boundary is not offered. Scheduled-to-answer latency includes client delay and is separate from dispatch-to-answer latency. Neither measures the server's internal queue.
+
+The combined schedule is limited to 100,000 offers across all selected population levels, arrival and recovery phases, and targets. The request budget can stop execution earlier; it does not increase this planning limit.
+
+Results show scheduled and observed activation, achieved traffic, per-user accounting and overlap evidence. Newcomer exposure and selected-user bursts cannot establish equal-work fairness against incumbents. Independent user acceptance failures remain visible. For scheduled arrivals and recovery, valid requests that finish during drain contribute to work qualification. Shared-window throughput and the overlap used for fairness still use in-window completions. Warmup drains before the scheduled measurement begins and does not contribute output to it.
+
+### Sustained shared use and lighter recovery
+
+Select `recovery` with at least two users. `control_seconds`, `sustained_seconds` and `lighter_seconds` define explicit common windows; `lighter_requests_per_second` drives both control and lighter traffic, and must be below `sustained_requests_per_second`. User profiles stay unchanged. Lifetime request sequences continue, while a separate work sequence advances from sustained into lighter traffic. Work replays a finite seeded control corpus, so request hashes can prove which controls match. Synthetic requests use fresh prefixes while keeping the same logical work IDs. Reported cache reuse that changes the uncached input work disqualifies a comparison. These measurements describe observed recovery.
+
+Each user reports its lighter/control median completion slowdown, actual input/output lengths, first-answer and stream-gap measurements, matched sample counts and request links. Matched control and lighter latency include valid requests admitted in the respective window that complete during drain. `recovery.max_slowdown` is optional; omitted means measured only. A single user's qualified regression fails the recovery criterion even when aggregates recover. Missing controls, different actual work, insufficient samples, unqualified stream gaps, missing sustained peer overlap, generator saturation and partial phases prevent a passing recovery conclusion. The delivered sustained schedule must send more than one request per user and have a higher dispatch rate than both other phases. Single-chunk responses cannot qualify stream-gap recovery; select a suitable output profile when testing it. Configured endpoint errors still fail independently of comparison uncertainty.
+
+The runnable replacement block in [multi-user.yaml](../examples/multi-user.yaml) combines newcomers, a burst and recovery. Setup, CLI inspection, HTML/JSON reports and reproduction exports preserve each phase and user; baseline comparison rejects changed schedules. An interrupted run retains completed, partial and unexercised windows and their finite offer totals.
+## Scale-down continuity
+
+Select `checks: [scale_down]` and a `scale_down` section naming one configured
+target. The [example configuration](../examples/scale-down.yaml) uses existing
+fixtures and scoring. Other selected checks still run normally. This scenario
+observes one externally performed removal of one replica incarnation; it does not
+provision infrastructure or issue removal commands.
+
+The long cohort occupies `long_cohort_size` slots while one continuous arrival
+stage sends `followup_fixture` requests at `requests_per_second`. Set `concurrency`
+above the cohort size, and leave enough shared run budget for baseline, drain
+and post-removal samples. `baseline_timeout_seconds` bounds baseline/arming;
+`event_timeout_seconds` bounds the wait for an accepted marker; `grace_seconds`
+bounds removal observation; `post_seconds` measures survivor traffic;
+`completion_seconds` bounds final client cleanup. The grace policy explicitly
+anchors to `drain_effective` or `removal_requested`. A client cleanup allowance
+does not extend backend grace. Global limits remain authoritative.
+
+A high token cap does not guarantee a long response. If the default long fixture
+ends early, supply a representative streaming prompt through the existing
+`custom_fixtures` JSON file and select its fixture ID. For example, a file may
+contain:
+
+```json
+[
+  {"fixture_id":"representative.long","messages":[{"role":"user","content":"Write a detailed step-by-step explanation of the water cycle for a science lesson."}],"scorer":"contains","expected":"evaporation","max_tokens":2048,"check_ids":["scale_down"]},
+  {"fixture_id":"representative.short","messages":[{"role":"user","content":"Reply with just OK."}],"scorer":"exact","expected":"OK","max_tokens":8,"check_ids":["scale_down"]}
+]
+```
+
+Set `custom_fixtures` to that file and set `long_fixture` and `followup_fixture` to
+its IDs. Adapt the prompt, expected answer and existing scorer to your workload;
+this illustrative prompt is not guaranteed to stay open. Empty deltas, reasoning
+alone and tool arguments do not arm the text-stream scenario. The observed answer
+must span the confirmed transition interval; an answer ending after arming but
+before removal does not qualify.
+
+The three results have independent prerequisites:
+
+| Result | What establishes a pass |
+| --- | --- |
+| Client-visible continuity | Confirmed transition and baseline topology; enough original answer streams spanning the transition; valid stream termination, configured correctness and timing |
+| Backend drain semantics | Exact removed incarnation; active attributed work; complete all-traffic admissions/completions through termination; no admission after cutoff; successful completion before termination; declared grace respected |
+| Remaining capacity | New requests during the drain observation window and after exit independently meet configured error-rate, correctness and timing limits, with at least `min_post_samples` valid responses in each; confirmed surviving topology and full configured post-removal offered load |
+
+The drain observation window starts at the earliest bounded admission-cutoff
+time and ends at confirmed process exit, using capture times in the runner
+clock. It includes the cutoff polling uncertainty so failures before the next
+collector poll cannot disappear; it is not an exact backend-only drain interval.
+The post-exit window starts when the runner observes termination and lasts
+`post_seconds`. Requests are assigned by dispatch time; responses may finish
+later. Each window is scored separately, so successful later traffic cannot
+dilute a drain-window breach. A short or unconfirmed drain with fewer than
+`min_post_samples` valid responses is inconclusive even when post-exit traffic
+passes. The capacity summary names both window verdicts; JSON reports also
+retain each window's request IDs, limitations and timing evidence.
+
+A confirmed interruption or late admission fails even when some other coverage
+is missing. Unknown attribution, absent overlap, missing lifecycle facts,
+uncertain clock ordering or insufficient samples stay inconclusive. HTTP 200,
+`[DONE]`, recovery and successful retries cannot erase an original error. Backend
+attempts retain their own identities; Giraffe adds no inference retries.
+
+### Read-only lifecycle export
+
+Set `targets[].deployment.collector_url` to an HTTP(S) endpoint returning a JSON
+object with the top-level key `scale_down_lifecycle`. Ordinary allowlisted
+configuration categories may coexist. Lifecycle events do not belong in arbitrary
+metadata. Collection uses the existing bounded read-only transport and does not
+forward inference credentials. The entire collector response must fit 64 KiB.
+Each events, inventories and coverage array is limited to 256 items. Long runs
+must stay within those bounds; gaps or truncation must be explicit, never hidden.
+
+The version 1 lifecycle object has these fields:
+
+| Field | Contract |
+| --- | --- |
+| `schema_version` | Integer `1`, explicitly supplied |
+| `target` | Configured Giraffe target name |
+| `source`, `clock_id` | Stable source identity and source-clock incarnation for this history |
+| `through_sequence` | Nonnegative integer watermark covering both events and inventories |
+| `captured_at` | UTC ISO timestamp generated when this export is sampled, not the last event time |
+| `clock_uncertainty_ms` | Explicit nonnegative upper bound on source UTC clock error, at most 60000 ms |
+| `inventories` | Inventory observations described below |
+| `events` | Lifecycle facts described below |
+| `coverage` | Explicit completeness intervals described below |
+
+Every inventory contains `event_id`, nonnegative integer `sequence`, nonnegative
+`time_ms`, and a `replicas` array of at most 512 unique stable **incarnation IDs**. A restarted
+process must get a different ID. Include baseline inventory with at least two
+incarnations and inventory showing survivors after termination. A source may
+report a failed or cancelled completion after termination for an attempt admitted
+before exit on that incarnation. Other lifecycle facts after termination
+contradict that history and leave its transition untrusted for all three verdicts.
+
+Every lifecycle fact contains `event_id`, `sequence`, `time_ms`, `kind` and
+`replica_id`. Supported kinds are `removal_requested`, `drain_effective`,
+`request_admitted`, `request_completed` and `replica_terminated`. Request facts
+require `request_id` and `attempt_id`; completions report `outcome` as `completed`,
+`failed` or `cancelled`. Correlate `request_id` to Giraffe's request ID or the
+server request ID returned with the response. The client records `x-replica-id`
+and the streaming response `id` as attribution hints; backend admissions establish
+which attempt actually reached the removed incarnation. Retries need distinct
+attempt IDs and cannot overwrite original admissions or completions. Each
+completion needs a matching admission for the same request and attempt on that
+incarnation; an unmatched completion invalidates drain coverage. Backend
+`cancelled` means the client went away, leaving drain completion inconclusive
+for that work rather than proving a deployment failure.
+
+Use one ordered sequence across the source history. Re-export unchanged facts
+with the same IDs, sequences and contents. `time_ms` uses the source's own clock
+and units throughout; Giraffe uses same-source ordering and elapsed times for
+admissions, completion and grace. It never subtracts unrelated monotonic clocks.
+`captured_at` plus `clock_uncertainty_ms` maps each collection to a conservative
+runner interval. The timestamp must overlap the HTTP collection interval within
+that declared uncertainty. Missing, stale or unmappable capture time cannot
+establish overlap. Polling must observe an active answer before and after the
+transition; allow time for a fresh source capture after arming before removing.
+
+Every coverage entry contains `replica_id`, `start_sequence`, `end_sequence`,
+`complete`, `scope` (`all` or `giraffe`), `gaps` (at most 256 sequence integers) and `truncated`.
+`complete` and `truncated` are JSON booleans; source sequence fields are integers,
+not numeric strings. Omitting `complete` or `scope` on an entry defaults to `false` and `giraffe`.
+Start must not exceed end. A drain pass requires complete, gap-free, untruncated
+**all-traffic** coverage from source sequence zero through the selected replica's
+confirmed termination. With this schema, sequence zero is the known origin of the
+replica incarnation; a rolling interval starting later cannot rule out earlier
+unfinished work. Include unfinished attempts and failed completions. Coverage of only Giraffe traffic or sampled absence cannot establish
+that other traffic drained correctly. Complete Giraffe-traffic coverage through
+termination can still prove that a Giraffe request was active at an abrupt exit
+for the client-visible continuity verdict. A replica count decrease, readiness change
+or deletion request is not process termination or an effective admission cutoff.
+
+All identifiers are nonempty strings up to 256 characters. Evidence remains a
+claim from its named backend source. Wrong target/incarnation, conflicting IDs,
+backwards sequences, source clock changes, malformed data and exceeded bounds
+leave explicit limitations; none supplies missing proof. For an executable source
+example see [the controlled router fixture](../tests/fake_replica_router.py). It is
+not an adapter for Kubernetes, vLLM or GPUStack.
