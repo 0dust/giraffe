@@ -36,11 +36,18 @@ def test_per_check_request_settings_can_exceed_suite_defaults(check):
 
 @pytest.mark.parametrize("check,field", [("sessions", "concurrency"), ("sessions", "max_output_tokens"),
                                          ("arrivals", "concurrency"), ("capacity", "concurrency"),
-                                         ("prefix", "max_output_tokens"), ("concurrency", "max_output_tokens")])
+                                         ("concurrency", "max_output_tokens")])
 def test_dedicated_request_fields_have_no_second_override(check, field):
     assert field not in CHECK_OPTION_FIELDS[check]
     with pytest.raises(ValidationError, match="unsupported options"):
         config(checks=[], test_options={check: {field: 4}})
+
+
+def test_prefix_output_allowance_is_a_supported_check_option():
+    assert "max_output_tokens" in CHECK_OPTION_FIELDS["prefix"]
+    configured = config(checks=["prefix"], max_output_tokens=2048, test_options={"prefix": {"max_output_tokens": 8}})
+    assert configured.effective_check("prefix")["max_output_tokens"] == 8
+    assert RunConfig.model_validate(configured.model_dump()).effective_check("prefix") == configured.effective_check("prefix")
 
 
 def test_endpoint_response_owns_warm_samples_and_shared_request_settings():

@@ -47,7 +47,8 @@ async def test_global_output_budget_reaches_reasoning_requests_without_per_check
 
     requests = [record for record in report.requests if record.fixture_id != 'performance-evidence']
     assert requests and all(record.requested_max_tokens == 2048 for record in requests)
-    assert all(payload['max_tokens'] == 2048 for payload in sent if payload['max_tokens'] != 1)
+    # The token-evidence setup probe has its own tiny allowance; identify it by its prompt, not its size.
+    assert all(payload['max_tokens'] == 2048 for payload in sent if payload['messages'][-1]['content'] != 'Reply with 1.')
     assert {check.id: check.status for check in report.checks if check.id in checks} == dict.fromkeys(checks, 'pass')
 
 
