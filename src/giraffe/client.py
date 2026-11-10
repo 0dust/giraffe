@@ -413,8 +413,10 @@ class LLMClient:
             options.update(logprobs=True, top_logprobs=0)
         if "stream_options" in self._evidence_fields:
             options["stream_options"] = {"include_usage": True}
+        # A single token can be a hidden reasoning delimiter. Give the bounded
+        # probe room to observe visible output, without waiting for a full answer.
         return RequestSpec(fixture_id="performance-evidence", scenario="performance_evidence_probe",
-            check_ids=[], messages=[{"role": "user", "content": "Reply with 1."}], max_tokens=1,
+            check_ids=[], messages=[{"role": "user", "content": "Reply with 1."}], max_tokens=16,
             request_timeout_seconds=self.config.request_timeout_seconds, options=options,
             workload={"performance_evidence_probe": True, "role": "setup", "phase": "preparation",
                       "evidence_fields": sorted(self._evidence_fields)})
@@ -956,16 +958,22 @@ class LLMClient:
             if streaming:
                 token_evidence = choice.get("logprobs")
                 token_parts = token_evidence.get("content") if isinstance(token_evidence, dict) else None
-                tokens = None
+                tokens = reasoning_token_count = None
                 if (isinstance(token_parts, list) and token_parts
                         and all(isinstance(part, dict) and isinstance(part.get("token"), str)
-                                for part in token_parts)
-                        and "".join(part["token"] for part in token_parts) == answer):
-                    tokens = len(token_parts)
+                                for part in token_parts)):
+                    token_text = "".join(part["token"] for part in token_parts)
+                    # Some endpoints attach a mixed reasoning/answer token batch
+                    # to the reasoning delta. Count only exact, unambiguous text
+                    # matches; observed tokens do not establish final usage.
+                    if answer and not reasoning and token_text == answer:
+                        tokens = len(token_parts)
+                    elif reasoning and not answer and token_text == reasoning:
+                        reasoning_token_count = len(token_parts)
                 content_event = output_event("answer", _REASONING_TAG.sub("", answer), now, tokens=tokens)
                 if content_event is not None:
                     content_event_spans.append((content_event, len(record.output), len(record.output) + len(answer)))
-                output_event("reasoning", reasoning, now)
+                output_event("reasoning", reasoning, now, tokens=reasoning_token_count)
                 observe_generation(now, answer, reasoning)
             calls = content.get("tool_calls")
             if calls is not None:

@@ -359,6 +359,13 @@ does not infer them from characters or SSE event counts. Counts must cover the
 same output scope at both boundaries. Reasoning needs a usable reasoning-token
 breakdown, and mixed text/tool responses cannot establish this pace. Server
 counts can include control tokens and need not equal tokenization of visible text.
+Aligned reasoning logprobs establish stream support but do not replace that usage
+breakdown: servers can omit thinking tags and other control tokens from the
+stream while including them in completion usage. When reasoning usage is not
+separated, Giraffe leaves answer generation pace unmeasured and identifies this
+accounting limit. Use a server that reports reasoning-token usage separately, or
+configure the model to answer without reasoning. Generation pace remains an
+answer-only metric; it does not combine reasoning and answer tokens.
 Network buffering also affects arrival times, so this is not an exact server
 decoding measurement.
 

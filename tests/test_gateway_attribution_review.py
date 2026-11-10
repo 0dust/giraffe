@@ -87,7 +87,8 @@ def streamed_gateway(monkeypatch, *, rejected_attempts=0, reject_marked_logprobs
                          "metadata": {"spend_logs_metadata": json.loads(request.headers["x-litellm-spend-logs-metadata"])},
                          "api_key": hashlib.sha256(key.encode()).hexdigest(), "prompt_tokens": 3,
                          "completion_tokens": 5, "total_tokens": 8, "status": "success"})
-        elif body["max_tokens"] == 1:
+        elif (body["max_tokens"] == 16
+              and body["messages"] == [{"role": "user", "content": "Reply with 1."}]):
             compatibility_attempts += 1
             if compatibility_attempts <= rejected_attempts:
                 # A gateway can repeatedly reject a known parameter after its first rejection.
@@ -1398,7 +1399,9 @@ async def test_duration_remedy_includes_streamed_compatibility(monkeypatch, loca
                 "completion_tokens": 5, "total_tokens": 8, "status": "success"})
         delay = .9
         if restart:
-            delay = .88 if marker or body.get("max_tokens") == 1 else .03
+            probe = (body.get("max_tokens") == 16
+                     and body.get("messages") == [{"role": "user", "content": "Reply with 1."}])
+            delay = .88 if marker or probe else .03
         await asyncio.sleep(delay)
         return httpx.Response(200, content=(b'data: {"choices":[{"delta":{"content":"OK"}}]}\n\n'
             b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
