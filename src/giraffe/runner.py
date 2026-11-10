@@ -1276,15 +1276,26 @@ async def _context_fixtures(run, target, client, fixtures, source=None):
         if size != "long":
             desired = max(1, desired // 3)
 
-        def build(chars):
+        def build(chars, variant=False):
             # The fixture builder takes a character allowance; the tokenizer
             # determines that allowance using the complete rendered chat prompt.
             allowance = chars if size == "long" else chars * 3
             local = config.model_copy(update={"context_limit": max(128, allowance + output_budget + 32)})
-            return _context_request(local, size, position)
+            request = _context_request(local, size, position)
+            if variant:
+                # A one-token window can fall in a gap of the filler's token counts;
+                # a longer closing instruction shifts every count by a fixed amount.
+                request.messages = [{**message, "content": message["content"].replace(
+                    "\nReply with the box label only.", "\nReply with the box label only, no other text.")}
+                    for message in request.messages]
+            return request
 
-        result = await prepare_messages(run, target, "context_preparation", lambda chars: build(chars).messages,
-                                        desired, tolerance=.01, accepted_token_range=(minimum, max(0, available)))
+        for variant in (False, True):
+            result = await prepare_messages(run, target, "context_preparation",
+                                            lambda chars: build(chars, variant).messages,
+                                            desired, tolerance=.01, accepted_token_range=(minimum, max(0, available)))
+            if result.get("reason_code") != "input_sizing_unavailable":
+                break
         if result.get("input_tokens") is not None and result["input_tokens"] > available and result["filler_chars"] == 0:
             result.update(status="unavailable", reason_code="context_window_exceeded", reason=(
                 f"The minimum locally counted prompt ({result['input_tokens']} tokens) plus the configured output "
@@ -1298,7 +1309,7 @@ async def _context_fixtures(run, target, client, fixtures, source=None):
                 "sizing_version": CONTEXT_SIZING_VERSION, "preparations": evidence}
             run.mark_unfinished(target.name, {"context"})
             return []
-        spec = build(result["filler_chars"])
+        spec = build(result["filler_chars"], variant)
         spec.messages = result["messages"]
         spec.requested_input_tokens = desired
         spec.workload.update(calibrated_input_tokens=result["input_tokens"], input_token_source=result["method"],

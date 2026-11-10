@@ -114,6 +114,27 @@ def test_generated_load_compares_with_saved_pre_output_budget_report(monkeypatch
         assert "Fixture pack identity differs." in _settings_reasons(changed, current), change
 
 
+def test_output_budgets_generator_constant_is_the_current_workloads_source_hash():
+    import hashlib
+
+    from giraffe import workloads
+    from giraffe.reporting import _OUTPUT_BUDGETS_GENERATOR_SOURCE
+
+    assert _OUTPUT_BUDGETS_GENERATOR_SOURCE == hashlib.sha256(Path(workloads.__file__).read_bytes()).hexdigest()
+    # The predecessor generator (BASE_COMMIT) hashed differently; see the generation script below.
+    assert _OUTPUT_BUDGETS_GENERATOR_SOURCE != "2c5cfa60063bd236302582d25e7fe37e7807b829f487168cd09407d37bd60e6e"
+
+
+@pytest.mark.usefixtures("local_tokenizer")
+def test_load_run_from_another_generator_source_is_not_comparable(monkeypatch):
+    current = run_virtual(monkeypatch, generate_load_report(monkeypatch))
+    baseline = RunReport.model_validate_json(gzip.decompress(BASE_REPORT.read_bytes()))
+    assert _same_load_workload(current.manifest, baseline.manifest)
+    current.manifest["fixture_pack"]["workload_fixture_sha256"] = "0" * 64  # an unattested generator hash
+    assert not _same_load_workload(current.manifest, baseline.manifest)
+    assert "Fixture pack identity differs." in _settings_reasons(current, baseline)
+
+
 @pytest.mark.usefixtures("local_tokenizer")
 def test_load_restart_still_requires_matching_readiness_fixture(monkeypatch):
     current = run_virtual(monkeypatch, generate_load_report(monkeypatch, restart=True))

@@ -331,3 +331,28 @@ async def test_request_budget_does_not_become_a_preparation_timeout():
     assert result["status"] == "calibrated"
     assert run.reason == "maximum request budget reached"
     assert not run._tokenizer_unavailable
+
+
+@pytest.mark.parametrize("limit, offset", [(limit, offset) for limit in (1024, 2048, 3000) for offset in (0, 1, 3)])
+async def test_context_sizing_converges_near_full_coverage_boundary(limit, offset):
+    # Available input just above ceil(0.8 * limit) leaves a one-to-few token window;
+    # (2048, available == 1639) hit a gap in the builtin tokenizer's token counts.
+    import math
+    from collections import defaultdict
+    from giraffe.fixtures import builtin_fixtures
+    from giraffe.models import RunConfig
+    from giraffe.runner import _context_fixtures
+
+    output = limit - (math.ceil(limit * .8) + offset)
+    config = RunConfig.model_validate({
+        "targets": [{"name": "local", "url": "http://endpoint.invalid/v1", "model": "m", "tokenizer": "builtin"}],
+        "checks": ["context"], "context_limit": limit, "max_output_tokens": output})
+    run = SimpleNamespace(config=config, deadline=time.monotonic() + 60, preparation=lambda *a, **kw: None,
+                          observations=defaultdict(dict), mark_unfinished=lambda *a, **kw: None,
+                          stop_reason=lambda name: None)
+    prepared = await _context_fixtures(run, config.targets[0], None, builtin_fixtures(config))
+    assert len(prepared) == 6, run.observations["local"]["context_calibration"]
+    for spec in prepared:
+        if spec.fixture_id.startswith("context.long."):
+            tokens = spec.workload["calibrated_input_tokens"]
+            assert math.ceil(limit * .8) <= tokens <= limit - output

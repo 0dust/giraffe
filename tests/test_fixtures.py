@@ -99,6 +99,18 @@ def test_builtin_answer_fixtures_use_configured_output_budget_without_a_check_ov
                for spec in fixtures["context"])
 
 
+def test_backend_cancel_fixtures_use_the_global_cap_not_their_former_small_caps():
+    # Formerly 128 and 8; small caps exhaust reasoning models before they stream (issue #78).
+    fixtures = builtin_fixtures(config(
+        max_output_tokens=2048, checks=["cancellation"],
+        test_options={"cancellation": {"backend_verification": "required"}}))
+    probe, followup = fixtures["backend_cancellation"]
+    assert (probe.fixture_id, followup.fixture_id) == ("limits.backend_cancel.v1", "limits.backend_cancel.followup.v1")
+    assert probe.max_tokens == followup.max_tokens == 2048
+    output_cap, = [spec for spec in fixtures["limits"] if spec.fixture_id.startswith("limits.output_cap")]
+    assert output_cap.max_tokens == 8
+
+
 @pytest.mark.parametrize("output,expected", [
     ("25", True), (" 25\n", True), ("125", False), ("250", False),
     ("The answer is 25", False), ("25\n26", False), ("26", False),

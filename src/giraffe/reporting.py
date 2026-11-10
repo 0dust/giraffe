@@ -171,7 +171,7 @@ def _comparison_manifest(manifest: dict) -> dict:
             "recovery": {"max_output_tokens", "request_timeout_seconds"},
             "capacity": {"max_output_tokens", "request_timeout_seconds"},
             "arrivals": {"max_output_tokens", "request_timeout_seconds"},
-            "prefix": {"context_limit", "request_timeout_seconds"},
+            "prefix": {"context_limit", "max_output_tokens", "request_timeout_seconds"},
             "sessions": {"context_limit", "request_timeout_seconds"},
             "consistency": {"context_limit", "max_output_tokens", "request_timeout_seconds"},
             "tools": {"context_limit", "max_output_tokens", "request_timeout_seconds"},
@@ -231,6 +231,16 @@ def _baseline_workload_fields(checks, *, shared: bool) -> set[str]:
             if workload_checks.intersection(checks) and (not shared or field not in SHARED_BASELINE_EXCLUDED_WORKLOADS)}
 
 
+# sha256 of src/giraffe/workloads.py (FIXTURE_SOURCE_SHA256) as of the "output_budgets"
+# generator revision, i.e. the source that new runs record. It is NOT the hash of the
+# predecessor revision (that is 2c5cfa60..., the origin/main source before issue #78);
+# the revision reuses the predecessor's settings identity and substitutes this hash so
+# unchanged Load-only runs stay comparable. Any later edit to workloads.py changes the
+# recorded hash: review compatibility, then update this value or add a new revision.
+# tests/test_run_limits_baseline_identity.py fails when it no longer matches the file.
+_OUTPUT_BUDGETS_GENERATOR_SOURCE = "a04c62a2e7b10ab0aef201cf5c283fe53df694d247ca5ce35caca1340a83f387"
+
+
 def _run_limits_workload_identity(manifest: dict, *, revision: str, include_load: bool = False,
                                   shared: bool = False) -> dict | None:
     """Reconstruct only identities whose generator revision is known exactly."""
@@ -243,7 +253,7 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str, include_load
         if identity is None or "prefix" in identity["settings"]:
             return None
         if identity["generator_source_sha256"] is not None:
-            identity["generator_source_sha256"] = "a04c62a2e7b10ab0aef201cf5c283fe53df694d247ca5ce35caca1340a83f387"
+            identity["generator_source_sha256"] = _OUTPUT_BUDGETS_GENERATOR_SOURCE
         return identity
     raw = manifest.get("config", {})
     legacy = revision == "legacy"

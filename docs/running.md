@@ -29,8 +29,11 @@ Supported `test_options.<check>.max_output_tokens` values override that default;
 `access` has no separate output setting and shares the initial request's resolved
 serving/first-output allowance. Custom fixtures, request-pack cases, session turns
 and load profiles keep their own explicit budgets; consistency retains its
-documented default allowance. Intentional output-cap probes
-also retain their small limits. A larger allowance does not force a longer answer
+documented default allowance. Only the intentional output-cap probe
+(`limits.output_cap`) retains its small limit. The backend-cancellation probe and
+its follow-up (`limits.backend_cancel`, `limits.backend_cancel.followup`, formerly
+128 and 8 tokens) now use the resolved cancellation allowance, so a raised
+`max_output_tokens` lets a reasoning model stream before the probe is cancelled. A larger allowance does not force a longer answer
 and still needs room alongside the prompt in the model's context window.
 
 The optional context check verifies recall at 80% of the full declared window.
@@ -49,10 +52,17 @@ test_options:
 The optional prefix check also reserves the global output allowance. The default
 `prefix.prefix_chars: 8192` does not fit a 4,096-token window with a 2,048-token
 output allowance, so no prefix requests are sent. Reduce `prefix.prefix_chars`
-or the global `max_output_tokens`, or set `test_options.prefix.context_limit` to
-a larger window only if the model supports it. Prefix has no separate output
-allowance setting. Validate or preview the configuration to see these warnings
-before sending traffic.
+or the global `max_output_tokens`, set a prefix-specific allowance with
+`test_options.prefix.max_output_tokens`, or set `test_options.prefix.context_limit`
+to a larger window only if the model supports it. Validate or preview the
+configuration to see these warnings before sending traffic.
+
+```yaml
+max_output_tokens: 2048
+test_options:
+  prefix:
+    max_output_tokens: 32
+```
 
 Generate a saved configuration, then review its endpoint, model and limits:
 

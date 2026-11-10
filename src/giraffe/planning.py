@@ -1218,16 +1218,18 @@ def request_plan(config: RunConfig | ConfigDraft, *,
             f"{config.arrivals.requests} scheduled offers; the pending queue and Limits can leave some undispatched.")
     if "prefix" in selected:
         settings = config.prefix
-        context_limit = config.effective_check("prefix")["context_limit"]
-        output_cap = config.max_output_tokens
+        prefix_options = config.effective_check("prefix")
+        context_limit = prefix_options["context_limit"]
+        output_cap = prefix_options["max_output_tokens"]
         # Include the 32-character nonce, newline, filler/instruction and trial suffix.
         prefix_chars = len(label_prompt(settings.prefix_chars + 33 + 80)) + len("\nTrial 0000.")
         if not prefix_admitted(prefix_chars, output_cap, context_limit):
             add("prefix", 0, "Estimated prefix input plus output/template reserves exceeds context_limit; no prefix requests are admitted.")
             warnings.append(
                 f"Prefix coverage will be unfinished: the estimated prefix input, template reserve and "
-                f"max_output_tokens={output_cap} exceed context_limit={context_limit}. Reduce max_output_tokens or "
-                "prefix.prefix_chars, or set test_options.prefix.context_limit to a larger window only if the model supports it.")
+                f"max_output_tokens={output_cap} exceed context_limit={context_limit}. Set test_options.prefix.max_output_tokens "
+                "to a smaller prefix-specific allowance, reduce max_output_tokens or prefix.prefix_chars, or set "
+                "test_options.prefix.context_limit to a larger window only if the model supports it.")
         else:
             prompt_chars = len(label_prompt(96))
             history = sum(prefix_admitted(prompt_chars * (turn + 1) + 4 * turn, output_cap, context_limit)

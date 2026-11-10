@@ -25,7 +25,7 @@ def test_prefix_warning_names_output_reservation_and_available_remedies():
     assert "max_output_tokens=2048" in warning
     assert "context_limit=4096" in warning
     assert "prefix.prefix_chars" in warning
-    assert "Reduce" in warning
+    assert "reduce" in warning
 
 
 @pytest.mark.parametrize("budget", [4096, 8192])
@@ -115,3 +115,22 @@ def test_restart_and_selected_response_share_effective_owner(budget):
     assert len(warnings) == int(budget >= 4096)
     if warnings:
         assert "test_options.first_output.max_output_tokens=4096" in warnings[0]
+
+
+def test_prefix_output_override_is_accepted_and_resolved():
+    config = RunConfig.model_validate({"targets": [TARGET], "checks": ["prefix"], "max_output_tokens": 2048,
+                                       "test_options": {"prefix": {"max_output_tokens": 32}}})
+    assert config.effective_check("prefix")["max_output_tokens"] == 32
+    default = RunConfig.model_validate({"targets": [TARGET], "checks": ["prefix"], "max_output_tokens": 2048})
+    assert default.effective_check("prefix")["max_output_tokens"] == 2048
+
+
+def test_prefix_override_restores_planned_requests_and_warning_names_it():
+    blocked = plan(checks=["prefix"], max_output_tokens=2048, context_limit=4096)
+    warning = next(message for message in blocked["warnings"] if "Prefix coverage" in message)
+    assert "test_options.prefix.max_output_tokens" in warning
+    result = plan(checks=["prefix"], max_output_tokens=2048, context_limit=4096,
+                  test_options={"prefix": {"max_output_tokens": 32}})
+    prefix = next(row for row in result["rows"] if row["id"] == "prefix")
+    assert prefix["requests_per_target"] > 0
+    assert not any("Prefix coverage" in message for message in result["warnings"])

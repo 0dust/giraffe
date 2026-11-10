@@ -418,6 +418,9 @@ delivery separately from endpoint response errors.
 Shared-prefix repeats run back to back, followed by a separate independent-control
 block so single-slot caches can retain the shared prefix. The default shared
 prefix is 8,192 characters (at least roughly 1k tokens with ordinary prose).
+Prefix requests reserve the global `max_output_tokens` inside `context_limit`; set
+`test_options.prefix.max_output_tokens` to give this check a smaller allowance
+(for example 32) when the global value is raised for reasoning models.
 Independent controls have different leading text. Prefix acceptance requires at
 least `limits.min_samples` successful repeats after the first use, each reporting
 cached tokens covering at least half the estimated shared-prefix tokens, rounded
