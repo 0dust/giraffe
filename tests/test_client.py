@@ -14,6 +14,56 @@ def spec(**changes):
     )
 
 
+@pytest.mark.parametrize("option_source", ["config", "request"])
+@pytest.mark.parametrize("config_stream,request_stream", [(False, True), (True, False), (True, True)])
+async def test_stream_options_follow_effective_stream_mode(
+    monkeypatch, option_source, config_stream, request_stream,
+):
+    calls = []
+
+    def respond(request):
+        payload = json.loads(request.content)
+        calls.append(payload)
+        if payload.get("stream_options") and not payload["stream"]:
+            return httpx.Response(400, json={"error": {
+                "message": "Stream options can only be defined when `stream=True`.",
+                "param": "stream_options",
+            }})
+        if payload["stream"]:
+            chunk = {"choices": [{"delta": {"content": "42"}, "finish_reason": "stop"}]}
+            return httpx.Response(200, text=f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n",
+                                  headers={"content-type": "text/event-stream"})
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": "42"}, "finish_reason": "stop"}],
+        })
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(
+        transport=httpx.MockTransport(respond), **kw))
+    options = {"temperature": 0, "stream_options": {
+        "include_usage": True, "continuous_usage_stats": True,
+    }}
+    target = Target(name="local", url="http://local", model="test")
+    config = RunConfig(targets=[target], stream=config_stream,
+                       request_options=options if option_source == "config" else {})
+    request = spec(stream=request_stream, options=options if option_source == "request" else {})
+    async with LLMClient(target, config) as client:
+        record = await client.execute(request)
+
+    assert record.valid and record.http_status == 200 and record.output == "42"
+    assert len(calls) == 1 and calls[0]["temperature"] == 0
+    assert calls[0]["stream"] is (config_stream and request_stream)
+    if calls[0]["stream"]:
+        assert calls[0]["stream_options"] == options["stream_options"]
+    else:
+        assert "stream_options" not in calls[0]
+    assert options == {"temperature": 0, "stream_options": {
+        "include_usage": True, "continuous_usage_stats": True,
+    }}
+    assert config.request_options == (options if option_source == "config" else {})
+    assert request.options == (options if option_source == "request" else {})
+
+
 async def test_ordinary_nonstream_json_keeps_existing_duplicate_member_handling(monkeypatch):
     body = (b'{"error":{"type":"upstream_failure"},"error":null,'
             b'"choices":[{"message":{"role":"assistant","content":"42"},"finish_reason":"stop"}]}')
