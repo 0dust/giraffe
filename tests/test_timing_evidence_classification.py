@@ -96,6 +96,29 @@ def test_reasoning_without_usage_breakdown_explains_generation_limit(
     assert CheckResult.model_validate_json(result.model_dump_json()) == result
 
 
+def test_reasoning_without_any_usage_retains_stream_evidence_remedy():
+    records = [answer(str(index), "generation", reasoning="thinking", output_tokens=None,
+        completion_tokens=None, reasoning_tokens=None) for index in range(2)]
+
+    result = assess("generation", records, min_output_tokens_per_second=1)
+
+    assert result.status == "inconclusive"
+    assert result.metrics.get("reason_code") != "unseparated_reasoning_tokens"
+    assert "enable streamed logprobs" in result.summary
+    assert "reasoning-token usage breakdown" not in result.finding_summary
+
+
+def test_mixed_missing_counts_retain_stream_evidence_remedy():
+    records = [answer("0", "generation", reasoning="thinking", output_tokens=None, completion_tokens=11),
+               answer("1", "generation", output_tokens=None)]
+
+    result = assess("generation", records, min_output_tokens_per_second=1)
+
+    assert result.status == "inconclusive"
+    assert result.metrics.get("reason_code") != "unseparated_reasoning_tokens"
+    assert "enable streamed logprobs" in result.summary
+
+
 def test_plain_output_missing_counts_retains_stream_evidence_remedy():
     records = [answer(str(index), "generation", output_tokens=None) for index in range(2)]
 

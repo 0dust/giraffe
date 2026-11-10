@@ -2022,10 +2022,15 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
             elif check_id == "generation" and _missing_timing(records, limits.model_copy(update={"first_output_ms": None})):
                 metrics["missing_timing_metrics"] = _missing_timing(records, limits.model_copy(update={"first_output_ms": None}))
                 status, summary = "inconclusive", "Configured generation limits cannot be checked with available stream or token measurements."
-                if ("generation_tokens_per_second" in metrics["missing_timing_metrics"]
-                        and any(r.valid and r.status == "completed" and r.stream
-                                and r.output_tokens is None and not r.reasoning_tokens
-                                and (r.reasoning.strip() or r.reasoning_stripped) for r in records)):
+                # Name the reasoning accounting limit only when usage arrived without
+                # a breakdown for every unpaced answer; missing usage or other gaps
+                # keep the stream/usage evidence remedy.
+                unpaced = [r for r in records if r.valid and r.status == "completed" and r.stream
+                           and r.generation_tokens_per_second is None]
+                if ("generation_tokens_per_second" in metrics["missing_timing_metrics"] and unpaced
+                        and all(r.output_tokens is None and r.completion_tokens is not None
+                                and not r.reasoning_tokens
+                                and (r.reasoning.strip() or r.reasoning_stripped) for r in unpaced)):
                     metrics["reason_code"] = "unseparated_reasoning_tokens"
                     summary = ("Reasoning output has no usable reasoning-token usage breakdown; "
                                "answer generation pace cannot be measured.")
