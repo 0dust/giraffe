@@ -499,11 +499,8 @@ def test_seeded_mixed_window_prefixes_qualify_every_shape_timing(count, changed)
         if row['metric'] == 'latency_ms':
             assert (row['baseline'], row['current'], row['observed_change']) == (10, 20, 100)
 
-    tails = [row for row in target['comparisons'] if row['aggregation'] == 'p95']
-    assert tails
-    for row in tails:
-        assert row['status'] == 'inconclusive'
-        assert ('request_mix_changed' in [warning['code'] for warning in row['warnings']]) == changed
+    # These per-shape windows have fewer than 20 samples, so no p95 rows are emitted.
+    assert not [row for row in target['comparisons'] if row['aggregation'] == 'p95']
 
 
 def test_load_delivery_warning_preserves_low_sample_reason_and_measurements():

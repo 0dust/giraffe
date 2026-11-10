@@ -1,6 +1,10 @@
+import random
+from statistics import median
+
 import pytest
 
-from giraffe.reporting import compare_baseline
+from giraffe.reporting import _different_output_work, compare_baseline
+from giraffe.stats import percentile
 from tests.test_reporting import baseline_check, make_report
 
 
@@ -29,62 +33,81 @@ def test_tail_regression_fails_when_median_is_unchanged(field, metric):
 @pytest.mark.parametrize("count", [19, 20])
 def test_tail_comparison_requires_twenty_samples(count):
     compared = compare_baseline(make_report(count=count), make_report("baseline", count=count))
-    tail = next(row for row in compared.baseline["targets"][0]["comparisons"]
-                if row["metric"] == "latency_p95_ms")
-    assert tail["status"] == ("pass" if count == 20 else "inconclusive")
-    if count == 19:
-        assert "at least 20" in tail["reason"]
+    metrics = {row["metric"] for row in compared.baseline["targets"][0]["comparisons"]}
+    tail = {"latency_p95_ms", "first_output_p95_ms", "max_stream_gap_p95_ms"}
+    assert tail <= metrics if count == 20 else not tail & metrics
+    assert "latency_ms" in metrics
 
 
-def test_tail_work_qualification_uses_only_measured_timing_records():
-    current, old = make_report(count=100), make_report("baseline", count=100)
-    for report in (current, old):
-        for index, record in enumerate(report.requests):
-            measured = index < 50
-            record.max_stream_gap_ms = 10 if measured else None
-            record.output_tokens = 100 if measured == (report is current) else 10
-    for record in current.requests[35:50]:
-        record.max_stream_gap_ms = 100
+def test_small_sample_baseline_does_not_gain_tail_noise():
+    compared = compare_baseline(make_report(count=8), make_report("baseline", count=8))
+    target = compared.baseline["targets"][0]
+    assert not any(row["metric"].endswith("_p95_ms") for row in target["comparisons"])
+    check = baseline_check(compared)
+    assert check.metrics["excluded_metrics"] == 0
+    assert "not comparable" not in check.summary
+    assert compared.overall == "pass"
+
+
+@pytest.mark.parametrize("field,metric", [
+    ("elapsed_ms", "latency"), ("first_output_ms", "first_output"),
+    ("max_stream_gap_ms", "max_stream_gap"),
+])
+def test_issue_scenario_fifteen_percent_slow_at_sixty_samples(field, metric):
+    current, old = make_report(count=60), make_report("baseline", count=60)
+    for record in current.requests[-9:]:
+        setattr(record, field, getattr(record, field) * 10)
     compared = compare_baseline(current, old)
-    tail = next(row for row in compared.baseline["targets"][0]["comparisons"]
-                if row["metric"] == "max_stream_gap_p95_ms")
-    assert tail["current_samples"] == tail["baseline_samples"] == 50
-    assert tail["evidence_ids"] == [record.id for record in current.requests[:50]]
-    assert tail["output_work"]["current"]["reported_output_tokens_p95"] == 100
-    assert tail["output_work"]["baseline"]["reported_output_tokens_p95"] == 10
-    assert tail["status"] == "inconclusive"
-    assert "output_work_changed" in {warning["code"] for warning in tail["warnings"]}
+    rows = {row["metric"]: row for row in compared.baseline["targets"][0]["comparisons"]}
+    assert rows[f"{metric}_ms"]["status"] == "pass"
+    assert rows[f"{metric}_p95_ms"]["status"] == "fail"
+    assert baseline_check(compared).status == compared.overall == "fail"
 
 
-@pytest.mark.parametrize("guard", ["output_tail", "client_delay", "stream_options", "input_tail"])
-def test_tail_comparison_preserves_timing_qualifications(guard):
-    current, old = make_report(count=100), make_report("baseline", count=100)
-    for record in current.requests[-15:]:
-        record.elapsed_ms *= 10
-        if guard == "output_tail":
-            record.output_chars *= 10
-            record.output_tokens *= 10
-    if guard == "client_delay":
-        current.observations["generator_max_lag_ms"] = 1000
-    elif guard == "stream_options":
-        for report, requested in ((current, True), (old, False)):
-            for record in report.requests:
-                record.stream = True
-                record.requested_stream_logprobs = requested
-                record.requested_stream_usage = True
-    elif guard == "input_tail":
-        for report in (current, old):
-            for record in report.requests:
-                record.input_tokens = 10
-        for record in current.requests[-15:]:
-            record.input_tokens = 100
-    compared = compare_baseline(current, old)
-    tail = next(row for row in compared.baseline["targets"][0]["comparisons"]
-                if row["metric"] == "latency_p95_ms")
-    expected = {"output_tail": "output_work_changed", "client_delay": "client_delayed",
-                "stream_options": "stream_options_changed", "input_tail": "input_work_changed"}[guard]
-    assert tail["status"] == "inconclusive"
-    assert expected in {warning["code"] for warning in tail["warnings"]}
+def _noisy_report(run_id, count, seed):
+    report = make_report(run_id, count=count)
+    rng = random.Random(seed)
+    for record in report.requests:
+        tokens = max(1, int(rng.lognormvariate(4, .6)))
+        record.output_tokens, record.output_chars = tokens, tokens * 4
+        record.elapsed_ms = 20 * tokens * rng.uniform(.9, 1.1)
+        record.first_output_ms = record.elapsed_ms / 2
+        record.max_stream_gap_ms = record.elapsed_ms / 10
+    return report
+
+
+@pytest.mark.parametrize("count", [20, 30])
+def test_same_distribution_runs_do_not_fail_tail_comparison(count):
+    for seed in range(5):
+        compared = compare_baseline(_noisy_report("current", count, seed),
+                                    _noisy_report("baseline", count, 100 + seed))
+        assert compared.overall != "fail", seed
+        assert not any(row["status"] == "fail"
+                       for row in compared.baseline["targets"][0]["comparisons"]), seed
+
+
+def _output_summary(tokens):
+    return {"output_chars_p50": median(tokens) * 4, "reported_output_tokens_p50": median(tokens),
+            "output_chars_p95": percentile(tokens, .95) * 4,
+            "reported_output_tokens_p95": percentile(tokens, .95)}
+
+
+@pytest.mark.parametrize("count", [30, 60])
+def test_tail_output_guard_tolerates_sampling_noise_but_not_doubled_tail(count):
+    # Same-distribution p95 answer length varies a lot at these sizes; only a large
+    # shift (here 2x+) should mark tail timing as different generated work.
+    def sample(rng):
+        return [max(1, int(rng.lognormvariate(5, .8))) for _ in range(count)]
+    fired = 0
+    for seed in range(200):
+        rng = random.Random(seed)
+        current, old = _output_summary(sample(rng)), _output_summary(sample(rng))
+        fired += (_different_output_work(current, old, 20, include_tail=True)
+                  and not _different_output_work(current, old, 20))
+    assert fired / 200 < .05
+    base = sample(random.Random(0))
+    assert _different_output_work(_output_summary([value * 3 for value in base]),
+                                  _output_summary(base), 20, include_tail=True)
 
 
 def test_lower_bound_equal_to_regression_threshold_is_material():

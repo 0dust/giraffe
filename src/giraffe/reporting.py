@@ -1005,15 +1005,22 @@ def _output_observations(check, scenario, current_work, old_work):
     return observations
 
 
+# A sample p95 of answer length is far noisier than the median (simulated same-distribution
+# runs of 20-60 samples differ by over 20% about a third of the time), so the tail output
+# guard tolerates a wider shift than the median guard.
+_TAIL_OUTPUT_TOLERANCE_FACTOR = 5
+
+
 def _different_output_work(current: dict[str, Any], old: dict[str, Any], threshold: float,
                            *, include_tail: bool = False) -> bool:
-    keys = ["output_chars_p50", "reported_output_tokens_p50"]
+    keys = [("output_chars_p50", threshold), ("reported_output_tokens_p50", threshold)]
     if include_tail:
-        keys += ["output_chars_p95", "reported_output_tokens_p95"]
-    for key in keys:
+        tail_threshold = threshold * _TAIL_OUTPUT_TOLERANCE_FACTOR
+        keys += [("output_chars_p95", tail_threshold), ("reported_output_tokens_p95", tail_threshold)]
+    for key, limit in keys:
         c, b = current[key], old[key]
         if c is not None and b is not None and c != b:
-            if b == 0 or abs(c - b) * 100 / b > threshold:
+            if b == 0 or abs(c - b) * 100 / b > limit:
                 return True
     return False
 
@@ -2768,6 +2775,10 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                     is_tail = metric in _TAIL_TIMING_METRICS
                     measured_conversation = conversation_user and timing_metric in TIMING_METRICS
                     if (work_reason and not measured_conversation) or (not values and not old_metrics[metric]):
+                        continue
+                    # A p95 needs enough samples; below the floor the median row already
+                    # covers the metric, so omit tail rows rather than add "not comparable" noise.
+                    if is_tail and min(len(values), len(old_metrics[metric])) < _P95_MINIMUM_SAMPLES:
                         continue
                     row = _compare_metric(metric, values, old_metrics[metric],
                                           1 if check == "access" and metric in {"valid_completion_rate", "error_rate"} else minimum,
