@@ -893,6 +893,11 @@ def _valid_completion(record: RequestRecord, check: str | None) -> bool:
     return record.status == "completed" and record.valid
 
 
+_P95_MINIMUM_SAMPLES = 20
+_TAIL_TIMING_METRICS = {f"{name.removesuffix('_ms')}_p95_ms": name
+                        for name in ("latency_ms", "first_output_ms", "max_stream_gap_ms")}
+
+
 def _metric_values(records: list[RequestRecord], *, check: str | None = None,
                    timing_records: dict[str, list[RequestRecord]] | None = None) -> dict[str, list[float]]:
     valid = [_valid_completion(record, check) for record in records]
@@ -927,12 +932,14 @@ def _metric_values(records: list[RequestRecord], *, check: str | None = None,
         "output_tokens_per_second": lambda r: _rate(r) if "multi_user" not in r.check_ids else None,
         "generation_tokens_per_second": lambda r: r.generation_tokens_per_second,
     }
+    values = {name: timing_values(name, measure) for name, measure in timing.items()}
     return {
         "valid_completion_rate": [float(success) for success in valid],
         "error_rate": [float(_user_error(r) if check == "multi_user" and r.workload.get("session_id")
                              else r.status in {"failed", "timeout"}) for r in records],
         "correctness_rate": [float(r.score) for r in records if r.score is not None],
-        **{name: timing_values(name, measure) for name, measure in timing.items()},
+        **values,
+        **{tail: values[base] for tail, base in _TAIL_TIMING_METRICS.items()},
     }
 
 
@@ -975,6 +982,8 @@ def _output_work(records: list[RequestRecord], *, check: str | None = None) -> d
         "valid_completions": len(completed),
         "output_chars_p50": median([r.output_chars for r in completed]) if completed else None,
         "reported_output_tokens_p50": median(tokens) if tokens else None,
+        "output_chars_p95": percentile([r.output_chars for r in completed], .95),
+        "reported_output_tokens_p95": percentile(tokens, .95),
         "reported_token_samples": len(tokens),
     }
 
@@ -1005,6 +1014,32 @@ def _different_output_work(current: dict[str, Any], old: dict[str, Any], thresho
     return False
 
 
+def _output_tail_shifted(current: list[RequestRecord], old: list[RequestRecord], threshold: float,
+                         *, check: str | None = None) -> bool:
+    """Whether answer-length p95 moved by more than the threshold beyond sampling noise.
+
+    A sample p95 of answer length is noisy at 20-60 samples, so a shift only counts when
+    the bootstrap interval of the relative change also excludes zero.
+    """
+    for field in ("output_tokens", "output_chars"):
+        values = [[getattr(r, field) for r in records if _valid_completion(r, check)
+                   and getattr(r, field) is not None] for records in (current, old)]
+        if min(map(len, values)) < _P95_MINIMUM_SAMPLES:
+            continue
+        c, b = (percentile(v, .95) for v in values)
+        if c == b or b == 0 or abs(c - b) * 100 / b <= threshold:
+            continue
+        rng = random.Random(0)
+        changes = []
+        for _ in range(400):
+            bc, bb = (percentile(rng.choices(v, k=len(v)), .95) for v in values)
+            changes.append((bc - bb) * 100 / bb if bb else None)
+        changes = [x for x in changes if x is not None]
+        if changes and (percentile(changes, .025) > 0 or percentile(changes, .975) < 0):
+            return True
+    return False
+
+
 def _compare_metric(
     name: str, current: list[float], old: list[float], minimum: int, threshold: float,
     *, rate_threshold: float | None = None,
@@ -1014,11 +1049,15 @@ def _compare_metric(
         "status": "inconclusive",
     }
     is_rate = name.endswith("_rate")
-    aggregate = (lambda data: sum(data) / len(data)) if is_rate else median
+    is_tail = name in _TAIL_TIMING_METRICS
+    if is_tail:
+        minimum = max(minimum, _P95_MINIMUM_SAMPLES)
+    aggregate = ((lambda data: sum(data) / len(data)) if is_rate else
+                 (lambda data: percentile(data, .95)) if is_tail else median)
     current_value = aggregate(current) if current else None
     old_value = aggregate(old) if old else None
     result.update(current=current_value, baseline=old_value,
-                  aggregation="mean" if is_rate else "median",
+                  aggregation="mean" if is_rate else "p95" if is_tail else "median",
                   change_unit="percentage_points" if is_rate else "percent")
     if current_value is not None and old_value is not None:
         result["observed_delta"] = current_value - old_value
@@ -1106,11 +1145,16 @@ def _load_work_comparison(current, old, *, compare_stream_options=True):
     return _stream_options_reason(current, old) if compare_stream_options else None, mix_changed
 
 
-def _input_work_changed(current, old, threshold):
-    current_input = median(r.input_tokens for r in current if r.valid)
-    old_input = median(r.input_tokens for r in old if r.valid)
-    return (current_input is not None and old_input is not None and old_input > 0
-            and abs(current_input - old_input)*100/old_input > threshold)
+def _input_work_changed(current, old, threshold, *, include_tail=False):
+    cohorts = [[r.input_tokens for r in records if r.valid and r.input_tokens is not None]
+               for records in (current, old)]
+    quantiles = (.5, .95) if include_tail else (.5,)
+    for quantile in quantiles:
+        current_input, old_input = (percentile(values, quantile) for values in cohorts)
+        if (current_input is not None and old_input is not None and old_input > 0
+                and abs(current_input - old_input)*100/old_input > threshold):
+            return True
+    return False
 
 
 def _work_samples_changed(lengths, threshold):
@@ -2742,8 +2786,14 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                                           != Counter(r.request_hash for r in old_records))
                 input_work_changed = _input_work_changed(*record_cohorts, threshold)
                 for metric, values in current_metrics.items():
-                    measured_conversation = conversation_user and metric in TIMING_METRICS
+                    timing_metric = _TAIL_TIMING_METRICS.get(metric, metric)
+                    is_tail = metric in _TAIL_TIMING_METRICS
+                    measured_conversation = conversation_user and timing_metric in TIMING_METRICS
                     if (work_reason and not measured_conversation) or (not values and not old_metrics[metric]):
+                        continue
+                    # A p95 needs enough samples; below the floor the median row already
+                    # covers the metric, so omit tail rows rather than add "not comparable" noise.
+                    if is_tail and min(len(values), len(old_metrics[metric])) < _P95_MINIMUM_SAMPLES:
                         continue
                     row = _compare_metric(metric, values, old_metrics[metric],
                                           1 if check == "access" and metric in {"valid_completion_rate", "error_rate"} else minimum,
@@ -2755,21 +2805,23 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                     metric_live_inputs, metric_live_output = live_inputs_differ, live_output_differs
                     metric_fixed_output = False
                     generation_work_changed = visible_work_changed = recovery_work_changed = False
-                    if track_timing and metric in TIMING_METRICS:
-                        current_samples, old_samples = current_timing[metric], old_timing[metric]
+                    if (track_timing or is_tail) and timing_metric in TIMING_METRICS:
+                        current_samples, old_samples = current_timing[timing_metric], old_timing[timing_metric]
                         metric_work_reason, metric_mix_changed = (
                             _load_work_comparison(current_samples, old_samples, compare_stream_options=False)
                             if current_samples and old_samples else (None, False))
                         current_output = _output_work(current_samples, check=check)
                         old_output = _output_work(old_samples, check=check)
-                        metric_output_changed = _different_output_work(current_output, old_output, threshold)
+                        metric_output_changed = _different_output_work(
+                            current_output, old_output, threshold) or (
+                            is_tail and _output_tail_shifted(current_samples, old_samples, threshold, check=check))
                     if measured_conversation:
                         metric_input_changed = _input_work_changed(current_samples, old_samples, threshold)
                         metric_live_inputs = _live_input_work_changed(current_samples, old_samples, threshold)
                         metric_live_output = (not metric_live_inputs and _live_input_work_changed(
                             current_samples, old_samples, threshold, compare_output=True))
                         metric_fixed_output = _fixed_generation_work_changed(current_samples, old_samples, threshold)
-                    if scheduled_user and metric in TIMING_METRICS:
+                    if scheduled_user and timing_metric in TIMING_METRICS:
                         metric_input_changed = (_measured_token_work_changed(current_samples, old_samples, threshold,
                                                                              lambda r: r.input_tokens)
                                                 or _uncached_input_work_changed(current_samples, old_samples, threshold))
@@ -2777,32 +2829,38 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                             current_samples, old_samples, threshold, _total_generated_tokens)
                         # Visible tokens after the first answer affect completion
                         # and streaming work without changing the first-answer boundary.
-                        visible_work_changed = metric != "first_output_ms" and _measured_token_work_changed(
+                        visible_work_changed = timing_metric != "first_output_ms" and _measured_token_work_changed(
                             current_samples, old_samples, threshold, lambda r: r.output_tokens)
                         if workload.get("scenario") == "recovery" and current_samples and old_samples:
                             recovery_work_changed = _matched_recovery_work_changed(
-                                current_samples, old_samples, threshold, compare_visible=metric != "first_output_ms")
+                                current_samples, old_samples, threshold, compare_visible=timing_metric != "first_output_ms")
+                    if is_tail:
+                        metric_mix_changed |= mix_changed
+                        metric_input_changed |= _input_work_changed(
+                            current_samples, old_samples, threshold, include_tail=True)
                     warnings = []
                     initial_uncertainty = row["reason"] if row["status"] == "inconclusive" else None
                     def warn(code, message, *, preserve_failure=False):
                         warnings.append({"code": code, "message": message})
                         if not preserve_failure or row["status"] != "fail":
                             row["status"] = "inconclusive"
-                    if (metric_input_changed or metric_live_inputs) and metric in TIMING_METRICS:
+                    if (metric_input_changed or metric_live_inputs) and timing_metric in TIMING_METRICS:
                         warn("input_work_changed", "Observed input work differs or lacks evidence; timing requires comparable input work."
                              if scheduled_user else "Observed input work or live generated histories differ; timing is not like-for-like.")
-                    if generation_work_changed and metric in TIMING_METRICS:
+                    if generation_work_changed and timing_metric in TIMING_METRICS:
                         warn("output_work_changed", "Observed total generation differs or lacks evidence; timing requires comparable generated work.")
                     elif visible_work_changed:
                         warn("output_work_changed", "Observed visible output differs or lacks evidence; timing requires comparable generated work.")
-                    elif metric_live_output and metric in TIMING_METRICS:
+                    elif metric_live_output and timing_metric in TIMING_METRICS:
                         warn("output_work_changed", "Observed generated work differs at matching live conversation turns; timing is not like-for-like.")
                     elif metric_fixed_output:
                         warn("output_work_changed", "Observed total generation differs at matching fixed conversation turns. Timing requires comparable generated work.")
-                    elif metric_output_changed and metric in {"latency_ms", "max_stream_gap_ms", "output_tokens_per_second", "generation_tokens_per_second"}:
+                    elif metric_output_changed and timing_metric in {"latency_ms", "max_stream_gap_ms", "output_tokens_per_second", "generation_tokens_per_second"}:
                         warn("output_work_changed", "Actual generated output lengths differ materially: "
                              f"median {old_output['reported_output_tokens_p50']} → {current_output['reported_output_tokens_p50']} tokens "
                              f"and {old_output['output_chars_p50']} → {current_output['output_chars_p50']} characters. "
+                             + (f"P95 {old_output['reported_output_tokens_p95']} → {current_output['reported_output_tokens_p95']} tokens "
+                                f"and {old_output['output_chars_p95']} → {current_output['output_chars_p95']} characters. " if is_tail else "") +
                              "These timings include different amounts of generated work; this does not establish a speed improvement or regression.")
                     if metric_work_reason:
                         warn("requested_work_changed", metric_work_reason)
@@ -2810,8 +2868,8 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                         warn("matched_recovery_work_changed", "Observed work differs or lacks evidence for matched recovery requests.")
                     if metric_mix_changed:
                         warn("request_mix_changed", "Request work identity shares differ by more than 10 percentage points; observed aggregate values reflect different request mixes.")
-                    if metric in TIMING_METRICS:
-                        stream_reason = _stream_options_reason(current_timing[metric], old_timing[metric])
+                    if timing_metric in TIMING_METRICS:
+                        stream_reason = _stream_options_reason(current_timing[timing_metric], old_timing[timing_metric])
                         if stream_reason:
                             warn("stream_options_changed", stream_reason)
                         if unqualified_user_probe:
@@ -2826,8 +2884,8 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                                         detail = point.get("concurrency_reason") or point.get("reason") or "Client occupancy or stream concurrency evidence is insufficient."
                                         message = f"{label} requested concurrency was not delivered or evidenced; {detail} Server queueing is not established."
                                     warn("load_not_delivered", message, preserve_failure=label == "Current")
-                        quality = {"Current": _timing_quality(report, name, current_samples, (metric,)),
-                                   "Baseline": _timing_quality(baseline, name, old_samples, (metric,))}
+                        quality = {"Current": _timing_quality(report, name, current_samples, (timing_metric,)),
+                                   "Baseline": _timing_quality(baseline, name, old_samples, (timing_metric,))}
                         delayed_runs = [label for label, item in quality.items() if item["status"] == "client_delayed"]
                         row["timing_quality"] = quality
                         if delayed_runs:
@@ -2846,7 +2904,7 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                                              f"threshold {q['threshold_ms']:.0f} ms).")
                                 warn("client_delayed", delay + " Some waiting time may come from Giraffe, "
                                      "so endpoint timing attribution is uncertain.")
-                        if check == "load" and metric in {"latency_ms", "first_output_ms"}:
+                        if check == "load" and timing_metric in {"latency_ms", "first_output_ms"}:
                             completed_counts = [sum(r.status == "completed" and r.valid for r in cohort)
                                                 for cohort in (current_records, old_records)]
                             if len(values) < completed_counts[0] or len(old_metrics[metric]) < completed_counts[1]:
