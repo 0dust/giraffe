@@ -170,7 +170,8 @@ def latency_summary(report: RunReport) -> dict:
             context_limit = configured.get("context_limit", config.get("test_options", {}).get(
                 "context", {}).get("context_limit") or config.get("context_limit", 4096))
             profile = {"fixture_version": FIXTURE_VERSION, "context_limit": context_limit,
-                       "fixture_context_limit": calibration.get("fixture_context_limit", context_limit)}
+                       "fixture_context_limit": calibration.get("fixture_context_limit", context_limit),
+                       "sizing_version": calibration.get("sizing_version")}
             if calibration.get("status") == "sized_locally":
                 # Keep only request-shape metadata, never the prepared prompt.
                 shapes = {record.fixture_id: {"fixture_id": record.fixture_id,
@@ -444,7 +445,7 @@ def _merge_block(block: list[dict], *, distribution: bool = True) -> dict:
 def calibrated_context_fixtures(observations: dict | None, target_name: str, config: RunConfig, *,
                                 cohort: str | None = None) -> list | None:
     """Recover matching request shapes for planning; these specs are never sent."""
-    from .fixtures import FIXTURE_VERSION, builtin_fixtures
+    from .fixtures import CONTEXT_SIZING_VERSION, FIXTURE_VERSION, builtin_fixtures
 
     options = config.effective_check("context")
     context_limit = options["context_limit"]
@@ -456,12 +457,13 @@ def calibrated_context_fixtures(observations: dict | None, target_name: str, con
             continue
         fixture_limit = profile.get("fixture_context_limit")
         if (profile.get("fixture_version") != FIXTURE_VERSION or profile.get("context_limit") != context_limit
+                or profile.get("sizing_version") != CONTEXT_SIZING_VERSION
                 or type(fixture_limit) is not int
                 or not 128 <= fixture_limit <= min(context_limit * 16, _MAX_CONTEXT_PREVIEW_CHARS)):
             continue
         effective = config.model_copy(update={**{key: value for key, value in options.items() if key != "limits"},
                                               "context_limit": fixture_limit})
-        specs = builtin_fixtures(effective, check_id="context")["context"]
+        specs = builtin_fixtures(effective)["context"]
         if profile.get("method") == "local_tokenizer":
             target = next((target for target in config.targets if target.name == target_name), None)
             if target is None or profile.get("tokenizer") != (target.tokenizer or target.model):

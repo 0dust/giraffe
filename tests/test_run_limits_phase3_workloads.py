@@ -56,7 +56,7 @@ class Client:
 
 
 @pytest.mark.parametrize("check,callback,output", [
-    ("prefix", prefixes, 24),
+    ("prefix", prefixes, 32),
     ("sessions", sessions, 48), ("consistency", consistency, 96), ("tools", tools, 96),
 ])
 async def test_extended_specs_resolve_local_settings_without_mutating_suite(check, callback, output):
@@ -202,14 +202,14 @@ async def test_concurrent_load_profile_caps_and_timeout_are_own_settings():
     ("prefix", prefixes), ("sessions", sessions),
     ("consistency", consistency), ("tools", tools),
 ])
-async def test_inherited_extended_request_budgets_preserve_fixture_defaults(suite_cap, check, callback):
+async def test_inherited_extended_request_budgets_preserve_workload_ownership(suite_cap, check, callback):
     config = configuration(check, max_output_tokens=suite_cap, request_timeout_seconds=.5)
     run, client = _Run(config, None, None), Client()
     args = [run, config.targets[0], client]
     if check in {"arrivals", "consistency"}:
         args.append(builtin_fixtures(config))
     await callback(*args)
-    expected = {"arrivals": min(24, suite_cap), "prefix": min(24, suite_cap),
+    expected = {"prefix": suite_cap,
                 "sessions": 32, "consistency": min(192, suite_cap),
                 "tools": suite_cap}[check]
     assert client.specs
