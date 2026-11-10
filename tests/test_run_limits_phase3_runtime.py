@@ -14,6 +14,43 @@ from giraffe.models import RequestSpec, RunConfig
 TARGET = {'name': 'local', 'url': 'http://local/v1', 'model': 'm'}
 
 
+@pytest.mark.parametrize('checks', [['access'], ['access', 'serving', 'first_output', 'correctness']])
+async def test_global_output_budget_reaches_reasoning_requests_without_per_check_workaround(monkeypatch, checks):
+    from tests.test_check_intent_core import DONE, ev
+
+    original = httpx.AsyncClient
+    sent = []
+
+    async def answer(request):
+        if request.method != 'POST':
+            return httpx.Response(404)
+        payload = json.loads(request.content)
+        sent.append(payload)
+        prompt = payload['messages'][-1]['content']
+        content = (prompt.split('\n', 1)[-1] if 'Copy exactly' in prompt else
+                   '25' if '17 cards' in prompt else 'B' if 'dax means' in prompt else
+                   'T8R2' if 'Name: Mira' in prompt else 'K7P4')
+        sufficient = payload['max_tokens'] >= 128
+        parts = [ev(reasoning='Thinking through the answer.')]
+        if sufficient:
+            parts.append(ev(content))
+        parts += [ev(finish='stop' if sufficient else 'length', usage={
+            'prompt_tokens': 30, 'completion_tokens': 129 if sufficient else payload['max_tokens'],
+            'completion_tokens_details': {'reasoning_tokens': 128 if sufficient else payload['max_tokens']}}), DONE]
+        return httpx.Response(200, content=b''.join(parts), headers={'content-type': 'text/event-stream'})
+
+    monkeypatch.setattr(httpx, 'AsyncClient', lambda **kwargs: original(
+        transport=httpx.MockTransport(answer), **kwargs))
+    config = RunConfig(targets=[TARGET], checks=checks, max_output_tokens=2048,
+                       samples=5, default_concurrency=1, max_requests=30)
+    report = await runner.run_suite(config)
+
+    requests = [record for record in report.requests if record.fixture_id != 'performance-evidence']
+    assert requests and all(record.requested_max_tokens == 2048 for record in requests)
+    assert all(payload['max_tokens'] == 2048 for payload in sent if payload['max_tokens'] != 1)
+    assert {check.id: check.status for check in report.checks if check.id in checks} == dict.fromkeys(checks, 'pass')
+
+
 async def test_a21_runner_and_client_apply_check_timeout_and_output_above_suite_defaults(monkeypatch):
     original = httpx.AsyncClient
     sent = []
@@ -73,7 +110,7 @@ def test_context_fixture_uses_its_check_output_and_context_window():
                        test_options={'context': {'max_output_tokens': 96, 'context_limit': 512,
                                                 'request_timeout_seconds': 45}})
     effective = runner._check_config(config, 'context')
-    specs = builtin_fixtures(effective, check_id='context')['context']
+    specs = builtin_fixtures(effective)['context']
     assert specs and all(spec.max_tokens == 96 for spec in specs)
     assert all(spec.request_timeout_seconds == 45 for spec in specs)
     assert max(spec.input_chars for spec in specs) <= 512 - 96 - 32

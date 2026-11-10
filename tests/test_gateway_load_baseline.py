@@ -30,6 +30,8 @@ GATEWAY_GENERATORS = (
     "49dcdfb6b173a93720e4e9e5a9bc54ffcea7580346d2ea0210e600e0779a03e6",
     "e4ddc7a7e8563f9ab3bba2fc42ad0232ee924c65f67d92dafd89c21025d202d0",
     "2c5cfa60063bd236302582d25e7fe37e7807b829f487168cd09407d37bd60e6e",
+    # Output-budget changes affect prefixes; dedicated Load requests are unchanged.
+    "a04c62a2e7b10ab0aef201cf5c283fe53df694d247ca5ce35caca1340a83f387",
 )
 CURRENT_LOAD_SOURCE = "fa40b2a909d2b067529ab02bd686c61adb8a175063e481d802ad33d308ef49fa"
 

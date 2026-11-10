@@ -184,14 +184,16 @@ def test_phase2_workload_source_bridge_requires_exact_attested_generator():
     assert not _same_run_limits_workload(current, old)
 
 
-def test_prefix_plan_uses_check_context_window_and_inherited_intrinsic_output_budget():
+def test_prefix_plan_reserves_the_configured_output_budget_within_its_context_window():
     configured = config(checks=["prefix"], max_output_tokens=8, context_limit=4096,
                         prefix={"prefix_chars": 32, "history_turns": 2},
                         test_options={"prefix": {"context_limit": 128}})
     row = next(row for row in request_plan(configured)["rows"] if row["id"] == "prefix")
     assert row["requests_per_target"] == 2 * configured.prefix.repeats + 2
-    # The same prompt cannot fit when the inherited intrinsic budget is 24.
-    configured = configured.model_copy(update={"max_output_tokens": 24})
+    # A larger configured output allowance leaves no room for these prompts.
+    configured = config(checks=["prefix"], max_output_tokens=2048, context_limit=4096,
+                        prefix={"prefix_chars": 32, "history_turns": 2},
+                        test_options={"prefix": {"context_limit": 512}})
     row = next(row for row in request_plan(configured)["rows"] if row["id"] == "prefix")
     assert row["requests_per_target"] == 0
 

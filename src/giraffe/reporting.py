@@ -171,7 +171,7 @@ def _comparison_manifest(manifest: dict) -> dict:
             "recovery": {"max_output_tokens", "request_timeout_seconds"},
             "capacity": {"max_output_tokens", "request_timeout_seconds"},
             "arrivals": {"max_output_tokens", "request_timeout_seconds"},
-            "prefix": {"context_limit", "request_timeout_seconds"},
+            "prefix": {"context_limit", "max_output_tokens", "request_timeout_seconds"},
             "sessions": {"context_limit", "request_timeout_seconds"},
             "consistency": {"context_limit", "max_output_tokens", "request_timeout_seconds"},
             "tools": {"context_limit", "max_output_tokens", "request_timeout_seconds"},
@@ -201,6 +201,7 @@ _COMPANION_REVISIONS = _CONVERSATION_REVISIONS | {
     "gateway_access", "gateway_access_policy", "access_conversations", "access_shared_first", "access_shared_targets_first",
     "policy_after_shared_workloads", "policy_after_all_shared_targets", "access_after_shared_workloads",
     "access_deferred_policy", "access_after_all_shared_targets", "scale_down_gateway_access",
+    "output_budgets",
 }
 # Access changed optional dispatch after the shared workloads in these revisions.
 _MULTI_USER_COMPANION_REVISIONS = {"policy_after_all_shared_targets", "access_after_all_shared_targets",
@@ -230,9 +231,30 @@ def _baseline_workload_fields(checks, *, shared: bool) -> set[str]:
             if workload_checks.intersection(checks) and (not shared or field not in SHARED_BASELINE_EXCLUDED_WORKLOADS)}
 
 
+# sha256 of src/giraffe/workloads.py (FIXTURE_SOURCE_SHA256) as of the "output_budgets"
+# generator revision, i.e. the source that new runs record. It is NOT the hash of the
+# predecessor revision (that is 2c5cfa60..., the origin/main source before issue #78);
+# the revision reuses the predecessor's settings identity and substitutes this hash so
+# unchanged Load-only runs stay comparable. Any later edit to workloads.py changes the
+# recorded hash: review compatibility, then update this value or add a new revision.
+# tests/test_run_limits_baseline_identity.py fails when it no longer matches the file.
+_OUTPUT_BUDGETS_GENERATOR_SOURCE = "a04c62a2e7b10ab0aef201cf5c283fe53df694d247ca5ce35caca1340a83f387"
+
+
 def _run_limits_workload_identity(manifest: dict, *, revision: str, include_load: bool = False,
                                   shared: bool = False) -> dict | None:
     """Reconstruct only identities whose generator revision is known exactly."""
+    if revision == "output_budgets":
+        # Only prefixes changed in this shared generator revision. Reuse the
+        # predecessor's exact source/settings constraints for unchanged work;
+        # prefix requests need a new baseline, as do changed built-in hashes.
+        identity = _run_limits_workload_identity(
+            manifest, revision="scale_down_gateway_access", include_load=include_load, shared=shared)
+        if identity is None or "prefix" in identity["settings"]:
+            return None
+        if identity["generator_source_sha256"] is not None:
+            identity["generator_source_sha256"] = _OUTPUT_BUDGETS_GENERATOR_SOURCE
+        return identity
     raw = manifest.get("config", {})
     legacy = revision == "legacy"
     try:
@@ -446,6 +468,7 @@ def _same_run_limits_workload(current: dict, old: dict, *, fingerprint_key: str 
 def _same_load_workload(current: dict, old: dict, *, fingerprint_key: str = "workload_fixture_sha256") -> bool:
     """Attest unchanged Load dispatch within exact source-equivalence groups."""
     revisions = ("shared_conversations", "scale_down_shared_conversations", "scale_down_gateway_access",
+                 "output_budgets",
                  "gateway_conversations",
                  "gateway_shared_first", "gateway_shared_targets_first",
                  "policy_conversations", "policy_shared_first", "policy_shared_targets_first",
@@ -818,9 +841,15 @@ def _settings_reasons(report: RunReport, baseline: RunReport, *, details: dict[s
             fingerprint_key = shared_key
             current_pack, old_pack = ({**pack, "workload_fixture_sha256": pack[fingerprint_key]}
                                       for pack in (current_pack, old_pack))
-        if has_identity and (_same_run_limits_workload(*sources, fingerprint_key=fingerprint_key)
-                             or _same_load_workload(*sources, fingerprint_key=fingerprint_key)):
+        same_load = has_identity and _same_load_workload(*sources, fingerprint_key=fingerprint_key)
+        if has_identity and (_same_run_limits_workload(*sources, fingerprint_key=fingerprint_key) or same_load):
             inactive.add("workload_fixture_sha256")
+        if same_load and all(set(config.get("checks", [])) == {"load"} and not config.get("restart_target")
+                             for config in (current_config, old_config)):
+            # Generated Load owns its prompts and caps. Its attested identity
+            # covers those requests; without restart readiness, built-ins were
+            # never sent. Do not infer absence from retention-filtered records.
+            inactive.add("builtin_sha256")
         if (not has_identity or {key: value for key, value in current_pack.items() if key not in inactive}
                 != {key: value for key, value in old_pack.items() if key not in inactive}):
             reasons.append("Fixture pack identity differs.")

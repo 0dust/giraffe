@@ -223,7 +223,17 @@ def test_serial_generation_measurement_remedy_does_not_raise_concurrency():
     assert "concurrency of at least 2" not in check.summary
 
 
-async def test_fixed_fixture_output_budget_remedy_does_not_raise_ineffective_ceiling(client, monkeypatch):
+@pytest.mark.parametrize("checks,options,field,allowance", [
+    (["serving"], {}, "max_output_tokens (or --max-output-tokens)", 128),
+    (["correctness"], {"correctness": {"max_output_tokens": 16}}, "test_options.correctness.max_output_tokens", 16),
+    (["access", "serving", "first_output"], {"serving": {"max_output_tokens": 16},
+                                            "first_output": {"max_output_tokens": 8}}, "test_options.serving.max_output_tokens", 16),
+    (["access", "serving", "first_output"], {"first_output": {"max_output_tokens": 16}}, "test_options.first_output.max_output_tokens", 16),
+    (["access"], {"serving": {"max_output_tokens": 16}}, "max_output_tokens (or --max-output-tokens)", 128),
+])
+async def test_builtin_output_budget_remedy_names_effective_configured_allowance(
+    client, monkeypatch, checks, options, field, allowance,
+):
     original = client.execute
 
     async def reasoning_only(self, spec, **kwargs):
@@ -234,11 +244,15 @@ async def test_fixed_fixture_output_budget_remedy_does_not_raise_ineffective_cei
             "error": "reasoning exhausted the output budget before an answer"})
 
     monkeypatch.setattr(client, "execute", reasoning_only)
-    report = await runner.run_suite(config(checks=["serving"], max_output_tokens=128))
-    check = next(c for c in report.checks if c.id == "serving")
-    assert check.status == "inconclusive"
-    assert "increasing max_output_tokens alone will not" in check.summary
-    assert "above 128" not in check.summary
+    report = await runner.run_suite(config(checks=checks, max_output_tokens=128, test_options=options,
+                                          concurrency=1, default_concurrency=1))
+    for result in report.checks:
+        if result.id not in checks:
+            continue
+        assert result.status == "inconclusive"
+        assert f"raise {field} above {allowance}" in result.summary
+        assert "increasing max_output_tokens alone will not" not in result.summary
+        assert "test_options.access.max_output_tokens" not in result.summary
 
 
 async def test_missing_cap_usage_remedy_does_not_raise_output_budget(client, monkeypatch):
@@ -358,7 +372,7 @@ async def test_load_minimum_valid_gate_preserves_duration_window(client):
 async def test_versioned_recovery_prompt_has_stable_builtin_fingerprint(client):
     report = await runner.run_suite(config())
     assert report.manifest["fixture_pack"]["builtin_sha256"] == (
-        "9aa71dc20218667d5cfcb17bcc4b26d8fc6bd80f217715ecf7061b02e5b7293e")
+        "d23bf06ae324964c23c19b2ffed1327d752cb7f45f47ee93d38c14d9de74e515")
 
 
 @pytest.mark.parametrize("selected", [False, True])
@@ -480,7 +494,7 @@ async def test_load_local_drops_consume_budget_and_admitted_requests_drain(clien
 
 
 async def test_context_override_controls_declared_limit_and_fixture_sizes():
-    report = await runner.run_suite(config(checks=["context"], context_limit=256,
+    report = await runner.run_suite(config(checks=["context"], context_limit=256, max_output_tokens=24,
                                           test_options={"context": {"context_limit": 1024}}))
     result = check(report, "context")
     assert result.metrics["declared_context_limit"] == 1024
@@ -675,7 +689,7 @@ async def test_deliberate_deadline_and_cancellation_not_serving_failures():
 
 @pytest.mark.parametrize("checks", [["context"], ["capacity", "context"]])
 async def test_context_sizing_is_local_and_records_reproduction(checks):
-    report = await runner.run_suite(config(checks=checks))
+    report = await runner.run_suite(config(checks=checks, max_output_tokens=24))
     result = check(report, "context")
     assert result.status == "pass"
     assert result.metrics["near_limit_coverage"]
@@ -685,6 +699,78 @@ async def test_context_sizing_is_local_and_records_reproduction(checks):
     assert len(calibration["preparations"]) == 6
     assert len({r.fixture_id for r in report.requests if r.scenario == "context"}) == 6
     assert not any(r.scenario == "context_calibration" for r in report.requests)
+
+
+@pytest.mark.parametrize("context_limit,output_budget", [
+    (4096, 256), (4096, 512), (2048, 128), (2304, 128),
+    (32768, 2048), (40960, 2048), (4096, 800), (4096, 819),
+])
+async def test_context_reaches_full_window_coverage_when_output_reservation_fits(context_limit, output_budget):
+    report = await runner.run_suite(config(checks=["context"], context_limit=context_limit,
+                                          max_output_tokens=output_budget))
+    result = check(report, "context")
+    assert result.status == "pass", result.summary
+    assert result.metrics["near_limit_coverage"]
+    long_requests = [record for record in report.requests if record.fixture_id.startswith("context.long.")]
+    assert {record.fixture_id.split(".")[2] for record in long_requests} == {"beginning", "middle", "end"}
+    assert all(record.input_tokens >= context_limit * .8 for record in long_requests)
+    assert all(record.workload["calibrated_input_tokens"] + output_budget <= context_limit for record in report.requests)
+    assert all(record.requested_max_tokens == output_budget for record in report.requests)
+
+
+@pytest.mark.parametrize("context_limit,output_budget", [(4096, 2048), (4096, 820), (4096, 4000), (4096, 4024)])
+async def test_context_reports_when_output_reservation_prevents_near_limit_coverage(context_limit, output_budget):
+    report = await runner.run_suite(config(checks=["context"], context_limit=context_limit,
+                                          max_output_tokens=output_budget))
+    result = check(report, "context")
+    assert result.status == "inconclusive"
+    assert not result.metrics["near_limit_coverage"]
+    assert result.metrics["reason_code"] == "context_output_reservation"
+    assert str(output_budget) in result.summary
+    assert "test_options.context.max_output_tokens" in result.summary
+    if output_budget == 4024:
+        assert result.metrics["reduced_position_coverage"]
+        assert result.metrics["correct"] == result.metrics["scored"] > 0
+    assert all(record.workload["calibrated_input_tokens"] + output_budget <= context_limit for record in report.requests)
+
+
+async def test_output_reservation_does_not_hide_failed_context_answers(client):
+    client.bad_target = "service"
+    report = await runner.run_suite(config(checks=["context"], context_limit=4096, max_output_tokens=2048))
+    assert check(report, "context").status == "fail"
+    assert check(report, "context").metrics["correct"] == 0
+
+
+@pytest.mark.parametrize("output_budget", [4096, 8192])
+async def test_context_output_budget_leaving_no_prompt_room_sends_no_requests(output_budget):
+    report = await runner.run_suite(config(checks=["context"], context_limit=4096, max_output_tokens=output_budget))
+    result = check(report, "context")
+    assert result.status == "inconclusive"
+    assert "test_options.context.max_output_tokens" in result.summary
+    assert str(output_budget) in result.summary
+    assert not report.requests
+
+
+async def test_context_reserves_configured_output_budget_and_reports_impossible_prompt(client):
+    from giraffe.planning import request_plan
+
+    configured = config(checks=["context"], context_limit=4096, max_output_tokens=2048, samples=1)
+    report = await runner.run_suite(configured)
+    requests = [record for record in report.requests if record.scenario == "context"]
+    assert len(requests) == 6
+    planned = next(row for row in request_plan(configured)["rows"] if row["id"] == "context_first_batch")
+    assert planned["requests_per_target"] == len(requests)
+    assert all(record.requested_max_tokens == 2048 for record in requests)
+    assert all(record.input_tokens + record.requested_max_tokens <= 4096 for record in requests)
+    assert check(report, "context").status == "inconclusive"
+    assert check(report, "context").metrics["reason_code"] == "context_output_reservation"
+
+    impossible = await runner.run_suite(config(checks=["context"], context_limit=128, max_output_tokens=128))
+    result = check(impossible, "context")
+    assert result.status == "inconclusive"
+    assert result.metrics["calibration"]["status"] == "unavailable"
+    assert result.metrics["calibration"]["reason"]
+    assert not impossible.requests
 
 
 async def test_context_without_token_usage_never_claims_declared_limit(client):
