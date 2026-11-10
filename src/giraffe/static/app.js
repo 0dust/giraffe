@@ -2867,7 +2867,7 @@ function renderModelDiscovery() {
   button.disabled=discovery?.status==='pending'||hasJsonChanges();button.textContent=discovery?.status==='pending'?'Connecting…':discovery?.status==='connected'?'Reconnect':'Connect';button.classList.toggle('handshaking',discovery?.status==='pending');
   button.classList.toggle('primary',!model);button.classList.toggle('small',Boolean(model));button.title='Sends one short request (32-token limit).';
   status.textContent=discovery?.message || '';
-  status.classList.toggle('error',discovery?.status==='error');status.classList.toggle('connected',discovery?.status==='connected');
+  status.classList.toggle('error',discovery?.status==='error');status.classList.toggle('connected',discovery?.status==='connected');status.classList.toggle('unverified',discovery?.status==='unverified');
   const choice=$('#connection-model-choice'),manual=$('#manual-model-field'),options=$('#model-options');
   const models=discovery?.models || [];
   if(choice){
@@ -2878,7 +2878,7 @@ function renderModelDiscovery() {
   }
   if(discovery?.status==='needs_model'&&options)options.open=true;
   const connectionOptions=$('#connection-options');if(connectionOptions&&['needs_model','error'].includes(discovery?.status))connectionOptions.open=true;
-  const label=$('#model-options-label');if(label)label.textContent=discovery?.status==='needs_model'?`Giraffe found ${models.length} models. Choose one.`:discovery?.status==='connected'?'Found on your server.':discovery?.status==='error'?'Type the exact model name to continue without a check.':discovery?.status==='pending'?'Looking for models…':model?'Typed by you. Connecting first is optional.':'Found when you connect, or type the exact name.';
+  const label=$('#model-options-label');if(label)label.textContent=discovery?.status==='needs_model'?`Giraffe found ${models.length} models. Choose one.`:['connected','unverified'].includes(discovery?.status)?'Found on your server.':discovery?.status==='error'?'Type the exact model name to continue without a check.':discovery?.status==='pending'?'Looking for models…':model?'Typed by you. Connecting first is optional.':'Found when you connect, or type the exact name.';
   const auth=$('#connection-auth');if(auth&&discovery?.status==='error'&&/key|401|403|unauthor/i.test(discovery.message || ''))auth.open=true;
   syncSetupStep();
 }
@@ -2891,9 +2891,9 @@ async function testConnection() {
   state.modelDiscovery={key,route,status:'pending',models:[],message:'Checking your endpoint. A model may take a moment to load…'};renderModelDiscovery();
   try{
     const api_key=apiKeyFor(url.value);
-    const result=await api('/api/targets/test-connection',{method:'POST',body:JSON.stringify({...JSON.parse(key),...(api_key?{api_key}:{})})});
+    const result=await api('/api/targets/test-connection',{method:'POST',body:JSON.stringify({...JSON.parse(key),...(state.autoModel&&state.autoModel===JSON.parse(key).model?{discovered:true}:{}),...(api_key?{api_key}:{})})});
     if(sequence!==state.modelDiscoverySequence||route!==state.routeVersion||key!==modelDiscoveryKey())return;
-    if(result.status==='connected'){
+    if(['connected','unverified'].includes(result.status)){
       if(!JSON.parse(key).model)state.autoModel=result.model;
       form.elements.model.value=result.model;form.elements.model.setCustomValidity('');
       state.config.targets[0].model=result.model;
