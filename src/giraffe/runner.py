@@ -1288,13 +1288,15 @@ async def _context_fixtures(run, target, client, fixtures, source=None):
                 request.messages = [{**message, "content": message["content"].replace(
                     "\nReply with the box label only.", "\nReply with the box label only, no other text.")}
                     for message in request.messages]
+                request.input_chars = sum(len(message["content"]) for message in request.messages)
             return request
 
         for variant in (False, True):
             result = await prepare_messages(run, target, "context_preparation",
                                             lambda chars: build(chars, variant).messages,
                                             desired, tolerance=.01, accepted_token_range=(minimum, max(0, available)))
-            if result.get("reason_code") != "input_sizing_unavailable":
+            # Only a gap in the token counts can be shifted past; other failures repeat unchanged.
+            if result.get("reason_code") != "input_sizing_unavailable" or not result.get("sizing_gap"):
                 break
         if result.get("input_tokens") is not None and result["input_tokens"] > available and result["filler_chars"] == 0:
             result.update(status="unavailable", reason_code="context_window_exceeded", reason=(
@@ -1302,7 +1304,8 @@ async def _context_fixtures(run, target, client, fixtures, source=None):
                 f"allowance ({output_budget} tokens) exceeds context_limit ({config.context_limit}). "
                 "Reduce test_options.context.max_output_tokens, or increase test_options.context.context_limit "
                 "only if the server supports that window."))
-        evidence.append({key: value for key, value in result.items() if key != "messages"})
+        evidence.append({key: value for key, value in result.items() if key != "messages"}
+                        | ({"prompt_variant": "closing_instruction_no_other_text"} if variant else {}))
         if result["status"] != "calibrated":
             run.observations[target.name]["context_calibration"] = {
                 "status": "unavailable", "reason": result["reason"], "method": "local_tokenizer",
@@ -1315,6 +1318,8 @@ async def _context_fixtures(run, target, client, fixtures, source=None):
         spec.workload.update(calibrated_input_tokens=result["input_tokens"], input_token_source=result["method"],
                              token_count_scope=result["token_count_scope"],
                              tokenizer=result["tokenizer"], context_group=f"{desired} target tokens")
+        if variant:
+            spec.workload["prompt_variant"] = "closing_instruction_no_other_text"
         prepared.append(spec)
     run.observations[target.name]["context_calibration"] = {
         "status": "sized_locally", "method": "local_tokenizer", "sizing_version": CONTEXT_SIZING_VERSION,

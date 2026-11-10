@@ -318,7 +318,7 @@ async def prepare_messages(run, target, scenario, build_messages, target_tokens,
             scope = "message_content" if content_only else ready.get("token_count_scope", "message_content")
             result.update(chat_template=ready.get("chat_template", False),
                           token_count_scope="builtin_reference" if builtin else scope)
-            low, high = 0, None
+            low, high, counted_below = 0, None, False
             filler = 0
             for attempt in range(MAX_SIZING_ATTEMPTS):
                 reason = run.stop_reason(target.name) if hasattr(run, "stop_reason") else None
@@ -344,7 +344,7 @@ async def prepare_messages(run, target, scenario, build_messages, target_tokens,
                                   messages=messages)
                     break
                 if tokens < target_tokens:
-                    low = filler
+                    low, counted_below = filler, True
                 else:
                     high = filler
                 if high is not None:
@@ -354,6 +354,10 @@ async def prepare_messages(run, target, scenario, build_messages, target_tokens,
                 else:
                     candidate = min(MAX_PROMPT_CHARS, max(filler + 1, round(filler * target_tokens / max(1, tokens))))
                 if candidate == filler:
+                    # Adjacent filler sizes straddle the target yet neither was accepted:
+                    # the token counts skip the accepted range.
+                    if high is not None and counted_below:
+                        result["sizing_gap"] = True
                     break
                 filler = candidate
             if result["status"] != "calibrated":

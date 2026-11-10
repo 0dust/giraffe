@@ -356,3 +356,106 @@ async def test_context_sizing_converges_near_full_coverage_boundary(limit, offse
         if spec.fixture_id.startswith("context.long."):
             tokens = spec.workload["calibrated_input_tokens"]
             assert math.ceil(limit * .8) <= tokens <= limit - output
+
+
+@pytest.mark.usefixtures("local_tokenizer")
+async def test_sizing_gap_is_reported_only_when_counts_straddle_the_accepted_range():
+    run, target, _ = run_and_target()
+    # The fake counter is len/4 and this builder grows in 8-character steps, so every
+    # count is even and the single accepted value 101 is skipped (100 or 102 only).
+    gap = await sizing.prepare_messages(run, target, "context", lambda n: [
+        {"role": "user", "content": "x" * (8 * (n // 8) + 8)}], 101, tolerance=.01, accepted_token_range=(101, 101))
+    assert gap["status"] == "unavailable" and gap["reason_code"] == "input_sizing_unavailable"
+    assert gap["sizing_gap"] is True
+    # A minimum prompt that already exceeds the range is not a gap.
+    over = await sizing.prepare_messages(run, target, "context", lambda n: [
+        {"role": "user", "content": "x" * (400 + n)}], 90, accepted_token_range=(80, 90))
+    assert "sizing_gap" not in over
+    # Counts that never grow cannot bracket the target either.
+    flat = await sizing.prepare_messages(run, target, "context", lambda n: [
+        {"role": "user", "content": "x" * 40}], 100, tolerance=.01, accepted_token_range=(100, 100))
+    assert flat["reason_code"] == "input_sizing_unavailable" and "sizing_gap" not in flat
+
+
+def _context_run(limit, output):
+    from collections import defaultdict
+    from giraffe.models import RunConfig
+    config = RunConfig.model_validate({
+        "targets": [{"name": "local", "url": "http://endpoint.invalid/v1", "model": "m", "tokenizer": "builtin"}],
+        "checks": ["context"], "context_limit": limit, "max_output_tokens": output})
+    run = SimpleNamespace(config=config, deadline=time.monotonic() + 60, preparation=lambda *a, **kw: None,
+                          observations=defaultdict(dict), mark_unfinished=lambda *a, **kw: None,
+                          stop_reason=lambda name: None)
+    return config, run
+
+
+@pytest.mark.parametrize("extra", [{}, {"sizing_gap": True}])
+async def test_context_variant_retry_runs_only_for_a_sizing_gap(monkeypatch, extra):
+    from giraffe import local_tokenizer
+    from giraffe.fixtures import builtin_fixtures
+    from giraffe.runner import _context_fixtures
+
+    config, run = _context_run(2048, 409)
+    calls = []
+
+    async def unavailable(run, target, scenario, build, desired, **kwargs):
+        calls.append(build(0))
+        return dict(status="unavailable", reason="stub", reason_code="input_sizing_unavailable", input_tokens=None,
+                   filler_chars=0, request_ids=[], method="local_tokenizer", tokenizer="builtin", **extra)
+
+    monkeypatch.setattr(local_tokenizer, "prepare_messages", unavailable)
+    assert await _context_fixtures(run, config.targets[0], None, builtin_fixtures(config)) == []
+    calibration = run.observations["local"]["context_calibration"]
+    assert calibration["reason"] == "stub"
+    assert len(calls) == (2 if extra else 1)
+    assert calibration["preparations"][0].get("prompt_variant") == ("closing_instruction_no_other_text" if extra else None)
+    if extra:
+        assert calls[0][0]["content"].endswith("Reply with the box label only.")
+        assert calls[1][0]["content"].endswith("Reply with the box label only, no other text.")
+
+
+async def test_context_fallback_prompt_is_recorded_and_normal_prompt_is_unchanged():
+    from giraffe.fixtures import builtin_fixtures
+    from giraffe.runner import _context_fixtures
+
+    config, run = _context_run(2048, 409)  # a single-token range; the builtin counts skip it for long.middle
+    prepared = {spec.fixture_id: spec for spec in await _context_fixtures(
+        run, config.targets[0], None, builtin_fixtures(config))}
+    evidence = run.observations["local"]["context_calibration"]["preparations"]
+    variants = {spec.fixture_id for spec in prepared.values() if "prompt_variant" in spec.workload}
+    assert variants and all(spec.fixture_id.startswith("context.long.") for spec in prepared.values()
+                            if spec.fixture_id in variants)
+    flagged = [item for item in evidence if "prompt_variant" in item]
+    assert len(flagged) == len(variants)
+    for spec in prepared.values():
+        content = spec.messages[0]["content"]
+        assert spec.input_chars == len(content)
+        assert content.endswith("no other text.") == (spec.fixture_id in variants)
+    # Non-variant specs are byte-identical to the stock builder's prompt shape.
+    normal = next(spec for spec in prepared.values() if spec.fixture_id not in variants)
+    assert normal.messages[0]["content"].endswith("\nReply with the box label only.")
+
+
+async def test_fallback_run_does_not_change_planning_profile_text_or_fixture_identity():
+    from giraffe.deployment import fixture_hash
+    from giraffe.fixtures import CONTEXT_SIZING_VERSION, FIXTURE_VERSION, builtin_fixtures
+    from giraffe.latency import calibrated_context_fixtures
+    from giraffe.runner import _context_fixtures
+
+    config, run = _context_run(2048, 409)
+    stock = builtin_fixtures(config)
+    before = fixture_hash({key: [spec.model_dump() for spec in specs] for key, specs in stock.items()})
+    prepared = await _context_fixtures(run, config.targets[0], None, stock)
+    assert any("prompt_variant" in spec.workload for spec in prepared)
+    # Manifest fixture identity derives from the unsized fixtures, so it is the same with or without fallback.
+    assert fixture_hash({key: [spec.model_dump() for spec in specs] for key, specs in stock.items()}) == before
+    shapes = [{"fixture_id": spec.fixture_id, "input_chars": spec.input_chars, "output_cap": spec.max_tokens}
+              for spec in prepared]
+    profile = {"fixture_version": FIXTURE_VERSION, "context_limit": 2048, "fixture_context_limit": 2048,
+               "sizing_version": CONTEXT_SIZING_VERSION, "method": "local_tokenizer", "tokenizer": "builtin",
+               "fixtures": shapes}
+    reused = calibrated_context_fixtures({"local": [{"family": "context", "context_profile": profile}]},
+                                         "local", config)
+    # A reused profile is a planning preview that is never sent: stock text, recorded sizes.
+    assert reused and all(spec.messages[0]["content"].endswith("\nReply with the box label only.") for spec in reused)
+    assert {spec.fixture_id: spec.input_chars for spec in reused} == {spec.fixture_id: spec.input_chars for spec in prepared}
