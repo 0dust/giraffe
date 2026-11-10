@@ -1,0 +1,443 @@
+{
+  "schema_version": "1",
+  "source_run_id": "e9ea49b96ec6466ba0769625be008258",
+  "source_outcome": "fail",
+  "invocation": {
+    "source": "cli",
+    "argv": [
+      "run",
+      "--config",
+      "/kaggle/working/ollama.yaml",
+      "--checks",
+      "access,serving,correctness,first_output,generation,load,gpu,prefix,json,cancellation",
+      "--max-duration",
+      "1200",
+      "--output",
+      "/kaggle/working/run-ollama",
+      "--html"
+    ]
+  },
+  "config": {
+    "targets": [
+      {
+        "tokenizer": null,
+        "name": "ollama",
+        "url": "http://127.0.0.1:11434/v1",
+        "model": "qwen2.5:1.5b",
+        "api_key_env": null,
+        "headers_env": {},
+        "route": "direct",
+        "parent": null,
+        "identity": {},
+        "metrics_url": null,
+        "host_metrics_url": null,
+        "metrics_api_key_env": null,
+        "metrics_headers_env": {},
+        "metrics_profile": "unknown",
+        "metrics_runtime_version": null,
+        "instrumentation": "unknown",
+        "deployment": {
+          "model": {},
+          "runtime": {},
+          "serving": {},
+          "backend": {},
+          "hardware": {},
+          "software": {},
+          "extension": {},
+          "scope": "configured endpoint; other replicas unverified",
+          "collected_at": null,
+          "metadata_file": null,
+          "launch_command": null,
+          "discovery": "none",
+          "collector_url": null,
+          "intended_change": null
+        },
+        "restart_command": null
+      }
+    ],
+    "config_version": 2,
+    "concurrency": null,
+    "max_requests": null,
+    "max_duration_seconds": 1200.0,
+    "max_memory_mb": 4096,
+    "request_timeout_seconds": 300.0,
+    "readiness_timeout_seconds": 180.0,
+    "max_output_tokens": 128,
+    "context_limit": 4096,
+    "samples": 6,
+    "sustained_seconds": 5.0,
+    "stop_after_errors": 20,
+    "unresponsive_after_failures": 5,
+    "unresponsive_for_seconds": 45.0,
+    "checks": [
+      "access",
+      "serving",
+      "correctness",
+      "first_output",
+      "generation",
+      "load",
+      "gpu",
+      "prefix",
+      "json",
+      "cancellation"
+    ],
+    "structured_json": true,
+    "metrics": true,
+    "metrics_interval_seconds": 1.0,
+    "gpu_min_observation_seconds": 30.0,
+    "metrics_timeout_seconds": 2.0,
+    "metrics_max_samples": 256,
+    "metrics_max_series": 128,
+    "cache_pressure_threshold": 0.9,
+    "arrivals": null,
+    "scale_down": null,
+    "prefix": {
+      "prefix_chars": 8192,
+      "repeats": 6,
+      "history_turns": 3
+    },
+    "concurrent_load": {
+      "profile": {
+        "short": {
+          "input_tokens": 128,
+          "output_tokens": 32
+        },
+        "medium": {
+          "input_tokens": 512,
+          "output_tokens": 64
+        },
+        "long": {
+          "input_tokens": 2048,
+          "output_tokens": 128
+        }
+      },
+      "combinations": {
+        "enabled": true,
+        "selected": [
+          "short_short",
+          "long_short",
+          "short_long"
+        ]
+      },
+      "mixed": {
+        "enabled": true,
+        "shares": {
+          "short_short": 60.0,
+          "long_short": 20.0,
+          "short_long": 20.0
+        },
+        "seed": null
+      },
+      "interference": {
+        "enabled": false,
+        "trigger": "first_output",
+        "trigger_chunks": 5,
+        "max_slowdown": 1.5
+      },
+      "stress": {
+        "enabled": false,
+        "large_input": true,
+        "large_output": true,
+        "min_output_percent": 80.0
+      },
+      "schedule": {
+        "duration_seconds": 15
+      },
+      "pass_criteria": {
+        "first_output_p95_ms": null,
+        "response_p95_ms": null,
+        "max_error_percent": 0.0,
+        "min_correct_percent": 100.0,
+        "min_valid_responses": 5
+      },
+      "input_token_tolerance": 0.1,
+      "calibration_attempts": 3
+    },
+    "load_test": {
+      "legacy_source": null,
+      "profile": {
+        "short": {
+          "input_tokens": 128,
+          "output_tokens": 64
+        },
+        "medium": {
+          "input_tokens": 512,
+          "output_tokens": 256
+        },
+        "long": {
+          "input_tokens": 2048,
+          "output_tokens": 512
+        }
+      },
+      "workloads": {
+        "combinations": {
+          "enabled": true,
+          "selected": [
+            "short_short",
+            "long_short",
+            "short_long"
+          ]
+        },
+        "mixed": {
+          "enabled": false,
+          "selected": [
+            "short_short",
+            "short_medium",
+            "short_long",
+            "medium_short",
+            "medium_medium",
+            "medium_long",
+            "long_short",
+            "long_medium",
+            "long_long"
+          ],
+          "share_mode": "equal",
+          "shares": {
+            "short_short": 11.0,
+            "short_medium": 11.0,
+            "short_long": 11.0,
+            "medium_short": 11.0,
+            "medium_medium": 11.0,
+            "medium_long": 11.0,
+            "long_short": 11.0,
+            "long_medium": 11.0,
+            "long_long": 12.0
+          }
+        },
+        "interference": {
+          "enabled": false,
+          "trigger": "streaming_started",
+          "max_slowdown": 1.5
+        },
+        "stress": {
+          "enabled": false,
+          "cases": [
+            "long_short",
+            "short_long",
+            "long_long"
+          ],
+          "min_output_percent": 80.0
+        }
+      },
+      "patterns": {
+        "concurrent": {
+          "enabled": true
+        },
+        "constant": {
+          "enabled": true
+        },
+        "poisson": {
+          "enabled": false,
+          "seed": 42
+        },
+        "rates": [
+          1.0,
+          2.0
+        ],
+        "bursts": {
+          "enabled": false,
+          "size": 32,
+          "first_seconds": 10.0,
+          "gap_seconds": 10.0
+        }
+      },
+      "schedule": {
+        "duration_seconds": 15
+      },
+      "request_timeout_seconds": 300.0,
+      "pass_criteria": {
+        "max_first_answer_ms": 2000.0,
+        "max_completion_ms": 30000.0,
+        "max_error_percent": 0.0,
+        "min_correct_percent": 100.0,
+        "max_stream_pause_ms": null,
+        "min_generation_tokens_per_second": null,
+        "min_valid_responses": 5
+      },
+      "migrated_tests": []
+    },
+    "sessions": null,
+    "multi_user": null,
+    "gateway_access": null,
+    "consistency": null,
+    "tool_calling": false,
+    "forced_tool_diagnostic": false,
+    "tool_checks": null,
+    "metrics_max_age_seconds": 60.0,
+    "overlap_models": false,
+    "stream": true,
+    "request_options": {},
+    "custom_fixtures": null,
+    "legacy_custom_fixture_max_output_tokens": null,
+    "request_source": "builtin",
+    "request_pack": null,
+    "judging": {
+      "judges": [],
+      "concurrency": 2,
+      "request_timeout_seconds": 30.0,
+      "max_duration_seconds": 300.0,
+      "max_output_tokens": 256,
+      "ca_bundle": null,
+      "proxy": null
+    },
+    "retention": "failures",
+    "ca_bundle": null,
+    "proxy": null,
+    "restart_target": null,
+    "limits": {
+      "latency_ms": null,
+      "min_output_tokens_per_second": null,
+      "max_error_rate": 0.0,
+      "min_correctness": 1.0,
+      "fairness_max_ratio": null,
+      "recovery_max_ratio": null,
+      "gpu_max_temperature_c": null,
+      "regression_percent": 20.0,
+      "regression_rate_points": 5.0,
+      "min_samples": 5
+    },
+    "traffic": {
+      "rates": [
+        1.0,
+        2.0,
+        4.0
+      ],
+      "duration_seconds": 5.0,
+      "arrival": "steady",
+      "max_in_flight": null,
+      "expected_response_seconds": null,
+      "seed": 42,
+      "mix": {
+        "short": 0.6,
+        "long_input": 0.2,
+        "long_output": 0.2
+      },
+      "scheduler_lag_tolerance_ms": 100.0,
+      "drain_timeout_seconds": null,
+      "long_input_chars": 4096,
+      "long_output_words": 32
+    },
+    "test_options": {}
+  },
+  "fixture_pack": {
+    "version": "0.3.0",
+    "custom": null,
+    "custom_sha256": null,
+    "builtin_sha256": "5d2d6bdb997f3b670434fe42510cc8e0c5b49ea940bd4cffd37af1831471f0c9",
+    "workload_fixture_sha256": "f9a5c7d7045b60ad7981367c1f8ed7c72c8b1c876f737b5461c0f694f3385c96"
+  },
+  "deployments": {
+    "ollama": {
+      "schema_version": "1",
+      "target": "ollama",
+      "route": "direct",
+      "parent": null,
+      "scope": "configured endpoint; other replicas unverified",
+      "collected_at": "2026-11-10T04:57:51.119636+00:00",
+      "fields": {
+        "model.requested": {
+          "configured": {
+            "value": "qwen2.5:1.5b",
+            "provenance": "user-supplied",
+            "scope": "configured endpoint; other replicas unverified",
+            "collected_at": "2026-11-10T04:57:51.119636+00:00",
+            "status": "unverified",
+            "freshness": "collection time; underlying update time unknown"
+          }
+        },
+        "model.served": {
+          "reported": {
+            "value": [
+              "qwen2.5:1.5b"
+            ],
+            "provenance": "runtime-reported",
+            "scope": "configured endpoint; other replicas unverified",
+            "collected_at": "2026-11-10T05:05:42.721980+00:00",
+            "status": "runtime_reported",
+            "freshness": "collection time; underlying update time unknown"
+          }
+        }
+      },
+      "continuity": "unverified",
+      "discovery": [
+        {
+          "status": "not_enabled"
+        }
+      ],
+      "limitations": [
+        "One configured endpoint/collector; other replicas unverified.",
+        "Chat APIs do not establish host layout, containers, launch settings or kernels."
+      ],
+      "identity": {},
+      "intended_change": null,
+      "unknown_fields": [
+        "backend.attention",
+        "backend.compilation",
+        "backend.graphs",
+        "backend.kernel",
+        "hardware.gpu_count",
+        "hardware.gpu_type",
+        "hardware.interconnect",
+        "hardware.layout",
+        "hardware.pipeline_parallel",
+        "hardware.tensor_parallel",
+        "model.chat_template",
+        "model.digest",
+        "model.quantization",
+        "model.revision",
+        "model.tokenizer",
+        "runtime.commit",
+        "runtime.engine",
+        "runtime.image",
+        "runtime.image_digest",
+        "runtime.version",
+        "serving.configuration",
+        "serving.context_limit",
+        "serving.gpu_memory_utilization",
+        "serving.instrumentation",
+        "serving.kv_cache",
+        "serving.launch_arguments",
+        "serving.max_num_batched_tokens",
+        "serving.max_num_seqs",
+        "serving.prefix_caching",
+        "serving.resolved_settings",
+        "serving.scheduler",
+        "software.cuda",
+        "software.driver",
+        "software.libraries",
+        "software.rocm"
+      ],
+      "model_residency": {
+        "before_preparation": {
+          "state": "unknown",
+          "source": null,
+          "target": "ollama",
+          "model": "qwen2.5:1.5b",
+          "scope": "configured endpoint; other replicas unverified",
+          "collected_at": null,
+          "reason": "Residency discovery is not enabled for this runtime."
+        },
+        "after_preparation": {
+          "state": "unknown",
+          "source": null,
+          "target": "ollama",
+          "model": "qwen2.5:1.5b",
+          "scope": "configured endpoint; other replicas unverified",
+          "collected_at": null,
+          "reason": "Residency discovery is not enabled for this runtime."
+        }
+      }
+    }
+  },
+  "scale_down_history": {},
+  "deployment_history": {
+    "ollama": []
+  },
+  "instructions": [
+    "Supply secret environment-variable references locally.",
+    "Match suite and fixture hashes; supply any local fixture/metadata files.",
+    "Verify unknown server settings manually. This export cannot recreate inaccessible server state.",
+    "Imported launch arguments describe intent and are never executed by this export.",
+    "A saved failed run is a reference, not an approved deployment."
+  ]
+}
