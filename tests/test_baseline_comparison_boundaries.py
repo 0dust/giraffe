@@ -1,10 +1,9 @@
 import random
-from statistics import median
+from types import SimpleNamespace
 
 import pytest
 
-from giraffe.reporting import _different_output_work, compare_baseline
-from giraffe.stats import percentile
+from giraffe.reporting import _output_tail_shifted, compare_baseline
 from tests.test_reporting import baseline_check, make_report
 
 
@@ -86,28 +85,25 @@ def test_same_distribution_runs_do_not_fail_tail_comparison(count):
                        for row in compared.baseline["targets"][0]["comparisons"]), seed
 
 
-def _output_summary(tokens):
-    return {"output_chars_p50": median(tokens) * 4, "reported_output_tokens_p50": median(tokens),
-            "output_chars_p95": percentile(tokens, .95) * 4,
-            "reported_output_tokens_p95": percentile(tokens, .95)}
+def _answers(rng, count, scale=1):
+    return [SimpleNamespace(status="completed", valid=True, workload={},
+                            output_tokens=(tokens := max(1, int(rng.lognormvariate(5, .8) * scale))),
+                            output_chars=tokens * 4) for _ in range(count)]
 
 
-@pytest.mark.parametrize("count", [30, 60])
-def test_tail_output_guard_tolerates_sampling_noise_but_not_doubled_tail(count):
-    # Same-distribution p95 answer length varies a lot at these sizes; only a large
-    # shift (here 2x+) should mark tail timing as different generated work.
-    def sample(rng):
-        return [max(1, int(rng.lognormvariate(5, .8))) for _ in range(count)]
-    fired = 0
-    for seed in range(200):
-        rng = random.Random(seed)
-        current, old = _output_summary(sample(rng)), _output_summary(sample(rng))
-        fired += (_different_output_work(current, old, 20, include_tail=True)
-                  and not _different_output_work(current, old, 20))
-    assert fired / 200 < .05
-    base = sample(random.Random(0))
-    assert _different_output_work(_output_summary([value * 3 for value in base]),
-                                  _output_summary(base), 20, include_tail=True)
+@pytest.mark.parametrize("count,bound", [(30, .10), (60, .05)])
+def test_tail_output_guard_rarely_fires_on_sampling_noise(count, bound):
+    # Measured: about 6% at n=30 and 2.5% at n=60 for same-distribution runs.
+    fired = sum(_output_tail_shifted(_answers(random.Random(seed), count),
+                                     _answers(random.Random(10_000 + seed), count), 20)
+                for seed in range(200))
+    assert fired / 200 < bound
+
+
+def test_tail_output_guard_fires_on_large_tail_shift():
+    base = _answers(random.Random(0), 60)
+    assert _output_tail_shifted(_answers(random.Random(0), 60, scale=3), base, 20)
+    assert not _output_tail_shifted(base, base, 20)
 
 
 def test_lower_bound_equal_to_regression_threshold_is_material():
@@ -141,3 +137,22 @@ def test_zero_baseline_timing_comparison(current_latency, status, reason):
         assert latency["worsening"] == 0
     else:
         assert "worsening" not in latency
+
+
+@pytest.mark.parametrize("count", [60, 100])
+def test_longer_tail_answers_are_not_reported_as_latency_regression(count):
+    # 15% of answers grow 100 -> 150 tokens; time per token is unchanged.
+    current, old = make_report(count=count), make_report("baseline", count=count)
+    for report in (current, old):
+        for record in report.requests:
+            record.output_tokens, record.output_chars = 100, 400
+            record.elapsed_ms = 1000
+    for record in current.requests[-round(count * .15):]:
+        record.output_tokens, record.output_chars = 150, 600
+        record.elapsed_ms = 1500
+    compared = compare_baseline(current, old)
+    rows = {row["metric"]: row for row in compared.baseline["targets"][0]["comparisons"]}
+    tail = rows["latency_p95_ms"]
+    assert tail["status"] == "inconclusive"
+    assert "output_work_changed" in {warning["code"] for warning in tail["warnings"]}
+    assert compared.overall != "fail"

@@ -1005,23 +1005,38 @@ def _output_observations(check, scenario, current_work, old_work):
     return observations
 
 
-# A sample p95 of answer length is far noisier than the median (simulated same-distribution
-# runs of 20-60 samples differ by over 20% about a third of the time), so the tail output
-# guard tolerates a wider shift than the median guard.
-_TAIL_OUTPUT_TOLERANCE_FACTOR = 5
-
-
-def _different_output_work(current: dict[str, Any], old: dict[str, Any], threshold: float,
-                           *, include_tail: bool = False) -> bool:
-    keys = [("output_chars_p50", threshold), ("reported_output_tokens_p50", threshold)]
-    if include_tail:
-        tail_threshold = threshold * _TAIL_OUTPUT_TOLERANCE_FACTOR
-        keys += [("output_chars_p95", tail_threshold), ("reported_output_tokens_p95", tail_threshold)]
-    for key, limit in keys:
+def _different_output_work(current: dict[str, Any], old: dict[str, Any], threshold: float) -> bool:
+    for key in ("output_chars_p50", "reported_output_tokens_p50"):
         c, b = current[key], old[key]
         if c is not None and b is not None and c != b:
-            if b == 0 or abs(c - b) * 100 / b > limit:
+            if b == 0 or abs(c - b) * 100 / b > threshold:
                 return True
+    return False
+
+
+def _output_tail_shifted(current: list[RequestRecord], old: list[RequestRecord], threshold: float,
+                         *, check: str | None = None) -> bool:
+    """Whether answer-length p95 moved by more than the threshold beyond sampling noise.
+
+    A sample p95 of answer length is noisy at 20-60 samples, so a shift only counts when
+    the bootstrap interval of the relative change also excludes zero.
+    """
+    for field in ("output_tokens", "output_chars"):
+        values = [[getattr(r, field) for r in records if _valid_completion(r, check)
+                   and getattr(r, field) is not None] for records in (current, old)]
+        if min(map(len, values)) < _P95_MINIMUM_SAMPLES:
+            continue
+        c, b = (percentile(v, .95) for v in values)
+        if c == b or b == 0 or abs(c - b) * 100 / b <= threshold:
+            continue
+        rng = random.Random(0)
+        changes = []
+        for _ in range(400):
+            bc, bb = (percentile(rng.choices(v, k=len(v)), .95) for v in values)
+            changes.append((bc - bb) * 100 / bb if bb else None)
+        changes = [x for x in changes if x is not None]
+        if changes and (percentile(changes, .025) > 0 or percentile(changes, .975) < 0):
+            return True
     return False
 
 
@@ -2798,7 +2813,8 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                         current_output = _output_work(current_samples, check=check)
                         old_output = _output_work(old_samples, check=check)
                         metric_output_changed = _different_output_work(
-                            current_output, old_output, threshold, include_tail=is_tail)
+                            current_output, old_output, threshold) or (
+                            is_tail and _output_tail_shifted(current_samples, old_samples, threshold, check=check))
                     if measured_conversation:
                         metric_input_changed = _input_work_changed(current_samples, old_samples, threshold)
                         metric_live_inputs = _live_input_work_changed(current_samples, old_samples, threshold)
