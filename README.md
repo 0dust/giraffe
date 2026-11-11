@@ -48,7 +48,7 @@ Install [`giraffe-llm` from PyPI](https://pypi.org/project/giraffe-llm/) in a vi
 ```sh
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install "giraffe-llm==0.1.0a1"
+python -m pip install "giraffe-llm==0.1.0a2"
 ```
 
 ### 2. Start your run
@@ -132,7 +132,7 @@ compatible server such as vLLM, enable
 `request_options.stream_options.continuous_usage_stats: true`. Without either,
 generation pace remains unmeasured and a required minimum rate stays inconclusive;
 first-answer time, stream pauses and total response time still work. See
-[streaming generation pace](docs/workloads.md#streaming-generation-pace).
+[streaming generation pace](https://github.com/0dust/giraffe/blob/main/docs/workloads.md#streaming-generation-pace).
 
 ## CI and GitHub Actions
 
@@ -204,11 +204,11 @@ giraffe run --config giraffe-config.json --html
 ```
 
 Run this from the folder containing the downloaded file, or pass its full path.
-For a YAML starting point, download [session-distributions.yaml](examples/session-distributions.yaml)
+For a YAML starting point, download [session-distributions.yaml](https://github.com/0dust/giraffe/blob/main/examples/session-distributions.yaml)
 from GitHub, update its endpoint and model, then run
 `giraffe run --config session-distributions.yaml --html` from that folder.
 Repository examples are not installed into your working directory by pip.
-See [conversation settings](docs/workloads.md#sampled-conversation-traffic) for
+See [conversation settings](https://github.com/0dust/giraffe/blob/main/docs/workloads.md#sampled-conversation-traffic) for
 weights, seeds and token-length limits.
 
 ## Save a baseline and compare
@@ -221,7 +221,7 @@ endpoint URL, model ID, workload and acceptance settings the same across runs:
 giraffe baseline save runs/before baselines/before.json
 
 # After changing your deployment:
-giraffe run --config examples/vllm.yaml \
+giraffe run --config giraffe.yaml \
   --baseline baselines/before.json --output runs/after --html
 ```
 
@@ -250,7 +250,7 @@ The four defaults are `access, serving, correctness, first_output`; select addit
 | Prefix cache · `prefix` | Reported cache reuse against independent controls |
 | Multi-turn sessions · `sessions` | Recall and timing across concurrent conversations |
 | Multi-user · `multi_user` | Persistent users sharing request slots, with individual delivery and timing outcomes |
-| Gateway quotas & priorities · `gateway_policy` | [Opt-in LiteLLM policy observations](docs/gateway-policy.md) with separate identities, bounded traffic and continued peer service |
+| Gateway quotas & priorities · `gateway_policy` | [Opt-in LiteLLM policy observations](https://github.com/0dust/giraffe/blob/main/docs/gateway-policy.md) with separate identities, bounded traffic and continued peer service |
 | Gateway usage attribution · `gateway_attribution` | Marked requests and final token counts matched to existing LiteLLM spend logs |
 | Gateway access policy · `gateway_access` | Declared allow/deny cases using existing test identity references |
 | Answer consistency · `consistency` | Answer agreement across repeated requests |
@@ -263,13 +263,13 @@ verdict. GPU hardware faults and an exceeded configured temperature limit can
 still fail the run. Prefix cache never fails the run.
 
 Gateway access is an optional LiteLLM check with explicit expected allow and deny
-cases. Configure it in the UI or run the [example](examples/gateway-access.yaml)
+cases. Configure it in the UI or run the [example](https://github.com/0dust/giraffe/blob/main/examples/gateway-access.yaml)
 after supplying existing test identity environment references. Network failures
 and unsupported error formats remain unverified; no keys or privileges change.
-See the [access-policy guide](docs/gateway-access.md) for supported evidence and limits.
+See the [access-policy guide](https://github.com/0dust/giraffe/blob/main/docs/gateway-access.md) for supported evidence and limits.
 
 Gateway attribution is optional and independent of simulated users. The bounded
-[LiteLLM example](examples/litellm-attribution.yaml) sends four requests using two
+[LiteLLM example](https://github.com/0dust/giraffe/blob/main/examples/litellm-attribution.yaml) sends four requests using two
 existing virtual keys and reads `/spend/logs/v2`; run it with
 `giraffe run --config examples/litellm-attribution.yaml` after setting the three
 named environment variables and the served model. It needs an existing LiteLLM
@@ -348,8 +348,8 @@ Results are **pass**, **fail**, **inconclusive**, **skipped** or **blocked**. Mi
 The opt-in `scale_down` check keeps streamed answers active while you remove one
 replica externally, then reports **client-visible continuity**, **backend drain
 semantics** and **remaining capacity** separately. Start with
-[`examples/scale-down.yaml`](examples/scale-down.yaml) and the
-[operator workflow](docs/running.md#scale-down-continuity).
+[`examples/scale-down.yaml`](https://github.com/0dust/giraffe/blob/main/examples/scale-down.yaml) and the
+[operator workflow](https://github.com/0dust/giraffe/blob/main/docs/running.md#scale-down-continuity).
 A read-only lifecycle exporter and a representative long-answer fixture are
 needed for complete coverage. Missing evidence stays inconclusive; successful
 traffic alone does not establish graceful draining. Giraffe does not provision or
