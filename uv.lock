@@ -389,7 +389,7 @@ wheels = [
 
 [[package]]
 name = "giraffe-llm"
-version = "0.1.0a2.dev1"
+version = "0.1.0a2"
 source = { editable = "." }
 dependencies = [
     { name = "fastapi" },

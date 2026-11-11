@@ -43,18 +43,12 @@ Start your inference server separately and have a model ready to use.
 
 ### 1. Install
 
-This is the `0.1.0a2.dev1` TestPyPI rehearsal for the planned `0.1.0a2` release.
-Install Giraffe from [TestPyPI](https://test.pypi.org/project/giraffe-llm/0.1.0a2.dev1/)
-in a fresh virtual environment, with dependencies from normal PyPI. The command is `giraffe`:
+Install [`giraffe-llm` from PyPI](https://pypi.org/project/giraffe-llm/) in a virtual environment. The command is `giraffe`:
 
 ```sh
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip download --no-deps --only-binary=:all: \
-  --index-url https://test.pypi.org/simple/ --dest test-dist \
-  "giraffe-llm==0.1.0a2.dev1"
-python -m pip install --index-url https://pypi.org/simple/ \
-  test-dist/giraffe_llm-0.1.0a2.dev1-py3-none-any.whl
+python -m pip install "giraffe-llm==0.1.0a2"
 ```
 
 ### 2. Start your run
