@@ -70,16 +70,21 @@ Every CLI `giraffe run` with an output directory also journals finished requests
 `evidence.jsonl` in that directory (`--retention` applies: with `none`, response text is
 not journaled). The journal is deleted once `report.json` is saved, so a run that
 finishes normally leaves only `report.json` and `.web.json`; scale-down runs keep it.
-If the process dies first (for example `kill -9`), `giraffe report RUN_DIR` rebuilds a
-report from the journal when no `report.json` or `summary.json` exists. Recovery:
+If the process dies first (for example `kill -9`), `giraffe report RUN_DIR --html` rebuilds a
+report from the journal when no `report.json` or `summary.json` exists. `report` needs at
+least one export (`--html`, `--junit PATH` or `--summary-md PATH`) and exits 4 without one.
+Recovery:
 
 - ignores the `.web.json` `state` value; it checks only whether the writer may still run;
 - refuses (exit 4) when it may: the owner PID is alive on this host (an uncertain probe
-  or this process's own PID counts as alive), or the heartbeat is recent. If a PID was
-  recycled, delete the stale `.web.json` and rerun the command;
+  or this process's own PID counts as alive). When `.web.json` has no usable PID for this
+  host, a recent heartbeat also refuses. If a PID was recycled, delete the stale
+  `.web.json` and rerun the command;
 - leaves final artifacts authoritative: an existing or corrupt `report.json`, or a
   `summary.json`, is never replaced from the journal;
-- marks every check inconclusive and the report incomplete, with judge scores missing;
+- marks every check inconclusive and the report incomplete, with judge scores missing,
+  except `scale_down`: its confirmed failures stay `fail` (so the overall result is `fail`),
+  while its passing results become inconclusive;
 - can lose the newest requests after a hard kill, because the journal is fsynced about
   every 50 records or second.
 
