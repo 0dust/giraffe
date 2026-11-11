@@ -63,7 +63,10 @@ def test_readme_quickstart_uses_shared_defaults_and_model_discovery():
     assert 'git clone' not in install
     assert 'python3 -m venv .venv' in install
     assert 'source .venv/bin/activate' in install
-    assert 'python -m pip install "giraffe-llm==0.1.0a2"' in install
+    assert '"giraffe-llm==0.1.0a2.dev1"' in install
+    assert '--index-url https://test.pypi.org/simple/ --dest test-dist' in install
+    assert 'python -m pip install --index-url https://pypi.org/simple/' in install
+    assert 'test-dist/giraffe_llm-0.1.0a2.dev1-py3-none-any.whl' in install
     block = README.split('### 2. Start your run\n', 1)[1].split('\n### ', 1)[0]
     command = next(line for line in block.splitlines() if line.startswith('giraffe run '))
     assert command == 'giraffe run --url http://127.0.0.1:11434/v1 --html'
