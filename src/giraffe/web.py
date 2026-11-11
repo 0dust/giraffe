@@ -227,7 +227,7 @@ class _ReportProcess:
                 import giraffe
                 package_file = str(Path(giraffe.__file__).resolve())
                 # Pin only Giraffe; do not promote its site-packages over stdlib.
-                self.process = subprocess.Popen([sys.executable, "-I", "-c",
+                self.process = subprocess.Popen([sys.executable, "-P", "-c",
                     "import importlib.util,os,sys; protocol=os.fdopen(os.dup(1),'wb'); "
                     "os.dup2(2,1); sys.stdout=sys.stderr; "
                     f"spec=importlib.util.spec_from_file_location('giraffe',{package_file!r}); "

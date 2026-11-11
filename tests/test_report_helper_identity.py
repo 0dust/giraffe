@@ -2,6 +2,10 @@
 
 import json
 import os
+from pathlib import Path
+import subprocess
+import sys
+import venv
 
 from fastapi import HTTPException
 import pytest
@@ -32,6 +36,31 @@ def test_report_helper_ignores_decoy_package_on_cwd_and_pythonpath(tmp_path, mon
         assert json.loads(body)["report"]["request_count"] == 1
     finally:
         helper.close()
+
+
+def test_report_helper_preserves_pythonpath_dependencies(tmp_path):
+    save_report(tmp_path)
+    environment = tmp_path / "environment"
+    venv.EnvBuilder(with_pip=False).create(environment)
+    package_root = str(Path(web.__file__).resolve().parent.parent)
+    dependencies = [path for path in sys.path
+                    if path and Path(path).name in {"site-packages", "dist-packages"}]
+    code = '''
+import json
+from pathlib import Path
+import sys
+from giraffe.web import _ReportProcess
+helper = _ReportProcess()
+try:
+    status, body = helper.read(Path(sys.argv[1]), "saved", "detail")
+    assert status == 200 and json.loads(body)["report"]["request_count"] == 1
+finally:
+    helper.close()
+'''
+    result = subprocess.run([str(environment / "bin" / "python"), "-P", "-c", code, str(tmp_path)],
+        env=dict(os.environ, PYTHONPATH=os.pathsep.join([package_root, *dependencies])),
+        timeout=30, capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 @pytest.mark.parametrize("identity", ["version", "package"])
