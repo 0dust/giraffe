@@ -364,3 +364,47 @@ def test_malformed_config_target_returns_configuration_error(tmp_path, capsys, t
     message = capsys.readouterr().err
     assert 'targets' in message
     assert 'Traceback' not in message
+
+
+@pytest.mark.skipif(not hasattr(signal, "SIGKILL"), reason="requires SIGKILL")
+def test_sigkilled_cli_run_is_recovered_from_its_evidence_journal(tmp_path, capsys):
+    import re
+    import time
+    from tests.fake_endpoint import FakeEndpoint
+
+    started = []
+
+    def delay(payload):
+        # The first requests finish at once and get journaled; later ones hang,
+        # so the run cannot complete before the kill.
+        started.append(payload)
+        return 0 if len(started) <= 3 else 300
+
+    directory, journal = tmp_path / "run", tmp_path / "run" / "evidence.jsonl"
+    with FakeEndpoint(response_delay=delay) as fake:
+        command = [sys.executable, "-c", "from giraffe.cli import main; raise SystemExit(main())",
+                   "run", "--url", fake.url, "--model", "fake-model", "--skip-preflight",
+                   "--checks", "correctness", "--output", str(directory), "--quiet"]
+        process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            deadline = time.monotonic() + 60
+            while time.monotonic() < deadline and process.poll() is None:
+                if journal.is_file() and '"type":"record"' in journal.read_text(errors="replace").replace(" ", ""):
+                    break
+                time.sleep(0.05)
+            assert process.poll() is None, "run ended before it could be killed"
+            assert journal.is_file(), "no evidence journal appeared"
+            process.send_signal(signal.SIGKILL)
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=20)
+    assert process.returncode == -signal.SIGKILL
+    assert not (directory / "report.json").exists()
+
+    assert main(["report", str(directory), "--html"]) == 0
+    recovered = int(re.search(r"Recovered (\d+) recorded requests", capsys.readouterr().err).group(1))
+    assert recovered >= 1
+    page = (directory / "report.html").read_text()
+    assert f"{recovered} requests recorded" in page
+    assert journal.is_file()
