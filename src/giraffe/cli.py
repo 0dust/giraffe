@@ -362,20 +362,15 @@ def _report_for_render(path: Path) -> RunReport:
                 or (path / "summary.json").exists()):
             raise
         from giraffe.evidence import recover_evidence
-        from giraffe.storage import _read, run_alive
+        from giraffe.storage import _read, pid_alive, run_alive
 
         meta = _read(path / ".web.json")
         pid = meta.get("owner_pid")
         if (meta.get("owner_host") == socket.gethostname()
                 and isinstance(pid, int) and not isinstance(pid, bool) and pid > 0):
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
-                alive = False
-            except (OSError, OverflowError):
-                alive = True
-            else:
-                alive = True
+            # Stricter than run_alive: recovery reads a journal a live writer may
+            # still append to, so an indeterminate probe counts as alive here.
+            alive = pid_alive(pid, uncertain=True)
         else:
             alive = run_alive(path, meta)
         if alive:
