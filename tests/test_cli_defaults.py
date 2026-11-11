@@ -186,7 +186,7 @@ def test_json_alias_changes_output_only(flags, format):
 
 def test_json_alias_emits_machine_report(tmp_path, monkeypatch, capsys):
     async def run(config, **kwargs):
-        assert kwargs == {"json_progress": True}
+        assert kwargs == {"json_progress": True, "directory": tmp_path / "run"}
         assert "json" not in config.checks
         return report()
 
