@@ -5,7 +5,7 @@
   </picture>
 </p>
 
-<h3 align="center">Check whether your self-hosted LLM performs as expected.</h3>
+<h3 align="center">Before you upgrade, reconfigure or swap a self-hosted LLM, find out what got worse.</h3>
 
 <p align="center">
   <a href="https://pypi.org/project/giraffe-llm/"><img alt="PyPI version" src="https://img.shields.io/pypi/v/giraffe-llm"></a>
@@ -91,6 +91,11 @@ Open the access link printed in the terminal (it contains a per-launch token), e
 ## Inference engines
 
 Connect through the engine’s **OpenAI-compatible chat API**. Discovery, metrics and server-side evidence vary by engine.
+
+**Live-tested on Linux with CUDA:** vLLM 0.33.0 and Ollama 0.40.16 on an NVIDIA
+Tesla T4; see the [November 10 validation record](https://github.com/0dust/giraffe/blob/main/docs/validation/2026-11-10.md)
+for the setup, results and what it does not cover. The other engines have
+runnable examples and automated tests, but no live qualification record yet.
 
 Generate a starter configuration from your installed package:
 
@@ -338,6 +343,10 @@ Results are **pass**, **fail**, **inconclusive**, **skipped** or **blocked**. Mi
 ## Community
 
 [Join the Giraffe Discord](https://discord.gg/GBefPbWebr) to get help with runs and reports, share feedback, and discuss ideas. Start a post in **#help-and-feedback** for a question, bug, or suggestion, and follow **#updates** for releases and improvements.
+
+**Want a second opinion on a run?** Post in **#help-and-feedback** and a
+maintainer will go through the verdicts with you. By default a report keeps
+response text only for failed requests; run with `--retention none` to keep none.
 
 [Report an issue](https://github.com/0dust/giraffe/issues) with your Giraffe version, engine/model and reproduction steps. Remove API keys and private prompts or answers before sharing reports.
 
