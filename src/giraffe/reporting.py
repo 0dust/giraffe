@@ -994,10 +994,10 @@ def _output_observations(check, scenario, current_work, old_work):
         ("output_tokens", "reported_output_tokens_p50", "reported_token_samples"),
         ("output_chars", "output_chars_p50", "valid_completions"),
     ):
-        current_value, old_value = current_work[value_key], old_work[value_key]
+        current_value, old_value = current_work.get(value_key), old_work.get(value_key)
         observations.append({"metric": metric, "check": check, "scenario": scenario,
             "current": current_value, "baseline": old_value, "aggregation": "median",
-            "current_samples": current_work[sample_key], "baseline_samples": old_work[sample_key],
+            "current_samples": current_work.get(sample_key), "baseline_samples": old_work.get(sample_key),
             "descriptive": True, "change_unit": "percent",
             "observed_delta": current_value - old_value if current_value is not None and old_value is not None else None,
             "observed_change": (current_value - old_value) * 100 / old_value
@@ -3863,11 +3863,15 @@ def _baseline_verdict(row: dict[str, Any]) -> tuple[str, str]:
     return "No material change", "muted"
 
 
-def _baseline_display_rows(target: dict[str, Any]) -> list[dict[str, Any]]:
-    rows = [*target.get("comparisons", []), *_comparison_outputs(target)]
+def _baseline_display_rows(target: dict[str, Any], *, target_index: int = 0) -> list[dict[str, Any]]:
+    rows = [dict(row, _evidence_id=f"comparison-metric-{target_index}-{index}")
+            for index, row in enumerate(target.get("comparisons", []))]
+    rows.extend(dict(row, _evidence_id=f"comparison-output-{target_index}-{index}")
+                for index, row in enumerate(_comparison_outputs(target)))
     traffic = target.get("traffic_capacity")
     if traffic:
         rows.append(dict(traffic, metric="Highest acceptable tested arrival rate (requests/s)",
+                         _evidence_id=f"comparison-traffic-{target_index}",
                          baseline=traffic.get("baseline_highest_acceptable_rate_rps"),
                          current=traffic.get("current_highest_acceptable_rate_rps"),
                          acceptance_improved=(traffic.get("status") == "pass"
@@ -3878,30 +3882,197 @@ def _baseline_display_rows(target: dict[str, Any]) -> list[dict[str, Any]]:
     if load:
         from .load_test import point_label
 
-        for point in load.get("points", []):
+        for point_index, point in enumerate(load.get("points", [])):
             before, after = point.get("baseline") or {}, point.get("current") or {}
             rows.append(dict(point, metric="Load acceptance: " + point_label(after or before),
+                             _evidence_id=f"comparison-load-{target_index}-{point_index}",
                              baseline=point.get("baseline_acceptance", before.get("status", "Unknown")),
                              current=point.get("current_acceptance", after.get("status", "Unknown")), check="load",
+                             baseline_samples=before.get("dispatched"), current_samples=after.get("dispatched"),
+                             sample_basis="dispatched",
                              scenario=point_label(after or before),
                              acceptance_improved=(point.get("acceptance_change") == "gained"
                                  if "acceptance_change" in point else point.get("status") == "pass"
                                  and before.get("status") == "fail" and after.get("status") == "pass")))
         if not load.get("points"):
-            rows.append(dict(load, metric="Tested load acceptance", baseline=None, current=None))
+            rows.append(dict(load, metric="Tested load acceptance", baseline=None, current=None,
+                             _evidence_id=f"comparison-load-{target_index}"))
     if not rows:
         rows.append(dict(metric="Comparison unavailable", status="inconclusive",
+                         _evidence_id=None,
                          reason=" ".join(target.get("reasons", []))))
     return rows
 
 
-def _baseline_summary_html(baseline: dict[str, Any]) -> str:
-    rows = [row for target in baseline.get("targets", [])
-            for row in [*target.get("comparisons", []), *_comparison_outputs(target)]]
-    warnings = sum(bool(row.get("warnings")) or row.get("status") == "inconclusive" for row in rows)
-    summary = f"{len(rows)} measurements · {warnings} with warnings"
-    return (f'<p class="baseline-summary"><a href="#baseline-heading">vs baseline '
-            f'{_e(baseline.get("saved_baseline_name") or baseline.get("name") or baseline.get("run_id", "unknown"))}: {_e(summary)}</a></p>')
+def _summary_measurement(row: dict[str, Any], value: Any) -> str:
+    if value is None:
+        return "Not recorded"
+    if isinstance(value, str):
+        return value.replace("_", " ").capitalize()
+    if not isinstance(value, (int, float)) or not math.isfinite(value):
+        return "Not recorded"
+    metric = row.get("metric", "")
+    if row.get("change_unit") == "percentage_points" or metric.endswith("_rate"):
+        return f"{value * 100:,.1f}%"
+    unit = (" ms" if metric.endswith("_ms") else
+            " tok/s" if metric.endswith("tokens_per_second") else
+            " tokens" if metric == "output_tokens" else
+            " chars" if metric == "output_chars" else
+            " req/s" if "delta_rps" in row or metric.endswith("(requests/s)") else "")
+    return f"{value:,.1f}{unit}"
+
+
+def _summary_change(row: dict[str, Any]) -> str:
+    change = row.get("observed_change")
+    if isinstance(change, (int, float)) and math.isfinite(change):
+        unit = " percentage points" if row.get("change_unit") == "percentage_points" else "%"
+        return f"{change:+,.1f}{unit}"
+    delta = row.get("observed_delta")
+    if isinstance(delta, (int, float)) and math.isfinite(delta):
+        return ("+" if delta >= 0 else "") + _summary_measurement(row, delta)
+    delta = row.get("delta_rps")
+    if isinstance(delta, (int, float)) and math.isfinite(delta):
+        return f"{delta:+,.1f} req/s"
+    change = row.get("acceptance_change")
+    if change:
+        return str(change).replace("_", " ").capitalize()
+    return "Not recorded"
+
+
+def comparison_summary(report: RunReport) -> dict[str, Any]:
+    """Project recorded comparison evidence for the app and portable report, without rescoring it."""
+    baseline = report.baseline
+    result = {"current_acceptance": _acceptance_status(report), "comparison_status": "absent",
+              "reference": None, "reason": "No baseline selected.", "rows": [],
+              "total_rows": 0, "omitted_rows": 0}
+    if not baseline:
+        return result
+    status = baseline.get("status") or "inconclusive"
+    result.update(comparison_status=status, reference={
+        "name": baseline.get("saved_baseline_name") or baseline.get("name") or baseline.get("run_id") or "Reference",
+        "run_id": baseline.get("run_id"), "started_at": baseline.get("source_started_at"),
+        "finished_at": baseline.get("source_finished_at"),
+        "acceptance": (baseline.get("acceptance") or {}).get("baseline"),
+    })
+    reason = {"pass": "No material regression was recorded in the comparable evidence.",
+              "fail": "A material regression was recorded in the compared evidence."}.get(
+                  status, "The evidence cannot confirm or rule out a regression.")
+    result["reason"] = reason
+    labels = {"correctness_rate": "Correct answers", "valid_completion_rate": "Completed valid responses",
+              "error_rate": "Request errors", "latency_ms": "Full response time",
+              "latency_p95_ms": "Full response time · p95", "first_output_ms": "First useful output",
+              "first_output_p95_ms": "First useful output · p95", "max_stream_gap_ms": "Longest pause per response",
+              "max_stream_gap_p95_ms": "Longest pause per response · p95",
+              "output_tokens_per_second": "Output rate, including initial wait",
+              "generation_tokens_per_second": "Generation pace", "output_tokens": "Answer length · tokens",
+              "output_chars": "Answer length · characters", "attribution_outcome": "Attribution outcome"}
+    core_metrics = ["correctness_rate", "latency_ms", "first_output_ms", "valid_completion_rate", "error_rate"]
+    rows = []
+    for target_index, target in enumerate(baseline.get("targets", [])):
+        seen = set()
+        for row in _baseline_display_rows(target, target_index=target_index):
+            fingerprint = json.dumps([row.get("check"), _comparison_cohort(row), *(
+                row.get(name) for name in ("metric", "baseline", "current", "status", "reason"))], sort_keys=True)
+            if fingerprint in seen:
+                continue
+            seen.add(fingerprint)
+            check, metric = row.get("check"), row.get("metric", "Metric")
+            scope = (row.get("scenario_label") or
+                     (_comparison_load_label(row["load_point"]) if row.get("load_point") else
+                      _condition_label(row.get("condition_id") or row.get("scenario") or check or "Run comparison",
+                                       target=target.get("target"), report=report)))
+            section = ("gateway-attribution-outcomes" if metric == "attribution_outcome" else
+                       "gateway-access-decisions" if check == "gateway_access" else
+                       "gateway-policy-outcomes" if check == "gateway_policy" and metric == "policy_acceptance" else
+                       "load-acceptance" if check == "load" or metric == "Tested load acceptance" else
+                       "answers" if metric in {"correctness_rate", "output_tokens", "output_chars"} else
+                       "delivery" if metric in {"valid_completion_rate", "error_rate"} else
+                       "timing" if metric in labels else "comparison")
+            row_status = row.get("status") or "inconclusive"
+            row_reason = " ".join(dict.fromkeys(filter(None, [row.get("reason"), *(
+                warning.get("message") for warning in row.get("warnings", []))])))
+            if not row_reason and metric == "Comparison unavailable":
+                row_reason = target.get("summary") or "No comparable metric evidence was recorded."
+            label = labels.get(metric, str(metric).replace("_", " ").capitalize())
+            if row.get("aggregation") == "median" and "p95" not in label:
+                label += " · median"
+            display = {"target": target.get("target"), "check": check, "metric": metric,
+                         "scope": " · ".join(str(value) for value in
+                             (target.get("target"), CHECK_NAMES.get(check, check), scope) if value),
+                         "label": label, "baseline": _summary_measurement(row, row.get("baseline")),
+                         "current": _summary_measurement(row, row.get("current")),
+                         "change": _summary_change(row), "status": row_status,
+                         "verdict": {"Observed result": "Observed result", "Worse": "Regression detected",
+                             "Interpretation limited": "Interpretation limited", "Better": "No material regression",
+                             "No material change": "No material regression"}.get(_baseline_verdict(row)[0], "Inconclusive"),
+                         "reason": row_reason, "samples": " · ".join(
+                             (f"{side.capitalize()} {row[side + '_samples']} dispatched" if row.get("sample_basis") == "dispatched"
+                              else f"{side.capitalize()} n={row[side + '_samples']}") if row.get(side + "_samples") is not None
+                             else f"{side.capitalize()} samples not recorded" for side in ("baseline", "current")),
+                         "evidence_section": section,
+                         "evidence_id": row["_evidence_id"]}
+            changed = row.get("baseline") is not None and row.get("current") is not None and row["baseline"] != row["current"]
+            severity = 1 if display["verdict"] == "Interpretation limited" else {"fail": 0, "inconclusive": 1, "pass": 2}.get(row_status, 1)
+            priority = (display["verdict"] == "Observed result", severity, not changed,
+                        core_metrics.index(metric) if metric in core_metrics else len(core_metrics))
+            rows.append((priority, display))
+    groups: dict[tuple, list[dict[str, Any]]] = {}
+    for priority, row in sorted(rows, key=lambda entry: entry[0]):
+        groups.setdefault(priority[:2], []).append(row)
+    selected = []
+    for candidates in groups.values():
+        representatives = {}
+        for row in candidates:
+            representatives.setdefault(row["evidence_section"], row)
+        ordered = [*representatives.values(), *(row for row in candidates
+                   if row is not representatives[row["evidence_section"]])]
+        selected.extend(ordered[:3 - len(selected)])
+        if len(selected) == 3:
+            break
+    result.update(rows=selected, total_rows=len(rows), omitted_rows=max(0, len(rows) - 3))
+    return result
+
+
+def _baseline_summary_html(report: RunReport) -> str:
+    summary = comparison_summary(report)
+    labels = {"pass": "No material regression", "fail": "Regression detected",
+              "inconclusive": "Inconclusive", "absent": "No baseline selected"}
+    parts = ['<section class="comparison-summary" aria-label="Run comparison summary">',
+             f'<p><strong>Current acceptance:</strong> {_badge(summary["current_acceptance"])}</p>',
+             f'<p><strong>Baseline comparison:</strong> {_e(labels.get(summary["comparison_status"], "Inconclusive"))}</p>',
+             f'<p>{_e(summary["reason"])}</p>']
+    reference = summary["reference"]
+    if reference:
+        parts.append(f'<p>Reference: <strong>{_e(reference["name"])}</strong> · '
+                     f'Run {_e(reference["run_id"] or "not recorded")} · '
+                     f'{_e(reference["started_at"] or reference["finished_at"] or "Date not recorded")}<br>'
+                     f'Reference acceptance: {_e(reference["acceptance"] or "Not recorded separately")}. '
+                     'Saving a reference does not approve its acceptance result.</p>')
+    for row in summary["rows"]:
+        parts.append(f'<article class="comparison-summary-row"><h3>{_e(row["label"])}</h3>'
+                     f'<p>{_e(row["scope"])}</p><dl>'
+                     f'<div><dt>Baseline</dt><dd>{_e(row["baseline"])}</dd></div>'
+                     f'<div><dt>Current</dt><dd>{_e(row["current"])}</dd></div>'
+                     f'<div><dt>Observed change</dt><dd>{_e(row["change"])}</dd></div>'
+                     f'<div><dt>Verdict</dt><dd>{_e(row["verdict"])}</dd></div></dl>'
+                     f'<p>{_e(row["samples"])}</p><p>{_e(row["reason"])}</p>'
+                     f'<a href="#{_e(row["evidence_id"] or "baseline-heading")}">'
+                     f'{"Open metric evidence" if row["evidence_id"] else "Open full comparison"}</a></article>')
+    if reference:
+        parts.append(f'<p><a href="#baseline-heading">Open full comparison ({summary["total_rows"]} recorded rows)</a></p>')
+    parts.append('</section>')
+    return "".join(parts)
+
+
+_COMPARISON_SUMMARY_STYLE = """
+.comparison-summary{margin:24px 0;padding:16px 0;border-block:1px solid var(--line);min-width:0;overflow-wrap:anywhere}
+.comparison-summary p{max-width:75ch}.comparison-summary-row{padding:12px 0;border-top:1px solid var(--line)}
+.comparison-summary-row h3{margin:0}.comparison-summary-row dl{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}
+.comparison-summary-row dl>div{min-width:0}.comparison-summary-row dt{color:var(--text-2);font-size:12px}
+.comparison-summary-row dd{margin:4px 0;font-weight:600}.baseline-table tr:target{outline:2px solid var(--accent);outline-offset:-2px}
+@media(max-width:600px){.comparison-summary-row dl{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:360px){.comparison-summary-row dl{grid-template-columns:1fr}}
+"""
 
 
 def _deployment_change_html(diff: dict[str, Any]) -> str:
@@ -3944,12 +4115,12 @@ def _baseline_table_html(baseline: dict[str, Any], report: RunReport | None = No
     conditions: dict[tuple, list[dict[str, Any]]] = defaultdict(list)
     notes = []
     seen = defaultdict(set)
-    for target in baseline.get("targets", []):
+    for target_index, target in enumerate(baseline.get("targets", [])):
         deployment = _deployment_change_html(target.get("configuration_diff") or {})
         if deployment:
             notes.append(f'<div><h3>{_e(target.get("target", "Target"))} · Deployment</h3>'
                          f'{deployment}</div>')
-        rows = _baseline_display_rows(target)
+        rows = _baseline_display_rows(target, target_index=target_index)
         for row in rows:
             key = (target.get("target"), row.get("check"), _comparison_cohort(row))
             fingerprint = json.dumps([row.get(name) for name in ("metric", "baseline", "current", "status", "reason")], sort_keys=True)
@@ -4016,7 +4187,8 @@ def _baseline_table_html(baseline: dict[str, Any], report: RunReport | None = No
                 return f'<td>{value(qualification)}{details}</td>'
 
             verdict, tone = _baseline_verdict(row)
-            parts.append(f'<tr><th scope="row">{_e(label)}</th>'
+            anchor = f' id="{_e(row["_evidence_id"])}" tabindex="-1"' if row["_evidence_id"] else ""
+            parts.append(f'<tr{anchor}><th scope="row">{_e(label)}</th>'
                          f'{cell("baseline", before)}{cell("current", after)}'
                          f'<td class="{tone}">{_e(change)}</td>'
                          f'<td><strong class="{tone}">{verdict}</strong></td>')
@@ -4238,7 +4410,7 @@ def _render(report: RunReport) -> str:
                "partial": "Partial results"}.get(_acceptance_status(report), _acceptance_status(report).capitalize())
     parts = ["<!doctype html><html lang=\"en\"><meta charset=\"utf-8\">",
              '<meta name="viewport" content="width=device-width, initial-scale=1">',
-             f"<title>Giraffe — {_e(report.run_id)}</title>", '<style>' + STYLE + '.load-acceptance-export{max-width:100%;overflow-x:auto}.load-acceptance-export table{min-width:760px}.load-acceptance-export th:nth-child(2),.load-acceptance-export th:nth-child(3),.load-acceptance-export td:nth-child(2),.load-acceptance-export td:nth-child(3){white-space:nowrap;min-width:140px}.load-acceptance-export small{display:block;white-space:normal}' + '</style><main>',  f"<h1>{_e(verdict)}</h1>",
+             f"<title>Giraffe — {_e(report.run_id)}</title>", '<style>' + STYLE + _COMPARISON_SUMMARY_STYLE + '.load-acceptance-export{max-width:100%;overflow-x:auto}.load-acceptance-export table{min-width:760px}.load-acceptance-export th:nth-child(2),.load-acceptance-export th:nth-child(3),.load-acceptance-export td:nth-child(2),.load-acceptance-export td:nth-child(3){white-space:nowrap;min-width:140px}.load-acceptance-export small{display:block;white-space:normal}' + '</style><main>',  f"<h1>{_e(verdict)}</h1>",
              f'<p class="muted">Run {_e(report.run_id)} · suite {_e(report.suite_version)}<br>'
              f'{_e(report.started_at)} → {_e(report.finished_at)}</p>']
     for summary in disconnected.values():
@@ -4253,8 +4425,7 @@ def _render(report: RunReport) -> str:
                  '<a href="#baseline">Baseline comparison</a> · <a href="#html-performance">Performance</a> · '
                  '<a href="#requests">Request evidence</a> · <a href="#reproduction">Reproduce</a></nav>')
     parts.append(_json_export_html(report))
-    if report.baseline:
-        parts.append(_baseline_summary_html(report.baseline))
+    parts.append(_baseline_summary_html(report))
     parts.append('<div id="html-results" aria-label="Results"><section id="findings"><h2>Findings</h2>')
     findings = [check for check in report.checks if check.status in {"fail", "inconclusive", "blocked"}]
     for check in findings:

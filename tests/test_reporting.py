@@ -35,6 +35,228 @@ def baseline_check(report: RunReport) -> CheckResult:
     return next(check for check in report.checks if check.id == "baseline")
 
 
+@pytest.mark.parametrize("comparison_status", ["pass", "fail", "inconclusive"])
+def test_comparison_summary_keeps_absolute_failure_separate_from_recorded_verdict(comparison_status):
+    from giraffe.reporting import _render, comparison_summary
+    from giraffe.web import _api_report
+
+    report = make_report()
+    report.checks[0].status = "fail"
+    report.overall = "fail"
+    report.baseline = {
+        "run_id": "reference-run", "status": comparison_status,
+        "source_started_at": "2026-10-24T12:00:00Z", "source_outcome": "pass",
+        "acceptance": {"baseline": "fail", "current": "fail"},
+        "targets": [{"target": "local", "comparisons": [{
+            "check": "correctness", "scenario": "warm", "metric": "latency_ms",
+            "aggregation": "median", "baseline": 222.6, "current": 288.4,
+            "observed_delta": 65.8, "observed_change": 29.5597, "change_unit": "percent",
+            "baseline_samples": 6, "current_samples": 6, "status": comparison_status,
+            "reason": "Sample variation crosses the configured regression threshold.",
+        }]}],
+    }
+    before = report.model_dump(mode="json")
+    summary = comparison_summary(report)
+    assert summary["current_acceptance"] == "fail"
+    assert summary["comparison_status"] == comparison_status
+    assert summary["reference"] == {
+        "name": "reference-run", "run_id": "reference-run",
+        "started_at": "2026-10-24T12:00:00Z", "finished_at": None, "acceptance": "fail",
+    }
+    row = summary["rows"][0]
+    assert row["baseline"] == "222.6 ms" and row["current"] == "288.4 ms"
+    assert row["change"] == "+29.6%"
+    assert row["samples"] == "Baseline n=6 · Current n=6"
+    assert row["scope"] == "local · Answer correctness · Warm-up"
+    assert row["status"] == comparison_status
+    assert row["evidence_section"] == "timing"
+    assert "Sample variation" in row["reason"]
+    assert _api_report(report)["comparison_summary"] == summary
+    assert report.model_dump(mode="json") == before
+    html = _render(report)
+    top = html[html.index('class="comparison-summary"'):html.index('<div id="html-results"')]
+    assert "Current acceptance:" in top and "Baseline comparison:" in top
+    assert "222.6 ms" in top and "288.4 ms" in top and "+29.6%" in top
+    assert "2026-10-24T12:00:00Z" in top and "Reference acceptance: fail" in top
+    assert "Saving a reference does not approve its acceptance result." in top
+
+
+def test_comparison_summary_absent_incompatible_and_legacy_evidence_remain_explicit():
+    from giraffe.reporting import _render, comparison_summary
+
+    report = make_report()
+    assert comparison_summary(report) == {
+        "current_acceptance": "pass", "comparison_status": "absent", "reference": None,
+        "reason": "No baseline selected.", "rows": [], "total_rows": 0, "omitted_rows": 0,
+    }
+    assert "No baseline selected." in _render(report)
+    report.baseline = {"run_id": "old", "status": "inconclusive", "source_outcome": "pass",
+                       "targets": [{"target": "local", "reasons": ["Workloads differ."],
+                                    "comparisons": []}]}
+    summary = comparison_summary(report)
+    assert summary["reference"]["acceptance"] is None
+    assert summary["reference"]["started_at"] is None
+    assert "cannot confirm or rule out a regression" in summary["reason"]
+    assert "Workloads differ." in summary["rows"][0]["reason"]
+    assert summary["rows"][0]["baseline"] == "Not recorded"
+    assert summary["rows"][0]["change"] == "Not recorded"
+    assert summary["rows"][0]["samples"] == "Baseline samples not recorded · Current samples not recorded"
+    report.baseline["targets"][0]["comparisons"] = [{
+        "metric": "latency_ms", "status": "inconclusive", "baseline": 0, "current": 10,
+        "baseline_samples": 0, "reason": "Needs more samples.",
+    }]
+    row = comparison_summary(report)["rows"][0]
+    assert row["baseline"] == "0.0 ms" and row["current"] == "10.0 ms"
+    assert row["change"] == "Not recorded"
+    assert row["samples"] == "Baseline n=0 · Current samples not recorded"
+
+
+def test_comparison_summary_prioritizes_recorded_failures_and_bounds_the_headline():
+    from giraffe.reporting import comparison_summary
+
+    report = make_report()
+    report.baseline = {"run_id": "old", "status": "fail", "targets": [{
+        "target": "local", "comparisons": [
+            {"metric": f"pass-{index}", "status": "pass"} for index in range(8)
+        ] + [{"metric": "latency_ms", "status": "fail", "reason": "Slower."},
+             {"metric": "correctness_rate", "status": "inconclusive", "reason": "Uncertain."}],
+    }]}
+    summary = comparison_summary(report)
+    assert summary["total_rows"] == 10 and summary["omitted_rows"] == 7
+    assert [row["status"] for row in summary["rows"]] == ["fail", "inconclusive", "pass"]
+
+
+def test_comparison_summary_uses_load_dispatch_counts_and_keeps_unique_evidence_targets():
+    from giraffe.reporting import _render, comparison_summary
+
+    report = make_report()
+    metric = {"metric": "latency_ms", "check": "correctness", "scenario": "warm",
+              "status": "pass", "warnings": [{"message": "Interpretation needs qualification."}]}
+    point = {"type": "combinations", "shape": "short_short", "pattern": "concurrent",
+             "source": "primary", "level": 2, "rate": None, "bursts": False,
+             "status": "pass", "dispatched": 8}
+    report.baseline = {"run_id": "old", "status": "fail", "targets": [{
+        "target": "local", "comparisons": [metric, metric], "load_test": {
+            "status": "fail", "points": [{"baseline": point, "current": {**point, "status": "fail", "dispatched": 6},
+                                           "status": "fail", "acceptance_change": "lost", "reason": "Load lost."}],
+        },
+    }]}
+    summary = comparison_summary(report)
+    assert summary["total_rows"] == 2
+    load, qualified = summary["rows"]
+    assert load["samples"] == "Baseline 8 dispatched · Current 6 dispatched"
+    assert load["evidence_section"] == "load-acceptance"
+    assert load["evidence_id"] == "comparison-load-0-0"
+    assert qualified["status"] == "pass" and qualified["verdict"] == "Interpretation limited"
+    assert qualified["evidence_id"] == "comparison-metric-0-0"
+    html = _render(report)
+    assert 'href="#comparison-metric-0-0"' in html
+    assert html.count('id="comparison-metric-0-0"') == 1
+    assert 'href="#comparison-load-0-0"' in html
+    assert html.count('id="comparison-load-0-0"') == 1
+
+
+def test_comparison_summary_surfaces_changed_latency_and_correctness_among_uncertain_metrics():
+    from giraffe.reporting import _render, comparison_summary
+
+    current = make_report(latency=288.4, count=4)
+    reference = make_report("reference", latency=222.6, count=4)
+    for report in (current, reference):
+        report.checks[0].status = "fail"
+        report.checks[0].summary = "Answer correctness below the configured requirement."
+        report.overall = "fail"
+        report.requests[0].score = False
+    compared = compare_baseline(current, reference)
+    summary = comparison_summary(compared)
+    assert summary["current_acceptance"] == "fail"
+    assert summary["comparison_status"] == "inconclusive"
+    rows = {row["metric"]: row for row in summary["rows"]}
+    assert {"latency_ms", "correctness_rate"} <= rows.keys()
+    assert rows["latency_ms"]["baseline"] == "222.6 ms"
+    assert rows["latency_ms"]["current"] == "288.4 ms"
+    assert rows["latency_ms"]["change"] == "+29.6%"
+    assert rows["latency_ms"]["status"] == "inconclusive"
+    assert rows["correctness_rate"]["baseline"] == rows["correctness_rate"]["current"] == "75.0%"
+    assert len(summary["rows"]) == 3
+    html = _render(compared)
+    top = html.split('class="comparison-summary"', 1)[1].split('<div id="html-results"', 1)[0]
+    assert "222.6 ms" in top and "288.4 ms" in top and "75.0%" in top
+
+
+@pytest.mark.parametrize("include_samples", [True, False])
+def test_comparison_api_accepts_legacy_token_only_output_work_without_fabricating_missing_fields(include_samples):
+    from giraffe.reporting import _render, comparison_summary
+    from giraffe.web import _api_report
+
+    report = make_report()
+    work = {"baseline": {"reported_output_tokens_p50": 10},
+            "current": {"reported_output_tokens_p50": 12}}
+    if include_samples:
+        work["baseline"]["reported_token_samples"] = 6
+        work["current"]["reported_token_samples"] = 8
+    report.baseline = {"run_id": "old", "status": "inconclusive", "targets": [{
+        "target": "local", "comparisons": [{"metric": "latency_ms", "check": "load",
+            "scenario": "warm", "status": "inconclusive", "output_work": work}],
+    }]}
+    before = report.model_dump(mode="json")
+    api = _api_report(report)
+    assert api["comparison_summary"] == comparison_summary(report)
+    rows = {row["metric"]: row for row in api["comparison_summary"]["rows"]}
+    assert rows["output_tokens"]["baseline"] == "10.0 tokens"
+    assert rows["output_tokens"]["current"] == "12.0 tokens"
+    assert rows["output_tokens"]["samples"] == ("Baseline n=6 · Current n=8" if include_samples
+        else "Baseline samples not recorded · Current samples not recorded")
+    assert rows["output_tokens"]["evidence_id"] == "comparison-output-0-0"
+    assert rows["output_chars"]["baseline"] == rows["output_chars"]["current"] == "Not recorded"
+    assert rows["output_chars"]["evidence_id"] == "comparison-output-0-1"
+    html = _render(report)
+    assert "10.0 tokens" in html
+    assert html.count('id="comparison-output-0-0"') == 1
+    assert 'href="#comparison-output-0-0"' in html
+    assert report.model_dump(mode="json") == before
+
+
+@pytest.mark.parametrize("empty_traffic", [False, True])
+@pytest.mark.parametrize("empty_output_side", ["baseline", "current"])
+def test_comparison_evidence_ids_follow_sources_despite_empty_optional_evidence(empty_traffic, empty_output_side):
+    from giraffe.reporting import _render
+    from giraffe.web import _api_report
+
+    report = make_report()
+    point = {"type": "combinations", "shape": "short_short", "pattern": "concurrent",
+             "source": "primary", "level": 2, "rate": None, "bursts": False, "status": "pass"}
+    work = {"baseline": {"reported_output_tokens_p50": 10},
+            "current": {"reported_output_tokens_p50": 12}}
+    work[empty_output_side] = {}
+    report.baseline = {"run_id": "old", "status": "fail", "targets": [
+        {"target": "other", "comparisons": []},
+        {"target": "local", "comparisons": [{"metric": "latency_ms", "check": "load",
+            "scenario": "warm", "status": "pass", "output_work": work}],
+         "traffic_capacity": {} if empty_traffic else {
+             "status": "fail", "baseline_highest_acceptable_rate_rps": 4,
+             "current_highest_acceptable_rate_rps": 2, "delta_rps": -2, "reason": "Accepted rate fell.",
+         },
+         "load_test": {"status": "fail", "points": [
+             {"baseline": point, "current": point, "status": "pass", "reason": "Still accepted."},
+             {"baseline": {**point, "level": 4}, "current": {**point, "level": 4, "status": "fail"},
+              "status": "fail", "reason": "Lost accepted load.", "acceptance_change": "lost"},
+         ]}},
+    ]}
+    before = report.model_dump(mode="json")
+    summary = _api_report(report)["comparison_summary"]
+    load = next(row for row in summary["rows"] if row["reason"] == "Lost accepted load.")
+    assert load["evidence_id"] == "comparison-load-1-1"
+    html = _render(report)
+    assert 'href="#comparison-load-1-1"' in html and html.count('id="comparison-load-1-1"') == 1
+    if not empty_traffic:
+        traffic = next(row for row in summary["rows"] if row["reason"] == "Accepted rate fell.")
+        assert traffic["evidence_id"] == "comparison-traffic-1"
+        assert html.count('id="comparison-traffic-1"') == 1
+    else:
+        assert all(not row["metric"].endswith("(requests/s)") for row in summary["rows"])
+    assert report.model_dump(mode="json") == before
+
+
 def test_rate_baseline_uses_percentage_point_threshold():
     error = _compare_metric("error_rate", [0.1125] * 200, [0.0] * 200, 2, 20,
                             rate_threshold=5)
@@ -1095,7 +1317,8 @@ def test_html_baseline_table_uses_actual_comparison_contract():
     assert 'Material worsening exceeds observed sample uncertainty.' in html
     assert html.count('>Baseline comparison</h2>') == 1
     assert 'Entry 1' not in html
-    assert 'vs baseline baseline:' in html
+    assert 'Reference: <strong>baseline</strong>' in html
+    assert 'Baseline comparison:</strong> Regression detected' in html
 
 
 def test_html_json_export_is_relative_with_filename_note_and_no_embedded_json():
@@ -1154,13 +1377,20 @@ def test_html_findings_include_three_bounded_expected_received_rows():
 
 
 def test_html_traffic_only_baseline_includes_capacity_delta_and_summary():
-    from giraffe.reporting import _render
+    from giraffe.reporting import _render, comparison_summary
     from tests.test_traffic_reporting import traffic_report
 
     report = compare_baseline(traffic_report(high_failure="latency"), traffic_report("baseline"))
     assert report.baseline["targets"][0]["comparisons"] == []
     html = _render(report)
-    assert 'vs baseline baseline: 0 measurements · 0 with warnings' in html
+    summary = html.split('class="comparison-summary"', 1)[1].split('<div id="html-results"', 1)[0]
+    assert 'Regression detected' in summary
+    assert 'Highest acceptable tested arrival rate (requests/s)' in summary
+    assert 'req/s' in summary and '-75.0%' not in summary  # Only recorded absolute capacity change is summarized.
+    assert '0 measurements' not in summary
+    assert comparison_summary(report)["rows"][0]["evidence_id"] == "comparison-traffic-0"
+    assert 'href="#comparison-traffic-0"' in summary
+    assert html.count('id="comparison-traffic-0"') == 1
     table = html[html.index('<table class="baseline-table">'):]
     assert 'Highest acceptable tested arrival rate (requests/s)' in table
     assert '-75.0%' in table
@@ -1169,7 +1399,7 @@ def test_html_traffic_only_baseline_includes_capacity_delta_and_summary():
 
 @pytest.mark.parametrize('has_points', [True, False])
 def test_html_load_baseline_table_names_qualification_and_missing_comparisons(has_points):
-    from giraffe.reporting import _render
+    from giraffe.reporting import _render, comparison_summary
 
     report = make_report()
     point = dict(type='combinations', shape='short_short', pattern='concurrent',
@@ -1181,6 +1411,10 @@ def test_html_load_baseline_table_names_qualification_and_missing_comparisons(ha
     report.baseline = dict(run_id='before', status=comparison['status'],
                            targets=[dict(target='local', load_test=comparison)])
     html = _render(report)
+    evidence_id = "comparison-load-0-0" if has_points else "comparison-load-0"
+    assert comparison_summary(report)["rows"][0]["evidence_id"] == evidence_id
+    assert f'href="#{evidence_id}"' in html
+    assert html.count(f'id="{evidence_id}"') == 1
     table = re.search(r'<table class="baseline-table">(.*?)</table>', html, re.S).group(1)
     assert html.count('<section id="baseline">') == 1
     if has_points:
@@ -1224,8 +1458,9 @@ def test_html_baseline_no_regression_summary_includes_uncompared_count_and_focus
     ] + [dict(status="inconclusive", metric=f"uncompared-{index}", reason="No samples.")
          for index in range(30)])])
     html = _render(report)
-    assert 'vs baseline before-upgrade: 94 measurements · 30 with warnings' in html
-    assert '<a href="#baseline-heading">vs baseline' in html
+    assert 'Reference: <strong>before-upgrade</strong>' in html
+    assert '<a href="#baseline-heading">Open full comparison (94 recorded rows)</a>' in html
+    assert html.count('class="comparison-summary-row"') == 3
     assert '<h2 tabindex="-1" id="baseline-heading">Baseline comparison</h2>' in html
     assert '<summary>Unchanged (64)</summary>' in html
     assert '<summary>Not comparable (30)</summary>' in html
@@ -1245,8 +1480,13 @@ def test_html_load_improvement_requires_comparable_evidence(status, verdict):
     assert f'>{verdict}</strong>' in html
     assert ('Complete matched load evidence.' if status == 'pass' else 'Client-limited evidence.') in html
     assert '<td>Fail</td>' in html and '<td>Pass</td>' in html
-    assert '0 measurements · 0 with warnings' in _baseline_summary_html(baseline)
-    assert 'better' not in _baseline_summary_html(baseline)
+    report = make_report()
+    report.baseline = baseline
+    summary = _baseline_summary_html(report)
+    assert 'Open full comparison (1 recorded rows)' in summary
+    assert '0 measurements' not in summary
+    assert ('No material regression' if status == 'pass' else 'Inconclusive') in summary
+    assert 'Baseline</dt><dd>Fail</dd>' in summary and 'Current</dt><dd>Pass</dd>' in summary
 
 
 @pytest.mark.parametrize('scorer, criterion, options', [
@@ -1356,7 +1596,8 @@ def test_html_integrates_findings_acceptance_warnings_and_observed_outputs():
     assert '<h1>Passed</h1>' in html
     assert html.index('<section id="findings">') < html.index('<section id="baseline">')
     assert html.count('>Baseline comparison</h2>') == 1
-    assert 'vs baseline Before &lt;upgrade&gt;: 2 measurements · 1 with warnings' in html
+    assert 'Reference: <strong>Before &lt;upgrade&gt;</strong>' in html
+    assert 'Interpretation limited' in html and 'Longer &lt;answers&gt;' in html
     assert 'Baseline: pass · Current: pass' in baseline
     assert 'Interpretation limited' in baseline and 'Observed result' in baseline
     assert 'Longer &lt;answers&gt; Client delay' in baseline

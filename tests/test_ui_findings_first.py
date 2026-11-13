@@ -1,4 +1,8 @@
 """Findings-first results, navigation and safe actions in the real UI renderer."""
+import json
+
+import pytest
+
 from tests.test_ux_results import run_render_checks
 
 
@@ -73,6 +77,173 @@ assert.match(html,/vs baseline Before deploy: 4 measurements · 1 with warnings/
 html=renderComparison(state.detail.report);assert.equal((html.match(/data-metric=/g)||[]).length,4);for(const heading of ['Baseline','Current','Change'])assert(html.includes('<dt>'+heading+'</dt>'));
 assert.match(html,/\+30%/);assert.match(html,/-30%/);assert.match(html,/Regression detected/);assert.match(html,/No material regression/);assert.match(html,/Too few samples/);assert.match(html,/Why this warning/);assert.doesNotMatch(html,/Entry \d/);
 """)
+
+
+@pytest.mark.parametrize("comparison_status", ["pass", "fail", "inconclusive"])
+def test_headline_comparison_summary_keeps_current_failure_and_recorded_verdict(comparison_status):
+    from giraffe.web import _api_report
+    from tests.test_reporting import make_report
+
+    value = make_report(count=6)
+    value.checks[0].status = "fail"
+    value.checks[0].metrics = {"correct": 4, "scored": 6}
+    value.overall = "fail"
+    value.baseline = {
+        "run_id": "before-upgrade", "saved_baseline_name": "Reference <upgrade>",
+        "source_started_at": "2026-10-24T10:00:00Z", "status": comparison_status,
+        "acceptance": {"baseline": "fail", "current": "fail"},
+        "targets": [{"target": "local", "comparisons": [{
+            "check": "correctness", "scenario": "warm", "metric": "latency_ms",
+            "baseline": 222.6, "current": 288.4, "baseline_samples": 6, "current_samples": 6,
+            "observed_delta": 65.8, "observed_change": 29.5, "change_unit": "percent",
+            "status": comparison_status, "reason": "Sample variation crosses the threshold.",
+        }]}],
+    }
+    run_render_checks("const value=" + json.dumps(_api_report(value)) + ";" + r"""
+detail(value);
+const summary=$('.comparison-summary');assert(summary,'comparison summary must be visible near the headline');
+assert.match(summary.textContent,/Current acceptance:.*Failed/);
+assert.match(summary.textContent,/Baseline comparison:/);
+assert.match(summary.textContent,new RegExp({pass:'No material regression',fail:'Regression detected',inconclusive:'Inconclusive'}[value.baseline.status]));
+assert.match(summary.textContent,/Reference <upgrade>/);assert.equal(summary.querySelector('upgrade'),null);
+assert.match(summary.textContent,/before-upgrade/);assert.match(summary.textContent,/2026/);
+assert.match(summary.textContent,/Reference acceptance:.*Failed/);
+assert.match(summary.textContent,/Saving.*does not approve/i);
+assert.match(summary.textContent,/222\.6 ms/);assert.match(summary.textContent,/288\.4 ms/);assert.match(summary.textContent,/\+29\.5%/);
+assert.match(summary.textContent,/Baseline n=6.*Current n=6/);
+assert.match(summary.textContent,/Sample variation crosses the threshold/);
+assert(!summary.closest('[role="tabpanel"]'),'summary must be shared by both tabs');
+chooseReportTab('performance');assert.equal($('.comparison-summary').textContent,summary.textContent);
+assert.equal($('#report-performance').hidden,false);
+""", dom=True)
+
+
+def test_comparison_summary_evidence_links_clear_filters_and_reveal_the_metric_section():
+    from giraffe.web import _api_report
+    from tests.test_reporting import make_report
+
+    value = make_report()
+    value.baseline = {"run_id": "reference", "status": "inconclusive", "targets": [{
+        "target": "local", "comparisons": [
+            {"check": "correctness", "scenario": "short", "metric": "latency_ms",
+             "baseline": 10, "current": 10, "status": "pass", "reason": "Stable response time."},
+            {"check": "correctness", "scenario": "warm", "metric": "latency_ms",
+             "baseline": 222.6, "current": 288.4, "status": "inconclusive",
+             "reason": "Too few samples."},
+        ]}]}
+    run_render_checks("const value=" + json.dumps(_api_report(value)) + ";" + r"""
+(async()=>{
+detail(value);chooseReportTab('performance');state.comparisonFilter='without_warnings';state.comparisonCheck='other';renderDetail();
+const evidence=$('.comparison-summary [data-comparison-summary-section="timing"]');assert(evidence);
+assert.equal(evidence.getAttribute('href'),'#runs/saved-run/results/timing');
+await listeners.click({target:evidence,preventDefault(){}});
+await route();
+assert.equal(state.comparisonFilter,'all');assert.equal(state.comparisonCheck,'all');
+assert.equal(reportView.tab,'results');assert($('#report-baseline-reference').open);
+assert.match($('#results-timing').textContent,/Too few samples/);
+assert.equal(document.activeElement,$('#results-comparison-metric-0-1'));
+assert.equal(document.activeElement.getAttribute('data-metric'),'latency_ms');
+const full=$('.comparison-summary [data-comparison-summary-section="comparison"]');assert(full);
+await listeners.click({target:full,preventDefault(){}});
+await route();
+assert.equal(document.activeElement,$('#report-baseline-reference summary'));
+})()
+""", dom=True)
+
+
+@pytest.mark.parametrize("evidence", ["traffic", "load", "load_no_points"])
+def test_comparison_summary_opens_exact_target_for_traffic_and_load_evidence(evidence):
+    from giraffe.web import _api_report
+    from tests.test_reporting import make_report
+    from tests.test_ui_report_tabs import PERFORMANCE
+
+    value = make_report()
+    target = {"target": "loaded"}
+    if evidence == "traffic":
+        target["traffic_capacity"] = {
+            "status": "fail", "reason": "Loaded target lost accepted arrival rate.",
+            "baseline_highest_acceptable_rate_rps": 5, "current_highest_acceptable_rate_rps": 2,
+            "delta_rps": -3,
+        }
+        expected_id = "results-comparison-traffic-1"
+    else:
+        point = {"type": "combinations", "shape": "short_short", "pattern": "concurrent", "bursts": False}
+        target["traffic_capacity"] = {}
+        target["comparisons"] = [{"check": "correctness", "scenario": "warm", "metric": "latency_ms",
+            "baseline": 10, "current": 10, "status": "pass",
+            "output_work": {"current": {}, "baseline": {"valid_completions": 8}}}]
+        target["load_test"] = {"status": "fail", "points": [
+            {"status": "pass", "acceptance_change": "unchanged_accepted",
+             "baseline": {**point, "level": 1, "status": "pass"},
+             "current": {**point, "level": 1, "status": "pass"}},
+            {"status": "fail", "acceptance_change": "lost", "reason": "Loaded target lost concurrency 2.",
+             "baseline": {**point, "level": 2, "status": "pass"},
+             "current": {**point, "level": 2, "status": "fail"}},
+        ]}
+        expected_id = "results-comparison-load-1-1"
+        if evidence == "load_no_points":
+            target["load_test"] = {"status": "inconclusive", "reason": "Loaded target lost measurement coverage."}
+            expected_id = "results-comparison-load-1"
+    value.baseline = {"run_id": "reference", "status": "fail", "targets": [
+        {"target": "other", "comparisons": [{"check": "correctness", "metric": "correctness_rate",
+            "baseline": 1, "current": 1, "status": "pass"}]}, target,
+    ]}
+    run_render_checks(PERFORMANCE + "const value=" + json.dumps(_api_report(value)) + ";const expectedId=" +
+                      json.dumps(expected_id) + ";value.performance=performanceFixture();" + r"""
+(async()=>{
+detail(value);chooseReportTab('performance');
+const action=$('.comparison-summary [data-comparison-summary-evidence="'+expectedId.slice('results-'.length)+'"]');assert(action);
+await listeners.click({target:action,preventDefault(){}});await route();
+const destination=$('#'+expectedId);assert(destination);
+assert.equal(document.activeElement,destination);assert($('#report-baseline-reference').open);
+assert.match(destination.textContent,/Loaded target lost/);
+assert.equal(destination.closest('[hidden]'),null);
+const ids=$$('[id]').map(node=>node.id);assert.equal(new Set(ids).size,ids.length,'evidence IDs must be unique across report tabs');
+})()
+""", dom=True)
+
+
+@pytest.mark.parametrize("empty_side", ["baseline", "current"])
+def test_comparison_summary_output_evidence_skips_empty_work_before_a_valid_cohort(empty_side):
+    from giraffe.web import _api_report
+    from tests.test_reporting import make_report
+
+    value = make_report()
+    previous = {"reported_output_tokens_p50": 10, "reported_token_samples": 8,
+                "output_chars_p50": 15, "valid_completions": 8}
+    current = {**previous, "reported_output_tokens_p50": 20, "output_chars_p50": 30}
+    empty_work = {"baseline": previous, "current": current, empty_side: {}}
+    value.baseline = {"status": "pass", "run_id": "reference", "targets": [{"target": "local", "comparisons": [
+        {"check": "correctness", "scenario": "empty-work", "metric": "latency_ms", "status": "pass",
+         "baseline": 10, "current": 10, "output_work": empty_work},
+        {"check": "correctness", "scenario": "valid-work", "metric": "latency_ms", "status": "pass",
+         "baseline": 10, "current": 10, "output_work": {"baseline": previous, "current": current}},
+    ]}]}
+    run_render_checks("const value=" + json.dumps(_api_report(value)) + ";" + r"""
+(async()=>{
+detail(value);const action=$('[data-comparison-summary-evidence="comparison-output-0-0"]');assert(action);
+await listeners.click({target:action,preventDefault(){}});await route();
+const evidence=$('#results-comparison-output-0-0');assert.equal(document.activeElement,evidence);
+assert.match(evidence.textContent,/10 tokens/);assert.match(evidence.textContent,/20 tokens/);
+assert.match(evidence.closest('[data-comparison-group]').textContent,/Valid work/);
+assert.doesNotMatch(evidence.closest('[data-comparison-group]').textContent,/Empty work/);
+})()
+""", dom=True)
+
+
+@pytest.mark.parametrize("baseline", [None, {"run_id": "old", "status": "inconclusive", "targets": [{
+    "target": "local", "status": "inconclusive", "reasons": ["Requested workload differs."]}]}])
+def test_comparison_summary_does_not_invent_missing_measurements(baseline):
+    from giraffe.web import _api_report
+    from tests.test_reporting import make_report
+
+    value = make_report()
+    value.baseline = baseline
+    run_render_checks("const value=" + json.dumps(_api_report(value)) + ";" + r"""
+detail(value);const summary=$('.comparison-summary');assert(summary);
+assert.match(summary.textContent,value.baseline?/Requested workload differs/:/No baseline selected/);
+assert.doesNotMatch(summary.textContent,/0 ms|0%|n=0|No material regression/);
+""", dom=True)
 
 
 def test_live_plan_progress_collapsed_activity_and_one_completion_announcement():

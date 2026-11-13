@@ -343,7 +343,11 @@ def test_inspect_comparison_opens_preserved_disclosure_on_results_tab():
 (async()=>{
  const value=report([check('access','pass')],{overall:'fail',baseline:{status:'fail',rows:[]}});
  detail(value);const reference=$('#report-baseline-reference');assert(reference.open);reference.open=false;
- await listeners.click({target:$('[data-tab="baseline"]'),preventDefault(){}});
+ chooseReportTab('performance');
+ const action=$('.comparison-summary-actions [data-comparison-summary-section="comparison"]');
+ assert(action);assert.equal(action.textContent,'Open full comparison');
+ await listeners.click({target:action,preventDefault(){}});await route();
+ assert.equal($('#report-baseline-reference'),reference);
  assert.equal(reportView.tab,'results');assert.equal(reference.open,true);
  assert.equal(document.activeElement,$('summary',reference));
 })()
