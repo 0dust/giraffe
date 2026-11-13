@@ -17,6 +17,8 @@ import time
 import uuid
 from time import monotonic
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+import math
 from typing import Any, AsyncIterator, Callable, Literal
 
 import httpx
@@ -29,6 +31,22 @@ from giraffe.logprobs import LogprobBudget, LogprobCollector
 from giraffe.transport import HTTPClientPool, _finish_cleanup
 
 logger = logging.getLogger(__name__)
+
+
+def _retry_after(value: str | None) -> float | None:
+    if not value:
+        return None
+    try:
+        seconds = float(value)
+        return max(0.0, seconds) if math.isfinite(seconds) else None
+    except ValueError:
+        try:
+            date = parsedate_to_datetime(value)
+            if date.tzinfo is None:
+                return None
+            return max(0.0, (date - datetime.now(timezone.utc)).total_seconds())
+        except (TypeError, ValueError, OverflowError):
+            return None
 
 
 # A non-cooperative endpoint must not grow the test process's memory indefinitely.
@@ -552,18 +570,21 @@ class LLMClient:
 
     async def execute(
         self, spec: RequestSpec, *, first_output_event: asyncio.Event | None = None,
+        on_rate_limit: Callable[[float | None], None] | None = None,
         lifecycle_observer: Callable[[RequestLifecycleEvent], None] | None = None,
         _before_send: Callable[[], None] | None = None,
     ) -> RequestRecord:
         from .identities import identity_scope
         with identity_scope(spec.identity is not None):
             return await self._execute(spec, first_output_event=first_output_event,
+                                       on_rate_limit=on_rate_limit,
                                        lifecycle_observer=lifecycle_observer, _before_send=_before_send)
 
     async def _execute(
         self, spec: RequestSpec, *, first_output_event: asyncio.Event | None = None,
         _before_send: Callable[[], None] | None = None,
         lifecycle_observer: Callable[[RequestLifecycleEvent], None] | None = None,
+        on_rate_limit: Callable[[float | None], None] | None = None,
     ) -> RequestRecord:
         if self._client is None:
             raise RuntimeError("Use LLMClient as an async context manager")
@@ -1125,6 +1146,11 @@ class LLMClient:
                 events = None
                 try:
                     record.http_status = response.status_code
+                    if response.status_code == 429:
+                        record.rate_limited = True
+                        record.retry_after_seconds = _retry_after(response.headers.get("retry-after"))
+                        if on_rate_limit is not None:
+                            on_rate_limit(record.retry_after_seconds)
                     if access_probe:
                         record._gateway_access_routing_issue = routing_issue(response.headers, payload["model"])
                     if spec.identity is not None:
@@ -1194,6 +1220,10 @@ class LLMClient:
                                     "context size", "context window", "max_model_len",
                                     "inputs` tokens + `max_new_tokens`", "inputs` must have less than")):
                                 raise _ProtocolError(f"HTTP {response.status_code}: context length rejection")
+                        if response.status_code == 429:
+                            suffix = (f"; retry after {record.retry_after_seconds:g}s"
+                                      if record.retry_after_seconds is not None else "")
+                            raise _ProtocolError(f"rate limited (HTTP 429){suffix}")
                         raise _ProtocolError(f"HTTP {response.status_code}")
                     if stream:
                         if "application/json" in response.headers.get("content-type", ""):
