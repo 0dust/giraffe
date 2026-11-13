@@ -22,9 +22,22 @@ Add the line with `git commit -s`. It uses your configured `user.name` and
 Signed-off-by: Your Name <you@example.com>
 ```
 
-To sign off commits you have already made on a branch, run
-`git rebase --signoff main` and force-push the branch. If your employer may own
-your work, confirm that you are allowed to contribute it before signing off.
+To sign off commits you have already made, fetch and rebase onto the branch your
+pull request targets, then force-push. Use the actual target so the rebase does
+not bring unrelated commits into the pull request:
+
+```sh
+git fetch origin
+
+# Use one of these, matching the pull request's base branch:
+git rebase --signoff origin/main          # normal changes
+git rebase --signoff origin/release/0.1   # release backports
+
+git push --force-with-lease
+```
+
+If your employer may own your work, confirm that you are allowed to contribute
+it before signing off.
 
 The sign-off grants no rights beyond the Apache 2.0 license. The maintainers may
 also offer separate commercial products or services built on Giraffe.
