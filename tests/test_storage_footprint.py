@@ -38,22 +38,37 @@ def test_footprint_round_trip_preserves_models_api_and_failure_evidence(tmp_path
     legacy = tmp_path / "legacy"
     legacy.mkdir()
     (legacy / "report.json").write_bytes(legacy_json)
+    saved_bytes = (directory / "report.json").read_bytes()
+    expected_json = expected.model_dump_json()
     with TestClient(create_app(tmp_path), base_url="http://127.0.0.1:8787") as client:
         new = client.get("/api/runs/saved").json()["report"]
         old = client.get("/api/runs/legacy").json()["report"]
         assert new == old
         assert new["requests_compact"] and new["request_count"] == len(expected.requests)
-        assert {k: v for k, v in new.items() if k not in {"requests", "request_count", "requests_compact"}} == expected.model_dump(mode="json", exclude={"requests"})
+        assert new["comparison_summary"] == {
+            "current_acceptance": expected.overall, "comparison_status": "absent", "reference": None,
+            "reason": "No baseline selected.", "rows": [], "total_rows": 0, "omitted_rows": 0,
+        }
+        assert "comparison_summary" not in raw
+        assert "comparison_summary" not in expected.model_dump(mode="json")
+        assert {k: v for k, v in new.items()
+                if k not in {"requests", "request_count", "requests_compact", "comparison_summary"}} == expected.model_dump(mode="json", exclude={"requests"})
         for record in expected.requests:
             evidence = client.get(f"/api/runs/saved/requests/{record.id}")
             assert evidence.status_code == 200
             assert evidence.json() == record.model_dump(mode="json")
         # AM5 may append a hydrated raw series after stored metadata; JSON key
         # order differs from fully embedded legacy snapshots, values do not.
-        assert client.get("/api/runs/saved/report.json").json() == client.get("/api/runs/legacy/report.json").json()
+        exported = client.get("/api/runs/saved/report.json").json()
+        assert exported == client.get("/api/runs/legacy/report.json").json()
+        assert "comparison_summary" not in exported
         html = client.get("/api/runs/saved/report.html")
         assert html.status_code == 200 and "attachment" in html.headers["content-disposition"]
         assert html.content == client.get("/api/runs/legacy/report.html").content
+    assert (directory / "report.json").read_bytes() == saved_bytes
+    assert (legacy / "report.json").read_bytes() == legacy_json
+    assert report.model_dump_json() == original and expected.model_dump_json() == expected_json
+    assert load_report(directory) == _report(directory / "report.json") == expected
     assert not (directory / "report.html").exists()
 
 
