@@ -329,7 +329,7 @@ Exit codes:
                     if action in group._group_actions:
                         group._group_actions.remove(action)
                 advanced._group_actions.append(action)
-    report = commands.add_parser("report", help="Render a saved report without model requests")
+    report = commands.add_parser("report", help="Render a saved report or recover an interrupted run without model requests")
     report.add_argument("run_dir", type=Path, metavar="RUN_DIR")
     report.add_argument("--html", action="store_true", help="Write a standalone HTML report")
     report.add_argument("--junit", type=Path, metavar="PATH")
@@ -352,6 +352,35 @@ Exit codes:
 
 def load_report(path: Path) -> RunReport:
     return RunReport.model_validate_json((path / "report.json" if path.is_dir() else path).read_text())
+
+
+def _report_for_render(path: Path) -> RunReport:
+    try:
+        return load_report(path)
+    except FileNotFoundError:
+        if (not path.is_dir() or not (path / "evidence.jsonl").is_file()
+                or (path / "summary.json").exists()):
+            raise
+        from giraffe.evidence import recover_evidence
+        from giraffe.storage import _read, pid_alive, run_alive
+
+        meta = _read(path / ".web.json")
+        pid = meta.get("owner_pid")
+        if (meta.get("owner_host") == socket.gethostname()
+                and isinstance(pid, int) and not isinstance(pid, bool) and pid > 0):
+            # Stricter than run_alive: recovery reads a journal a live writer may
+            # still append to, so an indeterminate probe counts as alive here.
+            alive = pid_alive(pid, uncertain=True)
+        else:
+            alive = run_alive(path, meta)
+        if alive:
+            raise ValueError("Run may still be running; wait until its writer stops before recovering evidence") from None
+        recovered = recover_evidence(path, meta)
+        if recovered is None:
+            raise
+        print(f"Recovered {len(recovered.requests)} recorded requests from an interrupted run; "
+              "results are incomplete.", file=sys.stderr)
+        return recovered
 
 
 def load_configuration(path: Path) -> dict:
@@ -564,16 +593,17 @@ async def _run(config: RunConfig, *, json_progress: bool = False, verbose: bool 
 
     try:
         options = {}
-        if directory is not None and "scale_down" in config.checks:
+        if directory is not None:
             from giraffe.deployment import safe_config
             from giraffe.evidence import EvidenceWriter
             from giraffe.runner import record_sink
-            from giraffe.scale_down_control import ScaleDownFileControl
 
             writer = EvidenceWriter(directory, manifest={"config": safe_config(config.model_dump(mode="json"))})
             sink_token = record_sink.set(writer.record_finished)
-            adapter = ScaleDownFileControl(directory)
-            options["on_scale_down_control"] = adapter.bind
+            if "scale_down" in config.checks:
+                from giraffe.scale_down_control import ScaleDownFileControl
+                adapter = ScaleDownFileControl(directory)
+                options["on_scale_down_control"] = adapter.bind
         try:
             report = await run_suite(config, progress=progress, stop_event=stop, **options)
         except asyncio.CancelledError as error:
@@ -863,11 +893,11 @@ def _main(argv: list[str] | None = None) -> int:
                     print("\nGiraffe UI stopped.")
             return 0
         if args.command == "report":
-            report = load_report(args.run_dir)
             if not (args.html or args.junit or args.summary_md):
                 raise ValueError("Choose --html, --junit PATH or --summary-md PATH")
             if args.output and not args.html:
                 raise ValueError("--output requires --html")
+            report = _report_for_render(args.run_dir)
             if args.html:
                 from giraffe.reporting import _atomic_write, _render
                 output = args.output or (args.run_dir if args.run_dir.is_dir() else args.run_dir.parent) / "report.html"
@@ -1034,7 +1064,7 @@ def _main(argv: list[str] | None = None) -> int:
 
         async def run_with_partial_report():
             try:
-                control = {"directory": directory} if "scale_down" in config.checks else {}
+                control = {"directory": directory}
                 report = await (_run(config, quiet=True, **control) if getattr(args, "quiet", False) else
                                 _run(config, json_progress=True, **control) if json_output else
                                 _run(config, verbose=True, **control) if getattr(args, "verbose", False) else _run(config, **control))
