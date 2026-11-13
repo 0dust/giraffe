@@ -22,16 +22,13 @@ Add the line with `git commit -s`. It uses your configured `user.name` and
 Signed-off-by: Your Name <you@example.com>
 ```
 
-To sign off commits you have already made, fetch and rebase onto the branch your
-pull request targets, then force-push. Use the actual target so the rebase does
-not bring unrelated commits into the pull request:
+To sign off commits you have already made, rewrite them in place and force-push.
+These commands keep the branch on its current base, so they work the same for
+changes targeting `main` and for release backports:
 
 ```sh
-git fetch origin
-
-# Use one of these, matching the pull request's base branch:
-git rebase --signoff origin/main          # normal changes
-git rebase --signoff origin/release/0.1   # release backports
+git commit --amend --signoff    # the last commit only
+git rebase --signoff HEAD~3     # the last 3 commits; use your own count
 
 git push --force-with-lease
 ```
