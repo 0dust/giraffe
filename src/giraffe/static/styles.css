@@ -1712,14 +1712,18 @@ main > #report-results { padding-top:20px; }
 .run-diagnostics { margin-top:20px; }
 .baseline-delta { margin:8px 0; font-size:13px; }
 .baseline-delta a { color:var(--accent); text-decoration:underline; text-underline-offset:3px; }
-.comparison-summary { margin:16px 0 24px; padding:16px 20px; border:1px solid var(--line); border-radius:var(--r-lg); min-width:0; overflow-wrap:anywhere; }
-.comparison-summary-verdicts { display:flex; flex-wrap:wrap; align-items:baseline; gap:8px 28px; }
+.comparison-summary { margin:8px 0 12px; padding:8px 12px; border:1px solid var(--line); border-radius:var(--r-lg); min-width:0; overflow-wrap:anywhere; }
+.comparison-summary-verdicts { display:flex; flex-wrap:wrap; align-items:baseline; gap:4px 20px; }
 .comparison-summary-verdicts p, .comparison-summary-verdicts h2 { margin:0; font-size:14px; font-weight:400; }
+.comparison-summary .field-info { display:inline-grid; vertical-align:middle; }
+.comparison-summary.comparison-summary-absent { padding:4px 0; border:0; color:var(--text-2); }
+.comparison-summary-line { margin:0; font-size:12px; font-weight:400; }
 .comparison-summary .pass { color:var(--pass); }
 .comparison-summary .fail { color:var(--fail); }
 .comparison-summary .inconclusive { color:var(--unknown); }
-.comparison-summary-reference { margin:10px 0 4px; color:var(--text-2); font-size:12px; }
+.comparison-summary-reference { margin:4px 0; color:var(--text-2); font-size:12px; }
 .comparison-summary-reference code { font-size:inherit; }
+.comparison-summary .comparison-summary-details { padding:0; margin-top:4px; }
 .comparison-summary > .hint, .comparison-summary-reason { margin:6px 0; font-size:12px; }
 .comparison-summary-rows { list-style:none; margin:12px 0; padding:0; }
 .comparison-summary-rows > li { min-width:0; padding:12px 0; border-top:1px solid var(--line); font-size:12px; }
@@ -1733,8 +1737,8 @@ main > #report-results { padding-top:20px; }
 .comparison-summary a { color:var(--accent); text-decoration:underline; text-underline-offset:3px; }
 .comparison-summary-actions { margin-top:8px; font-size:12px; }
 @media(max-width:480px) {
-  .comparison-summary { padding:12px; }
-  .comparison-summary-verdicts { display:grid; gap:6px; }
+  .comparison-summary { padding:8px 12px; }
+  .comparison-summary-verdicts { display:grid; gap:4px; }
   .comparison-summary-values { grid-template-columns:minmax(0,1fr); gap:6px; }
   .comparison-summary-values > div { display:grid; grid-template-columns:62px minmax(0,1fr); align-items:baseline; gap:8px; }
   .comparison-summary-values dd { margin:0; }

@@ -108,7 +108,17 @@ assert.match(summary.textContent,new RegExp({pass:'No material regression',fail:
 assert.match(summary.textContent,/Reference <upgrade>/);assert.equal(summary.querySelector('upgrade'),null);
 assert.match(summary.textContent,/before-upgrade/);assert.match(summary.textContent,/2026/);
 assert.match(summary.textContent,/Reference acceptance:.*Failed/);
-assert.match(summary.textContent,/Saving.*does not approve/i);
+const details=summary.querySelector('details.comparison-summary-details');assert(details);assert(!details.hasAttribute('open'));
+assert(details.classList.contains('comparison-support'));
+assert.equal(details.querySelector('summary').textContent,'Key changes (1)');
+function visibleText(node){if(node.nodeType===3)return node.nodeValue;if(node.matches('details,.field-help'))return '';return node.childNodes.map(visibleText).join('');}
+const visible=visibleText(summary);
+assert.match(visible,/Current acceptance:.*Failed/);assert.match(visible,/Baseline comparison:/);
+assert.match(visible,/Reference <upgrade>/);assert.match(visible,/Reference acceptance:.*Failed/);
+assert.doesNotMatch(visible,/Saving a reference does not approve/);
+assert(!visible.includes(value.comparison_summary.reason));
+const help=Array.from(summary.querySelectorAll('.field-help')).map(node=>node.textContent).join(' ');
+assert(help.includes(value.comparison_summary.reason));assert.match(help,/Saving a reference does not approve/);
 assert.match(summary.textContent,/222\.6 ms/);assert.match(summary.textContent,/288\.4 ms/);assert.match(summary.textContent,/\+29\.5%/);
 assert.match(summary.textContent,/Baseline n=6.*Current n=6/);
 assert.match(summary.textContent,/Sample variation crosses the threshold/);
@@ -243,6 +253,30 @@ def test_comparison_summary_does_not_invent_missing_measurements(baseline):
 detail(value);const summary=$('.comparison-summary');assert(summary);
 assert.match(summary.textContent,value.baseline?/Requested workload differs/:/No baseline selected/);
 assert.doesNotMatch(summary.textContent,/0 ms|0%|n=0|No material regression/);
+if(!value.baseline){assert.equal((summary.textContent.match(/No baseline selected/g)||[]).length,1);assert.equal(summary.querySelector('button'),null);assert.equal(summary.querySelector('details'),null);}
+""", dom=True)
+
+
+def test_comparison_summary_reference_identity_and_legacy_disclosure():
+    run_render_checks(r"""
+state.detail={id:'saved-run'};
+for(const reference of [{run_id:'unique-reference-id'}, {name:'Named reference'}, {name:'Named reference',run_id:'other-run'}]){
+ const card=document.createElement('section');
+ card.innerHTML=renderBaselineSummary({baseline:{...reference,status:'pass',targets:[]}},'pass');
+ const line=card.querySelector('.comparison-summary-reference');
+ if(reference.run_id==='unique-reference-id'){assert.equal((line.textContent.match(/unique-reference-id/g)||[]).length,1);assert.equal(line.querySelector('code'),null);}
+ else if(!reference.run_id)assert.match(line.textContent,/Run not recorded/);
+ else assert.equal(line.querySelector('code').textContent,'other-run');
+ assert.equal(card.querySelector('.comparison-summary-details summary').textContent,'Full comparison');
+ assert.equal(card.querySelector('.comparison-summary-details').open,false);
+ assert.match(card.querySelector('#field-comparison-summary-reason-help').textContent,/Summary unavailable for this report/);
+ assert.equal(card.querySelector('.comparison-summary-reason'),null);
+ assert(card.querySelector('.comparison-summary-details .baseline-delta'));
+ assert(card.querySelector('.comparison-summary-actions [data-comparison-summary-section="comparison"]'));
+}
+const value=report([check('access','pass')],{baseline:{run_id:'reference',status:'pass'},comparison_summary:{comparison_status:'pass',reference:{name:'Reference',run_id:'reference'},rows:[{label:'Latency',scope:'Warm',baseline:'200 ms',current:'260 ms',change:'+30%',other_scopes:2}]}});
+detail(value);assert.match($('.comparison-summary-scope').textContent,/same result in 2 other scopes/);
+value.comparison_summary.rows[0].other_scopes=1;detail(value);assert.match($('.comparison-summary-scope').textContent,/same result in 1 other scope$/);
 """, dom=True)
 
 
