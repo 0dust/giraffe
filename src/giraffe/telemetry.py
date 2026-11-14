@@ -1,8 +1,9 @@
-"""Automatic bounded Prometheus scrapes; shared counters never imply causality."""
+"""Bounded runtime metrics scrapes; shared observations never imply causality."""
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 import re
@@ -98,6 +99,18 @@ TGI = {
     "tgi_request_inference_duration_bucket": ("server_inference_bucket", "counter", "requests"),
 }
 ENGINE_METRICS = {"llamacpp": LLAMACPP, "lmdeploy": LMDEPLOY, "tgi": TGI}
+# MTPLX v2.12.3 server/openai.py _metrics_envelope: completed-request values,
+# not cumulative counters, scheduler state, GPU memory or KV-cache occupancy.
+MTPLX = {
+    "ttft_s": ("mtplx_latest_ttft_seconds", "seconds", "TTFT"),
+    "request_elapsed_s": ("mtplx_latest_request_seconds", "seconds", "duration"),
+    "decode_tok_s": ("mtplx_latest_decode_tokens_per_second", "tokens/s", "decode rate"),
+    "prefill_tok_s": ("mtplx_latest_prefill_tokens_per_second", "tokens/s", "prefill rate"),
+    "prompt_tokens": ("mtplx_latest_prompt_tokens", "tokens", "prompt tokens"),
+    "completion_tokens": ("mtplx_latest_completion_tokens", "tokens", "completion tokens"),
+    "cached_tokens": ("mtplx_latest_cached_tokens", "tokens", "cached tokens"),
+}
+MTPLX_REFERENCE = "https://github.com/youssofal/MTPLX/blob/v2.12.3/mtplx/server/openai.py"
 ENGINE_METRIC_REFERENCES = {
     "llamacpp": "llama.cpp tools/server/README.md /metrics contract (b11696)",
     "lmdeploy": "LMDeploy lmdeploy/metrics/loggers.py; runtime/version qualification required",
@@ -126,7 +139,7 @@ SPEC_LABEL = re.compile(r'\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*"((?:\\[\\n"]|[^"\\]
 SERVING_FAMILIES = {"cache_occupancy", "running", "waiting", "preemptions"}
 GPU_FAMILIES = {entry[0] for entry in GPU.values()}
 METRIC_FAMILIES = {entry[0] for mapping in (V1, LEGACY, SGLANG, *ENGINE_METRICS.values(), GPU, HOST)
-                   for entry in mapping.values()}
+                   for entry in mapping.values()} | {entry[0] for entry in MTPLX.values()}
 # NVIDIA DCGM adverse bits: HW slowdown, SW/HW thermal, power brake.
 # Idle/application-clock/sync-boost/display-clock reasons alone are not failures.
 GPU_THROTTLE_REASONS = {8: "hardware slowdown",
@@ -332,7 +345,83 @@ def _spec_labels(raw_labels):
     return labels
 
 
+def _mtplx_number(value):
+    if type(value) not in (int, float):
+        return None
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
+    return number if math.isfinite(number) and number >= 0 else None
+
+
+def _mtplx_envelope(body):
+    if not body.lstrip().startswith("{"):
+        return None
+    try:
+        payload = json.loads(body)
+    except (ValueError, RecursionError):
+        return None
+    if (isinstance(payload, dict) and "latest" in payload
+            and (payload["latest"] is None or isinstance(payload["latest"], dict))
+            and isinstance(payload.get("recent"), list)
+            and isinstance(payload.get("tool_parse_counters"), dict)):
+        return payload
+    return None
+
+
+def _parse_mtplx(payload, target, config):
+    latest = (payload.get("latest") or {}) if payload is not None else {}
+    completed = _mtplx_number(latest.get("completed_at_s"))
+    timestamp = completed * 1000 if completed is not None else None
+    if timestamp is not None and not math.isfinite(timestamp):
+        completed = timestamp = None
+    age = time.time() - completed if completed is not None else None
+    stale = age is not None and (age > config.metrics_max_age_seconds or age < -5)
+    samples, invalid, truncated = [], [], []
+    # Do not persist latest/recent wholesale: envelopes may contain user text,
+    # request/session identity and previews. Only this numeric allowlist is saved.
+    for field, (family, unit, _) in MTPLX.items():
+        value = _mtplx_number(latest.get(field))
+        if value is None or unit == "tokens" and not value.is_integer():
+            if latest.get(field) is not None:
+                invalid.append(family)
+            continue
+        if len(samples) >= config.metrics_max_series:
+            truncated.append(family)
+            continue
+        samples.append({
+            "name": "mtplx:latest_" + field, "family": family, "kind": "gauge",
+            "unit": unit, "value": value, "labels": {},
+            "sample_timestamp_ms": timestamp, "age_seconds": age, "stale": stale,
+            "freshness": "completed-request timestamp" if completed is not None
+                         else "scrape only; completed-request freshness unknown",
+            "provenance": "MTPLX latest completed request; not linked to this run",
+        })
+    families = {sample["family"] for sample in samples if not sample["stale"]}
+    state = "unsupported_format" if payload is None else "stale_samples" if samples and stale else "available"
+    return {
+        "status": state, "samples": samples,
+        "missing_families": sorted((SERVING_FAMILIES | {entry[0] for entry in MTPLX.values()}) - families),
+        "series_limit_reached": bool(truncated), "truncated_families": sorted(truncated),
+        "invalid_families": sorted(invalid), "mapping": "mtplx", "profile": "mtplx",
+        "profile_source": "observed MTPLX JSON envelope" if target.metrics_profile == "unknown" else "configured profile",
+        "mapping_reference": MTPLX_REFERENCE, "runtime_version": target.metrics_runtime_version,
+        "version_verification": "JSON contract matches MTPLX v2.12.3; runtime identity/version require deployment evidence.",
+        "instrumentation": target.instrumentation, "instrumentation_provenance": "user-supplied; unverified",
+        "latest_completed_at_s": completed,
+        "reason": "Unrecognized MTPLX metrics JSON envelope." if payload is None else
+                  "Only stale completed-request samples were returned." if samples and stale else
+                  "MTPLX endpoint available; latest completed-request fields are missing or invalid, not zero." if not samples else
+                  "Latest completed request may predate this run; no request-window attribution or live scheduler coverage.",
+    }
+
+
 def parse(body, target, config, *, host=False):
+    if not host and target.metrics_profile in {"unknown", "mtplx"}:
+        envelope = _mtplx_envelope(body)
+        if envelope is not None or target.metrics_profile == "mtplx":
+            return _parse_mtplx(envelope, target, config)
     # Identify only published exact-name contracts. User-selected contracts win;
     # unrelated exporters and similarly named metrics cannot invent a runtime.
     detected = None
@@ -999,6 +1088,31 @@ def _histogram_percentiles(snapshots, family):
     return output
 
 
+def _derive_mtplx(snapshots):
+    if not any(snap.get("profile", snap.get("mapping")) == "mtplx" for snap in snapshots):
+        return {}
+    latest = snapshots[-1]
+    rows = {}
+    for family, unit, label in MTPLX.values():
+        fresh = _fresh_families(latest, [family])
+        values = fresh[family] if fresh else {}
+        value = next(iter(values.values())) if len(values) == 1 else None
+        row = _derived(value, unit,
+            "MTPLX latest completed request; may predate this run; not linked to the selected requests. No averaging or counter deltas.",
+            samples=int(value is not None), eligible=1,
+            reason=None if value is not None else "No valid fresh field in the final scrape's latest completed request; missing is unknown, not zero.",
+            collected_at=latest.get("collected_at"), completed_at_s=latest.get("latest_completed_at_s"),
+            freshness="Completed-request timestamp when supplied; otherwise source freshness is unknown.",
+            selected_window_attribution="not established",
+            aggregation="One latest completed request from the final scrape; repeated polls and recent records are not accumulated.")
+        row.update(label="MTPLX latest completed request " + label,
+                   scope="latest completed request at server endpoint")
+        if value is None:
+            row["action"] = "Collect an MTPLX envelope with a valid latest completed-request field; check the source timestamp and configured maximum age."
+        rows[family] = row
+    return rows
+
+
 def derive_server_metrics(data, *, host_configured=False):
     """Derive server-wide observations from adjacent compatible scrape intervals.
 
@@ -1011,6 +1125,7 @@ def derive_server_metrics(data, *, host_configured=False):
     snapshots = data.get("snapshots", [])
     metrics, _ = _derive_spec_decode(snapshots)
     metrics.update(_derive_sglang_spec_decode(snapshots))
+    metrics.update(_derive_mtplx(snapshots))
     for family in ("server_ttft", "server_queue", "server_inference"):
         metrics[family + "_mean_ms"] = _mean_duration(snapshots, family)
         for percentile, row in _histogram_percentiles(snapshots, family).items():
@@ -1069,6 +1184,9 @@ def derive_server_metrics(data, *, host_configured=False):
                             else "Check the recorded exporter discovery result; server-only evidence is unavailable from chat responses."))
                 row["details"].update(collection_status=latest.get("status"), endpoint=latest.get("endpoint"),
                                       endpoint_source=latest.get("endpoint_source"))
+            elif profiles == {"mtplx"} and not key.startswith("mtplx_latest_"):
+                row.update(state="not_supported", reason="MTPLX completed-request JSON does not expose this live gauge or cumulative counter contract.",
+                           action=None)
             elif profiles and key.startswith("spec_decode_sglang_"):
                 if "sglang" not in profiles:
                     row.update(state="not_supported", reason="SGLang scheduler gauges require the sglang metrics profile.", action=None)

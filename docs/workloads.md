@@ -743,9 +743,10 @@ endpoints, even on the same origin. Collection failure does not prevent endpoint
 tests or change their correctness/performance outcomes.
 
 With the default `metrics_profile: unknown`, Giraffe detects a profile only when
-published exact metric names identify one supported contract unambiguously.
+published exact metric names or the MTPLX JSON envelope identify one supported
+contract unambiguously.
 An explicit `targets[].metrics_profile` overrides detection. Profiles map exact
-metric names and units:
+metric names, JSON fields and units:
 
 - `vllm-v1`: vLLM 0.30.0 V1 metric names for KV-cache fraction, running/waiting
   requests, preemption count, prefix hits/queries, server TTFT sum/count and optional
@@ -754,6 +755,17 @@ metric names and units:
   qualify the recorded runtime/version before interpreting it as supported.
 - `sglang`, `llamacpp`, `lmdeploy` and `tgi`: runtime-specific Prometheus metric
   contracts; available families depend on the runtime and exporter.
+- `mtplx`: [MTPLX 2.12.3 JSON `/metrics`](https://mtplx.ai/docs/api/#health-and-metrics).
+  **Server observations** shows the final scrape's latest completed request TTFT
+  and duration (seconds), decode/prefill rates (tokens/s), and prompt, completion
+  and cached token counts. These are individual request values, never cumulative
+  counters, run throughput or run-window averages. Repeated polls and `recent`
+  records are not accumulated. The latest request may predate the run and is not
+  linked to the selected requests. Missing fields remain unavailable; missing
+  completion timestamps leave source freshness unknown. Supplied timestamps use
+  `metrics_max_age_seconds`. A valid idle envelope (`latest: null`) keeps polling.
+  Live scheduler counts, KV occupancy, GPU memory and cumulative/histogram metrics
+  remain unsupported. Request text, previews and request/session IDs are not saved.
 - `ollama` and `tensorrt-llm`: no serving Prometheus counter mapping is assumed.
   Native APIs can supply deployment information, but do not establish scheduler
   or KV-cache counter coverage at `/metrics`.

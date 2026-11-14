@@ -458,3 +458,11 @@ def test_cli_zero_disables_endpoint_watchdog_and_help_explains_it():
     run = parsed._subparsers._group_actions[0].choices["run"]
     run.show_advanced = True
     assert "0 disables" in run.format_help()
+
+
+def test_cli_accepts_mtplx_json_metrics_profile():
+    config = configuration(parser().parse_args([
+        "run", "--url", "http://localhost:8000/v1", "--model", "tiny",
+        "--metrics-profile", "mtplx",
+    ]))
+    assert config.targets[0].metrics_profile == "mtplx"
