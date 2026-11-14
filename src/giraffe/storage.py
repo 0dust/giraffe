@@ -25,7 +25,8 @@ from . import models
 DEFAULT_LIMITS = {"max_total_storage": 5 * 1024 ** 3, "min_free_disk": 1024 ** 3,
                   "max_run_storage": 256 * 1024 ** 2}
 # HTML remains recognized for legacy runs and explicit CLI exports.
-_FILES = {"report.json", "report.html", ".web.json", ".keep", "summary.json", "evidence.jsonl", "giraffe.log"}
+_FILES = {"report.json", "report.html", ".web.json", ".keep", "summary.json", "evidence.jsonl", "giraffe.log",
+          ".scale-down-event.json", ".scale-down-status.json"}
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 logger = logging.getLogger(__name__)
 _metadata_lock = threading.RLock()
@@ -324,12 +325,25 @@ def run_alive(directory: Path | str, meta: dict | None = None, *, active_id: str
     # cannot be rescued by probing our own PID.
     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0 or pid == os.getpid():
         return False
+    return pid_alive(pid, uncertain=False)
+
+
+def pid_alive(pid: int, *, uncertain: bool) -> bool:
+    """Probe a same-host PID. ``uncertain`` is the answer when the probe cannot
+    tell (our own PID or an unexpected OSError); permission-denied means the
+    process exists. Lifecycle cleanup passes False to avoid pinning dead runs;
+    evidence recovery passes True so it never reads a journal a live writer may still extend.
+    """
+    if pid == os.getpid():
+        return uncertain
     try:
         os.kill(pid, 0)
     except PermissionError:
         return True
-    except (ProcessLookupError, OSError, OverflowError):
+    except ProcessLookupError:
         return False
+    except (OSError, OverflowError):
+        return uncertain
     return True
 
 

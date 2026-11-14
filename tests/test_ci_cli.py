@@ -406,3 +406,120 @@ def test_blocked_runs_write_ci_outputs_without_changing_exit(blocker, tmp_path, 
     assert 'Report:' not in summary.read_text()
     assert not (tmp_path / 'run' / 'report.json').exists()
     assert reason in capsys.readouterr().err
+
+
+@pytest.mark.parametrize('mode', [[], ['--quiet'], ['--json'], ['--verbose']])
+@pytest.mark.parametrize('retention,expected', [('all', 'sensitive answer'), ('none', '')])
+def test_cli_journals_completed_requests_before_suite_failure(
+        mode, retention, expected, tmp_path, monkeypatch, local_tokenizer):
+    from giraffe.evidence import recover_evidence
+    from giraffe.runner import record_sink
+    from tests.test_evidence import record
+
+    async def suite(config, *, progress, stop_event):
+        record_sink.get()(record())
+        progress({'event': 'condition_finished', 'condition_summary': {
+            'condition_id': 'warm', 'target': 'local', 'status': 'finished'}})
+        raise RuntimeError('suite died before final report')
+
+    previous_sink = record_sink.get()
+    monkeypatch.setattr('giraffe.runner.run_suite', suite)
+    with pytest.raises(RuntimeError, match='suite died'):
+        main(['run', '--url', 'http://server/v1', '--model', 'tiny',
+              '--checks', 'serving', '--skip-preflight', '--output', str(tmp_path / 'run'),
+              '--retention', retention, '--min-free-disk', '0', *mode])
+    recovered = recover_evidence(tmp_path / 'run', {})
+    assert recovered is not None, 'ordinary CLI runs must journal before final export'
+    assert len(recovered.requests) == 1 and recovered.requests[0].output == expected
+    assert recovered.conditions[0]['lifecycle_status'] == 'interrupted'
+    assert record_sink.get() is previous_sink
+    assert not (tmp_path / 'run' / 'report.json').exists()
+
+
+@pytest.fixture
+def interrupted_cli_run(tmp_path, monkeypatch):
+    import socket
+    from datetime import datetime, timezone
+    from giraffe.evidence import EvidenceWriter
+    from tests.test_evidence import record
+
+    writer = EvidenceWriter(tmp_path, {'config': {'retention': 'all'}}, run_id='interrupted')
+    writer.record_finished(record())
+    writer.close()
+    with (tmp_path / 'evidence.jsonl').open('a') as stream:
+        stream.write('{"type":"record",')
+    meta = {'state': 'running', 'owner_host': socket.gethostname(), 'owner_pid': 12345,
+            'heartbeat_at': datetime.now(timezone.utc).isoformat()}
+    (tmp_path / '.web.json').write_text(json.dumps(meta))
+
+    def dead(pid, sig):
+        assert (pid, sig) == (12345, 0)
+        raise ProcessLookupError()
+
+    monkeypatch.setattr('giraffe.cli.os.kill', dead)
+    return tmp_path
+
+
+def test_report_recovers_interrupted_cli_journal_without_rewriting_source(interrupted_cli_run, capsys):
+    import xml.etree.ElementTree as ET
+
+    directory = interrupted_cli_run
+    before = {path.name: path.read_bytes() for path in directory.iterdir()}
+    junit, summary = directory / 'ci.xml', directory / 'ci.md'
+    assert main(['report', str(directory), '--html', '--junit', str(junit),
+                 '--summary-md', str(summary)]) == 0
+    assert '1 requests recorded' in (directory / 'report.html').read_text()
+    assert 'sensitive answer' in (directory / 'report.html').read_text()
+    assert ET.parse(junit).findall('.//skipped')
+    assert 'INCONCLUSIVE' in summary.read_text()
+    assert 'Recovered 1 recorded requests' in capsys.readouterr().err
+    assert not (directory / 'report.json').exists()
+    assert all((directory / name).read_bytes() == value for name, value in before.items())
+
+
+@pytest.mark.parametrize('owner', ['live', 'self', 'permission', 'unknown_error', 'foreign', 'invalid'])
+def test_report_does_not_recover_possible_live_writer(interrupted_cli_run, monkeypatch, capsys, owner):
+    import os
+
+    directory = interrupted_cli_run
+    meta = json.loads((directory / '.web.json').read_text())
+    if owner == 'self':
+        meta['owner_pid'] = os.getpid()
+    elif owner == 'foreign':
+        meta['owner_host'] = 'different-host'
+    elif owner == 'invalid':
+        meta['owner_pid'] = True
+    (directory / '.web.json').write_text(json.dumps(meta))
+
+    def probe(pid, sig):
+        if owner == 'permission':
+            raise PermissionError()
+        if owner == 'unknown_error':
+            raise OSError('cannot determine owner')
+
+    monkeypatch.setattr('giraffe.cli.os.kill', probe)
+    assert main(['report', str(directory), '--html']) == 4
+    assert 'may still be running' in capsys.readouterr().err
+    assert not (directory / 'report.html').exists()
+    assert not (directory / 'report.json').exists()
+
+
+@pytest.mark.parametrize('saved', ['complete', 'corrupt', 'summary'])
+def test_report_keeps_final_artifacts_authoritative(interrupted_cli_run, monkeypatch, capsys, saved):
+    directory = interrupted_cli_run
+    if saved == 'complete':
+        final = RunReport(run_id='final', started_at='now', finished_at='now',
+                          overall='pass', manifest={})
+        (directory / 'report.json').write_text(final.model_dump_json())
+    elif saved == 'corrupt':
+        (directory / 'report.json').write_text('{broken')
+    else:
+        (directory / 'summary.json').write_text('{"overall":"fail"}')
+    monkeypatch.setattr('giraffe.evidence.recover_evidence',
+                        lambda *a, **kw: pytest.fail('must not replace a final outcome'))
+    code = main(['report', str(directory), '--html'])
+    assert code == (0 if saved == 'complete' else 4)
+    if saved == 'complete':
+        assert 'sensitive answer' not in (directory / 'report.html').read_text()
+    else:
+        assert not (directory / 'report.html').exists()

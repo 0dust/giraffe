@@ -43,7 +43,7 @@ async def test_proven_streamed_fields_are_requested_on_measured_requests(monkeyp
     target = Target(name="test", url="http://runtime/v1", model="model")
     async with LLMClient(target, RunConfig(targets=[target])) as client:
         probe = client.token_evidence_probe()
-        assert probe.max_tokens == 1 and probe.request_timeout_seconds == client.config.request_timeout_seconds
+        assert probe.max_tokens == 16 and probe.request_timeout_seconds == client.config.request_timeout_seconds
         assert probe.check_ids == [] and probe.workload["role"] == "setup"
         evidence = client.observe_token_evidence_probe(await client.execute(probe))
         assert evidence["logprobs"] == evidence["usage"] == "supported"
@@ -204,7 +204,7 @@ async def test_runner_accepts_probe_content_after_five_seconds(monkeypatch):
     def handler(request):
         if request.method == "GET":
             return httpx.Response(404)
-        if json.loads(request.content).get("max_tokens") == 1:
+        if json.loads(request.content).get("max_tokens") == 16:
             return httpx.Response(200, stream=SlowContent(), headers={"content-type": "text/event-stream"})
         return completion()
 
@@ -232,7 +232,7 @@ async def test_probe_rejection_retries_share_one_timeout_budget(monkeypatch):
         if request.method == "GET":
             return httpx.Response(404)
         body = json.loads(request.content)
-        if body.get("max_tokens") == 1:
+        if body.get("max_tokens") == 16:
             probes.append(body)
             if body.get("logprobs"):
                 await asyncio.sleep(.1)
@@ -260,7 +260,7 @@ async def test_probe_cannot_exceed_overall_run_deadline(monkeypatch):
     async def handler(request):
         if request.method == "GET":
             return httpx.Response(404)
-        if json.loads(request.content).get("max_tokens") == 1:
+        if json.loads(request.content).get("max_tokens") == 16:
             await asyncio.sleep(2)
         return completion()
 
@@ -368,3 +368,33 @@ def test_connection_timeout_retains_transport_failure_accounting_and_exact_label
     record = {"status": "failed", "termination_reason": "connect_timeout", "termination_limit_seconds": 10}
     assert request_status(record) == "failed"
     assert request_result_text(record) == "Connection timeout (10 s)"
+
+
+async def test_probe_reaches_reasoning_after_hidden_first_token_and_enables_logprobs(monkeypatch):
+    calls = []
+
+    def handler(request):
+        body = json.loads(request.content)
+        calls.append(body)
+        if len(calls) > 1:
+            return completion()
+        delta = {} if body["max_tokens"] == 1 else {"reasoning_content": "Thinking"}
+        choice = {"delta": delta, "finish_reason": "length"}
+        if delta:
+            choice["logprobs"] = {"content": [{"token": "Thinking", "logprob": -0.1}]}
+        data = {"choices": [choice], "usage": {"completion_tokens": body["max_tokens"]}}
+        return httpx.Response(200, text=f"data: {json.dumps(data)}\n\ndata: [DONE]\n\n",
+                              headers={"content-type": "text/event-stream"})
+
+    mock_http(monkeypatch, handler)
+    target = Target(name="test", url="http://runtime/v1", model="model")
+    async with LLMClient(target, RunConfig(targets=[target])) as client:
+        probe = client.token_evidence_probe()
+        record = await client.execute(probe)
+        evidence = client.observe_token_evidence_probe(record)
+        assert evidence["logprobs"] == "supported"
+        assert 1 < probe.max_tokens <= 16
+        assert not record.valid and record.output_tokens is None
+        assert client.token_evidence_probe() is None
+        await client.execute(workload())
+    assert len(calls) == 2 and calls[-1]["logprobs"] is True

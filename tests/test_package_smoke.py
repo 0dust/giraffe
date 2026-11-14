@@ -2,6 +2,7 @@
 
 import importlib.util
 from importlib import resources
+import os
 from pathlib import Path
 import re
 from urllib.parse import urlsplit
@@ -36,6 +37,17 @@ async def test_smoke_accepts_transformed_assets_and_follows_versioned_dependenci
     for name in ("boot.js", "styles.css", "app.js", "form-config.mjs"):
         assert any(f"/static/{name}?v=" in url for url in requested)
     assert not any(url.endswith("/static/form-config.mjs") for url in requested)
+
+
+async def test_smoke_opens_large_report_with_decoy_package_on_pythonpath(tmp_path, smoke):
+    runs = tmp_path / "runs"
+    app = create_app(runs)
+    previous = os.environ.get("PYTHONPATH")
+    async with app.router.lifespan_context(app), httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://localhost",
+    ) as client:
+        await smoke.check_report_reader(client, runs)
+    assert os.environ.get("PYTHONPATH") == previous
 
 
 def test_smoke_checks_packaged_tokenizer_without_network_or_writable_cache(smoke):

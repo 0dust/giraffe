@@ -12,14 +12,68 @@ import heapq
 import random
 from typing import Any
 
+from giraffe.caps import MAX_TOKEN_EVIDENCE_PROBE_ATTEMPTS
 from giraffe.fixtures import builtin_fixtures
+from giraffe.gateway_access import (configured_probe_count as configured_access_probe_count,
+                                    deferred_for_shared_targets as defer_gateway_access)
+from giraffe.gateway_attribution import (POLL_FRACTIONS, configured_probe_count,
+                                         deferred_for_shared_targets, reader_preflight_bound)
+from giraffe.gateway_policy import deferred_for_shared_targets as defer_gateway_policy
 from giraffe.concurrent_load import prompt_overhead
+from giraffe.identities import gateway_identities_only
 from giraffe.logprob_workload import corpus_width, sample_count
 from giraffe.load_test import context_window, calibration_keys, load_time_plan, minimum_reservation, test_points, point_shapes, settings_sets, saved_shape_warnings
-from giraffe.models import CATALOGUE_NAMES, CHECK_NAMES, CHECK_OPTION_FIELDS, CORE_CHECKS, MAX_PLANNED_ARRIVALS, ConfigDraft, RunConfig, required_concurrency
+from giraffe.models import (CATALOGUE_NAMES, CHECK_NAMES, CHECK_OPTION_FIELDS, CORE_CHECKS, MAX_PLANNED_ARRIVALS,
+                            SHARED_BASELINE_EXCLUDED_WORKLOADS, ConfigDraft, RunConfig, required_concurrency)
 from giraffe.request_pack import active_pack, pack_summary, pack_settings
 from giraffe.workloads import fixed_session_turns, label_prompt, prefix_admitted
 from giraffe.tool_checks import resolved_tool_fixtures, resolved_tool_modes
+
+
+def _target_count(row, target):
+    return row.get("target_request_counts", {}).get(target, row["requests_per_target"])
+
+
+def _request_quotas(config):
+    if config.max_requests is None:
+        return {target.name: None for target in config.targets}
+    base, extra = divmod(config.max_requests, len(config.targets))
+    return {target.name: base + (index < extra) for index, target in enumerate(config.targets)}
+
+
+def token_evidence_request_reserve(rows, *, target=None):
+    # Shared compatibility uses spare quota before identity probes, while
+    # preserving the finite shared work (including bounded conversations).
+    reserve = 0
+    for row in rows:
+        if row["id"] in SHARED_BASELINE_EXCLUDED_WORKLOADS:
+            continue
+        count = _target_count(row, target)
+        reserve += count if count is not None else row.get("known_scheduled_requests", 0)
+    return reserve
+
+
+def recovery_later_reserves(config, *, runtime_counts_by_target=None):
+    """Reserve later fixed requests and flag work that shares sustained-load quota."""
+    later = [name for name in config.checks
+             if (name not in CORE_CHECKS or name == "load") and name != "gateway_attribution"]
+    if not later:
+        return {target.name: (0, False) for target in config.targets}
+    plan = request_plan(config.model_copy(update={"checks": later, "restart_target": None}))
+    runtime_counts_by_target = runtime_counts_by_target or {}
+    default_known = plan["known_per_target"]
+    load_reserve = plan["minimum_reserved_per_target"] - default_known
+    result = {}
+    for target in config.targets:
+        known = plan.get("known_target_counts", {}).get(target.name, default_known)
+        planned_identity = {row["id"]: _target_count(row, target.name)
+                            for row in plan["rows"] if row["id"] in {"gateway_policy", "gateway_access"}}
+        overrides = runtime_counts_by_target.get(target.name, {})
+        effective_identity = {name: overrides.get(name, count) for name, count in planned_identity.items()}
+        adjustment = sum(count - planned_identity[name] for name, count in effective_identity.items())
+        has_later_work = any(name not in effective_identity or effective_identity[name] for name in later)
+        result[target.name] = (known + load_reserve + adjustment, has_later_work)
+    return result
 
 
 def _warning_title(row):
@@ -56,6 +110,16 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
     observation_notes = []
     duration_estimates, duration_runs = {}, {}
     selected = set(config.checks)
+    quotas = _request_quotas(config)
+    shared_gateway = (not gateway_identities_only(selected) and any(
+        _target_count(row, target.name) for row in rows if row["id"] in SHARED_BASELINE_EXCLUDED_WORKLOADS
+        for target in config.targets))
+    defer_access = defer_gateway_access(config)
+    cross_target_attribution = deferred_for_shared_targets(config)
+    defer_attribution = cross_target_attribution or (defer_access and "gateway_attribution" in selected)
+    defer_policy = defer_gateway_policy(config) or (defer_access and "gateway_policy" in selected
+                                                  and config.gateway_policy is not None and config.gateway_policy.supported)
+    attribution_steps = {"gateway_attribution", "gateway_attribution_preflight", "gateway_attribution_settle"}
     requirements = required_concurrency(config)
     pool = min(requirements["peak"], config.concurrency) if config.concurrency else requirements["peak"]
     shares = {target.name: min(requirements["per_target_peak"], pool) for target in config.targets}
@@ -70,7 +134,7 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
 
     def fixtures_for(check):
         if check not in fixture_metadata:
-            fixture_metadata[check] = builtin_fixtures(effective(check), check_id=check)
+            fixture_metadata[check] = builtin_fixtures(effective(check))
         return fixture_metadata[check]
 
     def pooled_matches(target, queries, entries):
@@ -138,7 +202,9 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
                  "backend_cancellation": "cancellation", "cancellation_intentional": "cancellation"}.get(identifier, identifier)
         return {"capacity": "traffic.duration_seconds", "arrivals": "arrivals.requests",
                 "sessions": "sessions", "consistency": "consistency", "tools": "tool_checks",
-                "prefix": "prefix", "sessions_wait": "sessions.delay_seconds"}.get(check, "test_options." + check)
+                "prefix": "prefix", "sessions_wait": "sessions.delay_seconds",
+                "gateway_access": "gateway_access.request_timeout_seconds",
+                "gateway_attribution": "request_timeout_seconds"}.get(check, "test_options." + check)
 
     def unknown(target, row, count, timeout, bound):
         item = {"id": row["id"], "title": row["title"], "target": target,
@@ -146,6 +212,11 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
         unknowns.append(item)
         timeline.append({**item, "kind": "unknown", "field": time_field(row["id"]),
                          "low_seconds": 0, "high_seconds": bound})
+
+    def setup(target, identifier, title, field, timeout):
+        # Setup consumes the run deadline and stays outside the traffic estimate.
+        timeline.append({"id": identifier, "title": title, "target": target, "kind": "setup",
+                         "field": field, "low_seconds": 0, "high_seconds": timeout, "wait": True})
 
     @lru_cache(maxsize=256)
     def batch_moments(distributions):
@@ -381,10 +452,36 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
         ordered = [row for row in ordered if row["id"] not in {"pack_control", "pack_loaded"}]
         after_context = next(index for index, row in enumerate(ordered) if row["id"] == "context") + 1
         ordered[after_context:after_context] = pack_rows
+    has_initial = any(row["id"] == "initial" for row in ordered)
     for target in config.targets:
         has_observations = bool((observations or {}).get(target.name))
+        restart_requested = config.restart_target == target.name
+        restarting = restart_requested and bool(target.restart_command)
+        initial_count = int(has_initial and not restarting)
+        if restarting:
+            setup(target.name, "restart_hook", "Restart hook", "request_timeout_seconds", config.request_timeout_seconds)
+            # Health polling and its inference probe share this timeout.
+            setup(target.name, "restart_readiness", "Restart readiness", "readiness_timeout_seconds",
+                  config.readiness_timeout_seconds)
+        elif initial_count:
+            setup(target.name, "initial", "Initial connection allowance", "test_options.access.request_timeout_seconds"
+                  if "access" in selected else "test_options.serving.request_timeout_seconds",
+                  config.effective_initial()["request_timeout_seconds"])
+        if config.stream and (restarting or (shared_gateway and not restart_requested)):
+            # The ordinary initial request consumes quota; readiness is exempt.
+            # Optional streamed evidence uses spare quota and shares one timeout across retries.
+            quota = quotas[target.name]
+            evidence_reserve = token_evidence_request_reserve(rows, target=target.name)
+            if quota is None or quota - initial_count > max(1, evidence_reserve - initial_count):
+                setup(target.name, "performance_evidence_probe", "Streamed token and usage compatibility",
+                      "request_timeout_seconds", config.request_timeout_seconds)
         for row in ordered:
-            name, count = row["id"], row["requests_per_target"]
+            name = row["id"]
+            count = _target_count(row, target.name)
+            if name == "scale_down":
+                if config.scale_down and target.name == config.scale_down.target:
+                    fixed(target.name, row, 0, "scale_down", timeout=config.scale_down.max_duration_seconds)
+                continue
             if name == "recovery_prime" and "cancellation" in selected:
                 fixed(target.name, {"id": "recovery_wait", "title": "Recovery cleanup wait"},
                       min(5, config.effective_check("cancellation")["cleanup_seconds"]), "test_options.cancellation.cleanup_seconds")
@@ -396,15 +493,21 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
                      "limits.stop_control": "cancellation", "backend_cancellation": "cancellation",
                      "sustained": "recovery"}.get(name, name)
             if name in {"initial", "restart_readiness"}:
-                # Setup stays outside the headline. Initial inference still
-                # consumes the shared deadline, so budget remedies reserve its
-                # full effective timeout before the selected traffic starts.
-                if name == "initial":
-                    timeline.append({"id": name, "title": "Initial connection allowance", "target": target.name,
-                                     "kind": "setup", "field": "test_options.access.request_timeout_seconds"
-                                     if "access" in selected else "test_options.serving.request_timeout_seconds",
-                                     "low_seconds": 0, "high_seconds": config.effective_initial()["request_timeout_seconds"],
-                                     "wait": True})
+                continue
+            if name == "gateway_attribution":
+                settings = config.gateway_attribution
+                field = "gateway_attribution.settle_seconds"
+                if preflight := reader_preflight_bound(config, deferred=cross_target_attribution):
+                    fixed(target.name, {"id": "gateway_attribution_preflight", "title": "Gateway reader preflight"},
+                          0, field, timeout=preflight)
+                timeout = config.request_timeout_seconds
+                unknown(target.name, row, count, timeout, count * timeout)
+                minimum = POLL_FRACTIONS[-1] * settings.settle_seconds
+                settle = {"id": "gateway_attribution_settle", "title": "Gateway spend-log settle",
+                          "target": target.name, "kind": "fixed", "fixed_seconds": minimum,
+                          "low_seconds": minimum, "high_seconds": settings.settle_seconds}
+                components.append(settle)
+                timeline.append({**settle, "field": field, "coverage_high_seconds": settings.settle_seconds})
                 continue
             if name == "load_calibration":
                 timeout = max(own.request_timeout_seconds for _, own in settings_sets(config.load_test))
@@ -448,11 +551,27 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
                         # timeout after sending stops, even without timing samples.
                         item["coverage_high_seconds"] = item["high_seconds"]
                 continue
+            if name == "gateway_access":
+                settings = config.gateway_access
+                timeout = settings.request_timeout_seconds if settings else 0
+                unknown(target.name, row, count, timeout, count * timeout)
+                continue
+            if name.startswith("multi_user_"):
+                settings = config.multi_user
+                phases = row.get("window_count", 1 + bool(settings.warmup_seconds))
+                fixed(target.name, row, row.get("configured_seconds", settings.duration_seconds + settings.warmup_seconds),
+                      "multi_user.duration_seconds", count=phases,
+                      timeout=config.request_timeout_seconds)
+                continue
+            if name == "gateway_policy":
+                fixed(target.name, row, row.get("configured_seconds", 0),
+                      "gateway_policy.duration_seconds", count=1, timeout=0)
+                continue
             if name == "capacity":
                 settings = config.effective_traffic()
                 options = effective("capacity")
                 from giraffe.fixtures import traffic_fixtures
-                fixtures = traffic_fixtures(options, check_id="capacity") if has_observations else {}
+                fixtures = traffic_fixtures(options) if has_observations else {}
                 specs = [spec for group in fixtures.values() for spec in group]
                 observed = measured(target.name, "capacity", min(settings.max_in_flight, shares[target.name]), specs)
                 fixed(target.name, row, len(settings.rates) * settings.duration_seconds, "traffic.duration_seconds",
@@ -462,7 +581,7 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
             if name == "sustained":
                 options = config.effective_check("recovery")
                 from giraffe.fixtures import traffic_fixtures
-                heavy = traffic_fixtures(effective("recovery"), check_id="recovery") if has_observations else {}
+                heavy = traffic_fixtures(effective("recovery")) if has_observations else {}
                 observed = measured(target.name, "recovery", min(options["concurrency"], shares[target.name]),
                                     heavy.get("long_input", []) + heavy.get("long_output", []))
                 fixed(target.name, row, options["sustained_seconds"], "test_options.recovery.sustained_seconds",
@@ -641,13 +760,13 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
                 from giraffe.workloads import spec
                 settings = config.prefix
                 prefix_chars = len(label_prompt(settings.prefix_chars + 33 + 80)) + len("\nTrial 0000.")
-                specs = [spec("x" * prefix_chars, "prefix", "prefix", max_tokens=min(24, options.max_output_tokens))]
+                specs = [spec("x" * prefix_chars, "prefix", "prefix", max_tokens=options.max_output_tokens)]
                 history_chars = 0
                 for _ in range(settings.history_turns):
                     history_chars += len(label_prompt(96))
-                    if not prefix_admitted(history_chars, min(24, options.max_output_tokens), options.context_limit):
+                    if not prefix_admitted(history_chars, options.max_output_tokens, options.context_limit):
                         break
-                    specs.append(spec("x" * history_chars, "prefix", "prefix", max_tokens=min(24, options.max_output_tokens)))
+                    specs.append(spec("x" * history_chars, "prefix", "prefix", max_tokens=options.max_output_tokens))
                     history_chars += 4
             if name == "tools" and has_observations and not (config.tool_checks and config.tool_checks.conversations):
                 from giraffe.models import RequestSpec
@@ -677,21 +796,37 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
             row["estimated_requests_per_target"] = next(iter(estimates.values()))
             row["estimate_source"] = "from your recent runs" if max(duration_runs[row["id"]].values()) > 1 else "from your last run"
 
-    def combine(key):
-        totals = [sum(item.get(key, 0) for item in components if item["target"] == target.name) for target in config.targets]
+    def phases(items):
+        shared, access, policy, attribution = [], [], [], []
+        for item in items:
+            if defer_access and item["id"] == "gateway_access":
+                access.append(item)
+            elif defer_policy and item["id"] == "gateway_policy":
+                policy.append(item)
+            elif defer_attribution and item["id"] in attribution_steps:
+                attribution.append(item)
+            else:
+                shared.append(item)
+        return shared, access, policy, attribution
+
+    def combine_phase(items, key):
+        totals = [sum(item.get(key, 0) for item in items if item["target"] == target.name) for target in config.targets]
         if not config.overlap_models:
             return sum(totals)
         combined = max(totals, default=0)
         if pool < requirements["peak"]:
-            finite = sum(item.get(key, 0) for item in components if item["kind"] == "finite")
+            finite = sum(item.get(key, 0) for item in items if item["kind"] == "finite")
             if key == "low_seconds" and pool < len(config.targets):
                 combined = max(combined, finite / pool)
             elif key == "high_seconds":
-                other = max((sum(item.get(key, 0) for item in components
+                other = max((sum(item.get(key, 0) for item in items
                              if item["target"] == target.name and item["kind"] != "finite")
                              for target in config.targets), default=0)
                 combined = max(combined, other + finite)
         return combined
+
+    def combine(key):
+        return sum(combine_phase(phase, key) for phase in phases(components))
 
     low, high, fixed_seconds = combine("low_seconds"), combine("high_seconds"), combine("fixed_seconds")
     timeline_high = high
@@ -699,24 +834,26 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
     # Keep individual component highs in the budget timeline for a conservative
     # completion remedy. Shared-pool overlap retains its contention upper bound.
     if not config.overlap_models or pool >= requirements["peak"]:
-        ranges = []
-        for target in config.targets:
-            items = [item for item in components if item["target"] == target.name]
-            finite_items = [item for item in items if item["kind"] == "finite" and not item.get("upper_bound")]
-            mean = sum(item["expected_seconds"] for item in finite_items)
-            # Welch-Satterthwaite df for independent estimated variances keeps
-            # one small cohort from setting the df for all sequential work.
-            variance = sum(item["prediction_variance"] for item in finite_items)
-            df_denominator = sum(item["prediction_variance"] ** 2 / max(1, item["prediction_samples"] - 1)
-                                 for item in finite_items)
-            samples = 1 + variance ** 2 / df_denominator if df_denominator else None
-            finite_low, finite_high = prediction(mean, variance,
-                                                sum(item["prediction_third"] for item in finite_items), samples)
-            other = [item for item in items if item["kind"] != "finite" or item.get("upper_bound")]
-            ranges.append((sum(item["low_seconds"] for item in other) + finite_low,
-                           sum(item["high_seconds"] for item in other) + finite_high))
-        low = max((item[0] for item in ranges), default=0) if config.overlap_models else sum(item[0] for item in ranges)
-        high = max((item[1] for item in ranges), default=0) if config.overlap_models else sum(item[1] for item in ranges)
+        low = high = 0
+        for phase in phases(components):
+            ranges = []
+            for target in config.targets:
+                items = [item for item in phase if item["target"] == target.name]
+                finite_items = [item for item in items if item["kind"] == "finite" and not item.get("upper_bound")]
+                mean = sum(item["expected_seconds"] for item in finite_items)
+                # Welch-Satterthwaite df for independent estimated variances keeps
+                # one small cohort from setting the df for all sequential work.
+                variance = sum(item["prediction_variance"] for item in finite_items)
+                df_denominator = sum(item["prediction_variance"] ** 2 / max(1, item["prediction_samples"] - 1)
+                                     for item in finite_items)
+                samples = 1 + variance ** 2 / df_denominator if df_denominator else None
+                finite_low, finite_high = prediction(mean, variance,
+                                                    sum(item["prediction_third"] for item in finite_items), samples)
+                other = [item for item in items if item["kind"] != "finite" or item.get("upper_bound")]
+                ranges.append((sum(item["low_seconds"] for item in other) + finite_low,
+                               sum(item["high_seconds"] for item in other) + finite_high))
+            low += max((item[0] for item in ranges), default=0) if config.overlap_models else sum(item[0] for item in ranges)
+            high += max((item[1] for item in ranges), default=0) if config.overlap_models else sum(item[1] for item in ranges)
     midpoint = (low + high) / 2
     drain_fraction = combine("drain_uncertainty_seconds") / midpoint if midpoint else 0
     fixed_fraction = fixed_seconds / midpoint if midpoint else 0
@@ -728,28 +865,43 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
     setup_totals = [sum(item["high_seconds"] for item in timeline
                         if item["target"] == target.name and item["kind"] == "setup") for target in config.targets]
     setup_allowance = max(setup_totals, default=0) if config.overlap_models else sum(setup_totals)
-    budget_high = timeline_high + setup_allowance
+    # Gateway probes have a serial timeout bound per target even without latency samples.
+    probe_allowance = 0
+    for check, deferred in (("gateway_access", defer_access), ("gateway_attribution", defer_attribution)):
+        probe_bounds = [item["timeout_bound_seconds"] for item in unknowns if item["id"] == check]
+        parallel_probes = config.overlap_models and (pool >= requirements["peak"]
+                                                     or deferred and pool >= len(probe_bounds))
+        probe_allowance += max(probe_bounds, default=0) if parallel_probes else sum(probe_bounds)
+    budget_high = timeline_high + setup_allowance + probe_allowance
     errors, warnings = [], []
     budget = config.max_duration_seconds
     if budget is not None:
         cut, first_start = [], None
         risk_over_budget = False
         cursor_low = cursor_high = cursor_risk = 0
-        for target in config.targets:
+        for phase in phases(timeline):
+            phase_start, phase_ends = (cursor_low, cursor_high, cursor_risk), []
+            for target in config.targets:
+                if config.overlap_models:
+                    cursor_low, cursor_high, cursor_risk = phase_start
+                for item in (item for item in phase if item["target"] == target.name):
+                    if not item.get("wait"):
+                        first_start = min(first_start, cursor_low) if first_start is not None else cursor_low
+                    estimated = item["low_seconds"] if item["kind"] in {"unknown", "setup"} else item.get("coverage_high_seconds", item["high_seconds"])
+                    end_high = cursor_high + estimated
+                    cursor_risk = (cursor_risk + item["high_seconds"]
+                                   if cursor_risk is not None and item["high_seconds"] is not None else None)
+                    risk_over_budget |= cursor_risk is None or cursor_risk > budget
+                    if not item.get("wait") and end_high > budget:
+                        cut.append(item)
+                    cursor_low += item["low_seconds"]
+                    cursor_high = end_high
+                phase_ends.append((cursor_low, cursor_high, cursor_risk))
             if config.overlap_models:
-                cursor_low = cursor_high = cursor_risk = 0
-            for item in (item for item in timeline if item["target"] == target.name):
-                if not item.get("wait"):
-                    first_start = min(first_start, cursor_low) if first_start is not None else cursor_low
-                estimated = item["low_seconds"] if item["kind"] in {"unknown", "setup"} else item.get("coverage_high_seconds", item["high_seconds"])
-                end_high = cursor_high + estimated
-                cursor_risk = (cursor_risk + item["high_seconds"]
-                               if cursor_risk is not None and item["high_seconds"] is not None else None)
-                risk_over_budget |= cursor_risk is None or cursor_risk > budget
-                if not item.get("wait") and end_high > budget:
-                    cut.append(item)
-                cursor_low += item["low_seconds"]
-                cursor_high = end_high
+                cursor_low = max(end[0] for end in phase_ends)
+                cursor_high = max(end[1] for end in phase_ends)
+                cursor_risk = (None if any(end[2] is None for end in phase_ends)
+                               else max(end[2] for end in phase_ends))
         if cut:
             fields = list(dict.fromkeys(["max_duration_seconds", *(item["field"] for item in cut)]))
             fully_known = not unknowns
@@ -779,9 +931,12 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
             risk_components = [item for item in timeline if item["kind"] in {"setup", "unknown"}
                                and (item["high_seconds"] is None or item["high_seconds"] > 0)]
             for item in risk_components:
-                if item["kind"] == "setup":
+                if item["id"] == "initial":
                     reasons.append(f"{CHECK_NAMES['access']} for {item['target']} may wait up to {item['high_seconds']:,g} s "
                                    "if the server is slow to respond; this allowance shares the time limit and is excluded from the estimated duration.")
+                elif item["kind"] == "setup":
+                    reasons.append(f"{item['title']} for {item['target']} may take up to {item['high_seconds']:,g} s; "
+                                   "this allowance shares the time limit and is excluded from the estimated duration.")
                 elif item.get("id") == "sessions_wait" and item.get("reason"):
                     reasons.append(f"{item['target']} · conversation pauses can add up to {item['high_seconds']:,g} s. " + item["reason"])
                 elif item["high_seconds"] is not None:
@@ -809,7 +964,7 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
             "unknown_time_components": unknowns, "confidence": confidence,
             "confidence_details": {"fixed_fraction": fixed_fraction, "drain_uncertainty_fraction": drain_fraction,
                                    "insufficient_observations": list(dict.fromkeys(uncertain_observations))},
-            "time_timeline": timeline, "budget_high_seconds": budget_high,
+            "time_timeline": [item for phase in phases(timeline) for item in phase], "budget_high_seconds": budget_high,
             "estimate_exclusions": ["setup/connection", "AI evaluation", "report generation"],
             "time_bound_reasons": reasons, "time_estimate_assumptions": ([
                 "Finite request groups model immediate replenishment from comparable recorded distributions; explicit batch barriers retain batch maxima. Large variable pools use conservative work/drain bounds. A nominal 99% prediction interval combines service variance and finite-cohort uncertainty across sequential groups, with Student-t and measured-skew corrections. Medium confidence requires 150 samples from one run or at least 15 samples per setting across 3 consistent runs, at least 99% accounted timing coverage (including small measured inter-batch overhead only after 3 runs), no unknown components and a combined relative half-width at most 50% (single-run components also require a prediction half-width at most 40%). Each run has equal total weight, so recent runs weigh no less than older runs; pooling stops at a detected latency shift."
@@ -833,12 +988,8 @@ def request_plan(config: RunConfig | ConfigDraft, *,
     rows: list[dict[str, Any]] = []
     warnings: list[str] = []
     target_count = len(config.targets)
-    if config.max_requests is None:
-        quotas = {target.name: None for target in config.targets}
-    else:
-        base, extra = divmod(config.max_requests, target_count)
-        quotas = {target.name: base + (index < extra)
-                  for index, target in enumerate(config.targets)}
+    attribution_counts = {target.name: configured_probe_count(config, target) for target in config.targets}
+    quotas = _request_quotas(config)
     concurrency_warnings = config.concurrency_notices()
     capacity_warnings = []
     if "capacity" in selected:
@@ -900,10 +1051,37 @@ def request_plan(config: RunConfig | ConfigDraft, *,
                      "requests_per_target": count, "kind": kind, "source": source,
                      "summary": summary})
 
+    def warn_output_space(title, output, context, output_field="max_output_tokens", context_field="context_limit"):
+        if output >= context:
+            warnings.append(
+                f"{title}: {output_field}={output} leaves no room for the prompt within "
+                f"{context_field}={context}. Reduce {output_field}, or set {context_field} to a larger "
+                "window only if the model supports it. Servers that reserve prompt and output space may reject these requests.")
+
+    if "scale_down" in selected and config.scale_down:
+        settings = config.scale_down
+        maximum = settings.max_requests
+        add("scale_down", None, f"One external removal on {settings.target}; at most {maximum} requests within {settings.max_duration_seconds:g} seconds, subject to shared run limits.", kind="bounded")
+        quota = quotas[settings.target]
+        rows[-1].update(max_requests=maximum, max_duration_seconds=settings.max_duration_seconds, target=settings.target,
+            effective_request_upper_bound=min(maximum, quota) if quota is not None else maximum,
+            effective_duration_upper_bound=min(settings.max_duration_seconds, config.max_duration_seconds)
+                if config.max_duration_seconds is not None else settings.max_duration_seconds)
+        if quota is not None and quota < maximum:
+            warnings.append(f"Scale-down continuity on {settings.target} shares a request allowance of {quota}; its full scenario can offer up to {maximum} requests.")
+        if config.max_duration_seconds is not None and config.max_duration_seconds < settings.max_duration_seconds:
+            warnings.append(f"Scale-down continuity can observe for up to {settings.max_duration_seconds:g} seconds; the shared {config.max_duration_seconds:g}-second run limit can end it earlier.")
     # Only fixture cardinalities are needed. Keep context filler small even if
     # the operator has configured a very large context limit.
     fixtures = builtin_fixtures(config.model_copy(update={"context_limit": 128}))
     initial = bool(selected & {"access", "serving", "first_output", "generation"})
+    if initial or config.restart_target:
+        owner = next((check for check in ("serving", "first_output")
+                      if check in selected and config.test_options.get(check) is not None
+                      and config.test_options[check].max_output_tokens is not None), None)
+        warn_output_space("Initial connection" if initial else "Restart readiness",
+                          config.effective_initial()["max_output_tokens"], config.context_limit,
+                          f"test_options.{owner}.max_output_tokens" if owner else "max_output_tokens")
     if initial:
         add("initial", 1, "One generated request checks the connection. Time to first text uses this same request.",
             title=CHECK_NAMES["access"])
@@ -926,6 +1104,18 @@ def request_plan(config: RunConfig | ConfigDraft, *,
     pack_selected = config.request_source == "request_pack" and bool(selected & {"load", "capacity", "correctness"})
     pack = active_pack(config)
     details = pack_details if pack_details is not None else pack_summary(config) if pack else None
+    for check in sorted(selected & {"generation", "capacity", "fairness", "context", "correctness", "json",
+                                   "cancellation", "recovery", "prefix"}):
+        if pack_selected and check in {"capacity", "correctness"}:
+            continue
+        options = config.effective_check(check)
+        overrides = config.test_options.get(check)
+        output_field = (f"test_options.{check}.max_output_tokens" if overrides and overrides.max_output_tokens is not None
+                        else "max_output_tokens")
+        context_field = (f"test_options.{check}.context_limit" if overrides and overrides.context_limit is not None
+                         else "context_limit")
+        warn_output_space(CHECK_NAMES[check], options.get("max_output_tokens", config.max_output_tokens),
+                          options.get("context_limit", config.context_limit), output_field, context_field)
     if pack_selected and "correctness" in selected:
         count = len(config.request_pack.cases) if pack else None
         add("pack_control", count, "Sends each of your questions once. The answer and arrival checks reuse these results."
@@ -964,7 +1154,11 @@ def request_plan(config: RunConfig | ConfigDraft, *,
 
     if "context" in selected:
         context_options = config.effective_check("context")
-        context_shapes = builtin_fixtures(config.model_copy(update={**{key: value for key, value in context_options.items() if key != "limits"}, "context_limit": min(512, context_options["context_limit"])}))["context"]
+        # Bound preview construction without consuming the reserved output room.
+        preview_context = min(context_options["context_limit"], context_options["max_output_tokens"] + 512)
+        context_shapes = builtin_fixtures(config.model_copy(update={
+            **{key: value for key, value in context_options.items() if key != "limits"},
+            "context_limit": preview_context}))["context"]
         count = max(context_options["samples"], len(context_shapes))
         add("context_first_batch", count, "The first generated context batch.", title="Initial context cases")
         add("context", 0,
@@ -1000,14 +1194,17 @@ def request_plan(config: RunConfig | ConfigDraft, *,
                 kind="bounded", title="Backend cancellation verification")
     if "recovery" in selected:
         options = config.effective_check("recovery")
-        later = [name for name in config.checks if name not in CORE_CHECKS or name == "load"]
-        later_known = request_plan(config.model_copy(update={"checks": later, "restart_target": None}))["minimum_reserved_per_target"]
-        prior = sum(row["requests_per_target"] or 0 for row in rows)
-        needed = later_known + 2 * options["samples"] + max(options["limits"]["min_samples"], options["concurrency"] * 2)
-        eligible = [quota is None or quota - prior > needed for quota in quotas.values()]
-        uncertain = config.max_requests is not None and (any(row["kind"] != "exact" for row in rows) or len(set(eligible)) > 1)
-        add("recovery_prime", int(any(eligible)), "One baseline warm-up when remaining target/run budget exceeds later fixed work, both probe batches and the minimum load batch.",
-            kind="bounded" if any(eligible) and uncertain else "exact", title="Recovery baseline warm-up")
+        later_reserves = recovery_later_reserves(config)
+        minimum_recovery = 2 * options["samples"] + max(options["limits"]["min_samples"], options["concurrency"] * 2)
+        eligible = {target: int(quota is None or quota - sum(_target_count(row, target) or 0 for row in rows)
+                                > later_reserves[target][0] + minimum_recovery)
+                    for target, quota in quotas.items()}
+        different_eligibility = len(set(eligible.values())) > 1
+        uncertain = config.max_requests is not None and (any(row["kind"] != "exact" for row in rows) or different_eligibility)
+        add("recovery_prime", max(eligible.values()), "One baseline warm-up when remaining target/run budget exceeds later fixed work, both probe batches and the minimum load batch.",
+            kind="bounded" if any(eligible.values()) and uncertain else "exact", title="Recovery baseline warm-up")
+        if different_eligibility:
+            rows[-1]["target_request_counts"] = eligible
         add("recovery_baseline", options["samples"], "Matched quiet controls before sustained load.")
         add("recovery", options["samples"], "Fixed follow-up health requests after sustained load.")
         if options["sustained_seconds"] > 0:
@@ -1016,19 +1213,23 @@ def request_plan(config: RunConfig | ConfigDraft, *,
                 kind="bounded", title="Sustained load")
     if "gpu" in selected:
         add("gpu", 0, "Observes metrics without adding inference requests.", source="configured metrics endpoint")
-
     if "arrivals" in selected:
         add("arrivals", config.arrivals.requests,
             f"{config.arrivals.requests} scheduled offers; the pending queue and Limits can leave some undispatched.")
     if "prefix" in selected:
         settings = config.prefix
-        context_limit = config.effective_check("prefix")["context_limit"]
-        output_cap = min(24, config.max_output_tokens)
+        prefix_options = config.effective_check("prefix")
+        context_limit = prefix_options["context_limit"]
+        output_cap = prefix_options["max_output_tokens"]
         # Include the 32-character nonce, newline, filler/instruction and trial suffix.
         prefix_chars = len(label_prompt(settings.prefix_chars + 33 + 80)) + len("\nTrial 0000.")
         if not prefix_admitted(prefix_chars, output_cap, context_limit):
             add("prefix", 0, "Estimated prefix input plus output/template reserves exceeds context_limit; no prefix requests are admitted.")
-            warnings.append("Prefix coverage will be unfinished: estimated token admission rejects the configured prefix.")
+            warnings.append(
+                f"Prefix coverage will be unfinished: the estimated prefix input, template reserve and "
+                f"max_output_tokens={output_cap} exceed context_limit={context_limit}. Set test_options.prefix.max_output_tokens "
+                "to a smaller prefix-specific allowance, reduce max_output_tokens or prefix.prefix_chars, or set "
+                "test_options.prefix.context_limit to a larger window only if the model supports it.")
         else:
             prompt_chars = len(label_prompt(96))
             history = sum(prefix_admitted(prompt_chars * (turn + 1) + 4 * turn, output_cap, context_limit)
@@ -1080,6 +1281,21 @@ def request_plan(config: RunConfig | ConfigDraft, *,
                 "msg":"Expected scheduled Load test requests exceed the total request budget; some tests will be truncated.",
                 "values":{"expected_scheduled_requests":load_plan["expected_scheduled_requests"]*target_count,"max_requests":config.max_requests}})
         warnings.extend(w["msg"] for w in load_warnings)
+    if "multi_user" in selected:
+        from giraffe.multi_user import _planned_observation
+        settings = config.multi_user
+        windows = _planned_observation(settings, include_offers=False)["windows"]
+        for level in settings.levels:
+            phases = [window for window in windows if window["population"] == level]
+            seconds = sum(window["planned_duration_seconds"] for window in phases)
+            add(f"multi_user_{level}", None,
+                f"{level} persistent users share the run request slots across {len(phases)} explicit windows "
+                f"({seconds:g} s including warmup). Each request drains within its ordinary timeout.",
+                source="isolated conversations" if settings.conversations else "generated token-target prompts",
+                kind="duration", title=f"Multi-user · {level} users")
+            rows[-1].update(users=level, simultaneous_limit=config.concurrency,
+                            configured_seconds=seconds, window_count=len(phases), scenarios=settings.scenarios,
+                            scheduled_offers=sum(window.get("scheduled_offers", 0) for window in phases))
     if "sessions" in selected:
         settings = config.sessions
         if settings.profile == "performance":
@@ -1120,6 +1336,42 @@ def request_plan(config: RunConfig | ConfigDraft, *,
             source="configured tool fixtures" if config.tool_checks and (config.tool_checks.fixtures or conversations) else "generated examples",
             kind="bounded" if conversations else "exact")
 
+    if "gateway_access" in selected:
+        access_counts = {target.name: configured_access_probe_count(config, target) for target in config.targets}
+        counts = set(access_counts.values())
+        count = next(iter(counts)) if len(counts) == 1 else None
+        add("gateway_access", count,
+            "At most one serial request per declared case with a configured identity. "
+            "Both allow and deny evidence are required for a complete policy observation.",
+            source="declared LiteLLM access cases")
+        if count is None:
+            rows[-1]["target_request_counts"] = access_counts
+
+    if "gateway_policy" in selected:
+        settings = config.gateway_policy
+        if settings is None:
+            add("gateway_policy", 0, "Gateway policy unavailable: declare identities, policy and offered work.",
+                source="not configured", kind="exact")
+        elif not settings.supported:
+            add("gateway_policy", 0, "Gateway policy unavailable: selected gateway or capability is unsupported.",
+                source="unsupported capability", kind="exact")
+        else:
+            add("gateway_policy", sum(user.requests for user in settings.users),
+                "Bounded requests per declared identity; stops at policy duration or shared run limits.",
+                source="fixed identical non-streaming policy probes", kind="exact")
+            rows[-1].update(users=len(settings.users), simultaneous_limit=config.concurrency,
+                            configured_seconds=settings.duration_seconds)
+
+    if "gateway_attribution" in selected:
+        counts = set(attribution_counts.values())
+        count = next(iter(counts)) if len(counts) == 1 else None
+        add("gateway_attribution", count,
+            "Marked identity probes use spare request budget after shared workloads on configured endpoints."
+            if any(counts) else "Attribution is unavailable without a supported reader and all selected aliases.",
+            source="configured test identity references")
+        if count is None:
+            rows[-1]["target_request_counts"] = attribution_counts
+
     sample_counts = {}
     if "arrivals" in selected:
         sample_counts["arrivals.requests"] = config.arrivals.requests
@@ -1151,25 +1403,34 @@ def request_plan(config: RunConfig | ConfigDraft, *,
         warnings.append("Your dataset is inactive: select Answer correctness or Capacity under load to use it.")
     if config.overlap_models and target_count > 1:
         warnings.append("Models run at the same time and share Max concurrency. Their actual overlap depends on when request slots become free.")
-    known = sum(row.get("known_scheduled_requests", row["requests_per_target"] or 0
-                        if row["kind"] == "exact" else 0) for row in rows)
-    unknown = any(row["requests_per_target"] is None for row in rows)
+    known_counts, planned_counts, counted = {}, {}, {}
+    unknown = any(row["requests_per_target"] is None and not row.get("target_request_counts") for row in rows)
+    for target in quotas:
+        counts = [_target_count(row, target) for row in rows]
+        known_counts[target] = sum(row.get("known_scheduled_requests", count or 0
+                                           if row["kind"] == "exact" else 0)
+                                   for row, count in zip(rows, counts))
+        if not unknown:
+            planned_counts[target] = sum(counts)
+        counted[target] = sum(count if count is not None else row.get("expected_scheduled_requests", 0)
+                              for row, count in zip(rows, counts))
+    known = min(known_counts.values())
+    known_total = sum(known_counts.values())
+    planned = next(iter(planned_counts.values())) if len(set(planned_counts.values())) == 1 else None
+    planned_total = sum(planned_counts.values()) if planned_counts else None
     estimated = any(row["kind"] == "estimate" for row in rows)
     kind = "bounded" if unknown or any(row["kind"] == "bounded" for row in rows) else "estimate" if estimated else "exact"
-    planned = None if unknown else sum(row["requests_per_target"] for row in rows)
-    counted = sum(row["requests_per_target"] if row["requests_per_target"] is not None
-                  else row.get("expected_scheduled_requests", 0) for row in rows)
     adaptive_estimates = {}
     if config.max_requests is not None and "recovery" in selected and config.effective_check("recovery")["sustained_seconds"] > 0:
         adaptive_estimates["sustained"] = max(config.effective_check("recovery")["limits"]["min_samples"],
             config.effective_check("recovery")["concurrency"] * 2)
-    estimated_total = counted + sum(adaptive_estimates.values())
+    estimated_total = max(counted.values()) + sum(adaptive_estimates.values())
     # A workload row may contain both unknown refills and a known arrival
     # schedule. Preserve the additive schedule in the run headline as well as
     # in the drawer; Poisson expectations remain explicitly approximate.
     scheduled_extra = sum(row.get("expected_scheduled_requests", 0)
                           - row.get("known_scheduled_requests", 0) for row in rows)
-    headline_count = (known + scheduled_extra) * target_count
+    headline_count = known_total + scheduled_extra * target_count
     request_count_label = ("Unknown + " if unknown and headline_count else "Unknown" if unknown else "")
     if headline_count or not unknown:
         request_count_label += f"{'≈ ' if scheduled_extra or estimated else ''}{headline_count:,.0f}"
@@ -1179,7 +1440,9 @@ def request_plan(config: RunConfig | ConfigDraft, *,
             return "load_test.schedule.duration_seconds"
         if identifier.startswith("pack_"):
             return "request_pack.cases"
-        if identifier in {"arrivals", "prefix", "sessions", "consistency"}:
+        if identifier == "gateway_access":
+            return "gateway_access.cases"
+        if identifier in {"arrivals", "prefix", "sessions", "consistency"} | SHARED_BASELINE_EXCLUDED_WORKLOADS:
             return identifier
         if identifier == "tools":
             return "tool_checks"
@@ -1193,30 +1456,80 @@ def request_plan(config: RunConfig | ConfigDraft, *,
             return "test_options.cancellation"
         return "test_options." + ("context" if identifier == "context_first_batch" else identifier)
 
+    def required_cap(counts):
+        # A remainder slot goes to each earlier endpoint before the next one.
+        return max(((count - 1) * target_count + index + 1
+                    for index, count in enumerate(counts.values()) if count), default=0)
+
+    exact_limit = required_cap(planned_counts) if kind == "exact" else None
+    coverage_counts = planned_counts if exact_limit is not None else known_counts
+    if load_plan:
+        # Calibration has a finite attempt allowance. A suggested budget must
+        # cover that allowance as well as scheduled work.
+        calibration = sum(row["requests_per_target"] or 0 for row in rows if row["id"] == "load_calibration")
+        coverage_counts = {target: math.ceil(planned_counts[target] if planned_counts else count + calibration)
+                           for target, count in known_counts.items()}
+    required = required_cap(coverage_counts)
+
+    compatibility_quotas, compatibility_attempts = {}, {}
+    gateway_rows = [row for row in rows if row["id"] in SHARED_BASELINE_EXCLUDED_WORKLOADS]
+    if config.stream and gateway_rows:
+        gateway_only = gateway_identities_only(selected)
+        for target in config.targets:
+            restart = config.restart_target == target.name
+            probes = sum(_target_count(row, target.name) or 0 for row in gateway_rows)
+            if not probes or (restart and not target.restart_command) or (gateway_only and not restart):
+                continue
+            initial_count = int(initial and not restart)
+            shared_reserve = token_evidence_request_reserve(rows, target=target.name)
+            compatibility_floor = max(initial_count + 1, shared_reserve)
+            count = max(coverage_counts[target.name], shared_reserve + probes) - int(initial and restart)
+            # The runtime skips setup below this floor. Above it, the gateway
+            # probes may need extra quota to allow for the bounded setup retries.
+            if count > compatibility_floor:
+                compatibility_quotas[target.name] = count + MAX_TOKEN_EVIDENCE_PROBE_ATTEMPTS
+                quota = quotas[target.name]
+                if quota is not None:
+                    compatibility_attempts[target.name] = min(MAX_TOKEN_EVIDENCE_PROBE_ATTEMPTS,
+                                                              max(0, quota - compatibility_floor))
+    compatibility_limit = required_cap(coverage_counts | compatibility_quotas) if compatibility_quotas else None
+    attribution_limit = compatibility_limit if any(attribution_counts[target] for target in compatibility_quotas) else None
+    required = max(required, compatibility_limit or 0)
+
     request_warnings = []
+    affected_targets = []
     for target, quota in quotas.items():
         if quota is None:
             continue
-        if known > quota or planned is not None and planned > quota:
-            elapsed, cut = 0, []
+        compatibility_risk = compatibility_quotas.get(target, 0) > quota
+        if known_counts[target] > quota or planned_counts.get(target, 0) > quota or compatibility_risk:
+            elapsed, cut, fixed_cut = 0, [], False
+            affected_targets.append((target, quota))
             for row in rows:
-                row_count = row["requests_per_target"] or row.get("known_scheduled_requests", 0)
+                row_count = _target_count(row, target) or row.get("known_scheduled_requests", 0)
                 elapsed += row_count
-                if elapsed > quota and row_count:
+                if not row_count:
+                    continue
+                if elapsed > quota:
                     cut.append(row)
-            required = planned * target_count if kind == "exact" else known * target_count
-            if load_plan:
-                # Calibration has a finite attempt allowance. A suggested
-                # budget must cover that allowance as well as scheduled work.
-                required = math.ceil(planned if planned is not None else known + sum(
-                    row["requests_per_target"] or 0 for row in rows
-                    if row["id"] == "load_calibration")) * target_count
+                    fixed_cut = True
+                elif (compatibility_risk and row["id"] in SHARED_BASELINE_EXCLUDED_WORKLOADS
+                      and elapsed + compatibility_attempts[target] > quota):
+                    cut.append(row)
+            if compatibility_risk and not cut:
+                cut.append(next(row for row in reversed(gateway_rows) if _target_count(row, target)))
             fields = list(dict.fromkeys(["max_requests", *[edit_field(row) for row in cut]]))
             titles = list(dict.fromkeys(_warning_title(row) for row in cut))
             edits = list({(action["label"], action["field"]): action for action in [
                 {"label": f"Edit {_warning_title(row)}", "field": edit_field(row)} for row in cut]}.values())
-            message = (f"{target}: incomplete coverage for {', '.join(titles)}; "
-                       f"the planned requests exceed this endpoint's share of the request limit (Maximum requests: {quota:,}).")
+            if fixed_cut or not compatibility_risk:
+                message = (f"{target}: incomplete coverage for {', '.join(titles)}; "
+                           f"the planned requests exceed this endpoint's share of the request limit (Maximum requests: {quota:,}).")
+            else:
+                message = f"{target}: {', '.join(titles)} may run out of request quota (Maximum requests: {quota:,})."
+            if compatibility_risk:
+                message += (f" Allow for up to {MAX_TOKEN_EVIDENCE_PROBE_ATTEMPTS} streamed compatibility attempts "
+                            "before the optional gateway probes.")
             request_warnings.append({"kind": "incomplete_coverage", "fields": fields,
                 "values": {"max_requests": config.max_requests, "required_request_limit": required, "quota": quota},
                 "cut_checks": [row["id"] for row in cut], "msg": message,
@@ -1241,8 +1554,6 @@ def request_plan(config: RunConfig | ConfigDraft, *,
                     "fields": list(dict.fromkeys(field for item in notices for field in item["fields"]))}
         if warning_kind == "incomplete_coverage":
             combined["cut_checks"] = list(dict.fromkeys(check for item in notices for check in item["cut_checks"]))
-            affected_targets = [(target, quota) for target, quota in quotas.items()
-                                if quota is not None and (known > quota or planned is not None and planned > quota)]
             combined["targets"] = [{"target": target, "quota": quota, "cut_checks": item["cut_checks"]}
                                    for (target, quota), item in zip(affected_targets, notices)]
             combined["values"] = {**combined["values"], "quotas": quotas}
@@ -1279,7 +1590,9 @@ def request_plan(config: RunConfig | ConfigDraft, *,
     return {**timing, "arrival_history": arrival_history, "correctness_history": correctness_history,
             "count_kind": kind, "planned_per_target": planned,
             **({"request_count_label": request_count_label} if load_plan else {}),
-            "planned_total": planned * target_count if planned is not None else None,
+            "planned_total": planned_total,
+            **({"planned_target_counts": planned_counts} if planned_counts and planned is None else {}),
+            **({"known_target_counts": known_counts} if len(set(known_counts.values())) > 1 else {}),
             "conservative_requests_per_target": estimated_total, "adaptive_estimates": adaptive_estimates,
             "load_test": load_plan,
             "request_settings": {check: (config.effective_check(check) | {
@@ -1290,15 +1603,19 @@ def request_plan(config: RunConfig | ConfigDraft, *,
                                          else config.effective_check(check)) for check in config.checks},
             "initial_request_settings": config.effective_initial(),
             "baseline_comparison": {"regression_percent": config.limits.regression_percent,
-                                    "field": "limits.regression_percent"},
+                                    "regression_rate_points": config.limits.regression_rate_points,
+                                    "field": "limits.regression_percent",
+                                    "fields": {"timing": "limits.regression_percent",
+                                               "rates": "limits.regression_rate_points"}},
             "configured_load_seconds": load_plan.get("configured_load_seconds", 0),
             "load_warnings": load_warnings, "concurrency_warnings": concurrency_warnings,
             "capacity_warnings": capacity_warnings,
             "required_concurrency": required_concurrency(config),
             "minimum_reserved_per_target": known + (minimum_reservation(config.load_test) if load_plan else 0),
-            "known_per_target": known, "known_total": known * target_count,
+            "known_per_target": known, "known_total": known_total,
             "request_warnings": request_warnings, "request_limit": config.max_requests, "memory_limit_bytes": config.max_memory_mb * 1024**2,
             "memory_limit_label": "Maximum memory (RAM growth during this run)",
-            "required_request_limit": planned * target_count if kind == "exact" else None,
+            "required_request_limit": exact_limit,
+            **({"attribution_request_limit": attribution_limit} if attribution_limit is not None else {}),
             "target_quotas": quotas, "rows": rows, "bucket_cases": bucket_cases,
             "bucket_levels": bucket_levels, "evaluator": evaluator, "warnings": warnings}

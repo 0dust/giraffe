@@ -608,3 +608,15 @@ def test_tool_evaluation_inconclusive_propagates_without_hiding_failures(other_o
     assert result.metrics['missing_cases'] == []
     assert result.metrics['outcomes'][0]['calls']['status'] == 'inconclusive'
     assert result.status == ('inconclusive' if other_outcome == 'pass' else 'fail')
+
+
+async def test_prefix_requests_use_prefix_output_override():
+    with FakeEndpoint() as endpoint:
+        settings = config(endpoint, max_output_tokens=2048, context_limit=4096,
+                          prefix={"prefix_chars": 256, "repeats": 2, "history_turns": 2},
+                          test_options={"prefix": {"max_output_tokens": 32}})
+        await run_suite(settings)
+        budgets = {p["max_tokens"] for p in endpoint.requests if "Trial" in p["messages"][0]["content"]}
+        assert budgets == {32}
+        sent = [p for p in endpoint.requests if "Trial" in p["messages"][0]["content"]]
+        assert sent

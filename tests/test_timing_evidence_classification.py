@@ -4,7 +4,7 @@ import pytest
 
 from giraffe import runner
 from giraffe.client import REASONING_BUDGET_ERROR
-from giraffe.models import Limits, RequestRecord
+from giraffe.models import CheckResult, Limits, RequestRecord
 from tests.test_runner import config
 
 
@@ -68,3 +68,78 @@ def test_single_token_answer_does_not_supply_generation_pace_sample():
     assert result.metrics["completed"] == 2
     assert result.metrics["generation_rate_samples"] == 1
     assert "missing_timing_metrics" not in result.metrics
+
+
+@pytest.mark.parametrize("reasoning_tokens", [None, 0])
+@pytest.mark.parametrize("streamed_logprobs", [False, True])
+def test_reasoning_without_usage_breakdown_explains_generation_limit(
+        reasoning_tokens, streamed_logprobs):
+    events = [{"kind": "reasoning", "token_count": 2},
+              {"kind": "answer", "token_count": 4}] if streamed_logprobs else []
+    records = [answer(str(index), "generation", reasoning="thinking", output_tokens=None,
+        completion_tokens=11, reasoning_tokens=reasoning_tokens, output_events=events,
+        first_read_output_tokens=1, last_read_output_tokens=4,
+        read_output_tokens_source="logprobs" if streamed_logprobs else None)
+        for index in range(2)]
+
+    result = assess("generation", records, min_output_tokens_per_second=1)
+
+    assert result.status == "inconclusive"
+    assert result.metrics["generation_rate_samples"] == 0
+    assert result.metrics["missing_timing_metrics"] == ["generation_tokens_per_second"]
+    assert "reasoning-token usage breakdown" in result.finding_summary
+    assert "reports reasoning-token usage separately" in result.summary
+    # Separated reasoning usage alone cannot yield pace without counts at answer reads.
+    assert ("enable streamed logprobs" in result.summary) is not streamed_logprobs
+    assert "disable response buffering" not in result.summary
+    assert all(record.output_tokens is None for record in records)
+    assert result.remediation == {"action": "review_check", "check": "generation",
+                                  "code": "unseparated_reasoning_tokens"}
+    assert CheckResult.model_validate_json(result.model_dump_json()) == result
+
+
+def test_reasoning_limit_keeps_remedy_for_other_missing_timing():
+    records = [answer(str(index), "generation", reasoning="thinking", output_tokens=None,
+        completion_tokens=11, read_output_tokens_source="logprobs", max_stream_gap_ms=None,
+        answer_reads=1) for index in range(2)]
+
+    result = assess("generation", records, min_output_tokens_per_second=1, stream_gap_ms=500)
+
+    assert result.metrics["missing_timing_metrics"] == ["generation_tokens_per_second", "stream_gap_ms"]
+    assert result.metrics["reason_code"] == "unseparated_reasoning_tokens"
+    assert "reports reasoning-token usage separately" in result.summary
+    assert "disable response buffering along the route" in result.summary
+    assert "enable streamed logprobs" not in result.summary
+
+
+def test_reasoning_without_any_usage_retains_stream_evidence_remedy():
+    records = [answer(str(index), "generation", reasoning="thinking", output_tokens=None,
+        completion_tokens=None, reasoning_tokens=None) for index in range(2)]
+
+    result = assess("generation", records, min_output_tokens_per_second=1)
+
+    assert result.status == "inconclusive"
+    assert result.metrics.get("reason_code") != "unseparated_reasoning_tokens"
+    assert "enable streamed logprobs" in result.summary
+    assert "reasoning-token usage breakdown" not in result.finding_summary
+
+
+def test_mixed_missing_counts_retain_stream_evidence_remedy():
+    records = [answer("0", "generation", reasoning="thinking", output_tokens=None, completion_tokens=11),
+               answer("1", "generation", output_tokens=None)]
+
+    result = assess("generation", records, min_output_tokens_per_second=1)
+
+    assert result.status == "inconclusive"
+    assert result.metrics.get("reason_code") != "unseparated_reasoning_tokens"
+    assert "enable streamed logprobs" in result.summary
+
+
+def test_plain_output_missing_counts_retains_stream_evidence_remedy():
+    records = [answer(str(index), "generation", output_tokens=None) for index in range(2)]
+
+    result = assess("generation", records, min_output_tokens_per_second=1)
+
+    assert result.status == "inconclusive"
+    assert "enable streamed logprobs" in result.summary
+    assert "reasoning-token usage breakdown" not in result.finding_summary

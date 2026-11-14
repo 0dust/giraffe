@@ -7,6 +7,7 @@ import gc
 import hashlib
 import json
 import logging
+import math
 import os
 import queue
 import re
@@ -58,7 +59,7 @@ from giraffe.conditions import ConditionRequestIndex, aggregate_conditions, cond
 from giraffe.deployment import safe_config
 from giraffe.fixtures import load_custom_fixtures
 from giraffe.latency import load_observations
-from giraffe.models import (ConfigDraft, CleanupCriteria, Model, RequestRecord, RunConfig, RunReport,
+from giraffe.models import (ConfigDraft, CleanupCriteria, Model, RequestRecord, RunConfig, RunReport, ScaleDownMarker,
                             migrate_concurrent_load, migrate_load_test, migrate_run_limits)
 from giraffe.planning import request_plan
 from giraffe.open_files import open_file_guard
@@ -80,6 +81,7 @@ from giraffe.storage import (DEFAULT_LIMITS, apply_cleanup, automatic_cleanup, c
 
 logger = logging.getLogger(__name__)
 _EVENT_WAIT_SECONDS = 10.0
+_SCALE_DOWN_ACK_SECONDS = 5.0
 _RECOVERY_SECONDS = 5.0
 _FINALIZE_SECONDS = 12.0
 _PARTIAL_REPORT_SECONDS = 30.0
@@ -222,22 +224,17 @@ class _ReportProcess:
         with self.lock:
             if self.process is None or self.process.poll() is not None:
                 self.close()
-                package_root = str(Path(__file__).resolve().parent.parent)
-                env = os.environ.copy()
-                env["PYTHONPATH"] = os.pathsep.join(p for p in (package_root, env.get("PYTHONPATH")) if p)
+                import giraffe
+                package_file = str(Path(giraffe.__file__).resolve())
+                # Pin only Giraffe; do not promote its site-packages over stdlib.
                 self.process = subprocess.Popen([sys.executable, "-P", "-c",
-                    "import os,sys; protocol=os.fdopen(os.dup(1),'wb'); "
+                    "import importlib.util,os,sys; protocol=os.fdopen(os.dup(1),'wb'); "
                     "os.dup2(2,1); sys.stdout=sys.stderr; "
-                    f"package_root = {package_root!r}\n"
-                    # PYTHONPATH places wheel directories ahead of the stdlib;
-                    # restore their normal precedence without duplicate entries.
-                    "if os.path.basename(package_root) in ('site-packages', 'dist-packages'):\n"
-                    "    sys.path[:] = [p for p in sys.path if p != package_root]\n"
-                    "    sys.path.append(package_root)\n"
-                    "elif package_root not in sys.path:\n"
-                    "    sys.path.insert(0, package_root)\n"
+                    f"spec=importlib.util.spec_from_file_location('giraffe',{package_file!r}); "
+                    "package=importlib.util.module_from_spec(spec); "
+                    "sys.modules['giraffe']=package; spec.loader.exec_module(package); "
                     "from giraffe.web import _report_process_main; _report_process_main(protocol)"],
-                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=env)
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE)
                 self.release = weakref.finalize(self, _close_report_process, self.process)
                 needs_identity = True
             else:
@@ -409,6 +406,7 @@ class _RunThread:
         self.cancelling = threading.Event()
         self.cancel_delivered = False
         self.operation = operation
+        self.scale_down_control = None
         self.thread = None
         self.context = None
         self.owns_loop = owner is None
@@ -417,6 +415,55 @@ class _RunThread:
     def start(self):
         self.context = copy_context()
         self.owner.submit(self)
+
+    def bind_scale_down_control(self, control):
+        """Called by the suite on this worker's loop, never the API loop."""
+        if asyncio.get_running_loop() is not self.loop:
+            raise RuntimeError("Scale-down control must belong to the measurement loop")
+        self.scale_down_control = control
+
+    async def submit_scale_down_marker(self, marker, *, timeout=_SCALE_DOWN_ACK_SECONDS):
+        acknowledgment = Future()
+
+        def deliver():
+            if not acknowledgment.set_running_or_notify_cancel():
+                return
+            try:
+                if (self.stopping.is_set() or self.future.done() or self.task is None
+                        or self.task.done() or self.scale_down_control is None):
+                    result = dict(accepted=False, event_id=marker.get("event_id"),
+                        reason="The scale-down scenario is unavailable or stopping.",
+                        received_ms=None, accepted_ms=None, marker=marker)
+                else:
+                    result = self.scale_down_control.accept_marker(marker)
+                acknowledgment.set_result(result)
+            except Exception as error:
+                acknowledgment.set_exception(error)
+
+        loop = self.loop
+        if loop is None or loop.is_closed():
+            return dict(accepted=False, event_id=marker.get("event_id"),
+                reason="The scale-down scenario is unavailable or finished.",
+                received_ms=None, accepted_ms=None, marker=marker)
+        try:
+            loop.call_soon_threadsafe(deliver)
+        except RuntimeError:
+            return dict(accepted=False, event_id=marker.get("event_id"),
+                reason="The scale-down scenario is finished.",
+                received_ms=None, accepted_ms=None, marker=marker)
+        waiting = _completion_future(acknowledgment)
+        try:
+            return await asyncio.wait_for(asyncio.shield(waiting), timeout)
+        except asyncio.CancelledError:
+            acknowledgment.cancel()
+            raise
+        except TimeoutError:
+            # Prevent an undelivered callback from accepting after its caller
+            # times out. A delivery already running may still have an ACK.
+            acknowledgment.cancel()
+            if acknowledgment.done() and not acknowledgment.cancelled():
+                return acknowledgment.result()
+            raise
 
     def request_stop(self, *, cancel=False):
         self.stopping.set()
@@ -504,6 +551,12 @@ def _track_live_request(job: dict, event: dict, max_requests: int | None) -> Non
         request = {**event["request"], "slot": slot, "intentional": event.get("intentional", False)}
     else:
         return
+    if isinstance(event.get("user"), dict):
+        request["workload"] = {key: value for key, value in event["user"].items()
+                               if key in {"user_id", "population", "profile", "window_id", "phase", "request_sequence", "session_id", "turn_id", "conversation_sequence", "role", "matched_work_sequence", "trigger", "heavy_profile", "cancellation_role", "cohort", "origin", "work_sequence", "activation_seconds"}
+                               and (type(value) is int or isinstance(value, str) and len(value) <= 128
+                                    or key == "activation_seconds" and type(value) is float
+                                    and math.isfinite(value) and value >= 0)}
     request.update({key: event.get(key) for key in
                     ("input_chars", "requested_max_tokens", "requested_input_tokens")})
     if summary["through_slot"] is not None and slot <= summary["through_slot"]:
@@ -560,9 +613,10 @@ def _track_live_progress(job: dict, event: dict, max_requests: int | None) -> No
         plan = job.get("condition_plans", {}).get(key)
         if plan and plan.get("planned_reason"):
             summary = {**summary, "planned_reason": plan["planned_reason"]}
-        if plan and plan.get("planned") is not None and (summary.get("planned") is None or summary["planned"] < plan["planned"]):
-            # Some executors announce successive one-request groups. Keep the
-            # full configured condition denominator, without altering dispatch.
+        if (key[1] != "gateway_access" and plan and plan.get("planned") is not None
+                and (summary.get("planned") is None or summary["planned"] < plan["planned"])):
+            # Some executors announce successive one-request groups. Access
+            # requalifies credentials and announces the entire eligible set.
             summary = {**summary, "planned": plan["planned"], "planned_kind": plan["planned_kind"]}
         summary = {**summary, **{key: value for key, value in condition_aggregate(summary).items()
                    if key not in {"status", "lifecycle_status"}}}
@@ -724,7 +778,8 @@ def _merged_condition_rows(planned: list[dict], observed: list[dict], *, termina
         key = (observed_row.get("target"), (observed_row.get("condition") or {}).get("id"))
         prior = rows.get(key, {})
         row = {**prior, **observed_row}
-        if prior.get("planned") is not None and (row.get("planned") is None or row["planned"] < prior["planned"]):
+        if (key[1] != "gateway_access" and prior.get("planned") is not None
+                and (row.get("planned") is None or row["planned"] < prior["planned"])):
             row.update(planned=prior["planned"], planned_kind=prior["planned_kind"])
         rows[key] = row
     result = []
@@ -919,6 +974,8 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
         if job is not active or job.get("terminal"):
             return
         _track_live_progress(job, event, max_requests)
+        if "scale_down_control" in event:
+            job["scale_down_control"] = deepcopy(event["scale_down_control"])
         job["seq"] += 1
         event = {key: value for key, value in event.items() if key != "performance"}
         event["seq"] = job["seq"]
@@ -1288,6 +1345,23 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
         snapshot = snapshot or {}
         live = snapshot if snapshot.get("id") == identifier else {}
         state = live.get("state", meta.get("state", "completed"))
+        control = live.get("scale_down_control", meta.get("scale_down_control"))
+        if control is None and not live and not listing:
+            from .scale_down_control import MAX_STATUS_BYTES, STATUS_FILE, _read as read_control
+            try:
+                candidate = read_control(directory / STATUS_FILE, MAX_STATUS_BYTES)
+                expected_run = (persisted or summary or {}).get("run_id") or meta.get("run_id")
+                config = meta.get("config") or (persisted or {}).get("manifest", {}).get("config", {})
+                expected_target = (config.get("scale_down") or {}).get("target")
+                if (all(isinstance(candidate.get(key), str) and 0 < len(candidate[key]) <= 256
+                        for key in ("run_id", "target", "nonce", "phase"))
+                        and (expected_run is None or candidate["run_id"] == expected_run)
+                        and (expected_target is None or candidate["target"] == expected_target)
+                        and (state in {"running", "queued", "stopping"} or candidate["phase"] == "finished")):
+                    control = {key: candidate.get(key) for key in
+                               ("run_id", "target", "nonce", "phase", "acknowledgment")}
+            except (OSError, ValueError, UnicodeError):
+                pass  # A missing, partial or unsafe standalone status is unavailable.
         condition_rows = list(live["conditions"].values()) if live.get("conditions") else meta.get("conditions", [])
         if not listing:
             condition_rows = _merged_condition_rows(condition_rows, (persisted or {}).get("conditions", []),
@@ -1302,6 +1376,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                 "error": meta.get("error"), "error_id": meta.get("error_id"),
                 "seq": live.get("seq", meta.get("seq", 0)),
                 "progress": live.get("progress", meta.get("progress", {})),
+                "scale_down_control": control,
                 "events": live.get("events", meta.get("events", [])),
                 "live_preparations": list(live["live_preparations"].values()) if "live_preparations" in live else meta.get("live_preparations", []),
                 "live_requests": list(live.get("requests", {}).values()),
@@ -1478,7 +1553,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
             # Completed request payloads are newly dumped, owned dictionaries.
             # Lifecycle dictionaries still share nested counters with the runner.
             event = dict(event)
-            for key in ("condition", "condition_summary", "preparation"):
+            for key in ("condition", "condition_summary", "preparation", "scale_down_control", "scale_down", "scale_down_snapshots"):
                 if key in event:
                     event[key] = deepcopy(event[key])
             writer.progress(event)
@@ -1536,7 +1611,9 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                 try:
                     with _measurement_gc() as pauses:
                         try:
-                            report = await run_suite(config, progress=progress, stop_event=stop)
+                            report = await run_suite(config, progress=progress, stop_event=stop,
+                                **({"on_scale_down_control": job["worker"].bind_scale_down_control}
+                                   if "scale_down" in config.checks else {}))
                         except asyncio.CancelledError as error:
                             report = getattr(error, "giraffe_report", None)
                             if report is None:
@@ -1632,7 +1709,8 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                             live_preparations=list(job.get("live_preparations", {}).values()),
                             conditions=list(job["conditions"].values()),
                             live_request_summary=job["live_request_summary"],
-                            live_request_count=job["live_request_count"])
+                            live_request_count=job["live_request_count"],
+                            scale_down_control=job.get("scale_down_control"))
                 status_warning_added = False
 
                 def persist_final():
@@ -1979,7 +2057,8 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                     except FileNotFoundError:
                         return None
                 key = ("detail-wire", str(path), _file_revision(path),
-                       revision(".web.json"), revision("summary.json"), revision(".keep"))
+                       revision(".web.json"), revision("summary.json"), revision(".keep"),
+                       revision(".scale-down-status.json"))
                 if path.stat().st_size >= _ISOLATED_REPORT_BYTES and not _IN_REPORT_PROCESS:
                     status, body = _report_cache.get(key, _helper_response_cost,
                         lambda: report_process.read(root, identifier, "detail"))
@@ -2003,9 +2082,11 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                         detail = await run_in_threadpool(run_detail, identifier)
                     if detail["state"] in {"running", "queued", "stopping"}:
                         return {"seq": detail["seq"], "reset": False, "idle": True,
-                                "events": [], "records": [], "checks": [], "state": detail["state"]}
+                                "events": [], "records": [], "checks": [], "state": detail["state"],
+                                "scale_down_control": detail.get("scale_down_control")}
                 return {"seq": detail["seq"], "reset": True, "events": [], "records": [], "checks": [],
-                        "state": detail["state"], "error": detail.get("error")}
+                        "state": detail["state"], "error": detail.get("error"),
+                        "scale_down_control": detail.get("scale_down_control")}
             seq = feed["seq"]
             oldest = feed["deltas"][0]["seq"] if feed["deltas"] else seq + 1
             reset = after < oldest - 1 or after > seq
@@ -2046,6 +2127,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
         return {"seq": seq, "reset": reset, "events": events, "records": list(records.values()),
                 "checks": list(checks.values()), "state": feed["state"],
                 "progress": feed["progress"], "live_request_count": feed["live_request_count"],
+                "scale_down_control": feed.get("scale_down_control", feed["meta"].get("scale_down_control")),
                 "live_request_summary": feed["live_request_summary"],
                 "live_preparations": list(feed["live_preparations"].values()),
                 "phases": feed["phases"], "abort_reason": feed["meta"].get("abort_reason"),
@@ -2161,6 +2243,17 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
         return JSONResponse(config, headers={
             "Content-Disposition": f'attachment; filename="giraffe-{identifier}-config.json"',
         })
+
+    @app.post("/api/runs/{identifier}/scale-down/event")
+    async def mark_scale_down(identifier: str, body: ScaleDownMarker):
+        if active.get("id") != identifier:
+            raise HTTPException(409, "The requested run is not active")
+        worker = active["worker"]
+        try:
+            return await worker.submit_scale_down_marker(body.model_dump(mode="json"),
+                                                        timeout=_SCALE_DOWN_ACK_SECONDS)
+        except TimeoutError:
+            raise HTTPException(504, "No worker acknowledgment received; inspect run status before retrying") from None
 
     @app.post("/api/runs/{identifier}/cancel")
     async def cancel_run(identifier: str):

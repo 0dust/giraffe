@@ -189,13 +189,27 @@ class StageEvidence:
     offer_lags_ms: tuple[float | None, ...] = ()
 
 
+@dataclass(frozen=True)
+class ExplicitTrafficStage:
+    """Runtime settings for a stage whose caller has already built its offers."""
+
+    duration_seconds: float
+    max_in_flight: int
+    scheduler_lag_tolerance_ms: float
+    drain_timeout_seconds: float | None = None
+    arrival: str = "steady"
+
+
 async def run_stage(
     *,
-    traffic: TrafficConfig,
+    traffic: TrafficConfig | ExplicitTrafficStage,
     rate_rps: float,
     stage_index: int,
     fixtures: dict[str, list[RequestSpec]],
-    execute: Callable[[RequestSpec, Callable[[RequestRecord], None]], Awaitable[RequestRecord | None]],
+    execute: (
+        Callable[[RequestSpec, Callable[[RequestRecord], None]], Awaitable[RequestRecord | None]]
+        | Callable[[RequestSpec, Callable[[RequestRecord], None], Callable[[], bool]], Awaitable[RequestRecord | None]]
+    ),
     reserve_offer: Callable[[], bool],
     try_acquire: Callable[[], bool],
     release: Callable[[], None],
@@ -225,12 +239,15 @@ async def run_stage(
     calls its second argument to annotate the terminal record before persisting
     or returning it. It must finish promptly after cancellation, returning that record or
     attaching it as ``giraffe_record`` to the propagated CancelledError.
+    Explicit stages also pass an eligibility check to call before transport dispatch.
     ``on_drop`` reports reserved offers that never dispatch, including tasks
     cancelled before starting; unreserved schedule entries are not drops.
     """
     if traffic.max_in_flight is None:
         raise ValueError("resolve traffic.max_in_flight against the global bound first")
     if schedule_override is None:
+        if isinstance(traffic, ExplicitTrafficStage):
+            raise ValueError("an explicit traffic stage requires a finite offer schedule")
         schedule, overflow = arrival_schedule(traffic, rate_rps, stage_index)
     else:
         schedule, overflow = schedule_override, len(schedule_override) > MAX_PLANNED_ARRIVALS
@@ -256,6 +273,8 @@ async def run_stage(
         rate=None if schedule_pattern == "bursts" else rate_rps,
     )
     stage_end = started_at + traffic.duration_seconds
+    stage_cutoff = min(stage_end, deadline)
+    explicit = isinstance(traffic, ExplicitTrafficStage)
     sending_finished_at = None
     offer_lags_ms = [None] * len(schedule)
     outcomes = ["not_offered"] * len(schedule)
@@ -266,7 +285,7 @@ async def run_stage(
     reasons = []
     peak = 0
     execution_errors = 0
-    discard_through = -1.0
+    discard_through = -math.inf if explicit else -1.0
     stalls: list[tuple[float, float]] = []
     interrupted = overflow
     drain_expired = False
@@ -285,14 +304,41 @@ async def run_stage(
 
     def missed_arrival(offset: float, now: float) -> bool:
         nonlocal discard_through
-        if (now - started_at - offset) * 1000 > traffic.scheduler_lag_tolerance_ms:
+        elapsed = now - started_at
+        # Compare explicit offers on the same clock used to wake their tasks.
+        due = started_at + offset if explicit else offset
+        late = (now > due + traffic.scheduler_lag_tolerance_ms / 1000
+                if explicit else (elapsed - offset) * 1000 > traffic.scheduler_lag_tolerance_ms)
+        if late:
             # Discard the entire already-due backlog after an excessive stall,
             # rather than replaying it in a catch-up burst. Close Poisson
             # arrivals within the explicit tolerance are legitimate clusters;
             # the next random gap is not a scheduler lateness threshold.
-            discard_through = max(discard_through, now - started_at)
-            stalls.append((offset, now - started_at))
-        return offset <= discard_through
+            discard_through = max(discard_through, now if explicit else elapsed)
+            stalls.append((offset, elapsed))
+        return due <= discard_through
+
+    def blocked_offer(offset: float, now: float, *, refused: bool = False) -> str | None:
+        if not explicit:
+            return "dropped_late" if missed_arrival(offset, now) else None
+        if interruption() is not None:
+            return "not_offered"
+        cutoff = stage_cutoff if sending_finished_at is None else sending_finished_at
+        if refused or now >= cutoff:
+            # A closed window takes precedence when it precedes the lag limit.
+            # The public ledger keeps reserved offers that did not dispatch.
+            late = (started_at+offset+traffic.scheduler_lag_tolerance_ms/1000 < cutoff
+                    and missed_arrival(offset, now))
+            return "dropped_late" if late else "not_offered"
+        return "dropped_late" if missed_arrival(offset, now) else None
+
+    def finish_sending() -> float:
+        nonlocal sending_finished_at
+        if sending_finished_at is None:
+            now = time.monotonic()
+            sending_finished_at = max(started_at, min(now, stage_cutoff)) if explicit else now
+            intent.begin_drain(sending_finished_at)
+        return sending_finished_at
 
     def drop(index: int, outcome: str):
         outcomes[index] = outcome
@@ -301,7 +347,7 @@ async def run_stage(
             if on_drop:
                 on_drop()
 
-    def annotate(kind: str, offset: float, lag_ms: float, record: RequestRecord):
+    def annotate(index: int, kind: str, offset: float, lag_ms: float, record: RequestRecord):
         record.traffic_stage = stage_index
         record.traffic_rate_rps = rate_rps
         record.traffic_class = kind
@@ -310,6 +356,8 @@ async def run_stage(
             clock_start = record.timing_start_ms if record.timing_start_ms is not None else record.dispatch_ms
             if clock_start is not None:
                 lag_ms = max(lag_ms, clock_start-record.scheduled_ms)
+        if explicit:
+            offer_lags_ms[index] = lag_ms
         record.dispatch_lag_ms = lag_ms
         record.arrival_first_output_ms = (lag_ms + record.first_output_ms
                                            if record.first_output_ms is not None else None)
@@ -327,8 +375,8 @@ async def run_stage(
         dispatched = time.monotonic()
         lag_ms = max(0.0, (dispatched - started_at - offset) * 1000)
         offer_lags_ms[index] = lag_ms
-        if missed_arrival(offset, dispatched):
-            drop(index, "dropped_late")
+        if outcome := blocked_offer(offset, dispatched):
+            drop(index, outcome)
             return
         outcomes[index] = "started"
         try:
@@ -337,9 +385,35 @@ async def run_stage(
             })
             if run_start is not None:
                 spec.workload = {**spec.workload, "scheduled_ms": (started_at - run_start + offset) * 1000}
-            record = await execute(spec, lambda record: annotate(kind, offset, lag_ms, record))
+            def annotate_record(record):
+                annotate(index, kind, offset, lag_ms, record)
+
+            refusal = None
+            if explicit:
+                ready = time.monotonic()
+                lag_ms = max(0.0, (ready - started_at - offset) * 1000)
+                offer_lags_ms[index] = lag_ms
+                if outcome := blocked_offer(offset, ready):
+                    drop(index, outcome)
+                    return
+
+                def check_admission():
+                    nonlocal refusal
+                    now = time.monotonic()
+                    refusal = blocked_offer(offset, now)
+                    if refusal is not None:
+                        offer_lags_ms[index] = max(0.0, (now - started_at - offset) * 1000)
+                    return refusal is None
+
+                record = await execute(spec, annotate_record, check_admission)
+            else:
+                record = await execute(spec, annotate_record)
             if record is None:
-                drop(index, "not_offered")
+                if explicit and refusal is None:
+                    refused = time.monotonic()
+                    offer_lags_ms[index] = max(0.0, (refused-started_at-offset)*1000)
+                    refusal = blocked_offer(offset, refused, refused=True)
+                drop(index, refusal or "not_offered")
                 return
             records.append((index, record))
         except asyncio.CancelledError as exc:
@@ -347,6 +421,8 @@ async def run_stage(
             record = getattr(exc, "giraffe_record", None)
             if record is not None:
                 records.append((index, record))
+            elif explicit:
+                drop(index, "not_offered")
         except Exception:
             # Backend normally records exceptions. Keep a truthful failure if a
             # callback unexpectedly escapes without leaking transport text.
@@ -374,8 +450,8 @@ async def run_stage(
                     break
                 now = time.monotonic()
                 offer_lags_ms[index] = max(0, (now - started_at - offset) * 1000)
-                if missed_arrival(offset, now):
-                    drop(index, "dropped_late")
+                if outcome := blocked_offer(offset, now):
+                    drop(index, outcome)
                     continue
                 active = sum(not task.done() for task in tasks)
                 if active >= traffic.max_in_flight or not try_acquire():
@@ -394,8 +470,7 @@ async def run_stage(
                     reasons.append(reason)
                     interrupted = True
 
-        sending_finished_at = time.monotonic()
-        intent.begin_drain(sending_finished_at)
+        sending_finished_at = finish_sending()
         drain_deadline = (deadline if traffic.drain_timeout_seconds is None else
                           min(deadline, sending_finished_at + traffic.drain_timeout_seconds))
         while tasks:
@@ -413,9 +488,7 @@ async def run_stage(
         reasons.append("Traffic stage cancelled.")
         interrupted = True
     finally:
-        if sending_finished_at is None:
-            sending_finished_at = time.monotonic()
-        intent.begin_drain(sending_finished_at)
+        finish_sending()
         # Copy: task completion callbacks remove tasks from the live set.
         pending = list(tasks)
         for task in pending:

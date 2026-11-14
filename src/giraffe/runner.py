@@ -7,25 +7,28 @@ import hashlib
 import json
 import logging
 import math
+import re
 import platform
 import socket
+import ssl
 import time
 import uuid
 from collections import Counter, defaultdict
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager, nullcontext
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Literal
 
 import httpx
 
 from . import __version__
 from .client import LLMClient, no_response_failure
-from .conditions import condition_aggregate, condition_for, request_status
+from .conditions import condition_aggregate, condition_for, request_status, scheduled_multi_user_window
 from .deployment import fixture_hash
 from .fixtures import (FIXTURE_VERSION, builtin_fixtures, load_custom_fixtures,
                        score_response, traffic_fixtures, deterministic_options, reasoning_budget)
+from .identities import gateway_identities_only
 from .overlap import NEEDS_STREAM, max_evidenced_overlap, scheduling_delay_windows
 from .request_pack import pack_identity, pack_preview, pack_specs
 from .stats import percentile
@@ -35,7 +38,7 @@ from .timing import TimingHealth, configured_metrics, exceeded_unfinished, quali
 from .models import (
     INTERNAL_CHECK_NAMES as CHECK_NAMES, CHECK_NAMES as PUBLIC_CHECK_NAMES,
     CORE_CHECKS, CheckResult, Limits, RequestRecord, RequestSpec, RunConfig, RunReport, Target,
-    overall_status, required_concurrency,
+    SHARED_BASELINE_EXCLUDED_WORKLOADS, overall_status, required_concurrency,
 )
 
 
@@ -43,6 +46,11 @@ logger = logging.getLogger(__name__)
 # A context-local sink lets web runs persist evidence without changing request()
 # or sharing a writer between concurrent CLI invocations.
 record_sink = ContextVar("giraffe_record_sink", default=lambda record: None)
+
+
+class _DispatchRefused(Exception):
+    """The scheduled request never entered transport."""
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -104,7 +112,9 @@ def _stats(records: list[RequestRecord]) -> dict:
 
 
 def _stress(scenario):
+    # Scheduled warmup traffic shares stress accounting with its measurement window.
     return (scenario.startswith(("traffic_stage_", "context", "fairness_", "bucket_", "mixed_", "arrival", "stress_", "load_"))
+            or scheduled_multi_user_window(scenario.removesuffix("_warmup"))
             or scenario in {"sustained", "recovery", "recovery_baseline", "recovery_prime", "limits",
                             "stop_control", "client_cancel", "client_deadline", "backend_cancel",
                             "cancellation_probe", "cancellation_baseline"})
@@ -117,7 +127,7 @@ def _context_rejection(record):
 
 
 def _serving_failure(record, scenario):
-    if (scenario in {"sustained", "performance_evidence_probe"} or scenario.startswith("traffic_stage_") or record.status == "cancelled"
+    if (record.identity is not None or scenario in {"sustained", "performance_evidence_probe"} or scenario.startswith("traffic_stage_") or record.status == "cancelled"
             or _reasoning_budget(record)):
         return False
     if (scenario.startswith("load_calibration_") and record.input_tokens is not None
@@ -245,6 +255,7 @@ class _Run:
         self.ceiling_constrains_pool = config.concurrency is not None and peak["peak"] > config.concurrency
         self.max_connections = min(peak["per_target_peak"], pool_size)
         self.connection_limits = {target.name: self.max_connections for target in config.targets}
+        self.deferred_tls_contexts: dict[str, ssl.SSLContext] = {}
         self.slots = asyncio.Queue(maxsize=pool_size)
         for _ in range(pool_size):
             self.slots.put_nowait(None)
@@ -259,13 +270,19 @@ class _Run:
         self.errors = 0
         self.reason: str | None = None
         self.limits_reached = set()
+        self.request_limit_scopes: set[str] = set()
+        self.concurrency_limit_scopes: set[str] = set()
+        self.duration_limit_scope: str | None = None
+        self.user_stop_scope: Literal["gateway"] | None = None
+        self._gateway_only_phase = False
         self.memory_limit_reached = False
         self.memory_stop_reason = None
         self.memory_measured = False
         self.memory_sampling_done = False
         self.rss_at_start_bytes = None
         self.memory_interrupted_checks = set()
-        self.pending_checks = {(target.name, check) for target in config.targets for check in config.checks}
+        self.pending_checks: dict[tuple[str, str], Literal["inference", "judging"]] = {
+            (target.name, check): "inference" for target in config.targets for check in config.checks}
         self.judging_pending = any(spec.scorer == "judge" for spec in self.pack_specs)
         self.counts = Counter()
         if config.max_requests is None:
@@ -287,13 +304,10 @@ class _Run:
         from .conditions import planned_conditions
         self.planned_condition_ids = {(row["target"], row["condition_id"]) for row in planned_conditions(config)}
         from .planning import request_plan
-        # Optional evidence probes must not displace finite planned work,
-        # including bounded tool conversations that are excluded from "known".
-        self.planned_request_reserve_per_target = sum(
-            row["requests_per_target"] or row.get("known_scheduled_requests", 0)
-            for row in request_plan(config)["rows"])
+        self.request_plan_rows = request_plan(config)["rows"]
         self.endpoint_health = {t.name: {"first_attempt_seconds": None, "last_response_seconds": None,
             "consecutive_failures": 0, "failure_request_ids": [], "abort_reason": None} for t in config.targets}
+        self._retired_endpoint_watchdogs: set[str] = set()
         self.target_tasks = {}
         self.stop_notified = False
         for target, observation in self.observations.items():
@@ -305,6 +319,23 @@ class _Run:
                     "timeout_seconds": config.metrics_timeout_seconds,
                     "max_samples": config.metrics_max_samples,
                     "max_series": config.metrics_max_series, "collection_gaps_seconds": []})
+
+    def runtime_gateway_request_counts(self, target):
+        from .gateway_access import eligible_probe_count
+        from .gateway_policy import credential_issue
+
+        runtime_counts = {}
+        if "gateway_access" in self.config.checks:
+            runtime_counts["gateway_access"] = eligible_probe_count(self.config, target)
+        policy = self.config.gateway_policy
+        if "gateway_policy" in self.config.checks and policy and policy.supported and credential_issue(policy, target):
+            runtime_counts["gateway_policy"] = 0
+        return runtime_counts
+
+    def token_evidence_reserve(self, target):
+        from .planning import token_evidence_request_reserve
+
+        return token_evidence_request_reserve(self.request_plan_rows, target=target.name)
 
     def _condition(self, target, scenario, workload=None, *, request_parameters=None):
         condition = condition_for(scenario, workload or {}, self.config, request_parameters=request_parameters)
@@ -360,6 +391,8 @@ class _Run:
     def emit_condition(self, event, scenario, row):
         # Keep the global completed progress counter separate from condition totals.
         aggregate = condition_aggregate(row)
+        if event == "condition_finished" and row.get("condition_verdict") == "pending":
+            event = "condition_scoring"
         self.emit(event, row["target"], scenario, condition_summary={**row, "aggregate_status": aggregate["status"],
                   **{key: aggregate[key] for key in ("condition_id", "check_id", "name", "concurrency_description", "not_started", "reasons")}},
                   **{k: v for k, v in row.items() if k not in {"target", "completed"}})
@@ -373,7 +406,7 @@ class _Run:
             return "request budget reached"
         return fallback
 
-    def finish_condition(self, target, scenario, workload=None, reason=None, load_point_result=None):
+    def finish_condition(self, target, scenario, workload=None, reason=None, load_point_result=None, *, verdict=None):
         key = (target, condition_for(scenario, workload or {}, self.config)["id"])
         row = self.conditions.get(key)
         if row is None:
@@ -384,6 +417,10 @@ class _Run:
         row["status"] = "finished"
         if load_point_result is not None:
             row["load_point_result"] = dict(load_point_result)
+        if scheduled_multi_user_window(scenario) or scenario in SHARED_BASELINE_EXCLUDED_WORKLOADS:
+            # Scheduled windows and gateway probes need evidence qualification
+            # after request dispatch finishes.
+            row["condition_verdict"] = verdict or row.get("condition_verdict") or "pending"
         self.emit_condition("condition_finished", scenario, row)
 
     def record_finished(self, record: RequestRecord) -> None:
@@ -428,8 +465,49 @@ class _Run:
 
     def finish_checks(self, target, checks):
         for check in checks:
-            if not (self.judging_pending and check in {"correctness", "capacity", "load"}):
-                self.pending_checks.discard((target, check))
+            key = target, check
+            if self.judging_pending and check in {"correctness", "capacity", "load"}:
+                if key in self.pending_checks:
+                    self.pending_checks[key] = "judging"
+            else:
+                self.pending_checks.pop(key, None)
+        if (self.config.unresponsive_after_failures and target not in self._retired_endpoint_watchdogs
+                and not any(name == target and phase == "inference"
+                            and check != "gpu" and check not in SHARED_BASELINE_EXCLUDED_WORKLOADS
+                            for (name, check), phase in self.pending_checks.items())):
+            self.retire_endpoint_watchdog(target)
+
+    @contextmanager
+    def gateway_limit_phase(self):
+        non_inference = SHARED_BASELINE_EXCLUDED_WORKLOADS | {"gpu"}
+        restart = self.observations.get(self.config.restart_target, {}).get("restart")
+        if (any(check not in non_inference and phase == "inference"
+                for (_, check), phase in self.pending_checks.items())
+                or any(checks - non_inference for checks in self.unfinished.values())
+                or any(target.get("client_error") for target in self.observations.values())
+                or (self.config.restart_target and (not restart or restart["status"] != "ready"))):
+            yield
+            return
+        # Attribute a deadline or user stop to the phase that owned it,
+        # including when the monitor has not had a chance to wake.
+        if self.stop.is_set() or time.monotonic() >= self.deadline:
+            self.stop_reason()
+        previous = self._gateway_only_phase
+        self._gateway_only_phase = True
+        try:
+            yield
+        finally:
+            try:
+                if self.stop.is_set() or time.monotonic() >= self.deadline:
+                    self.stop_reason()
+            finally:
+                self._gateway_only_phase = previous
+
+    def inline_gateway_limit_phase(self):
+        ordinary = set(self.config.checks) - SHARED_BASELINE_EXCLUDED_WORKLOADS - {"gpu"}
+        if len(self.config.targets) == 1 and ordinary:
+            return self.gateway_limit_phase()
+        return nullcontext()
 
     def memory_sample(self, rss, unfinished=None):
         if self.memory_sampling_done:
@@ -463,28 +541,49 @@ class _Run:
             self.reason = self.reason or "cancelled by user"
         if time.monotonic() >= self.deadline:
             self.limits_reached.add("max_duration_seconds")
+            if self.duration_limit_scope is None:
+                self.duration_limit_scope = "gateway" if self._gateway_only_phase else "shared"
             self.reason = self.reason or "maximum run duration reached"
-        for name, health in self.endpoint_health.items():
-            since = health["last_response_seconds"]
-            if since is None:
-                since = health["first_attempt_seconds"]
-            silence = time.monotonic() - self.start - since if since is not None else 0
-            if (self.config.unresponsive_after_failures and not health["abort_reason"]
-                    and health["consecutive_failures"] >= self.config.unresponsive_after_failures
-                    and silence >= self.config.unresponsive_for_seconds):
-                health["abort_reason"] = (f"Endpoint {name} unresponsive: no response for {silence:.3g}s "
-                    f"after {health['consecutive_failures']} consecutive failed requests")
-                self.unfinished[name].update(self.config.checks)
-                self.emit("target_stopping", name, abort_reason=health["abort_reason"])
+        if self.config.unresponsive_after_failures:
+            for name in self.endpoint_health:
+                self._check_endpoint_watchdog(name)
         if all(health["abort_reason"] for health in self.endpoint_health.values()):
             self.reason = self.reason or "; ".join(health["abort_reason"] for health in self.endpoint_health.values())
         if self.errors >= self.config.stop_after_errors:
             self.reason = self.reason or "error threshold reached"
         self.reason = self.reason or previous
+        if (self.reason == "cancelled by user" and previous != self.reason and self._gateway_only_phase
+                and all(check in SHARED_BASELINE_EXCLUDED_WORKLOADS for _, check in self.pending_checks)
+                and all(checks <= SHARED_BASELINE_EXCLUDED_WORKLOADS for checks in self.unfinished.values())
+                and not any(health["abort_reason"] for health in self.endpoint_health.values())):
+            # A user stop also skips judging, which the inference deadline allows.
+            self.user_stop_scope = "gateway"
         if self.reason and self.reason != "maximum request budget reached" and not self.stop_notified:
             self.stop_notified = True
             self.emit("run_stopping", abort_reason=self.reason)
         return (self.endpoint_health[target]["abort_reason"] if target else None) or self.reason
+
+    def _check_endpoint_watchdog(self, target):
+        health = self.endpoint_health[target]
+        if (target in self._retired_endpoint_watchdogs or health["abort_reason"]
+                or health["consecutive_failures"] < self.config.unresponsive_after_failures):
+            return
+        since = health["last_response_seconds"]
+        if since is None:
+            since = health["first_attempt_seconds"]
+        silence = time.monotonic() - self.start - since if since is not None else 0
+        if silence >= self.config.unresponsive_for_seconds:
+            health["abort_reason"] = (f"Endpoint {target} unresponsive: no response for {silence:.3g}s "
+                f"after {health['consecutive_failures']} consecutive failed requests")
+            self.unfinished[target].update(self.config.checks)
+            self.emit("target_stopping", target, abort_reason=health["abort_reason"])
+
+    def retire_endpoint_watchdog(self, target):
+        # Record an already-reached threshold before excluding later gateway
+        # work, judging, and teardown from this endpoint's silence window.
+        if self.config.unresponsive_after_failures and target not in self._retired_endpoint_watchdogs:
+            self._check_endpoint_watchdog(target)
+            self._retired_endpoint_watchdogs.add(target)
 
     def endpoint_attempt(self, target):
         health = self.endpoint_health[target]
@@ -513,17 +612,21 @@ class _Run:
         return max(0, min(self.config.max_requests - self.budget_used,
                           self.quotas[target] - self.budget_counts[target]))
 
-    def allowed(self, target: str) -> bool:
+    def mark_request_limit(self, *, gateway_probe: bool = False) -> None:
+        self.limits_reached.add("max_requests")
+        self.request_limit_scopes.add("gateway" if gateway_probe else "shared")
+
+    def allowed(self, target: str, *, gateway_probe: bool = False) -> bool:
         reason = self.stop_reason(target)
         remaining = self.remaining(target)
         if remaining == 0:
-            self.limits_reached.add("max_requests")
+            self.mark_request_limit(gateway_probe=gateway_probe)
         if self.config.max_requests is not None and self.budget_used >= self.config.max_requests:
             self.reason = self.reason or "maximum request budget reached"
         return not reason and not self.reason and (remaining is None or remaining > 0)
 
-    def reserve_offer(self, target: str) -> bool:
-        if not self.allowed(target):
+    def reserve_offer(self, target: str, *, gateway_probe: bool = False) -> bool:
+        if not self.allowed(target, gateway_probe=gateway_probe):
             return False
         self.budget_used += 1
         self.budget_counts[target] += 1
@@ -540,16 +643,18 @@ class _Run:
         except asyncio.QueueEmpty:
             if self.ceiling_constrains_pool:
                 self.limits_reached.add("concurrency")
+                self.concurrency_limit_scopes.add("shared")
             return False
 
     def release_slot(self) -> None:
         self.slots.put_nowait(None)
 
     @asynccontextmanager
-    async def slot(self, reserved: bool, deadline: float | None = None):
+    async def slot(self, reserved: bool, deadline: float | None = None, *, gateway_probe: bool = False):
         if not reserved:
             if self.slots.empty() and self.ceiling_constrains_pool:
                 self.limits_reached.add("concurrency")
+                self.concurrency_limit_scopes.add("gateway" if gateway_probe else "shared")
             if deadline is None:
                 await self.slots.get()
             else:
@@ -566,31 +671,46 @@ class _Run:
                 self.release_slot()
 
     async def request(self, target, client, spec, event=None, on_start=None, timeout_override=None,
-                      *, slot_reserved=False, budget_reserved=False, deadline_override=None, budget_exempt=False, evaluate_record=None, finalize_record=None, request_parameters=None):
+                      *, slot_reserved=False, budget_reserved=False, deadline_override=None,
+                      admission_deadline=None, prepared_admission=False, admission_check=None,
+                      on_preparation_failure=None, budget_exempt=False, evaluate_record=None,
+                      finalize_record=None, request_parameters=None, lifecycle_observer=None):
         """Complete a request and persist its terminal evidence once.
 
         ``finalize_record`` synchronously adds scheduler-owned measurements before
         the evidence snapshot, including cancellation and postprocessing failures.
+        ``admission_deadline`` closes dispatch only; admitted requests retain
+        their ordinary timeout, unlike ``deadline_override``.
+        With ``prepared_admission``, HTTP preparation precedes admission and progress.
+        ``admission_check`` checks caller-owned eligibility before committing an attempt.
+        ``on_preparation_failure`` can read a client diagnostic without recording an attempt.
         """
         check_ids = [name for name in spec.check_ids if name in self.config.checks
                      and (not _stress(spec.scenario) or name not in {"access", "serving", "first_output", "generation"})
                      and (name != "generation" or spec.scenario == "generation")
                      and (name != "capacity" or spec.scenario.startswith("traffic_stage_"))]
         spec = spec.model_copy(update={"check_ids": check_ids})
+        gateway_probe = (spec.identity is not None and bool(check_ids)
+                         and SHARED_BASELINE_EXCLUDED_WORKLOADS.issuperset(check_ids))
         readiness = spec.scenario == "readiness" or (
             spec.scenario == "initial" and self.config.restart_target == target.name)
-        evidence_probe = spec.scenario == "performance_evidence_probe"
+        evidence_probe = spec.scenario == "performance_evidence_probe" or spec.identity is not None
         slot_deadline = min(self.deadline, deadline_override if deadline_override is not None else self.deadline)
-        async with self.slot(slot_reserved, slot_deadline) as admitted:
+        if admission_deadline is not None:
+            slot_deadline = min(slot_deadline, admission_deadline)
+        async with self.slot(slot_reserved, slot_deadline, gateway_probe=gateway_probe) as admitted:
             # An offered arrival owns its budget even if a later arrival exhausts
             # the ceiling. Only a real stop condition can prevent its dispatch.
             reason = self.stop_reason(target.name)
             stopped = not admitted or time.monotonic() >= slot_deadline or (
                 reason is not None and reason != "maximum request budget reached")
-            if stopped or (not budget_reserved and not budget_exempt and not self.reserve_offer(target.name)):
-                self.mark_unfinished(target.name, _scenario_checks(spec))
+            if stopped or (admission_deadline is None and not budget_reserved and not budget_exempt
+                           and not self.reserve_offer(target.name, gateway_probe=gateway_probe)):
+                if admission_deadline is None or time.monotonic() >= self.deadline or reason:
+                    self.mark_unfinished(target.name, _scenario_checks(spec))
                 return None
-            self.attempted += 1
+            if admission_deadline is None:
+                self.attempted += 1
             output_cap = spec.max_tokens if spec.max_tokens is not None else self.config.max_output_tokens
             request_parameters = {**(request_parameters or {}),
                 "input_chars": spec.input_chars or sum(len(str(message.get("content") or "")) for message in spec.messages),
@@ -602,35 +722,68 @@ class _Run:
                             condition_for(condition_scenario, spec.workload, self.config)["id"])
             if condition is None or condition["status"] != "running":
                 condition = self.start_condition(target.name, condition_scenario, spec.workload, request_parameters=request_parameters)
-            if condition is not None:
-                condition["sent"] += 1
-                condition["started"] += 1
-                condition["running"] += 1
-                if condition["planned"] is not None:
-                    condition["not_sent"] = max(0, condition["planned"] - condition["sent"])
-            request_slot = self.attempted - 1
-            self.counts[target.name] += 1
-            if not readiness and not evidence_probe:
-                self.endpoint_attempt(target.name)
+            def admission_clock():
+                reason = self.stop_reason(target.name)
+                stopping = reason not in {None, "maximum request budget reached"}
+                now = time.monotonic()
+                if now >= slot_deadline or stopping:
+                    if now >= self.deadline or stopping:
+                        self.mark_unfinished(target.name, _scenario_checks(spec))
+                    raise _DispatchRefused
+                if admission_check is not None and not admission_check():
+                    raise _DispatchRefused
+                return now
+
+            guard_admission = admission_deadline is not None and (budget_reserved or prepared_admission)
+            guard_transport = guard_admission and getattr(client, "_supports_dispatch_guard", False) is True
             key = (target.name, spec.scenario)
-            self.active[key] += 1
-            self.peak[key] = max(self.peak[key], self.active[key])
             global_deadline = False
             deadline = None
             intentional_deadline_applies = False
-            started, started_at = time.monotonic(), _now()
-            token = self.inflight.start(target.name)
+            request_slot = started = started_at = token = timeout = None
             failure = None
             task = asyncio.current_task()
             cancellations = task.cancelling()
-            try:
-                if on_start:
-                    on_start()
+            pending_start = None
+            start_progress_error = None
+            completed_before_progress = None
+            overlap = 0
+
+            def preparation_failure(kind):
+                if task.cancelling() > cancellations:
+                    raise asyncio.CancelledError
+                if self.stop.is_set() or time.monotonic() >= slot_deadline or deadline is not None and deadline.expired():
+                    if self.stop.is_set() or time.monotonic() >= self.deadline:
+                        self.mark_unfinished(target.name, _scenario_checks(spec))
+                    return None
+                if budget_reserved and not budget_exempt:
+                    self.budget_used -= 1
+                    self.budget_counts[target.name] -= 1
+                return RequestRecord(
+                    id=uuid.uuid4().hex, target=target.name, fixture_id=spec.fixture_id,
+                    scenario=spec.scenario, check_ids=spec.check_ids, started_at=_now(),
+                    status="failed", valid=False, error=f"request could not be prepared ({kind})",
+                    input_chars=spec.input_chars, requested_max_tokens=output_cap, stream=spec.stream,
+                )
+
+            def emit_start():
                 self.emit("request_started", target.name, spec.scenario,
                           request_slot=request_slot, fixture_id=spec.fixture_id,
+                          **({"user": {key: spec.workload[key] for key in ("user_id", "population", "profile", "window_id", "phase", "request_sequence", "session_id", "turn_id", "conversation_sequence", "role", "matched_work_sequence", "trigger", "heavy_profile", "cancellation_role", "cohort", "origin", "work_sequence", "activation_seconds") if key in spec.workload}} if "multi_user" in spec.check_ids else {}),
                           input_chars=request_parameters["input_chars"], requested_max_tokens=output_cap,
                           requested_input_tokens=spec.requested_input_tokens,
                           condition_id=condition_id, condition_summary=dict(condition) if condition else None)
+
+            def emit_scheduled_start():
+                nonlocal pending_start, start_progress_error
+                pending_start = None
+                try:
+                    emit_start()
+                except (Exception, asyncio.CancelledError) as exc:
+                    start_progress_error = exc
+
+            def request_budget():
+                nonlocal timeout_override, intentional_deadline_applies, global_deadline, timeout
                 request_timeout = (spec.request_timeout_seconds if spec.request_timeout_seconds is not None
                                    else self.config.request_timeout_seconds)
                 if deadline_override is not None:
@@ -639,53 +792,147 @@ class _Run:
                 intentional_deadline_applies = timeout_override is not None and timeout_override < request_timeout
                 remaining = self.deadline - time.monotonic()
                 global_deadline = remaining <= min(request_timeout, timeout_override or request_timeout)
-                timeout = max(.001, min(request_timeout,
-                                        timeout_override or request_timeout,
-                                        self.deadline - time.monotonic()))
-                deadline = asyncio.timeout(timeout)
+                timeout = max(.001, min(request_timeout, timeout_override or request_timeout, remaining))
+                return timeout
+
+            def begin_attempt():
+                nonlocal started, started_at, request_slot, token, pending_start
+                if admission_deadline is not None:
+                    started = admission_clock()
+                    if (not budget_reserved and not budget_exempt
+                            and not self.reserve_offer(target.name, gateway_probe=gateway_probe)):
+                        self.mark_unfinished(target.name, _scenario_checks(spec))
+                        raise _DispatchRefused
+                    self.attempted += 1
+                if condition is not None:
+                    condition["sent"] += 1
+                    condition["started"] += 1
+                    condition["running"] += 1
+                    if condition["planned"] is not None:
+                        condition["not_sent"] = max(0, condition["planned"] - condition["sent"])
+                request_slot = self.attempted - 1
+                self.counts[target.name] += 1
+                if not readiness and not evidence_probe:
+                    self.endpoint_attempt(target.name)
+                self.active[key] += 1
+                self.peak[key] = max(self.peak[key], self.active[key])
+                if admission_deadline is None:
+                    started = time.monotonic()
+                started_at = _now()
+                token = self.inflight.start(target.name)
+                if on_start:
+                    on_start()
+                if guard_admission and self.progress:
+                    # An admitted request enters transport before yielding to
+                    # public progress. A synchronous observer cannot hold it
+                    # past the checked admission boundary before dispatch.
+                    pending_start = task.get_loop().call_soon(emit_scheduled_start)
+                else:
+                    emit_start()
+                if guard_transport:
+                    deadline.reschedule(min(self.deadline, task.get_loop().time() + request_budget()))
+
+            try:
+                if guard_transport:
+                    # Keep the run bound during preparation. The transport hook
+                    # commits the attempt and starts its request timeout.
+                    admission_clock()
+                    deadline = asyncio.timeout_at(self.deadline)
+                else:
+                    begin_attempt()
+                    deadline = asyncio.timeout(request_budget())
                 async with deadline:
-                    record = await client.execute(spec, first_output_event=event)
-                if deadline.expired():
+                    if guard_transport:
+                        record = await client.execute(spec, first_output_event=event, _before_send=begin_attempt,
+                            **({"lifecycle_observer": lifecycle_observer} if lifecycle_observer is not None else {}))
+                    else:
+                        record = await client.execute(spec, first_output_event=event,
+                            **({"lifecycle_observer": lifecycle_observer} if lifecycle_observer is not None else {}))
+                if token is None:
+                    if record.status == "cancelled":
+                        if task.cancelling() > cancellations:
+                            raise asyncio.CancelledError
+                        if time.monotonic() >= self.deadline:
+                            self.mark_unfinished(target.name, _scenario_checks(spec))
+                        return None
+                    if on_preparation_failure is not None:
+                        # A failure during HTTP preparation is not an HTTP attempt.
+                        if task.cancelling() > cancellations:
+                            raise asyncio.CancelledError
+                        if deadline.expired():
+                            self.mark_unfinished(target.name, _scenario_checks(spec))
+                        else:
+                            admission_clock()
+                            on_preparation_failure(record)
+                        return None
+                    kind = re.fullmatch(r"request (?:failed|timeout) \(([A-Za-z_]\w*)\)", record.error or "")
+                    record = preparation_failure(kind[1] if kind else "Exception")
+                    if record is None:
+                        return None
+                elif deadline.expired():
                     record.status, record.valid = ("cancelled" if global_deadline else "timeout"), False
                     record.error = "maximum run duration reached" if global_deadline else (
                         "intentional request deadline" if timeout_override else "request deadline exceeded")
+            except _DispatchRefused:
+                return None
             except (asyncio.CancelledError, TimeoutError) as exc:
-                if isinstance(exc, asyncio.CancelledError) and task.cancelling() > cancellations:
-                    failure = exc
-                run_deadline_expired = global_deadline and deadline is not None and deadline.expired()
-                record = RequestRecord(
-                    id=uuid.uuid4().hex, target=target.name, fixture_id=spec.fixture_id,
-                    scenario=spec.scenario, check_ids=spec.check_ids, started_at=started_at,
-                    status="cancelled" if isinstance(exc, asyncio.CancelledError) or run_deadline_expired else "timeout",
-                    error="run cancelled" if isinstance(exc, asyncio.CancelledError)
-                    else ("maximum run duration reached" if run_deadline_expired else "request deadline exceeded"), elapsed_ms=(time.monotonic()-started)*1000,
-                    input_chars=spec.input_chars, requested_max_tokens=output_cap, stream=spec.stream,
-                )
+                if token is None:
+                    if isinstance(exc, asyncio.CancelledError):
+                        raise
+                    record = preparation_failure(type(exc).__name__)
+                    if record is None:
+                        return None
+                else:
+                    if isinstance(exc, asyncio.CancelledError) and task.cancelling() > cancellations:
+                        failure = exc
+                    run_deadline_expired = global_deadline and deadline is not None and deadline.expired()
+                    record = RequestRecord(
+                        id=uuid.uuid4().hex, target=target.name, fixture_id=spec.fixture_id,
+                        scenario=spec.scenario, check_ids=spec.check_ids, started_at=started_at,
+                        status="cancelled" if isinstance(exc, asyncio.CancelledError) or run_deadline_expired else "timeout",
+                        error="run cancelled" if isinstance(exc, asyncio.CancelledError)
+                        else ("maximum run duration reached" if run_deadline_expired else "request deadline exceeded"), elapsed_ms=(time.monotonic()-started)*1000,
+                        input_chars=spec.input_chars, requested_max_tokens=output_cap, stream=spec.stream,
+                    )
             except Exception as exc:
-                if not isinstance(exc, (httpx.HTTPError, OSError)):
-                    failure = exc
-                # Exception text can contain credential-bearing URLs from transports.
-                record = RequestRecord(
-                    id=uuid.uuid4().hex, target=target.name, fixture_id=spec.fixture_id,
-                    scenario=spec.scenario, check_ids=spec.check_ids, started_at=started_at,
-                    status="failed", error=f"client failure ({type(exc).__name__})",
-                    elapsed_ms=(time.monotonic()-started)*1000,
-                    input_chars=spec.input_chars, requested_max_tokens=output_cap,
-                )
+                if token is None:
+                    record = preparation_failure(type(exc).__name__)
+                    if record is None:
+                        return None
+                else:
+                    if not isinstance(exc, (httpx.HTTPError, OSError)):
+                        failure = exc
+                    # Exception text can contain credential-bearing URLs from transports.
+                    record = RequestRecord(
+                        id=uuid.uuid4().hex, target=target.name, fixture_id=spec.fixture_id,
+                        scenario=spec.scenario, check_ids=spec.check_ids, started_at=started_at,
+                        status="failed", error=f"client failure ({type(exc).__name__})",
+                        elapsed_ms=(time.monotonic()-started)*1000,
+                        input_chars=spec.input_chars, requested_max_tokens=output_cap,
+                    )
             finally:
-                self.active[key] -= 1
-                overlap = self.inflight.finish(target.name, token)
+                if token is not None:
+                    self.active[key] -= 1
+                    overlap = self.inflight.finish(target.name, token)
+                if pending_start is not None:
+                    # An immediate transport result must still emit its start
+                    # before the terminal progress event.
+                    completed_before_progress = _now(), (time.monotonic()-self.start)*1000
+                    pending_start.cancel()
+                    emit_scheduled_start()
             # The transport catches cancellation to preserve partial output. Restore
             # propagation here, after completing the record and its live condition.
             if task.cancelling() > cancellations and failure is None:
                 failure = asyncio.CancelledError()
                 record.status, record.valid = "cancelled", False
+            failure = failure or start_progress_error
             if isinstance(failure, asyncio.CancelledError):
                 failure.giraffe_record = record
             # A transport may catch cancellation to preserve partial streamed output.
             if time.monotonic() >= self.deadline and record.status == "cancelled":
                 record.error = "maximum run duration reached"
-            record.completed_at = _now()
+            record.completed_at = completed_before_progress[0] if completed_before_progress else _now()
+            record.identity = spec.identity
             record.request_timeout_seconds = spec.request_timeout_seconds or self.config.request_timeout_seconds
             if record.status in {"timeout", "cancelled"}:
                 try:
@@ -720,22 +967,27 @@ class _Run:
                     record.termination_reason = "request_timeout"
                     record.termination_limit_seconds = record.request_timeout_seconds
                 elif not record.termination_reason:
-                    record.termination_reason = "intentional_cancellation" if spec.cancel_after_ms or spec.cancel_after_chunks else "workload_cancelled"
+                    record.termination_reason = "intentional_cancellation" if spec.cancel_after_ms else "workload_cancelled"
                     record.termination_limit_seconds = spec.cancel_after_ms / 1000 if spec.cancel_after_ms else None
             record.condition_id = condition_id
-            record.dispatch_ms = (started-self.start)*1000
+            record.dispatch_ms = (started-self.start)*1000 if token is not None else None
             record.timing_start_ms = ((record._timing_started_monotonic - self.start) * 1000
                 if record._timing_started_monotonic is not None else record.dispatch_ms)
-            record.completed_ms = (time.monotonic()-self.start)*1000
+            if record._request_body_sent_monotonic is not None:
+                record.request_body_sent_ms = (record._request_body_sent_monotonic - self.start) * 1000
+            record.completed_ms = (completed_before_progress[1] if completed_before_progress
+                                   else (time.monotonic()-self.start)*1000)
             record.workload = {**spec.workload, **record.workload}
             record.load_point = dict(spec.load_point) if spec.load_point else None
             record.requested_input_tokens = spec.requested_input_tokens
             record.requested_output_tokens = spec.requested_output_tokens
             record.scheduled_ms = spec.workload.get("scheduled_ms")
-            record.client_wait_ms = max(0, record.dispatch_ms-record.scheduled_ms) if record.scheduled_ms is not None else None
+            record.client_wait_ms = (max(0, record.dispatch_ms-record.scheduled_ms)
+                if record.scheduled_ms is not None and record.dispatch_ms is not None else None)
             record.overlap = overlap
-            intentional = ((spec.cancel_after_ms is not None or spec.cancel_after_chunks is not None)
-                           and record.status == "cancelled") or (
+            intentional = (record.status == "cancelled" and record.termination_reason in {
+                "generation_chunk_limit", "intentional_cancellation", "intentional_cancellation_deadline",
+            }) or (
                 timeout_override is not None and record.status == "timeout")
             record.intentional = intentional
             propagating_error = False
@@ -756,7 +1008,7 @@ class _Run:
                 if (not evidence_probe and not getattr(client, "reports_response_activity", False)
                         and (record.response_body_bytes or record.chunks or record.output or record.reasoning)):
                     self.endpoint_response(target.name)
-                if (not readiness and not evidence_probe and no_response_failure(record, include_timeouts=not _stress(spec.scenario))
+                if (token is not None and not readiness and not evidence_probe and no_response_failure(record, include_timeouts=not _stress(spec.scenario))
                         and not intentional and timeout_override is None
                         and deadline_override is None and spec.cancel_after_ms is None
                         and spec.cancel_after_chunks is None and not self.stop.is_set()
@@ -780,7 +1032,7 @@ class _Run:
                 if budget_exempt:
                     self.observations[target.name].setdefault("readiness_requests", []).append(record.id)
                 if condition is not None:
-                    condition["running"] -= 1
+                    condition["running"] -= int(token is not None)
                     condition["completed"] += 1
                     condition["failed"] += int(_request_failed(record))
                     result_status = request_status(record.model_dump(include={"status", "score", "valid"}))
@@ -795,11 +1047,13 @@ class _Run:
                               condition_id=condition_id, condition_summary=dict(condition) if condition else None,
                               input_chars=request_parameters["input_chars"], requested_max_tokens=output_cap,
                               requested_input_tokens=spec.requested_input_tokens,
+                              **({"user": {key: spec.workload[key] for key in ("user_id", "population", "profile", "window_id", "phase", "request_sequence", "session_id", "turn_id", "conversation_sequence", "role", "matched_work_sequence", "trigger", "heavy_profile", "cancellation_role", "cohort", "origin", "work_sequence", "activation_seconds") if key in spec.workload}} if "multi_user" in spec.check_ids else {}),
                               request_slot=request_slot, request=record.model_dump(mode="json", include={
                                   "id", "target", "fixture_id", "scenario", "condition_id", "intentional", "status", "valid", "score",
                                   "elapsed_ms", "first_output_ms", "check_ids", "http_status",
                                   "request_timeout_seconds", "termination_reason", "termination_limit_seconds",
                                   "started_at", "dispatch_ms", "completed_ms", "timing_start_ms",
+                                  *({"request_body_sent_ms"} if record.request_body_sent_ms is not None else ()),
                                   "timing_schema", "first_token_ms", "first_reasoning_ms", "last_output_ms",
                                   "stream", "stream_end_ms", "answer_reads", "answer_chunks", "answer_chars",
                                   "first_read_answer_chars", "first_read_output_tokens", "last_read_output_tokens",
@@ -1006,7 +1260,7 @@ async def _finish_gpu_observation(run, target):
 
 async def _context_fixtures(run, target, client, fixtures, source=None):
     """Size recall cases locally with the target tokenizer, without inference."""
-    from .fixtures import _context_request
+    from .fixtures import CONTEXT_SIZING_VERSION, _context_request
     from .local_tokenizer import prepare_messages
 
     config = _check_config(run.config, "context")
@@ -1014,33 +1268,62 @@ async def _context_fixtures(run, target, client, fixtures, source=None):
     for original in fixtures["context"]:
         _, size, position, *_ = original.fixture_id.split(".")
         output_budget = original.max_tokens or config.max_output_tokens
-        desired = max(1, int((config.context_limit - output_budget) * .85))
+        available = config.context_limit - output_budget
+        near_limit = math.ceil(config.context_limit * .8)
+        # Reach the full-window coverage threshold without spending output room.
+        desired = max(1, min(int(config.context_limit * .85), available))
+        minimum = near_limit if size == "long" and available >= near_limit else 1
         if size != "long":
             desired = max(1, desired // 3)
 
-        def build(chars):
+        def build(chars, variant=False):
             # The fixture builder takes a character allowance; the tokenizer
             # determines that allowance using the complete rendered chat prompt.
             allowance = chars if size == "long" else chars * 3
             local = config.model_copy(update={"context_limit": max(128, allowance + output_budget + 32)})
-            return _context_request(local, size, position, "context")
+            request = _context_request(local, size, position)
+            if variant:
+                # A one-token window can fall in a gap of the filler's token counts;
+                # a longer closing instruction shifts every count by a fixed amount.
+                request.messages = [{**message, "content": message["content"].replace(
+                    "\nReply with the box label only.", "\nReply with the box label only, no other text.")}
+                    for message in request.messages]
+                request.input_chars = sum(len(message["content"]) for message in request.messages)
+            return request
 
-        result = await prepare_messages(run, target, "context_preparation", lambda chars: build(chars).messages, desired, tolerance=.01)
-        evidence.append({key: value for key, value in result.items() if key != "messages"})
+        for variant in (False, True):
+            result = await prepare_messages(run, target, "context_preparation",
+                                            lambda chars: build(chars, variant).messages,
+                                            desired, tolerance=.01, accepted_token_range=(minimum, max(0, available)))
+            # Only a gap in the token counts can be shifted past; other failures repeat unchanged.
+            if result.get("reason_code") != "input_sizing_unavailable" or not result.get("sizing_gap"):
+                break
+        if result.get("input_tokens") is not None and result["input_tokens"] > available and result["filler_chars"] == 0:
+            result.update(status="unavailable", reason_code="context_window_exceeded", reason=(
+                f"The minimum locally counted prompt ({result['input_tokens']} tokens) plus the configured output "
+                f"allowance ({output_budget} tokens) exceeds context_limit ({config.context_limit}). "
+                "Reduce test_options.context.max_output_tokens, or increase test_options.context.context_limit "
+                "only if the server supports that window."))
+        evidence.append({key: value for key, value in result.items() if key != "messages"}
+                        | ({"prompt_variant": "closing_instruction_no_other_text"} if variant else {}))
         if result["status"] != "calibrated":
             run.observations[target.name]["context_calibration"] = {
-                "status": "unavailable", "reason": result["reason"], "method": "local_tokenizer", "preparations": evidence}
+                "status": "unavailable", "reason": result["reason"], "method": "local_tokenizer",
+                "sizing_version": CONTEXT_SIZING_VERSION, "preparations": evidence}
             run.mark_unfinished(target.name, {"context"})
             return []
-        spec = build(result["filler_chars"])
+        spec = build(result["filler_chars"], variant)
         spec.messages = result["messages"]
         spec.requested_input_tokens = desired
         spec.workload.update(calibrated_input_tokens=result["input_tokens"], input_token_source=result["method"],
                              token_count_scope=result["token_count_scope"],
                              tokenizer=result["tokenizer"], context_group=f"{desired} target tokens")
+        if variant:
+            spec.workload["prompt_variant"] = "closing_instruction_no_other_text"
         prepared.append(spec)
     run.observations[target.name]["context_calibration"] = {
-        "status": "sized_locally", "method": "local_tokenizer", "preparations": evidence}
+        "status": "sized_locally", "method": "local_tokenizer", "sizing_version": CONTEXT_SIZING_VERSION,
+        "preparations": evidence}
     return prepared
 
 
@@ -1065,8 +1348,30 @@ def _target_error(run, target, enabled, exc):
     run.unfinished[target.name].update(enabled)
 
 
-async def _target(run: _Run, target: Target, fixtures: dict):
+def _identity_only_target(target):
+    # Gateway probes never require or inherit shared credentials.
+    identity_target = target.model_copy(update={"api_key_env": None, "headers_env": {}})
+    identity_target._api_key = None
+    return identity_target
+
+
+def _deferred_identity_client(run, target):
+    # Use the shared phase's loaded trust while creating a separate identity pool.
+    context = run.deferred_tls_contexts.get(target.name)
+    tls_options = {"_tls_context": context} if context is not None else {}
+    return LLMClient(_identity_only_target(target), run.config,
+                     max_connections=run.connection_limits[target.name], **tls_options)
+
+
+async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attribution=False, defer_policy=False,
+                  defer_access=False):
     config, enabled = run.config, set(run.config.checks)
+    if defer_attribution:
+        enabled.discard("gateway_attribution")
+    if defer_policy:
+        enabled.discard("gateway_policy")
+    if defer_access:
+        enabled.discard("gateway_access")
     telemetry_task = None
     telemetry_stop = asyncio.Event()
     from giraffe import deployment, telemetry, workloads
@@ -1075,7 +1380,8 @@ async def _target(run: _Run, target: Target, fixtures: dict):
         if reason and reason != "maximum request budget reached":
             run.unfinished[target.name].update(enabled)
             return
-        run.observations[target.name]["deployment"] = await deployment.snapshot(target, config, run.deadline, run.stop)
+        run.observations[target.name]["deployment"] = await deployment.snapshot(target, config, run.deadline, run.stop,
+                    **({"run_start": run.start} if "scale_down" in config.checks else {}))
         run.observations[target.name]["deployment"]["model_residency"] = {
             "before_preparation": run.preparation_residency.get(target.name, deployment.unknown_residency(target, "Initial observation unavailable.")),
             "after_preparation": deployment.unknown_residency(target, "Preparation did not reach the second observation."),
@@ -1088,7 +1394,11 @@ async def _target(run: _Run, target: Target, fixtures: dict):
         if enabled == {"gpu"} and config.restart_target != target.name:
             await _metrics(run, target, "start")
             return
-        async with LLMClient(target, config, max_connections=run.connection_limits[target.name]) as client:
+        gateway_only = config.restart_target != target.name and gateway_identities_only(enabled)
+        client_target = _identity_only_target(target) if gateway_only else target
+        async with LLMClient(client_target, config, max_connections=run.connection_limits[target.name]) as client:
+            if (defer_attribution or defer_policy or defer_access) and (context := getattr(client, "tls_context", None)) is not None:
+                run.deferred_tls_contexts[target.name] = context
             client.logprob_budget = run.logprob_budget
             client.on_response = lambda: run.endpoint_response(target.name)
             data = run.observations[target.name]["serving_telemetry"]
@@ -1105,7 +1415,7 @@ async def _target(run: _Run, target: Target, fixtures: dict):
             if enabled & {"access", "serving", "first_output", "generation"} or restart:
                 response = config.effective_initial()
                 response_config = config.model_copy(update={key: response[key] for key in ("samples", "max_output_tokens", "request_timeout_seconds")})
-                initial_specs = builtin_fixtures(response_config, check_id="serving")["short"]
+                initial_specs = builtin_fixtures(response_config)["short"]
                 if restart and restart["status"] == "hook_completed":
                     ready_deadline = min(run.deadline, time.monotonic() + config.readiness_timeout_seconds)
                     backoff = .1
@@ -1139,16 +1449,17 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                 else:
                     await run.group(target, client, initial_specs, "initial", count=1)
             run.finish_checks(target.name, {"access"})
-            if config.stream and hasattr(client, "token_evidence_probe"):
+            if config.stream and not gateway_only and hasattr(client, "token_evidence_probe"):
                 # A one-token inference can still have a slow first response.
                 # Share one configured timeout across compatibility retries.
                 probe_end = min(run.deadline, time.monotonic() + config.request_timeout_seconds)
                 run.preparation(target.name, "performance_evidence_probe", "Checking streamed token and usage evidence", "running")
                 client.on_response = None
                 probe_count = 0
+                planned_reserve = run.token_evidence_reserve(target)
                 while (run.allowed(target.name) and time.monotonic() < probe_end
                        and (run.remaining(target.name) is None or run.remaining(target.name) > max(
-                           1, run.planned_request_reserve_per_target - (run.budget_counts[target.name] - probe_count)))):
+                           1, planned_reserve - (run.budget_counts[target.name] - probe_count)))):
                     spec = client.token_evidence_probe()
                     if spec is None:
                         break
@@ -1165,17 +1476,17 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                 await deployment.model_residency(target, config, deadline=run.deadline, stop=run.stop))
             if enabled & {"serving", "first_output"}:
                 response = config.effective_response()
-                response_specs = builtin_fixtures(config.model_copy(update={key: response[key] for key in ("samples", "max_output_tokens", "request_timeout_seconds")}), check_id="serving")["short"]
+                response_specs = builtin_fixtures(config.model_copy(update={key: response[key] for key in ("samples", "max_output_tokens", "request_timeout_seconds")}))["short"]
                 await run.group(target, client, response_specs, "warm", count=response["samples"])
             run.finish_checks(target.name, {"serving", "first_output"})
             if "generation" in enabled:
                 effective = _check_config(config, "generation")
-                await run.group(target, client, builtin_fixtures(effective, check_id="generation")["generation"], "generation",
+                await run.group(target, client, builtin_fixtures(effective)["generation"], "generation",
                                 count=effective.samples, checks=["generation"])
             run.finish_checks(target.name, {"generation"})
             if "context" in enabled:
                 effective = _check_config(config, "context")
-                check_fixtures = builtin_fixtures(effective, check_id="context")
+                check_fixtures = builtin_fixtures(effective)
                 context_fixtures = await _context_fixtures(run, target, client, check_fixtures)
                 count = max(effective.samples, len(check_fixtures["context"]))
                 if context_fixtures:
@@ -1199,7 +1510,7 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                         run.finish_checks(target.name, {check_id})
                         continue
                     effective = _check_config(config, check_id)
-                    check_fixtures = builtin_fixtures(effective, check_id=check_id)
+                    check_fixtures = builtin_fixtures(effective)
                     if check_id == "correctness":
                         # Explicit custom request settings belong to their fixture.
                         check_fixtures[check_id].extend(spec.model_copy(update={
@@ -1216,7 +1527,7 @@ async def _target(run: _Run, target: Target, fixtures: dict):
             if "cancellation" in enabled:
                 effective = _check_config(config, "cancellation")
                 options = config.effective_check("cancellation")
-                cancellation_fixtures = builtin_fixtures(effective, check_id="cancellation")
+                cancellation_fixtures = builtin_fixtures(effective)
                 normal = [spec.model_copy(update={"scorer": "none", "options": deterministic_options(config, spec.options)})
                                  if spec.fixture_id.startswith("limits.stop.") else spec
                                  for spec in cancellation_fixtures["limits"] if spec.cancel_after_ms is None
@@ -1250,16 +1561,17 @@ async def _target(run: _Run, target: Target, fixtures: dict):
             run.finish_checks(target.name, {"cancellation"})
             if "recovery" in enabled:
                 effective = _check_config(config, "recovery")
-                probe_specs = builtin_fixtures(effective, check_id="recovery")["sustained"]
-                from .planning import request_plan
-                later = [name for name in config.checks if name not in CORE_CHECKS or name == "load"]
-                later_plan = request_plan(config.model_copy(update={"checks": later, "restart_target": None}))
+                probe_specs = builtin_fixtures(effective)["sustained"]
+                from .planning import recovery_later_reserves
+                later_reserve, has_later_work = recovery_later_reserves(
+                    config, runtime_counts_by_target={target.name: run.runtime_gateway_request_counts(target)},
+                )[target.name]
                 if "cancellation" in enabled and not run.stop_reason(target.name):
                     cleanup = config.effective_check("cancellation")["cleanup_seconds"]
                     await asyncio.sleep(max(0, min(5, cleanup, run.deadline - time.monotonic())))
                 remaining = run.remaining(target.name)
                 if remaining is None or remaining > (
-                        later_plan["minimum_reserved_per_target"] + 2 * effective.samples
+                        later_reserve + 2 * effective.samples
                         + max(effective.limits.min_samples, effective.concurrency*2)):
                     # Uncounted warm-up so the baseline is not the probe fixture's cold first use.
                     await run.request(target, client, probe_specs[0].model_copy(update={
@@ -1267,15 +1579,15 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                 await run.group(target, client, probe_specs, "recovery_baseline",
                                 count=effective.samples, checks=["recovery"])
                 remaining = run.remaining(target.name)
-                reserved = later_plan["minimum_reserved_per_target"] + effective.samples
+                reserved = later_reserve + effective.samples
                 # Preserve later fixed work and probes; cap the remaining share
                 # only when another selected check still needs request budget.
-                allowance = (max(0, min(remaining // 2 if later else remaining, remaining-reserved))
+                allowance = (max(0, min(remaining // 2 if has_later_work else remaining, remaining-reserved))
                              if remaining is not None else None)
                 run.observations[target.name]["sustained_budget"] = {
                     "allowance": allowance, "reserved_later": reserved,
                     "policy": "reserve fixed later work and probes; half quota cap only with later checks"}
-                heavy = traffic_fixtures(effective, check_id="recovery")
+                heavy = traffic_fixtures(effective)
                 heavy_specs = heavy["long_input"] + heavy["long_output"]
                 end = min(run.deadline, time.monotonic() + effective.sustained_seconds)
                 dispatched, exhausted = 0, False
@@ -1284,7 +1596,7 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                     while time.monotonic() < end:
                         if (allowance is not None and dispatched >= allowance) or not run.allowed(target.name):
                             if allowance is not None and dispatched >= allowance:
-                                run.limits_reached.add("max_requests")
+                                run.mark_request_limit()
                             exhausted = True
                             return
                         index = dispatched
@@ -1328,16 +1640,24 @@ async def _target(run: _Run, target: Target, fixtures: dict):
                 await run.group(target, client, probe_specs, "recovery",
                                 count=effective.samples, checks=["recovery"])
             run.finish_checks(target.name, {"recovery"})
-            await workloads.execute(run, target, client, fixtures)
+            if "scale_down" in enabled and config.scale_down.target == target.name:
+                from .scale_down import execute as execute_scale_down
+                await execute_scale_down(run, target, client, fixtures, collector_task=telemetry_task)
+                run.finish_checks(target.name, {"scale_down"})
+            await workloads.execute(run, target, client, fixtures, defer_attribution=defer_attribution,
+                                    defer_policy=defer_policy, defer_access=defer_access)
             run.finish_checks(target.name, enabled - {"gpu"})
     except asyncio.CancelledError:
-        run.unfinished[target.name].update(check for name, check in run.pending_checks if name == target.name)
+        gateway_deadline = run.duration_limit_scope == "gateway" and run.reason == "maximum run duration reached"
+        run.unfinished[target.name].update(check for (name, check), phase in run.pending_checks.items()
+                                           if name == target.name and (phase == "inference" or not gateway_deadline))
         raise
     except Exception as exc:
         _target_error(run, target, enabled, exc)
 
     finally:
         try:
+            run.retire_endpoint_watchdog(target.name)
             preparation = run.observations[target.name].get("preparation", {})
             if preparation.get("status") == "running":
                 reason = run.stop_reason(target.name)
@@ -1361,7 +1681,8 @@ async def _target(run: _Run, target: Target, fixtures: dict):
             run.observations[target.name]["metrics"] = [_gpu_snapshot(snap) for snap in data["snapshots"]]
             current = run.observations[target.name]["deployment"]
             if current and (target.deployment.discovery != "none" or target.deployment.collector_url):
-                end = await deployment.snapshot(target, config, run.deadline, run.stop)
+                end = await deployment.snapshot(target, config, run.deadline, run.stop,
+                    **({"run_start": run.start} if "scale_down" in config.checks else {}))
                 run.observations[target.name]["deployment_history"].append(end)
                 observations = [current, *run.observations[target.name]["deployment_history"]]
                 initial_signature = deployment.observed_signature(current)
@@ -1389,6 +1710,94 @@ async def _target(run: _Run, target: Target, fixtures: dict):
             raise
         except Exception as exc:
             _target_error(run, target, enabled, exc)
+
+
+async def _deferred_access(run, target):
+    from .gateway_access import configured_probe_count, execute
+
+    check = "gateway_access"
+    observations = run.observations[target.name]
+    reason = run.stop_reason(target.name)
+    if reason not in {None, "maximum request budget reached"} or observations.get("client_error"):
+        run.mark_unfinished(target.name, {check})
+        return
+    restart = observations["restart"]
+    if run.config.restart_target == target.name and (not restart or restart["status"] != "ready"):
+        run.finish_checks(target.name, {check})
+        return
+    run.emit("scenario_started", target.name, check)
+    try:
+        if configured_probe_count(run.config, target):
+            async with _deferred_identity_client(run, target) as client:
+                await execute(run, target, client)
+        else:
+            await execute(run, target, None)
+    except asyncio.CancelledError:
+        run.mark_unfinished(target.name, {check})
+        raise
+    except Exception as exc:
+        logger.error("Internal gateway access error (%s)", type(exc).__name__)
+    finally:
+        run.finish_checks(target.name, {check})
+        run.emit("scenario_finished", target.name, check)
+
+
+async def _deferred_policy(run, target):
+    from .gateway_policy import execute
+
+    check = "gateway_policy"
+    observations = run.observations[target.name]
+    reason = run.stop_reason(target.name)
+    if (reason and reason != "maximum request budget reached" or observations.get("client_error")):
+        run.mark_unfinished(target.name, {check})
+        return
+    restart = observations["restart"]
+    if run.config.restart_target == target.name and (not restart or restart["status"] != "ready"):
+        run.finish_checks(target.name, {check})
+        return
+    run.emit("scenario_started", target.name, check)
+    try:
+        async with _deferred_identity_client(run, target) as client:
+            await execute(run, target, client)
+    except asyncio.CancelledError:
+        run.mark_unfinished(target.name, {check})
+        raise
+    except Exception as exc:
+        logger.error("Internal gateway policy error (%s)", type(exc).__name__)
+        observations.setdefault(check, {}).update(
+            execution_error="Gateway policy could not complete.")
+    finally:
+        run.finish_checks(target.name, {check})
+        run.emit("scenario_finished", target.name, check)
+
+
+async def _deferred_attribution(run, target, *, deferred=True):
+    from .gateway_attribution import CHECK, _state, execute
+
+    observations = run.observations[target.name]
+    reason = run.stop_reason(target.name)
+    if reason and reason != "maximum request budget reached" or observations.get("client_error"):
+        run.mark_unfinished(target.name, {CHECK})
+        return
+    restart = observations["restart"]
+    if run.config.restart_target == target.name and (not restart or restart["status"] != "ready"):
+        observations[CHECK] = _state("unverified", "Gateway attribution did not run because restart readiness was not established.")
+        run.finish_checks(target.name, {CHECK})
+        return
+    run.emit("scenario_started", target.name, CHECK)
+    try:
+        async with _deferred_identity_client(run, target) as client:
+            await execute(run, target, client, deferred=deferred)
+    except asyncio.CancelledError:
+        run.mark_unfinished(target.name, {CHECK})
+        raise
+    except Exception as exc:
+        # Identity transport failures must not replace completed shared checks.
+        logger.error("Internal gateway attribution error (%s)", type(exc).__name__)
+        observations[CHECK] = _state("unverified", "Gateway attribution could not complete.")
+    finally:
+        run.finish_checks(target.name, {CHECK})
+        run.emit("scenario_finished", target.name, CHECK)
 
 
 def _timing_violations(records, limits, *, unfinished=False):
@@ -1466,7 +1875,8 @@ def _pack_results(run: _Run, target: Target) -> dict:
     delays = scheduling_delay_windows(run)
     for case, spec in zip(cases, run.pack_specs, strict=True):
         loaded = [r for r in run.records if r.target == target.name and r.fixture_id == spec.fixture_id
-                  and (r.traffic_stage is not None or r.scenario == "pack_loaded" or bool(r.load_point))]
+                  and (r.scenario == "pack_loaded" or bool(r.load_point)
+                       or ("capacity" in r.check_ids and r.traffic_stage is not None))]
         stats = _stats(loaded)
         accuracy = stats["correct"] / stats["scored"] if stats["scored"] else None
         failed = accuracy is not None and accuracy < limits.min_correctness
@@ -1497,13 +1907,18 @@ def _pack_results(run: _Run, target: Target) -> dict:
 def _checks(run: _Run, target: Target) -> list[CheckResult]:
     config = run.config
     all_records = [r for r in run.records if r.target == target.name]
-    ordinary = [r for r in all_records if r.scenario not in {"client_cancel", "client_deadline", "backend_cancel"}
-                or _serving_failure(r, r.scenario)]
+    ordinary = [r for r in all_records if r.identity is None and (r.scenario not in {"client_cancel", "client_deadline", "backend_cancel"}
+                or _serving_failure(r, r.scenario))]
     observations = run.observations[target.name]
     result = []
     warm = [r for r in ordinary if r.scenario == "warm"]
     for check_id in CORE_CHECKS:
         title = CHECK_NAMES[check_id]
+        if check_id == "scale_down":
+            if check_id in run.config.checks:
+                from .scale_down import result as scale_down_result
+                result.append(scale_down_result(run, target))
+            continue
         if check_id == "load":
             from giraffe.load_test import result as load_result
             item = load_result(run, target) if check_id in run.config.checks else CheckResult(
@@ -1516,7 +1931,7 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
         records = [r for r in ordinary if check_id in r.check_ids]
         if check_id == "correctness" and run.pack_specs:
             records = [r for r in all_records if r.scenario in {"pack_control", "pack_loaded"}
-                       or r.traffic_stage is not None or bool(r.load_point)]
+                       or bool(r.load_point) or ("capacity" in r.check_ids and r.traffic_stage is not None)]
             limits = limits.model_copy(update={"min_samples": 1})
         if check_id == "capacity":
             records = [r for r in records if r.traffic_stage is not None]
@@ -1636,6 +2051,18 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
             elif check_id == "generation" and _missing_timing(records, limits.model_copy(update={"first_output_ms": None})):
                 metrics["missing_timing_metrics"] = _missing_timing(records, limits.model_copy(update={"first_output_ms": None}))
                 status, summary = "inconclusive", "Configured generation limits cannot be checked with available stream or token measurements."
+                # Name the reasoning accounting limit only when usage arrived without
+                # a breakdown for every unpaced answer; missing usage or other gaps
+                # keep the stream/usage evidence remedy.
+                unpaced = [r for r in records if r.valid and r.status == "completed" and r.stream
+                           and r.generation_tokens_per_second is None]
+                if ("generation_tokens_per_second" in metrics["missing_timing_metrics"] and unpaced
+                        and all(r.output_tokens is None and r.completion_tokens is not None
+                                and not r.reasoning_tokens
+                                and (r.reasoning.strip() or r.reasoning_stripped) for r in unpaced)):
+                    metrics["reason_code"] = "unseparated_reasoning_tokens"
+                    summary = ("Reasoning output has no usable reasoning-token usage breakdown; "
+                               "answer generation pace cannot be measured.")
             elif (check_id == "generation" and limits.min_output_tokens_per_second is not None
                   and metrics["generation_rate_samples"] < limits.min_samples):
                 status, summary = "inconclusive", "Too few measurable streamed answers to assess generation pace."
@@ -1777,6 +2204,13 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                 status, summary = "inconclusive", "Some fixtures lack a score because inference or answer evaluation did not complete."
                 if metrics["cancelled"]:
                     metrics["reason_code"] = "cancelled"
+            elif (check_id == "context" and not metrics["near_limit_coverage"]
+                  and config.context_limit - config.max_output_tokens < math.ceil(config.context_limit * .8)):
+                metrics["reason_code"] = "context_output_reservation"
+                status, summary = "inconclusive", (
+                    f"The configured output allowance ({config.max_output_tokens} tokens) leaves "
+                    f"{max(0, config.context_limit - config.max_output_tokens)} input tokens, "
+                    f"below the {math.ceil(config.context_limit * .8)} tokens required for 80% context coverage.")
             elif check_id == "context" and metrics["reduced_position_coverage"]:
                 status, summary = "inconclusive", "reduced fact-position coverage (context_limit too small)"
             elif check_id == "context" and not metrics["near_limit_coverage"]:
@@ -2065,7 +2499,8 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
             check.summary = check.finding_summary + " " + budget
             continue
         if interrupted and run.reason == "maximum run duration reached" and check.id not in {"load", "recovery"}:
-            check.finding_summary = "Run deadline reached before this check finished."
+            if check.id != "gateway_attribution" or check.metrics.get("reason_code") != "time_limited":
+                check.finding_summary = "Run deadline reached before this check finished."
             check.remediation = _deadline_remediation(run.config)
             check.summary = check.finding_summary + " " + _deadline_guidance(run.config)
             continue
@@ -2089,8 +2524,11 @@ def _deadline_remediation(config):
     plan = request_plan(config)
     high = plan.get("budget_high_seconds")
     action = {"action": "set_limit", "limit": "max_duration"}
-    if not plan["unknown_time_components"] and high is not None and math.isfinite(high):
-        action["minimum"] = math.ceil(high)
+    if (all(item["id"] == "gateway_attribution" for item in plan["unknown_time_components"])
+            and high is not None and math.isfinite(high)):
+        minimum = math.ceil(high)
+        if minimum > (config.max_duration_seconds or 0):
+            action["minimum"] = minimum
     return action
 
 
@@ -2102,6 +2540,8 @@ def _budget_remediation(config, check_id):
     planned = plan["required_request_limit"] or max(
         plan["known_total"], (plan["conservative_requests_per_target"]
                               - plan["adaptive_estimates"].get("concurrency", 0)) * len(config.targets))
+    if check_id == "gateway_attribution":
+        planned = max(planned, plan.get("attribution_request_limit", 0))
     return {"action": "set_limit", "limit": "max_requests",
             "minimum": max(planned, (config.max_requests or 0) + 1)}
 
@@ -2133,9 +2573,16 @@ def _budget_guidance(config, check_id=None):
 def _output_budget_guidance(config, records, check_id):
     capped = [r for r in records if _reasoning_budget(r) or r.finish_reason == "length"]
     owner = "capacity" if config.request_source == "request_pack" and "capacity" in config.checks else check_id
+    value = config.max_output_tokens
+    if check_id in {"access", "serving", "first_output"}:
+        # These checks share requests. Name the selected setting that owns the
+        # effective allowance, including access which has no output override.
+        owner = next((name for name in ("serving", "first_output")
+                      if name in config.checks and config.test_options.get(name) is not None
+                      and config.test_options[name].max_output_tokens is not None), check_id)
+        value = config.effective_initial()["max_output_tokens"]
     options = config.test_options.get(owner)
     field = f"test_options.{owner}.max_output_tokens" if options and options.max_output_tokens is not None else "max_output_tokens"
-    value = config.max_output_tokens
     if check_id == "sessions":
         field, value = "sessions.max_tokens", config.sessions.max_tokens
         for index, workload in enumerate(config.sessions.workloads):
@@ -2165,6 +2612,11 @@ def _output_budget_guidance(config, records, check_id):
             "or configure the model to produce the final answer within its requested cap, then rerun")
 
 
+_READ_COUNT_GUIDANCE = ("enable streamed logprobs or cumulative completion token usage alongside streamed content "
+                        "(request_options.stream_options.continuous_usage_stats: true on a compatible server); "
+                        "final-only usage cannot establish generation pace")
+
+
 def _verdict_summary(check, config, records, budget):
 
     summary, metrics, limits = check.summary, check.metrics, config.limits
@@ -2186,6 +2638,8 @@ def _verdict_summary(check, config, records, budget):
     else:
         check.remediation = {"action": "review_check", "check": check.id, "code": reason or check.status}
     if check.status == "blocked" and summary.startswith("Internal error in Giraffe ("):
+        return summary
+    if check.id == "gateway_access":
         return summary
     if check.id == "concurrency":
         from .concurrent_load import remedies
@@ -2329,6 +2783,10 @@ def _verdict_summary(check, config, records, budget):
                   f"and allow the whole rate plan to finish. {budget}")
     elif check.status == "inconclusive" and any(_reasoning_budget(r) for r in records):
         remedy = _output_budget_guidance(config, records, check.id)
+    elif check.id == "context" and reason == "context_output_reservation":
+        maximum = config.context_limit - math.ceil(config.context_limit * .8)
+        remedy = (f"set test_options.context.max_output_tokens to at most {maximum} while leaving enough output tokens "
+                  "for a complete answer, or increase test_options.context.context_limit only if the server supports that window")
     elif check.id == "context":
         remedy = (f"set context_limit to the server's actual token window (currently {config.context_limit}), "
                   "enable prompt token usage reporting and rerun all fact positions with enough output tokens for complete answers")
@@ -2339,6 +2797,10 @@ def _verdict_summary(check, config, records, budget):
                   f"and {config.samples} successful requests in each baseline and recovery batch; "
                   + (_deadline_guidance(config) + " "
                      if config.max_duration_seconds is not None else "") + budget)
+    elif check.id == "gateway_attribution" and reason == "time_limited":
+        remedy = _deadline_guidance(config).rstrip(".")
+    elif check.id == "gateway_attribution" and reason == "budget_limited":
+        remedy = f"raise max_requests (or --max-requests) to at least {check.remediation['minimum']} and rerun the configured attribution probes"
     elif any(word in text for word in ("run budget", "run deadline", "no applicable")):
         remedy = budget + (" Allow more max_duration_seconds (or --max-duration) if the run deadline stops traffic"
                           if config.max_duration_seconds is not None else "")
@@ -2347,10 +2809,19 @@ def _verdict_summary(check, config, records, budget):
                   "disable response buffering along the route, and rerun the same workload; raising client concurrency alone cannot make a serial server process requests in parallel")
     elif check.id == "cancellation" and not config.stream:
         remedy = "enable streaming (stream: true, omit --nonstream) so the client can observe output and interrupt the request, then rerun cancellation"
+    elif reason == "unseparated_reasoning_tokens":
+        remedy = ("use a server that reports reasoning-token usage separately from total completion usage, "
+                  "or configure the model to answer without reasoning; streamed reasoning logprobs alone "
+                  "cannot account for hidden control tokens, so they do not establish answer-token usage")
+        # Separated reasoning usage is necessary, not sufficient: pace also needs
+        # token counts at answer reads, and other missing timings keep their remedy.
+        if any(check.id in r.check_ids and r.valid and r.status == "completed" and r.stream
+               and r.read_output_tokens_source is None for r in records):
+            remedy += "; also " + _READ_COUNT_GUIDANCE
+        if set(metrics.get("missing_timing_metrics", [])) - {"generation_tokens_per_second"}:
+            remedy += "; disable response buffering along the route so the other configured timing limits can be measured"
     elif any(word in text for word in ("stream", "timing", "measurable", "measured", "token measurements", "first-output baseline")) and check.status == "inconclusive":
-        usage_guidance = ("enable streamed logprobs or cumulative completion token usage alongside streamed content "
-                          "(request_options.stream_options.continuous_usage_stats: true on a compatible server); "
-                          "final-only usage cannot establish generation pace; "
+        usage_guidance = (_READ_COUNT_GUIDANCE + "; "
                           if "generation_tokens_per_second" in metrics.get("missing_timing_metrics", []) else "")
         remedy = (f"enable streaming (stream: true, omit --nonstream), disable response buffering along the route; "
                   f"{usage_guidance}"
@@ -2378,7 +2849,8 @@ def _verdict_summary(check, config, records, budget):
 
 
 async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | None = None,
-                    stop_event: asyncio.Event | None = None) -> RunReport:
+                    stop_event: asyncio.Event | None = None,
+                    on_scale_down_control: Callable | None = None) -> RunReport:
     from .local_tokenizer import ensure_tokenizers
     from .deployment import preparation_residency
     residency = config._preparation_residency
@@ -2389,7 +2861,7 @@ async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | Non
     with PhaseSampler("traffic") as sampler:
         try:
             return await _run_suite(config, progress=progress, stop_event=stop_event,
-                                    sampler=sampler, residency=residency)
+                                    sampler=sampler, residency=residency, on_scale_down_control=on_scale_down_control)
         except Exception:
             logger.exception("Unexpected suite failure")
             raise
@@ -2397,6 +2869,9 @@ async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | Non
             sampler.detach()
             if hasattr(sampler, "run"):
                 sampler.run.memory_sampling_done = True
+                control = getattr(sampler.run, "scale_down_control", None)
+                if control is not None and control.phase != "finished":
+                    control.set_phase("finished")
 
 
 async def _stop_judging(evaluation, run):
@@ -2425,7 +2900,7 @@ async def _stop_judging(evaluation, run):
             "duration_seconds": None, "stop_reason": "cancelled"}
 
 
-async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, residency) -> RunReport:
+async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, residency, on_scale_down_control=None) -> RunReport:
     """Run the built-in suite with one shared load budget and preserve partial evidence."""
     outer_cancellation = None
     suite_task = asyncio.current_task()
@@ -2457,9 +2932,18 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
     started_at, run_id = _now(), uuid.uuid4().hex
     run = _Run(config, progress, stop_event)
     run.run_id = run_id
+    sampler.run = run
+    if "scale_down" in config.checks:
+        from .scale_down import ScaleDownController
+        run.scale_down_control = ScaleDownController(run_id, config.scale_down.target,
+                                                     run_start=run.start, stop=run.stop)
+        run.scale_down_control.on_change = lambda status: run.emit(
+            "scale_down_updated", config.scale_down.target, "scale_down", scale_down={},
+            scale_down_snapshots=[], scale_down_control=status)
+        if on_scale_down_control:
+            on_scale_down_control(run.scale_down_control)
     run.preparation_residency = residency
     loop = asyncio.get_running_loop()
-    sampler.run = run
     run.rss_at_start_bytes = sampler.initial_rss_bytes
     samples = []
     def consume_samples():
@@ -2480,15 +2964,47 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
     fixtures = {key: [value] if isinstance(value, RequestSpec) else list(value)
                 for key, value in fixtures.items()}
     custom_hash = None
-    if config.custom_fixtures and "correctness" in config.checks:
+    if config.custom_fixtures and set(config.checks) & {"correctness", "scale_down"}:
         fixtures["correctness"].extend(load_custom_fixtures(config.custom_fixtures,
             legacy_max_output_tokens=config.legacy_custom_fixture_max_output_tokens))
         custom_hash = hashlib.sha256(Path(config.custom_fixtures).read_bytes()).hexdigest()
+    if "scale_down" in config.checks:
+        from .scale_down import resolve_fixtures
+        resolve_fixtures(config.scale_down, fixtures)
     sampler.sample()
     consume_samples()
 
-    async def target_task(target):
-        task = asyncio.create_task(_target(run, target, fixtures))
+    from .gateway_access import deferred_for_shared_targets as defer_gateway_access
+    from .gateway_attribution import deferred_for_shared_targets
+    from .gateway_policy import deferred_for_shared_targets as defer_gateway_policy
+
+    defer_access = defer_gateway_access(config)
+    cross_target_attribution = deferred_for_shared_targets(config)
+    defer_attribution = cross_target_attribution or (defer_access and "gateway_attribution" in config.checks)
+    defer_policy = defer_gateway_policy(config) or (defer_access and "gateway_policy" in config.checks
+                                                  and config.gateway_policy is not None and config.gateway_policy.supported)
+
+    async def shared_target(target):
+        deferred = {}
+        if defer_attribution:
+            deferred["defer_attribution"] = True
+        if defer_policy:
+            deferred["defer_policy"] = True
+        if defer_access:
+            deferred["defer_access"] = True
+        await _target(run, target, fixtures, **deferred)
+
+    async def check_access(target):
+        await _deferred_access(run, target)
+
+    async def check_policy(target):
+        await _deferred_policy(run, target)
+
+    async def attribute(target):
+        await _deferred_attribution(run, target, deferred=cross_target_attribution)
+
+    async def target_task(target, execute):
+        task = asyncio.create_task(execute(target))
         run.target_tasks[target.name] = task
         try:
             await task
@@ -2497,13 +3013,37 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
                 raise
             run.unfinished[target.name].update(config.checks)
 
-    if config.overlap_models:
-        tasks = [asyncio.create_task(target_task(target)) for target in config.targets]
-    else:
+    def start_targets(execute):
+        if config.overlap_models:
+            return [asyncio.create_task(target_task(target, execute)) for target in config.targets]
+
         async def sequential():
             for target in config.targets:
-                await target_task(target)
-        tasks = [asyncio.create_task(sequential())]
+                await target_task(target, execute)
+
+        return [asyncio.create_task(sequential())]
+
+    async def shared_then_gateway():
+        phases = [shared_target]
+        if defer_access:
+            phases.append(check_access)
+        if defer_policy:
+            phases.append(check_policy)
+        if defer_attribution:
+            phases.append(attribute)
+        for execute in phases:
+            with (nullcontext() if execute is shared_target else run.gateway_limit_phase()):
+                phase = start_targets(execute)
+                try:
+                    await asyncio.gather(*phase)
+                finally:
+                    for task in phase:
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(*phase, return_exceptions=True)
+
+    tasks = ([asyncio.create_task(shared_then_gateway())] if defer_attribution or defer_policy or defer_access
+             else start_targets(shared_target))
     monitor = asyncio.create_task(run.monitor(tasks))
     try:
         await asyncio.gather(*tasks)
@@ -2524,6 +3064,11 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
         await asyncio.gather(monitor, return_exceptions=True)
         if any(task.cancelled() or not task.done() for task in tasks) or any(run.unfinished.values()):
             run.stop_reason()
+    if "gateway_access" in config.checks:
+        from .gateway_access import record_unstarted
+
+        for target in config.targets:
+            record_unstarted(run, target)
     inference_duration = time.monotonic() - run.start
     sampler.set_phase("scoring")
     consume_samples()
@@ -2594,6 +3139,13 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
         if check.target in target_abort_reasons and check.status == "pass":
             check.status = "inconclusive"
             check.summary = target_abort_reasons[check.target] + ". This check was interrupted."
+    gateway_conditions = []
+    for check in checks:
+        if check.id in SHARED_BASELINE_EXCLUDED_WORKLOADS:
+            row = run.conditions.get((check.target, check.id))
+            if row is not None and row.get("condition_verdict") == "pending":
+                row["condition_verdict"] = check.status
+                gateway_conditions.append(row)
     grouped = defaultdict(lambda: defaultdict(list))
     for record in run.records:
         grouped[record.target][record.scenario].append(record)
@@ -2611,7 +3163,8 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
         warnings.append("Client scheduling delay was observed. Timing quality is qualified by overlapping request/stage intervals; raw measurements are retained. Its cause is not established.")
     if (config.max_requests is not None and run.budget_used >= config.max_requests
             and any(run.unfinished.values())):
-        run.limits_reached.add("max_requests")
+        run.mark_request_limit(gateway_probe=all(
+            checks <= SHARED_BASELINE_EXCLUDED_WORKLOADS for checks in run.unfinished.values()))
         warnings.append("Global request budget exhausted; unfinished checks remain inconclusive.")
     cancellation_options = config.test_options.get("cancellation")
     if ("cancellation" in config.checks and cancellation_options
@@ -2643,6 +3196,10 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
                     "target_abort_reasons": target_abort_reasons,
                     "client_timing_health": run.timing_health.snapshot(),
                     "request_budget_used": run.budget_used,
+                    "request_limit_scopes": sorted(run.request_limit_scopes),
+                    "concurrency_limit_scopes": sorted(run.concurrency_limit_scopes),
+                    **({"duration_limit_scope": run.duration_limit_scope} if run.duration_limit_scope else {}),
+                    **({"user_stop_scope": run.user_stop_scope} if run.user_stop_scope else {}),
                     "inference_duration_seconds": inference_duration,
                     **({"judging": judging_summary} if judging_summary is not None else {}),
                     "replica_coverage": [{"target": t.name, "route": t.route, "parent": t.parent,
@@ -2650,7 +3207,8 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
                         "observed_models": sorted({r.observed_model for r in run.records if r.target == t.name and r.observed_model}),
                         "observed_backend_ids": sorted({r.backend_id for r in run.records if r.target == t.name and r.backend_id}),
                         "other_replicas": "unverified"} for t in config.targets]}
-    from .reporting import connection_summary
+    from .reporting import (_load_test_workload_source_sha256, _multi_user_workload_identity,
+                            connection_summary)
     connection_failures = [message for target in config.targets if (message := connection_summary(
         [r for r in run.records if r.target == target.name], target.url))]
     if connection_failures:
@@ -2669,9 +3227,21 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
         from giraffe import session_sampling
         workload_identity["session_sampling_source_sha256"] = hashlib.sha256(
             Path(session_sampling.__file__).read_bytes()).hexdigest()
+    if "multi_user" in config.checks:
+        workload_identity.update(_multi_user_workload_identity())
+    if "gateway_access" in config.checks:
+        from giraffe import gateway_access, gateway_json
+        workload_identity["gateway_access_source_sha256"] = hashlib.sha256(b"".join(
+            Path(module.__file__).read_bytes() for module in (gateway_access, gateway_json))).hexdigest()
+    if "gateway_policy" in config.checks:
+        from giraffe import gateway_json, gateway_policy, gateway_response
+        workload_identity["gateway_policy_source_sha256"] = hashlib.sha256(b"".join(
+            Path(module.__file__).read_bytes() for module in (gateway_policy, gateway_response, gateway_json))).hexdigest()
+    if "scale_down" in config.checks:
+        from giraffe import scale_down
+        workload_identity["scale_down_source_sha256"] = hashlib.sha256(Path(scale_down.__file__).read_bytes()).hexdigest()
     if "load" in config.checks:
-        from giraffe import load_test, concurrent_load, traffic
-        workload_identity["load_test_source_sha256"] = hashlib.sha256(b"".join(Path(m.__file__).read_bytes() for m in (load_test, concurrent_load, traffic))).hexdigest()
+        workload_identity["load_test_source_sha256"] = _load_test_workload_source_sha256()
     if "consistency" in config.checks and config.consistency and config.consistency.logprobs:
         from giraffe import logprobs, logprob_workload
         workload_identity["logprob_source_sha256"] = hashlib.sha256(
@@ -2687,6 +3257,16 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
                 "conversation_source_sha256": SOURCE_SHA256}
                if config.tool_checks and config.tool_checks.conversations else {}),
         }
+    shared_workload_hash = {}
+    if SHARED_BASELINE_EXCLUDED_WORKLOADS.intersection(workload_settings):
+        shared_settings = {key: value for key, value in workload_settings.items()
+                           if key not in SHARED_BASELINE_EXCLUDED_WORKLOADS}
+        excluded_sources = {f"{key}_source_sha256" for key in SHARED_BASELINE_EXCLUDED_WORKLOADS}
+        shared_workload_hash["shared_workload_fixture_sha256"] = fixture_hash({
+            **{key: value for key, value in workload_identity.items() if key not in excluded_sources},
+            "settings": shared_settings,
+            "generator_source_sha256": FIXTURE_SOURCE_SHA256 if any(shared_settings.values()) else None,
+        })
     fixture_values = {key: [spec.model_dump() for spec in specs] for key, specs in fixtures.items()}
     # An unused optional field must not invalidate existing baseline fingerprints.
     for specs in fixture_values.values():
@@ -2703,6 +3283,10 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
                 "invocation": {"source": "python_api", "argv": None},
                 "config_migration_notes": list(config._migration_notes),
                 "timing_measurement_version": 3,
+                **({"gateway_access_source_sha256": workload_identity["gateway_access_source_sha256"]}
+                   if "gateway_access_source_sha256" in workload_identity else {}),
+                **({"gateway_policy_source_sha256": workload_identity["gateway_policy_source_sha256"]}
+                   if "gateway_policy_source_sha256" in workload_identity else {}),
                 **({"request_pack": pack_identity(config)} if run.pack_specs else {}),
                 "workload_selection": {key: "selected" if key in public_config.checks else "not selected"
                                        for key in PUBLIC_CHECK_NAMES if key not in CORE_CHECKS},
@@ -2715,7 +3299,7 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
                                  "custom_sha256": custom_hash,
                                  "builtin_sha256": (None if run.pack_specs and set(config.checks) <= {"load", "capacity", "correctness"}
                                                     else fixture_hash(fixture_values)),
-                                 "workload_fixture_sha256": fixture_hash(workload_identity)},
+                                 "workload_fixture_sha256": fixture_hash(workload_identity), **shared_workload_hash},
                 "run_location": {"hostname": socket.gethostname(), "system": platform.system(),
                                  "machine": platform.machine(), "python": platform.python_version()},
                 "load_shape": {**({"arrival_rates_rps": config.traffic.rates,
@@ -2737,8 +3321,13 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
     memory_required_interrupted = any(check.required and (check.target, check.id)
                                      in run.memory_interrupted_checks for check in checks)
     verdict_reason = run.reason
-    if verdict_reason == "maximum request budget reached" and not any(run.unfinished.values()):
-        verdict_reason = None
+    if verdict_reason == "maximum request budget reached":
+        unfinished = set().union(*run.unfinished.values())
+        # A limit reached only during optional gateway work leaves the
+        # completed shared checks eligible for baseline comparison.
+        if not unfinished or (not gateway_identities_only(config.checks)
+                              and unfinished <= SHARED_BASELINE_EXCLUDED_WORKLOADS):
+            verdict_reason = None
     if run.memory_stop_reason and verdict_reason == run.memory_stop_reason and not memory_required_interrupted:
         verdict_reason = None
     report = RunReport(run_id=run_id, suite_version=__version__,
@@ -2752,6 +3341,8 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
         # when asyncio.timeout converts this cancellation into TimeoutError.
         outer_cancellation.giraffe_report = report
     try:
+        for row in gateway_conditions:
+            run.emit_condition("condition_finished", row["condition"]["id"], row)
         run.emit("run_finished", abort_reason=verdict_reason, target_abort_reasons=target_abort_reasons)
     except Exception:
         if outer_cancellation is None:

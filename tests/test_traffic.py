@@ -112,6 +112,46 @@ def test_arrivals_start_while_earlier_request_is_still_running(monkeypatch):
     run_virtual(monkeypatch, scenario())
 
 
+@pytest.mark.parametrize("build_seconds,late,unissued", [(.01, 0, 0), (.2, 5, 0), (.6, 8, 2)])
+def test_explicit_stage_rechecks_spec_build_delay_before_dispatch(monkeypatch, build_seconds, late, unissued):
+    async def scenario():
+        monkeypatch.setattr("tests.test_traffic.time", runner.time)
+        harness = Harness()
+        evidence = []
+
+        def build(index):
+            if index == 0:
+                asyncio.get_running_loop().now += build_seconds
+            return RequestSpec(fixture_id="short", scenario="traffic", check_ids=["capacity"],
+                               messages=[], scorer="exact", expected="ok")
+
+        async def execute(spec, finalize, check_admission):
+            if check_admission():
+                return await harness.execute(spec, finalize)
+            return None
+
+        result = await traffic.run_stage(
+            traffic=traffic.ExplicitTrafficStage(duration_seconds=.5, max_in_flight=4,
+                                                 scheduler_lag_tolerance_ms=100),
+            rate_rps=20, stage_index=0, fixtures={}, execute=execute,
+            reserve_offer=harness.reserve, try_acquire=harness.acquire, release=harness.release,
+            stop_reason=lambda: harness.stop, deadline=5, limits=Limits(),
+            schedule_override=[(index / 20, "short") for index in range(10)],
+            spec_factory=build, capture_evidence=evidence.append,
+        )
+        assert result["dropped_late"] == late
+        assert result["not_offered"] == unissued
+        assert result["started"] == 10-late-unissued
+        assert harness.available == harness.slots
+        assert evidence[0].offer_lags_ms[0] == pytest.approx(build_seconds*1000)
+        assert all(start < .5 for start in harness.starts)
+        if late:
+            assert evidence[0].outcomes[0] == "dropped_late"
+            assert evidence[0].stalls[0] == (0, build_seconds)
+            assert all(start > build_seconds for start in harness.starts)
+    run_virtual(monkeypatch, scenario())
+
+
 def test_nearly_coincident_arrivals_within_tolerance_are_not_missed_ticks(monkeypatch):
     async def scenario():
         monkeypatch.setattr("tests.test_traffic.time", runner.time)

@@ -2,7 +2,6 @@
 
 import json
 import random
-from typing import Any
 
 import pytest
 
@@ -14,15 +13,6 @@ from tests.test_web import report as empty_report
 
 
 pytestmark = pytest.mark.usefixtures("local_tokenizer")
-
-
-def assert_comparison_statuses_allow_small_p95(rows: list[dict[str, Any]]) -> None:
-    for row in rows:
-        if row["metric"].endswith("p95_ms") and min(row["current_samples"], row["baseline_samples"]) < 20:
-            assert row["status"] == "inconclusive"
-            assert "at least 20" in row["reason"]
-        else:
-            assert row["status"] == "pass"
 
 
 @pytest.mark.parametrize("request_source", ["builtin", "request_pack"])
@@ -65,8 +55,8 @@ def test_correctness_baseline_ignores_unselected_load_without_cohorts(request_so
     assert compared.baseline["status"] == compared.overall == "pass"
     target = compared.baseline["targets"][0]
     assert "load_test" not in target
-    assert target["comparisons"]
-    assert_comparison_statuses_allow_small_p95(target["comparisons"])
+    assert target["comparisons"] and all(row["status"] == ("inconclusive" if row["aggregation"] == "p95" and min(row["current_samples"], row["baseline_samples"]) < 20 else "pass")
+                                       for row in target["comparisons"])
     assert (current.model_dump_json(), previous.model_dump_json()) == before
 
 
@@ -132,6 +122,28 @@ def test_losing_accepted_rate_fails_baseline_without_bootstrap_sample_minimum():
     assert "previously acceptable tested load now fails" in _render(compared)
 
 
+def test_load_acceptance_qualifies_only_the_point_with_changed_stream_options():
+    baseline = arrival_report(count=5)
+    baseline.manifest["config"]["limits"]["min_samples"] = 2
+    for record in baseline.requests:
+        record.stream = True
+        record.requested_stream_logprobs = record.requested_stream_usage = True
+    current = baseline.model_copy(deep=True)
+    point = lose_rate(current)
+    for record in current.requests:
+        if record.id in point["request_ids"]:
+            record.requested_stream_logprobs = False
+            record.arrival_elapsed_ms = 130
+
+    target = compare_baseline(current, baseline).baseline["targets"][0]
+    assert not target["reasons"] and target["status"] == "inconclusive"
+    assert [row["acceptance_change"] for row in target["load_test"]["points"]] == ["unchanged_accepted", "work_changed"]
+    latency_rows = {row["load_point"]["rate"]: row for row in target["comparisons"] if row["metric"] == "latency_ms"}
+    assert latency_rows[10]["status"] == "pass"
+    assert latency_rows[50]["status"] == "inconclusive"
+    assert any(warning["code"] == "stream_options_changed" for warning in latency_rows[50]["warnings"])
+
+
 @pytest.mark.parametrize("missing_current", [False, True])
 def test_browser_load_acceptance_preserves_loss_or_missing_evidence_under_filters(missing_current):
     from tests.test_ux_results import run_render_checks
@@ -145,7 +157,8 @@ def test_browser_load_acceptance_preserves_loss_or_missing_evidence_under_filter
         lose_rate(current)
     compared = compare_baseline(current, old)
     target = compared.baseline["targets"][0]
-    assert_comparison_statuses_allow_small_p95(target["comparisons"])
+    assert all(row["status"] == ("inconclusive" if row["aggregation"] == "p95" and min(row["current_samples"], row["baseline_samples"]) < 20 else "pass")
+                                       for row in target["comparisons"])
     assert target["load_test"]["status"] == ("inconclusive" if missing_current else "fail")
     run_render_checks(r"""
 const value=VALUE,missing=MISSING;
@@ -299,27 +312,8 @@ def test_failed_baseline_does_not_block_observed_metric_comparison():
     assert target['load_test']['status'] == 'inconclusive'
     assert all(row['status'] == 'inconclusive' for row in target['load_test']['points'])
     assert target['comparisons']
-    assert_comparison_statuses_allow_small_p95(target['comparisons'])
-
-
-def test_tail_output_work_change_qualifies_p95_baseline_warning():
-    old, current = arrival_report(count=60), arrival_report(count=60)
-    for point in current.checks[0].metrics['points']:
-        records = [record for record in current.requests if record.scenario == point['id']]
-        for record in records[-9:]:
-            record.output = 'x' * 40
-            record.output_chars = 40
-            record.output_tokens = 10
-            record.elapsed_ms = 100
-            record.arrival_elapsed_ms = 100
-
-    target = compare_baseline(current, old).baseline['targets'][0]
-    tails = [row for row in target['comparisons'] if row['metric'] == 'latency_p95_ms']
-
-    assert tails and all(row['status'] == 'inconclusive' for row in tails)
-    assert all(any(warning['code'] == 'output_work_changed'
-                   and 'p95 lengths differ materially' in warning['message']
-                   for warning in row['warnings']) for row in tails)
+    assert all(row['status'] == ('inconclusive' if row['aggregation'] == 'p95' and min(row['current_samples'], row['baseline_samples']) < 20 else 'pass')
+               for row in target['comparisons'])
 
 
 def test_failed_baseline_with_too_few_samples_still_has_no_regression_verdict():
@@ -418,8 +412,7 @@ def test_load_request_mix_warns_only_above_ten_percentage_points(share, changed)
     assert not target['reasons'] and target['load_test']['status'] == 'pass'
     for row in target['comparisons']:
         assert ('request_mix_changed' in [w['code'] for w in row['warnings']]) == changed
-        expected = 'inconclusive' if changed or row['metric'].endswith('p95_ms') else 'pass'
-        assert row['status'] == expected
+        assert row['status'] == ('inconclusive' if changed or row['aggregation'] == 'p95' and min(row['current_samples'], row['baseline_samples']) < 20 else 'pass')
 
 
 @pytest.mark.parametrize('metric', ['correctness_rate', 'error_rate', 'valid_completion_rate'])
@@ -477,7 +470,8 @@ def test_rate_regression_in_matching_cohort_survives_mix_warning_elsewhere():
     assert rows[1]['status'] == 'fail' and rows[1]['warnings'] == []
     assert (rows[1]['current'], rows[1]['baseline']) == (0, 1)
     assert rows[4]['status'] == 'inconclusive'
-    assert [warning['code'] for warning in rows[4]['warnings']] == ['request_mix_changed']
+    assert [warning['code'] for warning in rows[4]['warnings']] == [
+        'sample_uncertainty', 'request_mix_changed']
 
 
 @pytest.mark.parametrize('count,changed', [(36, False), (37, True)])
@@ -504,6 +498,9 @@ def test_seeded_mixed_window_prefixes_qualify_every_shape_timing(count, changed)
         assert (row['baseline_samples'], row['current_samples']) in {(9, 17), (7, count - 17)}
         if row['metric'] == 'latency_ms':
             assert (row['baseline'], row['current'], row['observed_change']) == (10, 20, 100)
+
+    # These per-shape windows have fewer than 20 samples, so no p95 rows are emitted.
+    assert not [row for row in target['comparisons'] if row['aggregation'] == 'p95']
 
 
 def test_load_delivery_warning_preserves_low_sample_reason_and_measurements():

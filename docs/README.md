@@ -18,6 +18,12 @@ model and limits for your deployment, then use `giraffe validate` and
 `giraffe preview` before running them. Validation and preview send no test traffic.
 The workload guide identifies examples that still exercise legacy migration.
 
+## Live validation
+
+| Record | Scope |
+| --- | --- |
+| [November 10 Linux GPU validation](validation/2026-11-10.md) | Main at `b58fe37` against vLLM 0.33.0 and Ollama 0.40.16 on a Tesla T4 (Linux, CUDA); no other engines or GPUs |
+
 ## Historical evidence and designs
 
 | Archive | Scope |

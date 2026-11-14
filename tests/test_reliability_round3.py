@@ -101,7 +101,7 @@ async def test_blackholed_connect_fails_access_before_request_deadline(monkeypat
         if request.method == "GET":
             return httpx.Response(404)
         payload = json.loads(request.content)
-        if payload.get("max_tokens") == 1 and payload["messages"] == [{"role": "user", "content": "Reply with 1."}]:
+        if payload.get("max_tokens") == 16 and payload["messages"] == [{"role": "user", "content": "Reply with 1."}]:
             field = "logprobs" if "logprobs" in payload else "stream_options"
             return httpx.Response(400, json={"error": {"param": field}})
         timeout = request.extensions['timeout']['connect']
@@ -193,7 +193,7 @@ async def test_overlapping_heavy_hangs_survive_sustained_window_in_recovery_evid
         if request.method == 'GET':
             return httpx.Response(404)
         payload = json.loads(request.content)
-        if payload.get('max_tokens') == 1 and payload['messages'] == [{'role': 'user', 'content': 'Reply with 1.'}]:
+        if payload.get('max_tokens') == 16 and payload['messages'] == [{'role': 'user', 'content': 'Reply with 1.'}]:
             field = 'logprobs' if 'logprobs' in payload else 'stream_options'
             return httpx.Response(400, json={'error': {'param': field}})
         prompt = tuple(m['content'] for m in payload['messages'])

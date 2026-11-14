@@ -171,6 +171,62 @@ assert.equal(calls[1],'/api/runs/saved-run/performance?target=other');
 assert.match($('#report-performance').textContent,/Model B/);
 assert.equal(calls.length,2,'only the latest queued selection is loaded');
 assert.equal($('#performance-window').querySelector('[selected]').getAttribute('value'),'full');
+assert.equal($('#performance-window').value,'full','the visible selection must match the summary, not a previous user selection');
+assert.equal($('#performance-target').value,'other');
+})()
+""", dom=True)
+
+
+def test_multi_user_window_selector_and_summary_stay_aligned_after_live_completion():
+    run_render_checks(PERFORMANCE + r"""
+(async()=>{
+const windows=[];
+for(const profile of ['long_short','short_long'])for(const trigger of ['before_output','during_stream'])for(const role of ['control','probe']){
+  const id=[profile,trigger,role].join(':');
+  windows.push({id,label:id,workload_label:id,description:id,start_ms:0,end_ms:1000,duration_s:1,request_count:16});
+}
+windows.push({id:'cancellation',label:'Cancellation',workload_label:'Cancellation',description:'Selected cancellation',start_ms:0,end_ms:1000,duration_s:1,request_count:9});
+function data(selected){
+  const value=performanceFixture('local',selected),target=value.targets[0];
+  target.windows=windows;target.default_window=windows[0].id;
+  target.summaries[selected].metrics.throughput.value=windows.find(item=>item.id===selected).request_count;
+  return value;
+}
+state.detail={id:'saved-run',state:'running',config:{targets:[]},live_requests:[]};renderDetail();
+reportView.performance=data('cancellation');renderDetail();
+assert.equal($('#performance-window').value,'cancellation');
+state.detail={id:'saved-run',state:'completed',report:report([check('multi_user','pass')],{performance:data(windows[0].id)})};renderDetail();
+chooseReportTab('performance',{anchor:false});
+const select=$('#performance-window');
+assert.equal(select.querySelectorAll('optgroup').length,9);
+assert.equal(select.value,windows[0].id);
+assert.equal(selectedPerformance().window.id,select.value);
+assert.match($('.performance-window-description').textContent,/long_short:before_output:control/);
+api=async()=>data('cancellation');
+select.value='cancellation';listeners.change({target:select});await Promise.resolve();await Promise.resolve();
+assert.equal($('#performance-window').value,'cancellation');
+assert.equal(selectedPerformance().summary.metrics.throughput.value,9);
+assert.match($('.performance-window-description').textContent,/Selected cancellation/);
+})()
+""", dom=True)
+
+
+def test_live_refresh_preserves_target_selection_while_measurements_load():
+    run_render_checks(PERFORMANCE + r"""
+(async()=>{
+state.detail={id:'saved-run',state:'running',config:{targets:[]},live_requests:[]};renderDetail();
+reportView.performance=performanceFixture();reportView.tab='performance';renderDetail();
+let finish;api=()=>new Promise(resolve=>finish=resolve);
+const select=$('#performance-target');select.value='other';listeners.change({target:select});
+assert(reportView.pending);
+renderDetail();
+assert.equal($('#performance-target').value,'other','a live poll must preserve the requested target');
+assert($('#performance-window').hasAttribute('disabled'),'old measurements cannot be selected while loading');
+finish(performanceFixture('other','full'));await Promise.resolve();await Promise.resolve();
+assert.equal($('#performance-target').value,'other');
+assert.equal($('#performance-window').value,'full');
+assert(!$('#performance-window').hasAttribute('disabled'));
+assert.match($('#report-performance').textContent,/Model B/);
 })()
 """, dom=True)
 

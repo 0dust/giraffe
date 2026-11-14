@@ -31,6 +31,48 @@ def test_request_overrides_cannot_escape_token_or_concurrency_budget():
         RunConfig(targets=[Target(name="local", url="http://localhost", model="example")], request_options={"n": 100})
 
 
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
+@pytest.mark.parametrize("nested", [False, True])
+def test_request_options_reject_nonfinite_numbers_with_their_path(value, nested):
+    options = {"extra": [{"top_p": value}]} if nested else {"top_p": value}
+    path = "request_options.extra.0.top_p" if nested else "request_options.top_p"
+    with pytest.raises(ValidationError) as caught:
+        RunConfig(targets=[Target(name="local", url="http://localhost", model="example")],
+                  request_options=options)
+    assert f"{path} must be a finite number" in str(caught.value)
+
+
+def test_request_options_preserve_finite_numbers_and_other_json_values():
+    options = {"top_p": .5, "extra": [1, -2.5, True, False, "NaN", None, {"value": 1e308}]}
+    cfg = RunConfig(targets=[Target(name="local", url="http://localhost", model="example")],
+                    request_options=options)
+    assert cfg.request_options == options
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
+@pytest.mark.parametrize("source", ["request_pack", "tool_fixture", "tool_conversation"])
+def test_workload_request_options_reject_nonfinite_numbers(value, source):
+    from giraffe.tool_checks import default_tool_fixture
+    from tests.test_tool_conversations import fixture
+
+    options = {"extra": [{"top_p": value}]}
+    if source == "request_pack":
+        changes = {"request_source": "request_pack", "request_pack": {"version": 1, "cases": [{
+            "fixture_id": "one", "messages": [{"role": "user", "content": "hello"}],
+            "scorer": "none", "options": options}]}}
+        path = "request_pack.cases.0.options.extra.0.top_p"
+    elif source == "tool_fixture":
+        item = default_tool_fixture().model_dump(mode="python")
+        changes = {"tool_checks": {"fixtures": [{**item, "options": options}]}}
+        path = "tool_checks.fixtures.0.options.extra.0.top_p"
+    else:
+        changes = {"tool_checks": {"conversations": [fixture(options=options)]}}
+        path = "tool_checks.conversations.0.options.extra.0.top_p"
+    with pytest.raises(ValidationError) as caught:
+        RunConfig(targets=[Target(name="local", url="http://localhost", model="example")], **changes)
+    assert f"{path} must be a finite number" in str(caught.value)
+
+
 def test_explicit_checks_override_legacy_flags_and_round_trip():
     target = Target(name="local", url="http://localhost", model="example")
     default = RunConfig(targets=[target])
@@ -130,12 +172,13 @@ def test_workload_defaults_and_explicit_selection_preserve_disabled_configuratio
     assert draft.checks == []
     assert not draft.tool_calling
     assert set(CHECK_NAMES) - set(CORE_CHECKS) == {
-        "prefix", "sessions", "consistency", "tools"}
+        "gateway_attribution", "gateway_policy", "gateway_access",
+        "prefix", "sessions", "consistency", "tools", "multi_user"}
 
 
 @pytest.mark.parametrize("check_id,field", [
     ("load", "load_test"), ("prefix", "prefix"), ("sessions", "sessions"), ("consistency", "consistency"),
-    ("tools", "tool_calling"),
+    ("tools", "tool_calling"), ("multi_user", "multi_user"),
 ])
 def test_selected_extended_workloads_get_safe_defaults(check_id, field):
     config = RunConfig(targets=[Target(name="local", url="http://localhost", model="test")],
@@ -223,3 +266,42 @@ def test_legacy_migration_preserves_whether_parallelism_was_requested(legacy, ex
     assert config.default_concurrency == 4
     assert config.parallelism_requested('correctness') == explicit
     assert ('default_concurrency' in config.model_dump(mode='json')) == explicit
+
+
+@pytest.mark.parametrize("changes", [
+    {"concurrency": 1}, {"long_cohort_size": 3, "concurrency": 3},
+    {"long_cohort_size": 1, "min_overlap_samples": 2},
+    {"requests_per_second": float("nan")}, {"post_seconds": float("inf")},
+    {"event_timeout_seconds": 0}, {"grace_seconds": -1},
+])
+def test_scale_down_config_rejects_unbounded_or_starved_scenarios(changes):
+    from giraffe.models import ScaleDownConfig
+    with pytest.raises(ValidationError):
+        ScaleDownConfig(target="service", **changes)
+
+
+def test_scale_down_settings_are_optional_and_round_trip():
+    from giraffe.models import ScaleDownConfig
+    target = Target(name="service", url="http://localhost", model="model")
+    assert RunConfig(targets=[target]).scale_down is None
+    config = RunConfig(targets=[target], checks=["serving"], scale_down=ScaleDownConfig(target="service"))
+    assert RunConfig.model_validate(config.model_dump()).scale_down == config.scale_down
+
+
+def test_scale_down_arrival_bound_includes_baseline_samples():
+    from giraffe.models import ScaleDownConfig
+    # 99,999 follow-ups plus one long request already consume the finite cap.
+    with pytest.raises(ValueError, match='maximum planned arrivals'):
+        ScaleDownConfig(target='service', requests_per_second=9999.9, long_cohort_size=1,
+                        baseline_timeout_seconds=1, event_timeout_seconds=7,
+                        grace_seconds=1, post_seconds=1)
+
+
+def test_scale_down_selection_requires_a_bound_target_and_config():
+    target = dict(name='service', url='http://localhost/v1', model='test')
+    for settings in (None, dict(target='missing')):
+        with pytest.raises(ValueError, match='scale_down'):
+            RunConfig(targets=[target], checks=['scale_down'], scale_down=settings)
+    # Merely retaining scenario settings does not select the external exercise.
+    cfg = RunConfig(targets=[target], scale_down=dict(target='service'))
+    assert 'scale_down' not in cfg.checks

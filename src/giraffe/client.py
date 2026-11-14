@@ -8,6 +8,7 @@ import codecs
 import json
 import hashlib
 from contextlib import aclosing
+from dataclasses import dataclass
 from http.cookiejar import CookieJar
 import os
 import re
@@ -16,12 +17,12 @@ import time
 import uuid
 from time import monotonic
 from datetime import datetime, timezone
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Callable, Literal
 
 import httpx
 
 from .caps import (
-    MAX_SERVER_ID_CHARS, MAX_TOOL_CALLS,
+    MAX_GATEWAY_USAGE_TOKENS, MAX_SERVER_ID_CHARS, MAX_TOKEN_EVIDENCE_PROBE_ATTEMPTS, MAX_TOOL_CALLS,
 )
 from giraffe.models import RequestRecord, RequestSpec, RunConfig, Target
 from giraffe.logprobs import LogprobBudget, LogprobCollector
@@ -38,8 +39,34 @@ _MAX_CONTENT_READS = 65536
 _MAX_OUTPUT_EVENTS = 4096
 # Reuse completed HTTP/1.1 streams without waiting on servers that never send EOF.
 _STREAM_DRAIN_SECONDS = 0.1
-_REASONING_TAG = re.compile(r"<(/?)(think|thinking|reasoning)>", re.IGNORECASE)
+_REASONING_TAG_NAMES = ("think", "thinking", "reasoning")
+_REASONING_TAG = re.compile(r"<(/?)(" + "|".join(_REASONING_TAG_NAMES) + ")>", re.IGNORECASE)
+_REASONING_TAG_PREFIXES = {tag[:size] for name in _REASONING_TAG_NAMES
+                          for tag in (f"<{name}>", f"</{name}>") for size in range(1, len(tag))}
+_REASONING_TAG_PREFIX = re.compile("|".join(sorted(_REASONING_TAG_PREFIXES)), re.IGNORECASE)
+_MAX_REASONING_TAG_PREFIX = max(map(len, _REASONING_TAG_PREFIXES))
+_SURROGATE = re.compile(r"[\ud800-\udfff]")
 REASONING_BUDGET_ERROR = "reasoning exhausted the output budget before an answer"
+NO_ANSWER_ERROR = "response contained no useful answer output"
+
+
+@dataclass(frozen=True)
+class RequestLifecycleEvent:
+    """Transport observation; terminal scoring and run limits belong to the runner."""
+
+    kind: Literal["started", "answer", "attribution", "terminal"]
+    request_id: str
+    target: str
+    monotonic_seconds: float
+    stream: bool
+    backend_id: str | None = None
+    server_request_id: str | None = None
+    status: str | None = None
+    valid: bool | None = None
+    error: str | None = None
+    finish_reason: str | None = None
+    stream_terminated: bool | None = None
+    termination_reason: str | None = None
 
 
 def no_response_failure(record: RequestRecord, *, include_timeouts=True) -> bool:
@@ -105,13 +132,16 @@ async def _limited_body(response: httpx.Response, *, on_read=None, on_body=None)
     return bytes(body)
 
 
-async def _sse_events(response: httpx.Response, *, on_read=None) -> AsyncIterator[tuple[str, str, float]]:
-    """Decode SSE independently of TCP boundaries, including CRLF and multiline data."""
+async def _sse_events(
+    response: httpx.Response, *, on_read=None, mark_read_end=False,
+) -> AsyncIterator[tuple[str | None, str, float]]:
+    """Decode SSE events and optionally mark the end of each transport read."""
     decoder = codecs.getincrementaldecoder("utf-8")("strict")
     buffer = ""
     data: list[str] = []
     event_type = "message"
     consumed = 0
+    skip_lf = False
 
     async def chunks_with_eof() -> AsyncIterator[tuple[bytes, bool]]:
         async with aclosing(response.aiter_bytes()) as chunks:
@@ -127,12 +157,15 @@ async def _sse_events(response: httpx.Response, *, on_read=None) -> AsyncIterato
             consumed += len(chunk)
             if consumed > _MAX_RESPONSE_BYTES:
                 raise _ProtocolError("response exceeded the 4 MiB safety limit")
-            buffer += decoder.decode(chunk, final=final)
+            decoded = decoder.decode(chunk, final=final)
+            if skip_lf and decoded:
+                decoded = decoded.removeprefix("\n")
+                skip_lf = False
+            buffer += decoded
             while (match := re.search(r"[\r\n]", buffer)) is not None:
                 end = match.start()
-                # A CR at the end might be the first half of a fragmented CRLF.
-                if buffer[end] == "\r" and end == len(buffer) - 1 and not final:
-                    break
+                # A CR already ends the line. Skip an optional LF in the next read.
+                skip_lf = buffer[end] == "\r" and end == len(buffer) - 1
                 width = 2 if buffer[end:end + 2] == "\r\n" else 1
                 line, buffer = buffer[:end], buffer[end + width:]
                 if not line:
@@ -146,15 +179,24 @@ async def _sse_events(response: httpx.Response, *, on_read=None) -> AsyncIterato
                         data.append(value)
                     elif field == "event":
                         event_type = value
+            if mark_read_end and not final:
+                yield None, "", observed_at
     if buffer or data:
         raise _ProtocolError("unterminated SSE event at end of response")
 
 
-def _object(payload: str | bytes) -> dict[str, Any]:
-    try:
-        value = json.loads(payload)
-    except (ValueError, UnicodeDecodeError) as exc:
-        raise _ProtocolError("malformed JSON in response") from exc
+def _object(payload: str | bytes, *, strict_gateway_json: bool = False) -> dict[str, Any]:
+    if strict_gateway_json:
+        from .gateway_json import parse_gateway_json
+
+        value = parse_gateway_json(payload)
+        if value is None:
+            raise _ProtocolError("malformed JSON in response")
+    else:
+        try:
+            value = json.loads(payload)
+        except (ValueError, RecursionError) as exc:
+            raise _ProtocolError("malformed JSON in response") from exc
     if not isinstance(value, dict):
         raise _ProtocolError("response must contain a JSON object")
     if value.get("error") is not None:
@@ -168,11 +210,50 @@ def _text(value: Any) -> str:
         return ""
     if not isinstance(value, str):
         raise _ProtocolError("response content must be text")
+    if not value.isascii() and _SURROGATE.search(value):
+        raise _ProtocolError("response text contains invalid Unicode")
     return value
+
+
+def _has_post_finish_delta_payload(delta: dict[str, Any]) -> bool:
+    """Qualify marked usage only when later choice deltas carry no new output."""
+    metadata = {"audio": {"id", "expires_at"}, "function_call": set(),
+                "provider_specific_fields": {"annotations", "citations"}}
+    empty = (None, "", [], {})
+    for field, value in delta.items():
+        if field in {"annotations", "citations"} or (field == "role" and value == "assistant"):
+            continue
+        if field in metadata and isinstance(value, dict):
+            if any(name not in metadata[field] and part not in empty for name, part in value.items()):
+                return True
+        elif value not in empty:
+            return True
+    return False
 
 
 def _token_count(value: Any) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def _gateway_token_count(value: Any) -> int | None:
+    count = _token_count(value)
+    if count is not None and count > MAX_GATEWAY_USAGE_TOKENS:
+        raise _ProtocolError("token usage exceeded the gateway evidence limit")
+    return count
+
+
+def _gateway_usage_total(usage: dict[str, Any]) -> int | None:
+    if "total_tokens" not in usage:
+        return None
+    total = _gateway_token_count(usage["total_tokens"])
+    if total is None:
+        raise _ProtocolError("invalid total usage in gateway response")
+    return total
+
+
+def _check_gateway_usage_total(prompt: int | None, completion: int | None, total: int | None) -> None:
+    if total is not None and prompt is not None and completion is not None and total != prompt + completion:
+        raise _ProtocolError("inconsistent total usage in gateway response")
 
 
 def _rejected_evidence_field(body: bytes) -> str | None:
@@ -200,9 +281,12 @@ def _rejected_evidence_field(body: bytes) -> str | None:
     return None
 
 
-def _answer_spans(output: str) -> list[tuple[int, int]] | None:
-    """Raw-output spans that fixtures.final_answer keeps; None when reasoning is unclosed."""
-    cursor, spans, stack = 0, [], []
+def _answer_spans(
+    output: str, *, stream_stack: list[str] | None = None,
+) -> tuple[list[tuple[int, int]] | None, bool]:
+    """Locate answer text and report whether an orphan close revoked earlier spans."""
+    cursor, spans, answer_reset = 0, [], False
+    stack = [] if stream_stack is None else stream_stack
     for tag in _REASONING_TAG.finditer(output):
         name = tag[2].lower()
         if not tag[1]:
@@ -215,8 +299,10 @@ def _answer_spans(output: str) -> list[tuple[int, int]] | None:
                 if not stack:
                     cursor = tag.end()
         else:
-            spans, cursor = [], tag.end()
-    return None if stack else [*spans, (cursor, len(output))]
+            spans, cursor, answer_reset = [], tag.end(), True
+    if stack:
+        return (None if stream_stack is None else spans), answer_reset
+    return [*spans, (cursor, len(output))], answer_reset
 
 
 def _reasoning_spans(spans: list[tuple[int, int]] | None, length: int) -> list[tuple[int, int]]:
@@ -227,10 +313,74 @@ def _reasoning_spans(spans: list[tuple[int, int]] | None, length: int) -> list[t
     return [*result, (start, length)]
 
 
+def _mask_reasoning_tags(text: str) -> str:
+    return _REASONING_TAG.sub(lambda tag: " " * len(tag[0]), text)
+
+
+class _StreamGeneration:
+    """Classify complete text while retaining a possible split inline delimiter."""
+
+    def __init__(self):
+        self.pending: list[tuple[str, float, bool, bool]] = []
+        self.stack: list[str] = []
+
+    def receive(self, at: float, answer: str = "", reasoning: str = "", *,
+                final: bool = False) -> tuple[int, int, float | None, bool]:
+        """Return chunk counts, first generated-content receipt, and answer revocation."""
+        counted = bool(reasoning.strip())
+        if not self.pending and "<" not in answer:
+            useful = bool(answer.strip())
+            return (int(counted or useful), int(useful and not self.stack),
+                    at if answer or reasoning else None, False)
+
+        parts = [*self.pending, (answer, at, counted, False)]
+        text = "".join(part for part, _, _, _ in parts)
+        end = len(text)
+        if not final:
+            start = text.rfind("<", max(0, end - _MAX_REASONING_TAG_PREFIX))
+            if start >= 0 and _REASONING_TAG_PREFIX.fullmatch(text[start:]):
+                end = start
+        confirmed = text[:end]
+        # Preserve offsets so a split literal contributes at most once per SSE delta.
+        generated = _mask_reasoning_tags(confirmed)
+        # Whitespace qualifies for TTFT. Skip only complete leading delimiters.
+        token_offset = 0
+        while match := _REASONING_TAG.match(confirmed, token_offset):
+            token_offset = match.end()
+        token_at = at if reasoning else None
+        visible, cursor = [], 0
+        spans, answer_reset = _answer_spans(confirmed, stream_stack=self.stack)
+        for start, stop in spans:
+            visible.extend((" " * (start - cursor), confirmed[start:stop]))
+            cursor = stop
+        answer_text = "".join(visible)
+
+        count, answers, offset = int(counted), 0, 0
+        self.pending = []
+        for part, received_at, already_counted, already_answered in parts:
+            next_offset = offset + len(part)
+            if offset <= token_offset < min(next_offset, end):
+                token_at = received_at
+            if not already_counted and generated[offset:next_offset].strip():
+                count += 1
+                already_counted = True
+            if answer_reset:
+                already_answered = False
+            if not already_answered and answer_text[offset:next_offset].strip():
+                answers += 1
+                already_answered = True
+            if next_offset > max(end, offset):
+                self.pending.append((part[max(0, end - offset):], received_at, already_counted, already_answered))
+            offset = next_offset
+        return count, answers, token_at, answer_reset
+
+
 class LLMClient:
     reports_response_activity = True
+    _supports_dispatch_guard = True
 
-    def __init__(self, target: Target, config: RunConfig, *, max_connections: int | None = None):
+    def __init__(self, target: Target, config: RunConfig, *, max_connections: int | None = None,
+                 _tls_context: ssl.SSLContext | None = None):
         self.target = target
         self.config = config
         if max_connections is None:
@@ -241,6 +391,7 @@ class LLMClient:
         self.max_connections = max_connections
         self.logprob_budget = LogprobBudget()
         self._client: httpx.AsyncClient | HTTPClientPool | None = None
+        self._tls_context = _tls_context
         self._stream_drains: set[asyncio.Task[None]] = set()
         self.on_response = None
         self._evidence_fields = {"logprobs", "stream_options"}
@@ -254,7 +405,8 @@ class LLMClient:
         Only an explicit optional-field rejection permits another setup probe.
         Measured requests are never retried or used to discover compatibility.
         """
-        if self._evidence_probe_finished or self._evidence_probe_attempts >= 3 or not self.config.stream:
+        if (self._evidence_probe_finished or self._evidence_probe_attempts >= MAX_TOKEN_EVIDENCE_PROBE_ATTEMPTS
+                or not self.config.stream):
             return None
         self._evidence_probe_attempts += 1
         options = {}
@@ -262,8 +414,10 @@ class LLMClient:
             options.update(logprobs=True, top_logprobs=0)
         if "stream_options" in self._evidence_fields:
             options["stream_options"] = {"include_usage": True}
+        # A single token can be a hidden reasoning delimiter. Give the bounded
+        # probe room to observe visible output, without waiting for a full answer.
         return RequestSpec(fixture_id="performance-evidence", scenario="performance_evidence_probe",
-            check_ids=[], messages=[{"role": "user", "content": "Reply with 1."}], max_tokens=1,
+            check_ids=[], messages=[{"role": "user", "content": "Reply with 1."}], max_tokens=16,
             request_timeout_seconds=self.config.request_timeout_seconds, options=options,
             workload={"performance_evidence_probe": True, "role": "setup", "phase": "preparation",
                       "evidence_fields": sorted(self._evidence_fields)})
@@ -275,7 +429,8 @@ class LLMClient:
             self._evidence_fields.discard(field)
             self.token_evidence["logprobs" if field == "logprobs" else "usage"] = "rejected"
             self.token_evidence.update(status="probing", reason=f"Endpoint rejected {rejected} (HTTP {record.http_status}).")
-            self._evidence_probe_finished = not self._evidence_fields or self._evidence_probe_attempts >= 3
+            self._evidence_probe_finished = (not self._evidence_fields
+                                            or self._evidence_probe_attempts >= MAX_TOKEN_EVIDENCE_PROBE_ATTEMPTS)
         else:
             self._evidence_probe_finished = True
             completed = record.http_status == 200 and record.stream_terminated
@@ -295,14 +450,27 @@ class LLMClient:
     def _request_headers(self) -> dict[str, str]:
         return _headers(self.target)
 
+    @property
+    def tls_context(self) -> ssl.SSLContext:
+        if self._client is None or self._tls_context is None:
+            raise RuntimeError("Use LLMClient as an async context manager")
+        return self._tls_context
+
     def _create_client(self) -> HTTPClientPool:
         # HTTPX loads TLS certificates even for HTTP endpoints. Keep that
         # synchronous setup away from concurrent inference and the heartbeat.
         headers = self._request_headers()
-        verify = (ssl.create_default_context(cafile=self.config.ca_bundle)
-                  if self.config.ca_bundle else
-                  httpx.create_ssl_context(verify=True, trust_env=True))
-        cookies = CookieJar()
+        verify = self._tls_context
+        if verify is None:
+            verify = (ssl.create_default_context(cafile=self.config.ca_bundle)
+                      if self.config.ca_bundle else
+                      httpx.create_ssl_context(verify=True, trust_env=True))
+            self._tls_context = verify
+        if self.target.test_identities:
+            from .identities import IdentityCookieJar
+            cookies = IdentityCookieJar()
+        else:
+            cookies = CookieJar()
 
         def factory():
             return httpx.AsyncClient(
@@ -342,10 +510,11 @@ class LLMClient:
             if self._client is not None:
                 await self._client.aclose()
                 self._client = None
+                self._tls_context = None
 
     @staticmethod
     async def _drain_stream(
-        response: httpx.Response, events: AsyncIterator[tuple[str, str, float]],
+        response: httpx.Response, events: AsyncIterator[tuple[str | None, str, float]],
     ) -> None:
         # [DONE] completes the measured response. Consume only the transport tail
         # in the background so HTTPX can return the connection to its pool.
@@ -383,6 +552,18 @@ class LLMClient:
 
     async def execute(
         self, spec: RequestSpec, *, first_output_event: asyncio.Event | None = None,
+        lifecycle_observer: Callable[[RequestLifecycleEvent], None] | None = None,
+        _before_send: Callable[[], None] | None = None,
+    ) -> RequestRecord:
+        from .identities import identity_scope
+        with identity_scope(spec.identity is not None):
+            return await self._execute(spec, first_output_event=first_output_event,
+                                       lifecycle_observer=lifecycle_observer, _before_send=_before_send)
+
+    async def _execute(
+        self, spec: RequestSpec, *, first_output_event: asyncio.Event | None = None,
+        _before_send: Callable[[], None] | None = None,
+        lifecycle_observer: Callable[[RequestLifecycleEvent], None] | None = None,
     ) -> RequestRecord:
         if self._client is None:
             raise RuntimeError("Use LLMClient as an async context manager")
@@ -390,6 +571,7 @@ class LLMClient:
         stream = spec.stream if spec.workload.get("logprobs") else self.config.stream and spec.stream
         budget = spec.max_tokens if spec.max_tokens is not None else self.config.max_output_tokens
         record = RequestRecord(
+            identity=spec.identity,
             id=uuid.uuid4().hex, target=self.target.name, fixture_id=spec.fixture_id,
             scenario=spec.scenario, check_ids=spec.check_ids,
             started_at=datetime.now(timezone.utc).isoformat(), status="failed",
@@ -398,12 +580,46 @@ class LLMClient:
                 "No qualifying streamed generated-content event was observed." if stream else
                 "Non-streamed replies do not provide first-token arrival timing."),
         )
+        selected_headers = None
+        attribution = spec.identity is not None and "gateway_attribution" in spec.check_ids
+        access_probe = spec.identity is not None and "gateway_access" in spec.check_ids
+        policy_probe = spec.identity is not None and "gateway_policy" in spec.check_ids
+        priority_probe = (policy_probe and self.config.gateway_policy is not None
+                          and self.config.gateway_policy.capability == "priority_rpm")
+        if spec.identity is not None:
+            from .identities import identity_headers
+            try:
+                selected_headers = identity_headers(self.target, spec.identity)
+            except ValueError:
+                record.error = "Test identity credentials are unavailable."
+                return record
+            if access_probe:
+                from .gateway_access import IDENTITY_CHANGED, credential_digest, denial_kind, routing_issue
+
+                if credential_digest(selected_headers) != spec._gateway_access_credential_digest:
+                    record.error = IDENTITY_CHANGED
+                    return record
+            if attribution:
+                from .identities import litellm_key_fingerprint
+
+                record._gateway_key_hash = litellm_key_fingerprint(selected_headers)
+                selected_headers = dict(httpx.Headers(selected_headers))
+                selected_headers["x-litellm-trace-id"] = spec.workload["gateway_run"]
+                selected_headers["x-litellm-session-id"] = spec.workload["gateway_run"]
+                selected_headers["x-litellm-spend-logs-metadata"] = json.dumps({
+                    "giraffe_run": spec.workload["gateway_run"], "giraffe_request": record.id})
+        options = spec.options if access_probe else self.config.request_options | spec.options
         payload = {
-            key: value for key, value in (self.config.request_options | spec.options).items()
+            key: value for key, value in options.items()
             if key not in _RESERVED_OPTIONS and value is not None
         }
+        if attribution:
+            # LiteLLM can log an explicit caller session instead of the trace header.
+            payload["litellm_session_id"] = spec.workload["gateway_run"]
         payload.update(model=self.target.model, messages=spec.messages, stream=stream,
                        max_tokens=budget, n=1)
+        if not stream:
+            payload.pop("stream_options", None)
         if spec.scorer == "tool":
             if spec.tool_expectation and spec.tool_expectation.choice:
                 payload["tools"] = spec.tool_expectation.tools
@@ -417,7 +633,8 @@ class LLMClient:
         if stream and isinstance(options, dict) and options.get("continuous_usage_stats") is True:
             payload["stream_options"] = {"include_usage": True, **options}
         probing = spec.workload.get("performance_evidence_probe")
-        if stream and not probing:
+        # The shared key may route to a different backend from marked identities.
+        if stream and not probing and not attribution:
             if self.token_evidence["usage"] == "supported":
                 options = payload.setdefault("stream_options", {})
                 if isinstance(options, dict):
@@ -431,11 +648,17 @@ class LLMClient:
                     payload["logprobs"] = True
                     payload.setdefault("top_logprobs", 0)
         record.workload = dict(spec.workload)
-        if not probing and self._evidence_probe_attempts:
+        requested_logprobs = payload.get("logprobs") is True
+        stream_options = payload.get("stream_options")
+        requested_usage = isinstance(stream_options, dict) and stream_options.get("include_usage") is True
+        if stream and not probing and not attribution:
+            record.requested_stream_logprobs = requested_logprobs
+            record.requested_stream_usage = requested_usage
+        if not probing and not attribution and self._evidence_probe_attempts:
             record.workload["token_evidence"] = dict(self.token_evidence)
             evidence = record.workload["token_evidence"]
-            evidence["requested_logprobs"] = payload.get("logprobs") is True
-            evidence["requested_usage"] = isinstance(payload.get("stream_options"), dict) and payload["stream_options"].get("include_usage") is True
+            evidence["requested_logprobs"] = requested_logprobs
+            evidence["requested_usage"] = requested_usage
             if not stream:
                 evidence["logprobs"] = "non_streamed"
             if stream and not evidence["requested_logprobs"] and evidence["logprobs"] == "supported":
@@ -445,7 +668,7 @@ class LLMClient:
 
         def body_received(size):
             record.response_body_bytes += size
-            if self.on_response is not None:
+            if self.on_response is not None and spec.identity is None:
                 self.on_response()
         record.request_hash = hashlib.sha256(json.dumps({
             "messages": spec.messages, "options": {k: v for k, v in payload.items() if k not in {"model", "messages"}},
@@ -467,10 +690,71 @@ class LLMClient:
         reasoning_read_ids: set[int] = set()
         content_event_spans: list[tuple[dict[str, Any], int, int]] = []
         response_sequence = -1
+        generation = _StreamGeneration()
+        confirmed_progress = getattr(first_output_event, "requires_confirmed_answer", False)
+        pending_live_first = False
+        pending_live_chunks = 0
         conversation = spec.workload.get("selection") == "conversation"
         logprob_collector = LogprobCollector(spec.workload["top_logprobs"], self.logprob_budget) if spec.workload.get("logprobs") and stream else None
         assistant_content_present = False
         assistant_extras: dict[str, list[str]] = {}
+        answer_observed = False
+        answer_tail = ""
+        reasoning_stack: list[str] = []
+        lifecycle_attribution = (None, None)
+
+        def observe(kind):
+            if lifecycle_observer is not None:
+                terminal = kind == "terminal"
+                lifecycle_observer(RequestLifecycleEvent(
+                    kind=kind, request_id=record.id, target=record.target,
+                    monotonic_seconds=monotonic(), stream=stream,
+                    backend_id=record.backend_id, server_request_id=record.server_request_id,
+                    status=record.status if terminal else None,
+                    valid=record.valid if terminal else None,
+                    error=record.error if terminal else None,
+                    finish_reason=record.finish_reason if terminal else None,
+                    stream_terminated=record.stream_terminated if terminal else None,
+                    termination_reason=record.termination_reason if terminal else None))
+
+        def observe_attribution():
+            nonlocal lifecycle_attribution
+            current = (record.backend_id, record.server_request_id)
+            if lifecycle_observer is not None and current != lifecycle_attribution:
+                lifecycle_attribution = current
+                observe("attribution")
+
+        def observe_answer(text):
+            nonlocal answer_observed, answer_tail
+            if lifecycle_observer is None or answer_observed or not stream:
+                return
+            # Parse only new content, retaining at most one incomplete tag. Do
+            # not rescan an ever-growing reasoning response on every token.
+            text = answer_tail + text
+            answer_tail = ""
+            last_open = text.rfind("<")
+            if last_open >= 0 and any(tag.startswith(text[last_open:].lower()) for tag in (
+                "<think>", "</think>", "<thinking>", "</thinking>",
+                "<reasoning>", "</reasoning>")):
+                answer_tail, text = text[last_open:], text[:last_open]
+            cursor = 0
+            useful = False
+            for tag in _REASONING_TAG.finditer(text):
+                if not reasoning_stack and text[cursor:tag.start()].strip():
+                    useful = True
+                name = tag[2].lower()
+                if not tag[1]:
+                    reasoning_stack.append(name)
+                elif reasoning_stack and reasoning_stack[-1] == name:
+                    reasoning_stack.pop()
+                elif not reasoning_stack:
+                    useful = False  # Closing prompt-opened reasoning.
+                cursor = tag.end()
+            if not reasoning_stack and text[cursor:].strip():
+                useful = True
+            if useful and not reasoning_stack:
+                answer_observed = True
+                observe("answer")
 
         def stream_body_received(size):
             nonlocal read_id
@@ -478,17 +762,51 @@ class LLMClient:
                 read_id += 1
                 body_received(size)
 
+        def first_token(at: float, *, notify=True):
+            at_ms = (at - start) * 1000
+            previous = record.first_token_ms
+            if previous is None or at_ms < previous:
+                record.first_token_ms = at_ms
+                record.first_token_reason = None
+            if previous is None and notify and hasattr(first_output_event, "on_first_token"):
+                first_output_event.on_first_token()
+
+        def notify_answer_chunks(chunks: int):
+            if hasattr(first_output_event, "on_answer_chunk"):
+                for _ in range(chunks):
+                    first_output_event.on_answer_chunk()
+
+        def observe_generation(at: float, answer: str = "", reasoning: str = "", *, final=False):
+            nonlocal pending_live_first, pending_live_chunks
+            chunks, answers, token_at, answer_reset = generation.receive(at, answer, reasoning, final=final)
+            if token_at is not None:
+                first_token(token_at, notify=not final)
+            record.generation_chunks += chunks
+            if answer_reset:
+                record.answer_chunks = 0
+                if confirmed_progress:
+                    # An orphan close makes earlier apparent answers reasoning,
+                    # including any queued in the current read.
+                    pending_live_first = tool_output is not None
+                    pending_live_chunks = 0
+                    first_output_event.on_answer_reset()
+            if confirmed_progress and answers and not final:
+                pending_live_first |= record.answer_chunks == 0 and tool_output is None
+                pending_live_chunks += answers
+            record.answer_chunks += answers
+
+        def finish_progress(at: float):
+            observe_generation(at, final=True)
+            if hasattr(first_output_event, "on_stream_finished"):
+                first_output_event.on_stream_finished()
+
         def output_event(kind: str, text: str, at: float, *, tokens=None):
-            # Client receipt time, not server generation time. Tool-only TTFT
-            # starts at generated argument content, not ID/type/function names.
-            # No tokenization or text retention is added to the stream reader.
-            # A nonempty whitespace delta is still generated content for TTFT;
-            # useful-answer timing continues to require non-whitespace output.
+            # Tool-only TTFT starts at generated arguments, rather than call metadata.
+            # Content TTFT comes from delimiter-aware classification.
             if not stream or not text:
                 return
-            if record.first_token_ms is None:
-                record.first_token_ms = (at - start) * 1000
-                record.first_token_reason = None
+            if kind == "tool_arguments":
+                first_token(at)
             if kind == "reasoning" and read_id not in reasoning_read_ids:
                 if len(record.reasoning_read_timestamps_ms) < _MAX_CONTENT_READS:
                     record.reasoning_read_timestamps_ms.append((at - start) * 1000)
@@ -518,6 +836,7 @@ class LLMClient:
 
         def receive(data: dict[str, Any], *, streaming: bool, observed_at: float) -> None:
             nonlocal last_answer, response_sequence, assistant_content_present, tool_output, reads_truncated
+            nonlocal pending_live_first
             nonlocal usage_consistent, previous_completion, previous_reasoning, previous_output
             server_id = data.get("id")
             if (spec.cancel_after_chunks is not None and isinstance(server_id, str)
@@ -534,22 +853,33 @@ class LLMClient:
             backend = data.get("backend_id")
             if isinstance(backend, str) and backend:
                 record.backend_id = backend
+            observe_attribution()
             usage = data.get("usage")
             completion_tokens = reasoning_tokens = None
             if isinstance(usage, dict):
-                record.input_tokens = _token_count(usage.get("prompt_tokens"))
-                completion_tokens = _token_count(usage.get("completion_tokens"))
-                record.completion_tokens = completion_tokens
-                record.output_tokens = record.completion_tokens
+                gateway_probe = attribution or policy_probe or access_probe
+                count = _gateway_token_count if gateway_probe else _token_count
+                prompt_tokens = count(usage.get("prompt_tokens"))
+                completion_tokens = count(usage.get("completion_tokens"))
                 cached = usage.get("prompt_tokens_details")
-                if isinstance(cached, dict):
-                    record.cached_prompt_tokens = _token_count(cached.get("cached_tokens"))
-                    if record.cached_prompt_tokens is not None:
-                        record.cache_source = "usage.prompt_tokens_details.cached_tokens"
+                cached_tokens = count(cached.get("cached_tokens")) if isinstance(cached, dict) else None
                 details = usage.get("completion_tokens_details")
-                reasoning_tokens = _token_count(details.get("reasoning_tokens")) if isinstance(
-                    details, dict,
-                ) else None
+                if priority_probe and details is not None and not isinstance(details, dict):
+                    raise _ProtocolError("invalid completion token details in gateway response")
+                raw_reasoning_tokens = details.get("reasoning_tokens") if isinstance(details, dict) else None
+                reasoning_tokens = count(raw_reasoning_tokens)
+                if priority_probe:
+                    if raw_reasoning_tokens is not None and reasoning_tokens is None:
+                        raise _ProtocolError("invalid reasoning token usage in gateway response")
+                    _check_gateway_usage_total(prompt_tokens, completion_tokens, _gateway_usage_total(usage))
+                elif gateway_probe:
+                    _gateway_token_count(usage.get("total_tokens"))
+                record.input_tokens = prompt_tokens
+                record.completion_tokens = record.output_tokens = completion_tokens
+                if isinstance(cached, dict):
+                    record.cached_prompt_tokens = cached_tokens
+                    if cached_tokens is not None:
+                        record.cache_source = "usage.prompt_tokens_details.cached_tokens"
                 record.reasoning_tokens = reasoning_tokens
                 if record.output_tokens is not None and reasoning_tokens is not None:
                     record.output_tokens = max(0, record.output_tokens - reasoning_tokens)
@@ -601,29 +931,53 @@ class LLMClient:
                     record.assistant_message = {"role": "assistant", **content}
                 else:
                     assistant_content_present |= isinstance(content.get("content"), str)
-            answer = _text(content.get("content"))
+            if policy_probe:
+                if (content.get("role") != "assistant" or choice.get("finish_reason") not in ("stop", "length")
+                        or content.get("tool_calls") not in (None, []) or content.get("function_call") is not None):
+                    raise _ProtocolError("gateway policy probe requires a completed assistant answer")
+                for field in ("reasoning_content", "reasoning", "refusal"):
+                    _text(content.get(field))
+            if (attribution and streaming and record.finish_reason is not None
+                    and _has_post_finish_delta_payload(content)):
+                record._gateway_terminal_usage = False
+                kind = "reasoning" if content.get("reasoning_content") or content.get("reasoning") else "generated"
+                raise _ProtocolError(f"{kind} content arrived after the finish reason")
+            if access_probe:
+                from .gateway_access import assistant_reply
+
+                answer, reasoning, record._gateway_access_refusal, record._gateway_access_metered_reasoning = (
+                    assistant_reply(content, choice.get("finish_reason"), usage, record)
+                )
+            else:
+                answer = _text(content.get("content"))
             if logprob_collector is not None:
                 logprob_collector.add(choice.get("logprobs"))
             if spec.workload.get("logprobs") and not streaming:
                 record.logprob_evidence = self.logprob_budget.collect(choice.get("logprobs"), answer,
                                                           spec.workload["top_logprobs"])
-            reasoning = _text(content.get("reasoning_content") or content.get("reasoning"))
+            if not access_probe:
+                reasoning = _text(content.get("reasoning_content") or content.get("reasoning"))
             now = observed_at
             if streaming:
                 token_evidence = choice.get("logprobs")
                 token_parts = token_evidence.get("content") if isinstance(token_evidence, dict) else None
-                tokens = None
+                tokens = reasoning_token_count = None
                 if (isinstance(token_parts, list) and token_parts
                         and all(isinstance(part, dict) and isinstance(part.get("token"), str)
-                                for part in token_parts)
-                        and "".join(part["token"] for part in token_parts) == answer):
-                    tokens = len(token_parts)
+                                for part in token_parts)):
+                    token_text = "".join(part["token"] for part in token_parts)
+                    # Some endpoints attach a mixed reasoning/answer token batch
+                    # to the reasoning delta. Count only exact, unambiguous text
+                    # matches; observed tokens do not establish final usage.
+                    if answer and not reasoning and token_text == answer:
+                        tokens = len(token_parts)
+                    elif reasoning and not answer and token_text == reasoning:
+                        reasoning_token_count = len(token_parts)
                 content_event = output_event("answer", _REASONING_TAG.sub("", answer), now, tokens=tokens)
                 if content_event is not None:
                     content_event_spans.append((content_event, len(record.output), len(record.output) + len(answer)))
-                output_event("reasoning", reasoning, now)
-            if streaming and (_REASONING_TAG.sub("", answer).strip() or reasoning.strip()):
-                record.generation_chunks += 1
+                output_event("reasoning", reasoning, now, tokens=reasoning_token_count)
+                observe_generation(now, answer, reasoning)
             calls = content.get("tool_calls")
             if calls is not None:
                 if not isinstance(calls, list) or len(calls) > MAX_TOOL_CALLS:
@@ -659,12 +1013,14 @@ class LLMClient:
                     part["function"]["arguments"] += arguments
                     if streaming:
                         output_event("tool_arguments", arguments, now)
-                    if tool_output is None and (function.get("name") or function.get("arguments")):
+                    if tool_output is None and (name or arguments):
                         tool_output = now
-                    if record.first_output_ms is None and (function.get("name") or function.get("arguments")):
-                        record.first_output_ms = (now-start)*1000
-                        if first_output_event is not None:
-                            first_output_event.set()
+                        if record.first_output_ms is None:
+                            record.first_output_ms = (now - start) * 1000
+                            if first_output_event is not None and (not confirmed_progress or not streaming):
+                                first_output_event.set()
+                        if streaming and confirmed_progress and record.answer_chunks == 0:
+                            pending_live_first = True
             if answer:
                 if record.finish_reason is not None:
                     raise _ProtocolError("answer content arrived after the finish reason")
@@ -678,20 +1034,20 @@ class LLMClient:
                     # Missing usage on a later content event invalidates this boundary.
                     content_reads[-1] = (content_reads[-1][0], now, read_id, completion_tokens, reasoning_tokens)
                 record.output += answer
+                if streaming:
+                    observe_answer(answer)
                 if answer.strip():
                     if record.first_output_ms is None:
                         record.first_output_ms = (now - start) * 1000
-                        if first_output_event is not None:
+                        if first_output_event is not None and (not confirmed_progress or not streaming):
                             first_output_event.set()
                     if streaming and last_answer is not None:
                         record.max_stream_gap_ms = max(
                             record.max_stream_gap_ms or 0, (now - last_answer) * 1000,
                         )
                     last_answer = now
-                    if streaming:
-                        record.answer_chunks += 1
-                        if first_output_event is not None and hasattr(first_output_event, "on_answer_chunk"):
-                            first_output_event.on_answer_chunk()
+                    if streaming and not confirmed_progress:
+                        notify_answer_chunks(1)
                 if record.first_output_ms is not None:
                     record.last_output_ms = (now - start) * 1000
             if reasoning:
@@ -707,6 +1063,8 @@ class LLMClient:
                 if record.finish_reason is not None:
                     raise _ProtocolError("repeated completion finish reason")
                 record.finish_reason = finish
+                if streaming:
+                    finish_progress(now)
 
         request_timeout = (spec.request_timeout_seconds if spec.request_timeout_seconds is not None
                            else self.config.request_timeout_seconds)
@@ -716,19 +1074,87 @@ class LLMClient:
         )
         timeout = min(request_timeout,
                       spec.cancel_after_ms / 1000 if spec.cancel_after_ms else float("inf"))
+        transport_started = _before_send is None
         try:
-            async with asyncio.timeout(timeout):
-                response = await self._client.send(self._client.build_request(
+            observe("started")
+            async with asyncio.timeout(None if _before_send is not None else timeout) as request_deadline:
+                request = self._client.build_request(
                     "POST", completion_url(self.target.url), json=payload,
-                    timeout=httpx.Timeout(None, connect=min(request_timeout * .9, 10))), stream=True)
+                    timeout=httpx.Timeout(None, connect=min(request_timeout * .9, 10)))
+                if selected_headers is not None:
+                    # Building through HTTPX merges default headers and cookies.
+                    # Rebuild the complete headers from this identity instead.
+                    request.headers = httpx.Request("POST", request.url, json=payload,
+                                                    headers=selected_headers).headers
+                if spec.workload.get("scenario") == "noisy_neighbors" and spec.workload.get("role") == "probe":
+                    sending_post = False
+
+                    async def observe_send(event: str, info: dict) -> None:
+                        nonlocal sending_post
+                        protocol, _, name = event.partition(".")
+                        if protocol not in {"http11", "http2"}:
+                            return
+                        if name == "send_request_body.started":
+                            traced = info["request"]
+                            # CONNECT inherits the trace. An absolute-form POST
+                            # can be buffered by a forwarding proxy before the origin sees it.
+                            sending_post = traced.method == b"POST" and traced.url.target.startswith(b"/")
+                        elif name == "send_request_body.complete" and sending_post:
+                            record._request_body_sent_monotonic = monotonic()
+                            sending_post = False
+
+                    request.extensions["trace"] = observe_send
+                if _before_send is not None:
+                    def begin_transport():
+                        nonlocal start, transport_started
+                        _before_send()
+                        transport_started = True
+                        start = time.perf_counter()
+                        record._timing_started_monotonic = monotonic()
+                        record.started_at = datetime.now(timezone.utc).isoformat()
+                        record.client_preparation_ms = (start - preparation_start) * 1000
+                        request_deadline.reschedule(asyncio.get_running_loop().time() + timeout)
+
+                    if isinstance(self._client, HTTPClientPool):
+                        response = await self._client.send(request, stream=True, _before_send=begin_transport)
+                    else:
+                        begin_transport()
+                        response = await self._client.send(request, stream=True)
+                else:
+                    response = await self._client.send(request, stream=True)
                 events = None
                 try:
                     record.http_status = response.status_code
+                    if access_probe:
+                        record._gateway_access_routing_issue = routing_issue(response.headers, payload["model"])
+                    if spec.identity is not None:
+                        from .gateway_response import response_evidence
+                        record.gateway_evidence = response_evidence(response.status_code, headers=response.headers,
+                            declared_priority=spec.workload.get("declared_priority"))
                     record.backend_id = response.headers.get("x-backend-id") or response.headers.get(
                         "x-replica-id",
                     )
+                    observe_attribution()
                     if not 200 <= response.status_code < 300:
                         error_body = await _limited_body(response, on_body=body_received)
+                        if access_probe and response.status_code in (401, 403):
+                            custom_header = self.config.gateway_access.auth_header
+                            anonymous = (selected_headers.keys() == {"Accept"}
+                                         and (custom_header is None or custom_header not in request.headers))
+                            record.gateway_evidence.error_kind = denial_kind(
+                                response.status_code, error_body, anonymous=anonymous)
+                        elif spec.identity is not None:
+                            expected_key_hash = None
+                            policy = self.config.gateway_policy
+                            if (response.status_code == 429 and policy_probe
+                                    and policy is not None and policy.capability == "key_rpm"):
+                                from .identities import litellm_key_fingerprint
+
+                                expected_key_hash = litellm_key_fingerprint(
+                                    request.headers, auth_header=policy.custom_key_header,
+                                )
+                            record.gateway_evidence = response_evidence(response.status_code, error_body, response.headers,
+                                declared_priority=spec.workload.get("declared_priority"), expected_key_hash=expected_key_hash)
                         if spec.scenario == "connection" and response.status_code in {400, 404, 422}:
                             # Keep only the classification, never arbitrary server error text.
                             body = error_body.decode("utf-8", errors="replace").lower()
@@ -773,22 +1199,48 @@ class LLMClient:
                         if "application/json" in response.headers.get("content-type", ""):
                             _object(await _limited_body(response, on_body=body_received))
                             raise _ProtocolError("endpoint returned JSON instead of an SSE stream")
-                        events = _sse_events(response, on_read=stream_body_received)
+                        chunk_limit = spec.cancel_after_chunks
+                        terminal_usage = (None, None, None)
+                        events = _sse_events(response, on_read=stream_body_received,
+                                             mark_read_end=chunk_limit is not None or confirmed_progress)
                         async for event_type, event, observed_at in events:
+                            if event_type is None:
+                                # A finish in this read vetoes new Multi-user answer triggers.
+                                if confirmed_progress and record.finish_reason is None:
+                                    if pending_live_first:
+                                        first_output_event.set()
+                                    notify_answer_chunks(pending_live_chunks)
+                                    pending_live_first = False
+                                    pending_live_chunks = 0
+                                # Finish and [DONE] may already have arrived in this read.
+                                if (chunk_limit is not None and record.generation_chunks >= chunk_limit
+                                        and record.finish_reason is None):
+                                    record.client_cancelled_ms = (time.perf_counter() - start) * 1000
+                                    record.client_cancelled_at_ns = time.time_ns()
+                                    record.client_cancelled_monotonic_ns = time.monotonic_ns()
+                                    raise _IntentionalCancellation
+                                continue
                             if event_type == "error":
                                 raise _ProtocolError("endpoint returned an SSE error event")
                             if event.strip() == "[DONE]":
+                                if record.finish_reason is None:
+                                    finish_progress(observed_at)
                                 record.stream_end_ms = (observed_at - start) * 1000
                                 record.stream_terminated = True
                                 break
-                            receive(_object(event), streaming=True, observed_at=observed_at)
-                            if (spec.cancel_after_chunks is not None
-                                    and record.generation_chunks >= spec.cancel_after_chunks
-                                    and record.finish_reason is None):
-                                record.client_cancelled_ms = (time.perf_counter() - start) * 1000
-                                record.client_cancelled_at_ns = time.time_ns()
-                                record.client_cancelled_monotonic_ns = time.monotonic_ns()
-                                raise _IntentionalCancellation
+                            data = _object(event, strict_gateway_json=True) if attribution else _object(event)
+                            receive(data, streaming=True, observed_at=observed_at)
+                            usage = data.get("usage")
+                            if attribution and record.finish_reason is not None and isinstance(usage, dict):
+                                counts = (record.input_tokens, record.completion_tokens, _gateway_usage_total(usage))
+                                if any(previous is not None and current is not None and previous != current
+                                       for previous, current in zip(terminal_usage, counts)):
+                                    record._gateway_terminal_usage = False
+                                    raise _ProtocolError("conflicting terminal usage in gateway response")
+                                terminal_usage = tuple(current if current is not None else previous
+                                                       for previous, current in zip(terminal_usage, counts))
+                                _check_gateway_usage_total(*terminal_usage)
+                                record._gateway_terminal_usage = None not in counts[:2]
                         if not record.stream_terminated:
                             raise _ProtocolError("SSE stream ended without [DONE]")
                     else:
@@ -796,7 +1248,12 @@ class LLMClient:
                             record.stream_end_ms = (at - start) * 1000
                         body = await _limited_body(response, on_read=body_read, on_body=body_received)
                         observed_at = start + record.stream_end_ms / 1000 if record.stream_end_ms is not None else time.perf_counter()
-                        receive(_object(body), streaming=False, observed_at=observed_at)
+                        data = (_object(body, strict_gateway_json=True)
+                                if attribution or policy_probe or access_probe else _object(body))
+                        receive(data, streaming=False, observed_at=observed_at)
+                        usage = data.get("usage")
+                        if attribution and isinstance(usage, dict):
+                            _check_gateway_usage_total(record.input_tokens, record.completion_tokens, _gateway_usage_total(usage))
                         record.stream_terminated = True
                     if record.finish_reason is None:
                         raise _ProtocolError("response ended without a completion finish reason")
@@ -810,15 +1267,18 @@ class LLMClient:
                     from .fixtures import final_answer
                     final, stripped, _ = final_answer(record.output)
                     if spec.scorer != "tool" and not final.strip():
+                        if record._gateway_access_refusal:
+                            record.status = "completed"
+                            return record
                         if record.finish_reason == "length" and (record.reasoning.strip() or stripped
                                                                   or (record.reasoning_tokens or 0) > 0):
                             # The endpoint honoured Giraffe's own output budget: not a
                             # serving failure, but also not an answer.
                             record.status, record.error = "completed", REASONING_BUDGET_ERROR
                             return record
-                        raise _ProtocolError("response contained no useful answer output")
+                        raise _ProtocolError(NO_ANSWER_ERROR)
                     if record.first_output_ms is None:
-                        raise _ProtocolError("response contained no useful answer output")
+                        raise _ProtocolError(NO_ANSWER_ERROR)
                     if conversation and stream:
                         record.assistant_message = {"role": "assistant",
                             "content": record.output if assistant_content_present else None,
@@ -864,10 +1324,11 @@ class LLMClient:
         except UnicodeDecodeError:
             record.error = "response contains invalid UTF-8"
         except (httpx.HTTPError, OSError, ValueError) as exc:
-            logger.debug("Endpoint request failed", exc_info=True)
+            if spec.identity is None:
+                logger.debug("Endpoint request failed", exc_info=True)
             record.error = f"request failed ({type(exc).__name__})"
         finally:
-            if logprob_collector is not None and record.logprob_evidence is None:
+            if transport_started and logprob_collector is not None and record.logprob_evidence is None:
                 evidence = logprob_collector.finish(record.output)
                 if not record.valid and evidence.status == "available":
                     evidence = evidence.model_copy(update={"status": "incomplete", "reason": "Response did not complete validly."})
@@ -881,20 +1342,32 @@ class LLMClient:
             from .fixtures import final_answer
             final, stripped, _ = final_answer(record.output)
             record.answer_chars = len(final)
-            spans = _answer_spans(record.output)
-            if (((record.reasoning.strip() or stripped) and not record.reasoning_tokens)
+            spans, _ = _answer_spans(record.output)
+            if spans is None:
+                record.answer_chunks = 0
+            if (((record.reasoning.strip() or stripped) and not record.reasoning_tokens
+                    and record.completion_tokens != 0)
                     or (previous_reasoning and record.reasoning_tokens is None)):
                 record.output_tokens = None
             record.reasoning_stripped = record.reasoning_stripped or stripped
             reasoning_spans = _reasoning_spans(spans, len(record.output))
+            reasoning_output = _mask_reasoning_tags(record.output) if stripped else ""
             # Inline reasoning is known only once all fragments/tags have been
             # parsed. Reclassify bounded metadata without retaining extra text.
-            if stripped:
-                for event, offset, end in content_event_spans:
-                    answer_text = "".join(record.output[max(a, offset):min(b, end)] for a, b in spans or ())
-                    reasoning_text = "".join(record.output[max(a, offset):min(b, end)] for a, b in reasoning_spans)
-                    has_answer = bool(answer_text.strip())
-                    has_reasoning = bool(_REASONING_TAG.sub("", reasoning_text).strip())
+            answer_events = 0
+            for event, offset, end in content_event_spans:
+                answer_text = ("".join(record.output[max(a, offset):min(b, end)] for a, b in spans or ())
+                               if stripped else record.output[offset:end])
+                has_answer = bool(answer_text.strip())
+                if has_answer:
+                    answer_events += 1
+                    if answer_events == 2:
+                        record.second_answer_event_ms = event["at_ms"]
+                        if not stripped:
+                            break
+                if stripped:
+                    has_reasoning = any(reasoning_output[max(a, offset):min(b, end)].strip()
+                                        for a, b in reasoning_spans)
                     event["kind"] = ("answer_and_reasoning" if has_answer and has_reasoning else
                                      "answer" if has_answer else "reasoning")
                     event["token_count"] = event["token_count_source"] = None
@@ -906,7 +1379,7 @@ class LLMClient:
                 end = content_reads[index + 1][0] if index + 1 < len(content_reads) else len(record.output)
                 text = "".join(record.output[max(a, offset):min(b, end)] for a, b in spans or ())
                 has_reasoning = stripped and any(
-                    _REASONING_TAG.sub("", record.output[max(offset, a):min(end, b)]).strip()
+                    reasoning_output[max(offset, a):min(end, b)].strip()
                     for a, b in reasoning_spans)
                 if has_reasoning and stream and content_read_id not in reasoning_read_ids:
                     if len(record.reasoning_read_timestamps_ms) < _MAX_CONTENT_READS:
@@ -973,4 +1446,8 @@ class LLMClient:
                 if record.workload.get("equality") == "whitespace":
                     answer = " ".join(answer.split())
                 record.answer_hash = hashlib.sha256(answer.encode()).hexdigest()
+            observe("terminal")
+            if spec.identity is not None:
+                from .identities import discard_identity_response
+                discard_identity_response(record)
         return record

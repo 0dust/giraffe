@@ -17,7 +17,7 @@ def config(**updates):
 
 
 @pytest.mark.parametrize("check", ["serving", "first_output", "generation", "context", "correctness",
-                                  "json", "cancellation", "recovery", "load", "consistency", "tools"])
+                                  "json", "cancellation", "recovery", "load", "consistency", "tools", "prefix"])
 def test_per_check_request_settings_can_exceed_suite_defaults(check):
     if check == "load":
         configured = config(checks=[check], max_output_tokens=16, request_timeout_seconds=1,
@@ -36,11 +36,18 @@ def test_per_check_request_settings_can_exceed_suite_defaults(check):
 
 @pytest.mark.parametrize("check,field", [("sessions", "concurrency"), ("sessions", "max_output_tokens"),
                                          ("arrivals", "concurrency"), ("capacity", "concurrency"),
-                                         ("prefix", "max_output_tokens"), ("concurrency", "max_output_tokens")])
+                                         ("concurrency", "max_output_tokens")])
 def test_dedicated_request_fields_have_no_second_override(check, field):
     assert field not in CHECK_OPTION_FIELDS[check]
     with pytest.raises(ValidationError, match="unsupported options"):
         config(checks=[], test_options={check: {field: 4}})
+
+
+def test_prefix_output_allowance_is_a_supported_check_option():
+    assert "max_output_tokens" in CHECK_OPTION_FIELDS["prefix"]
+    configured = config(checks=["prefix"], max_output_tokens=2048, test_options={"prefix": {"max_output_tokens": 8}})
+    assert configured.effective_check("prefix")["max_output_tokens"] == 8
+    assert RunConfig.model_validate(configured.model_dump()).effective_check("prefix") == configured.effective_check("prefix")
 
 
 def test_endpoint_response_owns_warm_samples_and_shared_request_settings():
@@ -141,7 +148,10 @@ def test_regression_threshold_is_baseline_metadata_and_not_workload_identity():
     compared = compare_baseline(current, old)
     assert compared.baseline["regression_threshold"] == 5
     configured = config(limits={"regression_percent": 5})
-    metadata = {"field": "limits.regression_percent", "regression_percent": 5}
+    metadata = {"field": "limits.regression_percent", "regression_percent": 5,
+                "regression_rate_points": 5,
+                "fields": {"timing": "limits.regression_percent",
+                           "rates": "limits.regression_rate_points"}}
     assert capabilities(configured)["baseline_comparison"] == metadata
     assert request_plan(configured)["baseline_comparison"] == metadata
 
@@ -181,14 +191,16 @@ def test_phase2_workload_source_bridge_requires_exact_attested_generator():
     assert not _same_run_limits_workload(current, old)
 
 
-def test_prefix_plan_uses_check_context_window_and_inherited_intrinsic_output_budget():
+def test_prefix_plan_reserves_the_configured_output_budget_within_its_context_window():
     configured = config(checks=["prefix"], max_output_tokens=8, context_limit=4096,
                         prefix={"prefix_chars": 32, "history_turns": 2},
                         test_options={"prefix": {"context_limit": 128}})
     row = next(row for row in request_plan(configured)["rows"] if row["id"] == "prefix")
     assert row["requests_per_target"] == 2 * configured.prefix.repeats + 2
-    # The same prompt cannot fit when the inherited intrinsic budget is 24.
-    configured = configured.model_copy(update={"max_output_tokens": 24})
+    # A larger configured output allowance leaves no room for these prompts.
+    configured = config(checks=["prefix"], max_output_tokens=2048, context_limit=4096,
+                        prefix={"prefix_chars": 32, "history_turns": 2},
+                        test_options={"prefix": {"context_limit": 512}})
     row = next(row for row in request_plan(configured)["rows"] if row["id"] == "prefix")
     assert row["requests_per_target"] == 0
 
