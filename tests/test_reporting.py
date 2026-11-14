@@ -77,7 +77,7 @@ def test_comparison_summary_keeps_absolute_failure_separate_from_recorded_verdic
     top = html[html.index('class="comparison-summary"'):html.index('<div id="html-results"')]
     assert "Current acceptance:" in top and "Baseline comparison:" in top
     assert "222.6 ms" in top and "288.4 ms" in top and "+29.6%" in top
-    assert "2026-10-24T12:00:00Z" in top and "Reference acceptance: fail" in top
+    assert "Oct 24, 2026, 12:00 UTC" in top and "Reference acceptance: fail" in top
     assert "Saving a reference does not approve its acceptance result." in top
 
 
@@ -107,8 +107,106 @@ def test_comparison_summary_absent_incompatible_and_legacy_evidence_remain_expli
     }]
     row = comparison_summary(report)["rows"][0]
     assert row["baseline"] == "0.0 ms" and row["current"] == "10.0 ms"
-    assert row["change"] == "Not recorded"
+    assert row["change"] == "+10 ms · from zero"
     assert row["samples"] == "Baseline n=0 · Current samples not recorded"
+
+
+@pytest.mark.parametrize("metric,before,after,change,change_html", [
+    ("correctness_rate", 1.0, 0.0, "-100 percentage points", "-100.0 pp"),
+    ("latency_ms", 200, 260, "+30%", "+30.0%"),
+    ("latency_ms", 200, 259, "+29.5%", "+29.5%"),
+    ("latency_ms", None, None, "Not recorded", "Not recorded"),
+    ("latency_ms", 200, 200, "No change", "+0.0%"),
+])
+def test_comparison_summary_legacy_change_matches_each_table(metric, before, after, change, change_html):
+    from giraffe.reporting import comparison_summary
+
+    report = make_report()
+    report.baseline = {"run_id": "old", "status": "inconclusive", "targets": [{
+        "target": "local", "comparisons": [{"metric": metric, "baseline": before,
+            "current": after, "status": "inconclusive"}],
+    }]}
+    row = comparison_summary(report)["rows"][0]
+    assert row["change"] == change
+    assert row["change_html"] == change_html
+
+
+def test_comparison_summary_deduplicates_scopes_and_prefers_recorded_values():
+    from giraffe.reporting import comparison_summary
+
+    report = make_report()
+    report.baseline = {"run_id": "old", "status": "inconclusive", "targets": [{
+        "target": "local", "comparisons": [{"metric": "correctness_rate", "status": "inconclusive"}]
+        + [{"metric": "latency_ms", "baseline": 200, "current": 260,
+            "scenario": scope, "status": "inconclusive"} for scope in ("warm", "cold", "other")],
+    }]}
+    summary = comparison_summary(report)
+    assert summary["total_rows"] == 4 and summary["omitted_rows"] == 2
+    assert len(summary["rows"]) == 2
+    assert summary["rows"][0]["metric"] == "latency_ms"
+    assert summary["rows"][0]["other_scopes"] == 2
+    report.baseline["targets"][0]["comparisons"].pop(0)
+    summary = comparison_summary(report)
+    assert len(summary["rows"]) == 1 and summary["rows"][0]["other_scopes"] == 2
+    for row in report.baseline["targets"][0]["comparisons"]:
+        row["current"] = row["baseline"]
+    report.baseline["targets"][0]["comparisons"].insert(0, {
+        "metric": "correctness_rate", "status": "inconclusive",
+    })
+    assert comparison_summary(report)["rows"][0]["metric"] == "latency_ms"
+
+
+@pytest.mark.parametrize("value,expected", [
+    (None, "Date not recorded"),
+    ("2026-10-04T10:00:00.123456Z", "Oct 4, 2026, 10:00 UTC"),
+    ("2026-10-04T10:00:00.123456", "Oct 4, 2026, 10:00"),
+    ("<unrecorded>", "&lt;unrecorded&gt;"),
+])
+def test_comparison_summary_human_date(value, expected):
+    from giraffe.reporting import _summary_when
+
+    assert _summary_when(value) == expected
+
+
+@pytest.mark.parametrize("row,expected", [
+    ({"metric": "attribution_outcome", "baseline": "admitted", "current": "admitted", "status": "pass"}, "Same outcome"),
+    ({"metric": "policy_acceptance", "check": "gateway_access", "baseline": "admitted", "current": "rejected", "status": "fail"}, "Outcome changed"),
+    ({"metric": "attribution_outcome", "status": "inconclusive"}, "Not comparable"),
+    ({"metric": "policy_acceptance", "baseline": "pass", "current": "pass"}, "Same qualification"),
+    ({"metric": "policy_acceptance", "baseline": "pass", "current": "fail"}, "Qualification changed"),
+    ({"metric": "latency_ms", "baseline": "unknown", "current": 10}, "Not recorded"),
+    ({"metric": "latency_ms", "observed_change": 1234.05}, "+1,234.1%"),
+    ({"metric": "latency_ms", "observed_change": -100}, "-100%"),
+    ({"metric": "latency_ms", "baseline": 0, "current": 2000.25}, "+2,000.3 ms · from zero"),
+    ({"metric": "other", "baseline": 0, "current": 2000.25}, "+2,000.3 · from zero"),
+])
+def test_comparison_summary_change_formats_outcomes_and_observed_values(row, expected):
+    from giraffe.reporting import _summary_change
+
+    assert _summary_change(row) == expected
+
+
+def test_comparison_summary_html_collapses_evidence_and_formats_reference_once():
+    from giraffe.reporting import _baseline_summary_html, comparison_summary
+
+    report = make_report()
+    absent = _baseline_summary_html(report)
+    assert absent.count("No baseline selected") == 1 and "<details" not in absent
+    report.baseline = {"run_id": "unique-reference-id", "status": "fail",
+        "source_started_at": "2026-10-04T15:30:00.123456+05:30", "targets": [{
+            "target": "local", "comparisons": [{"metric": "correctness_rate", "baseline": 1,
+                "current": 0, "status": "fail", "scenario": scope} for scope in ("warm", "cold", "other")],
+        }]}
+    html = _baseline_summary_html(report)
+    head, details = html.split('<details class="comparison-summary-details">')
+    assert " open" not in html
+    assert "Oct 4, 2026, 10:00 UTC" in head
+    assert "2026-10-04T" not in html and "123456" not in html
+    assert html.count("unique-reference-id") == 1
+    assert 'class="comparison-summary-row"' in details and "-100.0 pp" in details
+    assert "same result in 2 other scopes" in details
+    for text in (comparison_summary(report)["reason"], "Saving a reference does not approve its acceptance result."):
+        assert text in details and text not in head
 
 
 def test_comparison_summary_prioritizes_recorded_failures_and_bounds_the_headline():
@@ -1387,6 +1485,7 @@ def test_html_traffic_only_baseline_includes_capacity_delta_and_summary():
     assert 'Regression detected' in summary
     assert 'Highest acceptable tested arrival rate (requests/s)' in summary
     assert 'req/s' in summary and '-75.0%' not in summary  # Only recorded absolute capacity change is summarized.
+    assert comparison_summary(report)["rows"][0]["change"].endswith(' req/s')
     assert '0 measurements' not in summary
     assert comparison_summary(report)["rows"][0]["evidence_id"] == "comparison-traffic-0"
     assert 'href="#comparison-traffic-0"' in summary

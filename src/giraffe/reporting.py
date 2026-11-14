@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from copy import deepcopy
+from datetime import datetime, timezone
+from decimal import Decimal, ROUND_HALF_UP
 import errno
 from fractions import Fraction
 from hashlib import sha256
@@ -3922,11 +3924,16 @@ def _summary_measurement(row: dict[str, Any], value: Any) -> str:
     return f"{value:,.1f}{unit}"
 
 
+def _summary_signed(value: float) -> str:
+    rounded = Decimal(str(value)).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
+    return f"{rounded:+,f}".removesuffix(".0")
+
+
 def _summary_change(row: dict[str, Any]) -> str:
     change = row.get("observed_change")
     if isinstance(change, (int, float)) and math.isfinite(change):
         unit = " percentage points" if row.get("change_unit") == "percentage_points" else "%"
-        return f"{change:+,.1f}{unit}"
+        return f"{_summary_signed(change)}{unit}"
     delta = row.get("observed_delta")
     if isinstance(delta, (int, float)) and math.isfinite(delta):
         return ("+" if delta >= 0 else "") + _summary_measurement(row, delta)
@@ -3936,7 +3943,57 @@ def _summary_change(row: dict[str, Any]) -> str:
     change = row.get("acceptance_change")
     if change:
         return str(change).replace("_", " ").capitalize()
-    return "Not recorded"
+    before, after = row.get("baseline"), row.get("current")
+    metric = row.get("metric", "")
+    if metric == "attribution_outcome" or (metric == "policy_acceptance" and row.get("check") == "gateway_access"):
+        return ("Not comparable" if row.get("status") == "inconclusive" else
+                "Same outcome" if before == after else "Outcome changed")
+    if metric == "policy_acceptance":
+        return "Same qualification" if before == after else "Qualification changed"
+    if not all(isinstance(value, (int, float)) and math.isfinite(value) for value in (before, after)):
+        return "Not recorded"
+    delta = after - before
+    if delta == 0:
+        return "No change"
+    if metric.endswith("_rate"):
+        return f"{_summary_signed(delta * 100)} percentage points"
+    if before == 0:
+        unit = _summary_measurement(row, delta).partition(" ")[2]
+        return f"{_summary_signed(delta)}{' ' + unit if unit else ''} · from zero"
+    return f"{_summary_signed(delta * 100 / before)}%"
+
+
+def _baseline_change(row: dict[str, Any]) -> str:
+    """Use the same recorded-value change in the portable table and summary."""
+    before, after = row.get("baseline"), row.get("current")
+    if row.get("aggregation") == "observed":
+        return ("Not comparable" if row.get("status") == "inconclusive" else
+                "Same outcome" if before == after else "Outcome changed")
+    if not all(isinstance(value, (int, float)) and math.isfinite(value) for value in (before, after)):
+        return "—"
+    if row.get("change_unit") == "percentage_points" or row.get("metric", "").endswith("_rate"):
+        return f"{(after - before) * 100:+.1f} pp"
+    if before:
+        return f"{(after - before) * 100 / abs(before):+.1f}%"
+    if after == before:
+        return "+0.0%"
+    metric = row.get("metric", "")
+    suffix = (" ms" if metric.endswith("_ms") else
+              " tok/s" if metric.endswith("tokens_per_second") else
+              " tokens" if metric == "output_tokens" else
+              " chars" if metric == "output_chars" else "")
+    return f"{after - before:+,.1f}{suffix} · from zero"
+
+
+def _summary_change_html(row: dict[str, Any]) -> str:
+    """Portable-report change: recorded changes keep the table's units; legacy rows use its computed rule."""
+    change = row.get("observed_change")
+    if isinstance(change, (int, float)) and math.isfinite(change):
+        return f"{change:+,.1f}" + (" pp" if row.get("change_unit") == "percentage_points" else "%")
+    if any(isinstance(row.get(name), (int, float)) and math.isfinite(row[name])
+           for name in ("observed_delta", "delta_rps")):
+        return _summary_change(row)
+    return _baseline_change(row).replace("—", "Not recorded")
 
 
 def comparison_summary(report: RunReport) -> dict[str, Any]:
@@ -4001,7 +4058,8 @@ def comparison_summary(report: RunReport) -> dict[str, Any]:
                              (target.get("target"), CHECK_NAMES.get(check, check), scope) if value),
                          "label": label, "baseline": _summary_measurement(row, row.get("baseline")),
                          "current": _summary_measurement(row, row.get("current")),
-                         "change": _summary_change(row), "status": row_status,
+                         "change": _summary_change(row), "change_html": _summary_change_html(row),
+                         "status": row_status,
                          "verdict": {"Observed result": "Observed result", "Worse": "Regression detected",
                              "Interpretation limited": "Interpretation limited", "Better": "No material regression",
                              "No material change": "No material regression"}.get(_baseline_verdict(row)[0], "Inconclusive"),
@@ -4013,12 +4071,20 @@ def comparison_summary(report: RunReport) -> dict[str, Any]:
                          "evidence_id": row["_evidence_id"]}
             changed = row.get("baseline") is not None and row.get("current") is not None and row["baseline"] != row["current"]
             severity = 1 if display["verdict"] == "Interpretation limited" else {"fail": 0, "inconclusive": 1, "pass": 2}.get(row_status, 1)
-            priority = (display["verdict"] == "Observed result", severity, not changed,
+            empty = display["baseline"] == display["current"] == "Not recorded"
+            priority = (display["verdict"] == "Observed result", empty, severity, not changed,
                         core_metrics.index(metric) if metric in core_metrics else len(core_metrics))
             rows.append((priority, display))
     groups: dict[tuple, list[dict[str, Any]]] = {}
+    unique = {}
     for priority, row in sorted(rows, key=lambda entry: entry[0]):
-        groups.setdefault(priority[:2], []).append(row)
+        key = tuple(row[name] for name in ("label", "baseline", "current", "change", "verdict", "status"))
+        if key in unique:
+            representative = unique[key]
+            representative["other_scopes"] = representative.get("other_scopes", 0) + 1
+            continue
+        unique[key] = row
+        groups.setdefault(priority[:3], []).append(row)
     selected = []
     for candidates in groups.values():
         representatives = {}
@@ -4029,44 +4095,69 @@ def comparison_summary(report: RunReport) -> dict[str, Any]:
         selected.extend(ordered[:3 - len(selected)])
         if len(selected) == 3:
             break
-    result.update(rows=selected, total_rows=len(rows), omitted_rows=max(0, len(rows) - 3))
+    result.update(rows=selected, total_rows=len(rows), omitted_rows=max(0, len(rows) - len(selected)))
     return result
+
+
+def _summary_when(value: str | None) -> str:
+    if not value:
+        return "Date not recorded"
+    try:
+        when = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return _e(value)
+    suffix = ""
+    if when.tzinfo is not None:
+        when = when.astimezone(timezone.utc)
+        suffix = " UTC"
+    return f"{when:%b} {when.day}, {when:%Y, %H:%M}{suffix}"
 
 
 def _baseline_summary_html(report: RunReport) -> str:
     summary = comparison_summary(report)
+    if summary["comparison_status"] == "absent":
+        return ('<section class="comparison-summary comparison-summary-absent">'
+                '<p><strong>Baseline comparison:</strong> No baseline selected.</p></section>')
     labels = {"pass": "No material regression", "fail": "Regression detected",
-              "inconclusive": "Inconclusive", "absent": "No baseline selected"}
+              "inconclusive": "Inconclusive"}
     parts = ['<section class="comparison-summary" aria-label="Run comparison summary">',
-             f'<p><strong>Current acceptance:</strong> {_badge(summary["current_acceptance"])}</p>',
-             f'<p><strong>Baseline comparison:</strong> {_e(labels.get(summary["comparison_status"], "Inconclusive"))}</p>',
-             f'<p>{_e(summary["reason"])}</p>']
+             f'<p><strong>Current acceptance:</strong> {_badge(summary["current_acceptance"])} · '
+             f'<strong>Baseline comparison:</strong> {_e(labels.get(summary["comparison_status"], "Inconclusive"))}</p>']
     reference = summary["reference"]
-    if reference:
-        parts.append(f'<p>Reference: <strong>{_e(reference["name"])}</strong> · '
-                     f'Run {_e(reference["run_id"] or "not recorded")} · '
-                     f'{_e(reference["started_at"] or reference["finished_at"] or "Date not recorded")}<br>'
-                     f'Reference acceptance: {_e(reference["acceptance"] or "Not recorded separately")}. '
-                     'Saving a reference does not approve its acceptance result.</p>')
+    run_id = reference["run_id"]
+    run = f' · Run {_e(run_id)}' if run_id and run_id != reference["name"] else ""
+    if not run_id:
+        run = " · Run not recorded"
+    parts.append(f'<p class="comparison-summary-reference">Reference: <strong>{_e(reference["name"])}</strong>{run} · '
+                 f'{_summary_when(reference["started_at"] or reference["finished_at"])} · '
+                 f'Reference acceptance: {_e(reference["acceptance"] or "Not recorded separately")}</p>')
+    parts.append('<details class="comparison-summary-details">'
+                 f'<summary>Key changes ({len(summary["rows"])})</summary>'
+                 f'<p>{_e(summary["reason"])}</p>'
+                 '<p>Saving a reference does not approve its acceptance result.</p>')
     for row in summary["rows"]:
+        count = row.get("other_scopes", 0)
+        scope = row["scope"] + (f" · same result in {count} other scope{'s' if count != 1 else ''}" if count else "")
         parts.append(f'<article class="comparison-summary-row"><h3>{_e(row["label"])}</h3>'
-                     f'<p>{_e(row["scope"])}</p><dl>'
+                     f'<p>{_e(scope)}</p><dl>'
                      f'<div><dt>Baseline</dt><dd>{_e(row["baseline"])}</dd></div>'
                      f'<div><dt>Current</dt><dd>{_e(row["current"])}</dd></div>'
-                     f'<div><dt>Observed change</dt><dd>{_e(row["change"])}</dd></div>'
+                     f'<div><dt>Observed change</dt><dd>{_e(row["change_html"])}</dd></div>'
                      f'<div><dt>Verdict</dt><dd>{_e(row["verdict"])}</dd></div></dl>'
                      f'<p>{_e(row["samples"])}</p><p>{_e(row["reason"])}</p>'
                      f'<a href="#{_e(row["evidence_id"] or "baseline-heading")}">'
                      f'{"Open metric evidence" if row["evidence_id"] else "Open full comparison"}</a></article>')
-    if reference:
-        parts.append(f'<p><a href="#baseline-heading">Open full comparison ({summary["total_rows"]} recorded rows)</a></p>')
-    parts.append('</section>')
+    parts.append(f'<p><a href="#baseline-heading">Open full comparison ({summary["total_rows"]} recorded rows)</a></p>')
+    parts.append('</details></section>')
     return "".join(parts)
 
 
 _COMPARISON_SUMMARY_STYLE = """
-.comparison-summary{margin:24px 0;padding:16px 0;border-block:1px solid var(--line);min-width:0;overflow-wrap:anywhere}
-.comparison-summary p{max-width:75ch}.comparison-summary-row{padding:12px 0;border-top:1px solid var(--line)}
+.comparison-summary{margin:12px 0;padding:8px 0;border-block:1px solid var(--line);min-width:0;overflow-wrap:anywhere}
+.comparison-summary p{margin:4px 0}.comparison-summary-reference{color:var(--text-2)}
+.comparison-summary-absent{padding:4px 0;border:0;color:var(--text-2)}
+.comparison-summary-details{margin:0;padding:0}.comparison-summary-details>summary{padding:4px 0;cursor:pointer;color:var(--text-2)}
+.comparison-summary-row{padding:12px 0;border-top:1px solid var(--line)}
 .comparison-summary-row h3{margin:0}.comparison-summary-row dl{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}
 .comparison-summary-row dl>div{min-width:0}.comparison-summary-row dt{color:var(--text-2);font-size:12px}
 .comparison-summary-row dd{margin:4px 0;font-weight:600}.baseline-table tr:target{outline:2px solid var(--accent);outline-offset:-2px}
@@ -4159,24 +4250,7 @@ def _baseline_table_html(baseline: dict[str, Any], report: RunReport | None = No
                     return _e(number.replace("_", " ").capitalize())
                 return f"{number * 100:.1f}%" if rate else _number(number)
 
-            change = "—"
-            if row.get("aggregation") == "observed":
-                change = ("Not comparable" if row.get("status") == "inconclusive" else
-                          "Same outcome" if before == after else "Outcome changed")
-            elif isinstance(before, (int, float)) and isinstance(after, (int, float)):
-                if rate:
-                    change = f"{(after - before) * 100:+.1f} pp"
-                elif before:
-                    change = f"{(after - before) * 100 / abs(before):+.1f}%"
-                elif after == before:
-                    change = "+0.0%"
-                else:
-                    metric = row.get("metric", "")
-                    suffix = (" ms" if metric.endswith("_ms") else
-                              " tok/s" if metric.endswith("tokens_per_second") else
-                              " tokens" if metric == "output_tokens" else
-                              " chars" if metric == "output_chars" else "")
-                    change = f"{after - before:+,.1f}{suffix} · from zero"
+            change = _baseline_change(row)
 
             def cell(side, qualification):
                 outcomes = row.get(f"{side}_outcomes")
