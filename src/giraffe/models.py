@@ -1751,7 +1751,7 @@ CHECK_OPTION_FIELDS = {
                      "trace_file", "server_log", "cancel_after_chunks", "cleanup_seconds", "trace_wait_seconds"},
     "recovery": {"samples", "concurrency", "sustained_seconds", "max_output_tokens", "request_timeout_seconds"},
     "arrivals": {"max_output_tokens", "request_timeout_seconds"},
-    "prefix": {"context_limit", "request_timeout_seconds"},
+    "prefix": {"context_limit", "max_output_tokens", "request_timeout_seconds"},
     "sessions": {"context_limit", "request_timeout_seconds"},
     "consistency": {"context_limit", "max_output_tokens", "request_timeout_seconds"},
     "tools": {"context_limit", "max_output_tokens", "request_timeout_seconds"},

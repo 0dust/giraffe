@@ -271,12 +271,14 @@ def _progress(run, target, scenario, status, **metadata):
         run.preparation(target.name, scenario, "Preparing input locally", status, **metadata)
 
 
-async def prepare_messages(run, target, scenario, build_messages, target_tokens, *, tolerance=.1, content_only=False):
+async def prepare_messages(run, target, scenario, build_messages, target_tokens, *, tolerance=.1, content_only=False,
+                           accepted_token_range=None):
     """Size a message builder accepting a filler-character count, without inference.
 
     Returns the messages actually counted, local token count, provenance and the
     filler size. No character estimate is accepted as token evidence. Unavailable
     tokenizers are cached for this run, preventing repeated expensive failures.
+    An optional inclusive token range also constrains tolerance and minimum prompts.
     """
     setup = getattr(target, "_tokenizer_setup", {})
     tokenizer = setup.get("tokenizer") or getattr(target, "tokenizer", None) or BUILTIN
@@ -316,7 +318,7 @@ async def prepare_messages(run, target, scenario, build_messages, target_tokens,
             scope = "message_content" if content_only else ready.get("token_count_scope", "message_content")
             result.update(chat_template=ready.get("chat_template", False),
                           token_count_scope="builtin_reference" if builtin else scope)
-            low, high = 0, None
+            low, high, counted_below = 0, None, False
             filler = 0
             for attempt in range(MAX_SIZING_ATTEMPTS):
                 reason = run.stop_reason(target.name) if hasattr(run, "stop_reason") else None
@@ -332,7 +334,9 @@ async def prepare_messages(run, target, scenario, build_messages, target_tokens,
                 result.update(input_tokens=tokens, filler_chars=filler, attempts=attempt + 1)
                 _progress(run, target, scenario, "running", tokenizer=tokenizer,
                           input_tokens=tokens, target_tokens=target_tokens, attempt=attempt + 1)
-                if abs(tokens - target_tokens) <= max(1, target_tokens * tolerance) or (filler == 0 and tokens > target_tokens):
+                within_range = accepted_token_range is None or accepted_token_range[0] <= tokens <= accepted_token_range[1]
+                if within_range and (abs(tokens - target_tokens) <= max(1, target_tokens * tolerance)
+                                     or (filler == 0 and tokens > target_tokens)):
                     floor = filler == 0 and tokens > target_tokens
                     result.update(status="calibrated", reason_code="minimum_prompt_length" if floor else None,
                                   reason=(f"Input target {target_tokens} is below the minimum prompt length "
@@ -340,7 +344,7 @@ async def prepare_messages(run, target, scenario, build_messages, target_tokens,
                                   messages=messages)
                     break
                 if tokens < target_tokens:
-                    low = filler
+                    low, counted_below = filler, True
                 else:
                     high = filler
                 if high is not None:
@@ -350,6 +354,10 @@ async def prepare_messages(run, target, scenario, build_messages, target_tokens,
                 else:
                     candidate = min(MAX_PROMPT_CHARS, max(filler + 1, round(filler * target_tokens / max(1, tokens))))
                 if candidate == filler:
+                    # Adjacent filler sizes straddle the target yet neither was accepted:
+                    # the token counts skip the accepted range.
+                    if high is not None and counted_below:
+                        result["sizing_gap"] = True
                     break
                 filler = candidate
             if result["status"] != "calibrated":

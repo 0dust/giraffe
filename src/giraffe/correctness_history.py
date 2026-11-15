@@ -16,7 +16,7 @@ def fixture_keys(config):
     elif "correctness" in config.checks:
         effective = config.effective_check("correctness")
         current = config.model_copy(update={key: value for key, value in effective.items() if key != "limits"})
-        specs = builtin_fixtures(current, check_id="correctness")["correctness"]
+        specs = builtin_fixtures(current)["correctness"]
         specs = [spec.model_copy(update={"options": deterministic_options(current, spec.options)}) for spec in specs]
     else:
         return {}

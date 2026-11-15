@@ -98,6 +98,8 @@ def test_load_source_compatibility_does_not_hide_unattested_work(change):
     elif change == "multi_user":
         old.manifest["config"]["checks"].append("multi_user")
     else:
+        for report in (current, old):
+            report.manifest["config"]["checks"].append("serving")
         old.manifest["fixture_pack"]["builtin_sha256"] = "changed"
     old.manifest["fixture_pack"]["workload_fixture_sha256"] = fixture_hash(identity)
     assert "Fixture pack identity differs." in _settings_reasons(current, old)
@@ -244,26 +246,28 @@ def test_unchanged_text_generator_has_reviewed_identity_table_entry():
                                      "policy_shared_first", "policy_shared_targets_first", "policy_after_shared_workloads",
                                      "policy_after_all_shared_targets", "access_shared_first", "access_shared_targets_first",
                                      "access_after_shared_workloads", "access_deferred_policy", "access_after_all_shared_targets",
-                                     "scale_down_registration", "scale_down_shared_conversations", "scale_down_gateway_access")]
+                                     "scale_down_registration", "scale_down_shared_conversations", "scale_down_gateway_access",
+                                     "output_budgets")]
     actual = hashlib.sha256(Path(workloads.__file__).read_bytes()).hexdigest()
     assert any(identity and identity["generator_source_sha256"] == actual for identity in attestations), (
         "generator_source_sha256 changed: review request-level compatibility and update/extend "
         "_run_limits_workload_identity in src/giraffe/reporting.py; do not bridge changed workloads.")
-    identity = _run_limits_workload_identity(manifest, revision="scale_down_gateway_access")
+    identity = _run_limits_workload_identity(manifest, revision="output_budgets")
     assert identity is not None, IDENTITY_TABLE_GUIDANCE
     assert identity["generator_source_sha256"] == actual, IDENTITY_TABLE_GUIDANCE
 
 
 @pytest.mark.parametrize("check", ["sessions", "consistency", "prefix"])
-def test_gateway_dispatch_preserves_core_predecessor_specialist_baselines(check):
+def test_gateway_dispatch_specialist_baselines_reject_changed_prefix_budget(check):
     current, old, _, _ = reports(check)
     old.manifest["config"] = deepcopy(current.manifest["config"])
     predecessor = _run_limits_workload_identity(old.manifest, revision="shared_conversations")
     assert predecessor["generator_source_sha256"] == "d9a9e921584262148e06b636f0e8f195b7e530fd2a69c5e98f013359cf947ede"
     old.manifest["fixture_pack"]["workload_fixture_sha256"] = fixture_hash(predecessor)
     before = old.model_dump_json()
-    assert _settings_reasons(current, old) == []
-    assert _settings_reasons(old, current) == []
+    expected = ["Fixture pack identity differs."] if check == "prefix" else []
+    assert _settings_reasons(current, old) == expected
+    assert _settings_reasons(old, current) == expected
     assert old.model_dump_json() == before
 
 
@@ -340,13 +344,34 @@ def prefix_reports():
     return current, old, settings
 
 
-def test_unchanged_versioned_prefix_baseline_survives_multi_user_wiring():
+def test_changed_prefix_budget_requires_new_baseline_after_multi_user_wiring():
     current, old, _ = prefix_reports()
     before = old.model_dump_json()
     assert current.manifest["fixture_pack"] != old.manifest["fixture_pack"]
+    assert _settings_reasons(current, old) == ["Fixture pack identity differs."]
+    assert _settings_reasons(old, current) == ["Fixture pack identity differs."]
+    assert old.model_dump_json() == before
+
+
+@pytest.mark.parametrize("checks", [["prefix"], ["prefix", "sessions"], ["prefix", "tools"], ["prefix", "load"]])
+@pytest.mark.parametrize("shared", [False, True])
+def test_output_budget_revision_never_attests_changed_prefixes_in_mixed_runs(checks, shared):
+    configured = RunConfig(targets=[{"name": "local", "url": "http://localhost", "model": "test"}],
+                           checks=checks, max_output_tokens=2048)
+    manifest = {"config": configured.model_dump(mode="json")}
+    assert _run_limits_workload_identity(manifest, revision="output_budgets",
+                                        include_load="load" in checks, shared=shared) is None
+
+
+def test_output_budget_revision_preserves_exact_unchanged_load_source():
+    current, old, settings = load_reports()
+    from giraffe.reporting import _load_test_workload_source_sha256
+
+    current.manifest["fixture_pack"]["workload_fixture_sha256"] = fixture_hash({
+        "generator_source_sha256": workloads.FIXTURE_SOURCE_SHA256,
+        "settings": settings, "load_test_source_sha256": _load_test_workload_source_sha256()})
     assert _settings_reasons(current, old) == []
     assert _settings_reasons(old, current) == []
-    assert old.model_dump_json() == before
 
 
 @pytest.mark.parametrize("which", ["current", "baseline"])
@@ -391,13 +416,13 @@ def test_policy_dispatch_bridge_does_not_attest_new_or_changed_workloads(check, 
 
 
 @pytest.mark.parametrize("check", ["sessions", "consistency", "prefix"])
-def test_shared_executor_preserves_exact_persistent_user_revision_for_legacy_checks(check):
+def test_shared_executor_legacy_baselines_reject_changed_prefix_budget(check):
     current, old, _, _ = reports(check)
     old.manifest = deepcopy(current.manifest)
     identity = _run_limits_workload_identity(old.manifest, revision="persistent_users")
     assert identity["generator_source_sha256"] == "aee9ca71bc5ffd780d1574422b761e3177471a12f951a10b04322573ca062f76"
     old.manifest["fixture_pack"]["workload_fixture_sha256"] = fixture_hash(identity)
-    assert _settings_reasons(current, old) == []
+    assert _settings_reasons(current, old) == (["Fixture pack identity differs."] if check == "prefix" else [])
     old.manifest["fixture_pack"]["workload_fixture_sha256"] = "unreviewed-source"
     assert "Fixture pack identity differs." in _settings_reasons(current, old)
 
@@ -607,24 +632,26 @@ def test_conversation_wiring_does_not_bridge_multi_user_workloads(revision):
 
 @pytest.mark.parametrize("revision", ["gateway_policy", "gateway_conversations"])
 @pytest.mark.parametrize("check", ["sessions", "consistency", "prefix"])
-def test_policy_core_merge_retains_both_exact_specialist_predecessors(check, revision):
+def test_policy_core_predecessors_reject_changed_prefix_budget(check, revision):
     current, old, _, _ = reports(check)
     old.manifest = deepcopy(current.manifest)
     identity = _run_limits_workload_identity(old.manifest, revision=revision)
     old.manifest["fixture_pack"]["workload_fixture_sha256"] = fixture_hash(identity)
-    assert _settings_reasons(current, old) == []
-    assert _settings_reasons(old, current) == []
+    expected = ["Fixture pack identity differs."] if check == "prefix" else []
+    assert _settings_reasons(current, old) == expected
+    assert _settings_reasons(old, current) == expected
 
 
 @pytest.mark.parametrize("revision", ["gateway_access", "gateway_access_policy", "policy_conversations"])
 @pytest.mark.parametrize("check", ["sessions", "consistency", "prefix"])
-def test_access_core_merge_retains_exact_specialist_predecessors(check, revision):
+def test_access_core_predecessors_reject_changed_prefix_budget(check, revision):
     current, old, _, _ = reports(check)
     old.manifest = deepcopy(current.manifest)
     identity = _run_limits_workload_identity(old.manifest, revision=revision)
     old.manifest["fixture_pack"]["workload_fixture_sha256"] = fixture_hash(identity)
-    assert _settings_reasons(current, old) == []
-    assert _settings_reasons(old, current) == []
+    expected = ["Fixture pack identity differs."] if check == "prefix" else []
+    assert _settings_reasons(current, old) == expected
+    assert _settings_reasons(old, current) == expected
 
 
 def sampled_reports(profile):

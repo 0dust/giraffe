@@ -134,7 +134,7 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
 
     def fixtures_for(check):
         if check not in fixture_metadata:
-            fixture_metadata[check] = builtin_fixtures(effective(check), check_id=check)
+            fixture_metadata[check] = builtin_fixtures(effective(check))
         return fixture_metadata[check]
 
     def pooled_matches(target, queries, entries):
@@ -571,7 +571,7 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
                 settings = config.effective_traffic()
                 options = effective("capacity")
                 from giraffe.fixtures import traffic_fixtures
-                fixtures = traffic_fixtures(options, check_id="capacity") if has_observations else {}
+                fixtures = traffic_fixtures(options) if has_observations else {}
                 specs = [spec for group in fixtures.values() for spec in group]
                 observed = measured(target.name, "capacity", min(settings.max_in_flight, shares[target.name]), specs)
                 fixed(target.name, row, len(settings.rates) * settings.duration_seconds, "traffic.duration_seconds",
@@ -581,7 +581,7 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
             if name == "sustained":
                 options = config.effective_check("recovery")
                 from giraffe.fixtures import traffic_fixtures
-                heavy = traffic_fixtures(effective("recovery"), check_id="recovery") if has_observations else {}
+                heavy = traffic_fixtures(effective("recovery")) if has_observations else {}
                 observed = measured(target.name, "recovery", min(options["concurrency"], shares[target.name]),
                                     heavy.get("long_input", []) + heavy.get("long_output", []))
                 fixed(target.name, row, options["sustained_seconds"], "test_options.recovery.sustained_seconds",
@@ -760,13 +760,13 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
                 from giraffe.workloads import spec
                 settings = config.prefix
                 prefix_chars = len(label_prompt(settings.prefix_chars + 33 + 80)) + len("\nTrial 0000.")
-                specs = [spec("x" * prefix_chars, "prefix", "prefix", max_tokens=min(24, options.max_output_tokens))]
+                specs = [spec("x" * prefix_chars, "prefix", "prefix", max_tokens=options.max_output_tokens)]
                 history_chars = 0
                 for _ in range(settings.history_turns):
                     history_chars += len(label_prompt(96))
-                    if not prefix_admitted(history_chars, min(24, options.max_output_tokens), options.context_limit):
+                    if not prefix_admitted(history_chars, options.max_output_tokens, options.context_limit):
                         break
-                    specs.append(spec("x" * history_chars, "prefix", "prefix", max_tokens=min(24, options.max_output_tokens)))
+                    specs.append(spec("x" * history_chars, "prefix", "prefix", max_tokens=options.max_output_tokens))
                     history_chars += 4
             if name == "tools" and has_observations and not (config.tool_checks and config.tool_checks.conversations):
                 from giraffe.models import RequestSpec
@@ -1051,6 +1051,13 @@ def request_plan(config: RunConfig | ConfigDraft, *,
                      "requests_per_target": count, "kind": kind, "source": source,
                      "summary": summary})
 
+    def warn_output_space(title, output, context, output_field="max_output_tokens", context_field="context_limit"):
+        if output >= context:
+            warnings.append(
+                f"{title}: {output_field}={output} leaves no room for the prompt within "
+                f"{context_field}={context}. Reduce {output_field}, or set {context_field} to a larger "
+                "window only if the model supports it. Servers that reserve prompt and output space may reject these requests.")
+
     if "scale_down" in selected and config.scale_down:
         settings = config.scale_down
         maximum = settings.max_requests
@@ -1068,6 +1075,13 @@ def request_plan(config: RunConfig | ConfigDraft, *,
     # the operator has configured a very large context limit.
     fixtures = builtin_fixtures(config.model_copy(update={"context_limit": 128}))
     initial = bool(selected & {"access", "serving", "first_output", "generation"})
+    if initial or config.restart_target:
+        owner = next((check for check in ("serving", "first_output")
+                      if check in selected and config.test_options.get(check) is not None
+                      and config.test_options[check].max_output_tokens is not None), None)
+        warn_output_space("Initial connection" if initial else "Restart readiness",
+                          config.effective_initial()["max_output_tokens"], config.context_limit,
+                          f"test_options.{owner}.max_output_tokens" if owner else "max_output_tokens")
     if initial:
         add("initial", 1, "One generated request checks the connection. Time to first text uses this same request.",
             title=CHECK_NAMES["access"])
@@ -1090,6 +1104,18 @@ def request_plan(config: RunConfig | ConfigDraft, *,
     pack_selected = config.request_source == "request_pack" and bool(selected & {"load", "capacity", "correctness"})
     pack = active_pack(config)
     details = pack_details if pack_details is not None else pack_summary(config) if pack else None
+    for check in sorted(selected & {"generation", "capacity", "fairness", "context", "correctness", "json",
+                                   "cancellation", "recovery", "prefix"}):
+        if pack_selected and check in {"capacity", "correctness"}:
+            continue
+        options = config.effective_check(check)
+        overrides = config.test_options.get(check)
+        output_field = (f"test_options.{check}.max_output_tokens" if overrides and overrides.max_output_tokens is not None
+                        else "max_output_tokens")
+        context_field = (f"test_options.{check}.context_limit" if overrides and overrides.context_limit is not None
+                         else "context_limit")
+        warn_output_space(CHECK_NAMES[check], options.get("max_output_tokens", config.max_output_tokens),
+                          options.get("context_limit", config.context_limit), output_field, context_field)
     if pack_selected and "correctness" in selected:
         count = len(config.request_pack.cases) if pack else None
         add("pack_control", count, "Sends each of your questions once. The answer and arrival checks reuse these results."
@@ -1128,7 +1154,11 @@ def request_plan(config: RunConfig | ConfigDraft, *,
 
     if "context" in selected:
         context_options = config.effective_check("context")
-        context_shapes = builtin_fixtures(config.model_copy(update={**{key: value for key, value in context_options.items() if key != "limits"}, "context_limit": min(512, context_options["context_limit"])}))["context"]
+        # Bound preview construction without consuming the reserved output room.
+        preview_context = min(context_options["context_limit"], context_options["max_output_tokens"] + 512)
+        context_shapes = builtin_fixtures(config.model_copy(update={
+            **{key: value for key, value in context_options.items() if key != "limits"},
+            "context_limit": preview_context}))["context"]
         count = max(context_options["samples"], len(context_shapes))
         add("context_first_batch", count, "The first generated context batch.", title="Initial context cases")
         add("context", 0,
@@ -1188,13 +1218,18 @@ def request_plan(config: RunConfig | ConfigDraft, *,
             f"{config.arrivals.requests} scheduled offers; the pending queue and Limits can leave some undispatched.")
     if "prefix" in selected:
         settings = config.prefix
-        context_limit = config.effective_check("prefix")["context_limit"]
-        output_cap = min(24, config.max_output_tokens)
+        prefix_options = config.effective_check("prefix")
+        context_limit = prefix_options["context_limit"]
+        output_cap = prefix_options["max_output_tokens"]
         # Include the 32-character nonce, newline, filler/instruction and trial suffix.
         prefix_chars = len(label_prompt(settings.prefix_chars + 33 + 80)) + len("\nTrial 0000.")
         if not prefix_admitted(prefix_chars, output_cap, context_limit):
             add("prefix", 0, "Estimated prefix input plus output/template reserves exceeds context_limit; no prefix requests are admitted.")
-            warnings.append("Prefix coverage will be unfinished: estimated token admission rejects the configured prefix.")
+            warnings.append(
+                f"Prefix coverage will be unfinished: the estimated prefix input, template reserve and "
+                f"max_output_tokens={output_cap} exceed context_limit={context_limit}. Set test_options.prefix.max_output_tokens "
+                "to a smaller prefix-specific allowance, reduce max_output_tokens or prefix.prefix_chars, or set "
+                "test_options.prefix.context_limit to a larger window only if the model supports it.")
         else:
             prompt_chars = len(label_prompt(96))
             history = sum(prefix_admitted(prompt_chars * (turn + 1) + 4 * turn, output_cap, context_limit)

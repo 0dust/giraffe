@@ -224,22 +224,17 @@ class _ReportProcess:
         with self.lock:
             if self.process is None or self.process.poll() is not None:
                 self.close()
-                package_root = str(Path(__file__).resolve().parent.parent)
-                env = os.environ.copy()
-                env["PYTHONPATH"] = os.pathsep.join(p for p in (package_root, env.get("PYTHONPATH")) if p)
+                import giraffe
+                package_file = str(Path(giraffe.__file__).resolve())
+                # Pin only Giraffe; do not promote its site-packages over stdlib.
                 self.process = subprocess.Popen([sys.executable, "-P", "-c",
-                    "import os,sys; protocol=os.fdopen(os.dup(1),'wb'); "
+                    "import importlib.util,os,sys; protocol=os.fdopen(os.dup(1),'wb'); "
                     "os.dup2(2,1); sys.stdout=sys.stderr; "
-                    f"package_root = {package_root!r}\n"
-                    # PYTHONPATH places wheel directories ahead of the stdlib;
-                    # restore their normal precedence without duplicate entries.
-                    "if os.path.basename(package_root) in ('site-packages', 'dist-packages'):\n"
-                    "    sys.path[:] = [p for p in sys.path if p != package_root]\n"
-                    "    sys.path.append(package_root)\n"
-                    "elif package_root not in sys.path:\n"
-                    "    sys.path.insert(0, package_root)\n"
+                    f"spec=importlib.util.spec_from_file_location('giraffe',{package_file!r}); "
+                    "package=importlib.util.module_from_spec(spec); "
+                    "sys.modules['giraffe']=package; spec.loader.exec_module(package); "
                     "from giraffe.web import _report_process_main; _report_process_main(protocol)"],
-                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=env)
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE)
                 self.release = weakref.finalize(self, _close_report_process, self.process)
                 needs_identity = True
             else:

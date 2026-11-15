@@ -416,6 +416,8 @@ main:has(.new-run-layout.connecting) .setup-lede { font-size: 16px; margin-top: 
 .setup-connection-status.connected::before { background: var(--pass); animation: none; }
 .setup-connection-status.error { color: color-mix(in oklab, var(--fail) 85%, var(--text)); border-color: color-mix(in oklab, var(--fail) 30%, transparent); background: color-mix(in oklab, var(--fail) 6%, var(--surface)); }
 .setup-connection-status.error::before { background: var(--fail); animation: none; }
+.setup-connection-status.unverified { color: var(--text); }
+.setup-connection-status.unverified::before { background: var(--unknown); animation: none; }
 .connection-options { margin-top: 18px; }
 .connection-options > .details-content { padding: 8px 0 0 0; gap: 4px; }
 .connection-options .setup-disclosure { border-top: 1px solid var(--line); padding: 6px 0; }

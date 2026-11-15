@@ -411,7 +411,7 @@ def planned_conditions(config: Any) -> list[dict[str, Any]]:
         add("scale_down_followup")
     if "cancellation" in selected:
         options = config.effective_check("cancellation")
-        fixtures = builtin_fixtures(config, check_id="cancellation")["limits"]
+        fixtures = builtin_fixtures(config)["limits"]
         normal = sum(spec.cancel_after_ms is None and not spec.fixture_id.startswith("limits.stop_control") for spec in fixtures)
         cancelled = sum(spec.cancel_after_ms is not None for spec in fixtures)
         add("stop_control", 1, "exact")

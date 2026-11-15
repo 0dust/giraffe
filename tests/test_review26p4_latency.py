@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from giraffe.fixtures import FIXTURE_VERSION, builtin_fixtures
+from giraffe.fixtures import CONTEXT_SIZING_VERSION, FIXTURE_VERSION
 from giraffe.latency import (calibrated_context_fixtures, comparable_latency, input_bucket,
                              latency_summary, load_observations)
 from giraffe.models import RequestRecord, RunConfig, RunReport
@@ -68,23 +68,16 @@ def test_old_summary_tail_is_unknown_and_malformed_tail_is_not_used():
         "local", **match) == {"n": 5, "p50_ms": 10, "p90_ms": 20, "cohort": None}
 
 
-def test_context_rebuilds_actual_calibrated_inputs_and_rejects_different_window():
+def test_legacy_context_calibration_is_not_restamped_as_current_policy():
     current = report()
     current.observations = {"targets": {"local": {"context_calibration": {
         "status": "sized_from_observed_usage", "fixture_context_limit": 24000,
         "adjustments": [{"fixture_context_limit": 32000}]}}}}
     observed = {"local": latency_summary(current)["targets"][0]["measurements"]}
-    actual = calibrated_context_fixtures(observed, "local", config(), cohort="run")
     profile = observed["local"][0]["context_profile"]
     assert profile["fixture_context_limit"] == 24000
-    expected = builtin_fixtures(config().model_copy(update={"context_limit": 24000}), check_id="context")["context"]
-    assert [spec.input_chars for spec in actual] == [spec.input_chars for spec in expected]
-    assert {input_bucket(spec.input_chars) for spec in actual} != {
-        input_bucket(spec.input_chars) for spec in builtin_fixtures(config(), check_id="context")["context"]}
-    assert calibrated_context_fixtures(observed, "local", config(context_limit=8192)) is None
-    assert calibrated_context_fixtures(observed, "local", config(), cohort="another") is None
-    observed["local"][0]["context_profile"]["fixture_version"] = FIXTURE_VERSION + ".changed"
-    assert calibrated_context_fixtures(observed, "local", config()) is None
+    assert profile.get("sizing_version") is None
+    assert calibrated_context_fixtures(observed, "local", config(), cohort="run") is None
 
 
 @pytest.mark.parametrize("profile", [None, "invalid", [], {"fixture_context_limit": True},
@@ -98,7 +91,7 @@ def test_context_profile_malformed_or_excessive_limits_stay_unknown(profile, mon
 
     monkeypatch.setattr(fixtures, "builtin_fixtures", unexpected_build)
     if isinstance(profile, dict):
-        profile = {"fixture_version": FIXTURE_VERSION, "context_limit": 4096, **profile}
+        profile = {"fixture_version": FIXTURE_VERSION, "sizing_version": CONTEXT_SIZING_VERSION, "context_limit": 4096, **profile}
     observed = {"local": [{"family": "context", "context_profile": profile}]}
     assert calibrated_context_fixtures(observed, "local", config()) is None
 
@@ -111,7 +104,7 @@ def test_large_valid_context_profile_does_not_allocate_inputs_during_preview(mon
 
     monkeypatch.setattr(fixtures, "builtin_fixtures", unexpected_build)
     observed = {"local": [{"family": "context", "context_profile": {
-        "fixture_version": FIXTURE_VERSION, "context_limit": 1000000, "fixture_context_limit": 16000000}}]}
+        "fixture_version": FIXTURE_VERSION, "sizing_version": CONTEXT_SIZING_VERSION, "context_limit": 1000000, "fixture_context_limit": 16000000}}]}
     assert calibrated_context_fixtures(observed, "local", config(context_limit=1000000)) is None
 
 

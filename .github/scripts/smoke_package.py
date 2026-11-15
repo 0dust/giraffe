@@ -11,9 +11,11 @@ import sys
 import sysconfig
 import tempfile
 from urllib.parse import parse_qs, urljoin, urlsplit
+from unittest.mock import patch
 
 import giraffe
 import httpx
+from giraffe.models import RunConfig, RunReport, Target
 from giraffe.web import create_app
 
 
@@ -104,6 +106,27 @@ async def check_ui_assets(client, static):
             raise RuntimeError(f"Installed UI asset is missing or corrupted: {name}")
 
 
+async def check_report_reader(client, runs):
+    configuration = RunConfig(targets=[Target(
+        name="local", url="http://localhost/v1", model="package-smoke")], checks=["serving"])
+    report = RunReport(run_id="package-smoke", started_at="2026-01-01T00:00:00Z",
+        finished_at="2026-01-01T00:00:01Z", overall="pass",
+        manifest={"config": configuration.model_dump(mode="json")})
+    directory = runs / report.run_id
+    directory.mkdir(parents=True)
+    # Valid trailing whitespace crosses the 256 KiB subprocess threshold.
+    (directory / "report.json").write_text(report.model_dump_json() + "\n" * (300 * 1024))
+    decoy = runs.parent / "decoy"
+    package = decoy / "giraffe"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text('raise RuntimeError("decoy Giraffe imported")\n')
+    with patch.dict(os.environ, {"PYTHONPATH": str(decoy)}):
+        response = await client.get(f"/api/runs/{report.run_id}")
+    response.raise_for_status()
+    if response.json()["report"]["run_id"] != report.run_id:
+        raise RuntimeError("Installed UI did not open the packaged report")
+
+
 async def main():
     package = Path(giraffe.__file__).resolve()
     if not package.is_relative_to(Path(sys.prefix).resolve()):
@@ -119,14 +142,16 @@ async def main():
     check_builtin_tokenizer(resources.files("giraffe").joinpath("data"))
     static = resources.files("giraffe").joinpath("static")
     with tempfile.TemporaryDirectory() as directory:
-        app = create_app(Path(directory) / "runs", token="package-smoke-token")
-        async with httpx.AsyncClient(
+        runs = Path(directory) / "runs"
+        app = create_app(runs, token="package-smoke-token")
+        async with app.router.lifespan_context(app), httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://localhost"
         ) as client:
             response = await client.get("/?token=package-smoke-token", follow_redirects=True)
             response.raise_for_status()
             await check_ui_assets(client, static)
-    print(f"Installed giraffe-llm {installed.version}: CLI, offline tokenizer and UI assets passed")
+            await check_report_reader(client, runs)
+    print(f"Installed giraffe-llm {installed.version}: CLI, offline tokenizer, UI assets and report reader passed")
 
 
 if __name__ == "__main__":

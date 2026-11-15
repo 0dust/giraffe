@@ -163,7 +163,7 @@ async def prefixes(run, target, client):
                     prompt,
                     f"prefix_{kind}",
                     "prefix",
-                    expected="K7P4", max_tokens=min(24, config.max_output_tokens),
+                    expected="K7P4", max_tokens=config.max_output_tokens,
                     request_timeout_seconds=config.request_timeout_seconds,
                     prefix_group=kind,
                     shared_prefix_chars=len(prefix),
@@ -182,7 +182,7 @@ async def prefixes(run, target, client):
             prompt = label_prompt(96)
             messages = [*history, {"role": "user", "content": prompt}]
             request = spec(prompt, "prefix_history", "prefix", expected="K7P4",
-                           max_tokens=min(24, config.max_output_tokens),
+                           max_tokens=config.max_output_tokens,
                            request_timeout_seconds=config.request_timeout_seconds, turn=turn, mode="fixed")
             request.messages = messages
             request.input_chars = sum(len(m["content"]) for m in messages)

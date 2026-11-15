@@ -305,7 +305,8 @@ def test_report_inputs_accept_run_directories(command, tmp_path, monkeypatch, ca
         assert "use --replace" in capsys.readouterr().err
         assert main([*args, "--replace"]) == 0
     else:
-        async def run(config):
+        async def run(config, *, directory):
+            assert directory == tmp_path / "new-run"
             return report
 
         monkeypatch.setattr("giraffe.cli._run", run)
@@ -467,7 +468,8 @@ def test_cli_prints_the_retained_check_summary(policy, retained, tmp_path, monke
     from giraffe.fixtures import answer_difference
     from giraffe.models import CheckResult, RunReport
 
-    async def run(config):
+    async def run(config, *, directory):
+        assert directory == tmp_path / "run"
         return RunReport(run_id="mismatch", started_at="now", finished_at="now", overall="fail",
                          manifest={"config": config.model_dump(mode="json")}, checks=[CheckResult(
                              id="correctness", target="local", title="Correctness", status="fail",

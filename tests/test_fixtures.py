@@ -54,14 +54,14 @@ def test_traffic_mix_has_scored_and_bounded_short_input_long_input_and_long_outp
     assert set(fixtures) == {"short", "long_input", "long_output"}
     assert fixtures["long_input"][0].input_chars == 2000
     assert len(fixtures["long_output"][0].expected.split()) == 24
-    assert all(spec.scorer == "exact" and spec.expected and spec.max_tokens <= 40
+    assert all(spec.scorer == "exact" and spec.expected and spec.max_tokens == 40
                for group in fixtures.values() for spec in group)
     assert traffic_fixtures(configured) == fixtures
 
 
 @pytest.mark.parametrize("context_limit", [128, 512, 4096, 32768])
 def test_context_lengths_are_bounded_and_fact_positions_vary(context_limit):
-    configured = config(context_limit=context_limit)
+    configured = config(context_limit=context_limit, max_output_tokens=24)
     fixtures = builtin_fixtures(configured)
     context = fixtures["context"]
     assert len(context) == (2 if context_limit == 128 else 6)
@@ -88,6 +88,27 @@ def test_output_limits_and_nonstreaming_config_apply_to_all_builtins():
     assert all(spec.max_tokens <= 2 and not spec.stream for spec in specs)
     assert any(spec.cancel_after_ms for spec in fixtures["limits"])
     assert any(spec.options.get("stop") for spec in fixtures["limits"])
+
+
+def test_builtin_answer_fixtures_use_configured_output_budget_without_a_check_override():
+    fixtures = builtin_fixtures(config(max_output_tokens=2048, structured_json=True))
+    for specs in fixtures.values():
+        for spec in specs:
+            assert spec.max_tokens == (8 if spec.fixture_id.startswith("limits.output_cap") else 2048)
+    assert all(spec.input_chars + spec.max_tokens + 32 <= 4096
+               for spec in fixtures["context"])
+
+
+def test_backend_cancel_fixtures_use_the_global_cap_not_their_former_small_caps():
+    # Formerly 128 and 8; small caps exhaust reasoning models before they stream (issue #78).
+    fixtures = builtin_fixtures(config(
+        max_output_tokens=2048, checks=["cancellation"],
+        test_options={"cancellation": {"backend_verification": "required"}}))
+    probe, followup = fixtures["backend_cancellation"]
+    assert (probe.fixture_id, followup.fixture_id) == ("limits.backend_cancel.v1", "limits.backend_cancel.followup.v1")
+    assert probe.max_tokens == followup.max_tokens == 2048
+    output_cap, = [spec for spec in fixtures["limits"] if spec.fixture_id.startswith("limits.output_cap")]
+    assert output_cap.max_tokens == 8
 
 
 @pytest.mark.parametrize("output,expected", [

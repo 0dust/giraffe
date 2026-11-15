@@ -325,12 +325,25 @@ def run_alive(directory: Path | str, meta: dict | None = None, *, active_id: str
     # cannot be rescued by probing our own PID.
     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0 or pid == os.getpid():
         return False
+    return pid_alive(pid, uncertain=False)
+
+
+def pid_alive(pid: int, *, uncertain: bool) -> bool:
+    """Probe a same-host PID. ``uncertain`` is the answer when the probe cannot
+    tell (our own PID or an unexpected OSError); permission-denied means the
+    process exists. Lifecycle cleanup passes False to avoid pinning dead runs;
+    evidence recovery passes True so it never reads a journal a live writer may still extend.
+    """
+    if pid == os.getpid():
+        return uncertain
     try:
         os.kill(pid, 0)
     except PermissionError:
         return True
-    except (ProcessLookupError, OSError, OverflowError):
+    except ProcessLookupError:
         return False
+    except (OSError, OverflowError):
+        return uncertain
     return True
 
 

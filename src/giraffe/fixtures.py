@@ -25,6 +25,7 @@ from giraffe.tool_schema import (MAX_TOOL_JSON_BYTES, ToolSchemaBudgetExceeded, 
                                 bounded_tool_schema)
 
 FIXTURE_VERSION = "0.3.0"
+CONTEXT_SIZING_VERSION = "full-window-v1"
 SUITE_VERSION = "0.3.0"
 _RESERVED_OPTIONS = {"model", "messages", "stream", "max_tokens", "max_completion_tokens", "n"}
 _CONTEXT_POSITION_SEPARATION = 32
@@ -61,7 +62,7 @@ def _request(
     *,
     scorer: str = "exact",
     expected: Any = None,
-    max_tokens: int = 24,
+    max_tokens: int,
     version: int = 1,
     **kwargs: Any,
 ) -> RequestSpec:
@@ -78,23 +79,13 @@ def _request(
     )
 
 
-def _fixture_budget(config: RunConfig, default: int, check_id: str | None = None) -> int:
-    """Resolve built-in defaults once; explicit check settings are their own values."""
-    owners = (tuple(owner for owner in ("serving", "first_output") if owner in config.checks)
-              if check_id == "serving" else (check_id,))
-    if any(config.test_options.get(owner) is not None
-           and config.test_options[owner].max_output_tokens is not None for owner in owners):
-        return config.max_output_tokens
-    return min(default, config.max_output_tokens)
-
-
-def _context_request(config: RunConfig, size: str, position: str, check_id: str | None = None) -> RequestSpec:
+def _context_request(config: RunConfig, size: str, position: str) -> RequestSpec:
     """Reserve output/template space and bound ASCII input conservatively.
 
     A character budget deliberately avoids claiming an exact token budget. Even
     an ASCII prompt's token usage depends on the model and its chat template.
     """
-    output_budget = _fixture_budget(config, 24, check_id)
+    output_budget = config.max_output_tokens
     character_budget = config.context_limit - output_budget - 32
     # Keep the expected labels stable across prompt wording revisions.
     label = hashlib.sha256(f"context-v1-{size}-{position}".encode()).hexdigest()[:6].upper()
@@ -129,7 +120,7 @@ def _context_request(config: RunConfig, size: str, position: str, check_id: str 
     )
 
 
-def builtin_fixtures(config: RunConfig, *, check_id: str | None = None) -> dict[str, list[RequestSpec]]:
+def builtin_fixtures(config: RunConfig) -> dict[str, list[RequestSpec]]:
     """Return reproducible fixtures; the runner reuses them across load levels.
 
     The runner must enforce the shared request/time/concurrency budget. Fixtures
@@ -139,9 +130,10 @@ def builtin_fixtures(config: RunConfig, *, check_id: str | None = None) -> dict[
     by the runner. Exact scorers intentionally reject explanatory extra text.
     Identifiers are box labels so prompts do not imply access credentials.
     """
-    def request(*args, own_cap=False, **kwargs):
-        budget = kwargs.pop("max_tokens", 24)
-        return _request(*args, max_tokens=(budget if own_cap else _fixture_budget(config, budget, check_id)),
+    def request(*args, max_tokens=None, **kwargs):
+        # The caller has already resolved suite/check settings. Only fixtures
+        # testing a specific cap supply their own budget.
+        return _request(*args, max_tokens=config.max_output_tokens if max_tokens is None else max_tokens,
                         request_timeout_seconds=config.request_timeout_seconds, **kwargs)
 
     short = [
@@ -155,11 +147,11 @@ def builtin_fixtures(config: RunConfig, *, check_id: str | None = None) -> dict[
             "Copy exactly, with no extra text:\n"
             "The blue box holds seven red cards. The label on each card is K7P4.",
             expected="The blue box holds seven red cards. The label on each card is K7P4.",
-            max_tokens=64, version=2,
+            version=2,
         ),
     ]
     context = [
-        _context_request(config, size, position, check_id)
+        _context_request(config, size, position)
         for size in ("short", "long")
         for position in ("beginning", "middle", "end")
     ]
@@ -204,14 +196,14 @@ def builtin_fixtures(config: RunConfig, *, check_id: str | None = None) -> dict[
             "json.record", "json", ["json", "serving"],
             "Convert this box record to JSON.\nlabel: J6Q2\ncount: 3\nready: true\n"
             "Output only the JSON object, with no explanation or markdown.",
-            scorer="json", expected=expected, schema=schema, max_tokens=64, version=2,
+            scorer="json", expected=expected, schema=schema, version=2,
         ))
     cap = min(8, config.max_output_tokens)
     limits = [
         request(
             "limits.output_cap", "limits", ["cancellation"],
             "Write the numbers from 1 to 100 separated by spaces. No other text.",
-            scorer="none", expected={"maximum_output_tokens": cap}, max_tokens=cap, own_cap=True,
+            scorer="none", expected={"maximum_output_tokens": cap}, max_tokens=cap,
         ),
         request(
             "limits.stop", "limits", ["cancellation"],
@@ -257,11 +249,11 @@ def builtin_fixtures(config: RunConfig, *, check_id: str | None = None) -> dict[
             request(
                 "limits.backend_cancel", "backend_cancel", ["cancellation"],
                 "Write the numbers from 1 to 100, one per line.", scorer="none",
-                max_tokens=128, options=deterministic_options(config), cancel_after_chunks=chunks,
+                options=deterministic_options(config), cancel_after_chunks=chunks,
             ),
             request(
                 "limits.backend_cancel.followup", "backend_cancel_followup", ["cancellation"],
-                "Reply with just OK.", scorer="none", max_tokens=8, options=deterministic_options(config),
+                "Reply with just OK.", scorer="none", options=deterministic_options(config),
             ),
         ]
     for group in fixtures.values():
@@ -272,7 +264,7 @@ def builtin_fixtures(config: RunConfig, *, check_id: str | None = None) -> dict[
     return fixtures
 
 
-def traffic_fixtures(config: RunConfig, *, check_id: str | None = None) -> dict[str, list[RequestSpec]]:
+def traffic_fixtures(config: RunConfig) -> dict[str, list[RequestSpec]]:
     """Three reproducible request shapes with complete local answer scoring.
 
     Lengths describe characters and words, not tokenizer-dependent token counts.
@@ -288,10 +280,10 @@ def traffic_fixtures(config: RunConfig, *, check_id: str | None = None) -> dict[
     answer = " ".join(word_bank[index % len(word_bank)]
                       for index in range(traffic.long_output_words))
     groups = {
-        "short": builtin_fixtures(config, check_id=check_id)["short"],
+        "short": builtin_fixtures(config)["short"],
         "long_input": [_request("traffic.long_input", "capacity", ["capacity"],
                                 prefix + filler + suffix, expected="L8N2",
-                                max_tokens=_fixture_budget(config, 24, check_id),
+                                max_tokens=config.max_output_tokens,
                                 request_timeout_seconds=config.request_timeout_seconds)],
         "long_output": [_request("traffic.long_output", "capacity", ["capacity"],
                                  "Copy exactly, with no extra text:\n" + answer,

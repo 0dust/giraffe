@@ -860,7 +860,8 @@ def _baseline_rows(report, target, window, records, put):
                if index in capacity_stage_ids and row.get("status") in {"pass", "fail"}]
     mapping = (("baseline_throughput", "Throughput change",
                 {"output_tokens_per_second", "shared_window_output_tokens_per_second"}),
-               ("baseline_timing", "Latency / first-output change", {"latency_ms", "first_output_ms", "max_stream_gap_ms"}),
+               ("baseline_timing", "Latency / first-output change", {"latency_ms", "first_output_ms", "max_stream_gap_ms",
+                 "latency_p95_ms", "first_output_p95_ms", "max_stream_gap_p95_ms"}),
                ("baseline_generation", "Generation pace change", {"generation_tokens_per_second"}),
                ("baseline_quality", "Error / correctness change", {"error_rate", "correctness_rate", "valid_completion_rate"}))
     for key, label, names in mapping:

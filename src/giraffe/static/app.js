@@ -2867,7 +2867,7 @@ function renderModelDiscovery() {
   button.disabled=discovery?.status==='pending'||hasJsonChanges();button.textContent=discovery?.status==='pending'?'Connecting…':discovery?.status==='connected'?'Reconnect':'Connect';button.classList.toggle('handshaking',discovery?.status==='pending');
   button.classList.toggle('primary',!model);button.classList.toggle('small',Boolean(model));button.title='Sends one short request (32-token limit).';
   status.textContent=discovery?.message || '';
-  status.classList.toggle('error',discovery?.status==='error');status.classList.toggle('connected',discovery?.status==='connected');
+  status.classList.toggle('error',discovery?.status==='error');status.classList.toggle('connected',discovery?.status==='connected');status.classList.toggle('unverified',discovery?.status==='unverified');
   const choice=$('#connection-model-choice'),manual=$('#manual-model-field'),options=$('#model-options');
   const models=discovery?.models || [];
   if(choice){
@@ -2878,7 +2878,7 @@ function renderModelDiscovery() {
   }
   if(discovery?.status==='needs_model'&&options)options.open=true;
   const connectionOptions=$('#connection-options');if(connectionOptions&&['needs_model','error'].includes(discovery?.status))connectionOptions.open=true;
-  const label=$('#model-options-label');if(label)label.textContent=discovery?.status==='needs_model'?`Giraffe found ${models.length} models. Choose one.`:discovery?.status==='connected'?'Found on your server.':discovery?.status==='error'?'Type the exact model name to continue without a check.':discovery?.status==='pending'?'Looking for models…':model?'Typed by you. Connecting first is optional.':'Found when you connect, or type the exact name.';
+  const label=$('#model-options-label');if(label)label.textContent=discovery?.status==='needs_model'?`Giraffe found ${models.length} models. Choose one.`:['connected','unverified'].includes(discovery?.status)?'Found on your server.':discovery?.status==='error'?'Type the exact model name to continue without a check.':discovery?.status==='pending'?'Looking for models…':model?'Typed by you. Connecting first is optional.':'Found when you connect, or type the exact name.';
   const auth=$('#connection-auth');if(auth&&discovery?.status==='error'&&/key|401|403|unauthor/i.test(discovery.message || ''))auth.open=true;
   syncSetupStep();
 }
@@ -2891,9 +2891,9 @@ async function testConnection() {
   state.modelDiscovery={key,route,status:'pending',models:[],message:'Checking your endpoint. A model may take a moment to load…'};renderModelDiscovery();
   try{
     const api_key=apiKeyFor(url.value);
-    const result=await api('/api/targets/test-connection',{method:'POST',body:JSON.stringify({...JSON.parse(key),...(api_key?{api_key}:{})})});
+    const result=await api('/api/targets/test-connection',{method:'POST',body:JSON.stringify({...JSON.parse(key),...(state.autoModel&&state.autoModel===JSON.parse(key).model?{discovered:true}:{}),...(api_key?{api_key}:{})})});
     if(sequence!==state.modelDiscoverySequence||route!==state.routeVersion||key!==modelDiscoveryKey())return;
-    if(result.status==='connected'){
+    if(['connected','unverified'].includes(result.status)){
       if(!JSON.parse(key).model)state.autoModel=result.model;
       form.elements.model.value=result.model;form.elements.model.setCustomValidity('');
       state.config.targets[0].model=result.model;
@@ -3980,7 +3980,7 @@ function comparisonChange(row) {
   return `${percent>0?'+':''}${number(percent,1)}%`;
 }
 function comparisonMetricLabel(row) {
-  return ({attribution_outcome:'Attribution outcome',correctness_rate:'Correct answers',valid_completion_rate:'Completed valid responses',error_rate:'Request errors',latency_ms:'Full response time',first_output_ms:'First useful output',max_stream_gap_ms:'Longest pause per response',output_tokens_per_second:'Output rate, including initial wait',generation_tokens_per_second:'Generation pace',output_tokens:'Answer length · tokens',output_chars:'Answer length · characters'})[row.metric]||human(row.metric);
+  return ({attribution_outcome:'Attribution outcome',correctness_rate:'Correct answers',valid_completion_rate:'Completed valid responses',error_rate:'Request errors',latency_ms:'Full response time',latency_p95_ms:'Full response time · p95',first_output_ms:'First useful output',first_output_p95_ms:'First useful output · p95',max_stream_gap_ms:'Longest pause per response',max_stream_gap_p95_ms:'Longest pause per response · p95',output_tokens_per_second:'Output rate, including initial wait',generation_tokens_per_second:'Generation pace',output_tokens:'Answer length · tokens',output_chars:'Answer length · characters'})[row.metric]||human(row.metric);
 }
 function comparisonWarnings(row) {
   return row.warnings?.length?row.warnings.map(w=>w.message):row.status==='inconclusive'?[row.reason||'Insufficient evidence to interpret this change.']:[];
@@ -3990,8 +3990,9 @@ function comparisonWarningSummary(row) {
   const notes=[];
   for(const warning of row.warnings||[]){
     if(warning.code==='output_work_changed'){
-      const before=row.output_work?.baseline?.reported_output_tokens_p50,after=row.output_work?.current?.reported_output_tokens_p50;
-      notes.push(before!=null&&after!=null?`Answer length changed: ${number(before)} → ${number(after)} tokens.`:'Answer lengths differ.');
+      const key=row.aggregation==='p95'?'reported_output_tokens_p95':'reported_output_tokens_p50';
+      const before=row.output_work?.baseline?.[key],after=row.output_work?.current?.[key];
+      notes.push(before!=null&&after!=null&&before!==after?`Answer length changed${row.aggregation==='p95'?' (p95)':''}: ${number(before)} → ${number(after)} tokens.`:'Answer lengths differ.');
     }else if(warning.code==='client_delayed'){
       for(const [name,q] of Object.entries(row.timing_quality||{}))if(q.status==='client_delayed')notes.push(q.scope==='legacy_run_maximum'?`${name} recorded a run-wide Giraffe delay; request-level overlap was not recorded.`:`Giraffe delays affected ${q.affected_requests}/${q.total_requests} ${name.toLowerCase()} requests.`);
     }else if(warning.code==='sample_uncertainty')notes.push('Sample uncertainty limits this assessment.');
@@ -4010,7 +4011,7 @@ function comparisonTable(rows) {
   return `<div class="comparison-values">${rows.map(row=>{
     const warnings=comparisonWarnings(row),shortWarnings=comparisonWarningSummary(row),commonWindow=row.aggregation==='common_window';
     const showReason=row.check==='gateway_policy'&&row.metric==='policy_acceptance'&&['fail','inconclusive'].includes(row.status)&&typeof row.reason==='string'&&row.reason.trim()&&!warnings.some(warning=>typeof warning==='string'&&warning.trim()===row.reason.trim());
-    const aggregation=commonWindow?'Common window':row.aggregation==='observed'?(row.metric==='attribution_outcome'?'Observed outcome':'Policy evidence'):row.aggregation==='mean'?'Rate':'Median';
+    const aggregation=commonWindow?'Common window':row.aggregation==='observed'?(row.metric==='attribution_outcome'?'Observed outcome':'Policy evidence'):({mean:'Rate',p95:'P95'}[row.aggregation]||'Median');
     let label;
     if(row.aggregation==='observed')label=row.status==='fail'?'Observed failure':warnings.length?'Unverified':'Observed';
     else if(commonWindow)label=row.status==='fail'?'Observed decrease':warnings.length?'Warning':'Observed';
