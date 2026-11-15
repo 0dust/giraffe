@@ -178,6 +178,56 @@ async def test_answer_stream_counts_usage_and_preserves_finish(monkeypatch):
     assert received[0]["max_tokens"] == 7
 
 
+async def test_rate_limit_records_retry_after(monkeypatch):
+    target = Target(name="local", url="http://local/v1", model="test")
+    config = RunConfig(targets=[target])
+    original = httpx.AsyncClient
+    monkeypatch.setattr("giraffe.client.httpx.AsyncClient", lambda **kwargs: original(
+        transport=httpx.MockTransport(lambda _: httpx.Response(429, headers={"Retry-After": "1.5"})), **kwargs,
+    ))
+    async with LLMClient(target, config) as client:
+        record = await client.execute(spec())
+
+    assert record.status == "failed"
+    assert record.http_status == 429
+    assert record.rate_limited
+    assert record.retry_after_seconds == 1.5
+    assert record.error == "rate limited (HTTP 429); retry after 1.5s"
+
+
+async def test_rate_limit_callback_runs_before_error_body(monkeypatch):
+    target = Target(name="local", url="http://local/v1", model="test")
+    config = RunConfig(targets=[target])
+    original = httpx.AsyncClient
+    seen = []
+
+    class Body(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            seen.append("body")
+            yield b'{"error":"limited"}'
+
+        async def aclose(self):
+            pass
+
+    monkeypatch.setattr("giraffe.client.httpx.AsyncClient", lambda **kwargs: original(
+        transport=httpx.MockTransport(lambda _: httpx.Response(
+            429, headers={"Retry-After": "2"}, stream=Body())), **kwargs,
+    ))
+    async with LLMClient(target, config) as client:
+        await client.execute(spec(), on_rate_limit=lambda retry: seen.append(("header", retry)))
+
+    assert seen == [("header", 2.0), "body"]
+
+
+def test_retry_after_accepts_http_date_and_rejects_invalid_values():
+    from datetime import datetime, timedelta, timezone
+    from email.utils import format_datetime
+    from giraffe.client import _retry_after
+
+    future = format_datetime(datetime.now(timezone.utc) + timedelta(seconds=30), usegmt=True)
+    assert 28 <= _retry_after(future) <= 30
+    assert _retry_after("nan") is None
+    assert _retry_after("invalid") is None
 async def test_lifecycle_observer_reports_immutable_identity_and_real_stream_answer(monkeypatch):
     from dataclasses import FrozenInstanceError
 
@@ -282,8 +332,6 @@ async def test_lifecycle_observer_over_real_http_stream():
     assert received[0].kind == "started" and received[-1].kind == "terminal"
     assert len([item for item in received if item.kind == "answer"]) == 1
     assert {item.request_id for item in received} == {record.id}
-
-
 class Chunks(httpx.AsyncByteStream):
     def __init__(self, chunks):
         self.parts = chunks

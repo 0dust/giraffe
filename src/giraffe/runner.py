@@ -18,7 +18,7 @@ from contextlib import asynccontextmanager, contextmanager, nullcontext
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Literal
+from typing import Any, Callable, Literal
 
 import httpx
 
@@ -43,6 +43,7 @@ from .models import (
 
 
 logger = logging.getLogger(__name__)
+RATE_LIMIT_FALLBACK_SECONDS = 1.0
 # A context-local sink lets web runs persist evidence without changing request()
 # or sharing a writer between concurrent CLI invocations.
 record_sink = ContextVar("giraffe_record_sink", default=lambda record: None)
@@ -62,14 +63,15 @@ def _reasoning_budget(record) -> bool:
 
 
 def _stats(records: list[RequestRecord]) -> dict:
-    """attempted = completed + failed + timed_out + cancelled + reasoning_budget_exhausted.
+    """attempted = completed + failed + timed_out + cancelled + reasoning_budget_exhausted + rate_limited.
 
     Reasoning-budget records are neither errors nor answers; they are excluded from error_rate.
     """
     good = [r for r in records if r.status == "completed" and r.valid]
     latencies = [r.elapsed_ms for r in good]
     output = [r.first_output_ms for r in good if r.first_output_ms is not None]
-    evaluated = [r for r in records if r.status != "cancelled" and not _reasoning_budget(r)]
+    evaluated = [r for r in records if r.status != "cancelled" and not _reasoning_budget(r)
+                 and not r.rate_limited]
     errors = sum(r.status in {"failed", "timeout"} or (r.status == "completed" and not r.valid) for r in evaluated)
     rates = [r.output_tokens / (r.elapsed_ms / 1000) for r in good
              if r.output_tokens is not None and r.elapsed_ms > 0]
@@ -77,10 +79,11 @@ def _stats(records: list[RequestRecord]) -> dict:
     result = {
         "attempted": len(records), "completed": len(good),
         "failed": sum((r.status == "failed" or (r.status == "completed" and not r.valid))
-                      and not _reasoning_budget(r) for r in records),
+                      and not _reasoning_budget(r) and not r.rate_limited for r in records),
         "reasoning_budget_exhausted": sum(map(_reasoning_budget, records)),
         "timed_out": sum(r.status == "timeout" for r in records),
         "cancelled": sum(r.status == "cancelled" for r in records),
+        "rate_limited": sum(r.rate_limited for r in records),
         "error_rate": errors / len(evaluated) if evaluated else None,
         "p50_ms": percentile(latencies, .5), "p95_ms": percentile(latencies, .95),
         "first_output_p50_ms": percentile(output, .5),
@@ -268,6 +271,8 @@ class _Run:
         self.dropped_offers = 0
         self.budget_counts = Counter()
         self.errors = 0
+        self.rate_limit_until = {target.name: 0.0 for target in config.targets}
+        self.rate_limit_failures = Counter()
         self.reason: str | None = None
         self.limits_reached = set()
         self.request_limit_scopes: set[str] = set()
@@ -551,6 +556,8 @@ class _Run:
             self.reason = self.reason or "; ".join(health["abort_reason"] for health in self.endpoint_health.values())
         if self.errors >= self.config.stop_after_errors:
             self.reason = self.reason or "error threshold reached"
+        if any(count >= self.config.stop_after_errors for count in self.rate_limit_failures.values()):
+            self.reason = self.reason or "rate limit threshold reached"
         self.reason = self.reason or previous
         if (self.reason == "cancelled by user" and previous != self.reason and self._gateway_only_phase
                 and all(check in SHARED_BASELINE_EXCLUDED_WORKLOADS for _, check in self.pending_checks)
@@ -596,6 +603,12 @@ class _Run:
             return
         health.update(last_response_seconds=time.monotonic() - self.start,
                       consecutive_failures=0, failure_request_ids=[])
+
+    def rate_limit_received(self, target: str, retry_after: float | None) -> None:
+        self.rate_limit_failures[target] += 1
+        delay = retry_after if retry_after is not None else RATE_LIMIT_FALLBACK_SECONDS
+        self.rate_limit_until[target] = max(self.rate_limit_until[target], time.monotonic() + delay)
+        self.stop_reason(target)
 
     def endpoint_failure(self, target, record_id=None):
         health = self.endpoint_health[target]
@@ -672,9 +685,10 @@ class _Run:
 
     async def request(self, target, client, spec, event=None, on_start=None, timeout_override=None,
                       *, slot_reserved=False, budget_reserved=False, deadline_override=None,
-                      admission_deadline=None, prepared_admission=False, admission_check=None,
-                      on_preparation_failure=None, budget_exempt=False, evaluate_record=None,
-                      finalize_record=None, request_parameters=None, lifecycle_observer=None):
+                      latest_dispatch_deadline=None, admission_deadline=None, prepared_admission=False,
+                      admission_check=None, on_preparation_failure=None, budget_exempt=False,
+                      evaluate_record=None, finalize_record=None, request_parameters=None,
+                      lifecycle_observer=None):
         """Complete a request and persist its terminal evidence once.
 
         ``finalize_record`` synchronously adds scheduler-owned measurements before
@@ -695,21 +709,31 @@ class _Run:
         readiness = spec.scenario == "readiness" or (
             spec.scenario == "initial" and self.config.restart_target == target.name)
         evidence_probe = spec.scenario == "performance_evidence_probe" or spec.identity is not None
-        slot_deadline = min(self.deadline, deadline_override if deadline_override is not None else self.deadline)
-        if admission_deadline is not None:
-            slot_deadline = min(slot_deadline, admission_deadline)
+        dispatch_deadlines = [deadline for deadline in (latest_dispatch_deadline, admission_deadline)
+                              if deadline is not None]
+        dispatch_deadline = min(dispatch_deadlines) if dispatch_deadlines else None
+        slot_deadline = min([self.deadline, *dispatch_deadlines,
+                             *([deadline_override] if deadline_override is not None else [])])
         async with self.slot(slot_reserved, slot_deadline, gateway_probe=gateway_probe) as admitted:
+            while admitted and not self.stop.is_set():
+                wait = self.rate_limit_until[target.name] - time.monotonic()
+                if wait <= 0 or time.monotonic() >= slot_deadline:
+                    break
+                try:
+                    await asyncio.wait_for(self.stop.wait(), min(wait, slot_deadline - time.monotonic()))
+                except TimeoutError:
+                    pass
             # An offered arrival owns its budget even if a later arrival exhausts
             # the ceiling. Only a real stop condition can prevent its dispatch.
             reason = self.stop_reason(target.name)
             stopped = not admitted or time.monotonic() >= slot_deadline or (
                 reason is not None and reason != "maximum request budget reached")
-            if stopped or (admission_deadline is None and not budget_reserved and not budget_exempt
+            if stopped or (dispatch_deadline is None and not budget_reserved and not budget_exempt
                            and not self.reserve_offer(target.name, gateway_probe=gateway_probe)):
-                if admission_deadline is None or time.monotonic() >= self.deadline or reason:
+                if dispatch_deadline is None or time.monotonic() >= self.deadline or reason:
                     self.mark_unfinished(target.name, _scenario_checks(spec))
                 return None
-            if admission_deadline is None:
+            if dispatch_deadline is None:
                 self.attempted += 1
             output_cap = spec.max_tokens if spec.max_tokens is not None else self.config.max_output_tokens
             request_parameters = {**(request_parameters or {}),
@@ -734,7 +758,8 @@ class _Run:
                     raise _DispatchRefused
                 return now
 
-            guard_admission = admission_deadline is not None and (budget_reserved or prepared_admission)
+            guard_admission = dispatch_deadline is not None and (
+                budget_reserved or prepared_admission or latest_dispatch_deadline is not None)
             guard_transport = guard_admission and getattr(client, "_supports_dispatch_guard", False) is True
             key = (target.name, spec.scenario)
             global_deadline = False
@@ -742,6 +767,9 @@ class _Run:
             intentional_deadline_applies = False
             request_slot = started = started_at = token = timeout = None
             failure = None
+            rate_limit_noted = False
+            # Policy probes need 429 evidence; a generic cooldown would censor it.
+            rate_limit_control = "gateway_policy" not in spec.check_ids
             task = asyncio.current_task()
             cancellations = task.cancelling()
             pending_start = None
@@ -797,7 +825,7 @@ class _Run:
 
             def begin_attempt():
                 nonlocal started, started_at, request_slot, token, pending_start
-                if admission_deadline is not None:
+                if dispatch_deadline is not None:
                     started = admission_clock()
                     if (not budget_reserved and not budget_exempt
                             and not self.reserve_offer(target.name, gateway_probe=gateway_probe)):
@@ -816,7 +844,7 @@ class _Run:
                     self.endpoint_attempt(target.name)
                 self.active[key] += 1
                 self.peak[key] = max(self.peak[key], self.active[key])
-                if admission_deadline is None:
+                if dispatch_deadline is None:
                     started = time.monotonic()
                 started_at = _now()
                 token = self.inflight.start(target.name)
@@ -842,12 +870,22 @@ class _Run:
                     begin_attempt()
                     deadline = asyncio.timeout(request_budget())
                 async with deadline:
+                    def note_rate_limit(retry_after: float | None) -> None:
+                        nonlocal rate_limit_noted
+                        rate_limit_noted = True
+                        self.rate_limit_received(target.name, retry_after)
+
+                    execute_kwargs: dict[str, Any] = {"first_output_event": event}
+                    if lifecycle_observer is not None:
+                        execute_kwargs["lifecycle_observer"] = lifecycle_observer
+                    if rate_limit_control and getattr(client, "_client", None) is not None:
+                        execute_kwargs["on_rate_limit"] = note_rate_limit
                     if guard_transport:
-                        record = await client.execute(spec, first_output_event=event, _before_send=begin_attempt,
-                            **({"lifecycle_observer": lifecycle_observer} if lifecycle_observer is not None else {}))
+                        record = await client.execute(spec, _before_send=begin_attempt, **execute_kwargs)
                     else:
-                        record = await client.execute(spec, first_output_event=event,
-                            **({"lifecycle_observer": lifecycle_observer} if lifecycle_observer is not None else {}))
+                        record = await client.execute(spec, **execute_kwargs)
+                if record.http_status is not None and record.http_status != 429:
+                    self.rate_limit_failures[target.name] = 0
                 if token is None:
                     if record.status == "cancelled":
                         if task.cancelling() > cancellations:
@@ -1025,8 +1063,11 @@ class _Run:
                             record.error = self.endpoint_health[target.name]["abort_reason"]
                         self.mark_unfinished(target.name, _scenario_checks(spec))
                 budget_only = bool(set(spec.check_ids) & {"prefix", "sessions", "tools"}) and reasoning_budget(record)
+                if record.rate_limited and rate_limit_control and not intentional and not rate_limit_noted:
+                    self.rate_limit_received(target.name, record.retry_after_seconds)
                 if _serving_failure(record, spec.scenario) and not readiness and not intentional and not budget_only:
-                    self.errors += 1
+                    if not record.rate_limited:
+                        self.errors += 1
                     record.check_ids = list(dict.fromkeys([*record.check_ids, *[
                         name for name in ("access", "serving", "first_output") if name in self.config.checks]]))
                 if budget_exempt:
@@ -1992,6 +2033,8 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
         elif check_id == "serving":
             if metrics["error_rate"] is not None and metrics["error_rate"] > limits.max_error_rate:
                 status, summary = "fail", "Invalid completions, errors or timeouts exceeded the configured allowance."
+            elif metrics["rate_limited"]:
+                status, summary = "inconclusive", "Requests were rate limited (HTTP 429); serving was not fully assessed."
             elif metrics["reasoning_budget_exhausted"]:
                 status, summary = "inconclusive", "Reasoning exhausted the output budget before an answer."
             else:

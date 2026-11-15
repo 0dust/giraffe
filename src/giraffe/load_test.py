@@ -749,7 +749,8 @@ async def concurrent_window(run, target, client, settings, point, calibration, *
                 return None
             spec = build_spec(run, settings, point, shape, calibration, role=role, phase=phase)
             try:
-                record = await run.request(target, client, spec, event=progress, slot_reserved=True)
+                record = await run.request(target, client, spec, event=progress,
+                                           slot_reserved=True, latest_dispatch_deadline=end)
             except asyncio.CancelledError as exc:
                 record = getattr(exc, "giraffe_record", None)
                 if record is not None:
