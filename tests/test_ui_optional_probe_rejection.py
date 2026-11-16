@@ -31,7 +31,8 @@ assert.doesNotMatch(html,/class="notice error"/);
             },
             r"""
 assert.match(html,/Unsupported optional capability: the endpoint rejected <code>stream_options<\/code> \(HTTP 422\)/);
-assert.match(html,/streamed token usage stays unavailable/);
+assert.doesNotMatch(html,/streamed token usage.*unavailable/);
+assert.match(html,/This setup probe is not a serving failure\.<\/div>/);
 assert.match(html,/class="notice[^"]*"[^>]*>HTTP 422<\/div>/);
 assert.doesNotMatch(html,/class="notice error"/);
 """,
