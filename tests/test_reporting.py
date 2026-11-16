@@ -156,6 +156,109 @@ def test_comparison_summary_deduplicates_scopes_and_prefers_recorded_values():
     assert comparison_summary(report)["rows"][0]["metric"] == "latency_ms"
 
 
+@pytest.mark.parametrize("qualification", [None, "unverified"])
+def test_comparison_summary_does_not_claim_a_policy_change_without_baseline_evidence(
+    qualification, tmp_path, capsys,
+):
+    from giraffe.cli import _print_result
+    from giraffe.reporting import _baseline_summary_html, comparison_summary
+    from giraffe.web import _api_report
+    from tests.test_gateway_policy import configuration
+
+    current, previous = make_report(count=0), make_report("baseline", count=0)
+    for report in (current, previous):
+        report.manifest["config"] = configuration().model_dump(mode="json")
+    previous.checks = []
+    current.checks = [CheckResult(
+        id="gateway_policy", target="proxy", title="Gateway policy", required=True,
+        status="blocked" if qualification is None else "inconclusive",
+        summary="No qualified policy evidence was collected.",
+        metrics={} if qualification is None else {"gateway_policy": {
+            "qualification": qualification, "settings": configuration().gateway_policy.model_dump(mode="json"),
+            "users": [], "interpretation": "No qualified policy evidence was collected.",
+        }},
+    )]
+    compared = compare_baseline(current, previous)
+    recorded = compared.baseline["targets"][0]["comparisons"][0]
+    assert recorded["metric"] == "policy_acceptance"
+    assert recorded["baseline"] is None and recorded["current"] == qualification
+    assert recorded["status"] == "inconclusive"
+    before = compared.model_dump(mode="json")
+    summary = comparison_summary(compared)
+    row = summary["rows"][0]
+    assert row["baseline"] == "Not recorded"
+    assert row["change"] == row["change_html"] == "Not comparable"
+    assert row["status"] == "inconclusive"
+    assert _api_report(compared)["comparison_summary"] == summary
+    html = _baseline_summary_html(compared)
+    assert "<dt>Observed change</dt><dd>Not comparable</dd>" in html
+    _print_result(compared, tmp_path / "report.json", None, tmp_path, {})
+    output = capsys.readouterr().out
+    assert "(Not comparable); Inconclusive" in output
+    assert "Same qualification" not in output and "Qualification changed" not in output
+    assert compared.model_dump(mode="json") == before
+
+
+def test_comparison_summary_preserves_distinct_target_incompatibility_reasons():
+    from giraffe.reporting import _baseline_summary_html, comparison_summary
+    from giraffe.web import _api_report
+
+    current, previous = make_report(count=0), make_report("baseline", count=0)
+    for report in (current, previous):
+        report.manifest["config"]["targets"].append(
+            Target(name="other", url="http://localhost:8001", model="test").model_dump(mode="json")
+        )
+    previous.manifest["config"]["targets"][0]["model"] = "other-model"
+    previous.manifest["config"]["targets"][1]["url"] = "http://another-endpoint"
+    compared = compare_baseline(current, previous)
+    summary = comparison_summary(compared)
+    rows = {row["target"]: row for row in summary["rows"]}
+    assert rows.keys() == {"local", "other"}
+    assert "Target model differs or is unknown." in rows["local"]["reason"]
+    assert "Target url differs or is unknown." in rows["other"]["reason"]
+    assert all(not row.get("other_scopes") for row in rows.values())
+    assert summary["total_rows"] == 2 and summary["omitted_rows"] == 0
+    assert _api_report(compared)["comparison_summary"] == summary
+    html = _baseline_summary_html(compared)
+    assert all(row["reason"] in html for row in rows.values())
+
+
+@pytest.mark.parametrize("same_scope", [False, True])
+@pytest.mark.parametrize("difference", [
+    {"baseline_samples": 60}, {"current_samples": 60}, {"sample_basis": "dispatched"},
+    {"reason": "Input workload differs."},
+    {"warnings": [{"code": "client_delayed", "message": "Client delay affected this scope."}]},
+    {"current": 260.02}, {"threshold": 10},
+    {"worsening_interval_95": [5, 35]},
+    {"timing_quality": {"current": {"status": "client_delayed", "affected_requests": 1}}},
+])
+def test_comparison_summary_does_not_merge_different_recorded_evidence(same_scope, difference):
+    from giraffe.reporting import comparison_summary
+
+    original = {
+        "check": "correctness", "scenario": "warm", "metric": "latency_ms",
+        "aggregation": "median", "baseline": 200, "current": 260.01,
+        "status": "inconclusive", "reason": "Timing interpretation is limited.",
+        "baseline_samples": 6, "current_samples": 6, "threshold": 20,
+        "worsening_interval_95": [10, 40],
+        "warnings": [{"code": "input_work_changed", "message": "Input workload differs."}],
+    }
+    different = {**original, "scenario": "warm" if same_scope else "cold", **difference}
+    report = make_report()
+    report.baseline = {"run_id": "old", "status": "inconclusive", "targets": [{
+        "target": "local", "comparisons": [original, different],
+    }]}
+    before = report.model_dump(mode="json")
+    summary = comparison_summary(report)
+    assert len(summary["rows"]) == 2
+    assert summary["total_rows"] == 2 and summary["omitted_rows"] == 0
+    assert {row["evidence_id"] for row in summary["rows"]} == {
+        "comparison-metric-0-0", "comparison-metric-0-1",
+    }
+    assert all(not row.get("other_scopes") for row in summary["rows"])
+    assert report.model_dump(mode="json") == before
+
+
 @pytest.mark.parametrize("value,expected", [
     (None, "Date not recorded"),
     ("2026-10-04T10:00:00.123456Z", "Oct 4, 2026, 10:00 UTC"),
@@ -184,6 +287,39 @@ def test_comparison_summary_change_formats_outcomes_and_observed_values(row, exp
     from giraffe.reporting import _summary_change
 
     assert _summary_change(row) == expected
+
+
+@pytest.mark.parametrize("before,after,status,expected,expected_html", [
+    (None, None, "pass", "Not recorded", "Not recorded"),
+    (None, "unverified", "fail", "Not recorded", "Not recorded"),
+    ("observed", None, "pass", "Not recorded", "Not recorded"),
+    ("observed", "unverified", "inconclusive", "Not comparable", "Not comparable"),
+    ("observed", "observed", "pass", "Same qualification", "Same outcome"),
+    ("observed", "unverified", "fail", "Qualification changed", "Outcome changed"),
+])
+def test_comparison_summary_policy_change_uses_the_same_evidence_guard_in_html(
+    before, after, status, expected, expected_html,
+):
+    from giraffe.reporting import _summary_change, _summary_change_html
+
+    row = {"metric": "policy_acceptance", "check": "gateway_policy", "aggregation": "observed",
+           "baseline": before, "current": after, "status": status}
+    assert _summary_change(row) == expected
+    assert _summary_change_html(row) == expected_html
+
+
+@pytest.mark.parametrize("change,expected,expected_html", [
+    ({"observed_change": 30}, "+30%", "+30.0%"),
+    ({"observed_change": -25, "change_unit": "percentage_points"},
+     "-25 percentage points", "-25.0 pp"),
+    ({"observed_delta": 4}, "+4.0", "+4.0"),
+])
+def test_comparison_summary_policy_guard_preserves_recorded_numeric_changes(change, expected, expected_html):
+    from giraffe.reporting import _summary_change, _summary_change_html
+
+    row = {"metric": "policy_acceptance", "check": "gateway_policy", "status": "inconclusive", **change}
+    assert _summary_change(row) == expected
+    assert _summary_change_html(row) == expected_html
 
 
 def test_comparison_summary_html_collapses_evidence_and_formats_reference_once():

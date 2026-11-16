@@ -3949,6 +3949,10 @@ def _summary_change(row: dict[str, Any]) -> str:
         return ("Not comparable" if row.get("status") == "inconclusive" else
                 "Same outcome" if before == after else "Outcome changed")
     if metric == "policy_acceptance":
+        if row.get("status") == "inconclusive":
+            return "Not comparable"
+        if before is None or after is None:
+            return "Not recorded"
         return "Same qualification" if before == after else "Qualification changed"
     if not all(isinstance(value, (int, float)) and math.isfinite(value) for value in (before, after)):
         return "Not recorded"
@@ -3993,6 +3997,10 @@ def _summary_change_html(row: dict[str, Any]) -> str:
     if any(isinstance(row.get(name), (int, float)) and math.isfinite(row[name])
            for name in ("observed_delta", "delta_rps")):
         return _summary_change(row)
+    if row.get("metric") == "policy_acceptance" and (
+        row.get("status") == "inconclusive" or row.get("baseline") is None or row.get("current") is None
+    ):
+        return _summary_change(row)
     return _baseline_change(row).replace("—", "Not recorded")
 
 
@@ -4025,11 +4033,12 @@ def comparison_summary(report: RunReport) -> dict[str, Any]:
               "output_chars": "Answer length · characters", "attribution_outcome": "Attribution outcome"}
     core_metrics = ["correctness_rate", "latency_ms", "first_output_ms", "valid_completion_rate", "error_rate"]
     rows = []
+    scope_fields = {"scenario", "scenario_label", "condition_id", "load_point", "evidence_ids", "_evidence_id"}
     for target_index, target in enumerate(baseline.get("targets", [])):
         seen = set()
         for row in _baseline_display_rows(target, target_index=target_index):
-            fingerprint = json.dumps([row.get("check"), _comparison_cohort(row), *(
-                row.get(name) for name in ("metric", "baseline", "current", "status", "reason"))], sort_keys=True)
+            fingerprint = json.dumps({name: value for name, value in row.items()
+                                      if name != "_evidence_id"}, sort_keys=True)
             if fingerprint in seen:
                 continue
             seen.add(fingerprint)
@@ -4074,11 +4083,13 @@ def comparison_summary(report: RunReport) -> dict[str, Any]:
             empty = display["baseline"] == display["current"] == "Not recorded"
             priority = (display["verdict"] == "Observed result", empty, severity, not changed,
                         core_metrics.index(metric) if metric in core_metrics else len(core_metrics))
-            rows.append((priority, display))
+            evidence = json.dumps({name: value for name, value in row.items()
+                                   if name not in scope_fields}, sort_keys=True)
+            rows.append((priority, display, evidence))
     groups: dict[tuple, list[dict[str, Any]]] = {}
     unique = {}
-    for priority, row in sorted(rows, key=lambda entry: entry[0]):
-        key = tuple(row[name] for name in ("label", "baseline", "current", "change", "verdict", "status"))
+    for priority, row, evidence in sorted(rows, key=lambda entry: entry[0]):
+        key = row["reason"], evidence
         if key in unique:
             representative = unique[key]
             representative["other_scopes"] = representative.get("other_scopes", 0) + 1
