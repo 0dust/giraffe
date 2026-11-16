@@ -2920,7 +2920,8 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
             outer_cancellation = exc
             # Internally setting the event for cleanup must not attribute a
             # timeout or forced task cancellation to an explicit user stop.
-            run.reason = states.STOP_CANCELLED_BY_USER if run.stop.is_set() else states.STOP_RUN_CANCELLED
+            if run.reason in {None, states.STOP_REQUEST_BUDGET}:
+                run.reason = states.STOP_CANCELLED_BY_USER if run.stop.is_set() else states.STOP_RUN_CANCELLED
             run.stop.set()
 
     public_config = config.model_copy(deep=True)

@@ -47,14 +47,14 @@ if _required_modules_available():
     from giraffe.storage import DEFAULT_LIMITS, Heartbeat, format_size as _disk_size, parse_size
     from giraffe.resources import PhaseSampler, SAMPLING
 else:
-    raise SystemExit(4)
+    raise SystemExit(states.EXIT_CODE_USAGE)
 
 
 class UsageError(SystemExit):
     """An argument error that can use the caller's requested output format."""
 
     def __init__(self, message: str):
-        super().__init__(4)
+        super().__init__(states.EXIT_CODE_USAGE)
         self.message = message
 
     def __str__(self) -> str:
@@ -247,7 +247,10 @@ Exit codes:
   1  fail
   2  inconclusive
   3  blocked (including preflight failure)
-  4  usage or configuration error""")
+  4  usage or configuration error
+  130  cancelled (Ctrl+C)
+
+Run "giraffe describe" for every state, stop reason and exit code as JSON.""")
         source = run.add_mutually_exclusive_group()
         source.add_argument("--config", type=Path, help="YAML or JSON run configuration; - reads stdin")
         source.add_argument("--manifest", type=Path, help="Rerun the configuration in a saved report")
@@ -686,7 +689,7 @@ def _main(argv: list[str] | None = None) -> int:
         errors = [{**error, "message": error["message"].removeprefix("Value error, ").removeprefix("Assertion failed, ")}
                   for error in errors]
         if json_output:
-            emit("error", 4, errors=errors)
+            emit("error", states.EXIT_CODE_USAGE, errors=errors)
         else:
             for error in errors:
                 location = ".".join(map(str, error["loc"]))
@@ -695,7 +698,7 @@ def _main(argv: list[str] | None = None) -> int:
                 ):
                     location = ""
                 print(f"giraffe: {location + ': ' if location else ''}{error['message']}", file=sys.stderr)
-        return 4
+        return states.EXIT_CODE_USAGE
 
     try:
         args = parser().parse_args(arguments)
@@ -795,7 +798,7 @@ def _main(argv: list[str] | None = None) -> int:
                                      input_field=args.input_field, expected_field=args.expected_field,
                                      scorer=args.scorer)
             print(json.dumps(result, allow_nan=False))
-            return 4 if result["errors"] else 0
+            return states.EXIT_CODE_USAGE if result["errors"] else 0
         if args.command == "storage":
             from giraffe.storage import storage_summary
 
@@ -974,8 +977,8 @@ def _main(argv: list[str] | None = None) -> int:
                 print(f"giraffe: {message}", file=sys.stderr)
                 _blocked_outputs(config, args, directory, message)
                 if json_output:
-                    emit("blocked", 3, message=message, errors=guard["errors"])
-                return 3
+                    emit("blocked", states.EXIT_CODE_BLOCKED, message=message, errors=guard["errors"])
+                return states.EXIT_CODE_BLOCKED
             warnings.extend(item["msg"] for item in guard["warnings"])
             for item in guard["warnings"]:
                 print(f"Warning: {item['msg']}", file=sys.stderr)
@@ -986,8 +989,8 @@ def _main(argv: list[str] | None = None) -> int:
             print(f"giraffe: {error}", file=sys.stderr)
             _blocked_outputs(config, args, directory, str(error))
             if json_output:
-                emit("blocked", 3, message=str(error))
-            return 3
+                emit("blocked", states.EXIT_CODE_BLOCKED, message=str(error))
+            return states.EXIT_CODE_BLOCKED
         # Explicit identity probes must not spend or require shared credentials
         # before measuring their own gateway policy and attribution evidence.
         from giraffe.identities import gateway_identities_only
@@ -1015,8 +1018,8 @@ def _main(argv: list[str] | None = None) -> int:
                 print(f"giraffe: preflight failed for {target}: {message}", file=sys.stderr)
                 _blocked_outputs(config, args, directory, message)
                 if json_output:
-                    emit("blocked", 3, target=target, message=message)
-                return 3
+                    emit("blocked", states.EXIT_CODE_BLOCKED, target=target, message=message)
+                return states.EXIT_CODE_BLOCKED
         planning_warnings = plan["warnings"]
         for warning in planning_warnings:
             print(f"Warning: {warning}", file=sys.stderr)
@@ -1097,8 +1100,8 @@ def _main(argv: list[str] | None = None) -> int:
                     pass
                 print("Stopped.", file=sys.stderr)
                 if json_output:
-                    emit("interrupted", 130, message="Stopped.")
-                return 130
+                    emit("interrupted", states.EXIT_CODE_CANCELLED, message="Stopped.")
+                return states.EXIT_CODE_CANCELLED
             except BaseException as error:
                 logger.exception("CLI run could not finish")
                 stop_heartbeat()
@@ -1141,12 +1144,12 @@ def _main(argv: list[str] | None = None) -> int:
                     except OSError:
                         pass
                     if json_output:
-                        emit("error", 4, run_id=report.run_id, message=message, request_count=len(report.requests), resources=resources)
+                        emit("error", states.EXIT_CODE_USAGE, run_id=report.run_id, message=message, request_count=len(report.requests), resources=resources)
                     else:
                         print(f"giraffe: {message}", file=sys.stderr)
                         if getattr(args, "verbose", False) and not getattr(args, "quiet", False):
                             _print_memory(resources)
-                    return 4
+                    return states.EXIT_CODE_USAGE
         export_resources()
         from giraffe.storage import automatic_cleanup
 
@@ -1178,7 +1181,7 @@ def _main(argv: list[str] | None = None) -> int:
                              or any(target.get("client_error")
                                     for target in report.observations.get("targets", {}).values()))
         if cancelled is None and operational_error:
-            exit_code = 3
+            exit_code = states.EXIT_CODE_BLOCKED
         _ci_outputs(report, args, directory)
         policy = getattr(args, "fail_on", "inconclusive")
         if cancelled is None and not operational_error and (
@@ -1440,7 +1443,7 @@ def _progress_print(message):
 
 def main(argv: list[str] | None = None) -> int:
     if not _required_modules_available():
-        return 4
+        return states.EXIT_CODE_USAGE
     configure_logging()
     stdout, stderr = sys.stdout, sys.stderr
     out, err = _PipeSafeStream(stdout), _PipeSafeStream(stderr)

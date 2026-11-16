@@ -6,9 +6,82 @@ import threading
 import pytest
 
 from giraffe.web import _RunThread
-from tests.test_web import browser, finished, report, start, successful_runner
+from tests.test_web import browser, config, finished, report, start, successful_runner
 
 pytestmark = pytest.mark.usefixtures("local_tokenizer")
+
+
+async def test_run_terminal_and_cancel_results(tmp_path, monkeypatch):
+    entered, release = threading.Event(), threading.Event()
+
+    async def waiting(configuration, *, progress, stop_event):
+        progress({"event": "scenario_started", "target": "local", "scenario": "warm"})
+        entered.set()
+        await stop_event.wait()
+        while not release.is_set():
+            await asyncio.sleep(.001)
+        return report(configuration, cancelled=True)
+
+    monkeypatch.setattr("giraffe.web.run_suite", waiting)
+    async with browser(tmp_path) as client:
+        try:
+            response = await client.post("/api/runs", json={"config": config()})
+            assert response.status_code == 202
+            assert response.json()["terminal"] is False
+            identifier = response.json()["id"]
+            assert await asyncio.to_thread(entered.wait, 2)
+            assert (await client.get(f"/api/runs/{identifier}")).json()["terminal"] is False
+            assert (await client.get(f"/api/runs/{identifier}/events")).json()["terminal"] is False
+            assert (await client.get("/api/runs")).json()["runs"][0]["terminal"] is False
+            conflict = await client.post("/api/runs", json={"config": config()})
+            assert conflict.status_code == 409
+            assert conflict.json()["detail"] == "A run is already active; stop it or wait for its report"
+            assert conflict.headers["X-Giraffe-Error-Code"] == "run_active"
+            for result in ("stopping", "already_stopping"):
+                response = await client.post(f"/api/runs/{identifier}/cancel", json={})
+                assert response.status_code == 200
+                assert response.json() == {"id": identifier, "state": "stopping",
+                                           "terminal": False, "result": result}
+        finally:
+            release.set()
+        assert (await finished(client, identifier))["terminal"] is True
+        assert (await client.get(f"/api/runs/{identifier}/events")).json()["terminal"] is True
+        assert (await client.get("/api/runs")).json()["runs"][0]["terminal"] is True
+        response = await client.post(f"/api/runs/{identifier}/cancel", json={})
+        assert response.json() == {"id": identifier, "state": "completed",
+                                   "terminal": True, "result": "already_finished"}
+
+
+@pytest.mark.parametrize("state,terminal", [("queued", False), ("running", False), ("stopping", False),
+                                          ("completed", True), ("interrupted", True), ("error", True)])
+async def test_saved_run_terminal_events_and_cancel_result(tmp_path, monkeypatch, state, terminal):
+    monkeypatch.setattr("giraffe.web._EVENT_WAIT_SECONDS", 0)
+    async with browser(tmp_path) as client:
+        directory = tmp_path / "saved"
+        directory.mkdir()
+        (directory / ".web.json").write_text(json.dumps({"id": "saved", "state": state}))
+        detail = (await client.get("/api/runs/saved")).json()
+        assert detail["state"] == state and detail["terminal"] is terminal
+        events = (await client.get("/api/runs/saved/events")).json()
+        assert events["state"] == state and events["terminal"] is terminal
+        assert events["reset"] is terminal
+        if not terminal:
+            assert events["idle"] is True
+        response = await client.post("/api/runs/saved/cancel", json={})
+        assert response.json() == {"id": "saved", "state": state, "terminal": terminal,
+                                   "result": "already_finished" if terminal else "not_owned"}
+
+
+async def test_completed_run_with_unreadable_report_exposes_error(tmp_path):
+    async with browser(tmp_path) as client:
+        directory = tmp_path / "saved"
+        directory.mkdir()
+        metadata = json.dumps({"id": "saved", "state": "completed"})
+        (directory / ".web.json").write_text(metadata)
+        (directory / "report.json").write_text("unreadable")
+        detail = (await client.get("/api/runs/saved")).json()
+        assert detail["state"] == "error" and detail["terminal"] is True
+        assert (directory / ".web.json").read_text() == metadata
 
 
 async def test_sequential_runs_reuse_dedicated_measurement_loop(tmp_path, monkeypatch):

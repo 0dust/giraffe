@@ -52,10 +52,27 @@ Where you see it: `report.json` `requests[].status`, `evidence.jsonl`.
 | `running` | Run is executing. | No |
 | `stopping` | Stop requested, saving partial results. | No |
 | `completed` | A report was saved; the verdict may still be fail. A stopped run is `completed` with `abort_reason` set. | Yes |
-| `interrupted` | The process died or was shut down before a report was saved; recover with the command documented in [Resource limits](resources.md#recovering-an-interrupted-run). | Yes |
+| `interrupted` | The process died or was shut down. A partial report may exist; recover with the command documented in [Resource limits](resources.md#recovering-an-interrupted-run). | Until recovery |
 | `error` | The run could not be saved or recovered. | Yes |
 
 Where you see it: `.web.json` `state`, run API `state`.
+
+CLI-owned runs write `running`, `completed`, `interrupted` or `error`. They never report `stopping`.
+
+### Transitions
+
+| From | To |
+| --- | --- |
+| `queued` | `running`, `stopping`, `completed`, `interrupted`, `error` |
+| `running` | `stopping`, `completed`, `interrupted`, `error` |
+| `stopping` | `completed`, `interrupted`, `error` |
+| `interrupted` | `completed`, `error` |
+| `completed` | `error` |
+| `error` | None |
+
+An interrupted run can recover on the next server start to `completed` or `error`.
+The API reports `error` for a completed run whose saved report is unreadable. This does not rewrite `.web.json`.
+Repeated writes of the same run state are allowed.
 
 ## Stop reasons
 
@@ -85,6 +102,18 @@ Where you see it: `observations.targets.*.conditions[].status` before aggregatio
 
 After a run ends, each condition's `status` is an aggregate (`passed`, `failed`, `inconclusive`, `skipped`, `stopped`) and the lifecycle value moves to `lifecycle_status`.
 
+Recovered condition rows use status `interrupted`.
+
+### Transitions
+
+| From | To |
+| --- | --- |
+| `waiting` | `running`, `finished` |
+| `running` | `running`, `finished` |
+| `finished` | `running` |
+
+Repeated dispatch groups can restart a finished condition.
+
 ## Scale-down phase
 
 | Value | Meaning | Terminal? |
@@ -99,6 +128,39 @@ After a run ends, each condition's `status` is an aggregate (`passed`, `failed`,
 
 Where you see it: `.scale-down-status.json` `phase`.
 
-Phases are entered in this order; a run may skip ahead to `finalizing`.
+### Transitions
+
+| From | To |
+| --- | --- |
+| `baseline` | `waiting_for_output`, `finalizing`, `finished` |
+| `waiting_for_output` | `armed`, `finalizing`, `finished` |
+| `armed` | `observing`, `finalizing`, `finished` |
+| `observing` | `post_removal`, `finalizing`, `finished` |
+| `post_removal` | `finalizing`, `finished` |
+| `finalizing` | `finished` |
+| `finished` | None |
+
+Phases normally follow the declared order. Cleanup may skip to `finalizing`; the runner can force `finished`.
+
+## Reading states from a program
+
+`giraffe describe` and GET `/api/capabilities` include a `states` block with vocabularies, transitions, stop reasons and exit codes.
+Its `exit_codes` maps verdicts to codes and includes `cancelled`, `usage_error` and `default` keys. Stop reasons are open to free text.
+
+Run detail, history, events, start and cancel responses include `terminal`.
+It is true for `completed`, `interrupted` and `error`. Recovery can still change an interrupted run.
+
+POST `/api/runs/{id}/cancel` includes `result`:
+
+| Value | Meaning |
+| --- | --- |
+| `stopping` | This call requested a stop. |
+| `already_stopping` | The active run was already stopping. |
+| `already_finished` | The run is terminal. |
+| `not_owned` | The run is in progress but this server does not own it. |
+
+Start conflicts keep their HTTP 409 status and detail text. `X-Giraffe-Error-Code` identifies `run_active`, `run_stopping` or `connection_test_running`.
+
+`mark-scale-down` has its own outcomes and exit codes: `accepted` exits 0, `rejected` exits 1, and `submitted_without_acknowledgment` exits 2.
 
 Source of truth: `src/giraffe/states.py`.

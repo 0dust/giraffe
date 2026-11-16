@@ -1033,7 +1033,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
             except (OSError, ValueError):
                 saved = {}
             cached = unsaved_metadata.get(directory.name, {})
-            if (saved.get("state") in {"completed", "error", "interrupted"}
+            if (saved.get("state") in states.RUN_TERMINAL_STATES
                     and meta.get("state") in states.RUN_OWNED_STATES):
                 return  # A delayed stop/status write cannot resurrect a finished job.
             if "latency_summary" in saved:
@@ -1386,6 +1386,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                 "live_conditions": condition_rows,
                 "live_checks": list(live.get("checks", {}).values()),
                 "stoppable": bool(live) and state in states.RUN_OWNED_STATES,
+                "terminal": state in states.RUN_TERMINAL_STATES,
                 "phases": live.get("phases", meta.get("phases", [])),
                 "config": meta.get("config") or (persisted or {}).get("manifest", {}).get("config", {}),
                 "baseline_id": ((persisted or {}).get("baseline") or {}).get("saved_baseline_id", meta.get("baseline_id")),
@@ -1476,7 +1477,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
         counts = dict.fromkeys(states.CHECK_STATUSES, 0)
         for check in report.get("checks", []):
             counts[check["status"]] += 1
-        return {key: detail[key] for key in ("id", "state", "error", "abort_reason", "progress", "baseline_id",
+        return {key: detail[key] for key in ("id", "state", "terminal", "error", "abort_reason", "progress", "baseline_id",
                                              "started_at", "finished_at", "bytes", "kept")} | {
             "run_id": report.get("run_id"), "overall": report.get("overall"),
             "targets": _targets(detail["config"]), "check_counts": counts,
@@ -1993,12 +1994,15 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
             # never waits for parsing. The idle retry clears this pause.
             recovery_pause.set()
             if active:
-                raise HTTPException(409, "A run is already active; stop it or wait for its report")
+                raise HTTPException(409, "A run is already active; stop it or wait for its report",
+                                    headers={"X-Giraffe-Error-Code": "run_active"})
             if run_loop.busy():
-                raise HTTPException(409, "Previous run still stopping; wait for it to finish")
+                raise HTTPException(409, "Previous run still stopping; wait for it to finish",
+                                    headers={"X-Giraffe-Error-Code": "run_stopping"})
             if connection_pending:
                 raise HTTPException(409, "A connection test is running. Wait for its result "
-                                    "before starting a run.")
+                                    "before starting a run.",
+                                    headers={"X-Giraffe-Error-Code": "connection_test_running"})
             config, baseline = await run_in_threadpool(prepare_run, body)
             _validated_plan(config)
             guard = open_file_guard(config, raise_limit=True, web=True)
@@ -2040,7 +2044,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
             while len(feeds) > 4:
                 feeds.popitem(last=False)
             active["task"] = asyncio.create_task(execute(active, config, baseline))
-            return {"id": identifier, "state": "running", "migration_notes": config._migration_notes,
+            return {"id": identifier, "state": "running", "terminal": False, "migration_notes": config._migration_notes,
                     "live_conditions": waiting}
 
     @app.get("/api/runs/{identifier}")
@@ -2084,9 +2088,11 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                     if detail["state"] in states.RUN_IN_PROGRESS_STATES:
                         return {"seq": detail["seq"], "reset": False, "idle": True,
                                 "events": [], "records": [], "checks": [], "state": detail["state"],
+                                "terminal": detail["terminal"],
                                 "scale_down_control": detail.get("scale_down_control")}
                 return {"seq": detail["seq"], "reset": True, "events": [], "records": [], "checks": [],
                         "state": detail["state"], "error": detail.get("error"),
+                        "terminal": detail["terminal"],
                         "scale_down_control": detail.get("scale_down_control")}
             seq = feed["seq"]
             oldest = feed["deltas"][0]["seq"] if feed["deltas"] else seq + 1
@@ -2127,6 +2133,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                 checks[key] = feed.get("conditions", {}).get(key, event)
         return {"seq": seq, "reset": reset, "events": events, "records": list(records.values()),
                 "checks": list(checks.values()), "state": feed["state"],
+                "terminal": feed["state"] in states.RUN_TERMINAL_STATES,
                 "progress": feed["progress"], "live_request_count": feed["live_request_count"],
                 "scale_down_control": feed.get("scale_down_control", feed["meta"].get("scale_down_control")),
                 "live_request_summary": feed["live_request_summary"],
@@ -2260,6 +2267,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
     async def cancel_run(identifier: str):
         if active.get("id") == identifier:
             job = active
+            result = "already_stopping" if job["state"] == "stopping" else "stopping"
             job["state"] = "stopping"
             job["meta"]["state"] = "stopping"
             job["worker"].request_stop()
@@ -2268,9 +2276,10 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                 await run_in_threadpool(save_metadata, job["directory"], dict(job["meta"]))
             except OSError:
                 pass  # Stopping traffic must not depend on available disk space.
-            return {"id": identifier, "state": "stopping"}
+            return {"id": identifier, "state": "stopping", "terminal": False, "result": result}
         detail = await run_in_threadpool(run_detail, identifier)
-        return {"id": identifier, "state": detail["state"]}
+        return {"id": identifier, "state": detail["state"], "terminal": detail["terminal"],
+                "result": "already_finished" if detail["terminal"] else "not_owned"}
 
     @app.get("/api/runs/{identifier}/report.{extension}")
     def download_report(identifier: str, extension: str):

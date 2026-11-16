@@ -1,5 +1,9 @@
 import {configureGatewayAccess, configureGatewayPolicy, gatewayPolicySettings, positiveBoundErrors, inferSetupPreset, configureLoadTest, loadTestIssues, loadTestSettings, loadFieldName, convertExpectedAnswer, datasetCaseFromValues, changeDatasetScorer, configureJudging, configureSessions, configureMultiUser, multiUserSettings, configureProfiles, parseLogprobSettings, parseToolFixtures, effectiveProfileDefaults, configureTests, configureRunLimits, limitValue, optionDefault, optionValue, sameConfig} from './form-config.mjs?v=20261028-results-merge-ci';
 
+// Source: src/giraffe/states.py.
+const RUN_IN_PROGRESS_STATES = ['running','queued','stopping'];
+const RUN_TERMINAL_STATES = ['completed','interrupted','error'];
+
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 const escape = (value) => String(value ?? '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -38,7 +42,7 @@ const date = (value) => value ? new Date(value).toLocaleString(undefined,{month:
 const elapsed = (seconds) => seconds == null ? '—' : seconds < 60 ? `${number(seconds,1)}s` : `${Math.floor(seconds/60)}m ${Math.floor(seconds%60)}s`;
 const duration = (run) => run.started_at && run.finished_at ? elapsed((new Date(run.finished_at)-new Date(run.started_at))/1000) : '—';
 const human = (name) => String(name).replaceAll('_',' ').replace(/\b\w/, c=>c.toUpperCase());
-const activeState = (run) => run && ['running','queued','stopping'].includes(run.state);
+const activeState = (run) => run && RUN_IN_PROGRESS_STATES.includes(run.state);
 function displayStatus(status,run=state.detail) {
   if(run?.state&&!activeState(run)&&['running','queued','reserved','stopping'].includes(status))return status==='queued'?'skipped':['cancelled','interrupted'].includes(run.state)?'cancelled':'inconclusive';
   return status;
@@ -120,7 +124,7 @@ function patchHTML(parent,html,{landing=false}={}) {
       if(current.nodeType!==1){if(current.nodeValue!==wanted.nodeValue)current.nodeValue=wanted.nodeValue;continue;}
       if(current.isEqualNode(wanted))continue;
       if(current.getAttribute('data-request-id')!==wanted.getAttribute('data-request-id'))cancelLandings(current);
-      const before=current.getAttribute('data-state'),after=wanted.getAttribute('data-state'),land=landing&&['running','queued','stopping'].includes(before)&&after&&!inProgress(after)&&after!=='idle';
+      const before=current.getAttribute('data-state'),after=wanted.getAttribute('data-state'),land=landing&&RUN_IN_PROGRESS_STATES.includes(before)&&after&&!inProgress(after)&&after!=='idle';
       for(const attr of [...current.attributes]){
         if(current.tagName==='DETAILS'&&attr.name==='open'||attr.name==='tabindex'&&current.classList.contains('request-spot'))continue;
         if(!wanted.hasAttribute(attr.name))current.removeAttribute(attr.name);
