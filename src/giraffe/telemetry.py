@@ -110,6 +110,7 @@ MTPLX = {
     "completion_tokens": ("mtplx_latest_completion_tokens", "tokens", "completion tokens"),
     "cached_tokens": ("mtplx_latest_cached_tokens", "tokens", "cached tokens"),
 }
+MTPLX_OUTCOME_FLAGS = ("stream_error", "request_cancelled", "stream_cancelled_by_client", "memory_refusal")
 MTPLX_REFERENCE = "https://github.com/youssofal/MTPLX/blob/v2.12.3/mtplx/server/openai.py"
 ENGINE_METRIC_REFERENCES = {
     "llamacpp": "llama.cpp tools/server/README.md /metrics contract (b11696)",
@@ -372,6 +373,25 @@ def _mtplx_envelope(body):
 
 def _parse_mtplx(payload, target, config):
     latest = (payload.get("latest") or {}) if payload is not None else {}
+    flags, invalid_flags = {}, []
+    for field in MTPLX_OUTCOME_FLAGS:
+        if field in latest:
+            if type(latest[field]) is bool:
+                flags[field] = latest[field]
+            else:
+                invalid_flags.append(field)
+    if flags.get("stream_error") or flags.get("memory_refusal"):
+        outcome = "failed"
+    elif flags.get("request_cancelled") or flags.get("stream_cancelled_by_client"):
+        outcome = "cancelled"
+    else:
+        outcome = "unknown" if invalid_flags or not latest else "completed"
+    outcome_reason = (
+        f"MTPLX latest receipt {outcome}; partial-request measurements are withheld from completed-request observations."
+        if outcome in {"failed", "cancelled"} else
+        "MTPLX latest receipt has invalid outcome flags; completed-request measurements are withheld."
+        if invalid_flags else None)
+    measurements = latest if outcome_reason is None else {}
     completed = _mtplx_number(latest.get("completed_at_s"))
     timestamp = completed * 1000 if completed is not None else None
     if timestamp is not None and not math.isfinite(timestamp):
@@ -380,11 +400,12 @@ def _parse_mtplx(payload, target, config):
     stale = age is not None and (age > config.metrics_max_age_seconds or age < -5)
     samples, invalid, truncated = [], [], []
     # Do not persist latest/recent wholesale: envelopes may contain user text,
-    # request/session identity and previews. Only this numeric allowlist is saved.
+    # request/session identity and previews. Only safe outcome flags and numeric
+    # fields from a completed request are saved; error rates can use other timing.
     for field, (family, unit, _) in MTPLX.items():
-        value = _mtplx_number(latest.get(field))
+        value = _mtplx_number(measurements.get(field))
         if value is None or unit == "tokens" and not value.is_integer():
-            if latest.get(field) is not None:
+            if measurements.get(field) is not None:
                 invalid.append(family)
             continue
         if len(samples) >= config.metrics_max_series:
@@ -410,7 +431,10 @@ def _parse_mtplx(payload, target, config):
         "version_verification": "JSON contract matches MTPLX v2.12.3; runtime identity/version require deployment evidence.",
         "instrumentation": target.instrumentation, "instrumentation_provenance": "user-supplied; unverified",
         "latest_completed_at_s": completed,
+        "latest_outcome": outcome, "latest_outcome_flags": flags,
+        "invalid_outcome_flags": invalid_flags, "latest_outcome_reason": outcome_reason,
         "reason": "Unrecognized MTPLX metrics JSON envelope." if payload is None else
+                  outcome_reason if outcome_reason is not None else
                   "Only stale completed-request samples were returned." if samples and stale else
                   "MTPLX endpoint available; latest completed-request fields are missing or invalid, not zero." if not samples else
                   "Latest completed request may predate this run; no request-window attribution or live scheduler coverage.",
@@ -1092,23 +1116,29 @@ def _derive_mtplx(snapshots):
     if not any(snap.get("profile", snap.get("mapping")) == "mtplx" for snap in snapshots):
         return {}
     latest = snapshots[-1]
+    outcome_reason = latest.get("latest_outcome_reason")
     rows = {}
     for family, unit, label in MTPLX.values():
-        fresh = _fresh_families(latest, [family])
+        fresh = (_fresh_families(latest, [family])
+                 if latest.get("latest_outcome") not in {"failed", "cancelled", "unknown"} else None)
         values = fresh[family] if fresh else {}
         value = next(iter(values.values())) if len(values) == 1 else None
         row = _derived(value, unit,
             "MTPLX latest completed request; may predate this run; not linked to the selected requests. No averaging or counter deltas.",
             samples=int(value is not None), eligible=1,
-            reason=None if value is not None else "No valid fresh field in the final scrape's latest completed request; missing is unknown, not zero.",
+            reason=None if value is not None else outcome_reason or "No valid fresh field in the final scrape's latest completed request; missing is unknown, not zero.",
             collected_at=latest.get("collected_at"), completed_at_s=latest.get("latest_completed_at_s"),
+            latest_outcome=latest.get("latest_outcome"), latest_outcome_flags=latest.get("latest_outcome_flags", {}),
+            invalid_outcome_flags=latest.get("invalid_outcome_flags", []),
             freshness="Completed-request timestamp when supplied; otherwise source freshness is unknown.",
             selected_window_attribution="not established",
             aggregation="One latest completed request from the final scrape; repeated polls and recent records are not accumulated.")
         row.update(label="MTPLX latest completed request " + label,
                    scope="latest completed request at server endpoint")
         if value is None:
-            row["action"] = "Collect an MTPLX envelope with a valid latest completed-request field; check the source timestamp and configured maximum age."
+            row["action"] = ("Collect a successful MTPLX request receipt; failed, cancelled or invalid-outcome receipts cannot supply completed-request observations."
+                             if outcome_reason else
+                             "Collect an MTPLX envelope with a valid latest completed-request field; check the source timestamp and configured maximum age.")
         rows[family] = row
     return rows
 

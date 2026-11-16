@@ -435,3 +435,97 @@ def test_mtplx_series_limit_preserves_only_complete_fields():
     rows = telemetry.derive_server_metrics({"snapshots": [snap]})
     assert rows["mtplx_latest_ttft_seconds"]["value"] == 0
     assert rows["mtplx_latest_completion_tokens"]["value"] is None
+
+
+@pytest.mark.parametrize("flags,outcome", [
+    ({"stream_error": True, "request_cancelled": False}, "failed"),
+    ({"request_cancelled": True}, "cancelled"),
+    ({"stream_cancelled_by_client": True}, "cancelled"),
+    ({"memory_refusal": True}, "failed"),
+    ({"stream_error": True, "stream_cancelled_by_client": True}, "failed"),
+])
+def test_mtplx_partial_receipts_keep_outcome_but_withhold_completed_request_values(flags, outcome):
+    # MTPLX v2.12.3 error receipts divide partial tokens by total request time.
+    receipt = {"prompt_tokens": 20, "completion_tokens": 5, "request_elapsed_s": 10,
+               "decode_tok_s": .5, "request_id": "private-id", "error_detail": "private-error",
+               "request_last_user_preview": "private-prompt", **flags}
+    success = snapshot(mtplx_body({"decode_tok_s": 50}), 0, "unknown")
+    snap = snapshot(mtplx_body(receipt), 1, "unknown")
+    assert snap["status"] == "available" and snap["samples"] == []
+    assert snap["latest_outcome"] == outcome
+    assert snap["latest_outcome_flags"] == flags
+    assert outcome in snap["reason"]
+    rows = telemetry.derive_server_metrics({"snapshots": [success, snap]})
+    for family, _, _ in telemetry.MTPLX.values():
+        row = rows[family]
+        assert row["value"] is None and row["state"] == "insufficient_evidence"
+        assert row["sample_count"] == 0
+        assert row["details"]["latest_outcome"] == outcome
+        assert row["details"]["latest_outcome_flags"] == flags
+        assert outcome in row["reason"]
+    saved = json.dumps({"snapshot": snap, "derived": rows})
+    assert not any(private in saved for private in ("private-id", "private-error", "private-prompt"))
+
+
+@pytest.mark.parametrize("bad_flag", ["private-error", 1, None, {"private": "private-error"}])
+def test_mtplx_malformed_outcome_is_unknown_without_saving_its_content(bad_flag):
+    snap = snapshot(mtplx_body({"stream_error": bad_flag, "decode_tok_s": .5}), 0, "mtplx")
+    assert snap["status"] == "available" and snap["samples"] == []
+    assert snap["latest_outcome"] == "unknown"
+    assert snap["latest_outcome_flags"] == {}
+    assert snap["invalid_outcome_flags"] == ["stream_error"]
+    row = telemetry.derive_server_metrics({"snapshots": [snap]})["mtplx_latest_decode_tokens_per_second"]
+    assert row["value"] is None and "outcome" in row["reason"]
+    assert "private-error" not in json.dumps({"snapshot": snap, "row": row})
+
+
+def test_mtplx_false_outcome_flags_preserve_successful_measurements():
+    flags = {"stream_error": False, "request_cancelled": False,
+             "stream_cancelled_by_client": False, "memory_refusal": False}
+    snap = snapshot(mtplx_body({"decode_tok_s": 50, **flags}), 0, "unknown")
+    assert snap["latest_outcome"] == "completed"
+    assert snap["latest_outcome_flags"] == flags
+    row = telemetry.derive_server_metrics({"snapshots": [snap]})["mtplx_latest_decode_tokens_per_second"]
+    assert row["value"] == 50 and row["state"] == "measured"
+    assert row["details"]["latest_outcome_flags"] == flags
+
+
+async def test_mtplx_error_receipt_is_withheld_in_saved_report_and_later_success_keeps_polling(monkeypatch, tmp_path):
+    from giraffe.cli import load_report
+    from giraffe.reporting import write_report
+    from tests.test_performance import record, report, summary
+
+    target, config = settings("unknown")
+    config.metrics = False
+    error = {"mode": "stream", "request_cancelled": False, "stream_error": True,
+             "stream_cancelled_by_client": False, "memory_refusal": False,
+             "prompt_tokens": 20, "completion_tokens": 5, "request_elapsed_s": 10,
+             "decode_tok_s": .5, "request_id": "private-id", "session_id": "private-session",
+             "error_detail": "private-error", "request_last_user_preview": "private-prompt"}
+    receipts = iter([None, {"decode_tok_s": 50}, error, {"decode_tok_s": 60}])
+    actual, requests = httpx.AsyncClient, []
+
+    def reply(request):
+        requests.append(request)
+        return httpx.Response(200, text=mtplx_body(next(receipts)))
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: actual(**kw, transport=httpx.MockTransport(reply)))
+    run = SimpleNamespace(config=config, start=time.monotonic(), deadline=time.monotonic()+5,
+                          stop=asyncio.Event(), observations={target.name: {}})
+    snaps = [await telemetry.scrape(run, target, phase) for phase in ("idle", "success", "error")]
+    value = report([record()], observations={"targets": {"t": {"serving_telemetry": {"snapshots": snaps}}}})
+    value.manifest["config"]["targets"][0]["url"] = "http://inference/v1"
+    value.manifest["config"]["targets"][0]["model"] = "test"
+    path, html_path = write_report(value, tmp_path, html=True)
+    rows = {row["id"]: row for row in summary(load_report(path))["sections"]["server"]}
+    row = rows["mtplx_latest_decode_tokens_per_second"]
+    assert row["value"] is None and row["state"] == "insufficient_evidence"
+    assert row["details"]["latest_outcome_flags"]["stream_error"] is True
+    assert "failed" in row["reason"] and row["reason"] in html_path.read_text()
+    saved = path.read_text() + html_path.read_text()
+    assert not any(private in saved for private in
+                   ("private-id", "private-session", "private-error", "private-prompt"))
+    final = await telemetry.scrape(run, target, "recovered")
+    assert len(requests) == 4 and final["status"] == "available"
+    row = telemetry.derive_server_metrics({"snapshots": snaps + [final]})["mtplx_latest_decode_tokens_per_second"]
+    assert row["value"] == 60
