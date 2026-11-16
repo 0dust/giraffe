@@ -505,7 +505,11 @@ class LLMClient:
     async def __aexit__(self, *_: Any) -> None:
         try:
             if self._stream_drains:
-                await asyncio.gather(*self._stream_drains, return_exceptions=True)
+                async def join_drains():
+                    await asyncio.gather(*self._stream_drains, return_exceptions=True)
+
+                # A drain cancelled before its first step cannot close its response.
+                await _finish_cleanup(asyncio.create_task(join_drains()))
         finally:
             if self._client is not None:
                 await self._client.aclose()
