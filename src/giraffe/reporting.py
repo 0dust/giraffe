@@ -4050,7 +4050,7 @@ def comparison_summary(report: RunReport) -> dict[str, Any]:
             section = ("gateway-attribution-outcomes" if metric == "attribution_outcome" else
                        "gateway-access-decisions" if check == "gateway_access" else
                        "gateway-policy-outcomes" if check == "gateway_policy" and metric == "policy_acceptance" else
-                       "load-acceptance" if check == "load" or metric == "Tested load acceptance" else
+                       "load-acceptance" if (row["_evidence_id"] or "").startswith("comparison-load-") else
                        "answers" if metric in {"correctness_rate", "output_tokens", "output_chars"} else
                        "delivery" if metric in {"valid_completion_rate", "error_rate"} else
                        "timing" if metric in labels else "comparison")

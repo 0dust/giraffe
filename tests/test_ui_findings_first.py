@@ -161,6 +161,62 @@ assert.equal(document.activeElement,$('#report-baseline-reference summary'));
 """, dom=True)
 
 
+@pytest.mark.parametrize("metric,section,source,baseline,current", [
+    ("latency_ms", "timing", "comparisons", 200, 260),
+    ("correctness_rate", "answers", "comparisons", 1, 0.5),
+    ("output_tokens", "answers", "observed_outputs", 10, 20),
+    ("output_chars", "answers", "observed_outputs", 15, 30),
+    ("error_rate", "delivery", "comparisons", 0, 0.5),
+    ("valid_completion_rate", "delivery", "comparisons", 1, 0.5),
+])
+@pytest.mark.parametrize("with_load_test", [False, True], ids=["historical", "with_acceptance"])
+@pytest.mark.parametrize("start_tab", ["results", "performance"])
+def test_comparison_summary_load_metrics_reveal_their_category(
+    metric, section, source, baseline, current, with_load_test, start_tab,
+):
+    from giraffe.web import _api_report
+    from tests.test_reporting import make_report
+    from tests.test_ui_report_tabs import PERFORMANCE
+
+    value = make_report()
+    target = {"target": "local", source: [{
+        "check": "load", "scenario": "historical-load", "metric": metric,
+        "baseline": baseline, "current": current, "status": "fail",
+        "reason": "Recorded Load measurement changed.", "baseline_samples": 8, "current_samples": 8,
+        **({"descriptive": True} if source == "observed_outputs" else {}),
+    }]}
+    if with_load_test:
+        point = {"type": "combinations", "shape": "short_short", "pattern": "concurrent",
+                 "bursts": False, "level": 1, "status": "pass"}
+        target["load_test"] = {"status": "pass", "points": [{
+            "status": "pass", "acceptance_change": "unchanged_accepted", "baseline": point, "current": point,
+        }]}
+    value.baseline = {"run_id": "reference", "status": "fail", "targets": [target]}
+    evidence_id = "comparison-" + ("output" if source == "observed_outputs" else "metric") + "-0-0"
+    run_render_checks(PERFORMANCE + "const value=" + json.dumps(_api_report(value)) + ";const expected=" +
+                      json.dumps({"section": section, "id": evidence_id, "metric": metric, "tab": start_tab,
+                                  "withLoadTest": with_load_test}) + ";value.performance=performanceFixture();" + r"""
+(async()=>{
+detail(value);chooseReportTab(expected.tab);
+state.comparisonFilter='without_warnings';state.comparisonCheck='other';renderDetail();
+$('#report-baseline-reference').open=false;$('.comparison-summary-details').open=true;
+assert.equal(Boolean($('#results-load-acceptance')),expected.withLoadTest);
+const action=$('[data-comparison-summary-evidence="'+expected.id+'"]');assert(action);
+await listeners.click({target:action,preventDefault(){}});await route();
+const destination=$('#results-'+expected.id);assert(destination);
+assert.equal(state.comparisonFilter,'all');assert.equal(state.comparisonCheck,'all');
+assert.equal(reportView.tab,'results');
+assert($('#report-baseline-reference').open,'metric navigation must open the comparison disclosure');
+assert.equal(destination.closest('details:not([open])'),null,'metric evidence must be revealed');
+assert.equal(destination.closest('[hidden]'),null);assert(destination.getClientRects().length);
+assert.equal(document.activeElement,destination);assert.equal(destination.getAttribute('data-metric'),expected.metric);
+assert($('#results-'+expected.section).contains(destination));
+assert.equal(location.hash,'#runs/saved-run/results/'+expected.section);
+assert.equal(value.comparison_summary.rows.find(row=>row.evidence_id===expected.id).evidence_section,expected.section);
+})()
+""", dom=True)
+
+
 @pytest.mark.parametrize("evidence", ["traffic", "load", "load_no_points"])
 def test_comparison_summary_opens_exact_target_for_traffic_and_load_evidence(evidence):
     from giraffe.web import _api_report
@@ -202,12 +258,18 @@ def test_comparison_summary_opens_exact_target_for_traffic_and_load_evidence(evi
                       json.dumps(expected_id) + ";value.performance=performanceFixture();" + r"""
 (async()=>{
 detail(value);chooseReportTab('performance');
+$('#report-baseline-reference').open=false;$('.comparison-summary-details').open=true;
 const action=$('.comparison-summary [data-comparison-summary-evidence="'+expectedId.slice('results-'.length)+'"]');assert(action);
 await listeners.click({target:action,preventDefault(){}});await route();
 const destination=$('#'+expectedId);assert(destination);
 assert.equal(document.activeElement,destination);assert($('#report-baseline-reference').open);
 assert.match(destination.textContent,/Loaded target lost/);
 assert.equal(destination.closest('[hidden]'),null);
+assert.equal(destination.closest('details:not([open])'),null);
+if(expectedId.includes('comparison-load-')){
+ assert.equal(action.getAttribute('data-comparison-summary-section'),'load-acceptance');
+ assert($('#results-load-acceptance').contains(destination));
+}
 const ids=$$('[id]').map(node=>node.id);assert.equal(new Set(ids).size,ids.length,'evidence IDs must be unique across report tabs');
 })()
 """, dom=True)
