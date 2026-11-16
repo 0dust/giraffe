@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "giraffe-llm"
-version = "0.1.0a1"
+version = "0.1.0a3.dev0"
 description = "A built-in acceptance test suite for self-hosted LLM services"
 readme = "README.md"
 license = "Apache-2.0"
@@ -14,6 +14,8 @@ dependencies = ["httpx>=0.28,<0.29", "pydantic>=2.11,<3", "PyYAML>=6,<7", "jsons
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
     "Topic :: Software Development :: Testing",
 ]
