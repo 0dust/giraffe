@@ -1061,6 +1061,48 @@ assert.match(previewMarkup,/Other selected checks/);
     assert result.returncode == 0, result.stderr
 
 
+def test_request_pack_results_show_standalone_loaded_responses_and_preserve_stages():
+    from tests.test_ux_results import run_render_checks
+
+    run_render_checks(r"""
+const root=document.createElement('div');
+const loaded={attempted:2,completed:2,scored:2,correct:2,status:'pass'};
+function loadedCell(item) {
+  root.innerHTML=renderPackResults({cases:[{case_id:'<case>',...item}]});
+  assert.equal(root.querySelector('tbody').querySelector('td').textContent,'<case>');
+  return root.querySelector('tbody').querySelectorAll('td')[2];
+}
+let cell=loadedCell({stages:[],loaded});
+assert.doesNotMatch(cell.textContent,/No loaded evidence/);
+assert.match(cell.textContent,/2 \/ 2 scored/);
+assert.match(cell.textContent,/2 \/ 2 completed/);
+assert(cell.querySelector('[data-state="pass"]'));
+assert.doesNotMatch(cell.textContent,/insufficient evidence/);
+// The standalone summary also applies to saved results without a stages array.
+assert.match(loadedCell({loaded}).textContent,/2 \/ 2 completed/);
+// Rate stages retain their own evidence and take precedence over the aggregate.
+cell=loadedCell({loaded,stages:[{rate_rps:5,correct:1,scored:3,valid:4,offered:5,planned:6,dropped_local:1,dropped_late:2}]});
+assert.match(cell.textContent,/5 req\/s: 1 \/ 3 scored · 4 valid/);
+assert.match(cell.textContent,/5 \/ 6 offered · 3 dropped/);
+assert.doesNotMatch(cell.textContent,/completed|No loaded evidence/);
+// The runner always creates loaded stats, even when no loaded request was sent.
+for(const value of [undefined,null,{}, {...loaded,attempted:0,completed:0,scored:0,correct:0,status:'inconclusive'}]) {
+  assert.equal(loadedCell({stages:[],loaded:value}).textContent,'No loaded evidence');
+}
+// Zero correct, incomplete completions, and unscored responses remain visible.
+cell=loadedCell({loaded:{attempted:3,completed:2,scored:2,correct:0,status:'fail'}});
+assert.match(cell.textContent,/0 \/ 2 scored/);
+assert.match(cell.textContent,/2 \/ 3 completed/);
+assert(cell.querySelector('[data-state="fail"]'));
+assert.match(cell.textContent,/insufficient evidence/);
+cell=loadedCell({loaded:{attempted:2,completed:2,scored:0,correct:0,status:'inconclusive'}});
+assert.match(cell.textContent,/0 \/ 0 scored/);
+assert.match(cell.textContent,/2 \/ 2 completed/);
+assert(cell.querySelector('[data-state="inconclusive"]'));
+assert.match(cell.textContent,/insufficient evidence/);
+""", dom=True)
+
+
 def test_ai_judge_configuration_evidence_and_evaluation_phase():
     from giraffe.capabilities import capabilities
 
