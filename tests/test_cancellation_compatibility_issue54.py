@@ -46,7 +46,7 @@ async def test_http_chunk_cutoff_changes_executed_work_and_is_incompatible(tmp_p
     print(json.dumps(summary))
     assert summary["cancelled_answer_chunks"] == [[1], [10]]
     assert summary["fixture_hash_equal"]
-    assert "Recorded effective_checks differs or is missing." in summary["incompatible_reasons"]
+    assert "Recorded effective_checks differs." in summary["incompatible_reasons"]
     assert summary["baseline_status"] == "inconclusive"
     assert all(not target["comparisons"] for target in result.baseline["targets"])
 
@@ -70,5 +70,5 @@ async def test_http_cleanup_wait_changes_executed_recovery_work_and_is_incompati
     assert waits[0] >= .025 and waits[1] >= .145
     assert waits[1] - waits[0] >= .08
     assert summary["fixture_hash_equal"]
-    assert "Recorded effective_checks differs or is missing." in summary["incompatible_reasons"]
+    assert "Recorded effective_checks differs." in summary["incompatible_reasons"]
     assert summary["baseline_status"] == "inconclusive"

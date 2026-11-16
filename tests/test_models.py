@@ -253,7 +253,7 @@ def test_serial_answer_verdict_preserves_concurrency_intent_on_round_trip(explic
         assert configured.parallelism_requested('correctness') == explicit
         assert result.metrics['evidenced_overlap'] < 2
         if not explicit:
-            assert 'server answered one at a time' in result.summary
+            assert 'overlapping streamed answers were not observed' in result.summary
 
 
 @pytest.mark.parametrize('legacy,explicit', [({}, False), ({'concurrency': None}, False),

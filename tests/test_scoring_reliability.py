@@ -1,13 +1,15 @@
 """Answer scoring must use final answers and preserve missing evidence."""
 
 import json
+import math
 
 import httpx
 import pytest
 
+from giraffe import runner
 from giraffe.client import LLMClient
 from giraffe.fixtures import builtin_fixtures, load_custom_fixtures, score_response, traffic_fixtures
-from giraffe.models import RequestSpec
+from giraffe.models import Limits, RequestSpec
 from tests.test_fixtures import config, custom_entry, custom_file, record
 
 
@@ -72,6 +74,7 @@ def test_contains_requires_alphanumeric_boundaries(expected, output, score):
 
 @pytest.mark.parametrize("scorer,expected,output", [
     ("exact", "42", "4"), ("contains", "42", "4"),
+    ("exact", "42", "Let me reason through this carefully before answering"),
     ("json", {"count": 42}, '{"count":'),
 ])
 def test_truncated_incomplete_answer_is_unscored(scorer, expected, output):
@@ -186,3 +189,132 @@ def test_tool_content_scores_final_text_without_hiding_call_failures(unclosed, w
         assert scored.tool_evaluation.content.status == 'inconclusive'
     else:
         assert scored.tool_evaluation.content.status == 'pass'
+
+
+@pytest.mark.parametrize("check_id,scorer,expected,correct_output,wrong_output,capped_output", [
+    ("correctness", "exact", "42", "42", "14", "4"),
+    ("json", "json", {"count": 42}, '{"count":42}', '{"count":14}', '{"count":'),
+])
+@pytest.mark.parametrize("correct,wrong,capped,threshold,status", [
+    (0, 1, 9, .9, "inconclusive"),
+    (0, 1, 9, math.nextafter(.9, 0), "inconclusive"),
+    (0, 1, 9, math.nextafter(.9, 1), "fail"),
+    (0, 2, 8, .9, "fail"),
+    (0, 0, 10, .9, "inconclusive"),
+    (8, 2, 0, .8, "pass"),
+    (8, 2, 0, math.nextafter(.8, 1), "fail"),
+    (0, 10, 0, .9, "fail"),
+    (10, 0, 0, .9, "pass"),
+    (9, 0, 1, .9, "inconclusive"),
+])
+def test_incomplete_answer_verdict_requires_unrecoverable_correctness_failure(
+    check_id, scorer, expected, correct_output, wrong_output, capped_output,
+    correct, wrong, capped, threshold, status,
+):
+    settings = config(checks=[check_id], default_concurrency=1,
+                      limits=Limits(min_correctness=threshold, min_samples=2))
+    state = runner._Run(settings, None, None)
+    spec = fixture(scorer, expected, **({"schema": {}} if scorer == "json" else {})).model_copy(
+        update={"check_ids": [check_id]})
+    answers = ([(correct_output, "stop")] * correct + [(wrong_output, "stop")] * wrong
+               + [(capped_output, "length")] * capped)
+    state.records = [score_response(spec, record(spec, output, id=str(index), finish_reason=finish))
+                     for index, (output, finish) in enumerate(answers)]
+    assert [item.score for item in state.records] == [True] * correct + [False] * wrong + [None] * capped
+
+    result = next(item for item in runner._checks(state, settings.targets[0]) if item.id == check_id)
+    assert result.status == status
+    # JSON reports retain the observed score; the optimistic bound is not a measured accuracy.
+    exported = result.model_dump(mode="json")
+    assert exported["metrics"]["correct"] == correct
+    assert exported["metrics"]["scored"] == correct + wrong
+    assert exported["metrics"]["attempted"] == len(answers)
+    assert exported["metrics"]["accuracy"] == (correct / (correct + wrong) if correct + wrong else None)
+
+
+@pytest.mark.parametrize("threshold,status", [(.9, "inconclusive"), (math.nextafter(.9, 1), "fail")])
+def test_recovery_incomplete_answers_use_the_full_attempted_set(threshold, status):
+    settings = config(checks=["recovery"], default_concurrency=1, samples=2,
+                      limits=Limits(min_correctness=threshold, min_samples=2))
+    state = runner._Run(settings, None, None)
+    state.observations["local"]["sustained_complete"] = True
+    answers = ([("recovery_baseline", "42", "stop")] * 2
+               + [("sustained", "14", "stop")]
+               + [("sustained", "4", "length")] * 5
+               + [("recovery", "4", "length")] * 2)
+    for index, (scenario, output, finish) in enumerate(answers):
+        spec = fixture(expected="42").model_copy(update={"scenario": scenario, "check_ids": ["recovery"]})
+        state.records.append(score_response(spec, record(
+            spec, output, id=str(index), finish_reason=finish, elapsed_ms=10, first_output_ms=1)))
+
+    result = next(item for item in runner._checks(state, settings.targets[0]) if item.id == "recovery")
+    assert result.status == status
+    assert result.metrics["correct"] == 2 and result.metrics["scored"] == 3
+    assert result.metrics["attempted"] == 10 and result.metrics["accuracy"] == 2 / 3
+    assert result.metrics["unscored_completions"] == 7
+
+
+@pytest.mark.parametrize("wrong,capped,threshold,status", [
+    (1, 9, .9, "inconclusive"),
+    (1, 9, math.nextafter(.9, 1), "fail"),
+    (10, 0, .9, "fail"),
+])
+def test_pack_loaded_incomplete_answers_cannot_prematurely_fail_a_case(wrong, capped, threshold, status):
+    settings = config(checks=["correctness"], default_concurrency=1, request_source="request_pack",
+                      request_pack={"version": 1, "cases": [{
+                          "fixture_id": "answer", "messages": [{"role": "user", "content": "Compute."}],
+                          "scorer": "exact", "expected": "42"}]},
+                      limits=Limits(min_correctness=threshold, min_samples=2))
+    state = runner._Run(settings, None, None)
+    original = state.pack_specs[0]
+    answers = ([("pack_control", "42", "stop")]
+               + [("pack_loaded", "14", "stop")] * wrong
+               + [("pack_loaded", "4", "length")] * capped)
+    for index, (scenario, output, finish) in enumerate(answers):
+        spec = original.model_copy(update={"scenario": scenario})
+        state.records.append(score_response(spec, record(
+            spec, output, id=str(index), finish_reason=finish, workload=spec.workload)))
+
+    result = next(item for item in runner._checks(state, settings.targets[0]) if item.id == "correctness")
+    pack = result.metrics["request_pack"]
+    loaded = pack["cases"][0]["loaded"]
+    assert pack["control_status"] == "pass"
+    assert loaded["status"] == pack["loaded_status"] == result.status == status
+    assert loaded["correct"] == 0 and loaded["scored"] == wrong
+    assert loaded["attempted"] == wrong + capped and loaded["accuracy"] == 0
+
+
+def test_recovery_incomplete_baseline_cannot_become_a_pass():
+    settings = config(checks=["recovery"], default_concurrency=1, samples=9,
+                      limits=Limits(min_correctness=.95, min_samples=2))
+    state = runner._Run(settings, None, None)
+    state.observations["local"]["sustained_complete"] = True
+    answers = ([("recovery_baseline", "4", "length")] * 9
+               + [("sustained", "42", "stop")] * 2
+               + [("recovery", "14", "stop")]
+               + [("recovery", "42", "stop")] * 8)
+    for index, (scenario, output, finish) in enumerate(answers):
+        spec = fixture(expected="42").model_copy(update={"scenario": scenario, "check_ids": ["recovery"]})
+        state.records.append(score_response(spec, record(
+            spec, output, id=str(index), finish_reason=finish, elapsed_ms=10, first_output_ms=1)))
+
+    result = next(item for item in runner._checks(state, settings.targets[0]) if item.id == "recovery")
+    assert result.status == "inconclusive"
+    assert result.metrics["correct"] == 10 and result.metrics["scored"] == 11
+    assert result.metrics["attempted"] == 20 and result.metrics["accuracy"] == 10 / 11
+
+
+@pytest.mark.parametrize("output", ['{"count":14}', '{"other":42}'])
+def test_complete_wrong_json_at_token_cap_still_fails(output):
+    settings = config(checks=["json"], default_concurrency=1)
+    state = runner._Run(settings, None, None)
+    spec = fixture("json", {"count": 42}, schema={"type": "object", "required": ["count"]}).model_copy(
+        update={"check_ids": ["json"]})
+    state.records = [score_response(spec, record(spec, output, id=str(index), finish_reason="length"))
+                     for index in range(2)]
+    assert all(item.score is False for item in state.records)
+
+    result = next(item for item in runner._checks(state, settings.targets[0]) if item.id == "json")
+    assert result.status == "fail"
+    assert result.metrics["correct"] == 0 and result.metrics["scored"] == 2
+    assert result.metrics["accuracy"] == 0

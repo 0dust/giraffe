@@ -28,7 +28,7 @@ from .client import LLMClient, no_response_failure
 from .conditions import condition_aggregate, condition_for, request_status, scheduled_multi_user_window
 from .deployment import fixture_hash
 from .fixtures import (FIXTURE_VERSION, builtin_fixtures, load_custom_fixtures,
-                       score_response, traffic_fixtures, deterministic_options, reasoning_budget)
+                       score_response, traffic_fixtures, deterministic_options, reasoning_budget, TRUNCATED_ANSWER)
 from .identities import gateway_identities_only
 from .overlap import NEEDS_STREAM, max_evidenced_overlap, scheduling_delay_windows
 from .request_pack import pack_identity, pack_preview, pack_specs
@@ -110,6 +110,15 @@ def _stats(records: list[RequestRecord]) -> dict:
     result["completed_requests_per_second"] = result["completed"]/window if window>0 else None
     result["aggregate_output_tokens_per_second"] = result["output_tokens"]/window if window>0 and not result["unknown_output_length"] else None
     return result
+
+
+def _cannot_meet_correctness(stats: dict, minimum: float) -> bool:
+    """Fail only if every unscored attempt passing would still miss the limit."""
+    attempted = stats["attempted"]
+    if not attempted:
+        return False
+    best_possible = (stats["correct"] + attempted - stats["scored"]) / attempted
+    return best_possible < minimum
 
 
 def _stress(scenario):
@@ -1880,7 +1889,7 @@ def _pack_results(run: _Run, target: Target) -> dict:
                        or ("capacity" in r.check_ids and r.traffic_stage is not None))]
         stats = _stats(loaded)
         accuracy = stats["correct"] / stats["scored"] if stats["scored"] else None
-        failed = accuracy is not None and accuracy < limits.min_correctness
+        failed = _cannot_meet_correctness(stats, limits.min_correctness)
         observed = bool(loaded) and all(r.valid and r.score is not None for r in loaded)
         evidenced = max_evidenced_overlap((r for r in loaded if r.score is not None), target_records, delays)
         concurrency = run.config.effective_check("correctness")["concurrency"]
@@ -2181,18 +2190,16 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
             elif check_id == "context" and disproving:
                 status, summary = "fail", (f"Server rejected a prompt sized at {disproving[0]} tokens, below the safety margin "
                                            f"for declared context_limit {config.context_limit} (70% estimated, 85% server-reported).")
-            elif accuracy is not None and accuracy < limits.min_correctness:
+            elif _cannot_meet_correctness(metrics, limits.min_correctness):
                 status, summary = "fail", "Local known-answer or schema scoring failed the configured correctness limit."
             elif (check_id in {"correctness", "json"} and not run.pack_specs and config.concurrency > 1
-                  and metrics["evidenced_overlap"] < 2 and (run.config.parallelism_requested(check_id)
-                  or metrics["completed"] != metrics["attempted"]
-                  or metrics["scored"] != metrics["completed"] or not metrics["scored"])):
+                  and metrics["evidenced_overlap"] < 2 and run.config.parallelism_requested(check_id)
+                  and metrics["scored"] == metrics["completed"] == metrics["attempted"] and metrics["scored"]):
                 metrics["reason_code"] = "missing_concurrent_answers"
                 status, summary = "inconclusive", ("Known-answer checks were not exercised concurrently: no scored answer's streamed response "
                     "overlapped another outside recorded client scheduling delays" + (f"; {NEEDS_STREAM}." if not config.stream else
                                                              " (client overlap alone does not show server concurrency)."))
-                if metrics["scored"] == metrics["completed"] == metrics["attempted"] and metrics["scored"]:
-                    summary += " The server answered one at a time."
+                summary += " Server concurrency is unverified."
             elif check_id == "context" and near_missed:
                 status, summary = "fail", f"Near-limit recall missed the fact at position(s): {', '.join(near_missed)}."
             elif check_id == "context" and rejected:
@@ -2226,9 +2233,9 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                     and metrics["evidenced_overlap"] < 2 and not run.config.parallelism_requested(check_id)
                     and metrics["scored"] == metrics["completed"] == metrics["attempted"]
                     and metrics["scored"] and status in {"pass", "fail"}):
-                metrics["concurrency_evidence"] = "not observed — server answered one request at a time"
-                summary = (f"{metrics['correct']}/{metrics['scored']} correct; server answered one at a time, "
-                           "so concurrent correctness was not tested.")
+                metrics["concurrency_evidence"] = "not observed — server concurrency is unverified"
+                summary = (f"{metrics['correct']}/{metrics['scored']} correct; overlapping streamed answers were not observed, "
+                           "so server concurrency is unverified and concurrent correctness was not tested.")
         elif check_id == "cancellation":
             import re as _re
             cancelled = [r for r in all_records if r.scenario == "client_cancel"]
@@ -2376,7 +2383,7 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                     or sustained_error_rate > limits.max_error_rate
                     or (baseline_error_rate is not None and baseline_error_rate > limits.max_error_rate)
                     or (metrics["violations"] or (ratio_failed and not saturated))
-                    or (accuracy is not None and accuracy < limits.min_correctness)):
+                    or _cannot_meet_correctness(metrics, limits.min_correctness)):
                 status, summary = "fail", "Repeated traffic or light-load recovery failed correctness or configured limits."
                 if baseline_error_rate is not None and baseline_error_rate > limits.max_error_rate:
                     summary = "Light-load baseline requests failed before sustained traffic; repeated traffic or recovery limits were not met."
@@ -2385,8 +2392,8 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
             elif metrics["cancelled"]:
                 status, summary = "inconclusive", "Sustained or recovery requests were cancelled by the run deadline or a stop; recovery was not fully observed."
                 metrics["reason_code"] = "cancelled"
-            elif accuracy is None or metrics["unscored_completions"]:
-                status, summary = "inconclusive", "Some sustained or recovery completions lack a local correctness score."
+            elif accuracy is None or metrics["scored"] < metrics["attempted"]:
+                status, summary = "inconclusive", "Some baseline, sustained or recovery answers lack a local correctness score."
             elif saturated and any((limits.first_output_ms, limits.latency_ms, limits.stream_gap_ms,
                                         limits.min_output_tokens_per_second, limits.recovery_max_ratio)):
                 status, summary = "inconclusive", "Client scheduling delay prevents attributing sustained and recovery timing to the endpoint."
@@ -2494,16 +2501,21 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                              if planned is not None else
                              f"Stopped by you after {len(run.records)} requests. This duration-based workload has no fixed request count.")
             continue
-        if interrupted and run.reason == states.STOP_REQUEST_BUDGET and check.id not in {"load", "recovery"}:
+        if (interrupted or stopped_short_of_samples) and run.reason == states.STOP_REQUEST_BUDGET and check.id not in {"load", "recovery"}:
             check.finding_summary = "Request budget reached before this check finished."
             check.remediation = _budget_remediation(run.config, check.id)
             check.summary = check.finding_summary + " " + budget
             continue
-        if interrupted and run.reason == states.STOP_MAX_DURATION and check.id not in {"load", "recovery"}:
+        if (interrupted or stopped_short_of_samples) and run.reason == states.STOP_MAX_DURATION and check.id not in {"load", "recovery"}:
             if check.id != "gateway_attribution" or check.metrics.get("reason_code") != "time_limited":
                 check.finding_summary = "Run deadline reached before this check finished."
             check.remediation = _deadline_remediation(run.config)
             check.summary = check.finding_summary + " " + _deadline_guidance(run.config)
+            continue
+        if check.status == "inconclusive" and check.id in run.unfinished[target.name] and run.reason == states.STOP_ERROR_THRESHOLD:
+            check.finding_summary = "Run stopped after the configured number of request errors before this check finished."
+            check.summary = (check.finding_summary + " Inspect the failed requests, fix the error cause, "
+                             "then rerun the unfinished checks.")
             continue
         if check.id not in {"load", "concurrency"}:
             check.summary = _verdict_summary(check, config, records, budget)
@@ -2743,8 +2755,8 @@ def _verdict_summary(check, config, records, budget):
                   f"and allow at least {config.gpu_min_observation_seconds:g} seconds for observation; "
                   "inspect reported device errors before rerunning")
     elif reason == "missing_concurrent_answers":
-        summary += (" Plain words: answers could not be checked under concurrent load. The server appears to handle one request at a time, "
-                    "or the recorded streaming/client timing did not expose overlapping answers."
+        summary += (" Plain words: answers could not be checked under concurrent load. "
+                    "The recorded streaming/client timing did not expose overlapping answers; server concurrency is unverified."
                     if config.stream else " Plain words: streaming was disabled, so answers could not be checked under concurrent load; server parallelism is unverified.")
         remedy = ("enable parallel serving on the server (for example OLLAMA_NUM_PARALLEL=2 for Ollama, or the engine's equivalent), "
                   "restart the server to apply the configuration and rerun with streaming (stream: true, omit --nonstream); "
@@ -2753,6 +2765,8 @@ def _verdict_summary(check, config, records, budget):
             reason is None and "scheduling delay" in text and metrics.get("timing_quality", {}).get("status") == "client_delayed")):
         remedy = "rerun from an idle load-generator machine and reduce competing client work so streaming timing can be measured"
     elif check.status == "inconclusive" and metrics.get("reasoning_budget_exhausted"):
+        remedy = _output_budget_guidance(config, records, check.id)
+    elif check.status == "inconclusive" and any(r.score is None and r.score_message == TRUNCATED_ANSWER for r in records):
         remedy = _output_budget_guidance(config, records, check.id)
     elif reason == "insufficient_timing_samples":
         setting = "samples (or --samples)" + (" and any test_options.generation.samples override" if check.id == "generation" else "")
@@ -2846,7 +2860,8 @@ def _verdict_summary(check, config, records, budget):
             "consistency": "inspect differing answers and token probabilities, verify deterministic serving settings and rerun the same shapes and concurrency levels",
             "tools": "inspect the tool protocol and argument outcomes, enable the server's tool parser and correct the configured tool contract, then rerun",
         }.get(check.id, "inspect the failed request and coverage details, correct the reported server or workload issue, then rerun the same workload")
-    return summary.rstrip(".") + ". To conclude, " + remedy[:1].lower() + remedy[1:].rstrip(".") + "."
+    return (summary.rstrip(".") + ". To conclude, " + remedy[:1].lower() + remedy[1:].rstrip(".") + "."
+            if remedy.strip() else summary)
 
 
 async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | None = None,
@@ -3156,6 +3171,13 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
               for target in config.targets if target.name in grouped}
     warnings = ["Other traffic on the target is unknown; results cover only the recorded workload.",
                 "Backend/replica identity is unverified unless explicitly reported by the server; a service URL does not establish complete replica coverage."]
+    for target in config.targets:
+        observed = sorted({r.observed_model for r in run.records
+                           if r.target == target.name and r.observed_model and r.observed_model != target.model})
+        if observed:
+            warnings.append(f"Target {target.name} requested model {target.model!r}, but responses reported "
+                            + ", ".join(repr(name[:256]) for name in observed[:8])
+                            + ". Model aliases may differ; verify the served model.")
     if run.memory_limit_reached:
         warnings.append("Maximum memory (RAM growth during this run) was exceeded." +
             (" Unfinished checks were interrupted." if run.memory_interrupted_checks else " No check was interrupted."))

@@ -20,8 +20,6 @@ def test_prompt_opened_reasoning_uses_last_closing_tag(tag):
 
 
 @pytest.mark.parametrize('scorer,expected,output,schema', [
-    ('exact', '42', '14', None),
-    ('exact', '42', '42 extra', None),
     ('json', {'count': 42}, '{"count":4}', {}),
     ('json', None, '{"count":"wrong"}', {'type': 'object', 'properties': {'count': {'type': 'integer'}}}),
     ('json', None, 'not JSON', {}),
@@ -29,6 +27,13 @@ def test_prompt_opened_reasoning_uses_last_closing_tag(tag):
 def test_length_finish_cannot_excuse_already_wrong_answers(scorer, expected, output, schema):
     spec = fixture(scorer, expected, **({'schema': schema} if schema is not None else {}))
     assert score_response(spec, record(spec, output, finish_reason='length')).score is False
+
+
+@pytest.mark.parametrize('output', ['14', '42 extra'])
+def test_truncated_exact_text_cannot_establish_a_complete_mismatch(output):
+    spec = fixture('exact', '42')
+    assert score_response(spec, record(spec, output, finish_reason='length')).score is None
+    assert score_response(spec, record(spec, output, finish_reason='stop')).score is False
 
 
 @pytest.mark.parametrize('expected,output', [('.5', '1.5'), ('5', '1.5'), ('5', '5,000'), ('1,000', '21,000')])

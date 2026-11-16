@@ -334,6 +334,47 @@ def event(content=None, *, reasoning=None, finish=None, usage=None):
     return ("data: " + json.dumps(data) + "\n\n").encode()
 
 
+@pytest.mark.parametrize("prefix", [
+    b'data: {"choices":[],"usage":null}\n\n',
+    event(finish=""),
+    b'event: ping\ndata: {}\n\n',
+    b'event: ping\ndata:\n\n',
+])
+@pytest.mark.parametrize("ending", [b'data: [DONE]\n\n', b'data: [DONE]\n', b'data: [DONE]'])
+async def test_stream_metadata_and_terminal_sentinel_compatibility(monkeypatch, prefix, ending):
+    client, response, _ = setup_client(monkeypatch, [prefix, event("42"), event(finish="stop"), ending])
+    async with client:
+        result = await client.execute(spec())
+    assert result.valid and result.output == "42" and result.finish_reason == "stop"
+    assert response.closed
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("finish", ["abort", "made_up_reason", "error", "content_filter"])
+async def test_unusable_terminal_reason_cannot_complete_validly(monkeypatch, stream, finish):
+    client, _, _ = setup_client(monkeypatch,
+        [event("42"), event(finish=finish), b'data: [DONE]\n\n'] if stream else None,
+        stream=stream, body=None if stream else {
+            "choices": [{"message": {"content": "42"}, "finish_reason": finish}]})
+    async with client:
+        result = await client.execute(spec())
+    assert not result.valid and result.status == "failed"
+    assert "usable answer" in result.error
+
+
+@pytest.mark.parametrize("chunks", [
+    [b'data: {"choices":[]}\n\n', b'data: [DONE]'],
+    [event("42", finish=""), b'data: [DONE]'],
+    [b'event: ping\ndata: {"error":{"message":"SECRET"}}\n\n'],
+])
+async def test_compatible_metadata_cannot_hide_incomplete_or_error_response(monkeypatch, chunks):
+    client, _, _ = setup_client(monkeypatch, chunks)
+    async with client:
+        result = await client.execute(spec())
+    assert not result.valid and result.status == "failed"
+    assert "SECRET" not in result.error
+
+
 @pytest.mark.asyncio
 async def test_sse_handles_fragmented_utf8_crlf_and_multiline_json(monkeypatch):
     raw = ('data: {"choices":\r\n'

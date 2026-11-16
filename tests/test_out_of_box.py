@@ -68,22 +68,26 @@ def test_first_output_default_uses_p95_not_a_single_outlier():
     assert result.status == "fail"
 
 
-@pytest.mark.asyncio
-async def test_healthy_endpoint_passes_shared_defaults(monkeypatch):
-    config = configuration()
-    assert config.effective_check("correctness")["concurrency"] == 4
-    # Correctness answers depend on the prompt; use the fixture-aware fake client.
-    from tests.test_runner import FakeClient
-    for name, value in {"delay": .004, "active": 0, "peak": 0, "closed": [], "scenarios": [],
-                        "bad_target": None, "initial_slow": False, "bad_sustained": False,
-                        "useful_event": True, "input_usage": True, "bad_mixed_gap": False}.items():
-        monkeypatch.setattr(FakeClient, name, value)
-    monkeypatch.setattr(runner, "LLMClient", FakeClient)
-    report = await runner.run_suite(config)
-    assert report.overall == "pass"
-    assert {c.id for c in report.checks if c.status == "pass"} == set(DEFAULT_CHECKS)
-    assert report.abort_reason is None
+def test_healthy_endpoint_passes_shared_defaults(monkeypatch, local_tokenizer):
+    from tests.virtual_clock import run_virtual
 
+    async def scenario():
+        config = configuration()
+        assert config.effective_check("correctness")["concurrency"] == 4
+        # Correctness answers depend on the prompt; use the fixture-aware fake client.
+        from tests.test_runner import FakeClient
+        for name, value in {"delay": .004, "active": 0, "peak": 0, "closed": [], "scenarios": [],
+                            "bad_target": None, "initial_slow": False, "bad_sustained": False,
+                            "useful_event": True, "input_usage": True, "bad_mixed_gap": False}.items():
+            monkeypatch.setattr(FakeClient, name, value)
+        monkeypatch.setattr(runner, "LLMClient", FakeClient)
+        report = await runner.run_suite(config)
+        assert report.overall == "pass"
+        assert {c.id for c in report.checks if c.status == "pass"} == set(DEFAULT_CHECKS)
+        assert report.abort_reason is None
+
+
+    run_virtual(monkeypatch, scenario())
 
 @pytest.mark.asyncio
 async def test_generation_default_passes_and_explicit_gap_overrides(monkeypatch):
@@ -165,7 +169,7 @@ def test_fully_scored_serial_answers_conclude_only_when_parallelism_inherited(ch
     assert result.status == ('fail' if not all_correct else 'inconclusive' if explicit else 'pass')
     if not explicit:
         assert result.metrics['concurrency_evidence'].startswith('not observed')
-        assert f'{6 if all_correct else 5}/6 correct; server answered one at a time' in result.summary
+        assert f'{6 if all_correct else 5}/6 correct; overlapping streamed answers were not observed' in result.summary
 
 
 @pytest.mark.parametrize('reason', ['cancelled by user', 'maximum request budget reached', 'maximum run duration reached'])

@@ -17,7 +17,7 @@ import stat
 import tempfile
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
 
 from . import states
 from . import models
@@ -382,6 +382,8 @@ def _run(directory: Path, active_id: str | None, sources: set[str], unknown_sour
         reason = "saved baseline source could not be read"
     elif meta.get("state") in states.RUN_OWNED_STATES and run_alive(directory, meta, active_id=active_id):
         reason = "run is " + meta["state"]
+    elif (directory / "evidence.jsonl").exists() and not (directory / "report.json").is_file():
+        reason = "unrecovered request evidence"
     if not directory.is_dir():
         return None
     return {"id": directory.name, "bytes": run_size(directory),
@@ -423,13 +425,14 @@ def storage_summary(root: Path | str, *, active_id: str | None = None, limits: d
             "limits": DEFAULT_LIMITS | limits, "auto_cleanup": auto_cleanup or {}}
 
 
-def automatic_cleanup(root: Path | str, policy: dict, *, active_id: str) -> dict:
+def automatic_cleanup(root: Path | str, policy: dict, *, active_id: str,
+                      stop_requested: Callable[[], bool] | None = None) -> dict:
     """Apply only explicitly configured criteria, protecting the triggering run."""
     if not policy:
         return {"deleted": [], "skipped": [], "bytes_freed": 0}
     plan = cleanup_plan(root, active_id=active_id, **policy)
     return apply_cleanup(root, [row["id"] for row in plan["candidates"]],
-                         active_id=active_id, **policy)
+                         active_id=active_id, stop_requested=stop_requested, **policy)
 
 
 def check_start(root: Path | str, limits: dict) -> None:
@@ -500,7 +503,8 @@ def cleanup_plan(root: Path | str, *, older_than_days: int | None = None, keep_l
             "bytes_freed": total - remaining, "runs_bytes_after": remaining}
 
 
-def apply_cleanup(root: Path | str, ids: list[str], **criteria) -> dict:
+def apply_cleanup(root: Path | str, ids: list[str], *,
+                  stop_requested: Callable[[], bool] | None = None, **criteria) -> dict:
     root = Path(root).resolve()
     plan = cleanup_plan(root, **criteria)
     candidates = {run["id"]: run for run in plan["candidates"]}
@@ -515,6 +519,9 @@ def apply_cleanup(root: Path | str, ids: list[str], **criteria) -> dict:
 
     _, before = stored_bytes()
     for identifier in dict.fromkeys(ids):
+        if stop_requested is not None and stop_requested():
+            skipped.append({"id": identifier, "reason": "cleanup cancelled"})
+            continue
         if not isinstance(identifier, str) or not _ID.fullmatch(identifier):
             skipped.append({"id": identifier, "reason": "invalid run id"})
             continue

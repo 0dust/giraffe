@@ -304,7 +304,7 @@ def test_cancellation_baselines_ignore_only_inactive_backend_settings(change, ex
     result = compare_baseline(current, previous)
     assert baseline_check(result).status == expected
     reasons = result.baseline["targets"][0]["reasons"]
-    assert ("Recorded effective_checks differs or is missing." in reasons) == (expected == "inconclusive")
+    assert ("Recorded effective_checks differs." in reasons) == (expected == "inconclusive")
     assert [report.model_dump_json() for report in (current, previous)] == before
 
 
@@ -718,6 +718,51 @@ def test_regression_evidence_bodies_are_retained_as_failures(tmp_path: Path):
     assert saved.baseline["status"] == "fail"
 
 
+@pytest.mark.parametrize("status", ["fail", "blocked", "inconclusive"])
+@pytest.mark.parametrize("policy", ["all", "failures", "none"])
+def test_retention_keeps_cited_unresolved_answer_evidence(status, policy):
+    from giraffe.reporting import _retained
+
+    source = make_report()
+    source.manifest["config"]["retention"] = policy
+    source.checks[0].status = status
+    source.checks[0].evidence_ids = [source.requests[0].id]
+    retained = _retained(source)
+    assert bool(retained.requests[0].output) == (policy != "none")
+    assert bool(retained.requests[1].output) == (policy == "all")
+    assert source.requests[0].output == source.requests[1].output == "42"
+
+
+@pytest.mark.parametrize("checks,comparable", [
+    (["first_output"], True), (["first_output", "generation", "correctness"], True),
+    (["scale_down"], False), (["capacity"], False),
+])
+def test_grading_limit_changes_preserve_only_core_measurement_comparability(checks, comparable):
+    from giraffe.reporting import _settings_reasons
+
+    current = make_report()
+    current.manifest["config"]["checks"] = checks
+    previous = current.model_copy(deep=True)
+    current.manifest["config"]["limits"]["first_output_ms"] = 12345
+    reasons = _settings_reasons(current, previous)
+    assert (not reasons) == comparable
+    current.manifest["config"]["limits"]["min_samples"] = 9
+    assert _settings_reasons(current, previous)
+
+
+def test_unknown_grading_fields_remain_incompatible():
+    from giraffe.reporting import _settings_reasons
+
+    source = make_report()
+    source.manifest["config"]["checks"] = ["first_output"]
+    config = RunConfig.model_validate(source.manifest["config"])
+    source.manifest["effective_checks"] = {"first_output": config.effective_check("first_output")}
+    previous = source.model_copy(deep=True)
+    source.manifest["config"]["limits"]["future_limit"] = 7
+    source.manifest["effective_checks"]["first_output"]["limits"]["future_limit"] = 7
+    assert _settings_reasons(source, previous)
+
+
 def test_intentional_cancellation_is_not_a_retention_failure(tmp_path: Path):
     report = make_report()
     report.requests[0].scenario = "client_cancel"
@@ -900,6 +945,8 @@ def test_old_baseline_none_effective_defaults_match_same_explicit_config():
     current.manifest['effective_checks']['generation']['limits']['stream_gap_ms'] = 5000
     assert _settings_reasons(current, previous) == []
     current.manifest['config']['test_options'] = {'generation': {'limits': {'stream_gap_ms': 2000}}}
+    assert _settings_reasons(current, previous) == []
+    current.manifest['config']['max_output_tokens'] += 1
     assert _settings_reasons(current, previous)
 
 
