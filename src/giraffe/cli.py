@@ -19,6 +19,9 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
+from . import states
+from .states import PROBLEM_STATUSES
+
 REQUIRED_MODULES = ("httpx", "pydantic", "yaml", "jsonschema", "fastapi", "uvicorn", "tiktoken")
 
 
@@ -1089,7 +1092,7 @@ def _main(argv: list[str] | None = None) -> int:
                 stop_heartbeat()
                 try:
                     save_state("interrupted", finished_at=datetime.now(timezone.utc).isoformat(),
-                               abort_reason="run cancelled")
+                               abort_reason=states.STOP_RUN_CANCELLED)
                 except OSError:
                     pass
                 print("Stopped.", file=sys.stderr)
@@ -1168,7 +1171,7 @@ def _main(argv: list[str] | None = None) -> int:
             warnings.append(warning)
             print(f"Warning: {warning}", file=sys.stderr)
         report = _retained(report)
-        exit_code = 130 if cancelled is not None else {"pass": 0, "fail": 1, "inconclusive": 2, "blocked": 3}.get(report.overall, 2)
+        exit_code = states.EXIT_CODE_CANCELLED if cancelled is not None else states.EXIT_CODES.get(report.overall, states.EXIT_CODE_DEFAULT)
         # The aggregate verdict prioritizes failed checks over blocked targets.
         # A client error can also occur after all of its checks already failed.
         operational_error = (any(check.required and check.status == "blocked" for check in report.checks)
@@ -1254,7 +1257,7 @@ def _print_result(report: RunReport, json_path: Path, html_path: Path | None,
     if quiet:
         return
     for check in report.checks:
-        if check.status in {"fail", "inconclusive", "blocked"}:
+        if check.status in PROBLEM_STATUSES:
             print(f"  {check.target} / {check.id}: {check.status} — {' '.join(check.summary.split())}")
     if report.abort_reason:
         print(f"Stopped: {report.abort_reason}")

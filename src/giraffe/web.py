@@ -46,6 +46,7 @@ from starlette.datastructures import Headers
 from anyio import CancelScope
 from pydantic import Field, ValidationError, WrapValidator
 
+from . import states
 from giraffe import __version__
 
 from .caps import (
@@ -784,9 +785,9 @@ def _merged_condition_rows(planned: list[dict], observed: list[dict], *, termina
         rows[key] = row
     result = []
     for row in rows.values():
-        lifecycle = row.get("status") if row.get("status") in {"waiting", "running", "finished"} else row.get("lifecycle_status", row.get("status"))
+        lifecycle = row.get("status") if row.get("status") in states.CONDITION_LIFECYCLE else row.get("lifecycle_status", row.get("status"))
         row = {**row, "status": lifecycle}
-        if terminal and lifecycle in {"waiting", "running"}:
+        if terminal and lifecycle in states.CONDITION_UNFINISHED:
             row.update(status="finished", running=0,
                        reason=reason or "Work was not completed before the run ended.")
             # A stale running aggregate is never a terminal passing verdict.
@@ -1033,7 +1034,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                 saved = {}
             cached = unsaved_metadata.get(directory.name, {})
             if (saved.get("state") in {"completed", "error", "interrupted"}
-                    and meta.get("state") in {"running", "stopping"}):
+                    and meta.get("state") in states.RUN_OWNED_STATES):
                 return  # A delayed stop/status write cannot resurrect a finished job.
             if "latency_summary" in saved:
                 meta["latency_summary"] = saved["latency_summary"]
@@ -1081,7 +1082,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                 continue
             meta = metadata(directory)
             interrupted = meta.get("state") == "interrupted" and (directory / "evidence.jsonl").is_file()
-            if (meta.get("state") not in {"running", "stopping"} and not interrupted
+            if (meta.get("state") not in states.RUN_OWNED_STATES and not interrupted
                     or not is_giraffe_run(directory, meta) or directory.name == active_id):
                 continue
             if not interrupted and run_alive(directory, meta):
@@ -1357,7 +1358,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                         for key in ("run_id", "target", "nonce", "phase"))
                         and (expected_run is None or candidate["run_id"] == expected_run)
                         and (expected_target is None or candidate["target"] == expected_target)
-                        and (state in {"running", "queued", "stopping"} or candidate["phase"] == "finished")):
+                        and (state in states.RUN_IN_PROGRESS_STATES or candidate["phase"] == "finished")):
                     control = {key: candidate.get(key) for key in
                                ("run_id", "target", "nonce", "phase", "acknowledgment")}
             except (OSError, ValueError, UnicodeError):
@@ -1365,7 +1366,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
         condition_rows = list(live["conditions"].values()) if live.get("conditions") else meta.get("conditions", [])
         if not listing:
             condition_rows = _merged_condition_rows(condition_rows, (persisted or {}).get("conditions", []),
-                terminal=state not in {"running", "queued", "stopping"},
+                terminal=state not in states.RUN_IN_PROGRESS_STATES,
                 reason=(persisted or {}).get("abort_reason") or meta.get("error"))
             if persisted is not None:
                 persisted["conditions"] = condition_rows
@@ -1384,7 +1385,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                 "live_request_count": live.get("live_request_count", meta.get("live_request_count", 0)),
                 "live_conditions": condition_rows,
                 "live_checks": list(live.get("checks", {}).values()),
-                "stoppable": bool(live) and state in {"running", "stopping"},
+                "stoppable": bool(live) and state in states.RUN_OWNED_STATES,
                 "phases": live.get("phases", meta.get("phases", [])),
                 "config": meta.get("config") or (persisted or {}).get("manifest", {}).get("config", {}),
                 "baseline_id": ((persisted or {}).get("baseline") or {}).get("saved_baseline_id", meta.get("baseline_id")),
@@ -1404,7 +1405,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
         from .performance import build_performance
 
         directory = _directory(root, identifier)
-        live = snapshot if snapshot and snapshot.get("id") == identifier and snapshot.get("state") in {"running", "stopping"} else None
+        live = snapshot if snapshot and snapshot.get("id") == identifier and snapshot.get("state") in states.RUN_OWNED_STATES else None
         path = directory / "report.json"
         if live is None:
             if path.is_symlink() or not path.is_file():
@@ -1472,7 +1473,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
 
     def run_summary(detail: dict) -> dict:
         report = detail["report"] or detail["summary"] or {}
-        counts = dict.fromkeys(("pass", "fail", "inconclusive", "skipped", "blocked"), 0)
+        counts = dict.fromkeys(states.CHECK_STATUSES, 0)
         for check in report.get("checks", []):
             counts[check["status"]] += 1
         return {key: detail[key] for key in ("id", "state", "error", "abort_reason", "progress", "baseline_id",
@@ -1512,7 +1513,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
         finally:
             # No await may separate terminal publication from releasing the run.
             # A second cancellation cannot strand the next POST behind a 409.
-            if job["meta"].get("state") in {"running", "stopping"}:
+            if job["meta"].get("state") in states.RUN_OWNED_STATES:
                 job["meta"] = {**job["meta"], "state": "interrupted", "finished_at": _now()}
             job["state"] = job["meta"]["state"]
             try:
@@ -1670,7 +1671,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                 report, engine_cancel = waiting.result()
             cancelled = engine_cancel or cancelled
             if cancelled is not None and not report.abort_reason:
-                report.abort_reason = "run cancelled"
+                report.abort_reason = states.STOP_RUN_CANCELLED
             # Export has one owner even if shutdown cancels execute during disk
             # I/O. Finish that export before finalizing metadata and re-raising.
             _, export_cancel = await _finish_shielded(asyncio.create_task(finish_report(report)))
@@ -1786,7 +1787,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
             if (directory.is_dir() and not directory.is_symlink() and not directory.name.startswith(".")
                     and directory.name != active.get("id")):
                 meta = metadata(directory)
-                if meta.get("state") in {"running", "stopping"} and run_alive(directory, meta):
+                if meta.get("state") in states.RUN_OWNED_STATES and run_alive(directory, meta):
                     candidates.append((meta.get("started_at", ""), directory.name))
         return max(candidates, default=("", None))[1]
 
@@ -2050,7 +2051,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
             path = directory / "report.json"
             meta = metadata(directory)
             if (snapshot.get("id") != identifier and path.is_file() and not path.is_symlink()
-                    and meta.get("state") not in {"running", "queued", "stopping"}):
+                    and meta.get("state") not in states.RUN_IN_PROGRESS_STATES):
                 def revision(name):
                     try:
                         return _file_revision(directory / name)
@@ -2075,12 +2076,12 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
             feed = feeds.get(identifier)
             if feed is None:
                 detail = await run_in_threadpool(run_detail, identifier)
-                if detail["state"] in {"running", "queued", "stopping"}:
+                if detail["state"] in states.RUN_IN_PROGRESS_STATES:
                     remaining = deadline - asyncio.get_running_loop().time()
                     if remaining > 0:
                         await asyncio.sleep(remaining)
                         detail = await run_in_threadpool(run_detail, identifier)
-                    if detail["state"] in {"running", "queued", "stopping"}:
+                    if detail["state"] in states.RUN_IN_PROGRESS_STATES:
                         return {"seq": detail["seq"], "reset": False, "idle": True,
                                 "events": [], "records": [], "checks": [], "state": detail["state"],
                                 "scale_down_control": detail.get("scale_down_control")}
@@ -2138,7 +2139,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
     async def performance_selection(identifier: str, target: str | None = None, window: str | None = None):
         snapshot = live_snapshot()
         def select():
-            if snapshot.get("id") != identifier or snapshot.get("state") not in {"running", "stopping"}:
+            if snapshot.get("id") != identifier or snapshot.get("state") not in states.RUN_OWNED_STATES:
                 path = _directory(root, identifier) / "report.json"
                 try:
                     revision = _file_revision(path)

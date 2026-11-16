@@ -1063,3 +1063,28 @@ async def test_execute_closes_untransferred_sse_iterator_before_return(monkeypat
         record = await client.execute(spec(cancel_after_chunks=1 if failure == "cancellation" else None))
         assert record.status == ("failed" if failure == "protocol" else "cancelled")
         assert closed.is_set() and response.closed
+
+
+async def test_completed_body_with_cancelled_close_is_not_valid(monkeypatch):
+    import asyncio
+
+    class CancelledClose(Chunks):
+        async def aclose(self):
+            self.closed = True
+            raise asyncio.CancelledError
+
+    transport = CancelledClose([event("42", finish="stop"), b"data: [DONE]\n\n"])
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: original(
+        transport=httpx.MockTransport(lambda _: httpx.Response(
+            200, stream=transport, headers={"content-type": "text/event-stream"},
+            extensions={"http_version": b"HTTP/2"},
+        )), **kwargs,
+    ))
+    target = Target(name="local", url="http://local", model="test")
+    async with LLMClient(target, RunConfig(targets=[target])) as client:
+        record = await client.execute(spec())
+
+    assert record.output == "42" and record.stream_terminated and transport.closed
+    assert record.status == "cancelled"
+    assert record.valid is False

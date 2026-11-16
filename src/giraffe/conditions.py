@@ -10,6 +10,8 @@ import re
 from collections.abc import Mapping
 from typing import Any
 
+from . import states
+
 
 _SCENARIOS = {
     "gateway_access": ("Gateway access policy", "gateway_access"),
@@ -557,7 +559,7 @@ def condition_aggregate(summary: Mapping[str, Any], *, verdict: str | None = Non
     failed = summary.get("failed", statuses.get("failed", 0) + statuses.get("timed_out", 0)) or 0
     not_started = max(0, planned - started) if planned is not None else None
     reason = summary.get("reason")
-    terminal = summary.get("status") not in {"waiting", "running"}
+    terminal = summary.get("status") not in states.CONDITION_UNFINISHED
     explicit = verdict or summary.get("condition_verdict") or (summary.get("load_point_result") or {}).get("status")
     if running or not terminal and summary.get("status") == "running":
         status = "running"

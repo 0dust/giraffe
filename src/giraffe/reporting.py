@@ -21,6 +21,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
+from . import states
 from .caps import (MAX_HTML_PREVIEW_CHARS, MAX_HTML_JSON_PREVIEW_CHARS,
                    DEFAULT_HTML_REQUEST_DETAILS, MAX_FAILURE_SUMMARY_TITLE_CHARS,
                    MAX_FAILURE_SUMMARY_CHARS)
@@ -622,14 +623,14 @@ def _settings_reasons(report: RunReport, baseline: RunReport, *, details: dict[s
     current_limits, baseline_limits = _limits_reached(report), _limits_reached(baseline)
 
     def shared_abort(run, limits):
-        gateway_budget = (run.abort_reason == "maximum request budget reached"
+        gateway_budget = (run.abort_reason == states.STOP_REQUEST_BUDGET
                           and run.observations.get("request_limit_scopes") == ["gateway"]
                           and _mixed_gateway_run(run)
                           and "max_requests" not in limits)
-        gateway_deadline = (run.abort_reason == "maximum run duration reached"
+        gateway_deadline = (run.abort_reason == states.STOP_MAX_DURATION
                             and "max_duration_seconds" in run.limits_reached
                             and "max_duration_seconds" not in limits)
-        gateway_user_stop = (run.abort_reason == "cancelled by user"
+        gateway_user_stop = (run.abort_reason == states.STOP_CANCELLED_BY_USER
                              and run.observations.get("user_stop_scope") == "gateway"
                              and _mixed_gateway_run(run))
         return run.observations.get("target_abort_reasons") or (
@@ -4220,7 +4221,7 @@ def _render(report: RunReport) -> str:
     from .performance_html import STYLE, render_performance
 
     report = refresh_performance(report.model_copy())
-    evidence = {rid for check in report.checks if check.status in {"fail", "inconclusive", "blocked"}
+    evidence = {rid for check in report.checks if check.status in states.PROBLEM_STATUSES
                 for rid in check.evidence_ids}
     timing_failures = {rid for check in report.checks if check.status == "fail"
                        for rid in _check_timing_violation_ids(check)}
@@ -4256,7 +4257,7 @@ def _render(report: RunReport) -> str:
     if report.baseline:
         parts.append(_baseline_summary_html(report.baseline))
     parts.append('<div id="html-results" aria-label="Results"><section id="findings"><h2>Findings</h2>')
-    findings = [check for check in report.checks if check.status in {"fail", "inconclusive", "blocked"}]
+    findings = [check for check in report.checks if check.status in states.PROBLEM_STATUSES]
     for check in findings:
         parts.append(f'<article class="card"><strong>{_e(CHECK_NAMES.get(check.id, check.id))}</strong> · {_e(check.target)}'
                      f'<p>{_e(check.summary)}</p>{_answer_findings_html(check, report.requests, report)}</article>')

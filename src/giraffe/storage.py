@@ -19,6 +19,7 @@ import threading
 import time
 from typing import Any
 
+from . import states
 from . import models
 
 
@@ -98,7 +99,7 @@ class Heartbeat:
             try:
                 with _metadata_lock:
                     values = _read(self.directory / ".web.json")
-                    if values.get("state") not in {"running", "stopping"}:
+                    if values.get("state") not in states.RUN_OWNED_STATES:
                         return
                     values["heartbeat_at"] = datetime.now(timezone.utc).isoformat()
                     _write_metadata(self.directory, values)
@@ -186,7 +187,7 @@ def is_giraffe_run(directory: Path, meta: dict | None = None, report: dict | Non
                 for key in ("run_id", "started_at", "suite_version", "finished_at"))
             and models.is_supported_schema(report.get("schema_version"))
             and isinstance(report.get("overall"), str)
-            and report["overall"] in {"pass", "fail", "blocked", "inconclusive", "skipped"}
+            and report["overall"] in states.CHECK_STATUSES
             and isinstance(report.get("manifest"), dict))
 
 
@@ -379,7 +380,7 @@ def _run(directory: Path, active_id: str | None, sources: set[str], unknown_sour
         reason = "source run of a saved baseline"
     elif unknown_source:
         reason = "saved baseline source could not be read"
-    elif meta.get("state") in {"running", "stopping"} and run_alive(directory, meta, active_id=active_id):
+    elif meta.get("state") in states.RUN_OWNED_STATES and run_alive(directory, meta, active_id=active_id):
         reason = "run is " + meta["state"]
     if not directory.is_dir():
         return None
