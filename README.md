@@ -45,6 +45,8 @@ Start your inference server separately and have a model ready to use.
 
 Install [`giraffe-llm` from PyPI](https://pypi.org/project/giraffe-llm/) in a virtual environment. The command is `giraffe`:
 
+Giraffe runs on macOS and Linux with Python 3.11 or newer. Windows is not supported.
+
 ```sh
 python3 -m venv .venv
 source .venv/bin/activate

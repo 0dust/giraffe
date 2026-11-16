@@ -1,11 +1,13 @@
 """Publishing must reject tags or commits that do not match the release source."""
 
 import importlib.util
+import re
 import subprocess
 import tomllib
 from pathlib import Path
 
 import pytest
+from packaging.version import Version
 
 from giraffe import __version__
 
@@ -29,6 +31,13 @@ def test_current_repository_passes_release_validation():
 def test_package_version_matches_project_metadata():
     with (SCRIPT.parents[2] / "pyproject.toml").open("rb") as file:
         assert __version__ == tomllib.load(file)["project"]["version"]
+
+
+def test_source_version_is_not_older_than_readme_install_pin():
+    readme = (SCRIPT.parents[2] / "README.md").read_text(encoding="utf-8")
+    match = re.search(r"giraffe-llm==([0-9A-Za-z.+!_-]+)", readme)
+    assert match, "README.md has no giraffe-llm==<version> install pin"
+    assert Version(__version__) >= Version(match.group(1))
 
 
 def git(root, *args):
