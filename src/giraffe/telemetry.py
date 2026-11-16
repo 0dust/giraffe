@@ -391,11 +391,14 @@ def _parse_mtplx(payload, target, config):
         if outcome in {"failed", "cancelled"} else
         "MTPLX latest receipt has invalid outcome flags; completed-request measurements are withheld."
         if invalid_flags else None)
-    measurements = latest if outcome_reason is None else {}
     completed = _mtplx_number(latest.get("completed_at_s"))
     timestamp = completed * 1000 if completed is not None else None
     if timestamp is not None and not math.isfinite(timestamp):
         completed = timestamp = None
+    timestamp_reason = (
+        "MTPLX latest receipt has an invalid completion timestamp; completed-request measurements are withheld."
+        if latest.get("completed_at_s") is not None and completed is None else None)
+    measurements = latest if outcome_reason is None and timestamp_reason is None else {}
     age = time.time() - completed if completed is not None else None
     stale = age is not None and (age > config.metrics_max_age_seconds or age < -5)
     samples, invalid, truncated = [], [], []
@@ -430,11 +433,12 @@ def _parse_mtplx(payload, target, config):
         "mapping_reference": MTPLX_REFERENCE, "runtime_version": target.metrics_runtime_version,
         "version_verification": "JSON contract matches MTPLX v2.12.3; runtime identity/version require deployment evidence.",
         "instrumentation": target.instrumentation, "instrumentation_provenance": "user-supplied; unverified",
-        "latest_completed_at_s": completed,
+        "latest_completed_at_s": completed, "latest_timestamp_reason": timestamp_reason,
         "latest_outcome": outcome, "latest_outcome_flags": flags,
         "invalid_outcome_flags": invalid_flags, "latest_outcome_reason": outcome_reason,
         "reason": "Unrecognized MTPLX metrics JSON envelope." if payload is None else
                   outcome_reason if outcome_reason is not None else
+                  timestamp_reason if timestamp_reason is not None else
                   "Only stale completed-request samples were returned." if samples and stale else
                   "MTPLX endpoint available; latest completed-request fields are missing or invalid, not zero." if not samples else
                   "Latest completed request may predate this run; no request-window attribution or live scheduler coverage.",
@@ -1117,6 +1121,7 @@ def _derive_mtplx(snapshots):
         return {}
     latest = snapshots[-1]
     outcome_reason = latest.get("latest_outcome_reason")
+    timestamp_reason = latest.get("latest_timestamp_reason")
     rows = {}
     for family, unit, label in MTPLX.values():
         fresh = (_fresh_families(latest, [family])
@@ -1126,7 +1131,7 @@ def _derive_mtplx(snapshots):
         row = _derived(value, unit,
             "MTPLX latest completed request; may predate this run; not linked to the selected requests. No averaging or counter deltas.",
             samples=int(value is not None), eligible=1,
-            reason=None if value is not None else outcome_reason or "No valid fresh field in the final scrape's latest completed request; missing is unknown, not zero.",
+            reason=None if value is not None else outcome_reason or timestamp_reason or "No valid fresh field in the final scrape's latest completed request; missing is unknown, not zero.",
             collected_at=latest.get("collected_at"), completed_at_s=latest.get("latest_completed_at_s"),
             latest_outcome=latest.get("latest_outcome"), latest_outcome_flags=latest.get("latest_outcome_flags", {}),
             invalid_outcome_flags=latest.get("invalid_outcome_flags", []),

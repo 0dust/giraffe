@@ -762,8 +762,10 @@ metric names, JSON fields and units:
   counters, run throughput or run-window averages. Repeated polls and `recent`
   records are not accumulated. The latest request may predate the run and is not
   linked to the selected requests. Missing fields remain unavailable; missing
-  completion timestamps leave source freshness unknown. Supplied timestamps use
-  `metrics_max_age_seconds`. A valid idle envelope (`latest: null`) keeps polling.
+  or null completion timestamps leave source freshness unknown. Supplied timestamps
+  must be valid nonnegative finite numbers that can be represented in milliseconds;
+  invalid timestamps leave completed-request measurements unavailable. Valid timestamps
+  use `metrics_max_age_seconds`. A valid idle envelope (`latest: null`) keeps polling.
   Safe boolean outcome flags are retained; failed, cancelled or malformed-outcome
   receipts leave completed-request measurements unavailable rather than presenting
   partial-stream rates as completed-request decode rates.
