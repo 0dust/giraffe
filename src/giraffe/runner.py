@@ -111,6 +111,15 @@ def _stats(records: list[RequestRecord]) -> dict:
     return result
 
 
+def _cannot_meet_correctness(stats: dict, minimum: float) -> bool:
+    """Fail only if every unscored attempt passing would still miss the limit."""
+    attempted = stats["attempted"]
+    if not attempted:
+        return False
+    best_possible = (stats["correct"] + attempted - stats["scored"]) / attempted
+    return best_possible < minimum
+
+
 def _stress(scenario):
     # Scheduled warmup traffic shares stress accounting with its measurement window.
     return (scenario.startswith(("traffic_stage_", "context", "fairness_", "bucket_", "mixed_", "arrival", "stress_", "load_"))
@@ -1879,7 +1888,7 @@ def _pack_results(run: _Run, target: Target) -> dict:
                        or ("capacity" in r.check_ids and r.traffic_stage is not None))]
         stats = _stats(loaded)
         accuracy = stats["correct"] / stats["scored"] if stats["scored"] else None
-        failed = accuracy is not None and accuracy < limits.min_correctness
+        failed = _cannot_meet_correctness(stats, limits.min_correctness)
         observed = bool(loaded) and all(r.valid and r.score is not None for r in loaded)
         evidenced = max_evidenced_overlap((r for r in loaded if r.score is not None), target_records, delays)
         concurrency = run.config.effective_check("correctness")["concurrency"]
@@ -2180,7 +2189,7 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
             elif check_id == "context" and disproving:
                 status, summary = "fail", (f"Server rejected a prompt sized at {disproving[0]} tokens, below the safety margin "
                                            f"for declared context_limit {config.context_limit} (70% estimated, 85% server-reported).")
-            elif accuracy is not None and accuracy < limits.min_correctness:
+            elif _cannot_meet_correctness(metrics, limits.min_correctness):
                 status, summary = "fail", "Local known-answer or schema scoring failed the configured correctness limit."
             elif (check_id in {"correctness", "json"} and not run.pack_specs and config.concurrency > 1
                   and metrics["evidenced_overlap"] < 2 and run.config.parallelism_requested(check_id)
@@ -2373,7 +2382,7 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                     or sustained_error_rate > limits.max_error_rate
                     or (baseline_error_rate is not None and baseline_error_rate > limits.max_error_rate)
                     or (metrics["violations"] or (ratio_failed and not saturated))
-                    or (accuracy is not None and accuracy < limits.min_correctness)):
+                    or _cannot_meet_correctness(metrics, limits.min_correctness)):
                 status, summary = "fail", "Repeated traffic or light-load recovery failed correctness or configured limits."
                 if baseline_error_rate is not None and baseline_error_rate > limits.max_error_rate:
                     summary = "Light-load baseline requests failed before sustained traffic; repeated traffic or recovery limits were not met."
@@ -2382,8 +2391,8 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
             elif metrics["cancelled"]:
                 status, summary = "inconclusive", "Sustained or recovery requests were cancelled by the run deadline or a stop; recovery was not fully observed."
                 metrics["reason_code"] = "cancelled"
-            elif accuracy is None or metrics["unscored_completions"]:
-                status, summary = "inconclusive", "Some sustained or recovery completions lack a local correctness score."
+            elif accuracy is None or metrics["scored"] < metrics["attempted"]:
+                status, summary = "inconclusive", "Some baseline, sustained or recovery answers lack a local correctness score."
             elif saturated and any((limits.first_output_ms, limits.latency_ms, limits.stream_gap_ms,
                                         limits.min_output_tokens_per_second, limits.recovery_max_ratio)):
                 status, summary = "inconclusive", "Client scheduling delay prevents attributing sustained and recovery timing to the endpoint."
