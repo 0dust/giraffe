@@ -5,7 +5,12 @@ scale_down, traffic, gateway_access, gateway_policy and others) keep inline copi
 these literals: editing them would make saved baselines not comparable.
 """
 
+import logging
 from typing import Final
+
+logger = logging.getLogger(__name__)
+# Tests turn this on so an undeclared run-state write fails instead of logging.
+STRICT_TRANSITIONS = False
 
 
 # Check / run verdict: report.json overall/checks[].status and CLI JSON outcome (models.Status).
@@ -70,6 +75,21 @@ SCALE_DOWN_TRANSITIONS: Final = {
 
 def run_transition_allowed(current: str | None, new: str) -> bool:
     return current not in RUN_TRANSITIONS or current == new or new in RUN_TRANSITIONS[current]
+
+
+def check_run_transition(current: str | None, new: str | None) -> None:
+    """Flag a run-state write that RUN_TRANSITIONS does not declare; never blocks the write."""
+    if new is None or run_transition_allowed(current, new) and new in RUN_TRANSITIONS:
+        return
+    message = f"Undeclared run state transition: {current!r} -> {new!r}"
+    if STRICT_TRANSITIONS:
+        raise AssertionError(message)
+    logger.warning(message)
+
+
+def run_recoverable(state: str | None, journal_present: bool) -> bool:
+    """An interrupted run that still has its evidence journal can become completed or error."""
+    return state == "interrupted" and journal_present
 
 
 def describe() -> dict:

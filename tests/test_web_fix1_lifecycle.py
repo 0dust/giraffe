@@ -72,6 +72,25 @@ async def test_saved_run_terminal_events_and_cancel_result(tmp_path, monkeypatch
                                    "result": "already_finished" if terminal else "not_owned"}
 
 
+@pytest.mark.parametrize("state", ["queued", "running", "stopping", "completed", "interrupted", "error"])
+@pytest.mark.parametrize("journal", [False, True])
+async def test_recoverable_is_reported_beside_terminal(tmp_path, monkeypatch, state, journal):
+    monkeypatch.setattr("giraffe.web._EVENT_WAIT_SECONDS", 0)
+    async with browser(tmp_path) as client:
+        # Created after startup, so startup recovery does not consume the journal.
+        directory = tmp_path / "saved"
+        directory.mkdir()
+        (directory / ".web.json").write_text(json.dumps({"id": "saved", "state": state}))
+        if journal:
+            (directory / "evidence.jsonl").write_text("")
+        expected = journal and state == "interrupted"
+        assert (await client.get("/api/runs/saved")).json()["recoverable"] is expected
+        assert (await client.get("/api/runs/saved/events")).json()["recoverable"] is expected
+        if state in {"completed", "interrupted", "error"}:
+            row = next(run for run in (await client.get("/api/runs")).json()["runs"] if run["id"] == "saved")
+            assert row["recoverable"] is expected
+
+
 async def test_completed_run_with_unreadable_report_exposes_error(tmp_path):
     async with browser(tmp_path) as client:
         directory = tmp_path / "saved"

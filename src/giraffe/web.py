@@ -1036,6 +1036,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
             if (saved.get("state") in states.RUN_TERMINAL_STATES
                     and meta.get("state") in states.RUN_OWNED_STATES):
                 return  # A delayed stop/status write cannot resurrect a finished job.
+            states.check_run_transition(saved.get("state"), meta.get("state"))
             if "latency_summary" in saved:
                 meta["latency_summary"] = saved["latency_summary"]
             if saved.get("heartbeat_at"):
@@ -1387,6 +1388,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                 "live_checks": list(live.get("checks", {}).values()),
                 "stoppable": bool(live) and state in states.RUN_OWNED_STATES,
                 "terminal": state in states.RUN_TERMINAL_STATES,
+                "recoverable": states.run_recoverable(state, (directory / "evidence.jsonl").is_file()),
                 "phases": live.get("phases", meta.get("phases", [])),
                 "config": meta.get("config") or (persisted or {}).get("manifest", {}).get("config", {}),
                 "baseline_id": ((persisted or {}).get("baseline") or {}).get("saved_baseline_id", meta.get("baseline_id")),
@@ -1477,7 +1479,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
         counts = dict.fromkeys(states.CHECK_STATUSES, 0)
         for check in report.get("checks", []):
             counts[check["status"]] += 1
-        return {key: detail[key] for key in ("id", "state", "terminal", "error", "abort_reason", "progress", "baseline_id",
+        return {key: detail[key] for key in ("id", "state", "terminal", "recoverable", "error", "abort_reason", "progress", "baseline_id",
                                              "started_at", "finished_at", "bytes", "kept")} | {
             "run_id": report.get("run_id"), "overall": report.get("overall"),
             "targets": _targets(detail["config"]), "check_counts": counts,
@@ -2088,11 +2090,11 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                     if detail["state"] in states.RUN_IN_PROGRESS_STATES:
                         return {"seq": detail["seq"], "reset": False, "idle": True,
                                 "events": [], "records": [], "checks": [], "state": detail["state"],
-                                "terminal": detail["terminal"],
+                                "terminal": detail["terminal"], "recoverable": detail["recoverable"],
                                 "scale_down_control": detail.get("scale_down_control")}
                 return {"seq": detail["seq"], "reset": True, "events": [], "records": [], "checks": [],
                         "state": detail["state"], "error": detail.get("error"),
-                        "terminal": detail["terminal"],
+                        "terminal": detail["terminal"], "recoverable": detail["recoverable"],
                         "scale_down_control": detail.get("scale_down_control")}
             seq = feed["seq"]
             oldest = feed["deltas"][0]["seq"] if feed["deltas"] else seq + 1
@@ -2134,6 +2136,8 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
         return {"seq": seq, "reset": reset, "events": events, "records": list(records.values()),
                 "checks": list(checks.values()), "state": feed["state"],
                 "terminal": feed["state"] in states.RUN_TERMINAL_STATES,
+                "recoverable": states.run_recoverable(
+                    feed["state"], (_directory(root, identifier) / "evidence.jsonl").is_file()),
                 "progress": feed["progress"], "live_request_count": feed["live_request_count"],
                 "scale_down_control": feed.get("scale_down_control", feed["meta"].get("scale_down_control")),
                 "live_request_summary": feed["live_request_summary"],

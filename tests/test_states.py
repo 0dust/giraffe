@@ -165,3 +165,23 @@ def test_stop_reasons_not_scattered():
         occurrences = Counter(line.strip() for line in path.read_text().splitlines()
                               if any(f'"{value}"' in line for value in guarded))
         assert not occurrences, path
+
+
+def test_undeclared_run_transition_fails_in_tests_and_warns_in_production(monkeypatch, caplog):
+    assert states.STRICT_TRANSITIONS is True
+    for current, new in [(None, "running"), ("running", "running"), ("running", "completed"),
+                         ("interrupted", "completed"), ("completed", None), ("legacy", "running")]:
+        states.check_run_transition(current, new)
+    for current, new in [("completed", "running"), ("error", "completed"), ("running", "paused")]:
+        with pytest.raises(AssertionError, match="Undeclared run state transition"):
+            states.check_run_transition(current, new)
+    monkeypatch.setattr(states, "STRICT_TRANSITIONS", False)
+    with caplog.at_level("WARNING", logger="giraffe.states"):
+        states.check_run_transition("error", "completed")
+    assert "Undeclared run state transition: 'error' -> 'completed'" in caplog.text
+
+
+@pytest.mark.parametrize("state", states.RUN_STATES)
+def test_only_interrupted_runs_with_a_journal_are_recoverable(state):
+    assert states.run_recoverable(state, False) is False
+    assert states.run_recoverable(state, True) is (state == "interrupted")
