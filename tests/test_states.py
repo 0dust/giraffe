@@ -182,6 +182,7 @@ def test_undeclared_run_transition_fails_in_tests_and_warns_in_production(monkey
 
 
 @pytest.mark.parametrize("state", states.RUN_STATES)
-def test_only_interrupted_runs_with_a_journal_are_recoverable(state):
-    assert states.run_recoverable(state, False) is False
-    assert states.run_recoverable(state, True) is (state == "interrupted")
+@pytest.mark.parametrize("report_available", [False, True])
+def test_only_interrupted_runs_with_pending_evidence_are_recoverable(state, report_available):
+    assert states.run_recoverable(state, False, report_available) is False
+    assert states.run_recoverable(state, True, report_available) is (state == "interrupted" and not report_available)

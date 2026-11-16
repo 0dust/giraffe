@@ -150,7 +150,7 @@ Its `exit_codes` maps verdicts to codes and includes `cancelled`, `usage_error` 
 Run detail, history, events, start and cancel responses include `terminal`.
 It is true for `completed`, `interrupted` and `error`: no process is working on the run.
 
-Run detail, history and events also include `recoverable`. It is true only for an `interrupted` run that still has its `evidence.jsonl`; such a run can still become `completed` or `error`. To wait for a final state, poll until `terminal` is true and `recoverable` is false, with your own time limit: recovery runs when the server starts or when you run the recovery command.
+Run detail, history and events also include `recoverable`. It is true only for an `interrupted` run that still has its `evidence.jsonl` and has no valid saved report; such a run can still become `completed` or `error`. A valid report finishes recovery even if journal cleanup failed or a crash left the journal behind. To wait for a final state, poll until `terminal` is true and `recoverable` is false, with your own time limit: recovery runs when the server starts or when you run the recovery command.
 
 The server checks every run-state write against the transition table above. A write the table does not declare is still saved, and logged as a warning; the test suite fails on it.
 

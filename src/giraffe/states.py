@@ -87,9 +87,9 @@ def check_run_transition(current: str | None, new: str | None) -> None:
     logger.warning(message)
 
 
-def run_recoverable(state: str | None, journal_present: bool) -> bool:
-    """An interrupted run that still has its evidence journal can become completed or error."""
-    return state == "interrupted" and journal_present
+def run_recoverable(state: str | None, journal_present: bool, report_available: bool) -> bool:
+    """An interrupted journal needs recovery until a valid report owns its evidence."""
+    return state == "interrupted" and journal_present and not report_available
 
 
 def describe() -> dict:

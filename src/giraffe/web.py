@@ -1318,6 +1318,18 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
         except (OSError, ValueError, KeyError, TypeError):
             return None
 
+    def pending_recovery(directory: Path, state: str | None, *, report_available: bool | None = None) -> bool:
+        journal_present = (directory / "evidence.jsonl").is_file()
+        if state == "interrupted" and journal_present and report_available is None:
+            # A listing summary does not validate the full report accepted by recovery.
+            try:
+                _report(directory / "report.json")
+            except HTTPException:
+                report_available = False
+            else:
+                report_available = True
+        return states.run_recoverable(state, journal_present, bool(report_available))
+
     def run_detail(identifier: str, *, listing: bool = False, snapshot: dict | None = None) -> dict:
         directory = _directory(root, identifier)
         meta = metadata(directory)
@@ -1388,7 +1400,8 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                 "live_checks": list(live.get("checks", {}).values()),
                 "stoppable": bool(live) and state in states.RUN_OWNED_STATES,
                 "terminal": state in states.RUN_TERMINAL_STATES,
-                "recoverable": states.run_recoverable(state, (directory / "evidence.jsonl").is_file()),
+                "recoverable": pending_recovery(directory, state,
+                    report_available=None if listing else persisted is not None),
                 "phases": live.get("phases", meta.get("phases", [])),
                 "config": meta.get("config") or (persisted or {}).get("manifest", {}).get("config", {}),
                 "baseline_id": ((persisted or {}).get("baseline") or {}).get("saved_baseline_id", meta.get("baseline_id")),
@@ -2133,11 +2146,12 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
             elif event.get("event", "").startswith("condition_") and event.get("condition"):
                 key = (event.get("target"), event["condition"]["id"])
                 checks[key] = feed.get("conditions", {}).get(key, event)
+        recoverable = (await run_in_threadpool(pending_recovery, _directory(root, identifier), feed["state"])
+                       if feed["state"] == "interrupted" else False)
         return {"seq": seq, "reset": reset, "events": events, "records": list(records.values()),
                 "checks": list(checks.values()), "state": feed["state"],
                 "terminal": feed["state"] in states.RUN_TERMINAL_STATES,
-                "recoverable": states.run_recoverable(
-                    feed["state"], (_directory(root, identifier) / "evidence.jsonl").is_file()),
+                "recoverable": recoverable,
                 "progress": feed["progress"], "live_request_count": feed["live_request_count"],
                 "scale_down_control": feed.get("scale_down_control", feed["meta"].get("scale_down_control")),
                 "live_request_summary": feed["live_request_summary"],
