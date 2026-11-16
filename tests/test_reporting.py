@@ -233,7 +233,7 @@ def test_comparison_summary_preserves_distinct_target_incompatibility_reasons():
     {"timing_quality": {"current": {"status": "client_delayed", "affected_requests": 1}}},
 ])
 def test_comparison_summary_does_not_merge_different_recorded_evidence(same_scope, difference):
-    from giraffe.reporting import comparison_summary
+    from giraffe.reporting import _render, comparison_summary
 
     original = {
         "check": "correctness", "scenario": "warm", "metric": "latency_ms",
@@ -256,6 +256,10 @@ def test_comparison_summary_does_not_merge_different_recorded_evidence(same_scop
         "comparison-metric-0-0", "comparison-metric-0-1",
     }
     assert all(not row.get("other_scopes") for row in summary["rows"])
+    html = _render(report)
+    for row in summary["rows"]:
+        assert f'href="#{row["evidence_id"]}"' in html
+        assert html.count(f'id="{row["evidence_id"]}"') == 1
     assert report.model_dump(mode="json") == before
 
 

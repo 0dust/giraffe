@@ -4225,7 +4225,8 @@ def _baseline_table_html(baseline: dict[str, Any], report: RunReport | None = No
         rows = _baseline_display_rows(target, target_index=target_index)
         for row in rows:
             key = (target.get("target"), row.get("check"), _comparison_cohort(row))
-            fingerprint = json.dumps([row.get(name) for name in ("metric", "baseline", "current", "status", "reason")], sort_keys=True)
+            fingerprint = json.dumps({name: value for name, value in row.items()
+                                      if name != "_evidence_id"}, sort_keys=True)
             if fingerprint not in seen[key]:
                 seen[key].add(fingerprint)
                 conditions[key].append(row)
