@@ -3948,7 +3948,6 @@ function renderLoadAcceptance(targets,sectionPrefix='results') {
   }).join('')}</section>`;
 }
 function isProbe(r){return ['client_cancel','client_deadline','deadline_probe'].includes(r.scenario)||/intentional cancellation/i.test(r.error || '');}
-function optionalProbeRejection(r){const field=r?.workload?.rejected_evidence_field;return r?.scenario==='performance_evidence_probe'&&r.workload?.performance_evidence_probe===true&&r.status==='failed'&&[400,422].includes(r.http_status)&&['logprobs','top_logprobs','stream_options'].includes(field)?field:null;}
 function renderBaselineSummary(report) {
   const baseline=report.baseline;if(!baseline)return '';
   const saved=state.baselines.find(item=>(state.detail?.baseline_id&&item.id===state.detail.baseline_id)||item.run_id===baseline.run_id);
@@ -4175,6 +4174,7 @@ function closeRequestEvidence() {
   const fallback=$('#test-dialog')?.open?$('#condition-filter')||$('[data-condition-action="close"]'):$(`#tab-${reportView.tab}`);
   (back||retained||fallback)?.focus?.({preventScroll:true});
 }
+function optionalProbeRejection(r){const field=r?.workload?.rejected_evidence_field;return r?.scenario==='performance_evidence_probe'&&r.workload?.performance_evidence_probe===true&&r.status==='failed'&&[400,422].includes(r.http_status)&&['logprobs','top_logprobs','stream_options'].includes(field)?field:null;}
 async function openRequest(id) {
   const detail=state.detail,report=detail?.report,conditionContext=conditionRequestContext(id);
   if(!detail)return;
