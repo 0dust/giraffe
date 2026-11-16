@@ -22,6 +22,58 @@ from tests.test_storage_web import completed
 from tests.test_web import config, report as web_report
 
 
+@pytest.mark.parametrize("summary", [False, True])
+def test_cleanup_preserves_unrecovered_crash_evidence(tmp_path, summary):
+    directory = tmp_path / "crashed"
+    directory.mkdir()
+    (directory / ".web.json").write_text(json.dumps({
+        "id": directory.name, "run_id": directory.name, "state": "running",
+        "started_at": "2020-01-01T00:00:00Z", "heartbeat_at": "2020-01-01T00:00:00Z",
+        "owner_host": socket.gethostname(), "owner_pid": 2147483647}))
+    (directory / "evidence.jsonl").write_text('{"type":"header"}\n')
+    if summary:
+        (directory / "summary.json").write_text('{}')
+    assert not cleanup_plan(tmp_path, keep_latest=0)["candidates"]
+    assert not automatic_cleanup(tmp_path, {"keep_latest": 0}, active_id="new")["deleted"]
+    assert not apply_cleanup(tmp_path, [directory.name], keep_latest=0)["deleted"]
+    write_report(synthetic_report(2, 10, "all"), directory)
+    assert automatic_cleanup(tmp_path, {"keep_latest": 0}, active_id="new")["deleted"] == [directory.name]
+
+
+def test_cleanup_rechecks_journal_protection_after_preview(tmp_path):
+    directory = tmp_path / "crashed"
+    write_report(synthetic_report(2, 10, "all"), directory)
+    plan = cleanup_plan(tmp_path, keep_latest=0)
+    assert [row["id"] for row in plan["candidates"]] == [directory.name]
+    (directory / "report.json").unlink()
+    (directory / ".web.json").write_text(json.dumps({
+        "id": directory.name, "run_id": directory.name, "state": "interrupted",
+        "started_at": "2020-01-01T00:00:00Z"}))
+    (directory / "evidence.jsonl").write_text('{"type":"header"}\n')
+    assert not apply_cleanup(tmp_path, [directory.name], keep_latest=0)["deleted"]
+
+
+def test_automatic_cleanup_stops_between_runs_after_cancellation(tmp_path, monkeypatch):
+    for name in ("first", "second"):
+        write_report(synthetic_report(2, 10, "all"), tmp_path / name)
+    stopped = False
+    deleted = []
+    from giraffe import storage
+    original = storage.shutil.rmtree
+
+    def remove(path, *args, **kwargs):
+        nonlocal stopped
+        deleted.append(path.name)
+        original(path, *args, **kwargs)
+        stopped = True
+
+    monkeypatch.setattr(storage.shutil, "rmtree", remove)
+    result = automatic_cleanup(tmp_path, {"keep_latest": 0}, active_id="new",
+                               stop_requested=lambda: stopped)
+    assert len(deleted) == len(result["deleted"]) == 1
+    assert len(result["skipped"]) == 1 and result["skipped"][0]["reason"] == "cleanup cancelled"
+
+
 @pytest.mark.parametrize("meta_id", [None, "stale-other-id"])
 def test_crashed_cli_baseline_source_uses_saved_report_identity(tmp_path, monkeypatch, meta_id):
     source = tmp_path / "custom-output"

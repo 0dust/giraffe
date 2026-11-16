@@ -88,6 +88,17 @@ def test_baseline_regression_fails_its_selected_check_without_extra_testcase(tmp
     assert "Not selected" not in text
 
 
+def test_equal_baseline_rates_do_not_print_negative_zero(tmp_path):
+    source = report()
+    source.baseline = {"status": "pass", "targets": [{"target": "local", "comparisons": [{
+        "check": "correctness", "metric": "correctness_rate", "status": "pass",
+        "worsening": -0.0, "change_unit": "percentage_points"}]}]}
+    path = tmp_path / "summary.md"
+    write_summary_md(source, path, None)
+    assert "-0 percentage points" not in path.read_text()
+    assert "+0 percentage points" in path.read_text()
+
+
 @pytest.mark.parametrize('status,element', [('blocked', 'error'), ('fail', 'failure')])
 def test_inconclusive_baseline_preserves_current_error_or_failure(tmp_path, status, element):
     from giraffe.reporting import compare_baseline

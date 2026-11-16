@@ -259,10 +259,12 @@ async def test_disabled_mode_uses_text_workload_count_and_wire_contract():
     assert 'logprobs' not in check(report, 'consistency').metrics
 
 
-@pytest.mark.parametrize('retention,retained', [('all', True), ('none', False), ('failures', False)])
+@pytest.mark.parametrize('retention,retained', [('all', True), ('none', False), ('failures', True)])
 async def test_retention_and_export_preserve_measurements_without_token_leakage(tmp_path, retention, retained):
     with FakeEndpoint(mode='logprob_variable') as endpoint:
         report = await run_suite(run_config(endpoint, retention=retention, repetitions=4, options={'priming_rounds': 2}))
+    assert check(report, 'consistency').status == 'inconclusive'
+    assert check(report, 'consistency').evidence_ids
     write_report(report, tmp_path, html=True)
     data = (tmp_path/'report.json').read_text()
     html = (tmp_path/'report.html').read_text()

@@ -665,11 +665,18 @@ def test_live_response_history_obeys_retention(monkeypatch, tmp_path, retention)
         saved = json.loads(json_path.read_text())
         assert len(saved['requests']) == 2
         assert all(row['workload']['session_id'] for row in saved['requests'])
-        if retention == 'all':
+        if retention != 'none':
             assert marker in json_path.read_text()
         else:
             assert marker not in json_path.read_text()
             assert marker not in html_path.read_text()
+        if retention != 'all':
+            assert marker not in json.dumps(saved['inputs'])
+        if retention == 'failures':
+            evidence = {rid for check in saved['checks'] if check['status'] == 'inconclusive'
+                        for rid in check['evidence_ids']}
+            assert evidence
+            assert all(row['id'] in evidence for row in saved['requests'] if marker in row['output'])
     run_virtual(monkeypatch, scenario())
 
 

@@ -130,6 +130,7 @@ def _baseline_delta(report: RunReport) -> str:
             worsening = row.get("worsening")
             if not isinstance(worsening, (int, float)) or row.get("status") not in {"pass", "fail"}:
                 continue
+            worsening = worsening or 0.0
             unit = "percentage points" if row.get("change_unit") == "percentage_points" else "%"
             changes.append(f"{target.get('target', '')}/{row.get('check', '')} "
                            f"{row.get('metric', '')}: {worsening:+.3g} {unit} worsening")

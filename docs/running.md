@@ -25,6 +25,9 @@ Results appear in the terminal and in `runs/<timestamp>/report.json` and
 Standard built-in answer fixtures, including `short.copy`, use `max_output_tokens` as their
 output allowance. For a reasoning model that exhausts its budget before answering,
 raise it with `--max-output-tokens 2048` or YAML `max_output_tokens: 2048`.
+Unmatched exact-answer text cut at the token cap remains unscored because the final
+answer may be unfinished, including when reasoning has no tags. A completed mismatch
+still fails; a complete matching exact answer can still be scored at the cap.
 Supported `test_options.<check>.max_output_tokens` values override that default;
 `access` has no separate output setting and shares the initial request's resolved
 serving/first-output allowance. Custom fixtures, request-pack cases, session turns
@@ -165,6 +168,13 @@ saves partial results after the suite starts. A blocking preflight failure does
 not produce a run report. Ordinary runs do not restart the service; cold-start
 checks require the explicit cold-start command.
 
+Ctrl+C during preflight stops before suite traffic. During report export, it lets
+the report and terminal output finish before exiting 130; JSON output remains complete.
+A second stop forces interruption and can leave final output incomplete; the evidence
+journal remains available if report export did not finish.
+Responses reporting a different model name produce a warning. Aliases can differ,
+so this warning does not fail an otherwise successful run.
+
 | Exit code | Meaning |
 | --- | --- |
 | `0` | Pass |
@@ -230,6 +240,11 @@ Saving is explicit. Later runs do not replace the baseline; replacement requires
 evaluate the current run while comparison reports changes against the reference.
 Incompatible workloads leave metric comparison inconclusive. See
 [deployment and comparison evidence](workloads.md#deployment-metadata).
+
+For runs containing only access, serving, correctness, JSON, first-output and
+generation checks, changing grading limits does not invalidate measured baseline
+comparisons. Sampling requirements must still match. Other workloads retain their
+limit identity checks because limits can change executed traffic or capacity acceptance.
 
 ### Read a before/after comparison
 
