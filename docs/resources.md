@@ -92,7 +92,12 @@ Recovery:
 - can lose the newest requests after a hard kill, because the journal is fsynced about
   every 50 records or second.
 
-Recovery never modifies `evidence.jsonl` or `.web.json`.
+Recovery saves `report.json`, marks the run interrupted in `.web.json`, and leaves
+`evidence.jsonl` unchanged. Once JSON is saved, the recovered run is eligible for
+normal cleanup. To explicitly release an unrecoverable journal, use
+`giraffe runs keep RUN_DIR --off`, then preview and apply cleanup. This releases only
+the current journal: appending or replacing evidence protects it again. Active runs,
+saved baseline sources and directories containing unrelated files remain protected.
 
 All newly serialized report, baseline, summary and web-state JSON is compact.
 Eligible immutable schema-4 baseline sources can be hard-linked as-is. Older

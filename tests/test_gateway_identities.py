@@ -122,14 +122,25 @@ def test_gateway_error_evidence_is_strict_and_does_not_retain_text(status, error
     assert "message" not in evidence.model_dump_json()
 
 
-async def test_finish_reason_cannot_retain_echoed_credential(monkeypatch):
+@pytest.mark.parametrize("stream", [False, True])
+async def test_finish_reason_cannot_retain_echoed_credential(monkeypatch, stream):
     monkeypatch.setenv("KEY", "finish-secret")
     target = Target(name="proxy", url="http://proxy", model="test", test_identities={"alice": {"api_key_env": "KEY"}})
     original = httpx.AsyncClient
+
+    def respond(req):
+        data = {"choices": [{"delta" if stream else "message": {"content": "OK"},
+                             "finish_reason": "finish-secret"}]}
+        if stream:
+            return httpx.Response(200, headers={"content-type": "text/event-stream"},
+                                  text="data: " + json.dumps(data) + "\n\ndata: [DONE]\n\n")
+        return httpx.Response(200, json=data)
+
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(
-        lambda req: httpx.Response(200, json={"choices": [{"message": {"content": "OK"}, "finish_reason": "finish-secret"}]})), **kw))
-    async with LLMClient(target, RunConfig(targets=[target], stream=False)) as client:
+        respond), **kw))
+    async with LLMClient(target, RunConfig(targets=[target], stream=stream)) as client:
         result = await client.execute(request("alice"))
+    assert not result.valid and "usable answer" in result.error
     assert "finish-secret" not in result.model_dump_json()
 
 

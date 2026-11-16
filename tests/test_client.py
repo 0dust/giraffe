@@ -360,6 +360,22 @@ async def test_unusable_terminal_reason_cannot_complete_validly(monkeypatch, str
         result = await client.execute(spec())
     assert not result.valid and result.status == "failed"
     assert "usable answer" in result.error
+    assert f"finish_reason={finish!r}" in result.error
+
+
+@pytest.mark.parametrize("stream", [False, True])
+async def test_unusable_terminal_reason_diagnostic_is_bounded_and_escaped(monkeypatch, stream):
+    finish = "abort\n\x1b\u202e" + "x" * 1000
+    client, _, _ = setup_client(monkeypatch,
+        [event("42"), event(finish=finish), b'data: [DONE]\n\n'] if stream else None,
+        stream=stream, body=None if stream else {
+            "choices": [{"message": {"content": "42"}, "finish_reason": finish}]})
+    async with client:
+        result = await client.execute(spec())
+    assert not result.valid and result.status == "failed"
+    assert "abort\\n\\x1b\\u202e" in result.error
+    assert not any(character in result.error for character in ("\n", "\x1b", "\u202e"))
+    assert len(result.error) < 200 and result.error.endswith("...)")
 
 
 @pytest.mark.parametrize("chunks", [

@@ -368,7 +368,8 @@ def _report_for_render(path: Path) -> RunReport:
                 or (path / "summary.json").exists()):
             raise
         from giraffe.evidence import recover_evidence
-        from giraffe.storage import _read, pid_alive, run_alive
+        from giraffe.reporting import write_report
+        from giraffe.storage import _read, pid_alive, run_alive, update_metadata
 
         meta = _read(path / ".web.json")
         pid = meta.get("owner_pid")
@@ -384,6 +385,8 @@ def _report_for_render(path: Path) -> RunReport:
         recovered = recover_evidence(path, meta)
         if recovered is None:
             raise
+        write_report(recovered, path, preserve_evidence=True)
+        update_metadata(path, {"state": "interrupted", "run_id": recovered.run_id})
         print(f"Recovered {len(recovered.requests)} recorded requests from an interrupted run; "
               "results are incomplete.", file=sys.stderr)
         return recovered
@@ -560,6 +563,8 @@ async def _run(config: RunConfig, *, json_progress: bool = False, verbose: bool 
 
     def request_stop():
         nonlocal interrupted
+        if interrupted:
+            raise KeyboardInterrupt
         interrupted = True
         stop.set()
 
@@ -616,38 +621,39 @@ async def _run(config: RunConfig, *, json_progress: bool = False, verbose: bool 
         except asyncio.CancelledError as error:
             report = getattr(error, "giraffe_report", None)
             raise
-        if interrupted:
-            # Cooperative signal stops return normally from the suite. Keep
-            # their partial evidence on the same export path as task cancellation.
-            error = asyncio.CancelledError()
-            error.giraffe_report = report
-            raise error
-        return report
     finally:
-        for sig, previous in installed:
-            loop.remove_signal_handler(sig)
-            signal.signal(sig, previous)
         try:
-            if adapter is not None:
-                await adapter.close()
-        except Exception:
-            logger.exception("Scale-down status file could not be saved")
-            if report is not None:
-                report.warnings.append("Scale-down control status file could not be saved; inspect report evidence.")
-        finally:
-            if writer is not None:
-                from giraffe.runner import record_sink
-                record_sink.reset(sink_token)
-                try:
-                    await asyncio.to_thread(writer.close)
-                except Exception:
-                    logger.exception("CLI evidence writer could not finish")
-                    if report is not None:
-                        report.warnings.append("Live evidence journal could not finish; final report uses completed run state.")
+            try:
+                if adapter is not None:
+                    await adapter.close()
+            except Exception:
+                logger.exception("Scale-down status file could not be saved")
                 if report is not None:
-                    report.observations["evidence_dropped_count"] = writer.dropped_count
-                    if writer.dropped_count:
-                        report.warnings.append(f"{writer.dropped_count} evidence records not written to evidence.jsonl")
+                    report.warnings.append("Scale-down control status file could not be saved; inspect report evidence.")
+            finally:
+                if writer is not None:
+                    from giraffe.runner import record_sink
+                    record_sink.reset(sink_token)
+                    try:
+                        await asyncio.to_thread(writer.close)
+                    except Exception:
+                        logger.exception("CLI evidence writer could not finish")
+                        if report is not None:
+                            report.warnings.append("Live evidence journal could not finish; final report uses completed run state.")
+                    if report is not None:
+                        report.observations["evidence_dropped_count"] = writer.dropped_count
+                        if writer.dropped_count:
+                            report.warnings.append(f"{writer.dropped_count} evidence records not written to evidence.jsonl")
+        finally:
+            for sig, previous in installed:
+                loop.remove_signal_handler(sig)
+                signal.signal(sig, previous)
+    if interrupted:
+        # Include stops during journal finalization on the partial-report export path.
+        error = asyncio.CancelledError()
+        error.giraffe_report = report
+        raise error
+    return report
 
 
 def _print_memory(resources: dict) -> None:
@@ -672,10 +678,10 @@ def _print_memory(resources: dict) -> None:
 
 
 @contextmanager
-def _defer_interrupts():
+def _defer_interrupts(*, already_stopped=False, restore_handlers=None):
     interrupted = {"requested": False, "output_started": False}
     previous = {}
-    received = 0
+    received = int(already_stopped)
 
     def stop(signum, frame):
         nonlocal received
@@ -694,7 +700,7 @@ def _defer_interrupts():
         yield interrupted
     finally:
         for sig, handler in previous.items():
-            signal.signal(sig, handler)
+            signal.signal(sig, (restore_handlers or {}).get(sig, handler))
 
 
 def _main(argv: list[str] | None = None) -> int:
@@ -709,6 +715,7 @@ def _main(argv: list[str] | None = None) -> int:
     kind = arguments[0] if arguments else "usage"
     validation_input = {}
     interrupted = None
+    save_state = None
 
     def emit(outcome: str, exit_code: int, **details) -> None:
         print(json.dumps({"kind": kind, "outcome": outcome, "exit_code": exit_code, **details},
@@ -880,7 +887,7 @@ def _main(argv: list[str] | None = None) -> int:
             from giraffe.storage import set_kept
 
             set_kept(args.run_dir, not args.off)
-            print(f"{args.run_dir}: {'cleanup protection removed' if args.off else 'kept; protected from cleanup'}")
+            print(f"{args.run_dir}: {'manual cleanup protection removed' if args.off else 'kept; protected from cleanup'}")
             return 0
         if args.command in {"ui", "web"}:
             if not 1 <= args.port <= 65535:
@@ -1098,6 +1105,8 @@ def _main(argv: list[str] | None = None) -> int:
         cancelled = None
 
         async def run_with_partial_report():
+            nonlocal interrupted
+            cancellation = None
             try:
                 control = {"directory": directory}
                 report = await (_run(config, quiet=True, **control) if getattr(args, "quiet", False) else
@@ -1107,14 +1116,18 @@ def _main(argv: list[str] | None = None) -> int:
                 report = getattr(error, "giraffe_report", None)
                 if report is None:
                     raise
-                return report, error
-            return report, None
+                cancellation = error
+            # Protect the finished report before asyncio.run tears down its loop.
+            # Restore the caller's handlers, rather than asyncio.Runner's temporary SIGINT handler.
+            interrupted = finalization.enter_context(_defer_interrupts(
+                already_stopped=cancellation is not None, restore_handlers=run_handlers))
+            return report, cancellation
 
         with ExitStack() as finalization:
             with run_logging(directory), _heartbeat(directory / ".web.json") as stop_heartbeat:
                 try:
+                    run_handlers = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
                     report, cancelled = asyncio.run(run_with_partial_report())
-                    interrupted = finalization.enter_context(_defer_interrupts())
                     from giraffe.invocation import cli_invocation
                     report.manifest["invocation"] = cli_invocation(arguments)
                     if guard is not None:
@@ -1207,10 +1220,12 @@ def _main(argv: list[str] | None = None) -> int:
                 warning = f"Run completed, but run metadata could not be saved ({error.strerror or type(error).__name__})."
                 warnings.append(warning)
                 print(f"Warning: {warning}", file=sys.stderr)
-            for item in report.warnings:
+            from giraffe.runner import model_identity_warnings
+            model_warnings = model_identity_warnings(config, report.requests)
+            for item in model_warnings:
                 if item not in warnings:
                     print(f"Warning: {item}", file=sys.stderr)
-            warnings = list(dict.fromkeys([*warnings, *report.warnings]))
+            warnings = list(dict.fromkeys([*warnings, *model_warnings]))
             report = _retained(report)
             exit_code = 130 if cancelled is not None else {"pass": 0, "fail": 1, "inconclusive": 2, "blocked": 3}.get(report.overall, 2)
             # The aggregate verdict prioritizes failed checks over blocked targets.
@@ -1242,7 +1257,7 @@ def _main(argv: list[str] | None = None) -> int:
             sys.stdout.flush()
             return 130 if interrupted["requested"] else exit_code
     except (KeyboardInterrupt, asyncio.CancelledError):
-        if interrupted is not None:
+        if save_state is not None:
             try:
                 save_state("interrupted", finished_at=datetime.now(timezone.utc).isoformat(),
                            abort_reason="run cancelled")

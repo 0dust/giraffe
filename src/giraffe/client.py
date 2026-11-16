@@ -1269,7 +1269,13 @@ class LLMClient:
                     if record.finish_reason is None:
                         raise _ProtocolError("response ended without a completion finish reason")
                     if record.finish_reason not in {"stop", "length", "tool_calls", "function_call"}:
-                        raise _ProtocolError("endpoint did not finish a usable answer")
+                        message = "endpoint did not finish a usable answer"
+                        if spec.identity is None:
+                            reason = ascii(record.finish_reason[:80])
+                            if len(record.finish_reason) > 80:
+                                reason += "..."
+                            message += f" (finish_reason={reason})"
+                        raise _ProtocolError(message)
                     record.tool_calls = [tool_parts[index] for index in sorted(tool_parts)]
                     if spec.scorer == "tool" and record.tool_calls:
                         ids = [call["id"] for call in record.tool_calls]

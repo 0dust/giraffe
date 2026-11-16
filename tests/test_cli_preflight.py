@@ -43,22 +43,33 @@ def test_truncated_report_error_names_source_without_echoing_body(tmp_path, caps
 
 
 @pytest.mark.parametrize("json_output", [False, True])
-def test_run_model_warning_is_visible_in_terminal_and_json(tmp_path, monkeypatch, capsys, json_output):
-    from giraffe.models import RunReport
+@pytest.mark.parametrize("observed_model", ["tiny", "actual"])
+def test_run_only_surfaces_actionable_model_warning(tmp_path, monkeypatch, capsys, json_output, observed_model):
+    from giraffe.models import RequestRecord, RunReport
 
-    warning = "Target local requested model 'tiny', but responses reported 'actual'. Verify the served model."
+    caveat = "Other traffic on the target is unknown; results cover only the recorded workload."
+    warning = ("Target local requested model 'tiny', but responses reported 'actual'. "
+               "Model aliases may differ; verify the served model.")
 
     async def run(config, **kwargs):
         return RunReport(run_id="alias", started_at="now", finished_at="now", overall="pass",
-                         manifest={"config": config.model_dump(mode="json")}, warnings=[warning])
+                         manifest={"config": config.model_dump(mode="json")},
+                         warnings=[caveat, *([warning] if observed_model == "actual" else [])],
+                         requests=[RequestRecord(id="one", target="local", fixture_id="answer", scenario="serving",
+                             check_ids=["serving"], started_at="now", status="completed", valid=True,
+                             observed_model=observed_model)])
 
     monkeypatch.setattr("giraffe.cli._run", run)
     assert main(["run", "--url", "http://server", "--model", "tiny", "--skip-preflight",
                  "--output", str(tmp_path / "run"), *(["--json"] if json_output else [])]) == 0
     captured = capsys.readouterr()
-    assert warning in captured.err
+    assert (warning in captured.err) == (observed_model == "actual")
+    assert caveat not in captured.err
+    if observed_model == "tiny":
+        assert "Warning:" not in captured.err
     if json_output:
-        assert warning in json.loads(captured.out)["warnings"]
+        assert json.loads(captured.out)["warnings"] == ([warning] if observed_model == "actual" else [])
+    assert caveat in json.loads((tmp_path / "run" / "report.json").read_text())["warnings"]
 
 
 @pytest.mark.parametrize("output_format", ["text", "json"])

@@ -302,6 +302,29 @@ def test_recovery_incomplete_baseline_cannot_become_a_pass():
     assert result.status == "inconclusive"
     assert result.metrics["correct"] == 10 and result.metrics["scored"] == 11
     assert result.metrics["attempted"] == 20 and result.metrics["accuracy"] == 10 / 11
+    assert result.metrics["unscored_completions"] == 9
+
+
+def test_recovery_tolerated_request_failure_does_not_require_an_answer_score():
+    settings = config(checks=["recovery"], default_concurrency=1, samples=2,
+                      limits=Limits(max_error_rate=.34, min_samples=2, recovery_max_ratio=2))
+    state = runner._Run(settings, None, None)
+    state.observations["local"]["sustained_complete"] = True
+    for index, scenario in enumerate(["recovery_baseline"] * 2 + ["sustained"] * 3 + ["recovery"] * 2):
+        spec = fixture(expected="42").model_copy(update={"scenario": scenario, "check_ids": ["recovery"]})
+        answer = record(spec, "42", id=str(index), finish_reason="stop", elapsed_ms=10, first_output_ms=1)
+        if index == 4:
+            answer = answer.model_copy(update={"status": "failed", "valid": False,
+                                               "output": "", "error": "HTTP 503"})
+        else:
+            answer = score_response(spec, answer)
+        state.records.append(answer)
+
+    result = next(item for item in runner._checks(state, settings.targets[0]) if item.id == "recovery")
+    assert result.status == "pass"
+    assert result.metrics["sustained_error_rate"] == 1 / 3
+    assert result.metrics["scored"] == 6 and result.metrics["attempted"] == 7
+    assert result.metrics["unscored_completions"] == 0
 
 
 @pytest.mark.parametrize("output", ['{"count":14}', '{"other":42}'])
