@@ -108,6 +108,75 @@ def test_run_duration_must_be_finite(capsys):
     assert "finite" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("arguments,output_format", [
+    (["ui", "--no-browser"], "text"),
+    (["web", "--no-browser"], "text"),
+    (["run", "--url", "http://localhost/v1", "--model", "tiny"], "text"),
+    (["run", "--output-format", "json"], "json"),
+    (["cold-start", "--restart", "local"], "text"),
+    (["cold-start", "--restart", "local", "--json"], "json"),
+    (["try-example", "--config", "unused.yaml", "--case", "one", "--target", "local"], "text"),
+    (["try-example", "--config", "unused.yaml", "--case", "one", "--target", "local",
+      "--output-format=json"], "json"),
+])
+def test_native_windows_rejects_workload_commands_before_side_effects(
+    arguments, output_format, tmp_path, monkeypatch, capsys,
+):
+    from types import SimpleNamespace
+    import giraffe.cli as cli
+
+    monkeypatch.setattr(cli, "sys", SimpleNamespace(**{**vars(cli.sys), "platform": "win32"}))
+    monkeypatch.chdir(tmp_path)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Unsupported command reached configuration or socket setup")
+
+    monkeypatch.setattr(cli, "configuration", forbidden)
+    monkeypatch.setattr(cli, "load_configuration", forbidden)
+    monkeypatch.setattr(cli, "socket", SimpleNamespace(**{**vars(cli.socket), "socket": forbidden}))
+    assert main(arguments) == 4
+    captured = capsys.readouterr()
+    message = "Native Windows is not supported; use WSL2 or Docker."
+    if output_format == "json":
+        assert json.loads(captured.out) == {
+            "kind": arguments[0], "outcome": "error", "exit_code": 4,
+            "errors": [{"loc": [], "message": message, "type": "unsupported_platform"}],
+        }
+        assert not captured.err
+    else:
+        assert captured.err == f"giraffe: {message}\n"
+        assert not captured.out
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("arguments", [["--help"], ["--version"], ["ui", "--help"], ["run", "--help"]])
+def test_native_windows_keeps_help_and_version_available(arguments, monkeypatch, capsys):
+    from types import SimpleNamespace
+    import giraffe.cli as cli
+
+    monkeypatch.setattr(cli, "sys", SimpleNamespace(**{**vars(cli.sys), "platform": "win32"}))
+    with pytest.raises(SystemExit) as error:
+        main(arguments)
+    assert error.value.code == 0
+    captured = capsys.readouterr()
+    assert captured.out and not captured.err
+
+
+@pytest.mark.parametrize("platform", ["linux", "darwin"])
+def test_supported_platforms_reach_run_configuration(platform, monkeypatch):
+    from types import SimpleNamespace
+    import giraffe.cli as cli
+
+    monkeypatch.setattr(cli, "sys", SimpleNamespace(**{**vars(cli.sys), "platform": platform}))
+
+    def prepared(*args, **kwargs):
+        raise RuntimeError("normal run preparation")
+
+    monkeypatch.setattr(cli, "configuration", prepared)
+    with pytest.raises(RuntimeError, match="normal run preparation"):
+        main(["run", "--url", "http://localhost/v1", "--model", "tiny"])
+
+
 def test_ui_rejects_invalid_port_before_starting_server(capsys):
     assert main(["ui", "--port", "0"]) == 4
     assert "Port must be" in capsys.readouterr().err
@@ -178,8 +247,13 @@ def test_ui_launch_and_shutdown_stay_local_and_clear_implicit_restart(
         assert captured["migration_notes"] == []
 
 
-def test_describe_has_full_authoritative_schema_without_traffic(monkeypatch, capsys):
+@pytest.mark.parametrize("platform", ["darwin", "win32"])
+def test_describe_has_full_authoritative_schema_without_traffic(platform, monkeypatch, capsys):
+    from types import SimpleNamespace
+    import giraffe.cli as cli
     from giraffe.capabilities import capabilities
+
+    monkeypatch.setattr(cli, "sys", SimpleNamespace(**{**vars(cli.sys), "platform": platform}))
 
     def forbidden(*args, **kwargs):
         pytest.fail("Discovery must not run inference")

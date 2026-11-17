@@ -358,6 +358,27 @@ async def test_frontend_assets_require_revalidation_without_losing_validators(tm
         assert head.headers.get("cache-control") == "no-cache"
 
 
+@pytest.mark.parametrize("path,expected_text", [
+    ("/", "<title>Giraffe · Endpoint checks</title>"),
+    ("/static/app.js", "pass:'✓'"),
+])
+async def test_frontend_text_assets_use_utf8_with_a_non_utf8_locale(
+    tmp_path, monkeypatch, path, expected_text,
+):
+    from pathlib import Path
+
+    read_text = Path.read_text
+
+    def locale_read_text(file, encoding=None, errors=None):
+        return read_text(file, encoding=encoding or "cp1252", errors=errors)
+
+    monkeypatch.setattr(Path, "read_text", locale_read_text)
+    async with browser(tmp_path) as client:
+        response = await client.get(path)
+    assert response.status_code == 200
+    assert expected_text in response.text
+
+
 async def test_frontend_entrypoints_and_module_dependency_have_versioned_content_hashes(tmp_path):
     async with browser(tmp_path) as client:
         index = await client.get("/")

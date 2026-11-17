@@ -2371,7 +2371,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
 
     def app_script() -> bytes:
         # Version the module dependency too; hash these served bytes for the entry URL.
-        content = (static / "app.js").read_text()
+        content = (static / "app.js").read_text(encoding="utf-8")
         dependency = asset_url("form-config.mjs").removeprefix("/static/")
         return re.sub(r"\./form-config\.mjs(?:\?[^']*)?", f"./{dependency}", content, count=1).encode()
 
@@ -2408,7 +2408,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
         if not authenticated(request):
             return HTMLResponse("<!doctype html><title>Giraffe access</title><p>"
                 "Open the link printed by `giraffe ui` (it contains your access token).</p>")
-        content = (static / "index.html").read_text()
+        content = (static / "index.html").read_text(encoding="utf-8")
         for name in ("boot.js", "styles.css", "app.js"):
             url = asset_url(name, app_script() if name == "app.js" else None)
             content = content.replace(f'"/static/{name}"', f'"{url}"')
