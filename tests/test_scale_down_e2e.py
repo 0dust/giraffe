@@ -1,6 +1,7 @@
 """Real HTTP cross-layer verification, not real deployment qualification."""
 import asyncio
 import json
+import time
 
 import pytest
 
@@ -189,13 +190,93 @@ async def test_time_budget_cancellation_is_not_an_endpoint_interruption(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_final_collection_retains_termination_after_grace_expires(tmp_path):
-    with FakeReplicaRouter(release_delay=.35) as router:
-        _, check, _ = await exercise(router, config_for(router, tmp_path,
-            scale_down=dict(grace_seconds=.15, completion_seconds=.6)))
-        assert router.terminated
-        assert statuses(check)["drain"] == "fail", check.metrics
-        assert "exceeded the declared grace" in check.metrics["results"]["drain"]["summary"]
+@pytest.mark.parametrize("fresh_available", [True, False], ids=["fresh-poll", "exhausted-budget"])
+async def test_final_collection_retains_termination_after_grace_expires(tmp_path, monkeypatch, fresh_available):
+    from giraffe import deployment, runner, scale_down
+
+    original_snapshot = deployment.snapshot
+    original_ingest = scale_down.ingest_deployment
+    original_phase = scale_down.ScaleDownController.set_phase
+    original_request = runner._Run.request
+    original_gather = asyncio.gather
+    long_tasks = []
+    settlement = {}
+    release_stale = asyncio.Event()
+    finished = asyncio.Event()
+    held = []
+    phases = {}
+    completion_seconds = .6
+
+    def observed_phase(control, phase):
+        phases[phase] = time.monotonic()
+        result = original_phase(control, phase)
+        if phase == "finished":
+            finished.set()
+        return result
+
+    with FakeReplicaRouter(release_delay=10) as router:
+        async def delayed_snapshot(*args, **kwargs):
+            row = await original_snapshot(*args, **kwargs)
+            snapshot = row.get("scale_down_lifecycle")
+            if snapshot and router.mode is not None:
+                if not held and not router.terminated:
+                    # Hold a real pre-completion response until final cleanup.
+                    # The long answer stays active until this barrier is armed.
+                    held.append(snapshot)
+                    await release_stale.wait()
+                    settlement["response_arrived_ms"] = (time.monotonic() - settlement["run"].start) * 1000
+                elif held and not fresh_available and not finished.is_set():
+                    await finished.wait()
+            return row
+
+        def releasing_ingest(run, target, evidence):
+            changed = original_ingest(run, target, evidence)
+            if held and run.scale_down_control.phase == "finalizing":
+                router.release_delay = 0
+            return changed
+
+        async def observed_request(run, target, client, spec, *args, **kwargs):
+            if spec.scenario == "scale_down_long":
+                long_tasks.append(asyncio.current_task())
+                settlement["run"] = run
+            return await original_request(run, target, client, spec, *args, **kwargs)
+
+        def releasing_gather(*tasks, **kwargs):
+            joined = original_gather(*tasks, **kwargs)
+            if held and "finalizing" in phases and any(task in tasks for task in long_tasks):
+                def after_join(_):
+                    settlement["clients_settled_ms"] = (time.monotonic() - settlement["run"].start) * 1000
+                    # Let execute enter final collection before delivering the
+                    # response from its already-completed collector request.
+                    asyncio.get_running_loop().call_soon(release_stale.set)
+                joined.add_done_callback(after_join)
+            return joined
+
+        monkeypatch.setattr(deployment, "snapshot", delayed_snapshot)
+        monkeypatch.setattr(runner._Run, "request", observed_request)
+        monkeypatch.setattr(asyncio, "gather", releasing_gather)
+        monkeypatch.setattr(scale_down, "ingest_deployment", releasing_ingest)
+        monkeypatch.setattr(scale_down.ScaleDownController, "set_phase", observed_phase)
+        report, check, _ = await exercise(router, config_for(router, tmp_path,
+            scale_down=dict(grace_seconds=.15, completion_seconds=completion_seconds)))
+        assert held and release_stale.is_set() and router.terminated
+        long = next(r for r in report.requests if r.fixture_id == "long")
+        assert held[0]["collected_start_ms"] < long.completed_ms <= settlement["clients_settled_ms"]
+        assert settlement["clients_settled_ms"] < settlement["response_arrived_ms"]
+        assert not any(e["kind"] == "replica_terminated" for e in held[0]["export"]["events"])
+        snapshots = report.observations["targets"]["service"]["scale_down"]["snapshots"]
+        elapsed = phases["finished"] - phases["finalizing"]
+        if fresh_available:
+            assert any(snapshot["collected_start_ms"] >= settlement["clients_settled_ms"]
+                       and any(e["kind"] == "replica_terminated" for e in snapshot["export"]["events"])
+                       for snapshot in snapshots), snapshots
+            assert statuses(check)["drain"] == "fail", check.metrics
+            assert "exceeded the declared grace" in check.metrics["results"]["drain"]["summary"]
+        else:
+            assert elapsed >= completion_seconds - .02
+            assert statuses(check)["drain"] == "inconclusive", check.metrics
+            assert not any(e["kind"] == "replica_terminated"
+                           for snapshot in snapshots for e in snapshot["export"]["events"])
 
 
 @pytest.mark.asyncio

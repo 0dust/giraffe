@@ -510,7 +510,11 @@ class LLMClient:
     async def __aexit__(self, *_: Any) -> None:
         try:
             if self._stream_drains:
-                await asyncio.gather(*self._stream_drains, return_exceptions=True)
+                async def join_drains():
+                    await asyncio.gather(*self._stream_drains, return_exceptions=True)
+
+                # A drain cancelled before its first step cannot close its response.
+                await _finish_cleanup(asyncio.create_task(join_drains()))
         finally:
             if self._client is not None:
                 await self._client.aclose()
@@ -1269,7 +1273,13 @@ class LLMClient:
                     if record.finish_reason is None:
                         raise _ProtocolError("response ended without a completion finish reason")
                     if record.finish_reason not in {"stop", "length", "tool_calls", "function_call"}:
-                        raise _ProtocolError("endpoint did not finish a usable answer")
+                        message = "endpoint did not finish a usable answer"
+                        if spec.identity is None:
+                            reason = ascii(record.finish_reason[:80])
+                            if len(record.finish_reason) > 80:
+                                reason += "..."
+                            message += f" (finish_reason={reason})"
+                        raise _ProtocolError(message)
                     record.tool_calls = [tool_parts[index] for index in sorted(tool_parts)]
                     if spec.scorer == "tool" and record.tool_calls:
                         ids = [call["id"] for call in record.tool_calls]

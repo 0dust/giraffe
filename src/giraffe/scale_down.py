@@ -738,15 +738,18 @@ async def execute(run, target, client, fixtures, *, collector_task=None):
                     task.cancel()
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
-            # Completion can fall between collector polls. Give the same live
-            # sampler one final observation within the existing cleanup window.
+            # A response arriving after client completion may have been captured
+            # earlier. Wait for this sampler to start a new collection after the
+            # client join, within the same cleanup window.
+            clients_completed_ms = (time.monotonic()-run.start)*1000
             history = observation.get("scale_down_deployment_history", [])
             collected = len(history)
             while (target.deployment.collector_url and collector_task is not None
                    and not collector_task.done() and time.monotonic() < finish
                    and not observation["serving_telemetry"].get("sample_limit_reached")
-                   and collected < min(run.config.metrics_max_samples, MAX_SCALE_DOWN_SNAPSHOTS)
-                   and len(observation.get("scale_down_deployment_history", [])) == collected):
+                   and len(history) < min(run.config.metrics_max_samples, MAX_SCALE_DOWN_SNAPSHOTS)
+                   and not any((row.get("scale_down_lifecycle") or {}).get("collected_start_ms", -math.inf)
+                               >= clients_completed_ms for row in history[collected:])):
                 stop_reason = reason()
                 if stop_reason and stop_reason != "maximum request budget reached":
                     break

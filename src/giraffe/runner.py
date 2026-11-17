@@ -62,6 +62,18 @@ def _reasoning_budget(record) -> bool:
     return reasoning_budget(record)
 
 
+def model_identity_warnings(config: RunConfig, records: list[RequestRecord]) -> list[str]:
+    warnings = []
+    for target in config.targets:
+        observed = sorted({r.observed_model for r in records
+                           if r.target == target.name and r.observed_model and r.observed_model != target.model})
+        if observed:
+            warnings.append(f"Target {target.name} requested model {target.model!r}, but responses reported "
+                            + ", ".join(repr(name[:256]) for name in observed[:8])
+                            + ". Model aliases may differ; verify the served model.")
+    return warnings
+
+
 def _stats(records: list[RequestRecord]) -> dict:
     """attempted = completed + failed + timed_out + cancelled + reasoning_budget_exhausted.
 
@@ -113,11 +125,11 @@ def _stats(records: list[RequestRecord]) -> dict:
 
 
 def _cannot_meet_correctness(stats: dict, minimum: float) -> bool:
-    """Fail only if every unscored attempt passing would still miss the limit."""
-    attempted = stats["attempted"]
-    if not attempted:
+    """Fail only if every valid unscored completion passing would still miss the limit."""
+    completed = stats["completed"]
+    if not completed:
         return False
-    best_possible = (stats["correct"] + attempted - stats["scored"]) / attempted
+    best_possible = (stats["correct"] + completed - stats["scored"]) / completed
     return best_possible < minimum
 
 
@@ -2209,7 +2221,7 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                 metrics["reason_code"] = "scoring_disabled"
                 status, summary = "inconclusive", "Some request-pack cases have scoring disabled; answer correctness cannot be established."
             elif metrics["completed"] != metrics["attempted"] or metrics["scored"] < metrics["completed"] or not metrics["scored"]:
-                status, summary = "inconclusive", "Some fixtures lack a score because inference or answer evaluation did not complete."
+                status, summary = "inconclusive", "Some fixtures have no complete, locally scored answer."
                 if metrics["cancelled"]:
                     metrics["reason_code"] = "cancelled"
             elif (check_id == "context" and not metrics["near_limit_coverage"]
@@ -2372,7 +2384,7 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                             "baseline": before, "latency_ratio": latency_ratio, "first_output_ratio": first_ratio,
                             "sustained_budget": observations.get("sustained_budget"), "accuracy": accuracy,
                             "unscored_completions": sum(r.status == "completed" and r.valid and r.score is None
-                                                        for r in probes + sustained),
+                                                        for r in baseline + probes + sustained),
                             "baseline_non_timeout_error_rate": baseline_error_rate,
                             "sustained_error_rate": sustained_error_rate,
                             "sustained_non_timeout_error_rate": sum(r.status not in {"completed", "timeout", "cancelled"}
@@ -2392,7 +2404,7 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
             elif metrics["cancelled"]:
                 status, summary = "inconclusive", "Sustained or recovery requests were cancelled by the run deadline or a stop; recovery was not fully observed."
                 metrics["reason_code"] = "cancelled"
-            elif accuracy is None or metrics["scored"] < metrics["attempted"]:
+            elif accuracy is None or metrics["unscored_completions"]:
                 status, summary = "inconclusive", "Some baseline, sustained or recovery answers lack a local correctness score."
             elif saturated and any((limits.first_output_ms, limits.latency_ms, limits.stream_gap_ms,
                                         limits.min_output_tokens_per_second, limits.recovery_max_ratio)):
@@ -2516,8 +2528,7 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
             check.finding_summary = "Run stopped after the configured number of request errors before this check finished."
             check.summary = (check.finding_summary + " Inspect the failed requests, fix the error cause, "
                              "then rerun the unfinished checks.")
-            continue
-        if check.id not in {"load", "concurrency"}:
+        elif check.id not in {"load", "concurrency"}:
             check.summary = _verdict_summary(check, config, records, budget)
         if disconnected:
             check.finding_summary = disconnected + "."
@@ -3171,13 +3182,7 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
               for target in config.targets if target.name in grouped}
     warnings = ["Other traffic on the target is unknown; results cover only the recorded workload.",
                 "Backend/replica identity is unverified unless explicitly reported by the server; a service URL does not establish complete replica coverage."]
-    for target in config.targets:
-        observed = sorted({r.observed_model for r in run.records
-                           if r.target == target.name and r.observed_model and r.observed_model != target.model})
-        if observed:
-            warnings.append(f"Target {target.name} requested model {target.model!r}, but responses reported "
-                            + ", ".join(repr(name[:256]) for name in observed[:8])
-                            + ". Model aliases may differ; verify the served model.")
+    warnings.extend(model_identity_warnings(config, run.records))
     if run.memory_limit_reached:
         warnings.append("Maximum memory (RAM growth during this run) was exceeded." +
             (" Unfinished checks were interrupted." if run.memory_interrupted_checks else " No check was interrupted."))

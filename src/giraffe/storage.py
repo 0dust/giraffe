@@ -348,6 +348,16 @@ def pid_alive(pid: int, *, uncertain: bool) -> bool:
     return True
 
 
+def _evidence_version(directory: Path) -> list[int] | None:
+    try:
+        info = (directory / "evidence.jsonl").lstat()
+    except OSError:
+        return None
+    if stat.S_ISREG(info.st_mode):
+        return [info.st_dev, info.st_ino, info.st_mtime_ns, info.st_size]
+    return None
+
+
 def _run(directory: Path, active_id: str | None, sources: set[str], unknown_source: bool) -> dict | None:
     if directory.name.startswith(".") or directory.is_symlink() or not directory.is_dir():
         return None
@@ -382,7 +392,9 @@ def _run(directory: Path, active_id: str | None, sources: set[str], unknown_sour
         reason = "saved baseline source could not be read"
     elif meta.get("state") in states.RUN_OWNED_STATES and run_alive(directory, meta, active_id=active_id):
         reason = "run is " + meta["state"]
-    elif (directory / "evidence.jsonl").exists() and not (directory / "report.json").is_file():
+    elif ((directory / "evidence.jsonl").exists() and not (directory / "report.json").is_file()
+          and (meta.get("released_evidence") is None
+               or meta["released_evidence"] != _evidence_version(directory))):
         reason = "unrecovered request evidence"
     if not directory.is_dir():
         return None
@@ -562,4 +574,8 @@ def set_kept(directory: Path | str, kept: bool) -> None:
     if kept:
         marker.touch()
     else:
+        version = _evidence_version(directory)
+        if version is not None and not (directory / "report.json").is_file() and is_giraffe_run(directory):
+            # Release only this journal version; later evidence is protected again.
+            update_metadata(directory, {"released_evidence": version})
         marker.unlink(missing_ok=True)

@@ -302,6 +302,74 @@ def test_recovery_incomplete_baseline_cannot_become_a_pass():
     assert result.status == "inconclusive"
     assert result.metrics["correct"] == 10 and result.metrics["scored"] == 11
     assert result.metrics["attempted"] == 20 and result.metrics["accuracy"] == 10 / 11
+    assert result.metrics["unscored_completions"] == 9
+
+
+def test_recovery_tolerated_request_failure_does_not_require_an_answer_score():
+    settings = config(checks=["recovery"], default_concurrency=1, samples=2,
+                      limits=Limits(max_error_rate=.34, min_samples=2, recovery_max_ratio=2))
+    state = runner._Run(settings, None, None)
+    state.observations["local"]["sustained_complete"] = True
+    for index, scenario in enumerate(["recovery_baseline"] * 2 + ["sustained"] * 3 + ["recovery"] * 2):
+        spec = fixture(expected="42").model_copy(update={"scenario": scenario, "check_ids": ["recovery"]})
+        answer = record(spec, "42", id=str(index), finish_reason="stop", elapsed_ms=10, first_output_ms=1)
+        if index == 4:
+            answer = answer.model_copy(update={"status": "failed", "valid": False,
+                                               "output": "", "error": "HTTP 503"})
+        else:
+            answer = score_response(spec, answer)
+        state.records.append(answer)
+
+    result = next(item for item in runner._checks(state, settings.targets[0]) if item.id == "recovery")
+    assert result.status == "pass"
+    assert result.metrics["sustained_error_rate"] == 1 / 3
+    assert result.metrics["scored"] == 6 and result.metrics["attempted"] == 7
+    assert result.metrics["unscored_completions"] == 0
+
+
+@pytest.mark.parametrize("request_status", ["failed", "timeout", "cancelled", "completed"])
+@pytest.mark.parametrize("capped,threshold,status", [
+    (0, .9, "fail"),
+    (8, .9, "inconclusive"),
+    (8, math.nextafter(.9, 1), "fail"),
+])
+def test_recovery_correctness_bound_excludes_invalid_requests(
+    request_status, capped, threshold, status,
+):
+    settings = config(checks=["recovery"], default_concurrency=1, samples=2,
+                      limits=Limits(min_correctness=threshold, max_error_rate=.8,
+                                    min_samples=2, recovery_max_ratio=2))
+    state = runner._Run(settings, None, None)
+    state.observations["local"]["sustained_complete"] = True
+    answers = ([("recovery_baseline", "42", "stop")] * 2
+               + [("sustained", "42", "stop")] * 6
+               + [("sustained", "14", "stop")] * 2
+               + [("sustained", "4", "length")] * capped
+               + [("sustained", "", None)] * 8
+               + [("recovery", "42", "stop")] * 2)
+    for index, (scenario, output, finish) in enumerate(answers):
+        spec = fixture(expected="42").model_copy(update={"scenario": scenario, "check_ids": ["recovery"]})
+        answer = record(spec, output, id=str(index), finish_reason=finish,
+                        elapsed_ms=10, first_output_ms=1)
+        if finish is None:
+            answer = answer.model_copy(update={"status": request_status, "valid": False})
+        state.records.append(score_response(spec, answer))
+
+    result = next(item for item in runner._checks(state, settings.targets[0]) if item.id == "recovery")
+    assert result.status == status
+    assert result.metrics["correct"] == 10 and result.metrics["scored"] == 12
+    assert result.metrics["accuracy"] == 10 / 12
+    assert result.metrics["attempted"] == 20 + capped
+    assert result.metrics["completed"] == 12 + capped
+    assert result.metrics["unscored_completions"] == capped
+
+
+@pytest.mark.parametrize("request_status", ["failed", "timeout", "cancelled", "completed"])
+def test_correctness_bound_without_valid_completions_has_no_answer_evidence(request_status):
+    spec = fixture()
+    failed = record(spec, "", status=request_status, valid=False)
+    assert runner._cannot_meet_correctness(runner._stats([failed]), .9) is False
+    assert runner._cannot_meet_correctness(runner._stats([]), .9) is False
 
 
 @pytest.mark.parametrize("output", ['{"count":14}', '{"other":42}'])

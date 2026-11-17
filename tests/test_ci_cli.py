@@ -460,7 +460,7 @@ def interrupted_cli_run(tmp_path, monkeypatch):
     return tmp_path
 
 
-def test_report_recovers_interrupted_cli_journal_without_rewriting_source(interrupted_cli_run, capsys):
+def test_report_saves_recovered_cli_journal_without_rewriting_evidence(interrupted_cli_run, capsys):
     import xml.etree.ElementTree as ET
 
     directory = interrupted_cli_run
@@ -473,8 +473,12 @@ def test_report_recovers_interrupted_cli_journal_without_rewriting_source(interr
     assert ET.parse(junit).findall('.//skipped')
     assert 'INCONCLUSIVE' in summary.read_text()
     assert 'Recovered 1 recorded requests' in capsys.readouterr().err
-    assert not (directory / 'report.json').exists()
-    assert all((directory / name).read_bytes() == value for name, value in before.items())
+    recovered = RunReport.model_validate_json((directory / 'report.json').read_text())
+    assert recovered.overall == 'inconclusive' and len(recovered.requests) == 1
+    assert recovered.requests[0].output == 'sensitive answer'
+    assert (directory / 'evidence.jsonl').read_bytes() == before['evidence.jsonl']
+    metadata = json.loads((directory / '.web.json').read_text())
+    assert metadata['state'] == 'interrupted' and metadata['run_id'] == 'interrupted'
 
 
 @pytest.mark.parametrize('owner', ['live', 'self', 'permission', 'unknown_error', 'foreign', 'invalid'])

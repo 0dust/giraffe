@@ -156,6 +156,11 @@ Keep them in place before registering the trusted publishers.
 5. After upload, verify `python -m pip install "giraffe-llm==0.1.0a2"` and the CLI
    in another fresh environment. Then update README installation instructions
    to use the published package.
+6. If the release was cut from a release branch, set the version on `main` to
+   the next development version (for example, `0.1.0a3.dev0` after
+   publishing `0.1.0a2`) in `pyproject.toml` and `src/giraffe/__init__.py`,
+   and run `uv lock`. A source install of `main` must never report an older
+   version than the latest published release.
 
 Use a new version for changed artifacts; uploaded distribution filenames cannot
 be reused. Upload failures remain failures instead of silently skipping existing

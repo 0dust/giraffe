@@ -86,6 +86,8 @@ raise SystemExit(cli.main(["run", "--url", "http://server", "--model", "tiny", "
     assert json.loads(process.stdout)["exit_code"] == 130
     assert "Traceback" not in process.stderr
     assert (directory / "report.json").exists() == (phase == "unsupported_loop")
+    assert json.loads((directory / ".web.json").read_text())["state"] == (
+        "interrupted" if phase == "startup" else "completed")
 
 
 def test_cli_sigint_during_cleanup_preserves_remaining_runs(tmp_path):
@@ -124,19 +126,38 @@ raise SystemExit(cli.main(["run", "--url", "http://server", "--model", "tiny", "
 
 
 @pytest.mark.parametrize("stop_signal", [signal.SIGINT, signal.SIGTERM])
-@pytest.mark.parametrize("phase", ["report", "ci", "stdout", "forced_report"])
+@pytest.mark.parametrize("phase", ["report", "ci", "stdout", "forced_report", "journal", "teardown",
+                                   "forced_partial_report", "forced_partial_journal"])
 def test_cli_signal_during_export_saves_report_and_complete_json(tmp_path, stop_signal, phase):
     script = '''
 import os, signal, sys
 from giraffe import cli, runner, reporting
+from giraffe.evidence import EvidenceWriter
 from giraffe.models import RunReport
 async def run(config, **kwargs):
+    if sys.argv[3] in {"forced_partial_report", "forced_partial_journal"}:
+        os.kill(os.getpid(), int(sys.argv[2]))
+        await kwargs["stop_event"].wait()
     return RunReport(run_id="finished", started_at="now", finished_at="now",
                      overall="pass", manifest={"config": config.model_dump(mode="json")})
 runner.run_suite = run
+original_close = EvidenceWriter.close
+def close(writer):
+    if sys.argv[3] in {"journal", "forced_partial_journal"}:
+        os.kill(os.getpid(), int(sys.argv[2]))
+    return original_close(writer)
+EvidenceWriter.close = close
+original_run = cli.asyncio.run
+def asyncio_run(coro, **kwargs):
+    is_suite = coro.__name__ == "run_with_partial_report"
+    result = original_run(coro, **kwargs)
+    if is_suite and sys.argv[3] == "teardown":
+        os.kill(os.getpid(), int(sys.argv[2]))
+    return result
+cli.asyncio.run = asyncio_run
 original = reporting.write_report
 def write(*args, **kwargs):
-    if sys.argv[3] in {"report", "forced_report"}:
+    if sys.argv[3] in {"report", "forced_report", "forced_partial_report"}:
         os.kill(os.getpid(), int(sys.argv[2]))
         if sys.argv[3] == "forced_report":
             os.kill(os.getpid(), int(sys.argv[2]))
@@ -174,10 +195,11 @@ raise SystemExit(cli.main(["run", "--url", "http://server", "--model", "tiny",
     assert process.returncode == expected_code, process.stderr
     result = json.loads(process.stdout)
     assert result["exit_code"] == expected_code
-    assert result["outcome"] == ("pass" if phase == "stdout" else "interrupted")
-    if phase == "forced_report":
+    assert result["outcome"] == ("pass" if phase in {"stdout", "journal"} else "interrupted")
+    if phase in {"forced_report", "forced_partial_report", "forced_partial_journal"}:
         assert not (directory / "report.json").exists()
         assert (directory / "evidence.jsonl").exists()
+        assert json.loads((directory / ".web.json").read_text())["state"] == "interrupted"
         assert "Traceback" not in process.stderr
         return
     assert json.loads((directory / "report.json").read_text())["overall"] == "pass"

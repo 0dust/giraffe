@@ -380,3 +380,81 @@ async def test_final_observation_does_not_wait_for_unavailable_collector(unavail
     finally:
         collector_task.cancel()
         await asyncio.gather(collector_task, return_exceptions=True)
+
+
+@pytest.mark.parametrize('stop_at', ['completion_deadline', 'run_deadline', 'scheduler_resume', 'sample_cap', 'user_stop'])
+def test_stale_final_polls_keep_existing_cleanup_boundaries(monkeypatch, stop_at):
+    from giraffe import scale_down
+    from giraffe.models import ScaleDownSnapshot
+    from tests.virtual_clock import run_virtual
+
+    async def scenario():
+        monkeypatch.setattr('tests.test_scale_down_runner.time', scale_down.time)
+        limits = {'max_duration_seconds': .3} if stop_at == 'run_deadline' else {}
+        run, target, client, fixtures, _ = make_run(global_limits=limits)
+        run.config.scale_down.completion_seconds = .6
+        run.config.metrics_max_samples = 16 if stop_at == 'sample_cap' else 256
+        target.deployment.collector_url = 'http://localhost/collector'
+        history = run.observations[target.name]['scale_down_deployment_history'] = []
+        phases, boundary = {}, {}
+        original_phase = scale_down.ScaleDownController.set_phase
+        loop = asyncio.get_running_loop()
+
+        def observed_phase(control, phase):
+            phases[phase] = loop.time()
+            if phase == 'finalizing':
+                if stop_at == 'user_stop':
+                    boundary['expected'] = loop.time() + .3
+                    loop.call_at(boundary['expected'], run.stop.set)
+                elif stop_at == 'scheduler_resume':
+                    boundary['expected'] = loop.time() + .58 + .337
+                    def scheduler_pause():
+                        loop.now += .337
+                    loop.call_at(loop.time() + .58, scheduler_pause)
+            return original_phase(control, phase)
+
+        monkeypatch.setattr(scale_down.ScaleDownController, 'set_phase', observed_phase)
+
+        async def collector():
+            while run.scale_down_control.phase != 'finalizing':
+                await asyncio.sleep(.001)
+            if stop_at == 'sample_cap':
+                boundary['expected'] = loop.time() + .02 * run.config.metrics_max_samples
+            # Keep delivering old captures after clients settle. Neither their
+            # arrival nor their repetition can reset the existing finish time.
+            while True:
+                await asyncio.sleep(.02)
+                history.append({'scale_down_lifecycle': ScaleDownSnapshot(
+                    collected_start_ms=0, collected_end_ms=(loop.time()-run.start)*1000,
+                    capture_start_ms=0, capture_end_ms=0,
+                    export=dict(target=target.name, source='test-backend', clock_id='test-clock',
+                                through_sequence=1, events=[], inventories=[])).model_dump(mode='json')})
+                if len(history) == run.config.metrics_max_samples:
+                    boundary['expected'] = loop.time()
+                    await asyncio.Event().wait()
+
+        sampler = asyncio.create_task(collector())
+        try:
+            await asyncio.wait_for(scale_down.execute(run, target, client, fixtures,
+                                                     collector_task=sampler), timeout=2)
+            evidence = run.observations[target.name]['scale_down']
+            assert all(snapshot['collected_start_ms'] == 0 for snapshot in evidence['snapshots'])
+            assert scale_down.result(run, target).status == 'inconclusive'
+            assert run.slots.qsize() == run.slots.maxsize
+            if stop_at in {'completion_deadline', 'run_deadline'}:
+                boundary['expected'] = min(run.deadline, phases['finalizing'] + .6)
+            return dict(stop_at=stop_at, started=phases['finalizing'], finished=phases['finished'],
+                        expected=boundary['expected'], snapshots=len(history),
+                        sample_limit=run.config.metrics_max_samples,
+                        client_completed=max(record.completed_ms for record in run.records)/1000)
+        finally:
+            sampler.cancel()
+            await asyncio.gather(sampler, return_exceptions=True)
+
+    observed = run_virtual(monkeypatch, scenario())
+    assert observed['client_completed'] < observed['expected'], observed
+    assert observed['snapshots'] > 2, observed
+    assert observed['expected'] <= observed['finished'] < observed['expected'] + .01 + 1e-9, observed
+    assert observed['snapshots'] <= observed['sample_limit'], observed
+    if stop_at == 'sample_cap':
+        assert observed['snapshots'] == observed['sample_limit'], observed

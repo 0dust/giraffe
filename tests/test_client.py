@@ -360,6 +360,22 @@ async def test_unusable_terminal_reason_cannot_complete_validly(monkeypatch, str
         result = await client.execute(spec())
     assert not result.valid and result.status == "failed"
     assert "usable answer" in result.error
+    assert f"finish_reason={finish!r}" in result.error
+
+
+@pytest.mark.parametrize("stream", [False, True])
+async def test_unusable_terminal_reason_diagnostic_is_bounded_and_escaped(monkeypatch, stream):
+    finish = "abort\n\x1b\u202e" + "x" * 1000
+    client, _, _ = setup_client(monkeypatch,
+        [event("42"), event(finish=finish), b'data: [DONE]\n\n'] if stream else None,
+        stream=stream, body=None if stream else {
+            "choices": [{"message": {"content": "42"}, "finish_reason": finish}]})
+    async with client:
+        result = await client.execute(spec())
+    assert not result.valid and result.status == "failed"
+    assert "abort\\n\\x1b\\u202e" in result.error
+    assert not any(character in result.error for character in ("\n", "\x1b", "\u202e"))
+    assert len(result.error) < 200 and result.error.endswith("...)")
 
 
 @pytest.mark.parametrize("chunks", [
@@ -609,6 +625,98 @@ async def test_malformed_transport_tail_after_done_preserves_completed_response(
     assert result.status == "completed" and result.valid and result.output == "42"
     assert result.response_body_bytes == body_bytes
     assert response.closed and not client._stream_drains
+
+
+@pytest.mark.parametrize("repeat_cancel", [False, True])
+async def test_cancelled_shutdown_joins_stream_drain_before_propagating(monkeypatch, repeat_cancel):
+    import asyncio
+    from giraffe import client as module
+
+    close_release, second_cancel = asyncio.Event(), asyncio.Event()
+    responses, parsers, records, clients = [], [], [], []
+    owner = None
+
+    class PendingTail(httpx.AsyncByteStream):
+        closed = False
+
+        async def __aiter__(self):
+            yield event("42", finish="stop")
+            # Reproduce a ready monitor cancelling the owner before the newly
+            # scheduled drain has entered its response/parser cleanup scopes.
+            asyncio.get_running_loop().call_soon(owner.cancel)
+            yield b"data: [DONE]\n\n"
+            await asyncio.Event().wait()
+
+        async def aclose(self):
+            if repeat_cancel:
+                def cancel_again():
+                    owner.cancel()
+                    second_cancel.set()
+
+                asyncio.get_running_loop().call_soon(cancel_again)
+                await close_release.wait()
+            self.closed = True
+
+    body = PendingTail()
+
+    def respond(request):
+        response = httpx.Response(200, stream=body, request=request,
+            headers={"content-type": "text/event-stream"},
+            extensions={"http_version": b"HTTP/1.1"})
+        responses.append(response)
+        return response
+
+    actual_client, actual_events = httpx.AsyncClient, module._sse_events
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: actual_client(
+        **kwargs, transport=httpx.MockTransport(respond)))
+
+    def capture_events(*args, **kwargs):
+        parser = actual_events(*args, **kwargs)
+        parsers.append(parser)
+        return parser
+
+    monkeypatch.setattr(module, "_sse_events", capture_events)
+    monkeypatch.setattr(module, "_STREAM_DRAIN_SECONDS", .01)
+    target = Target(name="local", url="http://local", model="test")
+
+    async def run():
+        nonlocal owner
+        owner = asyncio.current_task()
+        async with LLMClient(target, RunConfig(targets=[target])) as client:
+            clients.append(client)
+            records.append(await client.execute(spec()))
+
+    pending = asyncio.create_task(run())
+    repeated = None
+    try:
+        async with asyncio.timeout(1):
+            if repeat_cancel:
+                repeated = asyncio.create_task(second_cancel.wait())
+                await asyncio.wait((pending, repeated), return_when=asyncio.FIRST_COMPLETED)
+                if repeated.done():
+                    assert pending.cancelling() == 2
+                    assert not pending.done() and clients[0]._client is not None
+                    assert not body.closed
+                    close_release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await pending
+        assert records[0].valid and records[0].status == "completed"
+        assert pending.cancelling() == (2 if repeat_cancel else 1)
+        assert responses[0].is_closed and body.closed
+        assert parsers[0].ag_frame is None
+        assert not clients[0]._stream_drains and clients[0]._client is None
+    finally:
+        close_release.set()
+        if repeated is not None:
+            repeated.cancel()
+            await asyncio.gather(repeated, return_exceptions=True)
+        await asyncio.gather(pending, return_exceptions=True)
+        for parser in parsers:
+            await parser.aclose()
+        for response in responses:
+            await response.aclose()
+        for client in clients:
+            await client.__aexit__()
 
 
 @pytest.mark.asyncio

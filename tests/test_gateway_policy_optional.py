@@ -531,10 +531,15 @@ async def test_inline_policy_limit_preserves_saved_serving_comparison(monkeypatc
 @pytest.mark.usefixtures("local_tokenizer")
 @pytest.mark.parametrize("cap,overlap,counts,reasons", [
     (13, False, [2, 1], [
+        {"The target request limit interrupted the configured gateway policy probes."},
+        {"maximum request budget reached"},
+    ]),
+    # With overlapping targets, the second target can hit its own quota before
+    # the first target exhausts the global budget. Both budget reasons are valid.
+    (17, True, [4, 3], [{None}, {
         "The target request limit interrupted the configured gateway policy probes.",
         "maximum request budget reached",
-    ]),
-    (17, True, [4, 3], [None, "maximum request budget reached"]),
+    }]),
 ])
 async def test_policy_budget_stop_reason_belongs_to_the_target(monkeypatch, cap, overlap, counts, reasons):
     from tests.test_gateway_policy import configuration as configured_policy
@@ -586,12 +591,13 @@ async def test_policy_budget_stop_reason_belongs_to_the_target(monkeypatch, cap,
     assert all(check.status == "pass" for check in report.checks if check.id == "serving")
 
     policies = [check for check in report.checks if check.id == "gateway_policy"]
-    for check, dispatched, reason in zip(policies, counts, reasons, strict=True):
+    for check, dispatched, allowed_reasons in zip(policies, counts, reasons, strict=True):
         summary = check.metrics["gateway_policy"]
         observation = report.observations["targets"][check.target]["gateway_policy"]
         assert summary["complete"] == (dispatched == 4)
         assert sum(user["dispatched"] for user in summary["users"]) == dispatched
-        assert summary["stop_reason"] == reason
+        reason = summary["stop_reason"]
+        assert reason in allowed_reasons
         assert bool(observation.get("budget_limited")) == (reason is not None)
         if reason is not None:
             assert reason in check.summary

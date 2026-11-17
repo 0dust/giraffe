@@ -16,7 +16,17 @@ def test_capacity_comparison_direction_and_delta_in_html(before, after, verdict,
     html = _render(report)
     assert f'>{verdict}</strong>' in html
     assert delta in html
-    assert '0 measurements · 0 with warnings' in html
+    summary = html.split('class="comparison-summary"', 1)[1].split('<div id="html-results"', 1)[0]
+    assert 'Current acceptance:</strong> <span class="badge pass">pass</span>' in summary
+    assert 'Baseline comparison:</strong> Inconclusive' in summary  # No aggregate verdict was recorded in this legacy fixture.
+    assert ('No material regression' if after > before else 'Regression detected') in summary
+    assert f'<dt>Baseline</dt><dd>{before:.1f} req/s</dd>' in summary
+    assert f'<dt>Current</dt><dd>{after:.1f} req/s</dd>' in summary
+    assert f'<dt>Observed change</dt><dd>{after - before:+.1f} req/s</dd>' in summary
+    assert 'Matched complete stages.' in summary
+    assert 'Open full comparison (1 recorded rows)' in summary
+    assert 'href="#comparison-traffic-0">Open metric evidence</a>' in summary
+    assert html.count('id="comparison-traffic-0"') == 1
     assert 'Did each run meet its requirements?' in html
 
 

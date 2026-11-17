@@ -295,6 +295,40 @@ async def test_error_threshold_stop_has_actionable_remediation_without_run_caps(
     assert "To conclude, ." not in result.summary
 
 
+async def test_error_threshold_stop_preserves_connection_cause_for_unfinished_checks(client, monkeypatch):
+    async def disconnected(self, spec, **kwargs):
+        return RequestRecord(id=uuid.uuid4().hex, target=self.target.name,
+            fixture_id=spec.fixture_id, scenario=spec.scenario, check_ids=spec.check_ids,
+            started_at="2026-10-19T00:00:00Z", status="failed", error="request failed (ConnectError)")
+
+    monkeypatch.setattr(client, "execute", disconnected)
+    report = await runner.run_suite(config(checks=["serving", "correctness"], stop_after_errors=1))
+    assert report.abort_reason == "error threshold reached"
+    result = check(report, "correctness")
+    assert result.status == "inconclusive"
+    assert result.summary.startswith("Could not connect to http://localhost:1234 (ConnectError); no checks could run")
+    assert "request errors" in result.summary and "fix the error cause" in result.summary
+    assert result.remediation["code"] == "endpoint_unavailable"
+
+
+async def test_capped_answer_summary_does_not_claim_inference_failed(client, monkeypatch):
+    original = client.execute
+
+    async def capped(self, spec, **kwargs):
+        record = await original(self, spec, **kwargs)
+        return record.model_copy(update={"output": "Let me reason through the answer",
+                                         "finish_reason": "length"})
+
+    monkeypatch.setattr(client, "execute", capped)
+    report = await runner.run_suite(config(checks=["correctness"], concurrency=1, default_concurrency=1))
+    result = check(report, "correctness")
+    assert result.status == "inconclusive"
+    assert all(record.status == "completed" for record in report.requests)
+    assert "no complete, locally scored answer" in result.summary
+    assert "inference or answer evaluation did not complete" not in result.summary
+    assert "max_output_tokens" in result.summary
+
+
 def test_serial_generation_measurement_remedy_does_not_raise_concurrency():
     from tests.test_timing import request
 
