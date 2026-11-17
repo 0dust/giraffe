@@ -1,13 +1,156 @@
 """Bad model selections block inference while transient probe failures remain advisory."""
 
+import json
+
 import httpx
 import pytest
 
-from giraffe.client import _headers
+from giraffe.client import LLMClient, _headers
 from giraffe.models import RunConfig, Target
 from giraffe.preflight import (ConnectionTest, ModelDiscovery, PreflightError, check_connection,
                                check_target, discover_models)
 from tests.test_connection import endpoint
+
+
+@pytest.mark.parametrize("status,body,options,rejected", [
+    (400, {"error": {"message": 'invalid reasoning value: "bogus" (must be ...)',
+                     "type": "invalid_request_error", "param": None, "code": None}},
+     {"reasoning_effort": "bogus"}, None),
+    (400, {"error": {"message": "bad", "param": "reasoning_effort"}},
+     {"reasoning_effort": "bogus"}, "reasoning_effort"),
+    (400, {"error": {"message": "Unknown field chat_template_kwargs SECRET-ECHO"}},
+     {"reasoning_effort": "bogus", "chat_template_kwargs": {"enable_thinking": False}},
+     "chat_template_kwargs"),
+    (422, {"detail": [{"type": "extra_forbidden", "loc": ["body", "reasoning_effort"], "msg": "x"}]},
+     {"reasoning_effort": "bogus"}, "reasoning_effort"),
+    (400, {"error": {"message": "invalid user input"}}, {"user": "x"}, None),
+    (400, {"error": {"message": "bad", "param": "user"}}, {"user": "x"}, "user"),
+    (400, {"error": "bad request"}, {}, None),
+    (404, {"error": "Unknown field reasoning_effort"}, {"reasoning_effort": "bogus"}, None),
+])
+async def test_request_option_rejection_message_is_private(monkeypatch, status, body, options, rejected):
+    requests, _ = endpoint(monkeypatch, lambda request: httpx.Response(status, json=body))
+    records = []
+    execute = LLMClient.execute
+
+    async def capture(client, spec):
+        record = await execute(client, spec)
+        records.append(record)
+        return record
+
+    monkeypatch.setattr(LLMClient, "execute", capture)
+    target = Target(name="local", url="http://server", model="tiny")
+    with pytest.raises(PreflightError) as error:
+        await check_target(target, RunConfig(targets=[target], request_options=options))
+
+    if rejected:
+        expected = (f"The server returned HTTP {status} and rejected request_options.{rejected}. "
+                    "Check that field's value or remove it from the configuration.")
+    elif options and status in {400, 422}:
+        expected = (f"The server returned HTTP {status}. Check the model name, the OpenAI-compatible "
+                    f"endpoint and request_options ({', '.join(sorted(options))}).")
+    else:
+        expected = (f"The server returned HTTP {status}. "
+                    "Check the model name and OpenAI-compatible endpoint.")
+    assert str(error.value) == expected
+    assert error.value.blocking is (status == 404)
+    assert len(requests) == 1
+    workload = records[0].workload
+    assert workload.get("rejected_request_option") == rejected
+    assert workload.get("request_option_keys") == (sorted(options) if options and status != 404 else None)
+    for private in ("invalid reasoning value", "bogus", "SECRET-ECHO"):
+        assert private not in str(error.value)
+        assert private not in json.dumps(workload)
+
+
+async def test_request_option_fallback_lists_at_most_five_keys(monkeypatch):
+    endpoint(monkeypatch, lambda request: httpx.Response(400, json={"error": {"message": "bad"}}))
+    target = Target(name="local", url="http://server", model="tiny")
+    options = {f"option_{letter}": "x" for letter in "gfedcba"}
+    with pytest.raises(PreflightError) as error:
+        await check_target(target, RunConfig(targets=[target], request_options=options))
+    assert str(error.value) == (
+        "The server returned HTTP 400. Check the model name, the OpenAI-compatible endpoint "
+        "and request_options (option_a, option_b, option_c, option_d, option_e and 2 more).")
+    assert "option_f" not in str(error.value) and "option_g" not in str(error.value)
+
+
+async def test_model_rejection_with_request_options_keeps_precedence(monkeypatch):
+    endpoint(monkeypatch, lambda request: httpx.Response(200, json={"data": [{"id": "available"}]})
+             if request.method == "GET" else httpx.Response(400, json={"error": {
+                 "message": "model tiny not found", "param": "reasoning_effort"}}))
+    target = Target(name="local", url="http://server", model="tiny")
+    with pytest.raises(PreflightError) as error:
+        await check_target(target, RunConfig(targets=[target], request_options={"reasoning_effort": "bogus"}))
+    assert error.value.blocking
+    assert str(error.value) == 'Model "tiny" not served at http://server. Available: available.'
+
+
+async def test_rejection_records_only_request_options_sent_in_payload(monkeypatch):
+    from giraffe.models import RequestSpec
+
+    requests, _ = endpoint(monkeypatch, lambda request: httpx.Response(400, json={
+        "error": {"message": "bad model stream_options temperature", "param": "model"}}))
+    target = Target(name="local", url="http://server", model="tiny")
+    config = RunConfig(targets=[target], request_options={"reasoning_effort": "bogus"})
+    async with LLMClient(target, config) as client:
+        record = await client.execute(RequestSpec(
+            fixture_id="connection", scenario="connection", check_ids=["access"],
+            messages=[{"role": "user", "content": "Reply with OK."}], stream=False,
+            options={"model": "ignored", "temperature": None, "stream_options": {"include_usage": True}},
+        ))
+    payload = json.loads(requests[0].content)
+    assert payload["model"] == "tiny"
+    assert "temperature" not in payload and "stream_options" not in payload
+    assert record.workload["request_option_keys"] == ["reasoning_effort"]
+    assert "rejected_request_option" not in record.workload
+
+
+@pytest.mark.parametrize("scenario", ["connection", "serving"])
+async def test_rejection_records_only_configured_preflight_options(monkeypatch, scenario):
+    from giraffe.models import RequestSpec
+
+    requests, _ = endpoint(monkeypatch, lambda request: httpx.Response(400, json={"error": "bad"}))
+    target = Target(name="local", url="http://server", model="tiny")
+    config = RunConfig(targets=[target], request_options={"reasoning_effort": "x"}, stream=True)
+    async with LLMClient(target, config) as client:
+        client.token_evidence["usage"] = "supported"
+        record = await client.execute(RequestSpec(
+            fixture_id="probe", scenario=scenario, check_ids=["access"],
+            messages=[{"role": "user", "content": "Reply with OK."}], stream=True,
+            options={"temperature": 0},
+        ))
+    payload = json.loads(requests[0].content)
+    assert payload["temperature"] == 0 and payload["stream"] is True
+    assert payload["stream_options"] == {"include_usage": True}
+    if scenario == "connection":
+        assert record.workload["request_option_keys"] == ["reasoning_effort"]
+    else:
+        assert "request_option_keys" not in record.workload
+
+
+@pytest.mark.parametrize("body,keys,expected", [
+    (b"not JSON", ["temperature"], None),
+    (b"[]", ["temperature"], None),
+    (b'{"error":"bad reasoning_effort"}', ["reasoning_effort"], "reasoning_effort"),
+    (b'{"detail":"bad reasoning_effort"}', ["reasoning_effort"], "reasoning_effort"),
+    (b'{"message":"bad reasoning_effort"}', ["reasoning_effort"], "reasoning_effort"),
+    (b'{"error":{"message":"bad reasoning_effort_extra"}}', ["reasoning_effort"], None),
+    (b'{"error":{"message":"bad option_name.value"}}', ["option_name.value"], "option_name.value"),
+    (b'{"error":{"message":"bad option_nameXvalue"}}', ["option_name.value"], None),
+    (b'{"error":{"message":"invalid user input"}}', ["user"], None),
+    (b'{"error":{"message":"bad seed"}}', ["seed"], None),
+    (b'{"error":{"message":"stop now"}}', ["stop"], None),
+    (b'{"error":{"param":"seed"}}', ["seed"], "seed"),
+    (b'{"detail":[{"loc":["body","stop"]}]}', ["stop"], "stop"),
+    (b'{"error":{"param":"z"},"detail":[{"loc":["a"]}]}', ["z", "a"], "a"),
+    (b'{"detail":[null,{"loc":"temperature"}]}', ["temperature"], None),
+    (b'{"error":{"message":null}}', ["temperature"], None),
+])
+def test_rejected_request_option_matches_only_supplied_keys(body, keys, expected):
+    from giraffe.client import _rejected_request_option
+
+    assert _rejected_request_option(body, iter(keys)) == expected
 
 
 @pytest.mark.parametrize("status", [400, 404, 422])
