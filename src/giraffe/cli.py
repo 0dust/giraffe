@@ -699,6 +699,9 @@ def _main(argv: list[str] | None = None) -> int:
         if hasattr(args, "output_format"):
             json_output = args.output_format == "json"
         kind = "baseline.save" if args.command == "baseline" else args.command
+        if sys.platform == "win32" and args.command in {"ui", "web", "run", "cold-start", "try-example"}:
+            return failure([{"loc": [], "message": "Native Windows is not supported; use WSL2 or Docker.",
+                             "type": "unsupported_platform"}])
         if arguments and arguments[0] in {"storage", "cleanup", "keep"}:
             replacement = {"storage": "list"}.get(arguments[0], arguments[0])
             print(f"Deprecated: giraffe {arguments[0]}; use giraffe runs {replacement}.", file=sys.stderr)
