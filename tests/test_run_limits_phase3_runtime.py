@@ -10,12 +10,13 @@ from giraffe import runner
 from giraffe.client import LLMClient
 from giraffe.fixtures import builtin_fixtures
 from giraffe.models import RequestSpec, RunConfig
+from tests.virtual_clock import run_virtual
 
 TARGET = {'name': 'local', 'url': 'http://local/v1', 'model': 'm'}
 
 
 @pytest.mark.parametrize('checks', [['access'], ['access', 'serving', 'first_output', 'correctness']])
-async def test_global_output_budget_reaches_reasoning_requests_without_per_check_workaround(monkeypatch, checks):
+def test_global_output_budget_reaches_reasoning_requests_without_per_check_workaround(monkeypatch, checks):
     from tests.test_check_intent_core import DONE, ev
 
     original = httpx.AsyncClient
@@ -43,7 +44,7 @@ async def test_global_output_budget_reaches_reasoning_requests_without_per_check
         transport=httpx.MockTransport(answer), **kwargs))
     config = RunConfig(targets=[TARGET], checks=checks, max_output_tokens=2048,
                        samples=5, default_concurrency=1, max_requests=30)
-    report = await runner.run_suite(config)
+    report = run_virtual(monkeypatch, runner.run_suite(config))
 
     requests = [record for record in report.requests if record.fixture_id != 'performance-evidence']
     assert requests and all(record.requested_max_tokens == 2048 for record in requests)
