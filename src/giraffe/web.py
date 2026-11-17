@@ -1318,8 +1318,11 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
         except (OSError, ValueError, KeyError, TypeError):
             return None
 
-    def pending_recovery(directory: Path, state: str | None, *, report_available: bool | None = None) -> bool:
+    def pending_recovery(directory: Path, *, report_available: bool | None = None) -> bool:
+        state = metadata(directory).get("state")
         journal_present = (directory / "evidence.jsonl").is_file()
+        if (directory / "summary.json").is_file():
+            return False  # Recovery leaves a final verdict summary in charge.
         if state == "interrupted" and journal_present and report_available is None:
             # A listing summary does not validate the full report accepted by recovery.
             try:
@@ -1400,7 +1403,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                 "live_checks": list(live.get("checks", {}).values()),
                 "stoppable": bool(live) and state in states.RUN_OWNED_STATES,
                 "terminal": state in states.RUN_TERMINAL_STATES,
-                "recoverable": pending_recovery(directory, state,
+                "recoverable": pending_recovery(directory,
                     report_available=None if listing else persisted is not None),
                 "phases": live.get("phases", meta.get("phases", [])),
                 "config": meta.get("config") or (persisted or {}).get("manifest", {}).get("config", {}),
@@ -2146,8 +2149,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
             elif event.get("event", "").startswith("condition_") and event.get("condition"):
                 key = (event.get("target"), event["condition"]["id"])
                 checks[key] = feed.get("conditions", {}).get(key, event)
-        recoverable = (await run_in_threadpool(pending_recovery, _directory(root, identifier), feed["state"])
-                       if feed["state"] == "interrupted" else False)
+        recoverable = await run_in_threadpool(pending_recovery, _directory(root, identifier))
         return {"seq": seq, "reset": reset, "events": events, "records": list(records.values()),
                 "checks": list(checks.values()), "state": feed["state"],
                 "terminal": feed["state"] in states.RUN_TERMINAL_STATES,

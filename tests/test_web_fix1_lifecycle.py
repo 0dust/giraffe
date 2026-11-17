@@ -114,11 +114,37 @@ async def test_recoverable_distinguishes_valid_report_from_retained_journal(tmp_
             result = (await client.get(endpoint)).json()
             # Unreadable reports retain their existing error presentation.
             assert result["state"] == ("error" if saved_report in {"unreadable", "invalid_schema"} else "interrupted")
-            assert result["recoverable"] is (saved_report == "absent")
+            assert result["recoverable"] is (saved_report != "valid")
         row = next(row for row in (await client.get("/api/runs")).json()["runs"] if row["id"] == "saved")
         # The listing parser can read a summary from a schema-invalid report;
         # that summary must not count as successful recovery publication.
-        assert row["recoverable"] is (saved_report in {"absent", "invalid_schema"})
+        assert row["recoverable"] is (saved_report != "valid")
+
+
+@pytest.mark.parametrize("saved_report", ["absent", "unreadable"])
+@pytest.mark.parametrize("final_summary", ["valid", "unreadable", "symlink"])
+async def test_final_summary_owns_interrupted_journal_recovery(tmp_path, saved_report, final_summary):
+    from giraffe.storage import write_metadata
+
+    async with browser(tmp_path) as client:
+        directory = tmp_path / "saved"
+        write_metadata(directory, {"id": directory.name, "state": "interrupted"})
+        (directory / "evidence.jsonl").write_text("")
+        if saved_report == "unreadable":
+            (directory / "report.json").write_text("invalid JSON")
+        summary_path = directory / "summary.json"
+        if final_summary == "symlink":
+            target = tmp_path / "retained-summary.json"
+            target.write_text(json.dumps({"overall": "fail", "error": "final verdict"}))
+            summary_path.symlink_to(target)
+        else:
+            summary_path.write_text(json.dumps({"overall": "fail", "error": "final verdict"})
+                                    if final_summary == "valid" else "invalid JSON")
+        for endpoint in ("/api/runs/saved", "/api/runs/saved/events"):
+            result = (await client.get(endpoint)).json()
+            assert result["terminal"] is True and result["recoverable"] is False
+        row = next(row for row in (await client.get("/api/runs")).json()["runs"] if row["id"] == "saved")
+        assert row["terminal"] is True and row["recoverable"] is False
 
 
 @pytest.mark.parametrize("cleanup", ["unlink_failure", "crash_before_unlink"])
