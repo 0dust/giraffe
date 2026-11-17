@@ -65,7 +65,7 @@ from giraffe.planning import request_plan
 from giraffe.open_files import open_file_guard
 from giraffe.preflight import APIKeyInput, ConnectionTest, ModelDiscovery, PreflightError, TokenizerSelection, attach_api_key
 from giraffe.preflight import check_connection as _check_connection, discover_models as _discover_models
-from giraffe.reporting import (_render, compare_baseline, html_failure_warning, reproduction_export,
+from giraffe.reporting import (_render, compare_baseline, comparison_summary, html_failure_warning, reproduction_export,
                                save_baseline_report, save_failure_summary, write_comparison_report, write_report)
 from giraffe.report_stream import expanded_report_chunks
 from giraffe.request_pack import pack_preview
@@ -799,6 +799,7 @@ def _merged_condition_rows(planned: list[dict], observed: list[dict], *, termina
 def _api_report(report: RunReport) -> dict:
     """Keep dispatch/condition metadata; fetch retained evidence on demand."""
     result = report.model_dump(mode="json", exclude={"requests"})
+    result["comparison_summary"] = comparison_summary(report)
     fields = {"id", "target", "fixture_id", "scenario", "condition_id", "check_ids", "status",
               "valid", "score", "elapsed_ms", "first_output_ms", "max_stream_gap_ms", "dispatch_ms", "completed_ms",
               "started_at", "completed_at", "intentional", "http_status", "error", "score_message",

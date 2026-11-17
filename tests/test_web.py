@@ -690,7 +690,10 @@ async def test_job_lifecycle_reads_retained_artifacts(tmp_path, fake_runner):
         assert "attachment" in saved.headers["content-disposition"]
         assert saved.json()["requests"][0] == evidence.json()
         assert {k: v for k, v in saved.json().items() if k != "requests"} == {
-            k: v for k, v in detail["report"].items() if k not in {"requests", "request_count", "requests_compact"}}
+            k: v for k, v in detail["report"].items()
+            if k not in {"requests", "request_count", "requests_compact", "comparison_summary"}}
+        assert detail["report"]["comparison_summary"]["comparison_status"] == "absent"
+        assert "comparison_summary" not in saved.json()
         html = await client.get(f"/api/runs/{identifier}/report.html")
         assert html.status_code == 200
         assert "private successful answer" not in html.text

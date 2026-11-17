@@ -1391,6 +1391,17 @@ def _print_result(report: RunReport, json_path: Path, html_path: Path | None,
             diff = target["configuration_diff"]
             changes = [row["field"] for row in diff["fields"] if row["change"] != "no_observed_change"]
             print(f"  {target['target']} / deployment changes: {', '.join(changes) or 'none observed; unknowns remain'}; confounded={diff['confounded']}; causality unverified")
+        from .reporting import comparison_summary
+
+        summary = comparison_summary(report)
+        verdict = {"pass": "No material regression", "fail": "Regression detected",
+                   "inconclusive": "Inconclusive"}.get(summary["comparison_status"], "Inconclusive")
+        print(f"Baseline comparison vs {summary['reference']['name']}: {verdict}; current acceptance: {summary['current_acceptance']}")
+        for row in summary["rows"]:
+            others = f" [also {row['other_scopes']} other scopes]" if row.get("other_scopes") else ""
+            print(f"  {row['label']} ({row['scope']}): {row['baseline']} -> {row['current']} ({row['change']}); {row['verdict']}{others}")
+        if summary["omitted_rows"]:
+            print(f"  {summary['omitted_rows']} more comparisons in the full report.")
     print(f"JSON: {json_path.resolve()}")
     if html_path:
         print(f"HTML: {html_path.resolve()}")

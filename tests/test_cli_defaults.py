@@ -218,6 +218,25 @@ def test_final_block_starts_with_verdict_collapses_unselected_and_gates_ram(outc
         assert output.splitlines()[1] == f"  local / first_output: {outcome} — First output exceeded its limit."
 
 
+@pytest.mark.parametrize("with_baseline", [False, True])
+def test_final_block_prints_compact_baseline_comparison(with_baseline, tmp_path, capsys):
+    value = report(checks=[CheckResult(id="access", target="local", title="Connection",
+                                      status="pass", summary="Connected.")])
+    if with_baseline:
+        value.baseline = {"run_id": "reference", "saved_baseline_name": "Before upgrade", "status": "fail",
+            "targets": [{"target": "local", "configuration_diff": {"fields": [], "confounded": False},
+                "comparisons": [{"metric": "latency_ms", "check": "correctness", "scenario": scope,
+                    "baseline": 200, "current": 260, "status": "fail"} for scope in ("warm", "cold", "other")]}]}
+    _print_result(value, tmp_path / "report.json", None, tmp_path, {})
+    output = capsys.readouterr().out
+    if with_baseline:
+        assert "Baseline comparison vs Before upgrade: Regression detected; current acceptance: pass" in output
+        assert "  Full response time (local · Answer correctness · Warm-up): 200.0 ms -> 260.0 ms (+30%); Regression detected [also 2 other scopes]" in output
+        assert "  2 more comparisons in the full report." in output
+    else:
+        assert "Baseline comparison vs" not in output
+
+
 @pytest.mark.parametrize("verbose", [False, True])
 async def test_progress_uses_human_names_and_hides_unknown_stages(verbose, monkeypatch, capsys):
     async def run(config, *, progress, stop_event):
