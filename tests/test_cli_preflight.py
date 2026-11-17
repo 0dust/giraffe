@@ -485,6 +485,7 @@ def test_advisory_preflight_proceeds_and_keeps_warnings(status, output_format, t
     for target in ["local", "other"]:
         assert f"Warning: preflight for {target}: " in captured.err
     assert captured.err.count("; continuing.") == 2
+    assert ".; continuing" not in captured.err + captured.out
     assert (directory / "report.json").exists()
     if output_format == "json":
         warnings = json.loads(captured.out)["warnings"]

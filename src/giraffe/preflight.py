@@ -286,8 +286,22 @@ async def check_target(target: Target, config: RunConfig) -> dict:
             message = ("Connection test timed out after 15 seconds. Check that the model is loaded, then try again."
                        if timeout else "Could not reach the model. Check the endpoint, TLS trust and proxy settings.")
         elif not 200 <= record.http_status < 300:
-            message = (f"The server returned HTTP {record.http_status}. "
-                       "Check the model name and OpenAI-compatible endpoint.")
+            rejected_option = record.workload.get("rejected_request_option")
+            option_keys = record.workload.get("request_option_keys")
+            if record.http_status in {400, 422} and rejected_option:
+                message = (f"The server returned HTTP {record.http_status} and rejected "
+                           f"request_options.{rejected_option}. Check that field's value or remove it "
+                           "from the configuration.")
+            elif record.http_status in {400, 422} and option_keys:
+                option_names = ", ".join(option_keys[:5])
+                if len(option_keys) > 5:
+                    option_names += f" and {len(option_keys) - 5} more"
+                message = (f"The server returned HTTP {record.http_status}. Check the model name, "
+                           "the OpenAI-compatible endpoint and request_options "
+                           f"({option_names}).")
+            else:
+                message = (f"The server returned HTTP {record.http_status}. "
+                           "Check the model name and OpenAI-compatible endpoint.")
         else:
             message = ("The server responded but did not return a usable answer within the "
                        "32-token test. Check the model's settings or continue with its name.")
