@@ -3997,6 +3997,8 @@ def _summary_change_html(row: dict[str, Any]) -> str:
     if any(isinstance(row.get(name), (int, float)) and math.isfinite(row[name])
            for name in ("observed_delta", "delta_rps")):
         return _summary_change(row)
+    if row.get("acceptance_change"):
+        return _summary_change(row)
     if row.get("metric") == "policy_acceptance" and (
         row.get("status") == "inconclusive" or row.get("baseline") is None or row.get("current") is None
     ):

@@ -394,6 +394,31 @@ def test_comparison_summary_uses_load_dispatch_counts_and_keeps_unique_evidence_
     assert html.count('id="comparison-load-0-0"') == 1
 
 
+@pytest.mark.parametrize("before,after,change,expected", [
+    ("pass", "fail", "lost", "Lost"),
+    ("fail", "pass", "gained", "Gained"),
+])
+def test_html_export_summary_preserves_recorded_load_acceptance_changes(tmp_path, before, after, change, expected):
+    from giraffe.reporting import comparison_summary
+
+    report = make_report(count=1)
+    point = {"type": "combinations", "shape": "short_short", "pattern": "concurrent",
+             "source": "primary", "level": 2, "rate": None, "bursts": False, "dispatched": 8}
+    report.baseline = {"run_id": "old", "status": after, "targets": [{
+        "target": "local", "load_test": {"status": after, "points": [{
+            "baseline": {**point, "status": before}, "current": {**point, "status": after},
+            "status": after, "acceptance_change": change, "reason": "Recorded load acceptance changed.",
+        }]},
+    }]}
+
+    assert comparison_summary(report)["rows"][0]["change"] == expected
+    _, html_path = write_report(report, tmp_path, html=True)
+    html = html_path.read_text()
+    summary = html.split('class="comparison-summary"', 1)[1].split('<div id="html-results"', 1)[0]
+    assert f'<dt>Observed change</dt><dd>{expected}</dd>' in summary
+    assert '<dt>Observed change</dt><dd>Not recorded</dd>' not in summary
+
+
 def test_comparison_summary_surfaces_changed_latency_and_correctness_among_uncertain_metrics():
     from giraffe.reporting import _render, comparison_summary
 
