@@ -17,7 +17,7 @@ import time
 import uuid
 from time import monotonic
 from datetime import datetime, timezone
-from typing import Any, AsyncIterator, Callable, Literal
+from typing import Any, AsyncIterator, Callable, Iterable, Literal
 from urllib.parse import urlsplit
 
 import httpx
@@ -290,6 +290,35 @@ def _rejected_evidence_field(body: bytes) -> str | None:
         for field in sorted(allowed):
             if re.search(r"\b" + field + r"\b", message):
                 return field
+    return None
+
+
+def _rejected_request_option(body: bytes, keys: Iterable[str]) -> str | None:
+    """Retain only a rejected key supplied by the caller, never server error text."""
+    try:
+        data = json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    error = data.get("error")
+    detail = data.get("detail")
+    if isinstance(error, dict):
+        message = error.get("message")
+    elif isinstance(error, str):
+        message = error
+    else:
+        message = detail if isinstance(detail, str) else data.get("message")
+    for key in sorted(keys):
+        if isinstance(error, dict) and error.get("param") == key:
+            return key
+        if isinstance(detail, list) and any(
+                isinstance(item, dict) and isinstance(item.get("loc"), list) and key in item["loc"]
+                for item in detail):
+            return key
+        # Common-word keys can occur in error prose without identifying a rejected option.
+        if "_" in key and isinstance(message, str) and re.search(r"\b" + re.escape(key) + r"\b", message):
+            return key
     return None
 
 
@@ -664,6 +693,10 @@ class LLMClient:
                 payload.update(spec.tool_expectation.choice.request_options())
             record.tool_request_options = {key: payload[key] for key in
                 ("tools", "tool_choice", "parallel_tool_calls") if key in payload}
+        request_option_keys = sorted(
+            key for key, value in self.config.request_options.items()
+            if key in payload and key not in _RESERVED_OPTIONS and value is not None
+        ) if spec.scenario == "connection" and not access_probe else []
         # Continuous usage is a server-specific, explicit opt-in. It requires
         # include_usage on compatible endpoints, unless the caller disables it.
         options = payload.get("stream_options")
@@ -1195,6 +1228,11 @@ class LLMClient:
                             record.gateway_evidence = response_evidence(response.status_code, error_body, response.headers,
                                 declared_priority=spec.workload.get("declared_priority"), expected_key_hash=expected_key_hash)
                         if spec.scenario == "connection" and response.status_code in {400, 404, 422}:
+                            if response.status_code in {400, 422} and request_option_keys:
+                                record.workload["request_option_keys"] = request_option_keys
+                                rejected_option = _rejected_request_option(error_body, request_option_keys)
+                                if rejected_option:
+                                    record.workload["rejected_request_option"] = rejected_option
                             # Keep only the classification, never arbitrary server error text.
                             body = error_body.decode("utf-8", errors="replace").lower()
                             try:
