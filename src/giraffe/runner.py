@@ -124,11 +124,11 @@ def _stats(records: list[RequestRecord]) -> dict:
 
 
 def _cannot_meet_correctness(stats: dict, minimum: float) -> bool:
-    """Fail only if every unscored attempt passing would still miss the limit."""
-    attempted = stats["attempted"]
-    if not attempted:
+    """Fail only if every valid unscored completion passing would still miss the limit."""
+    completed = stats["completed"]
+    if not completed:
         return False
-    best_possible = (stats["correct"] + attempted - stats["scored"]) / attempted
+    best_possible = (stats["correct"] + completed - stats["scored"]) / completed
     return best_possible < minimum
 
 
