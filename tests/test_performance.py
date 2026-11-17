@@ -369,6 +369,25 @@ def test_load_window_baseline_rows_match_point_shape_and_role(stored_without_poi
                        for row in rows[metric]["value"])
 
 
+def test_performance_summary_includes_failing_p95_baseline_rows():
+    from giraffe.reporting import compare_baseline
+    from tests.test_load_test_baseline import arrival_report
+
+    baseline = arrival_report(concurrent=True, count=60)
+    current = arrival_report(concurrent=True, count=60)
+    for point in current.checks[0].metrics["points"]:
+        records = [record for record in current.requests if record.scenario == point["id"]]
+        for record in records[-9:]:
+            record.elapsed_ms = 100
+            record.arrival_elapsed_ms = 100
+
+    compared = compare_baseline(current, baseline)
+    data = build_performance(compared)["targets"][0]
+    rows = data["summaries"][data["default_window"]]["metrics"]["baseline_timing"]["value"]
+
+    assert any(row["metric"] == "latency_p95_ms" and row["status"] == "fail" for row in rows)
+
+
 def test_load_window_capacity_uses_established_changes_even_when_neutral():
     from giraffe.reporting import compare_baseline
     from tests.test_load_test_baseline import arrival_report
