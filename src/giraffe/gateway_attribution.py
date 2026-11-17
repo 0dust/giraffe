@@ -10,6 +10,7 @@ import uuid
 
 import httpx
 
+from . import states
 from .caps import MAX_GATEWAY_USAGE_TOKENS
 from .gateway_json import parse_gateway_json
 from .identities import (credential_headers, gateway_identities_only, identity_headers,
@@ -184,7 +185,7 @@ async def _reader_preflight(run, target, headers, bound, verify):
     gateway = target.gateway
     now = time.monotonic()
     stop_reason = run.stop_reason(target.name)
-    if stop_reason and stop_reason != "maximum request budget reached":
+    if stop_reason and stop_reason != states.STOP_REQUEST_BUDGET:
         return None
     timeout = min(bound, (run.deadline - now) / 2)
     if timeout <= 0:
@@ -198,7 +199,7 @@ async def _reader_preflight(run, target, headers, bound, verify):
         with identity_scope(True):
             async with asyncio.timeout_at(deadline):
                 async with _reader(run.config, headers, timeout, verify=verify, stop=run.stop, deadline=deadline) as reader:
-                    if reader is None or run.stop_reason(target.name) not in {None, "maximum request budget reached"}:
+                    if reader is None or run.stop_reason(target.name) not in {None, states.STOP_REQUEST_BUDGET}:
                         return None
                     async with _spend_page(reader, gateway.url, marker, start_date, end_date, 1, 1,
                                            stop=run.stop, deadline=deadline) as response:
@@ -318,10 +319,10 @@ async def _execute(run, target, client, *, deferred=False):
             observation.update(state="unverified", planned_requests=planned, observed_requests=0,
                                collection_attempts=0, collection_complete=False,
                                reason="Gateway spend-log reader preflight was interrupted.")
-            if reason == "maximum run duration reached" and not run.stop.is_set():
+            if reason == states.STOP_MAX_DURATION and not run.stop.is_set():
                 observation.update(reason_code="time_limited",
                                    reason="The run deadline interrupted the gateway spend-log reader preflight.")
-            elif reason == "cancelled by user":
+            elif reason == states.STOP_CANCELLED_BY_USER:
                 observation.update(reason="The user stopped the run during the gateway spend-log reader preflight.")
 
         try:
@@ -330,7 +331,7 @@ async def _execute(run, target, client, *, deferred=False):
             report_preflight_stop(run.stop_reason(target.name))
             raise
         preflight_stop = run.stop_reason(target.name)
-        if preflight_stop not in {None, "maximum request budget reached"}:
+        if preflight_stop not in {None, states.STOP_REQUEST_BUDGET}:
             report_preflight_stop(preflight_stop)
             return
         if reader_status == "invalid_url":
@@ -353,7 +354,7 @@ async def _execute(run, target, client, *, deferred=False):
 
     def report_probe_stop(reason, *, cancelled=False):
         time_limited = not run.stop.is_set() and (
-            reason == "maximum run duration reached"
+            reason == states.STOP_MAX_DURATION
             or any(record.termination_reason == "run_duration_limit" for record in records))
         stopped_during_probes = len(records) < planned and run.stop.is_set()
         if not time_limited and not cancelled and not stopped_during_probes:
@@ -396,7 +397,7 @@ async def _execute(run, target, client, *, deferred=False):
     if report_probe_stop(probe_stop):
         return
     budget_limited = (len(records) < planned and run.remaining(target.name) == 0
-                      and probe_stop in {None, "maximum request budget reached"})
+                      and probe_stop in {None, states.STOP_REQUEST_BUDGET})
     budget_reason = "The request limit left too few slots for the configured attribution probes."
     if not records:
         observation.update(planned_requests=planned, observed_requests=0)
@@ -487,7 +488,7 @@ async def _execute(run, target, client, *, deferred=False):
             run.stop_reason(target.name)
         if (assessment["state"] == "unverified" and len(records) == planned
                 and deadline < settle_deadline and not run.stop.is_set()
-                and (not cancelled or run.reason == "maximum run duration reached")):
+                and (not cancelled or run.reason == states.STOP_MAX_DURATION)):
             assessment.update(reason_code="time_limited",
                               reason="The run deadline did not leave the configured spend-log settle window after all identity probes.")
         if budget_limited and assessment["state"] == "unverified" and not cancelled and not run.stop.is_set():

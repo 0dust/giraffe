@@ -200,6 +200,15 @@ def test_describe_has_full_authoritative_schema_without_traffic(monkeypatch, cap
     assert "runtime availability" in result["validation_note"]
 
 
+def test_describe_includes_state_exit_codes(capsys):
+    from giraffe import states
+
+    assert main(["describe"]) == 0
+    assert json.loads(capsys.readouterr().out)["states"]["exit_codes"] == {
+        **states.EXIT_CODES, "cancelled": states.EXIT_CODE_CANCELLED,
+        "usage_error": states.EXIT_CODE_USAGE, "default": states.EXIT_CODE_DEFAULT}
+
+
 def test_validate_stdin_normalizes_config_without_side_effects(monkeypatch, capsys, tmp_path):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr("sys.stdin", io.StringIO("""

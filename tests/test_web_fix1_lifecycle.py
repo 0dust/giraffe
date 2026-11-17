@@ -5,10 +5,244 @@ import threading
 
 import pytest
 
+from giraffe.models import RunConfig
 from giraffe.web import _RunThread
-from tests.test_web import browser, finished, report, start, successful_runner
+from tests.test_web import browser, config, finished, report, start, successful_runner
 
 pytestmark = pytest.mark.usefixtures("local_tokenizer")
+
+
+async def test_run_terminal_and_cancel_results(tmp_path, monkeypatch):
+    entered, release = threading.Event(), threading.Event()
+
+    async def waiting(configuration, *, progress, stop_event):
+        progress({"event": "scenario_started", "target": "local", "scenario": "warm"})
+        entered.set()
+        await stop_event.wait()
+        while not release.is_set():
+            await asyncio.sleep(.001)
+        return report(configuration, cancelled=True)
+
+    monkeypatch.setattr("giraffe.web.run_suite", waiting)
+    async with browser(tmp_path) as client:
+        try:
+            response = await client.post("/api/runs", json={"config": config()})
+            assert response.status_code == 202
+            assert response.json()["terminal"] is False
+            identifier = response.json()["id"]
+            assert await asyncio.to_thread(entered.wait, 2)
+            assert (await client.get(f"/api/runs/{identifier}")).json()["terminal"] is False
+            assert (await client.get(f"/api/runs/{identifier}/events")).json()["terminal"] is False
+            assert (await client.get("/api/runs")).json()["runs"][0]["terminal"] is False
+            conflict = await client.post("/api/runs", json={"config": config()})
+            assert conflict.status_code == 409
+            assert conflict.json()["detail"] == "A run is already active; stop it or wait for its report"
+            assert conflict.headers["X-Giraffe-Error-Code"] == "run_active"
+            for result in ("stopping", "already_stopping"):
+                response = await client.post(f"/api/runs/{identifier}/cancel", json={})
+                assert response.status_code == 200
+                assert response.json() == {"id": identifier, "state": "stopping",
+                                           "terminal": False, "result": result}
+        finally:
+            release.set()
+        assert (await finished(client, identifier))["terminal"] is True
+        assert (await client.get(f"/api/runs/{identifier}/events")).json()["terminal"] is True
+        assert (await client.get("/api/runs")).json()["runs"][0]["terminal"] is True
+        response = await client.post(f"/api/runs/{identifier}/cancel", json={})
+        assert response.json() == {"id": identifier, "state": "completed",
+                                   "terminal": True, "result": "already_finished"}
+
+
+@pytest.mark.parametrize("state,terminal", [("queued", False), ("running", False), ("stopping", False),
+                                          ("completed", True), ("interrupted", True), ("error", True)])
+async def test_saved_run_terminal_events_and_cancel_result(tmp_path, monkeypatch, state, terminal):
+    monkeypatch.setattr("giraffe.web._EVENT_WAIT_SECONDS", 0)
+    async with browser(tmp_path) as client:
+        directory = tmp_path / "saved"
+        directory.mkdir()
+        (directory / ".web.json").write_text(json.dumps({"id": "saved", "state": state}))
+        detail = (await client.get("/api/runs/saved")).json()
+        assert detail["state"] == state and detail["terminal"] is terminal
+        events = (await client.get("/api/runs/saved/events")).json()
+        assert events["state"] == state and events["terminal"] is terminal
+        assert events["reset"] is terminal
+        if not terminal:
+            assert events["idle"] is True
+        response = await client.post("/api/runs/saved/cancel", json={})
+        assert response.json() == {"id": "saved", "state": state, "terminal": terminal,
+                                   "result": "already_finished" if terminal else "not_owned"}
+
+
+@pytest.mark.parametrize("state", ["queued", "running", "stopping", "completed", "interrupted", "error"])
+@pytest.mark.parametrize("journal", [False, True])
+async def test_recoverable_is_reported_beside_terminal(tmp_path, monkeypatch, state, journal):
+    monkeypatch.setattr("giraffe.web._EVENT_WAIT_SECONDS", 0)
+    async with browser(tmp_path) as client:
+        # Created after startup, so startup recovery does not consume the journal.
+        directory = tmp_path / "saved"
+        directory.mkdir()
+        (directory / ".web.json").write_text(json.dumps({"id": "saved", "state": state}))
+        if journal:
+            (directory / "evidence.jsonl").write_text("")
+        expected = journal and state == "interrupted"
+        assert (await client.get("/api/runs/saved")).json()["recoverable"] is expected
+        assert (await client.get("/api/runs/saved/events")).json()["recoverable"] is expected
+        if state in {"completed", "interrupted", "error"}:
+            row = next(run for run in (await client.get("/api/runs")).json()["runs"] if run["id"] == "saved")
+            assert row["recoverable"] is expected
+
+
+@pytest.mark.parametrize("saved_report", ["absent", "valid", "unreadable", "invalid_schema"])
+async def test_recoverable_distinguishes_valid_report_from_retained_journal(tmp_path, saved_report):
+    from giraffe.reporting import write_report
+    from giraffe.storage import write_metadata
+
+    async with browser(tmp_path) as client:
+        # Create after startup to inspect pending work before recovery runs.
+        directory = tmp_path / "saved"
+        write_metadata(directory, {"id": directory.name, "state": "interrupted"})
+        if saved_report in {"valid", "invalid_schema"}:
+            write_report(report(RunConfig.model_validate(config())), directory)
+            if saved_report == "invalid_schema":
+                contents = json.loads((directory / "report.json").read_text())
+                contents["requests"][0]["status"] = "invalid-status"
+                (directory / "report.json").write_text(json.dumps(contents))
+        elif saved_report == "unreadable":
+            (directory / "report.json").write_text("invalid JSON")
+        (directory / "evidence.jsonl").write_text("")
+        for endpoint in ("/api/runs/saved", "/api/runs/saved/events"):
+            result = (await client.get(endpoint)).json()
+            # Unreadable reports retain their existing error presentation.
+            assert result["state"] == ("error" if saved_report in {"unreadable", "invalid_schema"} else "interrupted")
+            assert result["recoverable"] is (saved_report != "valid")
+        row = next(row for row in (await client.get("/api/runs")).json()["runs"] if row["id"] == "saved")
+        # The listing parser can read a summary from a schema-invalid report;
+        # that summary must not count as successful recovery publication.
+        assert row["recoverable"] is (saved_report != "valid")
+
+
+@pytest.mark.parametrize("saved_report", ["absent", "unreadable"])
+@pytest.mark.parametrize("final_summary", ["valid", "unreadable", "symlink"])
+async def test_final_summary_owns_interrupted_journal_recovery(tmp_path, saved_report, final_summary):
+    from giraffe.storage import write_metadata
+
+    async with browser(tmp_path) as client:
+        directory = tmp_path / "saved"
+        write_metadata(directory, {"id": directory.name, "state": "interrupted"})
+        (directory / "evidence.jsonl").write_text("")
+        if saved_report == "unreadable":
+            (directory / "report.json").write_text("invalid JSON")
+        summary_path = directory / "summary.json"
+        if final_summary == "symlink":
+            target = tmp_path / "retained-summary.json"
+            target.write_text(json.dumps({"overall": "fail", "error": "final verdict"}))
+            summary_path.symlink_to(target)
+        else:
+            summary_path.write_text(json.dumps({"overall": "fail", "error": "final verdict"})
+                                    if final_summary == "valid" else "invalid JSON")
+        for endpoint in ("/api/runs/saved", "/api/runs/saved/events"):
+            result = (await client.get(endpoint)).json()
+            assert result["terminal"] is True and result["recoverable"] is False
+        row = next(row for row in (await client.get("/api/runs")).json()["runs"] if row["id"] == "saved")
+        assert row["terminal"] is True and row["recoverable"] is False
+
+
+@pytest.mark.parametrize("cleanup", ["unlink_failure", "crash_before_unlink"])
+@pytest.mark.parametrize("isolated", [False, True])
+async def test_published_recovery_report_with_retained_journal_finishes_polling(tmp_path, monkeypatch, cleanup, isolated):
+    import errno
+    from pathlib import Path
+
+    from giraffe.evidence import EvidenceWriter, recover_evidence
+    from giraffe.reporting import ReportWriteError, write_report
+    from giraffe.storage import write_metadata
+
+    directory = tmp_path / "recovered"
+    meta = {"id": directory.name, "state": "interrupted", "config": config()}
+    write_metadata(directory, meta)
+    writer = EvidenceWriter(directory, manifest={"config": config()})
+    writer.record_finished(report(RunConfig.model_validate(config())).requests[0])
+    writer.close()
+    recovered = recover_evidence(directory, meta)
+    assert recovered is not None and recovered.observations["interrupted"] is True
+    journal = directory / "evidence.jsonl"
+    if cleanup == "unlink_failure":
+        original_unlink = Path.unlink
+
+        def fail_journal_unlink(path, *args, **kwargs):
+            if path == journal:
+                raise OSError(errno.EACCES, "journal cleanup denied")
+            return original_unlink(path, *args, **kwargs)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(Path, "unlink", fail_journal_unlink)
+            with pytest.raises(ReportWriteError) as failure:
+                write_report(recovered, directory)
+        assert failure.value.json_complete is True
+        assert failure.value.failed_file == "evidence.jsonl"
+    else:
+        # Same on-disk state as a crash after publication and before journal cleanup.
+        write_report(recovered, directory, preserve_evidence=True)
+    assert journal.is_file() and (directory / "report.json").is_file()
+    published = (directory / "report.json").read_bytes()
+    evidence = journal.read_bytes()
+
+    if isolated:
+        monkeypatch.setattr("giraffe.web._ISOLATED_REPORT_BYTES", 0)
+    async with browser(tmp_path) as client:
+        # The documented polling condition must finish despite retained evidence.
+        for _ in range(3):
+            detail = (await client.get("/api/runs/recovered")).json()
+            if detail["terminal"] and not detail["recoverable"]:
+                break
+        else:
+            pytest.fail("Published recovery report still advertises pending recovery")
+        assert detail["state"] == "interrupted" and detail["report"]["request_count"] == 1
+        events = (await client.get("/api/runs/recovered/events")).json()
+        assert events["terminal"] is True and events["recoverable"] is False
+        row = next(row for row in (await client.get("/api/runs")).json()["runs"] if row["id"] == "recovered")
+        assert row["state"] == "interrupted" and row["terminal"] is True
+        assert row["recoverable"] is False
+        assert (await client.post("/api/runs/recovered/cancel", json={})).json()["result"] == "already_finished"
+    assert journal.read_bytes() == evidence
+    assert (directory / "report.json").read_bytes() == published
+
+
+async def test_interrupted_event_feed_tracks_recovery_report_publication(tmp_path, monkeypatch):
+    from giraffe.evidence import recover_evidence
+    from giraffe.reporting import write_report
+
+    async def interrupted(configuration, *, progress, stop_event):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr("giraffe.web.run_suite", interrupted)
+    async with browser(tmp_path) as client:
+        identifier = await start(client)
+        detail = await finished(client, identifier)
+        assert detail["state"] == "interrupted" and detail["recoverable"] is True
+        path = f"/api/runs/{identifier}/events"
+        events = (await client.get(path)).json()
+        assert events["reset"] is False and events["recoverable"] is True
+        directory = tmp_path / identifier
+        recovered = recover_evidence(directory, json.loads((directory / ".web.json").read_text()))
+        assert recovered is not None
+        write_report(recovered, directory, preserve_evidence=True)
+        events = (await client.get(path)).json()
+        assert events["reset"] is False and events["terminal"] is True
+        assert events["state"] == "interrupted" and events["recoverable"] is False
+        assert (directory / "evidence.jsonl").is_file()
+
+
+async def test_completed_run_with_unreadable_report_exposes_error(tmp_path):
+    async with browser(tmp_path) as client:
+        directory = tmp_path / "saved"
+        directory.mkdir()
+        metadata = json.dumps({"id": "saved", "state": "completed"})
+        (directory / ".web.json").write_text(metadata)
+        (directory / "report.json").write_text("unreadable")
+        detail = (await client.get("/api/runs/saved")).json()
+        assert detail["state"] == "error" and detail["terminal"] is True
+        assert (directory / ".web.json").read_text() == metadata
 
 
 async def test_sequential_runs_reuse_dedicated_measurement_loop(tmp_path, monkeypatch):

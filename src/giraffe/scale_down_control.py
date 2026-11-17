@@ -10,6 +10,7 @@ import stat
 import tempfile
 import time
 
+from . import states
 from .models import ScaleDownMarker
 
 EVENT_FILE = ".scale-down-event.json"
@@ -169,7 +170,7 @@ def submit_marker(directory: Path, *, event_id: str, replica_id: str | None = No
     if (status.get("acknowledgment") or {}).get("accepted"):
         raise ValueError("A different marker has already been accepted")
     meta = _read(directory / ".web.json", 1024 * 1024)
-    if (status.get("phase") in {"finalizing", "finished"}
+    if (status.get("phase") in states.SCALE_DOWN_CLOSING_PHASES
             or meta.get("state") != "running" or not run_alive(directory, meta)):
         raise ValueError("The scale-down run is not active")
     try:

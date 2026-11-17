@@ -17,6 +17,11 @@ import pytest
 import pytest_asyncio
 from anyio._backends._asyncio import WorkerThread
 
+from giraffe import states
+
+# An undeclared run-state write fails the test instead of logging a warning.
+states.STRICT_TRANSITIONS = True
+
 
 # A separately installed ``scripts`` package can shadow the repository's
 # namespace directory, even when the checkout is first on sys.path. Storage

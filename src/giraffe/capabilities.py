@@ -6,7 +6,7 @@ from . import __version__
 
 from copy import deepcopy
 
-from giraffe import caps
+from giraffe import caps, states
 from giraffe.conditions import condition_labels
 from giraffe.local_tokenizer import SETUP_TIMEOUT_SECONDS
 from giraffe.fixtures import SUITE_VERSION, builtin_fixtures
@@ -179,7 +179,7 @@ def capabilities(config: RunConfig | None = None, *, restart_allowed: bool = Fal
         "kind": "capabilities", "schema_version": "1", "suite_version": SUITE_VERSION, "version": __version__,
         "validation_note": "The schema describes configuration. Validate checks semantic constraints; neither command contacts endpoints or verifies runtime availability.",
         "defaults": defaults, "config_schema": schema, "limits": limits,
-        "condition_labels": condition_labels(),
+        "condition_labels": condition_labels(), "states": states.describe(),
         "tokenizer_setup_timeout_seconds": SETUP_TIMEOUT_SECONDS,
         "cap_explanations": caps.cap_explanations(limits),
         "checks": [

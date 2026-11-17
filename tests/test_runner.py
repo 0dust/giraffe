@@ -734,6 +734,30 @@ async def test_user_stop_stops_submissions_and_saves_partial(client):
     assert "--max-requests" not in summary and "--max-duration" not in summary
 
 
+@pytest.mark.parametrize("reason", ["maximum run duration reached", "error threshold reached",
+                                   "memory limit reached: RAM grew by 2 MiB",
+                                   "Endpoint service unresponsive: no output"])
+@pytest.mark.parametrize("user_stop", [False, True])
+async def test_outer_cancellation_preserves_recorded_stop_reason(monkeypatch, reason, user_stop):
+    started = asyncio.Event()
+    stop = asyncio.Event()
+
+    async def waiting(run, *args, **kwargs):
+        run.reason = reason
+        if user_stop:
+            stop.set()
+        started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(runner, "_target", waiting)
+    task = asyncio.create_task(runner.run_suite(config(checks=["serving"]), stop_event=stop))
+    await asyncio.wait_for(started.wait(), 2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError) as cancelled:
+        await asyncio.wait_for(task, 2)
+    assert cancelled.value.giraffe_report.abort_reason == reason
+
+
 async def test_missing_optional_telemetry_does_not_block_api():
     report = await runner.run_suite(config(checks=["serving", "gpu"], metrics=True, gpu_min_observation_seconds=0))
     assert check(report, "serving").status == "pass"

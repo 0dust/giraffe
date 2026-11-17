@@ -48,7 +48,7 @@ async def test_immediate_restart_recovers_dead_writer_in_history_and_cancel(tmp_
             assert [(row["id"], row["state"]) for row in history["runs"]] == [("crashed", expected)]
             cancelled = await client.post("/api/runs/crashed/cancel", json={})
             assert cancelled.status_code == 200
-            assert cancelled.json() == {"id": "crashed", "state": expected}
+            assert cancelled.json() == {"id": "crashed", "state": expected, "terminal": True, "result": "already_finished"}
             baseline = await client.post("/api/baselines", json={"run_id": "crashed", "name": "Recovered"})
             assert baseline.status_code == (201 if has_report else 409)
             plan = (await client.post("/api/storage/cleanup-preview", json={"keep_latest": 0})).json()

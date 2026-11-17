@@ -1349,6 +1349,8 @@ class LLMClient:
                 logger.debug("Endpoint request failed", exc_info=True)
             record.error = f"request failed ({type(exc).__name__})"
         finally:
+            if record.status != "completed":
+                record.valid = False
             if transport_started and logprob_collector is not None and record.logprob_evidence is None:
                 evidence = logprob_collector.finish(record.output)
                 if not record.valid and evidence.status == "available":

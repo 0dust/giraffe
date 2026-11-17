@@ -6,6 +6,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
+from . import states
 from .deployment import REDACTED
 from .models import CHECK_NAMES, CheckResult, RunReport
 
@@ -46,7 +47,7 @@ def _rows(report: RunReport) -> list[tuple[CheckResult, str, str]]:
     overrides: dict[tuple[str, str], tuple[str, str]] = {}
     baseline = report.baseline or {}
     for comparison in report.checks:
-        if comparison.id != "baseline" or comparison.status not in {"fail", "inconclusive", "blocked"}:
+        if comparison.id != "baseline" or comparison.status not in states.PROBLEM_STATUSES:
             continue
         target_checks = [check for check in checks if check.target == comparison.target]
         if not target_checks:

@@ -16,6 +16,7 @@ import time
 
 from pydantic import ValidationError
 
+from . import states
 from .caps import MAX_SANITIZE_ITEMS
 from .models import MAX_SCALE_DOWN_SNAPSHOTS, CHECK_NAMES, CheckResult, RequestRecord, RunReport
 from .storage import fsync_directory
@@ -271,7 +272,7 @@ def recover_evidence(directory: Path | str, meta: dict, *, pause=None) -> RunRep
         # Journal rows describe executor lifecycle, not persisted verdicts.
         # Let RunReport rebuild aggregates from the finished request evidence.
         condition = {**condition, "condition": condition.get("condition") or {"id": condition_id},
-                     "status": "interrupted", "reason": reason}
+                     "status": states.CONDITION_RECOVERED, "reason": reason}
         targets.setdefault(target, {"conditions": []})["conditions"].append(condition)
     settings = config.get("scale_down")
     if "scale_down" in config.get("checks", []) and isinstance(settings, dict) and isinstance(settings.get("target"), str):

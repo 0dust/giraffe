@@ -8,6 +8,7 @@ describe the current configuration contract (`config_version: 2`).
 | Guide | What you will find |
 | --- | --- |
 | [Running and baselines](running.md) | CLI commands, browser UI, credentials, results and before/after comparisons |
+| [States and lifecycles](states.md) | Every status, run state, stop reason and exit code, with where each appears |
 | [Workloads and measurements](workloads.md) | Load patterns, check settings, acceptance criteria and evidence limits |
 | [Multi-turn conversation settings](workloads.md#sampled-conversation-traffic) | Fixed/dynamic pauses, sampled token lengths and turn counts, and a downloadable YAML example |
 | [Offline and container use](offline.md) | Dependency wheels, bundled encoding, Hugging Face caches and Docker commands |

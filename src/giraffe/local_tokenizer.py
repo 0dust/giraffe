@@ -18,6 +18,8 @@ import time
 
 import httpx
 
+from . import states
+
 PREPARATION_TIMEOUT_SECONDS = 10.0
 TARGET_PREPARATION_TIMEOUT_SECONDS = 20.0
 SETUP_TIMEOUT_SECONDS = 30.0
@@ -322,7 +324,7 @@ async def prepare_messages(run, target, scenario, build_messages, target_tokens,
             filler = 0
             for attempt in range(MAX_SIZING_ATTEMPTS):
                 reason = run.stop_reason(target.name) if hasattr(run, "stop_reason") else None
-                if reason and reason != "maximum request budget reached":
+                if reason and reason != states.STOP_REQUEST_BUDGET:
                     raise TokenizerUnavailable(reason)
                 messages = build_messages(filler)
                 process.stdin.write((json.dumps({"messages": messages, "content_only": content_only}) + "\n").encode())
@@ -365,7 +367,7 @@ async def prepare_messages(run, target, scenario, build_messages, target_tokens,
                               reason_code="input_sizing_unavailable")
     except asyncio.CancelledError:
         reason = run.stop_reason(target.name) if hasattr(run, "stop_reason") else None
-        if reason == "maximum request budget reached":
+        if reason == states.STOP_REQUEST_BUDGET:
             reason = None
         _progress(run, target, scenario, "cancelled", reason=reason or "Preparation cancelled")
         raise
@@ -374,7 +376,7 @@ async def prepare_messages(run, target, scenario, build_messages, target_tokens,
             # Observe the execution deadline here, before worker cleanup. The
             # monitor may wake only after this unavailable result finishes.
             reason = run.stop_reason(target.name) if hasattr(run, "stop_reason") else None
-            result["reason"] = (f"Local prompt preparation stopped: {reason or 'maximum run duration reached'}; "
+            result["reason"] = (f"Local prompt preparation stopped: {reason or states.STOP_MAX_DURATION}; "
                                 "no inference calibration was sent.")
         elif deadline == target_deadline:
             result["reason"] = f"Local prompt preparation reached its {TARGET_PREPARATION_TIMEOUT_SECONDS:g}s target budget; no inference calibration was sent."
