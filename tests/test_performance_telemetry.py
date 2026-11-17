@@ -491,6 +491,45 @@ def test_mtplx_latest_values_are_visible_server_observations_in_saved_html(tmp_p
     assert "private-prompt" not in path.read_text() + html_path.read_text()
 
 
+@pytest.mark.parametrize("latest", [None, {"ttft_s": 3}])
+def test_mtplx_latest_receipts_do_not_become_historical_series_in_saved_reports(tmp_path, latest):
+    from html import unescape
+
+    from giraffe.cli import load_report
+    from giraffe.reporting import write_report
+    from tests.test_performance import record, report, summary
+
+    snaps = [snapshot(mtplx_body(receipt), index, "unknown")
+             for index, receipt in enumerate(({"ttft_s": 1}, {"ttft_s": 10}, latest))]
+    data = telemetry.summarize({"snapshots": snaps}, .9)
+    value = report([record()], observations={"targets": {"t": {"serving_telemetry": data}}})
+    value.manifest["config"]["targets"][0]["url"] = "http://inference/v1"
+    value.manifest["config"]["targets"][0]["model"] = "test"
+    path, html_path = write_report(value, tmp_path, html=True)
+    saved = load_report(path)
+    saved_data = saved.observations["targets"]["t"]["serving_telemetry"]
+    assert saved_data["series"] == []
+    row = {r["id"]: r for r in summary(saved)["sections"]["server"]}["mtplx_latest_ttft_seconds"]
+    assert row["value"] == (latest or {}).get("ttft_s")
+    assert row["sample_count"] == int(latest is not None)
+    details = html_path.read_text().partition(
+        "<summary>Serving telemetry, phases and collection coverage</summary><pre>")[2].partition("</pre>")[0]
+    assert details
+    series = unescape(details).partition('"series":')[2]
+    assert json.JSONDecoder().raw_decode(series)[0] == []
+
+
+def test_mtplx_latest_families_are_excluded_without_losing_other_gauge_history():
+    latest = snapshot(mtplx_body({"ttft_s": .2, "request_elapsed_s": 2, "decode_tok_s": 50,
+                                 "prefill_tok_s": 100, "prompt_tokens": 20,
+                                 "completion_tokens": 40, "cached_tokens": 5}), 0, "unknown")
+    gauges = [snapshot(f"vllm:num_requests_running {count}\n", count) for count in (1, 2)]
+    data = telemetry.summarize({"snapshots": [latest, *gauges]}, .9)
+    assert len(data["series"]) == 1
+    assert data["series"][0]["family"] == "running"
+    assert data["series"][0]["samples"] == data["series"][0]["peak"] == 2
+
+
 def test_mtplx_recent_records_do_not_fill_missing_latest_and_explicit_profiles_win():
     body = json.dumps({"latest": None, "recent": [{"ttft_s": .2}], "tool_parse_counters": {}})
     assert snapshot(body, 0, "unknown")["samples"] == []

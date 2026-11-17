@@ -743,11 +743,12 @@ async def sample_during(run, target, *, stop_event: asyncio.Event):
 
 def summarize(data, threshold):
     _, spec_deltas = _derive_spec_decode(data["snapshots"])
+    latest_request_families = {family for family, _, _ in MTPLX.values()}
     groups = defaultdict(list)
     phases = defaultdict(set)
     for snap in data["snapshots"]:
         for sample in snap.get("samples", []):
-            if not sample["stale"]:
+            if not sample["stale"] and sample["family"] not in latest_request_families:
                 key = (sample["name"], str(sorted(sample["labels"].items())))
                 groups[key].append((snap, sample))
                 phases[snap["phase"]].add(key)
