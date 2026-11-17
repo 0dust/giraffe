@@ -751,7 +751,7 @@ def score_response(spec: RequestSpec, record: RequestRecord) -> RequestRecord:
             score, lenient = exact_matches(actual, expected, spec.workload)
         else:
             score = _contains(actual, expected)
-        incomplete = expected.startswith(actual) and actual != expected if spec.scorer == "exact" else not score
+        incomplete = not score
         message = "Answer matches the fixture." if score else "Answer differs from the fixture."
         if lenient:
             message = "Answer matches the fixture after removing a trailing period or surrounding markup."

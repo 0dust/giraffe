@@ -240,6 +240,8 @@ async def check_target(target: Target, config: RunConfig) -> dict:
                     messages=[{"role": "user", "content": "Reply with OK."}],
                     max_tokens=32, stream=False,
                 ))
+                if record.status == "cancelled":
+                    raise asyncio.CancelledError
     except (TimeoutError, httpx.TimeoutException):
         raise PreflightError("Connection test timed out after 15 seconds. "
                             "Check that the model is loaded, then try again.", blocking=False) from None
@@ -254,7 +256,7 @@ async def check_target(target: Target, config: RunConfig) -> dict:
         raise PreflightError("Could not connect. Check the endpoint, authentication, "
                             "TLS trust and proxy settings.",
                             blocking=isinstance(error, (httpx.ConnectError, httpx.UnsupportedProtocol))) from None
-    if record.status in {"timeout", "cancelled"}:
+    if record.status == "timeout":
         raise PreflightError("Connection test timed out after 15 seconds. "
                             "Check that the model is loaded, then try again.", blocking=False)
     if record.http_status in {401, 403}:

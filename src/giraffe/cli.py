@@ -15,7 +15,7 @@ import ipaddress
 import importlib.util
 import sys
 import time
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -351,7 +351,13 @@ Exit codes:
 
 
 def load_report(path: Path) -> RunReport:
-    return RunReport.model_validate_json((path / "report.json" if path.is_dir() else path).read_text())
+    source = path / "report.json" if path.is_dir() else path
+    try:
+        return RunReport.model_validate_json(source.read_text())
+    except ValidationError as error:
+        if any(item["type"] == "json_invalid" for item in error.errors(include_input=False, include_url=False)):
+            raise ValueError(f"Invalid JSON in report file: {source.resolve()}") from None
+        raise
 
 
 def _report_for_render(path: Path) -> RunReport:
@@ -362,7 +368,8 @@ def _report_for_render(path: Path) -> RunReport:
                 or (path / "summary.json").exists()):
             raise
         from giraffe.evidence import recover_evidence
-        from giraffe.storage import _read, pid_alive, run_alive
+        from giraffe.reporting import write_report
+        from giraffe.storage import _read, pid_alive, run_alive, update_metadata
 
         meta = _read(path / ".web.json")
         pid = meta.get("owner_pid")
@@ -378,6 +385,8 @@ def _report_for_render(path: Path) -> RunReport:
         recovered = recover_evidence(path, meta)
         if recovered is None:
             raise
+        write_report(recovered, path, preserve_evidence=True)
+        update_metadata(path, {"state": "interrupted", "run_id": recovered.run_id})
         print(f"Recovered {len(recovered.requests)} recorded requests from an interrupted run; "
               "results are incomplete.", file=sys.stderr)
         return recovered
@@ -554,6 +563,8 @@ async def _run(config: RunConfig, *, json_progress: bool = False, verbose: bool 
 
     def request_stop():
         nonlocal interrupted
+        if interrupted:
+            raise KeyboardInterrupt
         interrupted = True
         stop.set()
 
@@ -561,8 +572,9 @@ async def _run(config: RunConfig, *, json_progress: bool = False, verbose: bool 
     installed = []
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
+            previous = signal.getsignal(sig)
             loop.add_signal_handler(sig, request_stop)
-            installed.append(sig)
+            installed.append((sig, previous))
         except (NotImplementedError, RuntimeError):
             pass
     last = (None, None)
@@ -609,37 +621,39 @@ async def _run(config: RunConfig, *, json_progress: bool = False, verbose: bool 
         except asyncio.CancelledError as error:
             report = getattr(error, "giraffe_report", None)
             raise
-        if interrupted:
-            # Cooperative signal stops return normally from the suite. Keep
-            # their partial evidence on the same export path as task cancellation.
-            error = asyncio.CancelledError()
-            error.giraffe_report = report
-            raise error
-        return report
     finally:
-        for sig in installed:
-            loop.remove_signal_handler(sig)
         try:
-            if adapter is not None:
-                await adapter.close()
-        except Exception:
-            logger.exception("Scale-down status file could not be saved")
-            if report is not None:
-                report.warnings.append("Scale-down control status file could not be saved; inspect report evidence.")
-        finally:
-            if writer is not None:
-                from giraffe.runner import record_sink
-                record_sink.reset(sink_token)
-                try:
-                    await asyncio.to_thread(writer.close)
-                except Exception:
-                    logger.exception("CLI evidence writer could not finish")
-                    if report is not None:
-                        report.warnings.append("Live evidence journal could not finish; final report uses completed run state.")
+            try:
+                if adapter is not None:
+                    await adapter.close()
+            except Exception:
+                logger.exception("Scale-down status file could not be saved")
                 if report is not None:
-                    report.observations["evidence_dropped_count"] = writer.dropped_count
-                    if writer.dropped_count:
-                        report.warnings.append(f"{writer.dropped_count} evidence records not written to evidence.jsonl")
+                    report.warnings.append("Scale-down control status file could not be saved; inspect report evidence.")
+            finally:
+                if writer is not None:
+                    from giraffe.runner import record_sink
+                    record_sink.reset(sink_token)
+                    try:
+                        await asyncio.to_thread(writer.close)
+                    except Exception:
+                        logger.exception("CLI evidence writer could not finish")
+                        if report is not None:
+                            report.warnings.append("Live evidence journal could not finish; final report uses completed run state.")
+                    if report is not None:
+                        report.observations["evidence_dropped_count"] = writer.dropped_count
+                        if writer.dropped_count:
+                            report.warnings.append(f"{writer.dropped_count} evidence records not written to evidence.jsonl")
+        finally:
+            for sig, previous in installed:
+                loop.remove_signal_handler(sig)
+                signal.signal(sig, previous)
+    if interrupted:
+        # Include stops during journal finalization on the partial-report export path.
+        error = asyncio.CancelledError()
+        error.giraffe_report = report
+        raise error
+    return report
 
 
 def _print_memory(resources: dict) -> None:
@@ -663,6 +677,32 @@ def _print_memory(resources: dict) -> None:
     print(resources.get("sampling", "Sampling details not recorded."))
 
 
+@contextmanager
+def _defer_interrupts(*, already_stopped=False, restore_handlers=None):
+    interrupted = {"requested": False, "output_started": False}
+    previous = {}
+    received = int(already_stopped)
+
+    def stop(signum, frame):
+        nonlocal received
+        received += 1
+        if received > 1:
+            raise KeyboardInterrupt
+        if not interrupted["output_started"]:
+            interrupted["requested"] = True
+
+    try:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                previous[sig] = signal.signal(sig, stop)
+            except ValueError:  # CLI invoked outside the main thread.
+                break
+        yield interrupted
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, (restore_handlers or {}).get(sig, handler))
+
+
 def _main(argv: list[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     json_output = (bool(arguments) and arguments[0] in {"preview", "import-dataset"}) or "--json" in arguments or any(value == "--output-format=json" or (
@@ -674,6 +714,8 @@ def _main(argv: list[str] | None = None) -> int:
         json_output = False
     kind = arguments[0] if arguments else "usage"
     validation_input = {}
+    interrupted = None
+    save_state = None
 
     def emit(outcome: str, exit_code: int, **details) -> None:
         print(json.dumps({"kind": kind, "outcome": outcome, "exit_code": exit_code, **details},
@@ -845,7 +887,7 @@ def _main(argv: list[str] | None = None) -> int:
             from giraffe.storage import set_kept
 
             set_kept(args.run_dir, not args.off)
-            print(f"{args.run_dir}: {'cleanup protection removed' if args.off else 'kept; protected from cleanup'}")
+            print(f"{args.run_dir}: {'manual cleanup protection removed' if args.off else 'kept; protected from cleanup'}")
             return 0
         if args.command in {"ui", "web"}:
             if not 1 <= args.port <= 65535:
@@ -1063,6 +1105,8 @@ def _main(argv: list[str] | None = None) -> int:
         cancelled = None
 
         async def run_with_partial_report():
+            nonlocal interrupted
+            cancellation = None
             try:
                 control = {"directory": directory}
                 report = await (_run(config, quiet=True, **control) if getattr(args, "quiet", False) else
@@ -1072,127 +1116,157 @@ def _main(argv: list[str] | None = None) -> int:
                 report = getattr(error, "giraffe_report", None)
                 if report is None:
                     raise
-                return report, error
-            return report, None
+                cancellation = error
+            # Protect the finished report before asyncio.run tears down its loop.
+            # Restore the caller's handlers, rather than asyncio.Runner's temporary SIGINT handler.
+            interrupted = finalization.enter_context(_defer_interrupts(
+                already_stopped=cancellation is not None, restore_handlers=run_handlers))
+            return report, cancellation
 
-        with run_logging(directory), _heartbeat(directory / ".web.json") as stop_heartbeat:
-            try:
-                report, cancelled = asyncio.run(run_with_partial_report())
-                from giraffe.invocation import cli_invocation
-                report.manifest["invocation"] = cli_invocation(arguments)
-                if guard is not None:
-                    report.manifest["open_files"] = guard
-                if baseline:
-                    report = compare_baseline(report, baseline)
-            except (KeyboardInterrupt, asyncio.CancelledError):
-                logger.exception("CLI run stopped", extra={"giraffe_file_only": True})
-                stop_heartbeat()
+        with ExitStack() as finalization:
+            with run_logging(directory), _heartbeat(directory / ".web.json") as stop_heartbeat:
                 try:
-                    save_state("interrupted", finished_at=datetime.now(timezone.utc).isoformat(),
-                               abort_reason="run cancelled")
-                except OSError:
-                    pass
-                print("Stopped.", file=sys.stderr)
-                if json_output:
-                    emit("interrupted", 130, message="Stopped.")
-                return 130
-            except BaseException as error:
-                logger.exception("CLI run could not finish")
-                stop_heartbeat()
-                try:
-                    save_state("error", finished_at=datetime.now(timezone.utc).isoformat(),
-                               error=f"Run could not finish ({type(error).__name__}).")
-                except OSError:
-                    pass
-                raise
-            sampler = PhaseSampler("export")
-            resources = dict(report.observations.get("resources", {}))
-
-            def export_resources() -> dict:
-                resources["sampled_peak_rss_bytes"] = {
-                    **resources.get("sampled_peak_rss_bytes", {}), **sampler.peaks}
-                resources["sampling"] = SAMPLING
-                if not resources.get("memory_measurement"):
-                    resources["memory_measurement"] = "measured" if sampler.peaks.get("export") is not None else "unavailable"
-                return resources
-
-            try:
-                with sampler:
-                    json_path, html_path = write_report(report, directory, max_run_storage=args.max_run_storage,
-                                                       html=getattr(args, "html", False),
-                                                       **({"preserve_evidence": True} if "scale_down" in config.checks else {}))
-            except OSError as error:
-                logger.exception("CLI report export failed")
-                export_resources()
-                if getattr(error, "json_complete", False):
-                    warning = html_failure_warning(error)
-                    warnings.append(warning)
-                    json_path, html_path = directory / "report.json", None
-                    print(f"Warning: {warning}", file=sys.stderr)
-                else:
+                    run_handlers = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
+                    report, cancelled = asyncio.run(run_with_partial_report())
+                    from giraffe.invocation import cli_invocation
+                    report.manifest["invocation"] = cli_invocation(arguments)
+                    if guard is not None:
+                        report.manifest["open_files"] = guard
+                    if baseline:
+                        report = compare_baseline(report, baseline)
+                except (KeyboardInterrupt, asyncio.CancelledError):
+                    logger.exception("CLI run stopped", extra={"giraffe_file_only": True})
                     stop_heartbeat()
-                    message = save_failure_summary(report, directory, error)
                     try:
-                        save_state("error", error=message, run_id=report.run_id, finished_at=report.finished_at,
-                                   progress={"completed": len(report.requests)}, resources=resources)
+                        save_state("interrupted", finished_at=datetime.now(timezone.utc).isoformat(),
+                                   abort_reason="run cancelled")
                     except OSError:
                         pass
+                    print("Stopped.", file=sys.stderr)
                     if json_output:
-                        emit("error", 4, run_id=report.run_id, message=message, request_count=len(report.requests), resources=resources)
-                    else:
-                        print(f"giraffe: {message}", file=sys.stderr)
-                        if getattr(args, "verbose", False) and not getattr(args, "quiet", False):
-                            _print_memory(resources)
-                    return 4
-        export_resources()
-        from giraffe.storage import automatic_cleanup
+                        emit("interrupted", 130, message="Stopped.")
+                    return 130
+                except BaseException as error:
+                    logger.exception("CLI run could not finish")
+                    stop_heartbeat()
+                    try:
+                        save_state("error", finished_at=datetime.now(timezone.utc).isoformat(),
+                                   error=f"Run could not finish ({type(error).__name__}).")
+                    except OSError:
+                        pass
+                    raise
+                sampler = PhaseSampler("export")
+                resources = dict(report.observations.get("resources", {}))
 
-        policy = _auto_cleanup_policy(args)
-        cleanup_result = None
-        if policy and cancelled is None:
+                def export_resources() -> dict:
+                    resources["sampled_peak_rss_bytes"] = {
+                        **resources.get("sampled_peak_rss_bytes", {}), **sampler.peaks}
+                    resources["sampling"] = SAMPLING
+                    if not resources.get("memory_measurement"):
+                        resources["memory_measurement"] = "measured" if sampler.peaks.get("export") is not None else "unavailable"
+                    return resources
+
+                try:
+                    with sampler:
+                        json_path, html_path = write_report(report, directory, max_run_storage=args.max_run_storage,
+                                                           html=getattr(args, "html", False),
+                                                           **({"preserve_evidence": True} if "scale_down" in config.checks else {}))
+                except OSError as error:
+                    logger.exception("CLI report export failed")
+                    export_resources()
+                    if getattr(error, "json_complete", False):
+                        warning = html_failure_warning(error)
+                        warnings.append(warning)
+                        json_path, html_path = directory / "report.json", None
+                        print(f"Warning: {warning}", file=sys.stderr)
+                    else:
+                        stop_heartbeat()
+                        message = save_failure_summary(report, directory, error)
+                        try:
+                            save_state("error", error=message, run_id=report.run_id, finished_at=report.finished_at,
+                                       progress={"completed": len(report.requests)}, resources=resources)
+                        except OSError:
+                            pass
+                        if json_output:
+                            emit("error", 4, run_id=report.run_id, message=message, request_count=len(report.requests), resources=resources)
+                        else:
+                            print(f"giraffe: {message}", file=sys.stderr)
+                            if getattr(args, "verbose", False) and not getattr(args, "quiet", False):
+                                _print_memory(resources)
+                        return 4
+            export_resources()
+            if interrupted["requested"]:
+                cancelled = asyncio.CancelledError()
+            from giraffe.storage import automatic_cleanup
+
+            policy = _auto_cleanup_policy(args)
+            cleanup_result = None
+            if policy and cancelled is None:
+                try:
+                    cleanup_result = automatic_cleanup(runs_root, policy, active_id=directory.name,
+                                                       stop_requested=lambda: interrupted["requested"])
+                except OSError as error:
+                    cleanup_result = {"deleted": [], "error": str(error)}
+                for identifier in cleanup_result["deleted"]:
+                    if not json_output and not getattr(args, "quiet", False):
+                        print(f"Automatic cleanup deleted run: {identifier}")
             try:
-                cleanup_result = automatic_cleanup(runs_root, policy, active_id=directory.name)
+                save_state("completed", run_id=report.run_id, finished_at=report.finished_at, abort_reason=report.abort_reason,
+                           **({"auto_cleanup": cleanup_result, "auto_cleanup_policy": policy} if policy else {}),
+                           **({"error": warning} if warning else {}), resources={
+                    "sampled_peak_rss_bytes": dict(sampler.peaks), "sampling": resources["sampling"],
+                    "memory_measurement": "measured" if sampler.peaks.get("export") is not None else "unavailable"})
             except OSError as error:
-                cleanup_result = {"deleted": [], "error": str(error)}
-            for identifier in cleanup_result["deleted"]:
-                if not json_output and not getattr(args, "quiet", False):
-                    print(f"Automatic cleanup deleted run: {identifier}")
-        try:
-            save_state("completed", run_id=report.run_id, finished_at=report.finished_at, abort_reason=report.abort_reason,
-                       **({"auto_cleanup": cleanup_result, "auto_cleanup_policy": policy} if policy else {}),
-                       **({"error": warning} if warning else {}), resources={
-                "sampled_peak_rss_bytes": dict(sampler.peaks), "sampling": resources["sampling"],
-                "memory_measurement": "measured" if sampler.peaks.get("export") is not None else "unavailable"})
-        except OSError as error:
-            warning = f"Run completed, but run metadata could not be saved ({error.strerror or type(error).__name__})."
-            warnings.append(warning)
-            print(f"Warning: {warning}", file=sys.stderr)
-        report = _retained(report)
-        exit_code = 130 if cancelled is not None else {"pass": 0, "fail": 1, "inconclusive": 2, "blocked": 3}.get(report.overall, 2)
-        # The aggregate verdict prioritizes failed checks over blocked targets.
-        # A client error can also occur after all of its checks already failed.
-        operational_error = (any(check.required and check.status == "blocked" for check in report.checks)
-                             or any(target.get("client_error")
-                                    for target in report.observations.get("targets", {}).values()))
-        if cancelled is None and operational_error:
-            exit_code = 3
-        _ci_outputs(report, args, directory)
-        policy = getattr(args, "fail_on", "inconclusive")
-        if cancelled is None and not operational_error and (
-                (report.overall == "inconclusive" and policy in {"fail", "never"})
-                or (report.overall == "fail" and policy == "never")):
-            exit_code = 0
-            print(f"Note: {report.overall} verdict accepted by --fail-on {policy}.", file=sys.stderr)
-        summary = report.observations.get("summary")
-        if json_output:
-            emit(report.overall, exit_code, warnings=warnings, run_id=report.run_id, request_count=len(report.requests),
-                 performance=report.performance,
-                 abort_reason=report.abort_reason, resources=resources, auto_cleanup=cleanup_result,
-                 **({"summary": summary} if summary else {}),
-                 report_paths={"json": str(json_path.resolve()), "html": str(html_path.resolve()) if html_path else None})
-        else:
-            _print_result(report, json_path, html_path, directory, resources, verbose=getattr(args, "verbose", False), quiet=getattr(args, "quiet", False))
-        return exit_code
+                warning = f"Run completed, but run metadata could not be saved ({error.strerror or type(error).__name__})."
+                warnings.append(warning)
+                print(f"Warning: {warning}", file=sys.stderr)
+            from giraffe.runner import model_identity_warnings
+            model_warnings = model_identity_warnings(config, report.requests)
+            for item in model_warnings:
+                if item not in warnings:
+                    print(f"Warning: {item}", file=sys.stderr)
+            warnings = list(dict.fromkeys([*warnings, *model_warnings]))
+            report = _retained(report)
+            exit_code = 130 if cancelled is not None else {"pass": 0, "fail": 1, "inconclusive": 2, "blocked": 3}.get(report.overall, 2)
+            # The aggregate verdict prioritizes failed checks over blocked targets.
+            # A client error can also occur after all of its checks already failed.
+            operational_error = (any(check.required and check.status == "blocked" for check in report.checks)
+                                 or any(target.get("client_error")
+                                        for target in report.observations.get("targets", {}).values()))
+            if cancelled is None and operational_error:
+                exit_code = 3
+            _ci_outputs(report, args, directory)
+            interrupted["output_started"] = True
+            if interrupted["requested"]:
+                cancelled, exit_code = asyncio.CancelledError(), 130
+            policy = getattr(args, "fail_on", "inconclusive")
+            if cancelled is None and not operational_error and (
+                    (report.overall == "inconclusive" and policy in {"fail", "never"})
+                    or (report.overall == "fail" and policy == "never")):
+                exit_code = 0
+                print(f"Note: {report.overall} verdict accepted by --fail-on {policy}.", file=sys.stderr)
+            summary = report.observations.get("summary")
+            if json_output:
+                emit("interrupted" if interrupted["requested"] else report.overall, exit_code, warnings=warnings, run_id=report.run_id, request_count=len(report.requests),
+                     performance=report.performance,
+                     abort_reason=report.abort_reason, resources=resources, auto_cleanup=cleanup_result,
+                     **({"summary": summary} if summary else {}),
+                     report_paths={"json": str(json_path.resolve()), "html": str(html_path.resolve()) if html_path else None})
+            else:
+                _print_result(report, json_path, html_path, directory, resources, verbose=getattr(args, "verbose", False), quiet=getattr(args, "quiet", False))
+            sys.stdout.flush()
+            return 130 if interrupted["requested"] else exit_code
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        if save_state is not None:
+            try:
+                save_state("interrupted", finished_at=datetime.now(timezone.utc).isoformat(),
+                           abort_reason="run cancelled")
+            except OSError:
+                pass
+        print("Stopped.", file=sys.stderr)
+        if json_output and not (interrupted and interrupted["output_started"]):
+            emit("interrupted", 130, message="Stopped.")
+        return 130
     except ModelSelectionError as error:
         print(f"giraffe: {error}", file=sys.stderr)
         if json_output:

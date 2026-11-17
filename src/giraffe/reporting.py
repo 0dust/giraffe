@@ -696,15 +696,24 @@ def _settings_reasons(report: RunReport, baseline: RunReport, *, details: dict[s
                 reasons.append(f"{label} AI judge results are incomplete; "
                                "correctness and capacity cannot be compared.")
 
+    def comparison_limits(limits):
+        core = {"access", "serving", "correctness", "json", "first_output", "generation"}
+        if isinstance(limits, dict) and selected and selected <= core:
+            grading = {"first_output_ms", "latency_ms", "stream_gap_ms", "min_output_tokens_per_second",
+                       "max_error_rate", "min_correctness", "fairness_max_ratio", "recovery_max_ratio",
+                       "gpu_max_temperature_c", "regression_percent", "regression_rate_points"}
+            return {name: value for name, value in limits.items() if name not in grading}
+        return limits
+
     def effective_value(manifest, key):
         value = manifest.get(key)
         if key == "effective_traffic" and isinstance(value, dict):
             value = {name: setting for name, setting in value.items() if name != "expected_response_seconds"}
         if key == "effective_checks" and isinstance(value, dict):
-            value = {check: {**settings, **({"limits": {
+            value = {check: {**settings, **({"limits": comparison_limits({
                 name: limit for name, limit in settings["limits"].items()
                 if name not in {"regression_percent", "regression_rate_points"}
-            }} if isinstance(settings.get("limits"), dict) else {})}
+            })} if isinstance(settings.get("limits"), dict) else {})}
                             if isinstance(settings, dict) else settings
                      for check, settings in value.items()
                      if not shared_selection_changed or check not in SHARED_BASELINE_EXCLUDED_WORKLOADS}
@@ -769,6 +778,8 @@ def _settings_reasons(report: RunReport, baseline: RunReport, *, details: dict[s
                            "setting_missing", key)
             continue
         current, old = current_config[key], old_config[key]
+        if key == "limits":
+            current, old = comparison_limits(current), comparison_limits(old)
         if key == "checks" and shared_selection_changed:
             current, old = ([check for check in checks if check not in SHARED_BASELINE_EXCLUDED_WORKLOADS]
                             for checks in (current, old))
@@ -806,8 +817,12 @@ def _settings_reasons(report: RunReport, baseline: RunReport, *, details: dict[s
         if key == "effective_traffic" and not traffic_selected:
             continue
         if key in current_manifest or key in old_manifest:
-            if effective_value(current_manifest, key) != effective_value(old_manifest, key):
-                setting_reason(f"Recorded {key} differs or is missing.", "setting_unknown", key)
+            current, old = effective_value(current_manifest, key), effective_value(old_manifest, key)
+            if current != old:
+                if current is None or old is None:
+                    setting_reason(f"Recorded {key} is missing; comparability is unknown.", "setting_unknown", key)
+                else:
+                    setting_reason(f"Recorded {key} differs.", "setting_differs", key, current, old)
     # Fixture-set identity is independent of the installed package version.
     current_pack = report.manifest.get("fixture_pack")
     old_pack = baseline.manifest.get("fixture_pack")
@@ -1080,7 +1095,7 @@ def _compare_metric(
         else:
             result["reason"] = "A zero baseline does not support a relative timing comparison."
         return result
-    worsening = (current_value - old_value) * direction * scale
+    worsening = (current_value - old_value) * direction * scale or 0.0
     # Fixed seed makes re-rendering/repeating the same comparison reproducible.
     rng = random.Random(0)
     bootstrap = []
@@ -3083,7 +3098,7 @@ def _retained(report: RunReport) -> RunReport:
                        if changed else check.metrics)
             result.checks.append(check.model_copy(update={"summary": summary, "metrics": metrics})
                                  if summary != check.summary or changed else check)
-    failed_evidence = {rid for check in result.checks if check.status in {"fail", "blocked"}
+    failed_evidence = {rid for check in result.checks if check.status in {"fail", "blocked", "inconclusive"}
                        for rid in check.evidence_ids}
     result.requests = []
     for record in report.requests:

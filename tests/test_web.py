@@ -1178,7 +1178,7 @@ async def test_bootstrap_round_trip_keeps_serial_correctness_intent(tmp_path, mo
             assert result['status'] == ('inconclusive' if explicit else 'pass')
             assert detail['report']['overall'] == ('inconclusive' if explicit else 'pass')
             assert result['metrics']['evidenced_overlap'] < 2
-            assert 'server answered one at a time' in result['summary'].lower()
+            assert 'server concurrency is unverified' in result['summary'].lower()
             values = detail['report']['manifest']['config']
 
 

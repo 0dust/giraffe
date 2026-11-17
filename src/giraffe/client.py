@@ -181,7 +181,12 @@ async def _sse_events(
                         event_type = value
             if mark_read_end and not final:
                 yield None, "", observed_at
-    if buffer or data:
+    # Some compatible endpoints omit only the terminal sentinel's blank line.
+    # Never dispatch arbitrary partial JSON at EOF.
+    if event_type == "message" and ((not buffer and data == ["[DONE]"])
+            or (not data and buffer in {"data: [DONE]", "data:[DONE]"})):
+        yield "message", "[DONE]", observed_at
+    elif buffer or data:
         raise _ProtocolError("unterminated SSE event at end of response")
 
 
@@ -908,7 +913,7 @@ class LLMClient:
             elif usage is not None:
                 usage_consistent = False
             choices = data.get("choices")
-            if not isinstance(choices, list) or (not choices and not isinstance(usage, dict)):
+            if not isinstance(choices, list) or (not choices and not streaming):
                 raise _ProtocolError("response is missing completion choices")
             if not choices:
                 return
@@ -1061,6 +1066,8 @@ class LLMClient:
             if streaming:
                 record.chunks += 1
             finish = choice.get("finish_reason")
+            if streaming and finish == "":
+                finish = None
             if finish is not None:
                 if not isinstance(finish, str) or not finish:
                     raise _ProtocolError("invalid completion finish reason")
@@ -1226,6 +1233,8 @@ class LLMClient:
                                 continue
                             if event_type == "error":
                                 raise _ProtocolError("endpoint returned an SSE error event")
+                            if event_type == "ping" and not event.strip():
+                                continue
                             if event.strip() == "[DONE]":
                                 if record.finish_reason is None:
                                     finish_progress(observed_at)
@@ -1233,6 +1242,8 @@ class LLMClient:
                                 record.stream_terminated = True
                                 break
                             data = _object(event, strict_gateway_json=True) if attribution else _object(event)
+                            if event_type == "ping" and not data:
+                                continue
                             receive(data, streaming=True, observed_at=observed_at)
                             usage = data.get("usage")
                             if attribution and record.finish_reason is not None and isinstance(usage, dict):
@@ -1261,8 +1272,14 @@ class LLMClient:
                         record.stream_terminated = True
                     if record.finish_reason is None:
                         raise _ProtocolError("response ended without a completion finish reason")
-                    if record.finish_reason in {"error", "content_filter"}:
-                        raise _ProtocolError("endpoint did not finish a usable answer")
+                    if record.finish_reason not in {"stop", "length", "tool_calls", "function_call"}:
+                        message = "endpoint did not finish a usable answer"
+                        if spec.identity is None:
+                            reason = ascii(record.finish_reason[:80])
+                            if len(record.finish_reason) > 80:
+                                reason += "..."
+                            message += f" (finish_reason={reason})"
+                        raise _ProtocolError(message)
                     record.tool_calls = [tool_parts[index] for index in sorted(tool_parts)]
                     if spec.scorer == "tool" and record.tool_calls:
                         ids = [call["id"] for call in record.tool_calls]

@@ -1,4 +1,5 @@
 import json
+import asyncio
 
 import httpx
 import pytest
@@ -6,6 +7,69 @@ import pytest
 from giraffe.cli import main
 
 pytestmark = pytest.mark.usefixtures("local_tokenizer")
+
+
+def test_cancelled_preflight_stops_without_running_suite(tmp_path, monkeypatch, capsys):
+    from tests.test_connection import endpoint
+
+    async def cancelled(request):
+        asyncio.get_running_loop().call_soon(asyncio.current_task().cancel)
+        await asyncio.Future()
+
+    endpoint(monkeypatch, cancelled)
+    monkeypatch.setattr("giraffe.cli._run", lambda *a, **k: pytest.fail("Suite ran after cancellation"))
+    directory = tmp_path / "run"
+    assert main(["run", "--url", "http://server", "--model", "tiny", "--json",
+                 "--output", str(directory)]) == 130
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["outcome"] == "interrupted"
+    assert "timed out" not in captured.err and "continuing" not in captured.err
+    assert not directory.exists()
+
+
+@pytest.mark.parametrize("directory_input", [False, True])
+@pytest.mark.parametrize("json_output", [False, True])
+def test_truncated_report_error_names_source_without_echoing_body(tmp_path, capsys, directory_input, json_output):
+    path = tmp_path / "report.json"
+    path.write_text('{"PRIVATE_BAD_INPUT":')
+    source = tmp_path if directory_input else path
+    args = (["baseline", "save", str(source), str(tmp_path / "baseline.json"), "--output-format", "json"]
+            if json_output else ["inspect", str(source)])
+    assert main(args) == 4
+    captured = capsys.readouterr()
+    message = json.loads(captured.out)["errors"][0]["message"] if json_output else captured.err
+    assert str(path) in message and "Invalid JSON" in message
+    assert "PRIVATE_BAD_INPUT" not in captured.out + captured.err
+
+
+@pytest.mark.parametrize("json_output", [False, True])
+@pytest.mark.parametrize("observed_model", ["tiny", "actual"])
+def test_run_only_surfaces_actionable_model_warning(tmp_path, monkeypatch, capsys, json_output, observed_model):
+    from giraffe.models import RequestRecord, RunReport
+
+    caveat = "Other traffic on the target is unknown; results cover only the recorded workload."
+    warning = ("Target local requested model 'tiny', but responses reported 'actual'. "
+               "Model aliases may differ; verify the served model.")
+
+    async def run(config, **kwargs):
+        return RunReport(run_id="alias", started_at="now", finished_at="now", overall="pass",
+                         manifest={"config": config.model_dump(mode="json")},
+                         warnings=[caveat, *([warning] if observed_model == "actual" else [])],
+                         requests=[RequestRecord(id="one", target="local", fixture_id="answer", scenario="serving",
+                             check_ids=["serving"], started_at="now", status="completed", valid=True,
+                             observed_model=observed_model)])
+
+    monkeypatch.setattr("giraffe.cli._run", run)
+    assert main(["run", "--url", "http://server", "--model", "tiny", "--skip-preflight",
+                 "--output", str(tmp_path / "run"), *(["--json"] if json_output else [])]) == 0
+    captured = capsys.readouterr()
+    assert (warning in captured.err) == (observed_model == "actual")
+    assert caveat not in captured.err
+    if observed_model == "tiny":
+        assert "Warning:" not in captured.err
+    if json_output:
+        assert json.loads(captured.out)["warnings"] == ([warning] if observed_model == "actual" else [])
+    assert caveat in json.loads((tmp_path / "run" / "report.json").read_text())["warnings"]
 
 
 @pytest.mark.parametrize("output_format", ["text", "json"])

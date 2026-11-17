@@ -97,7 +97,7 @@ async def test_configured_concurrency_without_observed_overlap_is_inconclusive(c
         assert "not exercised concurrently" in result.summary
     else:
         assert result.status == "pass"
-        assert "answered one at a time" in result.summary
+        assert "server concurrency is unverified" in result.summary
         assert result.metrics["concurrency_evidence"].startswith("not observed")
 
 
@@ -106,6 +106,33 @@ async def test_single_concurrency_summary_does_not_claim_load(client, check_id):
     report = await runner.run_suite(config(checks=[check_id], concurrency=1))
     assert "under load" not in check(report, check_id).summary
     assert "under observed concurrency" not in check(report, check_id).summary
+
+
+@pytest.mark.parametrize("unscored", [False, True])
+def test_end_only_parallel_responses_do_not_prove_serial_execution(unscored):
+    from tests.test_timing import request
+
+    settings = config(checks=["correctness"])
+    settings.model_fields_set.discard("default_concurrency")
+    state = runner._Run(settings, None, None)
+    state.records = [request(str(i), start=i * .3).model_copy(update={
+        "target": "service", "scenario": "correctness", "check_ids": ["correctness"],
+        "first_output_ms": 306.9, "last_output_ms": 306.9, "stream_end_ms": 307,
+        "elapsed_ms": 307, "completed_ms": i * .3 + 307,
+        "score": None if unscored and i >= 2 else True,
+        "output": "thinking" if unscored and i >= 2 else "4",
+        "finish_reason": "length" if unscored and i >= 2 else "stop",
+        "score_message": "truncated before a complete answer" if unscored and i >= 2 else None,
+    }) for i in range(14 if unscored else 4)]
+    result = next(c for c in runner._checks(state, settings.targets[0]) if c.id == "correctness")
+    assert result.metrics["evidenced_overlap"] < 2
+    assert "one at a time" not in result.summary and "one request at a time" not in result.summary
+    if unscored:
+        assert result.status == "inconclusive"
+        assert result.metrics.get("reason_code") != "missing_concurrent_answers"
+        assert "max_output_tokens" in result.summary and "OLLAMA_NUM_PARALLEL" not in result.summary
+    else:
+        assert result.status == "pass" and "unverified" in result.summary
 
 
 @pytest.mark.parametrize("check_id", ["correctness", "json"])

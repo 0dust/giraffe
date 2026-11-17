@@ -423,7 +423,7 @@ def test_shared_capacity_pack_ignores_only_inactive_correctness_payload_settings
     current.manifest["effective_checks"]["correctness"].update(max_output_tokens=8, request_timeout_seconds=1)
     assert _settings_reasons(current, old) == []
     current.manifest["effective_checks"]["correctness"]["limits"]["min_correctness"] = .5
-    assert "Recorded effective_checks differs or is missing." in _settings_reasons(current, old)
+    assert "Recorded effective_checks differs." in _settings_reasons(current, old)
 
 
 @pytest.mark.parametrize("failed_run", ["current", "baseline"])

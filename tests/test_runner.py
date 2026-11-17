@@ -179,7 +179,7 @@ async def test_serialized_server_overlap_remedy_preserves_sequential_scope(clien
     assert all(r.score is True for r in report.requests)
     if concurrency > 1:
         assert "could not be checked under concurrent load" in check.summary
-        assert "one request at a time" in check.summary
+        assert "server concurrency is unverified" in check.summary
         assert "OLLAMA_NUM_PARALLEL" in check.summary
         assert "--concurrency 1" in check.summary and "sequentially" in check.summary
         assert "--concurrency 2" not in check.summary and "--samples" not in check.summary
@@ -201,6 +201,132 @@ async def test_serial_timing_sample_remedy_changes_the_serial_sample_count(clien
     enough = await runner.run_suite(config(checks=[check_id], samples=5,
         limits=Limits(min_samples=5, first_output_ms=1000, latency_ms=1000)))
     assert next(c for c in enough.checks if c.id == check_id).status == "pass"
+
+
+@pytest.mark.parametrize("reason,expected", [
+    ("maximum run duration reached", "Run deadline reached"),
+    ("maximum request budget reached", "Request budget reached"),
+])
+def test_timing_sampling_stopped_by_budget_names_the_budget(reason, expected):
+    from tests.test_timing import request
+
+    settings = config(checks=["first_output"], samples=5,
+                      limits=Limits(min_samples=5, first_output_ms=1000))
+    state = runner._Run(settings, None, None)
+    state.records = [request(str(i), start=i * 1000).model_copy(update={
+        "target": "service", "scenario": "warm", "check_ids": ["first_output"],
+    }) for i in range(2)]
+    state.reason = reason
+    state.unfinished["service"].add("first_output")
+    result = next(c for c in runner._checks(state, settings.targets[0]) if c.id == "first_output")
+    assert expected in result.summary
+    assert "set samples" not in result.summary
+
+
+def test_unscored_measurement_at_token_cap_keeps_timing_sample_remedy():
+    from giraffe.models import CheckResult
+    from tests.test_timing import request
+
+    settings = config(checks=["generation"], samples=2, limits=Limits(min_samples=5))
+    result = CheckResult(id="generation", title="Generation", target="service", status="inconclusive",
+                         summary="Too few timing samples.", metrics={"reason_code": "insufficient_timing_samples"})
+    record = request().model_copy(update={"score": None, "finish_reason": "length", "requested_max_tokens": 128})
+    summary = runner._verdict_summary(result, settings, [record], "")
+    assert "--samples" in summary and "at least 5" in summary
+    assert "max_output_tokens" not in summary
+
+
+def test_uncapped_budget_remediation_is_never_blank():
+    from giraffe.models import CheckResult
+
+    settings = config(checks=["correctness"], max_requests=None, max_duration_seconds=None)
+    result = CheckResult(id="correctness", title="Correctness", target="service", status="inconclusive",
+                         summary="No applicable requests completed within the run budget.")
+    assert "To conclude, ." not in runner._verdict_summary(result, settings, [], "")
+
+
+async def test_different_observed_model_warns_without_failing_answers(client, monkeypatch):
+    original = client.execute
+
+    async def aliased(self, spec, **kwargs):
+        record = await original(self, spec, **kwargs)
+        record.observed_model = "actual-backend-model"
+        return record
+
+    monkeypatch.setattr(client, "execute", aliased)
+    report = await runner.run_suite(config(checks=["serving"]))
+    assert check(report, "serving").status == "pass"
+    warnings = [warning for warning in report.warnings if "requested model" in warning]
+    assert len(warnings) == 1
+    assert "actual-backend-model" in warnings[0] and "verify the served model" in warnings[0]
+
+
+async def test_core_runs_compare_measurements_after_grading_limit_change(client):
+    from giraffe.reporting import compare_baseline
+
+    reports = []
+    for threshold in (1000, .001):
+        reports.append(await runner.run_suite(config(checks=["first_output"], samples=6,
+            limits=Limits(min_samples=2, first_output_ms=threshold, regression_percent=1000000))))
+    previous, current = reports
+    assert check(previous, "first_output").status == "pass"
+    assert check(current, "first_output").status == "fail"
+    compared = compare_baseline(current, previous)
+    assert check(compared, "baseline").status == "pass"
+    assert compared.overall == "fail"
+    assert any(target["comparisons"] for target in compared.baseline["targets"])
+
+
+async def test_error_threshold_stop_has_actionable_remediation_without_run_caps(client, monkeypatch):
+    original = client.execute
+
+    async def failed(self, spec, **kwargs):
+        record = await original(self, spec, **kwargs)
+        record.status, record.valid, record.http_status = "failed", False, 500
+        return record
+
+    monkeypatch.setattr(client, "execute", failed)
+    report = await runner.run_suite(config(checks=["serving", "correctness"],
+        max_requests=None, max_duration_seconds=None, stop_after_errors=1))
+    assert report.abort_reason == "error threshold reached"
+    result = check(report, "correctness")
+    assert result.status == "inconclusive"
+    assert "request errors" in result.summary and "fix the error cause" in result.summary
+    assert "To conclude, ." not in result.summary
+
+
+async def test_error_threshold_stop_preserves_connection_cause_for_unfinished_checks(client, monkeypatch):
+    async def disconnected(self, spec, **kwargs):
+        return RequestRecord(id=uuid.uuid4().hex, target=self.target.name,
+            fixture_id=spec.fixture_id, scenario=spec.scenario, check_ids=spec.check_ids,
+            started_at="2026-10-19T00:00:00Z", status="failed", error="request failed (ConnectError)")
+
+    monkeypatch.setattr(client, "execute", disconnected)
+    report = await runner.run_suite(config(checks=["serving", "correctness"], stop_after_errors=1))
+    assert report.abort_reason == "error threshold reached"
+    result = check(report, "correctness")
+    assert result.status == "inconclusive"
+    assert result.summary.startswith("Could not connect to http://localhost:1234 (ConnectError); no checks could run")
+    assert "request errors" in result.summary and "fix the error cause" in result.summary
+    assert result.remediation["code"] == "endpoint_unavailable"
+
+
+async def test_capped_answer_summary_does_not_claim_inference_failed(client, monkeypatch):
+    original = client.execute
+
+    async def capped(self, spec, **kwargs):
+        record = await original(self, spec, **kwargs)
+        return record.model_copy(update={"output": "Let me reason through the answer",
+                                         "finish_reason": "length"})
+
+    monkeypatch.setattr(client, "execute", capped)
+    report = await runner.run_suite(config(checks=["correctness"], concurrency=1, default_concurrency=1))
+    result = check(report, "correctness")
+    assert result.status == "inconclusive"
+    assert all(record.status == "completed" for record in report.requests)
+    assert "no complete, locally scored answer" in result.summary
+    assert "inference or answer evaluation did not complete" not in result.summary
+    assert "max_output_tokens" in result.summary
 
 
 def test_serial_generation_measurement_remedy_does_not_raise_concurrency():

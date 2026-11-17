@@ -4,6 +4,10 @@ import asyncio
 import inspect
 import json
 import threading
+import os
+import signal
+import subprocess
+import sys
 
 import pytest
 
@@ -15,6 +19,192 @@ from giraffe.models import CheckResult, RunConfig, RunReport
 from giraffe.web import create_app
 
 pytestmark = pytest.mark.usefixtures("local_tokenizer")
+
+
+def test_cli_single_sigint_during_real_preflight_exits_130(tmp_path):
+    script = '''
+import asyncio, os, signal, sys, httpx
+from giraffe import cli
+original = httpx.AsyncClient
+async def respond(request):
+    os.kill(os.getpid(), signal.SIGINT)
+    await asyncio.Future()
+httpx.AsyncClient = lambda **kwargs: original(transport=httpx.MockTransport(respond), **kwargs)
+async def forbidden(*args, **kwargs):
+    raise AssertionError("Suite traffic followed preflight cancellation")
+cli._run = forbidden
+raise SystemExit(cli.main(["run", "--url", "http://server", "--model", "tiny",
+                          "--min-free-disk", "0", "--json", "--output", sys.argv[1]]))
+'''
+    directory = tmp_path / "preflight"
+    process = subprocess.run([sys.executable, "-c", script, str(directory)],
+                             capture_output=True, text=True, timeout=20, env=os.environ.copy())
+    assert process.returncode == 130, process.stderr
+    assert json.loads(process.stdout)["outcome"] == "interrupted"
+    assert not directory.exists()
+    assert "Traceback" not in process.stderr and "timed out" not in process.stderr
+
+
+@pytest.mark.parametrize("phase", ["startup", "unsupported_loop"])
+def test_cli_sigint_before_export_remains_interruptible(tmp_path, phase):
+    script = '''
+import asyncio, os, signal, sys
+from contextlib import contextmanager
+from giraffe import cli, runner
+from giraffe.models import RunReport
+if sys.argv[2] == "startup":
+    @contextmanager
+    def startup(directory):
+        os.kill(os.getpid(), signal.SIGINT)
+        yield
+    cli.run_logging = startup
+else:
+    loop = asyncio.new_event_loop()
+    loop_type = type(loop)
+    loop.close()
+    def unsupported(*args, **kwargs):
+        raise NotImplementedError
+    loop_type.add_signal_handler = unsupported
+async def run(config, **kwargs):
+    if sys.argv[2] == "startup":
+        raise AssertionError("Suite launched after startup stop")
+    os.kill(os.getpid(), signal.SIGINT)
+    try:
+        await asyncio.Future()
+    except asyncio.CancelledError as error:
+        error.giraffe_report = RunReport(run_id="partial", started_at="now", finished_at="now",
+            overall="inconclusive", abort_reason="run cancelled", manifest={"config": config.model_dump(mode="json")})
+        raise
+runner.run_suite = run
+raise SystemExit(cli.main(["run", "--url", "http://server", "--model", "tiny", "--skip-preflight",
+                          "--min-free-disk", "0", "--json", "--output", sys.argv[1]]))
+'''
+    directory = tmp_path / "startup-stop"
+    process = subprocess.run([sys.executable, "-c", script, str(directory), phase],
+                             capture_output=True, text=True, timeout=5, env=os.environ.copy())
+    assert process.returncode == 130, process.stderr
+    assert json.loads(process.stdout)["exit_code"] == 130
+    assert "Traceback" not in process.stderr
+    assert (directory / "report.json").exists() == (phase == "unsupported_loop")
+    assert json.loads((directory / ".web.json").read_text())["state"] == (
+        "interrupted" if phase == "startup" else "completed")
+
+
+def test_cli_sigint_during_cleanup_preserves_remaining_runs(tmp_path):
+    script = '''
+import os, signal, sys
+from pathlib import Path
+from giraffe import cli, runner, storage
+from giraffe.models import RunReport
+from giraffe.reporting import write_report
+from scripts.measure_storage import synthetic_report
+root = Path(sys.argv[1])
+for name in ("first", "second"):
+    write_report(synthetic_report(2, 10, "all"), root / name)
+async def run(config, **kwargs):
+    return RunReport(run_id="current", started_at="now", finished_at="now",
+                     overall="pass", manifest={"config": config.model_dump(mode="json")})
+runner.run_suite = run
+original = storage.shutil.rmtree
+def remove(path, *args, **kwargs):
+    os.kill(os.getpid(), signal.SIGINT)
+    return original(path, *args, **kwargs)
+storage.shutil.rmtree = remove
+raise SystemExit(cli.main(["run", "--url", "http://server", "--model", "tiny", "--skip-preflight",
+    "--min-free-disk", "0", "--json", "--runs-dir", str(root), "--output", str(root / "current"),
+    "--auto-cleanup-keep-latest", "0"]))
+'''
+    process = subprocess.run([sys.executable, "-c", script, str(tmp_path)],
+                             capture_output=True, text=True, timeout=20, env=os.environ.copy())
+    assert process.returncode == 130, process.stderr
+    result = json.loads(process.stdout)
+    assert result["outcome"] == "interrupted" and len(result["auto_cleanup"]["deleted"]) == 1
+    assert result["auto_cleanup"]["skipped"][0]["reason"] == "cleanup cancelled"
+    assert sum((tmp_path / name).exists() for name in ("first", "second")) == 1
+    assert (tmp_path / "current" / "report.json").exists()
+    assert "Traceback" not in process.stderr
+
+
+@pytest.mark.parametrize("stop_signal", [signal.SIGINT, signal.SIGTERM])
+@pytest.mark.parametrize("phase", ["report", "ci", "stdout", "forced_report", "journal", "teardown",
+                                   "forced_partial_report", "forced_partial_journal"])
+def test_cli_signal_during_export_saves_report_and_complete_json(tmp_path, stop_signal, phase):
+    script = '''
+import os, signal, sys
+from giraffe import cli, runner, reporting
+from giraffe.evidence import EvidenceWriter
+from giraffe.models import RunReport
+async def run(config, **kwargs):
+    if sys.argv[3] in {"forced_partial_report", "forced_partial_journal"}:
+        os.kill(os.getpid(), int(sys.argv[2]))
+        await kwargs["stop_event"].wait()
+    return RunReport(run_id="finished", started_at="now", finished_at="now",
+                     overall="pass", manifest={"config": config.model_dump(mode="json")})
+runner.run_suite = run
+original_close = EvidenceWriter.close
+def close(writer):
+    if sys.argv[3] in {"journal", "forced_partial_journal"}:
+        os.kill(os.getpid(), int(sys.argv[2]))
+    return original_close(writer)
+EvidenceWriter.close = close
+original_run = cli.asyncio.run
+def asyncio_run(coro, **kwargs):
+    is_suite = coro.__name__ == "run_with_partial_report"
+    result = original_run(coro, **kwargs)
+    if is_suite and sys.argv[3] == "teardown":
+        os.kill(os.getpid(), int(sys.argv[2]))
+    return result
+cli.asyncio.run = asyncio_run
+original = reporting.write_report
+def write(*args, **kwargs):
+    if sys.argv[3] in {"report", "forced_report", "forced_partial_report"}:
+        os.kill(os.getpid(), int(sys.argv[2]))
+        if sys.argv[3] == "forced_report":
+            os.kill(os.getpid(), int(sys.argv[2]))
+    return original(*args, **kwargs)
+reporting.write_report = write
+original_ci = cli._ci_outputs
+def ci(*args, **kwargs):
+    if sys.argv[3] == "ci":
+        os.kill(os.getpid(), int(sys.argv[2]))
+    return original_ci(*args, **kwargs)
+cli._ci_outputs = ci
+if sys.argv[3] == "stdout":
+    original_out = sys.stdout
+    class InterruptedOutput:
+        def write(self, text):
+            if text.startswith('{'):
+                middle = len(text) // 2
+                original_out.write(text[:middle])
+                original_out.flush()
+                os.kill(os.getpid(), int(sys.argv[2]))
+                original_out.write(text[middle:])
+                return len(text)
+            return original_out.write(text)
+        def flush(self):
+            original_out.flush()
+    sys.stdout = InterruptedOutput()
+raise SystemExit(cli.main(["run", "--url", "http://server", "--model", "tiny",
+                          "--skip-preflight", "--min-free-disk", "0", "--json",
+                          "--output", sys.argv[1]]))
+'''
+    directory = tmp_path / "export"
+    process = subprocess.run([sys.executable, "-c", script, str(directory), str(stop_signal), phase],
+                             capture_output=True, text=True, timeout=20, env=os.environ.copy())
+    expected_code = 0 if phase == "stdout" else 130
+    assert process.returncode == expected_code, process.stderr
+    result = json.loads(process.stdout)
+    assert result["exit_code"] == expected_code
+    assert result["outcome"] == ("pass" if phase in {"stdout", "journal"} else "interrupted")
+    if phase in {"forced_report", "forced_partial_report", "forced_partial_journal"}:
+        assert not (directory / "report.json").exists()
+        assert (directory / "evidence.jsonl").exists()
+        assert json.loads((directory / ".web.json").read_text())["state"] == "interrupted"
+        assert "Traceback" not in process.stderr
+        return
+    assert json.loads((directory / "report.json").read_text())["overall"] == "pass"
+    assert json.loads((directory / ".web.json").read_text())["state"] == "completed"
+    assert "Traceback" not in process.stderr
 
 
 def partial_report(config, reason="cancelled by user"):
