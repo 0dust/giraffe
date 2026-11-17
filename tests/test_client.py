@@ -1237,3 +1237,56 @@ async def test_completed_body_with_cancelled_close_is_not_valid(monkeypatch):
     assert record.output == "42" and record.stream_terminated and transport.closed
     assert record.status == "cancelled"
     assert record.valid is False
+
+
+@pytest.mark.parametrize("base,path", [
+    ("http://server", "/v1"),
+    ("http://server/", "/v1"),
+    ("http://server/v1/", "/v1"),
+    ("http://server/v1/chat/completions", "/v1"),
+    ("http://server/v1/chat/completions/", "/v1"),
+    ("http://server/openai/deployments/a%2Fb", "/openai/deployments/a%2Fb"),
+])
+def test_completion_url_keeps_api_version_after_the_complete_path(base, path):
+    from giraffe.client import completion_url
+
+    query = "?api-version=2024-02-01"
+    assert completion_url(base + query) == "http://server" + path + "/chat/completions" + query
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("health_fallback", [False, True])
+async def test_inference_and_readiness_preserve_api_version(monkeypatch, stream, health_fallback):
+    import time
+
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        if request.method == "GET":
+            return httpx.Response(404 if health_fallback and request.url.path.endswith("/models") else 200)
+        if stream:
+            return httpx.Response(200, text=(
+                'data: {"choices":[{"delta":{"content":"42"},"finish_reason":"stop"}]}\n\n'
+                'data: [DONE]\n\n'), headers={"content-type": "text/event-stream"})
+        return httpx.Response(200, json={"choices": [
+            {"message": {"content": "42"}, "finish_reason": "stop"}]})
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: original(
+        transport=httpx.MockTransport(respond), **kwargs))
+    monkeypatch.setenv("AZURE_TEST_KEY", "private-header-key")
+    target = Target(name="local", model="test",
+        url="http://server/openai/deployments/example?api-version=2024-02-01",
+        headers_env={"api-key": "AZURE_TEST_KEY"})
+    async with LLMClient(target, RunConfig(targets=[target], stream=stream)) as client:
+        assert await client.ready(time.monotonic() + 5)
+        record = await client.execute(spec(stream=stream))
+    assert record.valid and record.output == "42"
+    paths = ["/openai/deployments/example/models"]
+    if health_fallback:
+        paths.append("/health")
+    paths.append("/openai/deployments/example/chat/completions")
+    assert [request.url.path for request in requests] == paths
+    assert all(request.url.query == b"api-version=2024-02-01" for request in requests)
+    assert all(request.headers["api-key"] == "private-header-key" for request in requests)

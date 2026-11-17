@@ -1523,6 +1523,12 @@ class GatewayAttribution(Model):
         return value
 
 
+def _validate_inference_query(query: str) -> None:
+    if query and not re.fullmatch(r"api-version=[0-9]{4}-[0-9]{2}-[0-9]{2}(?:-preview)?", query):
+        raise ValueError("endpoint URL query may only contain api-version=YYYY-MM-DD or "
+                         "api-version=YYYY-MM-DD-preview; use environment-referenced headers for credentials")
+
+
 class Target(Model):
     tokenizer: str | None = Field(default=None, min_length=1,
         description="Prompt sizing tokenizer: null or auto resolves the served model name and falls back to builtin; builtin uses tiktoken o200k_base. A model ID or local directory remains an optional CLI override. Tokenizer assets download and cache locally; no inference is used for sizing.")
@@ -1573,8 +1579,9 @@ class Target(Model):
         parsed = urlsplit(self.url)
         if parsed.scheme not in {"http", "https"} or not parsed.hostname:
             raise ValueError("target url must start with http:// or https:// (for example http://localhost:11434/v1)")
-        if parsed.username or parsed.password or parsed.query or parsed.fragment:
-            raise ValueError("use an endpoint URL without credentials, query or fragment")
+        if parsed.username is not None or parsed.password is not None or parsed.fragment:
+            raise ValueError("use an endpoint URL without credentials or fragment")
+        _validate_inference_query(parsed.query)
         if self.metrics_url:
             metrics = urlsplit(self.metrics_url)
             if metrics.scheme not in {"http", "https"} or not metrics.hostname:
@@ -2190,9 +2197,10 @@ class JudgeEndpoint(Model):
         if self.url:
             parsed = urlsplit(self.url)
             if parsed.scheme not in {"http", "https"} or not parsed.hostname or any(
-                (parsed.username, parsed.password, parsed.query, parsed.fragment)
+                (parsed.username is not None, parsed.password is not None, parsed.fragment)
             ):
-                raise ValueError("judge url must be an http(s) endpoint without credentials/query/fragment")
+                raise ValueError("judge url must be an http(s) endpoint without credentials/fragment")
+            _validate_inference_query(parsed.query)
         references = [*self.headers_env.values(), *([self.api_key_env] if self.api_key_env else [])]
         if any(not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value) for value in references):
             raise ValueError("judge credentials must name environment variables")
