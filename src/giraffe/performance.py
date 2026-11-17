@@ -515,7 +515,8 @@ def _window_summary(report, target, window, records, series, observation):
         "conversations": ("turn_latency", "turn_generation", "conversation_completion", "user_fairness", "workload_occupancy", "decode_interference", "response_interference", "recovery_ratios", "cancel_followup"),
         "server": ("gpu_utilization", "gpu_memory", "gpu_temperature", "gpu_errors", "throttling", "server_running", "server_waiting", "kv_cache", "prefix_cache", "prefix_hit_rate", "preemptions", "server_retractions_per_second", "server_queue", "server_inference", "server_prompt_tokens_per_second", "server_tokens", "host_cpu", "host_ram", "websocket_rtt")
                   + tuple(key for key, _, _ in SPEC_DECODE_ROWS)
-                  + (("spec_decode_accepted_by_position",) if "spec_decode_accepted_by_position" in metrics else ()),
+                  + (("spec_decode_accepted_by_position",) if "spec_decode_accepted_by_position" in metrics else ())
+                  + tuple(key for key in metrics if key.startswith("mtplx_latest_")),
         "baseline": ("baseline_throughput", "baseline_timing", "baseline_generation", "baseline_quality", "baseline_capacity"),
     }
     return {"metrics": metrics, "kpis": list(KPI_IDS), "distributions": distributions,
@@ -797,9 +798,13 @@ def _server_rows(report, target, window, observation, put, metrics):
     for key, row in derived.items():
         if key in {derived_key for _, derived_key, _, _ in mapping}:
             continue
-        put(key, row.get("value"), key.replace('_', ' ').capitalize(), row.get("unit", ""), row.get("source", "Server telemetry"),
+        mtplx = key.startswith("mtplx_latest_")
+        label = row.get("label", key.replace('_', ' ').capitalize()) if mtplx else key.replace('_', ' ').capitalize()
+        put(key, row.get("value"), label, row.get("unit", ""), row.get("source", "Server telemetry"),
             samples=row.get("sample_count", 0), state=row.get("state", "not_collected"), reason=row.get("reason"), action=row.get("action"),
-            scope="server-wide", collection_window="telemetry sample interval", details=row.get("details", {}))
+            scope=row.get("scope", "server-wide") if mtplx else "server-wide",
+            collection_window="telemetry sample interval", details=row.get("details", {}),
+            **({"eligible": row.get("eligible_count", 0)} if mtplx else {}))
         metrics[key]["action"] = row.get("action")
     accepted = derived.get("spec_decode_accepted_tokens", {})
     positions = accepted.get("details", {}).get("accepted_tokens_by_position", [])

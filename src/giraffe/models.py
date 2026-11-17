@@ -1543,7 +1543,7 @@ class Target(Model):
     host_metrics_url: str | None = Field(default=None, description="Optional node_exporter Prometheus-text URL for server host CPU/RAM; independent of runtime metrics credentials.")
     metrics_api_key_env: str | None = None
     metrics_headers_env: dict[str, str] = Field(default_factory=dict)
-    metrics_profile: Literal["unknown", "vllm-v1", "vllm-legacy", "ollama", "sglang", "llamacpp", "tensorrt-llm", "lmdeploy", "tgi"] = "unknown"
+    metrics_profile: Literal["unknown", "vllm-v1", "vllm-legacy", "ollama", "sglang", "llamacpp", "tensorrt-llm", "lmdeploy", "tgi", "mtplx"] = "unknown"
     metrics_runtime_version: str | None = None
     instrumentation: Literal["unknown", "enabled", "disabled", "unsupported"] = "unknown"
     deployment: Deployment = Field(default_factory=Deployment)

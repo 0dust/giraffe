@@ -279,7 +279,7 @@ Exit codes:
         run.add_argument("--metrics-url", help="Separate statistics endpoint for the first target")
         run.add_argument("--host-metrics-url", help="Optional node_exporter endpoint for server host CPU/RAM")
         run.add_argument("--metrics-api-key-env", help="Separate metrics secret reference")
-        run.add_argument("--metrics-profile", choices=["unknown", "ollama", "vllm-v1", "vllm-legacy", "sglang", "llamacpp", "tensorrt-llm", "lmdeploy", "tgi"], help="Metrics format used by the statistics endpoint")
+        run.add_argument("--metrics-profile", choices=["unknown", "ollama", "vllm-v1", "vllm-legacy", "sglang", "llamacpp", "tensorrt-llm", "lmdeploy", "tgi", "mtplx"], help="Metrics format used by the statistics endpoint")
         run.add_argument("--tool-calling", action="store_true", default=None, help="Include tool-calling capability checks")
         run.add_argument("--metrics", action="store_true", default=None, help="Include GPU metrics observations")
         run.add_argument("--nonstream", action=LegacyNonstream, nargs=0, default=None, dest="stream", help=argparse.SUPPRESS)
