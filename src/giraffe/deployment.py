@@ -16,6 +16,8 @@ from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
+from .launch_settings import compare_launch_settings, safe_speculation
+
 from .caps import (
     MAX_DEPLOYMENT_BODY_BYTES, MAX_DEPLOYMENT_SCOPE_CHARS, MAX_LAUNCH_ARGUMENTS,
     MAX_REPORT_SANITIZE_DEPTH, MAX_SANITIZE_DEPTH, MAX_SANITIZE_ITEMS,
@@ -151,7 +153,12 @@ def safe_launch(command):
     while index < len(args):
         arg = str(args[index])
         flag, equals, value = arg.partition("=")
-        if flag in LAUNCH_FLAGS:
+        if flag == "--speculative-config":
+            if not equals and index + 1 < len(args) and not str(args[index + 1]).startswith("--"):
+                index += 1
+                value = str(args[index])
+            result.append(flag + "=" + safe_speculation(value))
+        elif flag in LAUNCH_FLAGS:
             result.append(sanitize(arg))
             if not equals and index + 1 < len(args) and not str(args[index + 1]).startswith("--"):
                 index += 1
@@ -744,6 +751,8 @@ def deployment_diff(current, baseline):
     changed = [r["field"] for r in rows if r["change"] != "no_observed_change"]
     intended = current.get("intended_change")
     intended_fields = intended if isinstance(intended, list) else [intended]
+    launch_comparison, covered, extra_settings = compare_launch_settings(
+        current, baseline, intended_fields, LAUNCH_FLAGS)
     return {
         "fields": rows,
         "unknown_baseline": not bool(baseline),
@@ -755,7 +764,9 @@ def deployment_diff(current, baseline):
             "current": current.get("continuity", "unverified"),
         },
         "intended_change": intended,
-        "confounded": bool(intended and any(f not in intended_fields for f in changed)),
+        "confounded": bool(intended and (extra_settings or any(
+            f not in intended_fields and f not in covered for f in changed))),
+        "launch_comparison": launch_comparison,
         "interpretation": "Changes are investigation context, not evidence of causality. Missing/stale/unobserved fields cannot establish unchanged configuration.",
     }
 

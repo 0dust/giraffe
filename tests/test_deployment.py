@@ -609,3 +609,247 @@ def test_intended_change_rejects_invalid_or_truncated_new_lists(intended):
     assert not Draft202012Validator(Deployment.model_json_schema()).is_valid(payload)
     with pytest.raises(ValidationError):
         Deployment.model_validate(payload)
+
+
+SPECULATION_SETTING = "serving.launch_arguments.--speculative-config"
+SPECULATION_ARGS = ["--speculative-config", '{"method":"eagle3","num_speculative_tokens":3}']
+
+
+def launch_snapshot(arguments, *, enabled=False, intended=None, **fields):
+    values = {
+        "serving.launch_arguments": safe_launch(arguments),
+        "extension.requested_speculative_config": {"method": "eagle3", "k": 3} if enabled else None,
+        **fields,
+    }
+    return {"fields": {name: {"configured": {"value": value}} for name, value in values.items()},
+            "intended_change": intended}
+
+
+@pytest.mark.parametrize("intended", [SPECULATION_SETTING, [SPECULATION_SETTING]])
+@pytest.mark.parametrize("as_string", [False, True])
+def test_individual_speculation_setting_covers_equivalent_metadata(intended, as_string):
+    import shlex
+
+    before = ["vllm", "serve", "model", "--max-num-seqs", "16"]
+    after = before + SPECULATION_ARGS
+    if as_string:
+        before, after = shlex.join(before), shlex.join(after)
+    diff = deployment_diff(launch_snapshot(after, enabled=True, intended=intended),
+                           launch_snapshot(before))
+    assert diff["confounded"] is False
+    assert diff["launch_comparison"]["status"] == "unverified"
+    assert diff["launch_comparison"]["warnings"] == [
+        "The launch model operand is redacted; its equivalence is unverified."]
+    changes = diff["launch_comparison"]["settings"]
+    assert [(row["flag"], row["change"], row["intended"]) for row in changes] == [
+        ("--speculative-config", "added", True)]
+
+
+@pytest.mark.parametrize("before,after,flag,change", [
+    (["--max-num-seqs", "16"], ["--max-num-seqs", "32"], "--max-num-seqs", "changed"),
+    ([], ["--max-num-batched-tokens=4096"], "--max-num-batched-tokens", "added"),
+    (["--max-num-seqs", "16"], [], "--max-num-seqs", "removed"),
+    ([], ["--enforce-eager"], "--enforce-eager", "added"),
+    ([], ["--unknown-option", "private-value"], "--unknown-option", "added"),
+])
+def test_individual_speculation_flags_additional_launch_changes(before, after, flag, change):
+    prefix = ["vllm", "serve", "model"]
+    diff = deployment_diff(
+        launch_snapshot(prefix + after + SPECULATION_ARGS, enabled=True, intended=SPECULATION_SETTING),
+        launch_snapshot(prefix + before))
+    assert diff["confounded"] is True
+    assert any(row["flag"] == flag and row["change"] == change and not row["intended"]
+               for row in diff["launch_comparison"]["settings"])
+    assert "private-value" not in json.dumps(diff)
+
+
+@pytest.mark.parametrize("flag,field", [
+    ("--max-num-seqs", "serving.max_num_seqs"),
+    ("--max-num-batched-tokens", "serving.max_num_batched_tokens"),
+])
+def test_individual_batching_setting_covers_its_metadata(flag, field):
+    prefix = ["vllm", "serve", "model"]
+    diff = deployment_diff(
+        launch_snapshot(prefix + [flag + "=32"], intended="serving.launch_arguments." + flag,
+                        **{field: 32}),
+        launch_snapshot(prefix + [flag, "16"], **{field: 16}))
+    assert diff["confounded"] is False
+    assert diff["launch_comparison"]["status"] == "unverified"
+
+
+def test_whole_launch_declaration_keeps_behavior_and_explains_its_scope():
+    prefix = ["vllm", "serve", "model", "--max-num-seqs"]
+    intended = ["serving.launch_arguments", "extension.requested_speculative_config"]
+    diff = deployment_diff(
+        launch_snapshot(prefix + ["32"] + SPECULATION_ARGS, enabled=True, intended=intended),
+        launch_snapshot(prefix + ["16"]))
+    assert diff["confounded"] is False
+    assert diff["intended_change"] == intended
+    assert "additional changes within that field are not checked separately" in " ".join(
+        diff["launch_comparison"]["warnings"])
+
+
+@pytest.mark.parametrize("arguments,reason", [
+    (["--max-num-seqs", "16", "--max-num-seqs", "32"], "duplicate"),
+    (["--unknown-option", "hidden"], "unknown"),
+    (["--config", "settings.yaml"], "configuration"),
+    (["--max-num-seqs", "[redacted]"], "redacted"),
+])
+def test_ambiguous_launch_inputs_never_claim_a_checked_comparison(arguments, reason):
+    prefix = ["vllm", "serve", "model"]
+    diff = deployment_diff(
+        launch_snapshot(prefix + arguments + SPECULATION_ARGS, enabled=True, intended=SPECULATION_SETTING),
+        launch_snapshot(prefix + arguments))
+    assert diff["launch_comparison"]["status"] == "unverified"
+    assert reason in " ".join(diff["launch_comparison"]["warnings"]).lower()
+
+
+def test_changed_argument_order_and_redacted_speculation_remain_unverified():
+    before = ["vllm", "serve", "model", "--max-num-seqs", "16", "--max-model-len", "1024"]
+    after = ["vllm", "serve", "model", "--max-model-len", "1024", "--max-num-seqs", "16"]
+    diff = deployment_diff(
+        launch_snapshot(after + ["--speculative-config=[redacted]"], enabled=True,
+                        intended=SPECULATION_SETTING), launch_snapshot(before))
+    warnings = " ".join(diff["launch_comparison"]["warnings"]).lower()
+    assert diff["launch_comparison"]["status"] == "unverified"
+    assert "order" in warnings and "redacted" in warnings
+
+
+def test_speculation_metadata_disagreement_is_not_accepted_as_equivalent():
+    prefix = ["vllm", "serve", "model"]
+    current = launch_snapshot(prefix + SPECULATION_ARGS, enabled=True, intended=SPECULATION_SETTING)
+    current["fields"]["extension.requested_speculative_config"]["configured"]["value"]["k"] = 8
+    diff = deployment_diff(current, launch_snapshot(prefix))
+    assert diff["confounded"] is True
+    assert diff["launch_comparison"]["status"] == "unverified"
+    assert "equivalence" in " ".join(diff["launch_comparison"]["warnings"]).lower()
+
+
+@pytest.mark.parametrize("payload", [
+    '{"method":"eagle3","num_speculative_tokens":3,"model":"private-model"}',
+    '{"method":"eagle3","method":"mtp","num_speculative_tokens":3}',
+    '{"method":"password=private-method","num_speculative_tokens":3}',
+])
+def test_speculation_launch_import_redacts_unsupported_or_ambiguous_values(payload):
+    arguments = safe_launch(["vllm", "serve", "model", "--speculative-config", payload])
+    assert arguments[-1] == "--speculative-config=[redacted]"
+    assert "private-" not in json.dumps(arguments)
+
+
+def test_setting_comparison_ignores_collection_time_but_keeps_evidence_context_changes():
+    prefix = ["vllm", "serve", "model"]
+    baseline = launch_snapshot(prefix)
+    current = launch_snapshot(prefix + SPECULATION_ARGS, enabled=True, intended=SPECULATION_SETTING)
+    for snapshot, stamp in ((baseline, "2026-11-17T00:00:00Z"), (current, "2026-11-18T00:00:00Z")):
+        for row in snapshot["fields"].values():
+            row["configured"].update(collected_at=stamp, scope="one replica", provenance="user-supplied")
+    assert deployment_diff(current, baseline)["confounded"] is False
+    current["fields"]["serving.launch_arguments"]["configured"]["scope"] = "another replica"
+    diff = deployment_diff(current, baseline)
+    assert diff["confounded"] is True
+    assert diff["launch_comparison"]["status"] == "unverified"
+
+
+def test_individual_setting_does_not_hide_a_changed_imported_model_operand():
+    prefix = ["vllm", "serve", "model"]
+    baseline = launch_snapshot(prefix)
+    current = launch_snapshot(prefix + SPECULATION_ARGS, enabled=True, intended=SPECULATION_SETTING)
+    baseline["fields"]["serving.launch_arguments"]["configured"]["value"][2] = "old-model"
+    current["fields"]["serving.launch_arguments"]["configured"]["value"][2] = "new-model"
+    assert deployment_diff(current, baseline)["confounded"] is True
+
+
+def test_unknown_individual_setting_selector_is_explicitly_unverified():
+    prefix = ["vllm", "serve", "model"]
+    diff = deployment_diff(
+        launch_snapshot(prefix + ["--max-num-seqs", "32"],
+                        intended="serving.launch_arguments.--unknown-setting"),
+        launch_snapshot(prefix))
+    assert diff["confounded"] is True
+    assert diff["launch_comparison"]["status"] == "unverified"
+
+
+def test_known_imported_model_and_supported_settings_can_be_checked():
+    prefix = ["vllm", "serve", "model"]
+    baseline = launch_snapshot(prefix)
+    current = launch_snapshot(prefix + SPECULATION_ARGS, enabled=True, intended=SPECULATION_SETTING)
+    for saved in (baseline, current):
+        saved["fields"]["serving.launch_arguments"]["configured"]["value"][2] = "model"
+    diff = deployment_diff(current, baseline)
+    assert diff["confounded"] is False
+    assert diff["launch_comparison"]["status"] == "checked"
+    assert diff["launch_comparison"]["warnings"] == []
+
+
+async def test_redacted_model_operand_stays_unverified_after_collection():
+    from giraffe.deployment import snapshot
+
+    async def collect(model, enabled):
+        command = ["vllm", "serve", model] + (SPECULATION_ARGS if enabled else [])
+        config = RunConfig(targets=[{"name": "local", "url": "http://localhost:1/v1", "model": "alias",
+            "deployment": {"launch_command": command,
+                           "extension": {"requested_speculative_config": {"method": "eagle3", "k": 3} if enabled else None},
+                           "intended_change": SPECULATION_SETTING if enabled else None}}])
+        return await snapshot(config.targets[0], config, time.monotonic() + 5, asyncio.Event())
+
+    baseline, current = await collect("old-model", False), await collect("new-model", True)
+    for saved in (baseline, current):
+        assert saved["fields"]["serving.launch_arguments"]["configured"]["value"][2] == "[redacted]"
+    diff = deployment_diff(current, baseline)
+    assert diff["confounded"] is False
+    assert diff["launch_comparison"]["status"] == "unverified"
+    assert any("model operand" in warning and "redacted" in warning
+               for warning in diff["launch_comparison"]["warnings"])
+
+
+def test_competing_prefix_cache_flags_have_explicit_precedence_uncertainty():
+    prefix = ["vllm", "serve", "model", "--enable-prefix-caching", "--no-enable-prefix-caching"]
+    diff = deployment_diff(
+        launch_snapshot(prefix + SPECULATION_ARGS, enabled=True, intended=SPECULATION_SETTING),
+        launch_snapshot(prefix))
+    assert diff["launch_comparison"]["status"] == "unverified"
+    assert any("prefix-caching" in warning and "precedence" in warning
+               for warning in diff["launch_comparison"]["warnings"])
+
+
+def test_redacted_value_does_not_establish_an_additional_setting_change():
+    prefix = ["vllm", "serve", "model", "--attention-backend"]
+    diff = deployment_diff(
+        launch_snapshot(prefix + ["[redacted]"] + SPECULATION_ARGS,
+                        enabled=True, intended=SPECULATION_SETTING),
+        launch_snapshot(prefix + ["FLASH_ATTN"]))
+    assert diff["confounded"] is False
+    assert any(row["flag"] == "--attention-backend" and row["change"] == "unverified"
+               for row in diff["launch_comparison"]["settings"])
+    assert any("--attention-backend" in warning and "redacted" in warning
+               for warning in diff["launch_comparison"]["warnings"])
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+async def test_speculation_metadata_addition_and_removal_are_one_setting(enabled):
+    from giraffe.deployment import snapshot
+
+    async def collect(on):
+        config = RunConfig(targets=[{"name": "local", "url": "http://localhost:1/v1", "model": "alias",
+            "deployment": {"launch_command": ["vllm", "serve", "model"] + (SPECULATION_ARGS if on else []),
+                "extension": {"requested_speculative_config": {"method": "eagle3", "k": 3}} if on else {},
+                "intended_change": SPECULATION_SETTING}}])
+        return await snapshot(config.targets[0], config, time.monotonic() + 5, asyncio.Event())
+
+    baseline, current = await collect(not enabled), await collect(enabled)
+    diff = deployment_diff(current, baseline)
+    assert diff["confounded"] is False
+    assert diff["launch_comparison"]["warnings"] == [
+        "The launch model operand is redacted; its equivalence is unverified."]
+    assert diff["launch_comparison"]["settings"][0]["change"] == ("added" if enabled else "removed")
+
+
+def test_existing_metadata_context_changes_are_not_covered_as_equivalent():
+    prefix = ["vllm", "serve", "model"]
+    baseline = launch_snapshot(prefix)
+    current = launch_snapshot(prefix + SPECULATION_ARGS, enabled=True, intended=SPECULATION_SETTING)
+    baseline["fields"]["extension.requested_speculative_config"]["configured"]["scope"] = "one replica"
+    current["fields"]["extension.requested_speculative_config"]["configured"]["scope"] = "another replica"
+    diff = deployment_diff(current, baseline)
+    assert diff["confounded"] is True
+    assert any("equivalence" in warning for warning in diff["launch_comparison"]["warnings"])

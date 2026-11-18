@@ -30,6 +30,31 @@ assert.match(section.textContent,/not evidence of causality/);
 ''', dom=True)
 
 
+@pytest.mark.parametrize("mode", ["speculation", "batching", "whole", "legacy", "unverified"])
+def test_launch_setting_details_are_visible_beside_the_comparison(mode):
+    from tests.test_reporting_merged_features import launch_setting_comparison
+
+    value = launch_setting_comparison(mode).model_dump(mode="json")
+    run_render_checks("const value=" + json.dumps(value) + ";const mode=" + json.dumps(mode) + r''';
+detail(value);
+$('#report-baseline-reference').open=true;
+const section=$('#baseline-content .comparison-section');
+if(mode==='whole'||mode==='legacy'){
+ assert.match(section.textContent,/additional changes within that field are not checked separately/);
+}else if(mode==='unverified'){
+ assert.match(section.textContent,/Launch setting comparison unverified/);
+ assert.doesNotMatch(section.querySelector('.deployment-change').textContent,/one intended change/);
+}else{
+ assert.match(section.textContent,/--speculative-config/);
+ if(mode==='batching'){
+  assert.match(section.textContent,/--max-num-seqs/);
+  assert.match(section.textContent,/additional change/);
+  assert.match(section.textContent,/16.*32/);
+ }
+}
+''', dom=True)
+
+
 def test_speculative_metrics_remain_in_active_performance_panel_after_checks():
     value = saved_report(partial=True).model_dump(mode='json')
     run_render_checks('const value=' + json.dumps(value) + r''';
