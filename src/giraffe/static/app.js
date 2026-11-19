@@ -1343,9 +1343,9 @@ function renderPlanTime(plan) {
   const assumptions=[...(plan.confidence_details?.insufficient_observations||[]),...(plan.time_estimate_assumptions||[])];
   return `<div class="plan-time"><p>Estimated duration: ${escape(estimate)} · test traffic only</p><p class="hint">Confidence: ${escape(plan.confidence||'low')}. Excludes ${(plan.estimate_exclusions||['setup/connection','AI evaluation','report generation']).map(escape).join(', ')}.</p>${(plan.time_bound_reasons||[]).length?`<div class="unknown-time-components"><p class="hint">Additional work at unknown speed:</p><ul>${plan.time_bound_reasons.map(reason=>`<li>${escape(reason)}</li>`).join('')}</ul></div>`:''}${assumptions.length?`<details class="estimate-assumptions"><summary>Estimate assumptions</summary><ul>${assumptions.map(reason=>`<li>${escape(reason)}</li>`).join('')}</ul></details>`:''}${renderSettingIssues([...(plan.time_warnings||[]),...(plan.request_warnings||[]),...(plan.resource_warnings||[]),...(plan.concurrency_warnings||[]),...(plan.capacity_warnings||[])],'warning')}${renderSettingIssues((plan.resource_issues||[]).filter(issue=>issue.blocking))}</div>`;
 }
-function renderField(name,label,control,{hint,help,helpKey=name,hintAlways=false,full=false,wrapperId='',controlId=`field-${name}`,hintId=`field-${name}-hint`,hiddenLabel=false,hideInfo=false,helpDetails=''}={}) {
+function renderField(name,label,control,{hint,help,helpKey=name,hintAlways=false,full=false,wrapperId='',controlId=`field-${name}`,hintId=`field-${name}-hint`,hiddenLabel=false,hideInfo=false,helpDetails='',includeLimitHelp=true}={}) {
   const copy=fieldDescription(helpKey);hint ??= copy.hint || '';help ??= copy.help || '';
-  help=[help,state.bootstrap?.cap_explanations?.[settingPath(name)]?.help].filter(Boolean).join(' ');
+  if(includeLimitHelp)help=[help,state.bootstrap?.cap_explanations?.[settingPath(name)]?.help].filter(Boolean).join(' ');
   return `<div class="form-field ${full?'full':''}" ${wrapperId?`id="${escape(wrapperId)}"`:''}><div class="field-label"><label ${hiddenLabel?'class="sr-only" ':''}for="${escape(controlId)}">${escape(label)}</label>${hideInfo?'':infoHelp(name,label,help,helpDetails)}</div>${control}${hint||hintAlways?`<span class="hint" id="${escape(hintId)}">${escape(hint)}</span>`:''}<span class="field-error" id="field-${escape(name)}-error" hidden></span><div class="hint field-warning" id="field-${escape(name)}-warning" hidden></div></div>`;
 }
 function loadSettingPath(name) {
@@ -1384,13 +1384,13 @@ function settingBounds(name) {
   const scale=/^test_.*_limit_(min_correctness|max_error_rate)$/.test(name)?100:1;
   return {...bounds,minimum:bounds.minimum==null?undefined:bounds.minimum*scale,maximum:bounds.maximum==null?undefined:bounds.maximum*scale};
 }
-function field(name,label,value,{type='text',hint,help,helpKey=name,min,max,step,placeholder='',required=false,hintAlways=false,full=false,hiddenLabel=false,hideInfo=false}={}) {
+function field(name,label,value,{type='text',hint,help,helpKey=name,min,max,step,placeholder='',required=false,hintAlways=false,full=false,hiddenLabel=false,hideInfo=false,includeLimitHelp=true}={}) {
   const bounds=settingBounds(name);
   min=bounds.minimum ?? (bounds.exclusiveMinimum==null?undefined:bounds.type==='integer'?Math.floor(bounds.exclusiveMinimum)+1:bounds.exclusiveMinimum+Math.max(Number.MIN_VALUE,Math.abs(bounds.exclusiveMinimum)*Number.EPSILON));max=bounds.maximum;
 
   const description=hint ?? fieldDescription(helpKey).hint;
   const control=`<input id="field-${escape(name)}" name="${escape(name)}" type="${type}" value="${escape(value ?? '')}" ${required?'required':''} ${min!==undefined?`min="${min}"`:''} ${max!==undefined?`max="${max}"`:''} ${step!==undefined?`step="${step}"`:''} placeholder="${escape(placeholder)}" autocomplete="off" ${description||hintAlways?`aria-describedby="field-${escape(name)}-hint"`:''}>`;
-  return renderField(name,label,control,{hint,help,helpKey,hintAlways,full,hiddenLabel,hideInfo});
+  return renderField(name,label,control,{hint,help,helpKey,hintAlways,full,hiddenLabel,hideInfo,includeLimitHelp});
 }
 function selectField(name,label,options,{hint,help,helpKey=name,wrapperId='',controlId=`field-${name}`,helpDetails=''}={}) {
   const description=hint ?? fieldDescription(helpKey).hint;
@@ -1411,14 +1411,14 @@ function positionFieldHelp(popover) {
   popover.style.top=`${bounds.bottom+8+height<=window.innerHeight-gutter?bounds.bottom+8:Math.max(gutter,bounds.top-height-8)}px`;
 }
 function baselineOptions(selected='') {return `<option value="">No baseline · first or standalone run</option>${state.baselines.map(b=>`<option value="${escape(b.id)}" ${b.id===selected?'selected':''}>${escape(b.name)} · ${statusLabels[b.overall] || b.overall || 'saved'} · ${date(b.saved_at)}</option>`).join('')}`;}
-function schemaField(name,value,schema,{label,hint,help,helpKey=name,placeholder='Use run setting'}={}) {
+function schemaField(name,value,schema,{label,hint,help,helpKey=name,placeholder='Use run setting',includeLimitHelp=true}={}) {
   const nullable=schema.anyOf?.some(item=>item.type==='null');
   const valueSchema=schema.anyOf?.find(item=>item.type!=='null') || schema;
   label ||= schema.title || human(name);
   if(valueSchema.enum)return selectField(name,label,valueSchema.enum.map(item=>`<option value="${escape(item)}" ${item===value?'selected':''}>${escape(item==='poisson'?'Uneven (Poisson)':item==='steady'?'Even spacing':human(item))}</option>`).join(''),{hint,help,helpKey});
-  if(valueSchema.type==='array')return field(name,label,(value || []).join(', '),{hint,help,helpKey,required:true});
-  if(valueSchema.type==='string')return field(name,label,value,{hint,help,helpKey,required:!nullable,placeholder});
-  return field(name,label,value,{type:'number',hint,help,helpKey,step:valueSchema.type==='integer'?1:'any',required:!nullable,placeholder:nullable?placeholder:''});
+  if(valueSchema.type==='array')return field(name,label,(value || []).join(', '),{hint,help,helpKey,required:true,includeLimitHelp});
+  if(valueSchema.type==='string')return field(name,label,value,{hint,help,helpKey,required:!nullable,placeholder,includeLimitHelp});
+  return field(name,label,value,{type:'number',hint,help,helpKey,step:valueSchema.type==='integer'?1:'any',required:!nullable,placeholder:nullable?placeholder:'',includeLimitHelp});
 }
 const checkGroups=[
   {id:'answers',title:'Answers',blurb:'Is the output right?',checks:['access','serving','correctness','json','context','tools']},
@@ -1434,7 +1434,7 @@ const checkGuide={
   scale_down:{name:'Scale-down continuity',purpose:'Observe active answers during an external replica removal.',sends:'A long streaming cohort and bounded follow-up traffic.',shows:'Client-visible continuity, backend drain semantics and remaining capacity separately.',needs:'Streaming, at least two replicas, and read-only lifecycle evidence'},
   load:{name:'Load test',purpose:'Workloads, request rates and bursts in one place.',sends:'Selected workloads under maintained concurrency, arrivals and bursts.',shows:'Delivery, per-response criteria and highest tested accepted load.'},
   access:{name:'Endpoint response',purpose:'Can this endpoint return an answer?',sends:'One short generated request, shared with timing checks.',shows:'Whether the endpoint, authentication and model produce a valid answer.'},
-  serving:{name:'Invalid responses',purpose:'Look for errors, empty answers and incomplete responses.',sends:'Repeated short requests; also inspects responses from the selected checks.',shows:'Invalid responses, timeouts and server errors against your allowed error rate.'},
+  serving:{name:'Response validity',purpose:'Look for errors, empty answers and broken streams.',help:'Checks for errors, empty answers and broken streams. Wrong answers are checked separately. Some failures from other tests also count.'},
   correctness:{name:'Answer correctness',purpose:'Check known answers using built-in examples or your own questions.',sends:'Generated extraction, arithmetic and classification questions, or each of your saved questions.',shows:'Correct answers among scored responses. Missing answers stay visible.'},
   json:{name:'JSON correctness',purpose:'Check that JSON answers have the right fields, types and values.',sends:'Generated questions requesting a defined JSON structure.',shows:'Valid JSON, required fields, expected types and known values.'},
   context:{name:'Context recall',purpose:'Find out whether facts survive inside long questions.',sends:'Known facts placed at different positions and lengths in generated questions.',shows:'Recall at the exercised lengths. Use your server’s configured context limit.',needs:'Check the server context limit'},
@@ -1550,6 +1550,7 @@ function effectiveCheckSummary(check,config) {
 }
 function renderCheckInfo(check,config) {
   const guide=checkGuide[check.id];
+  if(guide.help)return infoHelp(`check_${check.id}`,guide.name,guide.help);
   const details=`<dl class="check-info-details"><div><dt>Sends</dt><dd>${escape(guide.sends)}</dd></div><div><dt>Shows</dt><dd>${escape(guide.shows)}</dd></div><div><dt>Settings</dt><dd data-effective-settings>${escape(effectiveCheckSummary(check,config))}</dd></div></dl>`;
   return infoHelp(`check_${check.id}`,guide.name,guide.purpose,details);
 }
@@ -1612,6 +1613,12 @@ function checkSettingValue(name,value) {
   return `${value}${unit?' '+unit:''}`;
 }
 function checkFieldHelp(check,name,kind='option') {
+  if(check.id==='serving')return {
+    samples:'Number of additional short requests, sent one at a time. Excludes the initial request.',
+    max_output_tokens:'Maximum generated tokens per request.',
+    request_timeout_seconds:'Time allowed for each repeated request.',
+    max_error_rate:'Percentage of failed, timed-out or invalid responses allowed. 0 allows none. Intentional cancellations are excluded.',
+  }[name];
   const descriptions={
     samples:({generation:'Repeat the generated long-answer request.',concurrency:'Short-only baseline samples and paired trials for the streaming-fairness scenario. Other scenarios have their own sample counts.',context:'Minimum requests across the generated context cases. Calibration and retries can add requests.',correctness:'Minimum generated questions; every built-in case is covered.',json:'Minimum generated JSON questions; every built-in case is covered.',cancellation:'Requests for normal controls and again for follow-up health checks.',recovery:'Short health requests after the load period.'})[check.id] || 'Requests used by this check.',
     context_limit:'Declared server context length, used to size generated questions. This does not change the server.',
@@ -1633,7 +1640,7 @@ function checkFieldHelp(check,name,kind='option') {
 }
 function checkFieldHint(check,config,name,kind='option',showValue=false) {
   const saved=config.test_options?.[check.id] || {},overrides=kind==='limit'?(saved.limits || {}):saved;
-  if(kind==='option'&&check.id==='first_output'&&config.checks.includes('serving')&&config.test_options?.serving?.[name]!=null)return `Endpoint response owns this shared request setting: ${checkSettingValue(name,optionValue(config,check,name))}. Change it in Endpoint response; the saved First answer override stays a draft.`;
+  if(kind==='option'&&check.id==='first_output'&&config.checks.includes('serving')&&config.test_options?.serving?.[name]!=null)return `${catalogTitle('serving')} owns this shared request setting: ${checkSettingValue(name,optionValue(config,check,name))}. Change it in ${catalogTitle('serving')}; the saved First answer override stays a draft.`;
   const overridden=Object.hasOwn(overrides,name)&&(kind==='limit'||overrides[name]!=null);
   const defaultValue=kind==='limit'?(Object.hasOwn(config.limits || {},name)?config.limits[name]:check.defaults.limits[name]):optionDefault(config,check,name);
   const value=kind==='limit'?limitValue(config,check,name):optionValue(config,check,name);
@@ -1654,6 +1661,7 @@ function updateRunLimitHints(config) {
 }
 function updateCheckFieldHints(config) {
   updateRunLimitHints(config);
+  const shared=$('[data-serving-shared-settings]');if(shared)shared.hidden=!config.checks.includes('first_output');
   const form=$('#new-run-form');
   if(form)for(const id of ['serving','first_output']){const check=state.bootstrap.checks.find(check=>check.id===id);for(const name of ['samples','max_output_tokens','request_timeout_seconds']){const input=form.elements[`test_${id}_${name}`];if(!input)continue;const owned=id==='first_output'&&config.checks.includes('serving')&&config.test_options?.serving?.[name]!=null;input.readOnly=owned;if(input.dataset?.inherited==='true'||owned)input.value=optionValue(config,check,name)??'';}}
   if(form)for(const [name,input] of Object.entries(form.elements)){
@@ -1693,10 +1701,10 @@ function renderTestCard(check,config) {
   const optionLabels={samples:'Sample requests',concurrency:'Concurrent requests',context_limit:'Context length (tokens)',max_output_tokens:'Output cap (tokens)',request_timeout_seconds:'Request timeout (seconds)',sustained_seconds:'Load duration (seconds)',metrics_max_age_seconds:'Metric freshness (seconds)',backend_verification:'Verify server cancellation',server_log:'Server log path',trace_file:'Trace file path',cancel_after_ms:'Cancel after (ms)',deadline_probe_ms:'Probe deadline (ms)',cancel_after_chunks:'Chunks before cancellation',cleanup_seconds:'Cleanup wait (seconds)',trace_wait_seconds:'Trace wait (seconds)'};
   const advancedOptions=new Set(['backend_verification','server_log','trace_file','cancel_after_chunks','cleanup_seconds','trace_wait_seconds']);
   const runOptions=new Set();
-  const option=name=>{let markup=schemaField(`test_${check.id}_${name}`,optionValue(config,check,name),state.bootstrap.option_schema.properties[name],{label:check.id==='correctness'&&name==='samples'?'Minimum questions':optionLabels[name] || human(name),helpKey:`test_${name}`,help:checkFieldHelp(check,name),hint:checkFieldHint(check,config,name),placeholder:'Use default'});if(check.id==='first_output'&&config.checks.includes('serving')&&config.test_options?.serving?.[name]!=null)markup=markup.replace('autocomplete="off"','autocomplete="off" readonly');return markCheckHint(markup,check,name,'option');};
+  const option=name=>{let markup=schemaField(`test_${check.id}_${name}`,optionValue(config,check,name),state.bootstrap.option_schema.properties[name],{label:check.id==='correctness'&&name==='samples'?'Minimum questions':optionLabels[name] || human(name),helpKey:`test_${name}`,help:checkFieldHelp(check,name),hint:checkFieldHint(check,config,name),placeholder:'Use default',includeLimitHelp:check.id!=='serving'});if(check.id==='first_output'&&config.checks.includes('serving')&&config.test_options?.serving?.[name]!=null)markup=markup.replace('autocomplete="off"','autocomplete="off" readonly');return markCheckHint(markup,check,name,'option');};
   const limitLabels={first_output_ms:'First answer (ms)',latency_ms:'Completion limit (ms)',stream_gap_ms:'Stream pause (ms)',min_output_tokens_per_second:'Minimum rate (tok/s)',fairness_max_ratio:'Maximum slowdown (ratio)',max_error_rate:'Errors allowed (%)',min_correctness:'Correct answers (%)',min_samples:'Minimum usable answers'};
   const primaryLimits=new Set(['first_output_ms','latency_ms','min_correctness','max_error_rate','fairness_max_ratio','min_samples']);
-  const limit=name=>markCheckHint(['min_correctness','max_error_rate'].includes(name)?field(`test_${check.id}_limit_${name}`,limitLabels[name],limitValue(config,check,name)*100,{type:'number',step:'any',required:true,helpKey:`limit_${name}`,help:checkFieldHelp(check,name,'limit'),hint:checkFieldHint(check,config,name,'limit')}):schemaField(`test_${check.id}_limit_${name}`,limitValue(config,check,name),state.bootstrap.limits_schema.properties[name],{label:limitLabels[name] || human(name),helpKey:`limit_${name}`,help:checkFieldHelp(check,name,'limit'),placeholder:'Measure only',hint:checkFieldHint(check,config,name,'limit')}),check,name,'limit');
+  const limit=name=>markCheckHint(['min_correctness','max_error_rate'].includes(name)?field(`test_${check.id}_limit_${name}`,limitLabels[name],limitValue(config,check,name)*100,{type:'number',step:'any',required:true,helpKey:`limit_${name}`,help:checkFieldHelp(check,name,'limit'),hint:checkFieldHint(check,config,name,'limit'),includeLimitHelp:check.id!=='serving'}):schemaField(`test_${check.id}_limit_${name}`,limitValue(config,check,name),state.bootstrap.limits_schema.properties[name],{label:limitLabels[name] || human(name),helpKey:`limit_${name}`,help:checkFieldHelp(check,name,'limit'),placeholder:'Measure only',hint:checkFieldHint(check,config,name,'limit')}),check,name,'limit');
   const inactive=()=>ownQuestions;
   const requestFields=check.option_fields.filter(name=>!inactive(name)&&!advancedOptions.has(name)&&!runOptions.has(name));
   const timeout=requestFields.includes('request_timeout_seconds')?option('request_timeout_seconds'):'';
@@ -1719,6 +1727,7 @@ function renderTestCard(check,config) {
   <div class="test-editor-head"><span class="eyebrow">${escape(checkGroups.find(group=>group.checks.includes(check.id))?.title || 'Check')}</span><h3 tabindex="-1" data-editor-title>${escape(guide.name)}</h3><button type="button" class="button ghost icon-button" data-close-test="${check.id}" aria-label="Close ${escape(guide.name)} settings"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m5 5 10 10M15 5 5 15"/></svg></button></div>
   <p class="hint draft-notice" ${selected?'hidden':''}>Saved draft · select this check to run it.</p>
   ${guide.needs?`<p class="check-prerequisite"><strong>Needs:</strong> ${escape(guide.needs)}.</p>`:''}${check.id==='gpu'?'<p class="hint">Metrics are collected automatically. Add exporter addresses in Connection settings.</p>':''}
+  ${check.id==='serving'?`<p class="hint">Leave blank to use the shown default. Enter a value to override it.</p><p class="hint" data-serving-shared-settings ${config.checks.includes('first_output')?'':'hidden'}>These requests and their settings are also used by First answer.</p>`:''}
   ${timeout?`<fieldset class="fields check-request-fields" data-test-settings="${check.id}">${timeout}</fieldset>`:''}
   ${check.id==='load'?'':questionSource}
   <div class="test-settings${requestFields.length===1&&criteriaFields.length===1?' simple-primary-settings':''}" data-test-settings="${check.id}">

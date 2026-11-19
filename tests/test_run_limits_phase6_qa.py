@@ -65,7 +65,7 @@ assert.equal(elements.max_requests.disabled,false);assert.equal(elements.max_req
 
 def test_restored_catalogue_retains_reference_names():
     names = {
-        "access": "Endpoint response", "serving": "Invalid responses",
+        "access": "Endpoint response", "serving": "Response validity",
         "correctness": "Answer correctness", "json": "JSON correctness",
         "context": "Context recall", "tools": "Tool-call correctness",
         "first_output": "First answer", "generation": "Generation",

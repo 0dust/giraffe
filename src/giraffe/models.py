@@ -28,25 +28,25 @@ Status = Literal["pass", "fail", "inconclusive", "skipped", "blocked"]
 # Public display names have one source; compatibility imports share this object.
 CHECK_NAMES = {
     "access": "Endpoint response",
-    "serving": "Invalid responses",
-    "first_output": "Time to first answer",
-    "generation": "Generation speed",
+    "serving": "Response validity",
+    "first_output": "First answer",
+    "generation": "Generation",
     "load": "Load test",
     "scale_down": "Scale-down continuity",
-    "context": "Long-context recall",
+    "context": "Context recall",
     "correctness": "Answer correctness",
     "json": "JSON correctness",
-    "cancellation": "Cancellation & limits",
+    "cancellation": "Cancellation & timeouts",
     "recovery": "Recovery after load",
     "gpu": "GPU metrics",
-    "prefix": "Prefix cache",
-    "sessions": "Multi-turn sessions",
+    "prefix": "Prompt cache evidence",
+    "sessions": "Concurrent conversations",
     "multi_user": "Multi-user",
     "gateway_access": "Gateway access policy",
     "gateway_policy": "Gateway quotas & priorities",
     "gateway_attribution": "Gateway usage attribution",
     "consistency": "Answer consistency",
-    "tools": "Tool calling",
+    "tools": "Tool-call correctness",
 }
 CATALOGUE_NAMES = INTERNAL_CHECK_NAMES = CHECK_NAMES
 # These checks compare their own declared workload and evidence.
@@ -2732,9 +2732,9 @@ class RunConfig(Model):
                 if value is not None and name not in supplied]
 
     def effective_response(self) -> dict[str, Any]:
-        """Endpoint response owns shared initial/warm requests.
+        """Response validity owns shared initial/warm requests.
 
-        Selected first-answer overrides apply when selected Endpoint response has
+        Selected first-answer overrides apply when selected Response validity has
         no explicit value for the same setting. Disabled drafts do not change work.
         """
         serving = self.test_options.get("serving", CheckOptions()) if "serving" in self.checks else CheckOptions()

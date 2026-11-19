@@ -21,6 +21,40 @@ def assert_moved(tree, name, text):
     assert not any(text in node['text'] for node in tree.nodes if 'hint' in node.get('class', '').split())
 
 
+def test_response_validity_help_is_concise_and_keeps_request_defaults_and_bounds():
+    result = browser_logic(r'''
+const check=bootstrap.checks.find(check=>check.id==='serving');
+config.checks=['serving','first_output'];
+const markup=renderTestCard(check,config);
+const shared={hidden:true};nodes['[data-serving-shared-settings]']=shared;
+updateCheckFieldHints(config);assert.equal(shared.hidden,false);
+updateCheckFieldHints({...config,checks:['serving']});assert.equal(shared.hidden,true);
+console.log(JSON.stringify({markup,other:renderTestCard(bootstrap.checks.find(check=>check.id==='generation'),config),cap:bootstrap.cap_explanations['test_options.serving.limits.max_error_rate'].help}));
+''')
+    tree = Markup(result['markup'])
+    expected = {
+        'check_serving': 'Checks for errors, empty answers and broken streams. Wrong answers are checked separately. Some failures from other tests also count.',
+        'test_serving_samples': 'Number of additional short requests, sent one at a time. Excludes the initial request.',
+        'test_serving_max_output_tokens': 'Maximum generated tokens per request.',
+        'test_serving_request_timeout_seconds': 'Time allowed for each repeated request.',
+        'test_serving_limit_max_error_rate': 'Percentage of failed, timed-out or invalid responses allowed. 0 allows none. Intentional cancellations are excluded.',
+    }
+    for name, text in expected.items():
+        paragraph, = [node for node in tree.nodes if node.get('id') == f'field-{name}-help-text']
+        assert paragraph['text'] == text
+    assert not any(node['tag'] == 'dt' for node in tree.nodes)
+    assert result['cap'] not in result['markup']
+    errors, = tree.named('test_serving_limit_max_error_rate')
+    assert (errors['min'], errors['max']) == ('0', '100')
+    inheritance = 'Leave blank to use the shown default. Enter a value to override it.'
+    assert result['markup'].count(inheritance) == 1
+    assert result['markup'].index(inheritance) < result['markup'].index('name="test_serving_request_timeout_seconds"')
+    shared, = [node for node in tree.nodes if 'data-serving-shared-settings' in node]
+    assert shared['text'] == 'These requests and their settings are also used by First answer.'
+    assert 'hidden' not in shared
+    assert 'The suite value is a default, not a ceiling.' in result['other']
+
+
 def test_run_limit_information_is_beside_each_checkbox_without_duplicate_icons():
     html = browser_logic(r'''
 const markup=renderSharedRunSettings(config);

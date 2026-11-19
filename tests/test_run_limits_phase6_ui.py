@@ -239,7 +239,7 @@ const markup=renderSessionEditor(config);
 assert.match(markup,/name="profile_sessions_concurrency"[^>]*value="2"/);
 const first=bootstrap.checks.find(check=>check.id==='first_output');
 assert.match(renderTestCard(first,config),/name="test_first_output_request_timeout_seconds"[^>]*value="60"[^>]*readonly/);
-assert.match(renderTestCard(first,config),/Endpoint response owns this shared request setting/);
+assert.match(renderTestCard(first,config),/Response validity owns this shared request setting/);
 const input={name:'test_first_output_request_timeout_seconds',value:'30',dataset:{inherited:'true'}};
 nodes['#new-run-form']={elements:{test_first_output_request_timeout_seconds:input}};
 updateCheckFieldHints(config);assert.equal(input.value,60);assert.equal(input.readOnly,true);

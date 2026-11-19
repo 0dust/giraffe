@@ -1,7 +1,11 @@
 """Comparable performance workloads span schedule stages, never quality roles."""
+import json
+
 import pytest
 
-from giraffe.performance import build_performance
+from giraffe.conditions import condition_for
+from giraffe.models import CHECK_NAMES
+from giraffe.performance import _cohort_label, build_performance
 from tests.performance_fixture import synthetic_report_1000
 from tests.test_performance import record, report
 
@@ -52,7 +56,7 @@ def test_default_prefers_largest_valid_performance_workload_then_earliest():
     assert data['metrics']['completed']['value'] == 2
     assert data['window']['workload_label'] == 'Load test · Short → Short'
     assert len(target['cohorts']) == 3
-    assert any(window['workload_label'] == 'Generation speed' for window in target['windows'])
+    assert any(window['workload_label'] == 'Generation' for window in target['windows'])
     rows.append(load_record('long-b', level=8, start=4000, shape='long_short'))
     assert selected(report(rows))[1]['window']['request_count'] == 3  # valid-count tie chooses earliest
 
@@ -67,6 +71,50 @@ def test_old_valid_completions_rank_workloads_even_without_lifetime_timing():
     assert data['window']['request_count'] == 2
     assert data['metrics']['request_throughput']['value'] is None
     assert data['window']['workload_label'] == 'Load test · Long → Short'
+
+
+@pytest.mark.parametrize('check', list(CHECK_NAMES))
+def test_whole_check_cohorts_use_current_names_without_rewriting_saved_conditions(check):
+    row = record().model_copy(update={'scenario': check, 'check_ids': [check], 'condition_id': check})
+    condition = condition_for(check, {})
+    value = report([row], observations={'targets': {'t': {'conditions': [{'condition': condition}]}}})
+    saved = json.dumps(value.observations, sort_keys=True)
+    target, data = selected(value)
+    cohort, = target['cohorts']
+    assert cohort['label'] == CHECK_NAMES[check]
+    assert data['window']['workload_label'] == CHECK_NAMES[check]
+    assert target['default_window'] == 'full:' + cohort['id']
+    assert data['metrics']['attempted']['value'] == 1
+    assert data['metrics']['completed']['value'] == 1
+    assert data['request_row_indices'] == [0]
+    assert json.dumps(value.observations, sort_keys=True) == saved
+    assert value.requests[0].scenario == check and value.requests[0].condition_id == check
+
+
+@pytest.mark.parametrize('scenario,check,saved_label,expected', [
+    ('generation', 'generation', None, 'Generation'),
+    ('generation', 'generation', 'Generation speed · 8 at once', 'Generation'),
+    ('generation', 'generation', 'Custom passage', 'Custom passage'),
+    ('first_output', 'first_output', 'Custom startup', 'Custom startup'),
+    ('prefix_shared', 'prefix', None, 'Shared prefix'),
+    ('client_deadline', 'cancellation', None, 'Client deadline'),
+    ('warm', 'serving', None, 'Warm-up'),
+])
+def test_cohort_names_preserve_custom_labels_and_distinct_phases(scenario, check, saved_label, expected):
+    row = record().model_copy(update={'scenario': scenario, 'check_ids': [check], 'condition_id': scenario})
+    conditions = [{'condition': {'id': scenario, 'label': saved_label}}] if saved_label else []
+    value = report([row], observations={'targets': {'t': {'conditions': conditions}}})
+    target, data = selected(value)
+    assert target['cohorts'][0]['label'] == expected
+    assert data['window']['workload_label'] == expected
+    assert value.observations['targets']['t']['conditions'] == conditions
+
+
+def test_saved_custom_subphase_label_does_not_parse_its_scenario_again():
+    scenario = 'load_primary_custom_r1e-'
+    row = record().model_copy(update={'scenario': scenario, 'check_ids': ['load'], 'condition_id': scenario})
+    observation = {'conditions': [{'condition': {'id': scenario, 'label': 'Imported workload'}}]}
+    assert _cohort_label([row], observation) == ('load', 'Load test · Imported workload')
 
 
 def test_shape_source_phase_and_role_stay_separate_when_levels_merge():

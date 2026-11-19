@@ -186,8 +186,12 @@ def _cohort_label(group, observation):
         return check, check_label
     saved = next((row.get("condition", {}).get("label") for row in observation.get("conditions", [])
                   if row.get("condition", {}).get("id") == first.condition_id), None)
-    label = saved or condition_for(first.scenario, first.workload)["label"]
+    same_check = first.scenario == check and check in CHECK_NAMES
+    default_label = condition_for(first.scenario, first.workload)["label"] if not saved or same_check else None
+    label = saved or default_label
     label = re.sub(r"(?: · | at )\d+(?: concurrent requests?| at once| per second).*?$", "", label)
+    if same_check and label == default_label:
+        label = check_label
     if re.fullmatch(r"(?:synthetic|traffic)_stage_\d+", first.scenario):
         label = saved.split(" · ")[0] if saved else "Comparable request workload"
     return check, f"{check_label} · {label}" if check in _PERFORMANCE_CHECKS and label != check_label else label

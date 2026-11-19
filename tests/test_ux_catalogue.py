@@ -60,7 +60,9 @@ assert.equal((markup.match(/data-test-card="/g)||[]).length,bootstrap.checks.len
 assert.equal((markup.match(/data-test-card="/g)||[]).length,20);
 for(const check of bootstrap.checks){
   assert.equal((markup.match(new RegExp('data-test-card="'+check.id+'"','g'))||[]).length,1);
-  const row=renderTestCard(check,config);assert.match(row,/<dt>Sends<\/dt>/);assert.match(row,/<dt>Shows<\/dt>/);
+  const row=renderTestCard(check,config);
+  if(check.id==='serving')assert.doesNotMatch(row,/<dt>Sends<\/dt>|<dt>Shows<\/dt>/);
+  else {assert.match(row,/<dt>Sends<\/dt>/);assert.match(row,/<dt>Shows<\/dt>/);}
 }
 for(const group of checkGroups)assert(markup.includes('data-action="catalogue-category" data-category="'+group.id+'"'));
 assert.equal((markup.match(/id="setup-dataset"/g)||[]).length,1);
@@ -253,9 +255,14 @@ for(const check of bootstrap.checks){
   assert.match(row,new RegExp('</label><button type="button" class="field-info"[^>]*popovertarget="'+helpId+'"'));
   assert(row.includes('aria-label="About '+escape(catalogTitle(check.id))+'"'));
   assert(row.includes('id="'+helpId+'" class="field-help" popover="auto"'));
-  assert.match(row,/<dt>Sends<\/dt>/);assert.match(row,/<dt>Shows<\/dt>/);
-  assert.match(row,/<dt>Settings<\/dt><dd data-effective-settings>/);
-  assert.equal((row.match(/data-effective-settings/g)||[]).length,1);
+  if(check.id==='serving'){
+    assert(row.includes('id="'+helpId+'-text">'+escape(checkGuide.serving.help)+'</p>'));
+    assert.doesNotMatch(row,/<dt>|data-effective-settings/);
+  }else{
+    assert.match(row,/<dt>Sends<\/dt>/);assert.match(row,/<dt>Shows<\/dt>/);
+    assert.match(row,/<dt>Settings<\/dt><dd data-effective-settings>/);
+    assert.equal((row.match(/data-effective-settings/g)||[]).length,1);
+  }
 }
 const check=bootstrap.checks.find(item=>item.id==='correctness');
 const status={},effective={};const card={querySelector:selector=>({'[data-setting-state]':status,'[data-effective-settings]':effective})[selector]};
