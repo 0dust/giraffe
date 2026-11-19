@@ -538,8 +538,11 @@ main:has(.new-run-layout.connecting) .setup-lede { font-size: 16px; margin-top: 
 .workload-bounds dd { font: 550 14px var(--mono); }
 .workload-help { font-size: 12px; }
 .workload-breakdown > div { display: grid; gap: 4px; margin-top: 6px; }
-.workload-breakdown details summary { font-size: 12.5px; min-height: 28px; color: var(--text-2); }
-.workload-breakdown details summary strong { font-family: var(--mono); color: var(--text); margin-right: 6px; min-width: 40px; }
+.workload-breakdown details > summary { display: flex; align-items: center; gap: 8px; padding: 5px 6px; border-radius: var(--r-sm); font-size: 12.5px; min-height: 32px; color: var(--text-2); cursor: pointer; }
+.workload-breakdown details > summary::before { content: ''; width: 6px; height: 6px; border-right: 1.6px solid currentColor; border-bottom: 1.6px solid currentColor; transform: rotate(-45deg); flex-shrink: 0; margin-right: 2px; }
+.workload-breakdown details[open] > summary::before { transform: rotate(45deg); }
+.workload-breakdown details > summary:is(:hover, :focus-visible), .workload-breakdown details[open] > summary { color: var(--text); background: var(--surface-2); }
+.workload-breakdown details summary strong { font-family: var(--mono); color: var(--accent); min-width: 2ch; overflow-wrap: anywhere; }
 .workload-breakdown details p, .workload-breakdown details small { display: block; padding: 0 0 6px 4px; color: var(--text-3); font-size: 12px; }
 .blueprint-note { font-size: 13px; color: var(--text-2); padding-left: 10px; border-left: 2px solid var(--accent-line); }
 
