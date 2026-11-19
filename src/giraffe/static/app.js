@@ -1614,10 +1614,7 @@ function checkSettingValue(name,value) {
 function checkFieldHelp(check,name,kind='option') {
   const descriptions={
     samples:({generation:'Repeat the generated long-answer request.',concurrency:'Short-only baseline samples and paired trials for the streaming-fairness scenario. Other scenarios have their own sample counts.',context:'Minimum requests across the generated context cases. Calibration and retries can add requests.',correctness:'Minimum generated questions; every built-in case is covered.',json:'Minimum generated JSON questions; every built-in case is covered.',cancellation:'Requests for normal controls and again for follow-up health checks.',recovery:'Short health requests after the load period.'})[check.id] || 'Requests used by this check.',
-    concurrency:'Requests sent together by this check. An accepted value is not demonstrated delivery capacity.',
     context_limit:'Declared server context length, used to size generated questions. This does not change the server.',
-    max_output_tokens:'Answer cap for this check. The suite value is a default, not a ceiling.',
-    request_timeout_seconds:'Timeout for each request in this check. The suite value is a default, not a ceiling.',
     sustained_seconds:'Send load for this long, then check recovery. The run budget can stop load earlier.',
     metrics_max_age_seconds:'Older server measurements are reported as stale.',
     backend_verification:'Required needs supported server logs or traces to prove cancelled work stopped.',
