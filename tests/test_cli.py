@@ -549,3 +549,24 @@ def test_cli_accepts_mtplx_json_metrics_profile():
         "--metrics-profile", "mtplx",
     ]))
     assert config.targets[0].metrics_profile == "mtplx"
+
+
+def test_cli_and_saved_config_accept_api_version_without_network(tmp_path, monkeypatch, capsys):
+    url = "http://server/openai/deployments/example?api-version=2024-02-01"
+    config = configuration(parser().parse_args(["run", "--url", url, "--model", "tiny"]))
+    assert config.targets[0].url == url
+    path = tmp_path / "config.json"
+    path.write_text(config.model_dump_json())
+    monkeypatch.setattr("giraffe.preflight.check_target", lambda *a: pytest.fail("Validation probed"))
+    assert main(["validate", "--config", str(path)]) == 0
+    assert not capsys.readouterr().err
+
+
+@pytest.mark.parametrize("suffix", [
+    "?api-key=PRIVATE_SECRET", "?api-version=PRIVATE_SECRET",
+    "?api-version=2024-02-01&token=PRIVATE_SECRET", "#PRIVATE_SECRET",
+])
+def test_cli_rejects_credential_query_urls_without_echoing_values(suffix, capsys):
+    assert main(["run", "--url", "http://server/v1" + suffix, "--model", "tiny"]) == 4
+    captured = capsys.readouterr()
+    assert "PRIVATE_SECRET" not in captured.out + captured.err

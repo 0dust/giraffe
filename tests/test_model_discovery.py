@@ -8,8 +8,13 @@ from giraffe.web import ModelDiscovery, discover_models
 from tests.test_web import browser
 
 
-@pytest.mark.parametrize("suffix", ["", "/v1", "/v1/chat/completions"])
-async def test_discovery_normalizes_url_and_preserves_auth(monkeypatch, suffix):
+@pytest.mark.parametrize("query", ["", "?api-version=2024-02-01"])
+@pytest.mark.parametrize("suffix,base", [
+    ("", "/v1"), ("/v1", "/v1"), ("/v1/chat/completions", "/v1"),
+    ("/openai/deployments/example/", "/openai/deployments/example"),
+    ("/openai/deployments/example/chat/completions", "/openai/deployments/example"),
+])
+async def test_discovery_normalizes_url_and_preserves_auth(monkeypatch, suffix, base, query):
     requests = []
 
     def respond(request):
@@ -22,13 +27,13 @@ async def test_discovery_normalizes_url_and_preserves_auth(monkeypatch, suffix):
     monkeypatch.setenv("GIRAFFE_TEST_HEADER", "private-gateway-key")
     monkeypatch.setattr("giraffe.preflight.httpx.AsyncClient",
                         lambda **kwargs: client(transport=httpx.MockTransport(respond), **kwargs))
-    result = await discover_models(ModelDiscovery(url="http://server" + suffix,
+    result = await discover_models(ModelDiscovery(url="http://server" + suffix + query,
                                   api_key_env="GIRAFFE_TEST_KEY",
                                   headers_env={"X-Gateway": "GIRAFFE_TEST_HEADER"}))
     assert result["models"] == ["model-a", "model-b"]
     assert len(requests) == 1
     assert requests[0].method == "GET"
-    assert str(requests[0].url) == "http://server/v1/models"
+    assert str(requests[0].url) == "http://server" + base + "/models" + query
     assert requests[0].headers["Authorization"] == "Bearer private-key"
     assert requests[0].headers["X-Gateway"] == "private-gateway-key"
     assert "private" not in str(result)

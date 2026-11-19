@@ -18,6 +18,7 @@ import uuid
 from time import monotonic
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Callable, Literal
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -93,12 +94,18 @@ class _IntentionalCancellation(Exception):
 
 def completion_url(url: str) -> str:
     """Accept a server origin, API base, or complete chat-completions endpoint."""
-    url = url.rstrip("/")
-    if url.endswith("/chat/completions"):
-        return url
-    if httpx.URL(url).path in {"", "/"}:
-        url += "/v1"
-    return url + "/chat/completions"
+    parsed = urlsplit(url)
+    path = parsed.path.rstrip("/")
+    if not path.endswith("/chat/completions"):
+        path = (path or "/v1") + "/chat/completions"
+    return parsed._replace(path=path).geturl()
+
+
+def models_url(url: str) -> str:
+    """Use the inference API base and preserve its query when listing models."""
+    parsed = urlsplit(completion_url(url))
+    path = parsed.path.removesuffix("/chat/completions") + "/models"
+    return parsed._replace(path=path).geturl()
 
 
 def _headers(target: Target) -> dict[str, str]:
@@ -548,7 +555,7 @@ class LLMClient:
             return False
         try:
             async with asyncio.timeout(remaining):
-                url = completion_url(self.target.url).removesuffix("/chat/completions") + "/models"
+                url = models_url(self.target.url)
                 async with self._client.stream("GET", url, timeout=min(5, remaining)) as response:
                     status = response.status_code
                 if status == 404:

@@ -14,7 +14,7 @@ from pydantic import Field, SecretStr, field_validator, model_validator
 from .caps import (
     MAX_PREFLIGHT_BODY_BYTES, MAX_PREFLIGHT_HEADER_CHARS,
 )
-from giraffe.client import NO_ANSWER_ERROR, REASONING_BUDGET_ERROR, LLMClient, _headers, completion_url
+from giraffe.client import NO_ANSWER_ERROR, REASONING_BUDGET_ERROR, LLMClient, _headers, models_url
 from giraffe.models import Model, RequestSpec, RunConfig, Target
 
 
@@ -121,7 +121,7 @@ async def discover_models(body: ModelDiscovery, *, allow_manual: bool = False,
         headers = _headers(target)
     except ValueError as error:
         raise PreflightError(str(error)) from None
-    url = completion_url(target.url).removesuffix("/chat/completions") + "/models"
+    url = models_url(target.url)
     try:
         verify = ssl.create_default_context(cafile=body.ca_bundle) if body.ca_bundle else True
         client = httpx.AsyncClient(
