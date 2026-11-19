@@ -17,7 +17,8 @@ pytestmark = pytest.mark.usefixtures("local_tokenizer")
 FIELDS = ["extension.requested_speculative_config", "serving.launch_arguments"]
 
 
-async def test_grouped_change_survives_run_baseline_export_and_rerun(tmp_path):
+@pytest.mark.parametrize("intended", [FIELDS, "serving.launch_arguments.--speculative-config"])
+async def test_grouped_change_survives_run_baseline_export_and_rerun(tmp_path, intended):
     with FakeEndpoint() as endpoint:
         def settings(enabled):
             launch = ["vllm", "serve", "fake-model"]
@@ -28,7 +29,7 @@ async def test_grouped_change_survives_run_baseline_export_and_rerun(tmp_path):
                 "deployment": {
                     "extension": {"requested_speculative_config": {"method": "eagle3", "k": 3} if enabled else None},
                     "launch_command": launch,
-                    "intended_change": FIELDS if enabled else None,
+                    "intended_change": intended if enabled else None,
                 },
             }])
 
@@ -39,8 +40,11 @@ async def test_grouped_change_survives_run_baseline_export_and_rerun(tmp_path):
         comparison = compare_baseline(current, baseline)
         diff = comparison.baseline["targets"][0]["configuration_diff"]
         assert {r["field"] for r in diff["fields"] if r["change"] != "no_observed_change"} == set(FIELDS)
-        assert diff["intended_change"] == FIELDS
+        assert diff["intended_change"] == intended
         assert diff["confounded"] is False
+        if isinstance(intended, str):
+            assert diff["launch_comparison"]["status"] == "unverified"
+            assert any("model operand" in warning for warning in diff["launch_comparison"]["warnings"])
         assert "not evidence of causality" in diff["interpretation"]
         assert baseline.model_dump_json() == original
 
@@ -48,19 +52,20 @@ async def test_grouped_change_survives_run_baseline_export_and_rerun(tmp_path):
         saved = load_report(tmp_path)
         assert saved.baseline["targets"][0]["configuration_diff"] == diff
         html = unescape((tmp_path / "report.html").read_text())
-        assert f'Deployment change: {", ".join(FIELDS)} (one intended change)' in html
+        assert f'Deployment change: {", ".join(FIELDS)}' in html
+        assert ('(one intended change)' in html) is isinstance(intended, list)
         assert 'Confounded: multiple unrelated changes' not in html
         assert 'data:application/json' not in html and '<script' not in html
         assert all(field in html for field in FIELDS)
         exported = reproduction_export(saved)
-        assert exported["deployments"]["local"]["intended_change"] == FIELDS
+        assert exported["deployments"]["local"]["intended_change"] == intended
         rerun_config = RunConfig.model_validate(exported["config"])
-        assert rerun_config.targets[0].deployment.intended_change == FIELDS
+        assert rerun_config.targets[0].deployment.intended_change == intended
         assert "[redacted]" in json.dumps(rerun_config.targets[0].deployment.launch_command)
         rerun = await run_suite(rerun_config)
         rerun_diff = compare_baseline(rerun, baseline).baseline["targets"][0]["configuration_diff"]
         assert rerun_diff["confounded"] is False
-        assert rerun_diff["intended_change"] == FIELDS
+        assert rerun_diff["intended_change"] == intended
 
 
 async def test_grouped_change_survives_configuration_api_and_cli_export(tmp_path):

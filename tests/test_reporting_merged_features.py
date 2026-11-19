@@ -44,6 +44,67 @@ def test_baseline_visibly_explains_grouped_and_confounded_deployment_changes(con
     assert '<script' not in html and 'data:application/json' not in html
 
 
+def launch_setting_comparison(mode):
+    from tests.test_deployment import SPECULATION_ARGS, SPECULATION_SETTING, launch_snapshot
+
+    current, baseline = make_report(), make_report("baseline")
+    prefix = ["vllm", "serve", "model", "--max-num-seqs"]
+    intended = FIELDS if mode in {"whole", "legacy"} else SPECULATION_SETTING
+    speculation = ["--speculative-config=[redacted]"] if mode == "unverified" else SPECULATION_ARGS
+    snapshots = (
+        launch_snapshot(prefix + ["32" if mode in {"batching", "whole", "legacy"} else "16"] + speculation,
+                        enabled=True, intended=intended),
+        launch_snapshot(prefix + ["16"]),
+    )
+    if mode == "mixed":
+        snapshots = (
+            launch_snapshot(prefix + ["32"], intended=[
+                "serving.launch_arguments", "serving.launch_arguments.--max-num-seqs"]),
+            launch_snapshot(prefix + ["16"]),
+        )
+    elif mode == "legacy_redaction":
+        snapshots = (
+            launch_snapshot(prefix + ["16"] + SPECULATION_ARGS, intended="extension.arm",
+                            **{"extension.arm": "treatment"}),
+            launch_snapshot(prefix + ["16"], **{"extension.arm": "control"}),
+        )
+        snapshots[1]["fields"]["serving.launch_arguments"]["configured"]["value"].append(
+            "--speculative-config=[redacted]")
+    for report, snapshot in zip((current, baseline), snapshots, strict=True):
+        report.observations = {"targets": {"local": {"deployment": snapshot}}}
+    result = compare_baseline(current, baseline)
+    if mode == "legacy":
+        result.baseline["targets"][0]["configuration_diff"].pop("launch_comparison")
+    return result
+
+
+@pytest.mark.parametrize("mode", ["speculation", "batching", "whole", "legacy", "unverified", "mixed", "legacy_redaction"])
+def test_launch_setting_results_survive_json_html_and_cli(mode, tmp_path, capsys):
+    from giraffe.cli import _print_result
+
+    value = launch_setting_comparison(mode)
+    diff = value.baseline["targets"][0]["configuration_diff"]
+    json_path, html_path = write_report(value, tmp_path, html=True)
+    assert load_report(tmp_path).baseline["targets"][0]["configuration_diff"] == diff
+    _print_result(value, json_path, html_path, tmp_path, {})
+    html, cli = unescape(html_path.read_text()), capsys.readouterr().out
+    for output in (html, cli):
+        if mode in {"whole", "legacy"}:
+            assert "additional changes within that field are not checked separately" in output
+        elif mode in {"unverified", "mixed", "legacy_redaction"}:
+            assert "Launch setting comparison unverified" in output
+            assert "redacted" in output
+            assert "(one intended change)" not in output
+            if mode == "mixed":
+                assert "additional changes within that field are not checked separately" in output
+        elif mode == "batching":
+            assert "--max-num-seqs" in output and "additional change" in output
+            assert "16" in output and "32" in output
+        else:
+            assert "--speculative-config" in output and "intended" in output
+    assert diff["confounded"] is (mode in {"batching", "unverified"})
+
+
 def gpu_series_limited_report():
     from tests.test_gpu_reliability import combined_snapshot, gpu_check
     from tests.test_performance import record, report

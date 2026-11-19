@@ -1470,10 +1470,19 @@ def _print_result(report: RunReport, json_path: Path, html_path: Path | None,
         states = sorted({s.get("status", "unknown") for s in telemetry.get("snapshots", [])})
         print(f"  {name} / serving telemetry: {', '.join(states)}; source freshness and other traffic remain qualified in JSON.")
     if report.baseline:
+        from .launch_settings import comparison_warnings, setting_change_text
+
         for target in report.baseline["targets"]:
             diff = target["configuration_diff"]
             changes = [row["field"] for row in diff["fields"] if row["change"] != "no_observed_change"]
             print(f"  {target['target']} / deployment changes: {', '.join(changes) or 'none observed; unknowns remain'}; confounded={diff['confounded']}; causality unverified")
+            launch = diff.get("launch_comparison") or {}
+            if launch.get("status") == "unverified":
+                print("    Launch setting comparison unverified.")
+            for warning in comparison_warnings(diff):
+                print(f"    {warning}")
+            for setting in launch.get("settings", []):
+                print(f"    {setting_change_text(setting)}")
         from .reporting import comparison_summary
 
         summary = comparison_summary(report)
