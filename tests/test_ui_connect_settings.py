@@ -193,6 +193,8 @@ def test_moved_settings_have_one_editable_control_on_their_own_step():
         else:
             assert any(parent['tag'] == 'details' and parent.get('id') == 'execution-settings' for parent in control['parents']), name
     timeout, = tree.named('request_timeout_seconds')
+    timeout_label, = [node for node in tree.nodes if node['tag'] == 'label' and node.get('for') == timeout['id']]
+    assert timeout_label['text'] == 'Default request timeout (seconds)'
     memory, = tree.named('max_memory_mb')
     grid = next(parent for parent in timeout['parents'] if parent.get('class') == 'fields')
     assert grid in memory['parents']

@@ -1,6 +1,9 @@
 """Per-check controls explain defaults without overwhelming the primary task."""
 
+from giraffe.models import RunConfig
+from tests.test_run_limits_phase6_ui import Markup
 from tests.test_ux_catalogue import browser_logic
+from tests.test_ux_results import run_render_checks
 
 
 def test_run_limit_edits_refresh_all_quoted_limits_without_replacing_controls():
@@ -46,12 +49,14 @@ assert.equal(nodes['#field-load_patterns_concurrent_levels-hint'].textContent,'U
 """)
 
 
-def test_questions_precede_settings_and_inactive_controls_stay_preserved():
+def test_timeout_precedes_questions_and_other_settings_with_inactive_controls_preserved():
     browser_logic(r"""
 for(const id of ['correctness','load']){
   config.checks=[id];const check=bootstrap.checks.find(x=>x.id===id);
   const markup=renderTestCard(check,config);
-  if(id==='correctness')assert(markup.indexOf('id="setup-dataset"')<markup.indexOf('data-test-settings="'+id+'"'));
+  const timeoutName=id==='load'?'load_request_timeout_seconds':'test_correctness_request_timeout_seconds';
+  assert(markup.indexOf('name="'+timeoutName+'"')<markup.indexOf('id="setup-dataset"'));
+  if(id==='correctness')assert(markup.indexOf('id="setup-dataset"')<markup.indexOf('name="test_correctness_concurrency"'));
   if(id==='load')assert(markup.indexOf('id="setup-dataset"')<markup.indexOf('name="load_patterns_rates"'));
   assert.match(markup,/>Settings<\/button>/);assert.match(markup,/aria-label="Settings for /);
 }
@@ -66,12 +71,13 @@ assert.equal(config.test_options.correctness.samples,9);
 """)
 
 
-def test_generic_transport_controls_are_secondary_and_pass_targets_remain_visible():
+def test_timeout_is_first_and_pass_targets_remain_visible():
     browser_logic(r"""
 for(const [id,name] of [['access','request_timeout_seconds'],['correctness','concurrency'],['generation','max_output_tokens'],['recovery','concurrency']]){
   const markup=renderTestCard(bootstrap.checks.find(x=>x.id===id),config);
-  const disclosure=markup.match(/<fieldset class="fields check-request-fields">([\s\S]*?)<\/fieldset>/)[1];
-  assert.match(disclosure,new RegExp('name="test_'+id+'_'+name+'"'));
+  const fields=[...markup.matchAll(/<fieldset class="fields check-request-fields"[^>]*>([\s\S]*?)<\/fieldset>/g)].map(match=>match[1]);
+  assert.match(fields[0],new RegExp('name="test_'+id+'_request_timeout_seconds"'));
+  assert(fields.some(group=>new RegExp('name="test_'+id+'_'+name+'"').test(group)));
   assert.equal((markup.match(new RegExp('name="test_'+id+'_'+name+'"','g'))||[]).length,1);
   assert.match(markup,new RegExp('id="field-check_'+id+'-help"[^>]*popover="auto"'));
   assert.doesNotMatch(markup,/Current value shown|Clear to inherit the shared default/);
@@ -86,6 +92,75 @@ const timing=renderTestCard(bootstrap.checks.find(x=>x.id==='first_output'),conf
 assert.match(timing,/Minimum usable answers/);
 assert(timing.indexOf('name="test_first_output_limit_min_samples"')<timing.indexOf('data-done-test="first_output"'));
 """)
+
+
+def test_request_timeout_is_the_first_editable_setting_in_every_applicable_panel():
+    cards = browser_logic(r"""
+console.log(JSON.stringify(Object.fromEntries(bootstrap.checks.map(check=>[
+  check.id,renderTestCard(check,{...config,checks:[check.id]})
+]))));
+""")
+    expected = {
+        "access", "serving", "first_output", "generation", "load", "context",
+        "correctness", "json", "cancellation", "recovery", "prefix", "sessions",
+        "gateway_access", "consistency", "tools",
+    }
+    found = set()
+    for check_id, html in cards.items():
+        tree = Markup(html)
+        editor, = [node for node in tree.nodes if node.get("data-test-editor") == check_id]
+        controls = [
+            node for node in tree.nodes
+            if node["tag"] in {"input", "select", "textarea"}
+            and node.get("type") not in {"hidden", "file"}
+            and editor in node["parents"]
+        ]
+        timeout = [node for node in controls if node.get("name", "").endswith("request_timeout_seconds")]
+        if not timeout:
+            continue
+        found.add(check_id)
+        assert len(timeout) == 1, check_id
+        assert controls[0] is timeout[0], check_id
+        if check_id not in {"load", "gateway_access"}:
+            label, = [node for node in tree.nodes if node["tag"] == "label" and node.get("for") == timeout[0]["id"]]
+            assert label["text"] == "Request timeout (seconds)"
+    assert found == expected
+
+
+def test_timeout_edits_keep_shared_questions_and_evaluator_outside_check_overrides():
+    config = RunConfig(targets=[{
+        "name": "local", "url": "http://localhost/v1", "model": "test",
+    }], checks=["correctness"])
+    run_render_checks("const config=" + config.model_dump_json() + ";" + r"""
+const form=document.createElement('form');form.setAttribute('id','new-run-form');document.body.insertBefore(form,null);
+const queryAll=form.querySelectorAll.bind(form);form.querySelectorAll=selector=>queryAll(selector.replace(/,\s+/g,','));
+const correctnessCheck=bootstrap.checks.find(item=>item.id==='correctness');
+function render(){
+  state.config=config;form.innerHTML=renderTestCard(correctnessCheck,config);form.elements={};
+  for(const input of form.querySelectorAll('input, select, textarea')){
+    input.name=input.getAttribute('name')||'';input.value=input.getAttribute('value')||'';
+    input.checked=input.hasAttribute('checked');input.checkValidity=()=>true;
+    form.elements[input.name]=input;
+  }
+}
+render();syncTestControls=()=>{};
+const timeout=form.querySelector('[name="test_correctness_request_timeout_seconds"]');
+const questionSource=form.querySelector('[name="request_source"]');
+assert.equal(timeout.closest('[data-test-settings]').dataset.testSettings,'correctness');
+assert.equal(questionSource.closest('[data-test-settings]'),null);
+editTestField(questionSource);assert.equal(form.elements.test_mode_correctness.value,'default');
+editTestField(timeout);assert.equal(form.elements.test_mode_correctness.value,'custom');
+config.request_source='request_pack';
+config.request_pack={cases:[{fixture_id:'question',messages:[{role:'user',content:'Question'}],expected:'Answer',scorer:'judge'}]};
+config.judging={judges:[{name:'evaluator',url:'invalid-url',model:'test'}]};state.judgeEditorOpen=true;render();
+const evaluator=form.elements.judge_0_url;
+assert(evaluator);assert.equal(evaluator.closest('[data-test-settings]'),null);
+editTestField(evaluator);assert.equal(form.elements.test_mode_correctness.value,'default');
+let validated=0;evaluator.checkValidity=()=>{validated++;assert.equal(evaluator.disabled,false);return false;};
+evaluator.focus=()=>{};evaluator.reportValidity=()=>{};syncConfigView=syncSetupStep=()=>{};
+assert.equal(validateRunForm(form),false);assert.equal(validated,1);
+assert.equal(state.openTest,'correctness');
+""", dom=True)
 
 
 def test_hint_origins_respect_explicit_overrides_and_measure_only():
