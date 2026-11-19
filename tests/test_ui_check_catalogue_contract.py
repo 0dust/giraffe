@@ -9,7 +9,7 @@ from giraffe.models import (CHECK_NAMES, CATALOGUE_NAMES, INTERNAL_CHECK_NAMES,
 from giraffe.runner import _checks
 
 NAMES = {
-    'access': 'Endpoint response', 'serving': 'Response validity',
+    'access': 'Endpoint response', 'serving': 'Invalid responses',
     'first_output': 'Time to first answer', 'generation': 'Generation speed',
     'load': 'Load test', 'context': 'Long-context recall',
     'correctness': 'Answer correctness', 'json': 'JSON correctness',
@@ -30,7 +30,7 @@ def test_one_display_name_catalogue():
     assert INTERNAL_CHECK_NAMES is CHECK_NAMES
     assert {row['id']: row['title'] for row in capabilities()['checks']} == NAMES
     from tests.test_ux_catalogue import browser_logic
-    browser_logic("assert.equal(catalogTitle('access'),bootstrap.checks.find(check=>check.id==='access').title);")
+    browser_logic("for(const id of ['access','serving'])assert.equal(catalogTitle(id),bootstrap.checks.find(check=>check.id===id).title);")
 
 
 def observed_run(*, cached=0, correct=True, latency_limit=None):

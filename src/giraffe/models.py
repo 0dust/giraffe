@@ -28,7 +28,7 @@ Status = Literal["pass", "fail", "inconclusive", "skipped", "blocked"]
 # Public display names have one source; compatibility imports share this object.
 CHECK_NAMES = {
     "access": "Endpoint response",
-    "serving": "Response validity",
+    "serving": "Invalid responses",
     "first_output": "Time to first answer",
     "generation": "Generation speed",
     "load": "Load test",
