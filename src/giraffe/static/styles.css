@@ -472,6 +472,7 @@ main:has(.new-run-layout.connecting) .setup-lede { font-size: 16px; margin-top: 
 .test-card > .test-card-heading .test-selection::after { content: ''; position: absolute; inset: -14px -18px; }
 .test-selection-line .field-info, .test-row-actions { position: relative; z-index: 1; }
 .test-description { margin: 3px 0 0 28px; font-size: 13px; color: var(--text-2); line-height: 1.45; max-width: 64ch; }
+.test-row-copy > [data-load-card-summary] { margin-left: 28px; }
 .test-row-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
 .test-setting-state { font: 600 11px var(--mono); color: var(--accent); text-transform: uppercase; letter-spacing: .08em; }
 .test-setting-state:empty { display: none; }
