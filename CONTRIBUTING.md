@@ -6,6 +6,39 @@ changes to the license, code owners, and repository rules. Authors cannot approv
 their own pull requests; a pull request by either owner needs the other owner's
 approval. Pushes that change the diff invalidate earlier approvals.
 
+## Sign your commits
+
+Giraffe is licensed under [Apache 2.0](LICENSE), and contributions are accepted
+under the same license. Every commit in a pull request must carry a
+`Signed-off-by` line, which certifies the
+[Developer Certificate of Origin 1.1](https://developercertificate.org/): that
+you wrote the change, or otherwise have the right to submit it under the
+project's license.
+
+Add the line with `git commit -s`. It uses your configured `user.name` and
+`user.email`:
+
+```text
+Signed-off-by: Your Name <you@example.com>
+```
+
+To sign off commits you have already made, rewrite them in place and force-push.
+These commands keep the branch on its current base, so they work the same for
+changes targeting `main` and for release backports:
+
+```sh
+git commit --amend --signoff    # the last commit only
+git rebase --signoff HEAD~3     # the last 3 commits; use your own count
+
+git push --force-with-lease
+```
+
+If your employer may own your work, confirm that you are allowed to contribute
+it before signing off.
+
+The sign-off grants no rights beyond the Apache 2.0 license. The maintainers may
+also offer separate commercial products or services built on Giraffe.
+
 ## Branches
 
 `main` is the development branch. Use a short-lived branch for each change and
