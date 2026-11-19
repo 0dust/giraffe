@@ -55,6 +55,25 @@ its follow-up (`limits.backend_cancel`, `limits.backend_cancel.followup`, former
 `max_output_tokens` lets a reasoning model stream before the probe is cancelled. A larger allowance does not force a longer answer
 and still needs room alongside the prompt in the model's context window.
 
+### Reasoning models
+
+Giraffe sends every field under YAML `request_options` unchanged with each
+request. Use it for the reasoning settings your server documents, such as
+`reasoning_effort` or `chat_template_kwargs`:
+
+```yaml
+max_output_tokens: 2048
+request_options:
+  reasoning_effort: low            # or, for templates such as Qwen3 on vLLM/SGLang:
+  # chat_template_kwargs: {enable_thinking: false}
+```
+
+Servers differ: Ollama, for example, accepts `reasoning_effort: none` to turn
+reasoning off and ignores `chat_template_kwargs`. A server may ignore a field it
+does not support, so check the reasoning output in the request evidence. A server
+that rejects a field returns an HTTP error, which the serving check reports. See
+[`examples/reasoning.yaml`](../examples/reasoning.yaml).
+
 The optional context check verifies recall at 80% of the full declared window.
 Its output allowance must leave at least that much input space; reserving more
 than 20% of the window makes this coverage impossible. For example, a 2,048-token

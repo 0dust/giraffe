@@ -2630,10 +2630,10 @@ def _output_budget_guidance(config, records, check_id):
     if capped and all(r.requested_max_tokens < value for r in capped):
         caps = ", ".join(str(value) for value in sorted({r.requested_max_tokens for r in capped}))
         return (f"the affected fixtures request {caps} tokens below the configured default; increasing {field} alone will not "
-                "change those requests. Configure the model to return the final fixture answer without extra reasoning within its requested cap, then rerun")
+                "change those requests. Configure the model to return the final fixture answer without extra reasoning within its requested cap (for example reasoning_effort or chat_template_kwargs in YAML request_options), then rerun")
     setting = field + (" (or --max-output-tokens)" if field == "max_output_tokens" else "")
     return (f"raise {setting} above {value} for requests using that output cap, "
-            "or configure the model to produce the final answer within its requested cap, then rerun")
+            "or configure the model to produce the final answer within its requested cap (for example reasoning_effort or chat_template_kwargs in YAML request_options), then rerun")
 
 
 _READ_COUNT_GUIDANCE = ("enable streamed logprobs or cumulative completion token usage alongside streamed content "
@@ -2837,7 +2837,7 @@ def _verdict_summary(check, config, records, budget):
         remedy = "enable streaming (stream: true, omit --nonstream) so the client can observe output and interrupt the request, then rerun cancellation"
     elif reason == "unseparated_reasoning_tokens":
         remedy = ("use a server that reports reasoning-token usage separately from total completion usage, "
-                  "or configure the model to answer without reasoning; streamed reasoning logprobs alone "
+                  "or configure the model to answer without reasoning (for example reasoning_effort or chat_template_kwargs in YAML request_options); streamed reasoning logprobs alone "
                   "cannot account for hidden control tokens, so they do not establish answer-token usage")
         # Separated reasoning usage is necessary, not sufficient: pace also needs
         # token counts at answer reads, and other missing timings keep their remedy.
