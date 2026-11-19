@@ -9,7 +9,7 @@ from giraffe.models import (CHECK_NAMES, CATALOGUE_NAMES, INTERNAL_CHECK_NAMES,
 from giraffe.runner import _checks
 
 NAMES = {
-    'access': 'Endpoint access', 'serving': 'Response validity',
+    'access': 'Endpoint response', 'serving': 'Response validity',
     'first_output': 'Time to first answer', 'generation': 'Generation speed',
     'load': 'Load test', 'context': 'Long-context recall',
     'correctness': 'Answer correctness', 'json': 'JSON correctness',
@@ -29,6 +29,8 @@ def test_one_display_name_catalogue():
     assert CATALOGUE_NAMES is CHECK_NAMES
     assert INTERNAL_CHECK_NAMES is CHECK_NAMES
     assert {row['id']: row['title'] for row in capabilities()['checks']} == NAMES
+    from tests.test_ux_catalogue import browser_logic
+    browser_logic("assert.equal(catalogTitle('access'),bootstrap.checks.find(check=>check.id==='access').title);")
 
 
 def observed_run(*, cached=0, correct=True, latency_limit=None):
@@ -76,7 +78,7 @@ def test_html_displays_current_names_without_rewriting_saved_titles():
                        finished_at='2026-10-29T00:00:01Z', overall='pass',
                        checks=[check], manifest={'config': {'checks': ['access']}})
     html = _render(report)
-    assert 'Endpoint access' in html
+    assert 'Endpoint response' in html
     assert 'Network and access' not in html
     assert report.checks[0].title == 'Network and access'
 

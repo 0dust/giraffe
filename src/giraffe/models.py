@@ -27,7 +27,7 @@ from .caps import (MAX_SIMULTANEOUS_REQUESTS, MAX_ARRIVAL_REQUESTS, MAX_BURST_SI
 Status = Literal["pass", "fail", "inconclusive", "skipped", "blocked"]
 # Public display names have one source; compatibility imports share this object.
 CHECK_NAMES = {
-    "access": "Endpoint access",
+    "access": "Endpoint response",
     "serving": "Response validity",
     "first_output": "Time to first answer",
     "generation": "Generation speed",
