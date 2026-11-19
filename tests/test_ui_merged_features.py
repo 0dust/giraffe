@@ -30,7 +30,7 @@ assert.match(section.textContent,/not evidence of causality/);
 ''', dom=True)
 
 
-@pytest.mark.parametrize("mode", ["speculation", "batching", "whole", "legacy", "unverified"])
+@pytest.mark.parametrize("mode", ["speculation", "batching", "whole", "legacy", "unverified", "mixed", "legacy_redaction"])
 def test_launch_setting_details_are_visible_beside_the_comparison(mode):
     from tests.test_reporting_merged_features import launch_setting_comparison
 
@@ -41,8 +41,9 @@ $('#report-baseline-reference').open=true;
 const section=$('#baseline-content .comparison-section');
 if(mode==='whole'||mode==='legacy'){
  assert.match(section.textContent,/additional changes within that field are not checked separately/);
-}else if(mode==='unverified'){
+}else if(['unverified','mixed','legacy_redaction'].includes(mode)){
  assert.match(section.textContent,/Launch setting comparison unverified/);
+ if(mode==='mixed')assert.match(section.textContent,/additional changes within that field are not checked separately/);
  assert.doesNotMatch(section.querySelector('.deployment-change').textContent,/one intended change/);
 }else{
  assert.match(section.textContent,/--speculative-config/);

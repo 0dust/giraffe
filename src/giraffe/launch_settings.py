@@ -140,8 +140,31 @@ def _sources(snapshot, field):
     return {key: value for key, value in row.items() if isinstance(value, dict)}
 
 
-def _same_context(before, after):
-    return all(before.get(key) == after.get(key) for key in ("provenance", "scope", "status"))
+def _same_context(before, after, *, allow_metadata_file_provenance=False):
+    provenance = (before.get("provenance"), after.get("provenance"))
+    user_declared_provenances = ("user-supplied", "user-supplied metadata file")
+    return (provenance[0] == provenance[1]
+            or allow_metadata_file_provenance
+            and all(value in user_declared_provenances for value in provenance)) and all(
+        before.get(key) == after.get(key) for key in ("scope", "status"))
+
+
+def _with_legacy_speculation_redacted(before, after):
+    redacted = "--speculative-config=[redacted]"
+    if not isinstance(before, list) or before.count(redacted) != 1 or not isinstance(after, list):
+        return None
+    positions = [index for index, arg in enumerate(after)
+                 if isinstance(arg, str) and arg.startswith("--speculative-config=")]
+    if len(positions) != 1:
+        return None
+    index = positions[0]
+    try:
+        _speculation(after[index].partition("=")[2])
+    except (ValueError, TypeError, RecursionError):
+        return None
+    restored = list(after)
+    restored[index] = redacted
+    return restored
 
 
 def compare_launch_settings(current, baseline, intended, allowed_flags):
@@ -157,10 +180,14 @@ def compare_launch_settings(current, baseline, intended, allowed_flags):
     if unsupported:
         result.update(status="unverified", warnings=result["warnings"] + [
             "Unsupported individual launch setting declaration; equivalence is unverified."])
-    if not declared:
+    before, after = _sources(baseline, LAUNCH_FIELD), _sources(current, LAUNCH_FIELD)
+    legacy_redacted_args = {
+        source: _with_legacy_speculation_redacted(before[source].get("value"), after[source].get("value"))
+        for source in before.keys() & after.keys()
+    } if not declared and not whole_field else {}
+    if not declared and not any(value is not None for value in legacy_redacted_args.values()):
         return result, set(), False
     result["status"] = "checked"
-    before, after = _sources(baseline, LAUNCH_FIELD), _sources(current, LAUNCH_FIELD)
     covered, parsed, extra = set(), {}, False
     comparable = bool(before and after and before.keys() == after.keys())
     for source in sorted(before.keys() | after.keys()):
@@ -169,12 +196,12 @@ def compare_launch_settings(current, baseline, intended, allowed_flags):
         right, right_order, more = _parse(new.get("value"), allowed_flags)
         result["warnings"].extend(warnings + more)
         parsed[source] = (left, right)
-        if left is None or right is None:
-            comparable = False
-            continue
         if not _same_context(old, new):
             comparable = False
             result["warnings"].append("Launch evidence provenance, scope or status changed; equivalence is unverified.")
+        if left is None or right is None:
+            comparable &= not declared and old.get("value") == new.get("value")
+            continue
         if [flag for flag in left_order if flag in right] != [flag for flag in right_order if flag in left]:
             result["warnings"].append("Launch argument order changed; precedence is unverified.")
         for flag in sorted(left.keys() | right.keys()):
@@ -188,7 +215,10 @@ def compare_launch_settings(current, baseline, intended, allowed_flags):
                                        "intended": is_intended})
             extra |= not is_intended and change != "unverified"
     if comparable:
-        covered.add(LAUNCH_FIELD)
+        if declared or all(old.get("value") == after[source].get("value")
+                           or old.get("value") == legacy_redacted_args.get(source)
+                           for source, old in before.items()):
+            covered.add(LAUNCH_FIELD)
     else:
         result["warnings"].append("Launch evidence is missing or not comparable in both runs.")
     for flag in declared:
@@ -201,7 +231,11 @@ def compare_launch_settings(current, baseline, intended, allowed_flags):
             old, new = old_meta.get(source, {}), new_meta.get(source, {})
             if old and new:
                 equivalent &= _same_context(old, new)
-            for row, command in zip((old, new), parsed.get(source, (None, None)), strict=True):
+            for row, command, launch in zip(
+                    (old, new), parsed.get(source, (None, None)),
+                    (before.get(source, {}), after.get(source, {})), strict=True):
+                if row:
+                    equivalent &= _same_context(row, launch, allow_metadata_file_provenance=True)
                 value = row.get("value")
                 try:
                     if flag == "--speculative-config":
@@ -217,5 +251,6 @@ def compare_launch_settings(current, baseline, intended, allowed_flags):
             result["warnings"].append(f"Launch/metadata equivalence for {field} could not be established.")
     result["warnings"] = list(dict.fromkeys(result["warnings"]))
     if result["warnings"]:
-        result["status"] = "whole_field" if whole_field else "unverified"
+        result["status"] = ("whole_field" if whole_field and result["warnings"] == [WHOLE_FIELD_WARNING]
+                            else "unverified")
     return result, covered, extra

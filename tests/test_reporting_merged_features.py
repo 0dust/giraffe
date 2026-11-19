@@ -56,6 +56,20 @@ def launch_setting_comparison(mode):
                         enabled=True, intended=intended),
         launch_snapshot(prefix + ["16"]),
     )
+    if mode == "mixed":
+        snapshots = (
+            launch_snapshot(prefix + ["32"], intended=[
+                "serving.launch_arguments", "serving.launch_arguments.--max-num-seqs"]),
+            launch_snapshot(prefix + ["16"]),
+        )
+    elif mode == "legacy_redaction":
+        snapshots = (
+            launch_snapshot(prefix + ["16"] + SPECULATION_ARGS, intended="extension.arm",
+                            **{"extension.arm": "treatment"}),
+            launch_snapshot(prefix + ["16"], **{"extension.arm": "control"}),
+        )
+        snapshots[1]["fields"]["serving.launch_arguments"]["configured"]["value"].append(
+            "--speculative-config=[redacted]")
     for report, snapshot in zip((current, baseline), snapshots, strict=True):
         report.observations = {"targets": {"local": {"deployment": snapshot}}}
     result = compare_baseline(current, baseline)
@@ -64,7 +78,7 @@ def launch_setting_comparison(mode):
     return result
 
 
-@pytest.mark.parametrize("mode", ["speculation", "batching", "whole", "legacy", "unverified"])
+@pytest.mark.parametrize("mode", ["speculation", "batching", "whole", "legacy", "unverified", "mixed", "legacy_redaction"])
 def test_launch_setting_results_survive_json_html_and_cli(mode, tmp_path, capsys):
     from giraffe.cli import _print_result
 
@@ -77,9 +91,12 @@ def test_launch_setting_results_survive_json_html_and_cli(mode, tmp_path, capsys
     for output in (html, cli):
         if mode in {"whole", "legacy"}:
             assert "additional changes within that field are not checked separately" in output
-        elif mode == "unverified":
+        elif mode in {"unverified", "mixed", "legacy_redaction"}:
             assert "Launch setting comparison unverified" in output
             assert "redacted" in output
+            assert "(one intended change)" not in output
+            if mode == "mixed":
+                assert "additional changes within that field are not checked separately" in output
         elif mode == "batching":
             assert "--max-num-seqs" in output and "additional change" in output
             assert "16" in output and "32" in output

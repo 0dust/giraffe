@@ -16,7 +16,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
-from .launch_settings import compare_launch_settings, safe_speculation
+from .launch_settings import LAUNCH_FIELD, compare_launch_settings, safe_speculation
 
 from .caps import (
     MAX_DEPLOYMENT_BODY_BYTES, MAX_DEPLOYMENT_SCOPE_CHARS, MAX_LAUNCH_ARGUMENTS,
@@ -538,6 +538,7 @@ async def snapshot(target, config, deadline, stop, *, run_start=None):
         intended.setdefault("serving", {})["launch_arguments"] = safe_launch(
             deployment.launch_command
         )
+        imported_fields.discard(LAUNCH_FIELD)
     for category, values in intended.items():
         for key, value in values.items():
             path = f"{category}.{key}"
