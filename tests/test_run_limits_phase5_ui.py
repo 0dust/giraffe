@@ -6,6 +6,7 @@ import pytest
 
 from giraffe.models import RunConfig
 from tests.test_ux_catalogue import browser_logic
+from tests.test_ux_results import run_render_checks
 from tests.test_ux_setup import run_browser_logic
 from tests.test_web import browser
 
@@ -115,6 +116,44 @@ assert.match(markup,/data-setting-path="traffic.expected_response_seconds"/);
 assert.equal((markup.match(/role="alert"/g)||[]).length,1);
 assert.equal(canStartRun(),false);
 """)
+
+
+def test_timing_risk_is_collapsed_once_at_duration_with_all_edit_links_in_details():
+    run_browser_logic(r"""
+state.config={checks:['access','correctness'],targets:[{}]};state.jsonDraft=state.jsonBase='synced';
+const risk={kind:'estimate_risk',msg:'Endpoint access may wait 300 s. Answer correctness has no comparable timing measurements. <unknown>',
+ fields:['max_duration_seconds','test_options.access.request_timeout_seconds','test_options.correctness']};
+const plan={estimated_seconds:1,time_warnings:[risk]};
+state.requestPreview={status:'current',revision:state.configRevision,route:state.routeVersion,plan};
+for(const path of risk.fields){
+ const {name}=settingDestination(path),input=element();input.getAttribute=key=>input.attributes[key];
+ nodes['#field-'+name]=input;nodes['#field-'+name+'-warning']=element({hidden:true});
+}
+syncInlineErrors();
+const warning=nodes['#field-max_duration_seconds-warning'];
+assert(!warning.hidden);
+assert.match(warning.innerHTML,/Some checks may not finish within the time limit/);
+const disclosure=warning.innerHTML.match(/<details\b[^>]*>[\s\S]*?<\/details>/)?.[0];
+assert(disclosure,'Timing diagnostics must be in a disclosure');assert.doesNotMatch(disclosure,/<details\b[^>]*\bopen(?:[\s=>])/);
+assert.match(disclosure,/Show timing details/);assert.match(disclosure,/300 s/);assert.match(disclosure,/&lt;unknown&gt;/);
+for(const path of risk.fields)assert(disclosure.includes('data-setting-path="'+path+'"'));
+assert.doesNotMatch(warning.innerHTML.replace(disclosure,''),/300 s|no comparable|data-setting-path/);
+for(const path of risk.fields.slice(1))assert(nodes['#field-'+settingDestination(path).name+'-warning'].hidden);
+const markup=renderPlanTime(plan);assert.match(markup,/<details\b/);assert.match(markup,/300 s/);
+state.requestPreview.plan={};syncInlineErrors();assert(warning.hidden);
+""")
+
+
+def test_open_timing_details_survive_repeated_previews():
+    run_render_checks(r"""
+$('#main').innerHTML=field('max_duration_seconds','Duration',10,{type:'number'});
+const risk={kind:'estimate_risk',msg:'No comparable timing measurements.',fields:['max_duration_seconds']};
+currentRequestPlan=()=>({time_warnings:[risk]});currentSettingErrors=currentResourceErrors=localSettingWarnings=()=>[];
+syncInlineErrors();const details=$('.timing-warning-details');details.open=true;
+syncInlineErrors();assert.equal($('.timing-warning-details'),details);assert(details.open);
+risk.msg='The configured timeout may exceed the time limit.';
+syncInlineErrors();assert.equal($('.timing-warning-details'),details);assert(details.open);assert.match(details.textContent,/configured timeout/);
+""", dom=True)
 
 
 async def test_tool_stream_conflict_reaches_both_inline_fields_and_plan(tmp_path):

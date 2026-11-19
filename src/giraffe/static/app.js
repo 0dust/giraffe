@@ -138,6 +138,7 @@ function patchHTML(parent,html,{landing=false}={}) {
     }
   };
   patch(parent,template.content,liveNodeKey(parent));
+  for(const popover of $$('.field-help:popover-open',parent))positionFieldHelp(popover);
   for(const [element,identity] of pendingLandings)landOnce(element,identity);
 }
 function spotGlyph(points,status) {
@@ -1249,8 +1250,12 @@ function concurrencyNoticeActions(issue) {
 function issueFields(issue) {
   return [...new Set([...(issue.fields||[issue.field||'config']),...(issue.check?[concurrencySetting(issue.check)]:[])])];
 }
+function renderTimingRisk(warning) {
+  return `<p>Some checks may not finish within the time limit.</p><details class="setup-disclosure timing-warning-details"><summary>Show timing details</summary><p>${escape(warning.msg)}</p><div class="actions">${settingActions(warning.fields || [])}</div></details>`;
+}
 function renderSettingIssues(errors=currentSettingErrors(),kind='error') {
   return errors.map(error=>{
+    if(error.kind==='estimate_risk')return `<div class="notice ${kind} setting-issue">${renderTimingRisk(error)}</div>`;
     const actions=inheritedConcurrencyNotice(error)?concurrencyNoticeActions(error):error.actions?.map(action=>Object.hasOwn(action,'value')&&['max_requests','max_duration_seconds'].includes(action.field)
       ?`<button type="button" class="button small" data-action="${action.field==='max_requests'?'use-request-budget':'use-time-budget'}" data-budget="${escape(action.value)}">${escape(action.label)}</button>`
       :Object.hasOwn(action,'value')&&action.field==='traffic.duration_seconds'
@@ -1279,13 +1284,14 @@ function syncInlineErrors() {
   }
   state.inlineErrorFields=[...messages.keys()];
   const warnings=new Map(),plan=currentRequestPlan();
-  for(const warning of [...localSettingWarnings(),...(plan?.load_warnings || []),...(plan?.concurrency_warnings || []),...(plan?.capacity_warnings || []),...(plan?.time_warnings || []),...(plan?.request_warnings || []),...(plan?.resource_warnings || [])])for(const path of issueFields(warning)){
+  for(const warning of [...localSettingWarnings(),...(plan?.load_warnings || []),...(plan?.concurrency_warnings || []),...(plan?.capacity_warnings || []),...(plan?.time_warnings || []),...(plan?.request_warnings || []),...(plan?.resource_warnings || [])])for(const path of warning.kind==='estimate_risk'?['max_duration_seconds']:issueFields(warning)){
     const {name}=settingDestination(path);warnings.set(name,[...(warnings.get(name) || []),warning]);
   }
   for(const name of new Set([...(state.inlineWarningFields || []),...warnings.keys()])){
     const input=name==='config_editor'?$('#config-editor'):$(`#field-${name}`),message=$(`#field-${name}-warning`);if(!input||!message)continue;
     const rows=warnings.get(name) || [],id=`field-${name}-warning`;
-    message.innerHTML=rows.map(row=>`${escape(row.msg)} ${inheritedConcurrencyNotice(row)?concurrencyNoticeActions(row):settingActions(row.fields || [])}`).join(' ');message.hidden=!rows.length;
+    const html=rows.map(row=>row.kind==='estimate_risk'?renderTimingRisk(row):`${escape(row.msg)} ${inheritedConcurrencyNotice(row)?concurrencyNoticeActions(row):settingActions(row.fields || [])}`).join(' ');
+    if(message.innerHTML!==html)patchHTML(message,html);message.hidden=!rows.length;
     const described=(input.getAttribute('aria-describedby') || '').split(/\s+/).filter(value=>value&&value!==id);
     if(rows.length)described.push(id);
     if(described.length)input.setAttribute('aria-describedby',described.join(' '));else input.removeAttribute('aria-describedby');
@@ -1340,7 +1346,7 @@ function renderPlanTime(plan) {
 function renderField(name,label,control,{hint,help,helpKey=name,hintAlways=false,full=false,wrapperId='',controlId=`field-${name}`,hintId=`field-${name}-hint`,hiddenLabel=false,hideInfo=false,helpDetails=''}={}) {
   const copy=fieldDescription(helpKey);hint ??= copy.hint || '';help ??= copy.help || '';
   help=[help,state.bootstrap?.cap_explanations?.[settingPath(name)]?.help].filter(Boolean).join(' ');
-  return `<div class="form-field ${full?'full':''}" ${wrapperId?`id="${escape(wrapperId)}"`:''}><div class="field-label"><label ${hiddenLabel?'class="sr-only" ':''}for="${escape(controlId)}">${escape(label)}</label>${hideInfo?'':infoHelp(name,label,help,helpDetails)}</div>${control}${hint||hintAlways?`<span class="hint" id="${escape(hintId)}">${escape(hint)}</span>`:''}<span class="field-error" id="field-${escape(name)}-error" hidden></span><span class="hint field-warning" id="field-${escape(name)}-warning" hidden></span></div>`;
+  return `<div class="form-field ${full?'full':''}" ${wrapperId?`id="${escape(wrapperId)}"`:''}><div class="field-label"><label ${hiddenLabel?'class="sr-only" ':''}for="${escape(controlId)}">${escape(label)}</label>${hideInfo?'':infoHelp(name,label,help,helpDetails)}</div>${control}${hint||hintAlways?`<span class="hint" id="${escape(hintId)}">${escape(hint)}</span>`:''}<span class="field-error" id="field-${escape(name)}-error" hidden></span><div class="hint field-warning" id="field-${escape(name)}-warning" hidden></div></div>`;
 }
 function loadSettingPath(name) {
   const paths=['request_timeout_seconds','patterns.concurrent.enabled','patterns.concurrent.levels','patterns.constant.enabled','patterns.poisson.enabled','patterns.poisson.seed','patterns.rates','patterns.bursts.enabled','patterns.bursts.size','patterns.bursts.first_seconds','patterns.bursts.gap_seconds','schedule.duration_seconds','schedule.finish_seconds'];
@@ -3320,7 +3326,12 @@ function renderPreparation(detail=state.detail) {
   const optional=item=>['runtime_metrics_discovery','performance_evidence_probe'].includes(item.scenario);
   const earlier=[...snapshots.values()].filter(item=>current.get(item.target || '')!==item&&!optional(item)&&(item.builtin||item.estimated||['failed','unavailable','cancelled'].includes(item.status)));
   const clocks=state.preparationClocks?.id===detail.id?state.preparationClocks.values:new Map();state.preparationClocks={id:detail.id,values:clocks};
-  return [...current.values(),...earlier].map(item=>{
+  const notices=new Set();
+  return [...current.values(),...earlier].filter(item=>{
+    if(item.status!=='completed'||!(item.builtin||item.estimated)||!item.reason)return true;
+    const key=JSON.stringify([item.target || '',Boolean(item.builtin),Boolean(item.estimated),item.reason]);
+    if(notices.has(key))return false;notices.add(key);return true;
+  }).map(item=>{
     const running=item.status==='running'&&activeState(detail),key=JSON.stringify([item.target,item.step,item.started_elapsed_seconds]),sample=Number(item.elapsed_seconds || 0),previous=clocks.get(key);
     if(!previous||sample!==previous.sample)clocks.set(key,{sample,at:Date.now()});
     const clock=clocks.get(key),seconds=sample+(running?(Date.now()-clock.at)/1000:0),status=running?'running':item.status==='running'?'cancelled':item.status;
