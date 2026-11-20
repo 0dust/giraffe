@@ -329,7 +329,12 @@ vm.runInNewContext('state.bootstrap=bootstrap;state.bootstrap.config=config;',co
 for(const check of context.bootstrap.checks) {{
   context.check=check;
   const markup=vm.runInNewContext('renderTestCard(check,config)',context);
-  assert.match(markup,/class="check-info-details"/);assert(markup.includes('<dt>Sends</dt>'));
+  if(['serving','correctness'].includes(check.id)) {{
+    assert.doesNotMatch(markup,/class="check-info-details"/);assert(!markup.includes('<dt>Sends</dt>'));
+    assert(markup.includes(`popovertarget="field-check_${{check.id}}-help"`));
+  }} else {{
+    assert.match(markup,/class="check-info-details"/);assert(markup.includes('<dt>Sends</dt>'));
+  }}
   for(const name of check.option_fields) {{
     assert(markup.includes(`name="test_${{check.id}}_${{name}}"`));
     assert(markup.includes(`popovertarget="field-test_${{check.id}}_${{name}}-help"`));
@@ -1215,7 +1220,7 @@ let markup=renderRequestSource(state.config);assert.match(markup,/My questions/)
 const calls=[];api=async(path,options)=>{calls.push({path,body:JSON.parse(options.body)});if(path==='/api/datasets/preview')return {columns:[],preview_rows:pack.cases,request_pack:pack,errors:[],needs_mapping:false};if(path==='/api/config/draft')return {config:JSON.parse(options.body)};throw Error('Unexpected endpoint');};
 await importRequestPack({name:'examples.json',size:20,text:async()=>JSON.stringify(pack)});
 assert.equal(state.config.request_pack,null);assert.equal(calls.length,1);assert.equal(calls[0].path,'/api/datasets/preview');assert(nodes['#dataset-dialog'].open);
-markup=nodes['#dataset-dialog'].innerHTML;assert.match(markup,/Use dataset/);assert(markup.includes('<th>Input</th>'));assert.match(markup,/&lt;question&gt;/);assert(!markup.includes('<pre>'));
+markup=nodes['#dataset-dialog'].innerHTML;assert.match(markup,/Replace current questions with this question/);assert(markup.includes('<th>Input</th>'));assert.match(markup,/&lt;question&gt;/);assert(!markup.includes('<pre>'));
 await useImportedDataset({preventDefault(){}});assert.equal(state.config.request_pack.cases[0].fixture_id,'one');assert.equal(state.config.targets[0].model,'');assert.equal(calls[1].path,'/api/config/draft');assert(!nodes['#dataset-dialog'].open);
 const accepted=JSON.stringify(state.config);
 // Sample loading uses the same staged preview: cancelling preserves custom questions.

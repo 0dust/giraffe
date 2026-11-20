@@ -37,7 +37,7 @@ for(const [name,value] of [['concurrency','40'],['max_output_tokens','256'],['re
 assert.equal(nodes['#field-load_patterns_concurrent_levels-hint'].textContent,'Used by maintained-concurrency traffic and the long-input / short-answer test.');
 nodes['#load-ceiling-label']={};syncLoadDisplay(readForm().config);assert.equal(nodes['#load-ceiling-label'].textContent,40);
 assert.match(nodes['#run-ceilings-summary'].textContent,/40 at once/);
-assert.equal(hints[0].textContent,'Custom · run default: 4 at a time');
+assert.equal(hints[0].textContent,'Custom: 8 at a time');
 assert.equal(hints[1].textContent,'Custom · run default: 256 tokens');
 assert.equal(hints[2].textContent,'Custom · run default: 60 seconds');
 assert.equal(bootstrap.limits['sessions.concurrency'].maximum,512);assert.equal(elements.profile_sessions_concurrency.max,String(bootstrap.limits['sessions.concurrency'].maximum)); // Preserve the session schema's own maximum.
@@ -64,9 +64,9 @@ config.checks=['correctness'];config.request_source='request_pack';config.reques
 config.test_options.correctness={samples:9,concurrency:2};
 const markup=renderTestCard(bootstrap.checks.find(x=>x.id==='correctness'),config);
 assert.doesNotMatch(markup,/name="test_correctness_(samples|concurrency|max_output_tokens|request_timeout_seconds)/);
-assert.match(markup,/Each saved case owns its output cap and request options/);
-assert.match(markup,/Concurrency: 4 \(default\)/);
-assert.match(markup,/Per-check request-setting overrides are unavailable. Per-check pass criteria remain supported./);
+assert.match(markup,/Add questions to calculate their execution plan/);
+assert.doesNotMatch(markup,/per-check request-setting overrides/i);
+assert.match(markup,/name="test_correctness_limit_min_correctness"/);
 assert.equal(config.test_options.correctness.samples,9);
 """)
 
@@ -87,7 +87,7 @@ assert(context.indexOf('name="test_context_context_limit"')<context.indexOf('cla
 assert.match(context,/Minimum requests across the generated context cases/);
 assert.match(context,/Calibration and retries can add requests/);
 assert.doesNotMatch(context,/Minimum requests for each context-length group/);
-assert.match(renderTestCard(bootstrap.checks.find(x=>x.id==='correctness'),config),/Minimum questions/);
+assert.match(renderTestCard(bootstrap.checks.find(x=>x.id==='correctness'),config),/Minimum requests/);
 const timing=renderTestCard(bootstrap.checks.find(x=>x.id==='first_output'),config);
 assert.match(timing,/Minimum usable answers/);
 assert(timing.indexOf('name="test_first_output_limit_min_samples"')<timing.indexOf('data-done-test="first_output"'));
@@ -123,7 +123,7 @@ console.log(JSON.stringify(Object.fromEntries(bootstrap.checks.map(check=>[
         assert controls[0] is timeout[0], check_id
         if check_id not in {"load", "gateway_access"}:
             label, = [node for node in tree.nodes if node["tag"] == "label" and node.get("for") == timeout[0]["id"]]
-            assert label["text"] == "Request timeout (seconds)"
+            assert label["text"] == ("Timeout per request (seconds)" if check_id == "correctness" else "Request timeout (seconds)")
     assert found == expected
 
 
@@ -167,12 +167,12 @@ def test_hint_origins_respect_explicit_overrides_and_measure_only():
     browser_logic(r"""
 const correctness=bootstrap.checks.find(x=>x.id==='correctness'),cancel=bootstrap.checks.find(x=>x.id==='cancellation');
 config.samples=7;
-assert.equal(checkFieldHint(correctness,config,'samples'),'Run default');
+assert.equal(checkFieldHint(correctness,config,'samples'),'Using run default: 7 requests');
 assert.equal(checkFieldHint(cancel,config,'cancel_after_ms'),'Check default');
 assert.match(checkFieldHelp(bootstrap.checks.find(x=>x.id==='access'),'request_timeout_seconds'),/suite value is a default, not a ceiling/);
 assert.match(checkFieldHelp(bootstrap.checks.find(x=>x.id==='generation'),'max_output_tokens'),/suite value is a default, not a ceiling/);
 config.test_options.correctness={samples:7};
-assert.equal(checkFieldHint(correctness,config,'samples'),'Custom · run default: 7 requests');
+assert.equal(checkFieldHint(correctness,config,'samples'),'Custom: 7 requests');
 const generation=bootstrap.checks.find(x=>x.id==='generation');config.limits.latency_ms=900;
 config.test_options.generation={limits:{latency_ms:null}};
 const hint=checkFieldHint(generation,config,'latency_ms','limit');
@@ -182,12 +182,12 @@ config.test_options.generation.limits.min_samples=null;
 assert.doesNotMatch(checkFieldHint(generation,config,'min_samples','limit'),/Measure only/);
 assert.doesNotMatch(checkFieldHint(cancel,config,'server_log'),/measure only/);
 const node={dataset:{checkId:'correctness',settingName:'samples',settingKind:'option'}};
-groups['[data-check-field-hint]']=[node];updateCheckFieldHints(config);assert.equal(node.textContent,'Custom · run default: 7 requests');
+groups['[data-check-field-hint]']=[node];updateCheckFieldHints(config);assert.equal(node.textContent,'Custom: 7 requests');
 delete config.test_options.correctness;config.samples=4;
 nodes['#new-run-form']={elements:{test_correctness_samples:{value:''}}};
-updateCheckFieldHints(config);assert.equal(node.textContent,'Run default: 4 requests');
+updateCheckFieldHints(config);assert.equal(node.textContent,'Using run default: 4 requests');
 nodes['#new-run-form'].elements.test_correctness_samples.value='4';
-updateCheckFieldHints(config);assert.equal(node.textContent,'Run default');
+updateCheckFieldHints(config);assert.equal(node.textContent,'Using run default: 4 requests');
 """)
 
 
@@ -205,7 +205,7 @@ config.test_options.correctness={samples:9};updateCheckFieldHints(config);assert
 assert.equal(testSettingsLabel(check,config),'Overrides');
 delete config.test_options.correctness;updateCheckFieldHints(config);assert.equal(reset.hidden,true);
 config.checks.push('load');markup=renderTestCard(check,config);
-assert.match(markup,/question-source-scope">Also used by Load test/);
+assert.match(markup,/question-source-scope">Load test uses this question source too/);
 assert.equal((markup.match(/name="request_source"/g)||[]).length,2);
 """)
 
@@ -215,7 +215,7 @@ def test_generated_request_summaries_are_minimums_and_profiles_do_not_claim_over
 config.samples=3;
 for(const id of ['correctness','json','context']){
   const check=bootstrap.checks.find(item=>item.id===id);
-  assert.match(effectiveCheckSummary(check,config),new RegExp('At least 3 '+(id==='context'?'requests':'questions')));
+  assert.match(effectiveCheckSummary(check,config),new RegExp('At least 3 '+(id==='json'?'questions':'requests')));
 }
 config.sessions=bootstrap.profile_defaults.sessions;
 assert.equal(testSettingsLabel(bootstrap.checks.find(item=>item.id==='sessions'),config),'');
@@ -224,15 +224,17 @@ assert.equal(testSettingsLabel(bootstrap.checks.find(item=>item.id==='sessions')
 
 def test_question_source_keeps_examples_collapsed_and_scope_in_help():
     browser_logic(r"""
-bootstrap.builtin_question_example={question:'What is 2 + 2?',expected:'4'};
+bootstrap.builtin_questions=[{question:'What is 2 + 2?',expected:'4'}];
 const original=JSON.stringify(config),markup=renderRequestSource(config);
 assert(markup.indexOf('value="builtin"')<markup.indexOf('value="request_pack"'));
 assert.match(markup,/value="builtin" checked/);
-assert.match(markup,/<details class="builtin-example"><summary>View an example<\/summary>/);
+assert.match(markup,/<details class="builtin-example"><summary>View questions and expected answers<\/summary>/);
 assert.match(markup,/What is 2 \+ 2\?/);assert.match(markup,/<code>4<\/code>/);
 assert.doesNotMatch(markup,/Questions &amp; expected answers|Known-answer questions are ready|Ready to use|Add or import a dataset/);
 assert.match(markup,/id="field-request_source-help"[^>]*popover="auto"/);
-assert.match(markup,/Sample count and requests-at-a-time settings are not used/);
+assert.match(markup,/Switching sources keeps your saved questions/);
+assert.match(markup,/Load test uses the same question source when selected/);
+assert.doesNotMatch(markup,/Each saved question runs once/);
 assert.equal(JSON.stringify(config),original);
 """)
 
@@ -291,12 +293,12 @@ def test_lower_run_ceiling_preserves_requested_override_and_sets_native_limits()
     browser_logic(r"""
 config.concurrency=8;config.test_options.correctness={concurrency:8};
 const check=bootstrap.checks.find(x=>x.id==='correctness');
-assert.match(effectiveCheckSummary(check,config),/8 at a time/);
+assert.match(effectiveCheckSummary(check,config),/Up to 8 in progress/);
 config.concurrency=4;config.max_output_tokens=32;config.request_timeout_seconds=5;
 config.test_options.generation={max_output_tokens:64};config.test_options.access={request_timeout_seconds:10};
 const summary=effectiveCheckSummary(check,config);
-assert.match(summary,/8 at a time/);assert.doesNotMatch(summary,/exceeds run limit/);
-assert.doesNotMatch(summary,/ · 4 at a time/);
+assert.match(summary,/Up to 8 in progress/);assert.doesNotMatch(summary,/exceeds run limit/);
+assert.doesNotMatch(summary,/ · Up to 4 in progress/);
 assert.equal(checkOverrideWarning(bootstrap.checks.find(x=>x.id==='generation'),config),'');
 assert.equal(checkOverrideWarning(bootstrap.checks.find(x=>x.id==='access'),config),'');
 const elements={test_correctness_concurrency:{value:'8'},test_generation_max_output_tokens:{value:'64'},

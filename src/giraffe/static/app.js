@@ -1107,23 +1107,23 @@ const fieldDescriptions={
   judge_url:{help:'OpenAI-compatible API address of the AI evaluator. Questions, expected answers and generated answers are sent to this endpoint.'},
   judge_name:{help:'A unique name for this evaluator, used to identify its votes and errors in the results.'},
   judge_api_key_env:{hint:'Environment variable name, not the key itself.',help:'Enter the name of an environment variable containing the evaluator’s API key, such as JUDGE_API_KEY. Set it on the machine running Giraffe. Do not paste the secret key into this field.'},
-  judging_concurrency:{help:'The most evaluator requests Giraffe may run at once. This is separate from target-test concurrency and does not affect inference timing. An accepted value is not demonstrated delivery capacity.'},
-  judging_request_timeout_seconds:{help:'Seconds allowed for one evaluator response. An evaluator timeout leaves that vote missing; it is not treated as an incorrect target answer.'},
-  judging_max_duration_seconds:{help:'Seconds allowed for the complete post-run AI evaluation. Unfinished evaluations remain inconclusive.'},
-  judging_max_output_tokens:{help:'The maximum answer tokens allowed for each evaluator response. This cap applies to evaluator output, not the answers being tested.'},
-  example_id:{help:'A unique name for this question, used to find it in results and comparisons. Keep the same ID when comparing later runs of the same question.'},
-  example_weight:{hint:'A larger number uses this question more often.',help:'Controls how often this question appears in arrival traffic compared with other questions. A weight of 2 gives it about twice the share of a question weighted 1. It does not make the question count twice when scoring an individual answer.'},
-  example_max_tokens:{hint:'Leave blank to use the run’s output cap.',help:'Maximum answer tokens to request for this question. The suite value is a default, not a ceiling.'},
-  example_scorer:{help:'AI evaluation compares meaning against your expected answer. Exact match compares text, including punctuation, after normalizing whitespace. Contains checks for the expected text inside the answer. JSON checks its structure and optional reference value. No answer check sends traffic without judging correctness.'},
-  example_expected:{help:'The answer you want the model to give. AI evaluation accepts answers with the same meaning. Exact match also requires matching punctuation and wording. For JSON checks, enter a JSON value; leaving it blank checks only the schema.'},
+  judging_concurrency:{help:'Maximum evaluator requests in progress, separate from requests to the model being tested.'},
+  judging_request_timeout_seconds:{help:'Time allowed for one evaluator response. A timeout leaves a missing score rather than an incorrect answer.'},
+  judging_max_duration_seconds:{help:'Time allowed for all evaluation after test traffic finishes. Unfinished evaluations leave missing scores.'},
+  judging_max_output_tokens:{help:'Maximum generated tokens per evaluator response.'},
+  example_id:{help:'Filled automatically. Keep the same test name when comparing later runs of this question.'},
+  example_weight:{help:'A weight of 2 selects this question about twice as often as weight 1 among the questions used in the same load scenario. It does not control the question sequence in standalone Answer correctness.'},
+  example_max_tokens:{help:'Maximum generated tokens for this question. Leave blank to inherit the effective output limit.'},
+  example_scorer:{help:'Choose how to check the model’s next reply.'},
+  example_expected:{help:'The reference answer for the selected answer check.'},
   example_schema:{help:'A JSON Schema describing the allowed answer structure, field types and required fields. The answer must parse as JSON and match this schema.'},
   example_rubric:{help:'Optional guidance for the evaluator, such as acceptable wording or how to handle missing details. The question, expected answer and generated answer are still included.'},
   example_options:{help:'Extra request settings as a JSON object, such as {"temperature": 0}. Giraffe keeps control of the model, messages and safety limits.'},
-  message_content:{help:'Text sent to the model. For a conversation, add messages in order. Giraffe uses the full saved conversation when testing this question.'},
-  message_role:{help:'User is a question or instruction. Assistant is a previous model reply. System is guidance for how the model should behave.'},
+  message_content:{help:'Text sent to the model.'},
+  message_role:{help:'Choose who supplied this message in the saved conversation.'},
   input_field:{help:'Choose the column that contains each question or saved conversation. Review the import preview before using the dataset.'},
   expected_field:{help:'Choose the column that contains the expected answer for each question.'},
-  import_scorer:{help:'Choose how imported answers will be checked. AI evaluation compares their meaning; exact match compares their text. You can change the check for individual questions after import.'},
+  import_scorer:{help:'Choose the answer check for these questions. You can edit individual questions after import.'},
   dataset_bulk_scorer:{help:'Apply the chosen check to every selected question. Choosing No answer check also removes their saved expected answers.'},
   try_target:{help:'Send this one question to the selected endpoint. Other endpoints are not used for this preview.'},
   config_editor:{help:'The same run settings as the form, with extra options for multiple endpoints, server metadata and request settings. Apply changes before running. Unapplied edits lock the form so the two views cannot silently disagree.'},
@@ -1343,10 +1343,10 @@ function renderPlanTime(plan) {
   const assumptions=[...(plan.confidence_details?.insufficient_observations||[]),...(plan.time_estimate_assumptions||[])];
   return `<div class="plan-time"><p>Estimated duration: ${escape(estimate)} · test traffic only</p><p class="hint">Confidence: ${escape(plan.confidence||'low')}. Excludes ${(plan.estimate_exclusions||['setup/connection','AI evaluation','report generation']).map(escape).join(', ')}.</p>${(plan.time_bound_reasons||[]).length?`<div class="unknown-time-components"><p class="hint">Additional work at unknown speed:</p><ul>${plan.time_bound_reasons.map(reason=>`<li>${escape(reason)}</li>`).join('')}</ul></div>`:''}${assumptions.length?`<details class="estimate-assumptions"><summary>Estimate assumptions</summary><ul>${assumptions.map(reason=>`<li>${escape(reason)}</li>`).join('')}</ul></details>`:''}${renderSettingIssues([...(plan.time_warnings||[]),...(plan.request_warnings||[]),...(plan.resource_warnings||[]),...(plan.concurrency_warnings||[]),...(plan.capacity_warnings||[])],'warning')}${renderSettingIssues((plan.resource_issues||[]).filter(issue=>issue.blocking))}</div>`;
 }
-function renderField(name,label,control,{hint,help,helpKey=name,hintAlways=false,full=false,wrapperId='',controlId=`field-${name}`,hintId=`field-${name}-hint`,hiddenLabel=false,hideInfo=false,helpDetails='',includeLimitHelp=true}={}) {
+function renderField(name,label,control,{hint,help,helpKey=name,hintAlways=false,full=false,wrapperId='',controlId=`field-${name}`,hintId=`field-${name}-hint`,hiddenLabel=false,hideInfo=false,helpDetails='',includeLimitHelp=true,hintAction=''}={}) {
   const copy=fieldDescription(helpKey);hint ??= copy.hint || '';help ??= copy.help || '';
   if(includeLimitHelp)help=[help,state.bootstrap?.cap_explanations?.[settingPath(name)]?.help].filter(Boolean).join(' ');
-  return `<div class="form-field ${full?'full':''}" ${wrapperId?`id="${escape(wrapperId)}"`:''}><div class="field-label"><label ${hiddenLabel?'class="sr-only" ':''}for="${escape(controlId)}">${escape(label)}</label>${hideInfo?'':infoHelp(name,label,help,helpDetails)}</div>${control}${hint||hintAlways?`<span class="hint" id="${escape(hintId)}">${escape(hint)}</span>`:''}<span class="field-error" id="field-${escape(name)}-error" hidden></span><div class="hint field-warning" id="field-${escape(name)}-warning" hidden></div></div>`;
+  return `<div class="form-field ${full?'full':''}" ${wrapperId?`id="${escape(wrapperId)}"`:''}><div class="field-label"><label ${hiddenLabel?'class="sr-only" ':''}for="${escape(controlId)}">${escape(label)}</label>${hideInfo?'':infoHelp(name,label,help,helpDetails)}</div>${control}${hint||hintAlways?`<span class="hint" id="${escape(hintId)}">${escape(hint)}</span>`:''}${hintAction}<span class="field-error" id="field-${escape(name)}-error" hidden></span><div class="hint field-warning" id="field-${escape(name)}-warning" hidden></div></div>`;
 }
 function loadSettingPath(name) {
   const paths=['request_timeout_seconds','patterns.concurrent.enabled','patterns.concurrent.levels','patterns.constant.enabled','patterns.poisson.enabled','patterns.poisson.seed','patterns.rates','patterns.bursts.enabled','patterns.bursts.size','patterns.bursts.first_seconds','patterns.bursts.gap_seconds','schedule.duration_seconds','schedule.finish_seconds'];
@@ -1384,13 +1384,13 @@ function settingBounds(name) {
   const scale=/^test_.*_limit_(min_correctness|max_error_rate)$/.test(name)?100:1;
   return {...bounds,minimum:bounds.minimum==null?undefined:bounds.minimum*scale,maximum:bounds.maximum==null?undefined:bounds.maximum*scale};
 }
-function field(name,label,value,{type='text',hint,help,helpKey=name,min,max,step,placeholder='',required=false,hintAlways=false,full=false,hiddenLabel=false,hideInfo=false,includeLimitHelp=true}={}) {
+function field(name,label,value,{type='text',hint,help,helpKey=name,min,max,step,placeholder='',required=false,hintAlways=false,full=false,hiddenLabel=false,hideInfo=false,includeLimitHelp=true,hintAction=''}={}) {
   const bounds=settingBounds(name);
   min=bounds.minimum ?? (bounds.exclusiveMinimum==null?undefined:bounds.type==='integer'?Math.floor(bounds.exclusiveMinimum)+1:bounds.exclusiveMinimum+Math.max(Number.MIN_VALUE,Math.abs(bounds.exclusiveMinimum)*Number.EPSILON));max=bounds.maximum;
 
   const description=hint ?? fieldDescription(helpKey).hint;
   const control=`<input id="field-${escape(name)}" name="${escape(name)}" type="${type}" value="${escape(value ?? '')}" ${required?'required':''} ${min!==undefined?`min="${min}"`:''} ${max!==undefined?`max="${max}"`:''} ${step!==undefined?`step="${step}"`:''} placeholder="${escape(placeholder)}" autocomplete="off" ${description||hintAlways?`aria-describedby="field-${escape(name)}-hint"`:''}>`;
-  return renderField(name,label,control,{hint,help,helpKey,hintAlways,full,hiddenLabel,hideInfo,includeLimitHelp});
+  return renderField(name,label,control,{hint,help,helpKey,hintAlways,full,hiddenLabel,hideInfo,includeLimitHelp,hintAction});
 }
 function selectField(name,label,options,{hint,help,helpKey=name,wrapperId='',controlId=`field-${name}`,helpDetails=''}={}) {
   const description=hint ?? fieldDescription(helpKey).hint;
@@ -1411,14 +1411,14 @@ function positionFieldHelp(popover) {
   popover.style.top=`${bounds.bottom+8+height<=window.innerHeight-gutter?bounds.bottom+8:Math.max(gutter,bounds.top-height-8)}px`;
 }
 function baselineOptions(selected='') {return `<option value="">No baseline · first or standalone run</option>${state.baselines.map(b=>`<option value="${escape(b.id)}" ${b.id===selected?'selected':''}>${escape(b.name)} · ${statusLabels[b.overall] || b.overall || 'saved'} · ${date(b.saved_at)}</option>`).join('')}`;}
-function schemaField(name,value,schema,{label,hint,help,helpKey=name,placeholder='Use run setting',includeLimitHelp=true}={}) {
+function schemaField(name,value,schema,{label,hint,help,helpKey=name,placeholder='Use run setting',includeLimitHelp=true,hintAction=''}={}) {
   const nullable=schema.anyOf?.some(item=>item.type==='null');
   const valueSchema=schema.anyOf?.find(item=>item.type!=='null') || schema;
   label ||= schema.title || human(name);
   if(valueSchema.enum)return selectField(name,label,valueSchema.enum.map(item=>`<option value="${escape(item)}" ${item===value?'selected':''}>${escape(item==='poisson'?'Uneven (Poisson)':item==='steady'?'Even spacing':human(item))}</option>`).join(''),{hint,help,helpKey});
-  if(valueSchema.type==='array')return field(name,label,(value || []).join(', '),{hint,help,helpKey,required:true,includeLimitHelp});
-  if(valueSchema.type==='string')return field(name,label,value,{hint,help,helpKey,required:!nullable,placeholder,includeLimitHelp});
-  return field(name,label,value,{type:'number',hint,help,helpKey,step:valueSchema.type==='integer'?1:'any',required:!nullable,placeholder:nullable?placeholder:'',includeLimitHelp});
+  if(valueSchema.type==='array')return field(name,label,(value || []).join(', '),{hint,help,helpKey,required:true,includeLimitHelp,hintAction});
+  if(valueSchema.type==='string')return field(name,label,value,{hint,help,helpKey,required:!nullable,placeholder,includeLimitHelp,hintAction});
+  return field(name,label,value,{type:'number',hint,help,helpKey,step:valueSchema.type==='integer'?1:'any',required:!nullable,placeholder:nullable?placeholder:'',includeLimitHelp,hintAction});
 }
 const checkGroups=[
   {id:'answers',title:'Answers',blurb:'Is the output right?',checks:['access','serving','correctness','json','context','tools']},
@@ -1435,7 +1435,7 @@ const checkGuide={
   load:{name:'Load test',purpose:'Workloads, request rates and bursts in one place.',sends:'Selected workloads under maintained concurrency, arrivals and bursts.',shows:'Delivery, per-response criteria and highest tested accepted load.'},
   access:{name:'Endpoint response',purpose:'Can this endpoint return an answer?',sends:'One short generated request, shared with timing checks.',shows:'Whether the endpoint, authentication and model produce a valid answer.'},
   serving:{name:'Response validity',purpose:'Look for errors, empty answers and broken streams.',help:'Checks for errors, empty answers and broken streams. Wrong answers are checked separately. Some failures from other tests also count.'},
-  correctness:{name:'Answer correctness',purpose:'Check known answers using built-in examples or your own questions.',sends:'Generated extraction, arithmetic and classification questions, or each of your saved questions.',shows:'Correct answers among scored responses. Missing answers stay visible.'},
+  correctness:{name:'Answer correctness',purpose:'Compare model answers with the answers you expect.',help:'Built-in mode repeats known questions. My questions runs an individual-question pass and the applicable repeated traffic. Missing scores can make the result inconclusive.'},
   json:{name:'JSON correctness',purpose:'Check that JSON answers have the right fields, types and values.',sends:'Generated questions requesting a defined JSON structure.',shows:'Valid JSON, required fields, expected types and known values.'},
   context:{name:'Context recall',purpose:'Find out whether facts survive inside long questions.',sends:'Known facts placed at different positions and lengths in generated questions.',shows:'Recall at the exercised lengths. Use your server’s configured context limit.',needs:'Check the server context limit'},
   tools:{name:'Tool-call correctness',purpose:'Check tool calls and any required assistant text. Nothing is run.',sends:'Configured fixtures can require none, auto, required or a named tool. The built-in weather check uses automatic selection. Optional legacy forced-choice diagnostics run separately.',shows:'Separate protocol, choice compliance, argument schema, task and assistant text outcomes against configured expectations.',needs:'Tool-capable model and endpoint'},
@@ -1504,6 +1504,37 @@ function checkCoverageWarning(check,config) {
   return planned!=null&&planned<minimum?`Too few planned samples for coverage: ${planned} in a group; ${minimum} required.`:'';
 }
 function checkOverrideWarning() {return '';}
+function correctnessPlan(config) {
+  if(hasJsonChanges())return null;
+  return currentRequestPlan() || (!state.requestPreview&&sameConfig(config,state.bootstrap.config)?state.bootstrap.request_plan:null);
+}
+function correctnessSource(path) {
+  if(!path)return 'run default';
+  if(path==='load_test'||path.startsWith('test_options.load.')||path.startsWith('load_test.'))return 'Load test settings';
+  if(path==='traffic'||path.startsWith('test_options.capacity.')||path.startsWith('traffic.'))return 'Capacity settings';
+  if(path.startsWith('test_options.correctness.'))return 'Answer correctness settings';
+  if(path.startsWith('request_pack.cases.'))return 'saved question';
+  return 'run default';
+}
+function renderCorrectnessExecution(config) {
+  if(config.request_source!=='request_pack')return '';
+  if(!config.request_pack?.cases?.length)return '<p class="hint">Add questions to calculate their execution plan.</p>';
+  if(!config.checks.includes('correctness'))return '<p class="hint">Select Answer correctness to include the individual-question pass.</p>';
+  const execution=correctnessPlan(config)?.request_settings?.correctness?.execution;
+  if(!execution)return `<p class="hint" role="status">${state.requestPreview?.status==='error'?'Question execution plan unavailable. Correct the settings and refresh the preview.':hasJsonChanges()?'Apply JSON changes to update the question execution plan.':'Updating the question execution plan…'}</p>`;
+  if(!execution.active)return '<p class="hint">Select Answer correctness to include the individual-question pass.</p>';
+  const shared=execution.shared_with,concurrency=execution.concurrency,timeout=execution.request_timeout_seconds;
+  const phases=[];
+  if(execution.quiet_requests)phases.push(`${counted(execution.quiet_requests,'request')} in an individual-question pass, one at a time`);
+  if(shared)phases.push(`the selected ${catalogTitle(shared)} traffic`);
+  else if(execution.repeated_requests)phases.push(`${counted(execution.repeated_requests,'request')} in a repeated pass, up to ${number(concurrency.value)} in progress`);
+  return `<p>${escape(phases.join(', followed by '))}.</p><p class="hint">Timeout per request: ${number(timeout.value)} seconds · ${escape(correctnessSource(timeout.source))}.</p><p class="hint">${shared?`Repeated requests in progress: uses ${escape(correctnessSource(concurrency.source))}.`:`Maximum requests in progress: ${number(concurrency.value)} · ${escape(correctnessSource(concurrency.source))}${concurrency.limited_by?' · limited by Run limits':''}.`}</p>`;
+}
+function updateCorrectnessExecution(config) {
+  const execution=$('[data-correctness-execution]');if(execution)execution.innerHTML=renderCorrectnessExecution(config);
+  const card=$('[data-test-card="correctness"]'),check=state.bootstrap.checks.find(check=>check.id==='correctness');
+  if(card&&check)updateCheckRow(check,config,card);
+}
 function effectiveCheckSummary(check,config) {
   if(check.id==='gateway_policy'){if(!config.gateway_policy)return 'Not configured · declare identities, policy and offered work';const s=gatewayPolicySettings(config);return `${s.capability} · ${s.users.length} identities · ${s.users.reduce((n,u)=>n+u.requests,0)} request cap · ${s.duration_seconds}s`;}
   if(check.id==='gateway_attribution'){const s=config.gateway_attribution;return s?.identities?.length?`${s.identities.length} identities · ${s.samples ?? 2} samples each · bounded read-only evidence`:'Not configured · select identities and an evidence endpoint in JSON';}
@@ -1511,7 +1542,7 @@ function effectiveCheckSummary(check,config) {
   if(check.id==='scale_down'){const s=scaleDownSettings(config);return `${s.target} · ${s.long_cohort_size} long stream${s.long_cohort_size===1?'':'s'} · ${s.requests_per_second} follow-up requests/s · ${s.grace_seconds}s grace from ${human(s.grace_anchor)}`;}
   const parts=[];
   const timeout=check.id==='load'?loadSettings(config).request_timeout_seconds:check.id==='gpu'?null:optionValue(config,check,'request_timeout_seconds') ?? config.request_timeout_seconds;
-  if(timeout!=null)parts.push(`Request timeout ${elapsed(timeout)}`);
+  if(timeout!=null&&check.id!=='correctness')parts.push(`Request timeout ${elapsed(timeout)}`);
   if(check.id==='access')parts.push('1 short request');
   else if(check.id==='capacity')parts.push(`${config.traffic.rates.join(' → ')} requests/s`,`${config.traffic.duration_seconds}s at each rate`);
   else if(check.id==='load'){const settings=loadSettings(config);parts.push(`${counted(Object.keys(loadTitles).filter(type=>settings.workloads[type].enabled).length,'workload')}`,validLoadLevels(settings.patterns.concurrent.levels)?`${settings.patterns.concurrent.levels.join(', ')} concurrent`:'Enter valid concurrency levels');}
@@ -1527,7 +1558,13 @@ function effectiveCheckSummary(check,config) {
   }
   else if(check.id==='correctness'&&config.request_source==='request_pack'){
     const count=config.request_pack?.cases?.length;
-    parts.push(count==null?'Each saved question once':`${count} saved ${count===1?'question':'questions'} · each once`);
+    parts.push(count==null?'My questions':`${count} saved ${count===1?'question':'questions'}`);
+    parts.push(config.checks.includes('load')?'Individual pass, then Load test traffic':config.checks.includes('capacity')?'Shared Capacity traffic':'Individual pass, then repeated pass');
+  }
+  else if(check.id==='correctness'){
+    const row=correctnessPlan(config)?.rows?.find(row=>row.id==='correctness');
+    parts.push(row?.requests_per_target!=null?`${number(row.requests_per_target)} requests`:`At least ${optionValue(config,check,'samples')} requests`);
+    parts.push(`Up to ${optionValue(config,check,'concurrency')} in progress`);
   }
   else if(['arrivals','prefix','sessions','consistency'].includes(check.id)){
     const profile={...profileDefaults(check.id,config),...config[check.id]};
@@ -1613,6 +1650,13 @@ function checkSettingValue(name,value) {
   return `${value}${unit?' '+unit:''}`;
 }
 function checkFieldHelp(check,name,kind='option') {
+  if(check.id==='correctness')return {
+    samples:'Repeat the built-in questions until at least this many requests have run. All three questions are covered.',
+    concurrency:'Start another request whenever one finishes.',
+    request_timeout_seconds:'Time allowed for each request, starting when it is sent.',
+    max_output_tokens:'Maximum generated tokens per request.',
+    min_correctness:'Minimum percentage of scored answers that must pass. Missing scores can make the result inconclusive.',
+  }[name];
   if(check.id==='serving')return {
     samples:'Number of additional short requests, sent one at a time. Excludes the initial request.',
     max_output_tokens:'Maximum generated tokens per request.',
@@ -1645,6 +1689,7 @@ function checkFieldHint(check,config,name,kind='option',showValue=false) {
   const defaultValue=kind==='limit'?(Object.hasOwn(config.limits || {},name)?config.limits[name]:check.defaults.limits[name]):optionDefault(config,check,name);
   const value=kind==='limit'?limitValue(config,check,name):optionValue(config,check,name);
   const origin=(kind==='limit'&&Object.hasOwn(config.limits || {},name))||config[name]!=null?'run default':'check default';
+  if(check.id==='correctness')return `${overridden?'Custom':`Using ${name==='concurrency'&&config.default_concurrency!=null?'run default':origin}`}: ${checkSettingValue(name,value)}`;
   const optionalTarget=kind==='limit'&&state.bootstrap.limits_schema.properties[name]?.anyOf?.some(item=>item.type==='null');
   if(value==null&&optionalTarget)return overridden&&defaultValue!=null?`Measure only · ${origin}: ${checkSettingValue(name,defaultValue)}`:'Measure only';
   if(overridden)return `Custom · ${origin}: ${checkSettingValue(name,defaultValue)}`;
@@ -1689,6 +1734,28 @@ function updateCheckFieldHints(config) {
     }
   }
   for(const reset of $$('[data-reset-test]'))reset.hidden=reset.dataset.resetTest!=='load'&&!Object.keys(config.test_options?.[reset.dataset.resetTest] || {}).length;
+  for(const reset of $$('[data-reset-check-setting]')){
+    const options=config.test_options?.[reset.dataset.resetCheckId] || {},saved=reset.dataset.resetCheckKind==='limit'?(options.limits || {}):options;
+    reset.hidden=!Object.hasOwn(saved,reset.dataset.resetCheckSetting);
+  }
+}
+function checkSettingReset(check,config,name,kind='option') {
+  if(check.id!=='correctness')return '';
+  const options=config.test_options?.[check.id] || {},saved=kind==='limit'?(options.limits || {}):options;
+  return `<button type="button" class="text-button small" data-reset-check-setting="${name}" data-reset-check-id="${check.id}" data-reset-check-kind="${kind}" aria-label="Reset ${escape(human(name))} to default" ${Object.hasOwn(saved,name)?'':'hidden'}>Reset to default</button>`;
+}
+function resetCheckSetting(button) {
+  assertAppliedConfig();captureFormDraft();
+  const id=button.dataset.resetCheckId,name=button.dataset.resetCheckSetting,kind=button.dataset.resetCheckKind,check=state.bootstrap.checks.find(check=>check.id===id);
+  const options=state.config.test_options?.[id],saved=kind==='limit'?options?.limits:options;
+  if(saved)delete saved[name];
+  if(options?.limits&&!Object.keys(options.limits).length)delete options.limits;
+  if(options&&!Object.keys(options).length)delete state.config.test_options[id];
+  const form=$('#new-run-form'),input=form.elements[`test_${id}_${kind==='limit'?'limit_':''}${name}`];
+  input.value=kind==='limit'?limitValue(state.config,check,name)*(['min_correctness','max_error_rate'].includes(name)?100:1):optionDefault(state.config,check,name);
+  input.dataset.inherited='true';
+  form.elements[`test_mode_${id}`].value=Object.keys(state.config.test_options?.[id] || {}).length?'custom':'default';
+  configChanged();syncTestControls();updateBounds();scheduleRequestPlan();
 }
 function markCheckHint(markup,check,name,kind) {
   return markup.replace('class="hint" id=',`class="hint" data-check-field-hint data-check-id="${check.id}" data-setting-name="${name}" data-setting-kind="${kind}" id=`);
@@ -1701,10 +1768,11 @@ function renderTestCard(check,config) {
   const optionLabels={samples:'Sample requests',concurrency:'Concurrent requests',context_limit:'Context length (tokens)',max_output_tokens:'Output cap (tokens)',request_timeout_seconds:'Request timeout (seconds)',sustained_seconds:'Load duration (seconds)',metrics_max_age_seconds:'Metric freshness (seconds)',backend_verification:'Verify server cancellation',server_log:'Server log path',trace_file:'Trace file path',cancel_after_ms:'Cancel after (ms)',deadline_probe_ms:'Probe deadline (ms)',cancel_after_chunks:'Chunks before cancellation',cleanup_seconds:'Cleanup wait (seconds)',trace_wait_seconds:'Trace wait (seconds)'};
   const advancedOptions=new Set(['backend_verification','server_log','trace_file','cancel_after_chunks','cleanup_seconds','trace_wait_seconds']);
   const runOptions=new Set();
-  const option=name=>{let markup=schemaField(`test_${check.id}_${name}`,optionValue(config,check,name),state.bootstrap.option_schema.properties[name],{label:check.id==='correctness'&&name==='samples'?'Minimum questions':optionLabels[name] || human(name),helpKey:`test_${name}`,help:checkFieldHelp(check,name),hint:checkFieldHint(check,config,name),placeholder:'Use default',includeLimitHelp:check.id!=='serving'});if(check.id==='first_output'&&config.checks.includes('serving')&&config.test_options?.serving?.[name]!=null)markup=markup.replace('autocomplete="off"','autocomplete="off" readonly');return markCheckHint(markup,check,name,'option');};
+  const correctnessLabels={samples:'Minimum requests',concurrency:'Maximum requests in progress',request_timeout_seconds:'Timeout per request (seconds)',max_output_tokens:'Output token limit'};
+  const option=name=>{let markup=schemaField(`test_${check.id}_${name}`,optionValue(config,check,name),state.bootstrap.option_schema.properties[name],{label:check.id==='correctness'?correctnessLabels[name]:optionLabels[name] || human(name),helpKey:`test_${name}`,help:checkFieldHelp(check,name),hint:checkFieldHint(check,config,name),placeholder:'Use default',includeLimitHelp:!['serving','correctness'].includes(check.id),hintAction:checkSettingReset(check,config,name)});if(check.id==='first_output'&&config.checks.includes('serving')&&config.test_options?.serving?.[name]!=null)markup=markup.replace('autocomplete="off"','autocomplete="off" readonly');return markCheckHint(markup,check,name,'option');};
   const limitLabels={first_output_ms:'First answer (ms)',latency_ms:'Completion limit (ms)',stream_gap_ms:'Stream pause (ms)',min_output_tokens_per_second:'Minimum rate (tok/s)',fairness_max_ratio:'Maximum slowdown (ratio)',max_error_rate:'Errors allowed (%)',min_correctness:'Correct answers (%)',min_samples:'Minimum usable answers'};
   const primaryLimits=new Set(['first_output_ms','latency_ms','min_correctness','max_error_rate','fairness_max_ratio','min_samples']);
-  const limit=name=>markCheckHint(['min_correctness','max_error_rate'].includes(name)?field(`test_${check.id}_limit_${name}`,limitLabels[name],limitValue(config,check,name)*100,{type:'number',step:'any',required:true,helpKey:`limit_${name}`,help:checkFieldHelp(check,name,'limit'),hint:checkFieldHint(check,config,name,'limit'),includeLimitHelp:check.id!=='serving'}):schemaField(`test_${check.id}_limit_${name}`,limitValue(config,check,name),state.bootstrap.limits_schema.properties[name],{label:limitLabels[name] || human(name),helpKey:`limit_${name}`,help:checkFieldHelp(check,name,'limit'),placeholder:'Measure only',hint:checkFieldHint(check,config,name,'limit')}),check,name,'limit');
+  const limit=name=>markCheckHint(['min_correctness','max_error_rate'].includes(name)?field(`test_${check.id}_limit_${name}`,check.id==='correctness'?'Required correct answers (%)':limitLabels[name],limitValue(config,check,name)*100,{type:'number',step:'any',required:true,helpKey:`limit_${name}`,help:checkFieldHelp(check,name,'limit'),hint:checkFieldHint(check,config,name,'limit'),includeLimitHelp:!['serving','correctness'].includes(check.id),hintAction:checkSettingReset(check,config,name,'limit')}):schemaField(`test_${check.id}_limit_${name}`,limitValue(config,check,name),state.bootstrap.limits_schema.properties[name],{label:limitLabels[name] || human(name),helpKey:`limit_${name}`,help:checkFieldHelp(check,name,'limit'),placeholder:'Measure only',hint:checkFieldHint(check,config,name,'limit')}),check,name,'limit');
   const inactive=()=>ownQuestions;
   const requestFields=check.option_fields.filter(name=>!inactive(name)&&!advancedOptions.has(name)&&!runOptions.has(name));
   const timeout=requestFields.includes('request_timeout_seconds')?option('request_timeout_seconds'):'';
@@ -1716,8 +1784,8 @@ function renderTestCard(check,config) {
   const moreCriteria=check.limit_fields.filter(name=>!primaryLimits.has(name)).map(limit).join('');
   const hostsQuestions=check.id===(config.checks.includes('correctness')?'correctness':config.checks.includes('load')?'load':null);
   const sharedQuestions=config.checks.includes('correctness')&&config.checks.includes('load');
-  const questionSource=hostsQuestions?`<div class="catalogue-question-source">${sharedQuestions?`<p class="hint question-source-scope">Also used by ${escape(catalogTitle('load'))}.</p>`:''}${renderRequestSource(config)}</div>`:'';
-  const inactiveControls=ownQuestions?`<p class="hint" id="field-request_pack_correctness" tabindex="-1" data-pack-request-settings>Each saved case owns its output cap and request options. Request timeout: ${elapsed(config.request_timeout_seconds)}. Concurrency: ${effectiveParallelism(config)} (default). Per-check request-setting overrides are unavailable. Per-check pass criteria remain supported.</p><span class="field-error" id="field-request_pack_correctness-error" hidden></span><span class="hint field-warning" id="field-request_pack_correctness-warning" hidden></span>`:'';
+  const questionSource=hostsQuestions?`<div class="catalogue-question-source">${sharedQuestions?`<p class="hint question-source-scope">${config.request_source==='request_pack'?'These questions and answer checks are shared with Load test.':'Load test uses this question source too.'}</p>`:''}${renderRequestSource(config)}</div>`:'';
+  const inactiveControls=ownQuestions?`<div id="field-request_pack_correctness" tabindex="-1" data-pack-request-settings data-correctness-execution>${renderCorrectnessExecution(config)}</div><span class="field-error" id="field-request_pack_correctness-error" hidden></span><span class="hint field-warning" id="field-request_pack_correctness-warning" hidden></span>`:'';
   return `<section class="test-card catalogue-row" data-test-card="${check.id}" data-category="${checkGroups.find(group=>group.checks.includes(check.id))?.id || ''}" data-search="${escape(`${guide.name} ${guide.purpose} ${check.title} ${check.id}`.toLowerCase())}">
   <div class="test-card-heading"><div class="test-row-copy"><div class="test-selection-line"><label class="test-selection"><input type="checkbox" name="check" value="${check.id}" ${selected?'checked':''}><span>${escape(guide.name)}</span></label>${renderCheckInfo(check,config)}</div><p class="test-description">${escape(guide.purpose)}</p><p class="hint" data-load-card-summary>${escape(effectiveCheckSummary(check,config))}</p></div><div class="test-row-actions"><button type="button" class="button small configure-test" data-configure-test="${check.id}" aria-label="Settings for ${escape(guide.name)}" aria-expanded="false" aria-controls="settings-${check.id}"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 6h7M15 6h1M4 14h1M9 14h7"/><circle cx="13" cy="6" r="2"/><circle cx="7" cy="14" r="2"/></svg>Settings</button></div></div>
   <p class="hint check-row-warning" data-check-override-warning="${check.id}" ${warningsVisible&&checkOverrideWarning(check,config)?'':'hidden'}>${escape(checkOverrideWarning(check,config,true))}</p>
@@ -1728,6 +1796,7 @@ function renderTestCard(check,config) {
   <p class="hint draft-notice" ${selected?'hidden':''}>Saved draft · select this check to run it.</p>
   ${guide.needs?`<p class="check-prerequisite"><strong>Needs:</strong> ${escape(guide.needs)}.</p>`:''}${check.id==='gpu'?'<p class="hint">Metrics are collected automatically. Add exporter addresses in Connection settings.</p>':''}
   ${check.id==='serving'?`<p class="hint">Leave blank to use the shown default. Enter a value to override it.</p><p class="hint" data-serving-shared-settings ${config.checks.includes('first_output')?'':'hidden'}>These requests and their settings are also used by First answer.</p>`:''}
+  ${check.id==='correctness'&&!ownQuestions?'<p class="hint">Leave blank to use the shown default. Enter a value to override it.</p>':''}
   ${timeout?`<fieldset class="fields check-request-fields" data-test-settings="${check.id}">${timeout}</fieldset>`:''}
   ${check.id==='load'?'':questionSource}
   <div class="test-settings${requestFields.length===1&&criteriaFields.length===1?' simple-primary-settings':''}" data-test-settings="${check.id}">
@@ -2390,7 +2459,7 @@ function syncPackControls() {
 function renderJudging(config) {
   if(config.request_source!=='request_pack'||!config.request_pack?.cases.some(item=>item.scorer==='judge'))return '';
   const settings={...state.bootstrap.judging.defaults,...config.judging};
-  return `<div class="judging-editor"><div class="test-editor-heading"><h3>AI evaluator</h3><button type="button" class="text-button" data-action="add-judge" ${settings.judges.length>=state.bootstrap.limits['judging.judges'].maxItems?'disabled':''}>Add evaluator</button></div><p class="hint">An AI model compares each answer with your expected answer and accepts correct paraphrases.</p><input type="hidden" name="judge_count" value="${settings.judges.length}">${settings.judges.map((judge,index)=>`<fieldset class="judge-row"><legend>Evaluator ${index+1}</legend><div class="fields">${field(`judge_${index}_model`,'Model',judge.model)}${field(`judge_${index}_url`,'Endpoint URL',judge.url,{type:'url',full:true,placeholder:'http://localhost:9000/v1'})}</div><details class="evaluator-options"><summary>Credentials & evaluator name</summary><div class="fields">${field(`judge_${index}_name`,'Name',judge.name)}${field(`judge_${index}_api_key_env`,'API key environment variable (optional)',judge.api_key_env,{full:true,placeholder:'JUDGE_API_KEY'})}</div></details><button type="button" class="text-button" data-action="remove-judge" data-judge-index="${index}" aria-label="Remove evaluator ${index+1}">Remove</button></fieldset>`).join('')}<details class="judge-limits"><summary>Evaluation limits</summary><div class="fields">${field('judging_concurrency','Evaluator concurrency',settings.concurrency,{type:'number',step:1})}${field('judging_request_timeout_seconds','Evaluator timeout (seconds)',settings.request_timeout_seconds,{type:'number',step:'any'})}${field('judging_max_duration_seconds','Evaluation duration (seconds)',settings.max_duration_seconds,{type:'number',step:'any'})}${field('judging_max_output_tokens','Evaluator cap (tokens)',settings.max_output_tokens,{type:'number',step:1})}</div><p class="hint">More connection and authentication settings are available in JSON.</p></details><p class="hint judge-disclosure">Questions, expected answers and model answers are sent to your configured evaluators. With several evaluators, more than half must agree. A tie or missing vote leaves the result inconclusive.</p></div>`;
+  return `<div class="judging-editor"><div class="test-editor-heading"><h3>AI evaluator</h3><button type="button" class="text-button" data-action="add-judge" ${settings.judges.length>=state.bootstrap.limits['judging.judges'].maxItems?'disabled':''}>Add evaluator</button></div><p class="hint">An AI model compares each answer with your expected answer and accepts correct paraphrases.</p><input type="hidden" name="judge_count" value="${settings.judges.length}">${settings.judges.map((judge,index)=>`<fieldset class="judge-row"><legend>Evaluator ${index+1}</legend><div class="fields">${field(`judge_${index}_model`,'Evaluator model',judge.model)}${field(`judge_${index}_url`,'Evaluator endpoint URL',judge.url,{type:'url',full:true,placeholder:'http://localhost:9000/v1'})}</div><details class="evaluator-options"><summary>Credentials & evaluator name</summary><div class="fields">${field(`judge_${index}_name`,'Name',judge.name)}${field(`judge_${index}_api_key_env`,'API key environment variable (optional)',judge.api_key_env,{full:true,placeholder:'JUDGE_API_KEY'})}</div></details><button type="button" class="text-button" data-action="remove-judge" data-judge-index="${index}" aria-label="Remove evaluator ${index+1}">Remove</button></fieldset>`).join('')}<details class="judge-limits"><summary>Evaluation limits</summary><div class="fields">${field('judging_concurrency','Evaluator requests in progress',settings.concurrency,{type:'number',step:1,includeLimitHelp:false})}${field('judging_request_timeout_seconds','Timeout per evaluator response (seconds)',settings.request_timeout_seconds,{type:'number',step:'any',includeLimitHelp:false})}${field('judging_max_duration_seconds','Total evaluation duration (seconds)',settings.max_duration_seconds,{type:'number',step:'any',includeLimitHelp:false})}${field('judging_max_output_tokens','Evaluator output token limit',settings.max_output_tokens,{type:'number',step:1,includeLimitHelp:false})}</div><p class="hint">More connection and authentication settings are available in JSON.</p></details><p class="hint judge-disclosure">Questions, expected answers and model answers are sent to your configured evaluators. With several evaluators, more than half must agree. A tie or missing vote leaves the result inconclusive.</p></div>`;
 }
 function changeJudge(action,index) {
   try {
@@ -2425,9 +2494,13 @@ function renderAnswerChecks(config) {
   const cases=config.request_pack?.cases || [],selected=selectedDatasetCases(),judged=cases.filter(item=>item.scorer==='judge');
   return `<section class="answer-checks">${selected.length?`<div class="dataset-bulk">${selectField('dataset_bulk_scorer',`Answer check for ${number(selected.length)} selected ${selected.length===1?'question':'questions'}`,'<option value="judge">AI evaluator · accepts correct paraphrases</option><option value="exact">Exact match</option><option value="contains">Contains text</option><option value="none">No answer check · removes expected answers</option>',{controlId:'dataset-bulk-scorer'})}<button type="button" class="button small" data-action="apply-answer-check">Apply to selected</button></div>`:''}${judged.length?`<div class="evaluator-status" id="evaluator-status"><p>${judgesReady(config)?'AI evaluator ready.':`${number(judged.length)} ${judged.length===1?'question needs':'questions need'} an AI evaluator.`}</p><button type="button" class="text-button" data-action="configure-evaluator">${judgesReady(config)?'Edit evaluator':'Configure evaluator'}</button></div><details class="judge-configuration" ${state.judgeEditorOpen?'open':''}><summary>AI evaluator settings</summary>${renderJudging(config)}</details>`:''}</section>`;
 }
+function renderBuiltinQuestions(config) {
+  const questions=state.bootstrap.builtin_questions || (state.bootstrap.builtin_question_example?[state.bootstrap.builtin_question_example]:[]);
+  return `<p><strong>${questions.length} built-in questions</strong></p><p class="hint">Requests repeat these questions; they do not create new questions.${config.custom_fixtures?' Additional configured cases can increase the request count.':''}</p><details class="builtin-example"><summary>View questions and expected answers</summary><ol>${questions.map(item=>`<li><p>${escape(item.question)}</p><p><strong>Expected answer:</strong> <code>${escape(item.expected)}</code></p></li>`).join('')}</ol></details>`;
+}
 function renderRequestSource(config) {
   const pack=config.request_pack,custom=config.request_source==='request_pack',cases=pack?.cases || [];
-  return `<section class="setup-section" id="setup-dataset"><div class="setup-body"><div class="request-source"><fieldset class="dataset-source"><legend>Questions ${infoHelp('request_source','Questions','Use built-in known-answer examples, or add or import your own questions and expected answers. Each saved question runs once in Answer correctness. Sample count and requests-at-a-time settings are not used for that check with saved questions. Load test uses the same source when selected; other checks use generated requests. Switching sources keeps your saved questions. Try one question to inspect the answer before testing them all.')}</legend><label><input type="radio" name="request_source" value="builtin" ${custom?'':'checked'}><span>Built-in examples</span></label><label><input type="radio" name="request_source" value="request_pack" ${custom?'checked':''}><span>My questions</span></label></fieldset>${custom?`<input type="file" id="request-pack-file" accept=".csv,.json,text/csv,application/json" hidden><div class="pack-actions actions"><button type="button" class="button small" data-action="add-example">+ Add question</button><button type="button" class="button small" data-action="import-pack">Import CSV / JSON</button><button type="button" class="text-button" data-action="sample-dataset">Use sample questions</button></div>${cases.length?`<div class="dataset-table question-table"><table><thead><tr><th><input type="checkbox" id="dataset-select-all" aria-label="Select all examples" ${cases.every(item=>state.datasetSelection.includes(item.fixture_id))?'checked':''}></th><th>Question / expected answer</th><th>Answer check</th><th>Actions</th></tr></thead><tbody>${cases.map((item,index)=>`<tr><td><input type="checkbox" data-dataset-select="${escape(item.fixture_id)}" aria-label="Select ${escape(item.fixture_id)}" ${state.datasetSelection.includes(item.fixture_id)?'checked':''}></td><td><strong>${escape(item.fixture_id)}</strong><span class="dataset-excerpt">${escape(item.messages.map(message=>message.content).join(' / '))}</span><small class="dataset-excerpt">Expected: ${Object.hasOwn(item,'expected')?escape(typeof item.expected==='string'?item.expected:JSON.stringify(item.expected)):'Not set'}${item.messages.length>1?` · ${number(item.messages.length)} messages`:''}</small></td><td>${answerChecks[item.scorer]}${item.scorer==='judge'?`<small data-evaluator-needed ${judgesReady(config)?'hidden':''}>Needs evaluator</small>`:''}</td><td><div class="dataset-row-actions"><button type="button" class="text-button" data-action="try-example" data-case-index="${index}" aria-label="Try ${escape(item.fixture_id)}">Try one</button><button type="button" class="text-button" data-action="edit-example" data-case-index="${index}" aria-label="Edit ${escape(item.fixture_id)}">Edit</button><button type="button" class="text-button" data-action="remove-example" data-case-index="${index}" aria-label="Remove ${escape(item.fixture_id)}">Remove</button></div></td></tr>`).join('')}</tbody></table></div><p class="hint dataset-count">${number(cases.length)} questions</p>`:'<div class="dataset-empty"><h3>Add your first question</h3><p class="hint">Enter a question and its expected answer, or use the sample questions to get started.</p></div>'}`:` ${state.bootstrap.builtin_question_example?`<details class="builtin-example"><summary>View an example</summary><p>${escape(state.bootstrap.builtin_question_example.question)}</p><p><strong>Expected answer:</strong> <code>${escape(state.bootstrap.builtin_question_example.expected)}</code></p><p class="hint">Exact match after whitespace normalization; extra explanation does not match.</p></details>`:''}`}</div>${renderAnswerChecks(config)}${custom&&cases.length?`<details class="setup-disclosure dataset-advanced"><summary>Advanced dataset settings</summary><p class="hint">${inputRetentionNotice}</p><div id="request-pack-preview"></div></details>`:''}</div></section>`;
+  return `<section class="setup-section" id="setup-dataset"><div class="setup-body"><div class="request-source"><fieldset class="dataset-source"><legend>Questions ${infoHelp('request_source','Questions','Choose built-in questions or add your own questions and expected answers. Switching sources keeps your saved questions. Load test uses the same question source when selected.')}</legend><label><input type="radio" name="request_source" value="builtin" ${custom?'':'checked'}><span>Built-in examples</span></label><label><input type="radio" name="request_source" value="request_pack" ${custom?'checked':''}><span>My questions</span></label></fieldset>${custom?`<input type="file" id="request-pack-file" accept=".csv,.json,text/csv,application/json" hidden><div class="pack-actions actions"><button type="button" class="button small" data-action="add-example">+ Add question</button><button type="button" class="button small" data-action="import-pack">Import CSV / JSON</button><button type="button" class="text-button" data-action="sample-dataset">Use sample questions</button></div>${renderDatasetImportHelp(config)}${cases.length?`<div class="dataset-table question-table"><table><thead><tr><th><input type="checkbox" id="dataset-select-all" aria-label="Select all examples" ${cases.every(item=>state.datasetSelection.includes(item.fixture_id))?'checked':''}></th><th>Question / expected answer</th><th>Answer check</th><th>Actions</th></tr></thead><tbody>${cases.map((item,index)=>`<tr><td><input type="checkbox" data-dataset-select="${escape(item.fixture_id)}" aria-label="Select ${escape(item.fixture_id)}" ${state.datasetSelection.includes(item.fixture_id)?'checked':''}></td><td><strong>${escape(item.fixture_id)}</strong><span class="dataset-excerpt">${escape(item.messages.map(message=>message.content).join(' / '))}</span><small class="dataset-excerpt">Expected: ${Object.hasOwn(item,'expected')?escape(typeof item.expected==='string'?item.expected:JSON.stringify(item.expected)):'Not set'}${item.messages.length>1?` · ${number(item.messages.length)} messages`:''}</small></td><td>${answerChecks[item.scorer]}${item.scorer==='judge'?`<small data-evaluator-needed ${judgesReady(config)?'hidden':''}>Needs evaluator</small>`:''}</td><td><div class="dataset-row-actions"><button type="button" class="text-button" data-action="try-example" data-case-index="${index}" aria-label="Try ${escape(item.fixture_id)}">Try one</button><button type="button" class="text-button" data-action="edit-example" data-case-index="${index}" aria-label="Edit ${escape(item.fixture_id)}">Edit</button><button type="button" class="text-button" data-action="remove-example" data-case-index="${index}" aria-label="Remove ${escape(item.fixture_id)}">Remove</button></div></td></tr>`).join('')}</tbody></table></div><p class="hint dataset-count">${number(cases.length)} questions</p>`:'<div class="dataset-empty"><h3>Add your first question</h3><p class="hint">Enter a question and its expected answer, or use the sample questions to get started.</p></div>'}`:`${renderBuiltinQuestions(config)}`}</div>${renderAnswerChecks(config)}${custom&&cases.length?`<details class="setup-disclosure dataset-advanced"><summary>Advanced dataset settings</summary><p class="hint">${inputRetentionNotice}</p><div id="request-pack-preview"></div></details>`:''}</div></section>`;
 }
 function datasetDialog(title,body,footer='') {
   const dialog=$('#dataset-dialog');
@@ -2453,8 +2526,18 @@ async function applyDataset(pack,{guard=()=>true,clearSelection=false}={}) {
 }
 function exampleEditorValues(){return new FormData($('#dataset-example-form'));}
 function readExampleMessages(){const values=exampleEditorValues();return Array.from({length:Number(values.get('message_count'))},(_,index)=>({role:values.get(`message_${index}_role`),content:String(values.get(`message_${index}_content`) || '')}));}
+function exampleScorerHint(scorer) {
+  return ({
+    exact:'Exact match: Capitalization and punctuation must match. Extra whitespace is ignored.',
+    contains:'Contains text: The expected text must appear with matching capitalization and word or numeric boundaries. This does not check the whole answer.',
+    json:'JSON check: The answer must match the schema and, when provided, the expected JSON value.',
+    judge:'AI evaluator: Configure an evaluator model and endpoint. It checks whether the answer matches the expected meaning.',
+    none:'No answer check: The answer remains unscored and can leave correctness inconclusive.',
+  })[scorer] || '';
+}
 function renderExampleMessages(messages) {
-  return `<input type="hidden" name="message_count" value="${messages.length}">${messages.map((message,index)=>`<div class="example-message">${textField(`message_${index}_content`,messages.length===1&&message.role==='user'?'Question':'Message '+(index+1),message.content,{rows:3})}<details class="message-options" ${messages.length>1?'open':''}><summary>Message options</summary><div class="message-controls">${selectField(`message_${index}_role`,'Role',['system','user','assistant'].map(role=>`<option value="${role}" ${message.role===role?'selected':''}>${human(role)}</option>`).join(''))}<button type="button" class="text-button" data-action="remove-message" data-message-index="${index}" ${messages.length===1?'disabled':''}>Remove message</button></div></details></div>`).join('')}`;
+  const speakers={system:'Application instructions',user:'User message',assistant:'Saved model reply'};
+  return `<input type="hidden" name="message_count" value="${messages.length}">${messages.map((message,index)=>`<div class="example-message">${textField(`message_${index}_content`,messages.length===1&&message.role==='user'?'Question':'Message '+(index+1),message.content,{rows:3})}<details class="message-options" ${messages.length>1?'open':''}><summary>Message options</summary><div class="message-controls">${selectField(`message_${index}_role`,'Message speaker',Object.entries(speakers).map(([role,label])=>`<option value="${role}" ${message.role===role?'selected':''}>${label}</option>`).join(''))}<button type="button" class="text-button" data-action="remove-message" data-message-index="${index}" ${messages.length===1?'disabled':''}>Remove message</button></div></details></div>`).join('')}`;
 }
 function openExampleEditor(index=null) {
   try{
@@ -2463,7 +2546,7 @@ function openExampleEditor(index=null) {
     let suffix=1;while(datasetCases().some(item=>item.fixture_id===`example-${suffix}`))suffix++;
     const item=clone(previous || {fixture_id:`example-${suffix}`,messages:[{role:'user',content:''}],scorer:'judge',expected:'',weight:1,options:{},max_tokens:null});
     state.datasetEditor={index,item,expectedFormat:item.scorer==='json'?'json':'text',scorer:item.scorer,revision:state.configRevision,route:state.routeVersion};
-    datasetDialog(previous?'Edit question':'Add question',`<form id="dataset-example-form"><div class="dialog-body"><div id="example-messages">${renderExampleMessages(item.messages)}</div><button type="button" class="text-button" data-action="add-message">Add conversation message</button><div class="example-check">${selectField('example_scorer','Answer check',Object.entries(answerChecks).map(([key,label])=>`<option value="${key}" ${item.scorer===key?'selected':''}>${label}</option>`).join(''))}</div>${textField('example_expected','Expected answer',Object.hasOwn(item,'expected')?(item.scorer==='json'?JSON.stringify(item.expected,null,2):item.expected):'',{wrapperId:'example-expected-label',hintId:'example-expected-hint',hint:'The answer you want the model to give.'})}${textField('example_schema','JSON schema',JSON.stringify(item.schema || {},null,2),{wrapperId:'example-schema-label'})}<details class="example-advanced"><summary>Advanced question settings</summary>${textField('example_rubric','Evaluator instructions (optional)',item.rubric,{rows:2,wrapperId:'example-rubric-label'})}<div class="fields">${field('example_id','Question ID',item.fixture_id,{full:true})}${field('example_weight','Traffic weight',item.weight,{type:'number',step:'any'})}${field('example_max_tokens','Output cap (optional)',item.max_tokens,{type:'number',step:1})}</div>${textField('example_options','Extra request options · JSON',JSON.stringify(item.options || {},null,2))}</details><div id="dataset-error" class="error-message" role="alert" hidden></div></div><div class="dialog-footer"><button type="button" class="button" data-action="close-dataset">Cancel</button><button type="submit" class="button primary">Save question</button></div></form>`);
+    datasetDialog(previous?'Edit question':'Add question',`<form id="dataset-example-form"><div class="dialog-body"><p class="hint">These messages form one saved conversation. Giraffe checks the model’s next reply.</p><div id="example-messages">${renderExampleMessages(item.messages)}</div><button type="button" class="text-button" data-action="add-message">Add message to this conversation</button><div class="example-check">${selectField('example_scorer','Answer check',Object.entries(answerChecks).map(([key,label])=>`<option value="${key}" ${item.scorer===key?'selected':''}>${label}</option>`).join(''),{hint:exampleScorerHint(item.scorer)})}</div>${textField('example_expected','Expected answer',Object.hasOwn(item,'expected')?(item.scorer==='json'?JSON.stringify(item.expected,null,2):item.expected):'',{wrapperId:'example-expected-label',hintId:'example-expected-hint',hint:'Enter the reference answer.'})}${textField('example_schema','JSON schema',JSON.stringify(item.schema || {},null,2),{wrapperId:'example-schema-label'})}<details class="example-advanced"><summary>Advanced question settings</summary>${textField('example_rubric','Evaluator instructions (optional)',item.rubric,{rows:2,wrapperId:'example-rubric-label'})}<div class="fields">${field('example_id','Test name',item.fixture_id,{full:true})}${field('example_weight','Relative frequency in Load test',item.weight,{type:'number',step:'any',includeLimitHelp:false})}${field('example_max_tokens','Output token limit (optional)',item.max_tokens,{type:'number',step:1,includeLimitHelp:false})}</div>${textField('example_options','Extra request options · JSON',JSON.stringify(item.options || {},null,2))}</details><div id="dataset-error" class="error-message" role="alert" hidden></div></div><div class="dialog-footer"><button type="button" class="button" data-action="close-dataset">Cancel</button><button type="submit" class="button primary">Save question</button></div></form>`);
     syncExampleScorer();$('#dataset-example-form').elements.message_0_content.focus();
   }catch(error){configError(error);}
 }
@@ -2479,7 +2562,8 @@ function syncExampleScorer(){
   }
   if(editor)editor.scorer=scorer;
   $('#example-expected-label').hidden=scorer==='none';$('#example-rubric-label').hidden=scorer!=='judge';$('#example-schema-label').hidden=scorer!=='json';
-  $('#example-expected-hint').textContent=({json:'Enter a JSON value. Leave blank to check only the schema. Use null for a null answer. One complete Markdown code fence is accepted; surrounding prose is rejected.',judge:'Accepts answers with the same meaning.',exact:'Wording, capitalization and punctuation must match. Extra spaces and line breaks are ignored.',contains:'The answer must include this text. Capitalization matters.'})[scorer] || '';
+  const hint=$('#field-example_scorer-hint');if(hint)hint.textContent=exampleScorerHint(scorer);
+  $('#example-expected-hint').textContent=scorer==='json'?'Enter a JSON value. Leave blank to check only the schema. Use null for a null answer. One complete Markdown code fence is accepted; surrounding prose is rejected.':'';
 }
 async function saveExample(event) {
   event.preventDefault();const editor=state.datasetEditor;if(!editor||state.configBusy)return;
@@ -2492,6 +2576,23 @@ async function saveExample(event) {
 }
 async function removeExample(index){try{const cases=clone(datasetCases());cases.splice(index,1);await applyDataset(cases.length?{version:1,cases}:null);}catch(error){configError(error);}}
 async function applyAnswerCheck(){try{const scorer=$('#dataset-bulk-scorer').value;const selected=new Set(state.datasetSelection);const cases=datasetCases().map(item=>selected.has(item.fixture_id)?changeDatasetScorer(item,scorer):clone(item));await applyDataset({version:1,cases});}catch(error){configError(error);}}
+function datasetImportSample(format) {
+  const rows=[{question:'What is 2 + 2? Reply with only the number.',answer:'4'},{question:'What is the capital of France? Reply with only the city name.',answer:'Paris'}];
+  if(format==='json')return {name:'giraffe-sample-questions.json',type:'application/json',text:JSON.stringify(rows,null,2)+'\n'};
+  if(format==='csv')return {name:'giraffe-sample-questions.csv',type:'text/csv',text:'question,answer\n'+rows.map(row=>[row.question,row.answer].map(value=>'"'+value.replaceAll('"','""')+'"').join(',')).join('\n')+'\n'};
+  return null;
+}
+function datasetConversationExample() {
+  return {version:1,cases:[{fixture_id:'return-window',messages:[{role:'system',content:'Answer questions about the saved store policy.'},{role:'user',content:'The store accepts returns within 30 days.'},{role:'assistant',content:'I will use that return policy.'},{role:'user',content:'How many days is the return window? Reply with only the number.'}],scorer:'exact',expected:'30',weight:1}]};
+}
+function renderDatasetImportHelp() {
+  return `<div class="dataset-import-help"><p class="hint">One question and expected answer per row. Choose their columns after uploading.</p><p class="hint">Limit: 1 MiB / 1,000 questions.</p><div class="actions"><button type="button" class="text-button" data-action="download-dataset-sample" data-format="csv">Download sample CSV</button><button type="button" class="text-button" data-action="download-dataset-sample" data-format="json">Download sample JSON</button></div><details class="dataset-format-example"><summary>View format example</summary><h4>CSV</h4><pre>${escape(datasetImportSample('csv').text)}</pre><h4>JSON rows</h4><pre>${escape(datasetImportSample('json').text)}</pre></details><details class="dataset-format-advanced"><summary>Advanced JSON format</summary><p class="hint">Use a request pack for saved conversations and individual answer checks. Each case contains the messages sent before the model’s next reply.</p><pre>${escape(JSON.stringify(datasetConversationExample(),null,2))}</pre></details></div>`;
+}
+function downloadDatasetSample(format) {
+  const sample=datasetImportSample(format);if(!sample)return;
+  const url=URL.createObjectURL(new Blob([sample.text],{type:sample.type})),link=document.createElement('a');
+  link.href=url;link.download=sample.name;link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
+}
 function importMappingValues(){const form=$('#dataset-import-form');return {input_field:form?.elements.input_field?.value || null,expected_field:form?.elements.expected_field?.value || null,scorer:form?.elements.import_scorer?.value || 'judge'};}
 function renderDatasetImportTable(preview) {
   const cases=preview?.request_pack?.cases.slice(0,5);
@@ -2503,7 +2604,8 @@ function renderDatasetImport() {
   const draft=state.datasetImport;if(!draft)return;const preview=draft.preview,columns=preview?.columns || [],mapping=draft.mapping || {};
   const options=value=>'<option value="">Choose a column</option>'+columns.map(column=>`<option value="${escape(column)}" ${value===column?'selected':''}>${escape(column)}</option>`).join('');
   const errors=(preview?.errors || []).map(error=>`<li>${error.row!=null?`Row ${number(error.row)} · `:''}${escape(error.field)}: ${escape(error.message)}</li>`).join('');
-  datasetDialog('Import dataset',`<form id="dataset-import-form"><div class="dialog-body"><p class="hint">${escape(draft.name)} · up to 1 MiB / 1,000 questions. Review the preview, then choose Use dataset to import.</p>${draft.loading?'<p role="status">Reading dataset…</p>':''}${columns.length?`<div class="fields dataset-mapping">${selectField('input_field','Question column',options(mapping.input_field))}${selectField('expected_field','Expected answer column',options(mapping.expected_field))}${selectField('import_scorer','Answer check',`<option value="judge" ${mapping.scorer!=='exact'?'selected':''}>AI evaluator</option><option value="exact" ${mapping.scorer==='exact'?'selected':''}>Exact match</option>`)}</div><button type="button" class="button small" data-action="preview-dataset-mapping" ${draft.loading?'disabled':''}>Preview mapping</button><p class="hint">Choose the question and answer columns, then check the preview.</p>`:''}${errors?`<div class="notice error"><ul>${errors}</ul></div>`:''}${draft.mappingDirty?'<p class="hint">Columns changed. Check the preview again before importing.</p>':''}${preview?.request_pack&&!draft.mappingDirty?`<p class="pack-summary">${number(preview.request_pack.cases.length)} examples ready to import.</p>`:''}${preview?.preview_rows?.length?`<details class="dataset-import-preview" open><summary>Preview · first ${number(preview.preview_rows.length)} rows</summary>${renderDatasetImportTable(preview)}</details>`:''}<div id="dataset-error" class="error-message" role="alert" ${draft.error?'':'hidden'}>${escape(draft.error || '')}</div></div><div class="dialog-footer"><button type="button" class="button" data-action="close-dataset">Cancel</button><button type="submit" class="button primary" ${!preview?.request_pack||draft.loading||draft.mappingDirty?'disabled':''}>Use dataset</button></div></form>`);
+  const count=preview?.request_pack?.cases.length;
+  datasetDialog('Import questions',`<form id="dataset-import-form"><div class="dialog-body"><p class="hint">${escape(draft.name)} · up to 1 MiB / 1,000 questions. Review the preview before replacing your current questions.</p>${draft.loading?'<p role="status">Reading dataset…</p>':''}${columns.length?`<div class="fields dataset-mapping">${selectField('input_field','Question column',options(mapping.input_field))}${selectField('expected_field','Expected answer column',options(mapping.expected_field))}${selectField('import_scorer','Answer check',`<option value="judge" ${mapping.scorer!=='exact'?'selected':''}>AI evaluator</option><option value="exact" ${mapping.scorer==='exact'?'selected':''}>Exact match</option>`,{hint:exampleScorerHint(mapping.scorer==='exact'?'exact':'judge')})}</div><button type="button" class="button small" data-action="preview-dataset-mapping" ${draft.loading?'disabled':''}>Preview mapping</button><p class="hint">Choose the question and answer columns, then check the preview.</p>`:''}${errors?`<div class="notice error"><ul>${errors}</ul></div>`:''}${draft.mappingDirty?'<p class="hint">Columns changed. Check the preview again before importing.</p>':''}${preview?.request_pack&&!draft.mappingDirty?`<p class="pack-summary">${number(count)} questions ready to import.</p>`:''}${preview?.preview_rows?.length?`<details class="dataset-import-preview" open><summary>Preview · first ${number(preview.preview_rows.length)} rows</summary>${renderDatasetImportTable(preview)}</details>`:''}<div id="dataset-error" class="error-message" role="alert" ${draft.error?'':'hidden'}>${escape(draft.error || '')}</div></div><div class="dialog-footer"><button type="button" class="button" data-action="close-dataset">Cancel</button><button type="submit" class="button primary" ${!preview?.request_pack||draft.loading||draft.mappingDirty?'disabled':''}>${count==null?'Replace current questions':`Replace current questions with ${count===1?'this question':`these ${number(count)} questions`}`}</button></div></form>`);
 }
 async function previewDatasetMapping({initial=false}={}) {
   const draft=state.datasetImport;if(!draft)return;
@@ -2643,7 +2745,7 @@ function scheduleRequestPlan() {
 function renderRequestPreview() {
   syncInlineErrors();
   renderRequestPlan();
-  try{const config=readForm(true).config;syncLoadDisplay(config);}catch{}
+  try{const config=readForm(true).config;syncLoadDisplay(config);updateCorrectnessExecution(config);}catch{}
   const element=$('#request-pack-preview');if(!element)return;
   if(state.config?.request_source!=='request_pack'){element.innerHTML='';return;}
   const expanded=element.querySelector?.('.request-planning')?.open || false;
@@ -4580,6 +4682,8 @@ document.addEventListener('click',async(event)=>{
   if(closeTest){toggleTestEditor(closeTest,true);return;}
   const done=event.target.closest('[data-done-test]')?.dataset.doneTest;
   if(done){toggleTestEditor(done,true);return;}
+  const resetSetting=event.target.closest('[data-reset-check-setting]');
+  if(resetSetting){try{resetCheckSetting(resetSetting);}catch(error){configError(error);}return;}
   const reset=event.target.closest('[data-reset-test]')?.dataset.resetTest;
   if(reset==='multi_user'){captureFormDraft();delete state.config.multi_user;delete state.config.test_options?.multi_user;state.jsonDraft=null;state.jsonBase=null;configChanged();renderNew();return;}
   if(reset==='load'){captureFormDraft();replaceMigrationNotes();delete state.config.load_test;state.loadPanels={};delete state.config.test_options?.load;state.jsonDraft=null;state.jsonBase=null;configChanged();renderNew();return;}
@@ -4687,6 +4791,7 @@ document.addEventListener('click',async(event)=>{
   if(action==='discard-config')discardConfig();
   if(action==='import-config'){try{assertAppliedConfig();$('#config-file').click();}catch(error){configError(error);}}
   if(action==='import-pack'){try{assertAppliedConfig();$('#request-pack-file').click();}catch(error){configError(error);}}
+  if(action==='download-dataset-sample')downloadDatasetSample(event.target.closest('[data-format]')?.dataset.format);
   if(action==='remove-pack')changeRequestSource('builtin',{remove:true});
   const caseIndex=Number(event.target.closest('[data-case-index]')?.dataset.caseIndex);
   if(action==='add-example')openExampleEditor();

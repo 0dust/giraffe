@@ -170,12 +170,15 @@ def capabilities(config: RunConfig | None = None, *, restart_allowed: bool = Fal
     inherited = configured.model_copy(update={"test_options": {}})
     defaults = inherited.model_dump(mode="json")
     defaults.pop("targets")  # Targets are required inputs, never discovered credentials.
-    example = builtin_fixtures(configured.model_copy(update={"context_limit": 128}))["correctness"][0]
+    questions = builtin_fixtures(configured.model_copy(update={"context_limit": 128}))["correctness"]
+    example = questions[0]
     schema = RunConfig.model_json_schema()
     limits = configuration_limits(schema)
     return {
         "restart_allowed": restart_allowed,
         "builtin_question_example": {"question": example.messages[0]["content"], "expected": example.expected},
+        "builtin_questions": [{"fixture_id": spec.fixture_id, "question": spec.messages[0]["content"],
+                               "expected": spec.expected} for spec in questions],
         "kind": "capabilities", "schema_version": "1", "suite_version": SUITE_VERSION, "version": __version__,
         "validation_note": "The schema describes configuration. Validate checks semantic constraints; neither command contacts endpoints or verifies runtime availability.",
         "defaults": defaults, "config_schema": schema, "limits": limits,

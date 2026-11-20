@@ -303,7 +303,7 @@ async def test_cap_errors_share_field_help_values_and_api_cli_copy(tmp_path, cap
 def test_retained_cap_help_is_present_at_actual_rendered_fields():
     tree = Markup(rendered_form())
     paths = {
-        "concurrency": "concurrency", "test_correctness_concurrency": "test_options.correctness.concurrency",
+        "concurrency": "concurrency",
         "sessions_count": "sessions.sessions", "profile_sessions_concurrency": "sessions.concurrency",
         "profile_prefix_repeats": "prefix.repeats", "profile_consistency_repetitions": "consistency.repetitions",
         "profile_consistency_levels": "consistency.levels",
@@ -319,6 +319,12 @@ def test_retained_cap_help_is_present_at_actual_rendered_fields():
         node_id = f"field-{name}-help" if name.startswith('load_') else f"field-{name}-help-text"
         help_text, = [node for node in tree.nodes if node.get("id") == node_id]
         assert policies[path]["help"] in help_text["text"], (name, help_text["text"])
+    correctness_help, = [node for node in tree.nodes if node.get("id") == "field-test_correctness_concurrency-help-text"]
+    assert correctness_help["text"] == "Start another request whenever one finishes."
+    correctness_input, = tree.named("test_correctness_concurrency")
+    bounds = capabilities()["limits"]["test_options.correctness.concurrency"]
+    assert correctness_input["min"] == str(bounds["minimum"])
+    assert correctness_input["max"] == str(bounds["maximum"])
 
 
 @pytest.mark.parametrize("settings,path,name", [

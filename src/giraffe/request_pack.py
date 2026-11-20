@@ -48,11 +48,45 @@ def active_pack(config: RunConfig) -> bool:
 
 def pack_settings(config: RunConfig) -> dict[str, Any]:
     """Read-only request settings for the dataset correctness panel."""
+    cases = config.request_pack.cases if config.request_pack else []
+    active = "correctness" in config.checks and bool(cases)
+    consumer = "load" if "load" in config.checks else "capacity" if "capacity" in config.checks else "correctness"
+    effective = config.effective_check(consumer)
+    parallelism = config.inherited_concurrency(config.default_concurrency)
+    shared = consumer if active and consumer in {"load", "capacity"} else None
+
+    def source(field):
+        if consumer == "load" and field == "request_timeout_seconds":
+            return "load_test.request_timeout_seconds"
+        options = config.test_options.get(consumer)
+        return (f"test_options.{consumer}.{field}" if field in effective and options
+                and getattr(options, field, None) is not None else field)
+
+    output_source = source("max_output_tokens")
+    output_limit = effective.get("max_output_tokens", config.max_output_tokens)
+    execution = {
+        "active": active,
+        "quiet_requests": len(cases) if active and "capacity" not in config.checks else 0,
+        "quiet_concurrency": 1,
+        "repeated_requests": (None if shared else max(len(cases), parallelism)) if active else 0,
+        "shared_with": shared,
+        "concurrency": {"value": None if shared else parallelism,
+                        "source": "load_test" if shared == "load" else "traffic" if shared == "capacity" else "default_concurrency",
+                        "limited_by": "concurrency" if not shared and parallelism < config.default_concurrency else None},
+        "request_timeout_seconds": {"value": effective.get("request_timeout_seconds", config.request_timeout_seconds),
+                                    "source": source("request_timeout_seconds")},
+        "max_output_tokens": {"value": output_limit, "source": output_source},
+        "case_output_limits": [{"fixture_id": case.fixture_id,
+                                "value": case.max_tokens if case.max_tokens is not None else output_limit,
+                                "source": f"request_pack.cases.{index}.max_tokens" if case.max_tokens is not None else output_source}
+                               for index, case in enumerate(cases)],
+    }
     return {
         "read_only": True,
-        "concurrency": config.inherited_concurrency(config.default_concurrency),
+        "concurrency": parallelism,
         "fields": ["default_concurrency", "max_output_tokens", "request_timeout_seconds"],
-        "explanation": "Dataset correctness uses every case once for serial controls, then default_concurrency for its loaded pass. Case output budgets and suite request defaults supply request settings; per-check request overrides are unsupported. When Capacity is selected, its requests provide the shared loaded pass.",
+        "explanation": "Execution metadata separates serial individual requests from repeated traffic. default_concurrency applies only to a separate repeated pass; shared Load test or Capacity traffic uses its own settings. Per-case output limits override request defaults.",
+        "execution": execution,
     }
 
 
