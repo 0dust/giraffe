@@ -1,6 +1,13 @@
 """Question editing and imports explain their contracts without changing them."""
 
+import json
+
+import pytest
+
 from giraffe.dataset_import import preview_dataset
+from giraffe.models import MAX_REQUEST_PACK_BYTES
+from tests.test_web import browser
+from tests.test_ui_question_navigation import navigation_browser
 from tests.test_run_limits_phase6_ui import Markup
 from tests.test_ux_catalogue import browser_logic
 
@@ -11,7 +18,7 @@ config.request_source='request_pack';
 config.request_pack={version:1,cases:[{fixture_id:'kept-name',messages:[{role:'user',content:'<question>'}],scorer:'json',expected:null,schema:{type:'null'},weight:2},{fixture_id:'example-1',messages:[{role:'user',content:'existing'}],scorer:'exact',expected:'answer',weight:1}]};
 const before=JSON.stringify(config);
 datasetEditingAllowed=()=>{};captureFormDraft=()=>{};syncExampleScorer=()=>{};
-let markup='';datasetDialog=(title,body)=>{markup=body;};
+let markup='';openSetupWorkspace=view=>{state.setupWorkspace={view};};renderSetupWorkspace=(title,body)=>{markup=body;};focusSetupWorkspace=()=>{};
 nodes['#dataset-example-form']={elements:{message_0_content:{focus(){}}}};
 openExampleEditor(0);const saved={markup,item:state.datasetEditor.item};
 openExampleEditor();
@@ -117,7 +124,7 @@ def test_import_replacement_count_preserves_mapping_errors_preview_and_disabled_
 const cases=Array.from({length:20},(_,i)=>({fixture_id:'example-'+i,messages:[{role:'user',content:'<question>'}],scorer:'exact',expected:'<answer>'}));
 const preview={columns:['question','answer'],preview_rows:[{question:'<question>',answer:'<answer>'}],request_pack:{version:1,cases},errors:[{row:2,field:'answer',message:'<invalid>'}]};
 state.datasetImport={name:'<questions>.csv',preview,mapping:{input_field:'question',expected_field:'answer',scorer:'exact'},mappingDirty:false,loading:false};
-let markup;datasetDialog=(title,body)=>{markup=body;};renderDatasetImport();const ready=markup;
+state.setupWorkspace={view:'question-import'};let markup;renderSetupWorkspace=(title,body)=>{markup=body;};renderDatasetImport();const ready=markup;
 state.datasetImport.mappingDirty=true;renderDatasetImport();const changed=markup;
 state.datasetImport.mappingDirty=false;state.datasetImport.loading=true;renderDatasetImport();
 const loading=markup;state.datasetImport.mapping.scorer='judge';renderDatasetImport();
@@ -136,3 +143,119 @@ console.log(JSON.stringify({ready,changed,loading,judge:markup}));
     assert 'Configure an evaluator model and endpoint' in judge_hint['text']
     for state in ('changed', 'loading'):
         assert '<button type="submit" class="button primary" disabled>' in result[state]
+
+
+async def test_near_limit_import_and_edits_keep_model_bounds_and_json_null(tmp_path, monkeypatch):
+    monkeypatch.setattr('giraffe.client.LLMClient.__aenter__',
+                        lambda *args: pytest.fail('Question editing must not send model requests'))
+    pack = {'version': 1, 'cases': [{'fixture_id': 'large', 'messages': [
+        {'role': 'user', 'content': 'x'}], 'scorer': 'exact', 'expected': 'a'}]}
+    overhead = len(json.dumps(pack, separators=(',', ':')).encode()) - 1
+    pack['cases'][0]['messages'][0]['content'] = 'x' * (MAX_REQUEST_PACK_BYTES - overhead - 40)
+    raw = json.dumps(pack, separators=(',', ':'))
+    preview = preview_dataset(raw, 'json')
+    assert preview['request_pack'] and not preview['errors']
+    assert len(raw.encode()) < MAX_REQUEST_PACK_BYTES
+    assert len(json.dumps(preview['request_pack'], separators=(',', ':')).encode()) > MAX_REQUEST_PACK_BYTES
+
+    result = browser_logic('const normalized=' + json.dumps(preview['request_pack']) + r'''
+config.max_requests=-17;config.targets[0].url='unfinished endpoint';
+const before=JSON.stringify(config);
+configChanged=()=>{state.configRevision++;};refreshQuestionSetupSummary=()=>{};
+openQuestionManager=()=>{state.datasetImport=null;};
+state.datasetImport={preview:{request_pack:normalized},revision:state.configRevision,route:state.routeVersion,loading:false,mappingDirty:false};
+api=()=>assert.fail('Applying the validated preview must not count its inflated JSON as a new raw import');
+await useImportedDataset({preventDefault(){}});
+assert.equal(config.request_pack.cases[0].messages[0].content.length,normalized.cases[0].messages[0].content.length);
+assert.equal(config.max_requests,-17);assert.equal(config.targets[0].url,'unfinished endpoint');
+let candidate;
+api=async(path,options)=>{assert.equal(path,'/api/config/draft');candidate=JSON.parse(options.body);return {config:candidate};};
+assert(await applyDataset(normalized));
+assert.equal(config.max_requests,-17);assert.equal(config.targets[0].url,'unfinished endpoint');
+assert.equal(candidate.config_version,2);assert.equal(candidate.targets.length,1);assert.equal(candidate.targets[0].url,'http://localhost/v1');
+assert.deepEqual(candidate.checks,[]);assert.equal(candidate.request_source,'request_pack');
+assert(!Object.hasOwn(candidate,'max_requests'),'Unrelated invalid run settings must not enter question validation');
+console.log(JSON.stringify(candidate));
+''')
+    async with browser(tmp_path) as client:
+        accepted = await client.post('/api/config/draft', json=result)
+        assert accepted.status_code == 200
+        assert accepted.json()['config']['request_pack']['cases'][0]['expected'] == 'a'
+        oversized = json.loads(json.dumps(result))
+        oversized['request_pack']['cases'][0]['messages'][0]['content'] = 'x' * MAX_REQUEST_PACK_BYTES
+        rejected = await client.post('/api/config/draft', json=oversized)
+        assert rejected.status_code == 422
+        assert '1 MiB' in rejected.text
+        null_pack = {'version': 1, 'cases': [
+            {'fixture_id': 'null', 'messages': [{'role': 'user', 'content': 'Null?'}],
+             'scorer': 'json', 'schema': {'type': 'null'}, 'expected': None},
+            {'fixture_id': 'schema-only', 'messages': [{'role': 'user', 'content': 'Null?'}],
+             'scorer': 'json', 'schema': {'type': 'null'}},
+        ]}
+        accepted_null = await client.post('/api/config/draft', json={**result, 'request_pack': null_pack})
+        assert accepted_null.status_code == 200
+        null_case, schema_only = accepted_null.json()['config']['request_pack']['cases']
+        assert null_case['expected'] is None and 'expected' not in schema_only
+
+
+
+def test_return_to_questions_restores_the_surviving_action_by_question_identity():
+    navigation_browser(r"""
+renderNew();await click('manage-questions');
+type(visible('[name="question_search"]'),'alpha');
+change(visible('[name="question_scorer_filter"]'),'exact');
+const selected=visible('[data-dataset-select="alpha"]');selected.checked=true;change(selected);
+window.scrollY=503.5;visible('[data-action="edit-example"]').focus({preventScroll:true});
+await click('edit-example');
+let editor=document.querySelector('#dataset-example-form');type(editor.elements.example_expected,'Updated alpha');
+await submit(editor);await until(()=>state.setupWorkspace?.view==='questions');
+const assertReturn=(action,fixtureId=null)=>{
+ const target=document.activeElement;assert.equal(target.dataset.action,action);
+ if(fixtureId)assert.equal(datasetCases()[Number(target.dataset.caseIndex)].fixture_id,fixtureId);
+ assert.equal(window.scrollY,503.5);
+ assert.equal(visible('[name="question_search"]').value,'alpha');
+ assert.equal(visible('[name="question_scorer_filter"]').value,'exact');
+ assert.deepEqual(state.datasetSelection,['alpha']);
+};
+assertReturn('edit-example','alpha');
+await click('edit-example');state.config.request_pack.cases.reverse();
+await click('cancel-question-edit');assertReturn('edit-example','alpha');
+assert.equal(document.activeElement.dataset.caseIndex,'1','The stable question can move to a different index');
+await click('import-pack');await click('cancel-question-import');assertReturn('import-pack');
+await click('edit-example');editor=document.querySelector('#dataset-example-form');
+change(editor.elements.example_scorer,'judge');await submit(editor);await until(()=>state.setupWorkspace?.view==='questions');
+assert.equal(document.activeElement.name,'question_search','A filtered-out action falls back to Search questions');
+assert.equal(window.scrollY,503.5);
+""")
+
+
+
+def test_builtin_examples_are_read_only_and_saved_questions_survive_source_switches():
+    navigation_browser(r"""
+state.config.request_source='builtin';renderNew();
+const saved=JSON.stringify(state.config.request_pack),form=document.querySelector('#new-run-form');
+assert(visible('[data-action="view-builtin-examples"]'));
+assert.equal(visible('[data-action="manage-questions"]'),undefined);
+await click('view-builtin-examples');
+assert.equal(state.setupWorkspace.view,'builtin-examples');
+const workspace=document.querySelector('#setup-workspace'),examples=document.querySelector('#builtin-examples-view');
+assert(examples);assert(examples.querySelector('.builtin-example').open);
+assert.equal(examples.querySelectorAll('ol > li').length,bootstrap.builtin_questions.length);
+for(const example of bootstrap.builtin_questions){assert(examples.textContent.includes(example.question));assert(examples.textContent.includes(String(example.expected)));}
+for(const action of ['add-example','edit-example','remove-example','import-pack','sample-dataset','apply-answer-check','configure-evaluator'])assert.equal(workspace.querySelector('[data-action="'+action+'"]'),null,action);
+assert.equal(workspace.querySelector('input,select,textarea,form'),null);
+assert.equal(document.querySelector('#question-manager'),null);
+assert.equal(state.config.request_source,'builtin');assert.equal(JSON.stringify(state.config.request_pack),saved);
+await click('setup-workspace-back');assert.equal(document.activeElement.dataset.action,'view-builtin-examples');
+openQuestionManager();assert.equal(state.setupWorkspace.view,'builtin-examples','A stale Manage action cannot expose editing for the built-in source');
+await click('setup-workspace-back');
+function selectSource(source){for(const input of form.querySelectorAll('[name="request_source"]'))input.checked=input.value===source;change(form.querySelector('[name="request_source"][value="'+source+'"]'));}
+selectSource('request_pack');
+assert(visible('[data-action="manage-questions"]'));assert.equal(visible('[data-action="view-builtin-examples"]'),undefined);
+await click('manage-questions');assert(document.querySelector('#question-manager'));assert(visible('[data-action="add-example"]'));
+assert.equal(document.querySelector('#question-manager .builtin-example'),null);
+assert.equal(JSON.stringify(state.config.request_pack),saved);
+await click('setup-workspace-back');selectSource('builtin');selectSource('request_pack');
+assert.equal(JSON.stringify(state.config.request_pack),saved);assert.equal(state.config.request_source,'request_pack');
+assert.equal(requests.length,0,'Browsing examples and switching sources do not send requests');
+""")

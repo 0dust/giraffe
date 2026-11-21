@@ -63,7 +63,10 @@ for(const id of ['correctness','load']){
 config.checks=['correctness'];config.request_source='request_pack';config.request_pack={cases:[]};
 config.test_options.correctness={samples:9,concurrency:2};
 const markup=renderTestCard(bootstrap.checks.find(x=>x.id==='correctness'),config);
-assert.doesNotMatch(markup,/name="test_correctness_(samples|concurrency|max_output_tokens|request_timeout_seconds)/);
+assert.match(markup,/data-correctness-builtin-settings hidden/);
+const inputs=Object.fromEntries(['samples','concurrency','max_output_tokens','request_timeout_seconds'].map(name=>['test_correctness_'+name,{value:'saved raw value'}]));
+nodes['#new-run-form']={elements:inputs};syncPackControls();
+for(const input of Object.values(inputs)){assert.equal(input.disabled,true);assert.equal(input.value,'saved raw value');}
 assert.doesNotMatch(markup,/Add questions to calculate their execution plan|Updating the question execution plan/);
 assert.doesNotMatch(markup,/per-check request-setting overrides/i);
 assert.match(markup,/name="test_correctness_limit_min_correctness"/);
@@ -127,7 +130,7 @@ console.log(JSON.stringify(Object.fromEntries(bootstrap.checks.map(check=>[
     assert found == expected
 
 
-def test_timeout_edits_keep_shared_questions_and_evaluator_outside_check_overrides():
+def test_timeout_edits_keep_shared_questions_and_focused_evaluator_outside_check_overrides():
     config = RunConfig(targets=[{
         "name": "local", "url": "http://localhost/v1", "model": "test",
     }], checks=["correctness"])
@@ -153,13 +156,15 @@ editTestField(timeout);assert.equal(form.elements.test_mode_correctness.value,'c
 config.request_source='request_pack';
 config.request_pack={cases:[{fixture_id:'question',messages:[{role:'user',content:'Question'}],expected:'Answer',scorer:'judge'}]};
 config.judging={judges:[{name:'evaluator',url:'invalid-url',model:'test'}]};state.judgeEditorOpen=true;render();
-const evaluator=form.elements.judge_0_url;
-assert(evaluator);assert.equal(evaluator.closest('[data-test-settings]'),null);
-editTestField(evaluator);assert.equal(form.elements.test_mode_correctness.value,'default');
-let validated=0;evaluator.checkValidity=()=>{validated++;assert.equal(evaluator.disabled,false);return false;};
-evaluator.focus=()=>{};evaluator.reportValidity=()=>{};syncConfigView=syncSetupStep=()=>{};
-assert.equal(validateRunForm(form),false);assert.equal(validated,1);
-assert.equal(state.openTest,'correctness');
+assert.equal(form.elements.judge_0_url,undefined);
+const evaluatorForm=document.createElement('form');evaluatorForm.setAttribute('id','evaluator-form');
+evaluatorForm.innerHTML=renderJudging(config,{focused:true});document.body.insertBefore(evaluatorForm,null);
+const evaluator=evaluatorForm.querySelector('[name="judge_0_url"]');
+assert(evaluator);assert.equal(evaluator.closest('[data-test-settings]'),null);assert.equal(evaluator.closest('#new-run-form'),null);
+let validated=0;evaluatorForm.reportValidity=()=>{validated++;return false;};
+state.setupWorkspace={view:'evaluator'};const before=JSON.stringify(config.judging);
+saveEvaluator({preventDefault(){}});assert.equal(validated,1);
+assert.equal(JSON.stringify(config.judging),before);assert.equal(state.setupWorkspace.view,'evaluator');
 """, dom=True)
 
 
@@ -222,19 +227,25 @@ assert.equal(testSettingsLabel(bootstrap.checks.find(item=>item.id==='sessions')
 """)
 
 
-def test_question_source_keeps_examples_collapsed_and_scope_in_help():
+def test_question_source_keeps_collection_out_of_compact_setup():
     browser_logic(r"""
 bootstrap.builtin_questions=[{question:'What is 2 + 2?',expected:'4'}];
 const original=JSON.stringify(config),markup=renderRequestSource(config);
 assert(markup.indexOf('value="builtin"')<markup.indexOf('value="request_pack"'));
 assert.match(markup,/value="builtin" checked/);
-assert.match(markup,/<details class="builtin-example"><summary>View questions and expected answers<\/summary>/);
-assert.match(markup,/What is 2 \+ 2\?/);assert.match(markup,/<code>4<\/code>/);
+assert.doesNotMatch(markup,/class="builtin-example"|What is 2 \+ 2\?|<code>4<\/code>/);
+const preview=renderBuiltinQuestions(config);assert.match(preview,/What is 2 \+ 2\?/);assert.match(preview,/<code>4<\/code>/);
 assert.doesNotMatch(markup,/Questions &amp; expected answers|Known-answer questions are ready|Ready to use|Add or import a dataset/);
-assert.match(markup,/id="field-request_source-help"[^>]*popover="auto"/);
-assert.match(markup,/Switching sources keeps your saved questions/);
-assert.match(markup,/Load test uses the same question source when selected/);
+assert.match(markup,/data-action="view-builtin-examples">View examples/);
+assert.doesNotMatch(markup,/data-action="manage-questions"|Manage questions/);
+assert.match(markup,/Required correct answers/);
+assert.doesNotMatch(markup,/dataset-example-form|dataset-import-form|judge_count/);
 assert.doesNotMatch(markup,/Each saved question runs once/);
+assert.equal(JSON.stringify(config),original);
+const custom=structuredClone(config);custom.request_source='request_pack';
+const customMarkup=renderRequestSource(custom);
+assert.match(customMarkup,/data-action="manage-questions">Manage questions/);
+assert.doesNotMatch(customMarkup,/data-action="view-builtin-examples"|View examples/);
 assert.equal(JSON.stringify(config),original);
 """)
 
@@ -314,7 +325,8 @@ config.request_source='request_pack';config.request_pack={cases:[]};
 const markup=renderTestCard(check,config);
 assert.match(markup,/data-pack-request-settings/);
 assert.doesNotMatch(markup,/exceeds run limit/);
-assert.doesNotMatch(markup,/name="test_correctness_concurrency"/);
+assert.match(markup,/data-correctness-builtin-settings hidden/);
+syncPackControls();assert.equal(elements.test_correctness_concurrency.disabled,true);
 const warning={dataset:{checkOverrideWarning:'correctness'}};groups['[data-check-override-warning]']=[warning];
 updateCheckFieldHints(config);assert.equal(warning.hidden,true);assert.equal(warning.textContent,'');
 config.concurrency=8;updateCheckFieldHints(config);

@@ -257,7 +257,7 @@ for(const check of bootstrap.checks){
   assert(row.includes('id="'+helpId+'" class="field-help" popover="auto"'));
   if(['serving','correctness'].includes(check.id)){
     assert(row.includes('id="'+helpId+'-text">'+escape(checkGuide[check.id].help)+'</p>'));
-    assert.doesNotMatch(row,/<dt>|data-effective-settings/);
+    assert.doesNotMatch(renderCheckInfo(check,config),/<dt>|data-effective-settings/);
   }else{
     assert.match(row,/<dt>Sends<\/dt>/);assert.match(row,/<dt>Shows<\/dt>/);
     assert.match(row,/<dt>Settings<\/dt><dd data-effective-settings>/);
@@ -305,22 +305,27 @@ assert.equal(JSON.stringify(config),original);
 """)
 
 
-def test_dataset_validation_and_evaluator_reveal_the_hosting_check():
+def test_dataset_validation_focuses_compact_actions_and_evaluator_opens_explicitly():
     browser_logic(r"""
-nodes['#check-search']={value:'gpu'};nodes['[data-action="add-example"]']={focus(){this.focused=true;}};
-const details={open:false};nodes['.judge-configuration']=details;
-nodes['[name="judge_0_url"]']={focus(){this.focused=true;}};
+nodes['#check-search']={value:'gpu'};nodes['[data-action="manage-questions"]']={focus(){this.focused=true;}};
+nodes['[data-action="configure-evaluator"]']={focus(){this.focused=true;}};
+nodes['[name="judge_0_model"]']={focus(){this.focused=true;}};
+nodes['#run-setup-content']={};nodes['#setup-workspace']={};
 syncTestControls=()=>{};revealSetupStep=step=>state.setupStep=step;
 readForm=()=>({config:state.config});state.config.request_source='request_pack';state.config.request_pack={cases:[]};
 state.catalogueCategory='server';state.catalogueFilter='selected';state.catalogueSearch='gpu';
 assert.throws(()=>validateSetupChecks(),/Add a question/);
 assert.equal(state.openTest,'correctness');assert.equal(state.setupStep,2);assert.equal(state.catalogueCategory,'all');
-assert(nodes['[data-action="add-example"]'].focused);
+assert(nodes['[data-action="manage-questions"]'].focused);
 state.config.checks=['load'];state.config.judging={judges:[{}]};state.openTest=null;state.setupStep=3;
-configureEvaluator();assert.equal(state.openTest,'load');assert.equal(state.setupStep,2);assert(details.open);
-assert(nodes['[name="judge_0_url"]'].focused);
-state.config.judging=null;let added=false;changeJudge=action=>{added=action==='add';assert.equal(state.openTest,'load');};
-state.openTest=null;configureEvaluator();assert(added);
+focusSetting('judging');assert.equal(state.openTest,'load');assert.equal(state.setupStep,2);
+assert.equal(state.setupWorkspace,null);assert(nodes['[data-action="configure-evaluator"]'].focused);
+const before=JSON.stringify(state.config.judging);configureEvaluator();
+assert.equal(state.setupWorkspace.view,'evaluator');assert(nodes['[name="judge_0_model"]'].focused);
+assert.equal(nodes['#run-setup-content'].hidden,true);assert.equal(nodes['#run-setup-content'].inert,true);
+assert.equal(JSON.stringify(state.config.judging),before);finishEvaluator();
+state.config.judging=null;configureEvaluator();assert.equal(state.config.judging,null);
+assert.equal(state.setupWorkspace.evaluatorDraft.judges.length,1);
 """)
 
 
