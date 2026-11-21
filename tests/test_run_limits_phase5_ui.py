@@ -156,6 +156,37 @@ syncInlineErrors();assert.equal($('.timing-warning-details'),details);assert(det
 """, dom=True)
 
 
+def test_review_timing_expansion_survives_renders_and_pending_previews():
+    run_render_checks(r"""
+(async()=>{
+$('#main').innerHTML='<div id="request-plan"></div><form id="new-run-form"></form>';
+state.config={checks:[],limits:{},targets:[]};state.configRevision=1;state.routeVersion=1;
+const risk={kind:'estimate_risk',msg:'Specific timing explanation',fields:['max_duration_seconds']};
+const plan={estimated_seconds:10,time_warnings:[risk],rows:[],evaluator:{},planned_total:1};
+state.requestPreview={status:'current',revision:1,route:1,plan,config:state.config};
+readForm=()=>({config:state.config});syncRunBlueprint=()=>{};canStartRun=()=>false;currentSettingErrors=()=>[];localSettingWarnings=()=>[];renderPlanBounds=()=>'';renderLoadPlan=()=>'';renderMigrationNotes=()=>'';renderFlightPlan=()=>'';renderReviewPassCriteria=()=>'';setupPlanCount=()=>'';syncInlineErrors=()=>{};syncLoadDisplay=()=>{};updateCorrectnessExecution=()=>{};localSettingErrors=()=>[];acceptMigrationNotes=()=>{};
+renderRequestPlan();let details=$('.timing-warning-details');assert(details);assert.equal(details.open,false);
+details.open=true;renderRequestPlan();details=$('.timing-warning-details');assert(details.open,'expanded timing details survive direct review rendering');
+let finish;api=()=>new Promise(resolve=>finish=resolve);
+const pending=refreshRequestPreview(undefined,{draft:true});
+assert.equal($('.timing-warning-details'),null);assert.doesNotMatch($('#request-plan').textContent,/Specific timing explanation/);
+finish({request_plan:plan,config:state.config});await pending;
+details=$('.timing-warning-details');assert(details.open,'expanded timing details survive pending to current');
+assert(details.querySelector('[data-setting-path="max_duration_seconds"]'));
+details.open=false;renderRequestPlan();assert.equal($('.timing-warning-details').open,false);
+const closedPending=refreshRequestPreview(undefined,{draft:true});finish({request_plan:plan,config:state.config});await closedPending;
+assert.equal($('.timing-warning-details').open,false,'collapsed timing details stay collapsed');
+$('.timing-warning-details').open=true;risk.msg='Updated timing explanation';risk.fields=['max_requests'];renderRequestPlan();
+details=$('.timing-warning-details');assert(details.open);assert.match(details.textContent,/Updated timing explanation/);assert.doesNotMatch(details.textContent,/Specific timing explanation/);
+assert(details.querySelector('[data-setting-path="max_requests"]'));assert.equal(details.querySelector('[data-setting-path="max_duration_seconds"]'),null);
+plan.time_warnings=[];renderRequestPlan();assert.equal($('.timing-warning-details'),null);
+plan.time_warnings=[risk];renderRequestPlan();assert.equal($('.timing-warning-details').open,false,'resolved warnings clear expansion');
+$('.timing-warning-details').open=true;state.routeVersion++;state.requestPreview={status:'current',revision:state.configRevision,route:state.routeVersion,plan,config:state.config};renderRequestPlan();
+assert.equal($('.timing-warning-details').open,false,'new route starts collapsed');
+})()
+""", dom=True)
+
+
 async def test_tool_stream_conflict_reaches_both_inline_fields_and_plan(tmp_path):
     values = {"config_version": 2, "targets": [{"name": "local", "url": "http://localhost/v1", "model": "test"}],
               "checks": ["tools"], "stream": False, "tool_checks": {"modes": ["stream"]}}
