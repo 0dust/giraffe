@@ -164,6 +164,10 @@ coverage requires endpoint-reported output tokens above `profile.short.output_to
 the Long output setting remains a cap. Missing streaming progress, early completion
 or insufficient measured long-output coverage can leave the comparison inconclusive.
 
+For saved questions, budgets at or below `profile.short.output_tokens` select
+short baseline/probe work; larger budgets select the long background. If either
+role has no eligible saved question, the comparison remains inconclusive.
+
 The shared `profile` defaults to input token targets 128/512/2048 and output caps
 64/256/512 for Short/Medium/Long. New profiles require strictly increasing sizes.
 Profile inputs are independent of `context_limit`; ordinary-request

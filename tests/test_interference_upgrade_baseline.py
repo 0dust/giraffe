@@ -8,7 +8,8 @@ and run this module with the extracted ``src`` first on PYTHONPATH:
     mkdir -p /tmp/interference-base
     tar -xf /tmp/base.tar -C /tmp/interference-base
     PYTHONPATH=/tmp/interference-base/src:. .venv/bin/python \
-        -m tests.test_interference_upgrade_baseline tests/fixtures /tmp/interference-base/src
+        -m tests.test_interference_upgrade_baseline tests/fixtures /tmp/interference-base/src \
+        multi-user migrated-load load-prefix multi-user-prefix
 
 Only run_location is normalized. The full measured requests and the identities
 computed by the historical runner remain intact; gzip uses a fixed mtime.
@@ -39,19 +40,36 @@ FIXTURES = Path(__file__).parent / "fixtures"
 
 
 class AnswerStream(httpx.AsyncByteStream):
+    def __init__(self, input_tokens=128, cached_tokens=None):
+        self.input_tokens, self.cached_tokens = input_tokens, cached_tokens
+
     async def __aiter__(self):
         for text in ("K7", "P", "4"):
             await asyncio.sleep(.004)
             yield ("data: " + json.dumps({"choices": [{"delta": {"content": text},
                                                        "finish_reason": None}]}) + "\n\n").encode()
+        usage = {"prompt_tokens": self.input_tokens, "completion_tokens": 4}
+        if self.cached_tokens is not None:
+            usage["prompt_tokens_details"] = {"cached_tokens": self.cached_tokens}
         yield ("data: " + json.dumps({"choices": [{"delta": {}, "finish_reason": "stop"}],
-                                      "usage": {"prompt_tokens": 128, "completion_tokens": 4}})
+                                      "usage": usage})
                + "\n\ndata: [DONE]\n\n").encode()
 
 
 def upgrade_config(kind):
     common = {"targets": [{"name": "local", "url": "http://unused.test/v1", "model": "test"}],
               "max_requests": None, "max_duration_seconds": None, "max_memory_mb": 0}
+    if kind in {"load-prefix", "multi-user-prefix"}:
+        config = upgrade_config("multi-user").model_dump(mode="json")
+        config.update(checks=["multi_user" if kind == "multi-user-prefix" else "load", "prefix"],
+                      prefix={"prefix_chars": 4096, "repeats": 4, "history_turns": 2})
+        config["limits"]["min_samples"] = 2
+        config["load_test"] = {
+            "workloads": {"combinations": {"selected": ["short_short"]}},
+            "patterns": {"concurrent": {"enabled": False}, "constant": {"enabled": True},
+                         "rates": [40]}, "schedule": {"duration_seconds": 1},
+            "pass_criteria": {"min_valid_responses": 2, "max_completion_ms": 1000}}
+        return RunConfig.model_validate(config)
     if kind == "multi-user":
         return RunConfig.model_validate({**common, "config_version": 2, "checks": ["multi_user"],
             "multi_user": {"levels": [2], "duration_seconds": .4,
@@ -65,14 +83,23 @@ def upgrade_config(kind):
                    "stream_gap_ms": None, "min_output_tokens_per_second": None}})
 
 
-async def generate_upgrade_report(monkeypatch, kind):
+async def generate_upgrade_report(monkeypatch, kind, *, prefix_budget=None):
     config = upgrade_config(kind)
+    if prefix_budget is not None:
+        values = config.model_dump(mode="json")
+        values["test_options"]["prefix"] = {"max_output_tokens": prefix_budget}
+        config = RunConfig.model_validate(values)
 
     async def handler(request):
         if request.method != "POST":
             return httpx.Response(404)
-        if json.loads(request.content)["stream"]:
-            return httpx.Response(200, stream=AnswerStream(), headers={"content-type": "text/event-stream"})
+        payload = json.loads(request.content)
+        text = payload["messages"][-1]["content"]
+        prefix_trial = "\nTrial " in text
+        cached = 1024 if prefix_trial and "Control " not in text and "Trial 0000" not in text else 0
+        if payload["stream"]:
+            stream = AnswerStream(1280 if prefix_trial else 128, cached if prefix_trial else None)
+            return httpx.Response(200, stream=stream, headers={"content-type": "text/event-stream"})
         await asyncio.sleep(.004)
         return httpx.Response(200, json={
             "choices": [{"message": {"content": "K7P4"}, "finish_reason": "stop"}],
@@ -169,6 +196,70 @@ def test_historical_source_cannot_attest_reverse_mode_in_migrated_settings():
     assert not _same_load_workload(current.manifest, old.manifest)
 
 
+@pytest.mark.usefixtures("local_tokenizer")
+@pytest.mark.parametrize("kind", ["load-prefix", "multi-user-prefix"])
+def test_prefix_companion_report_remains_comparable_across_load_source_upgrade(monkeypatch, kind):
+    current = run_virtual(monkeypatch, generate_upgrade_report(monkeypatch, kind))
+    old = baseline(kind)
+    before = current.model_dump_json(), old.model_dump_json()
+    assert _settings_reasons(current, current) == _settings_reasons(old, old) == []
+    assert _settings_reasons(current, old) == []
+    assert _settings_reasons(old, current) == []
+    compared = compare_baseline(current, old).baseline["targets"][0]
+    assert compared["reasons"] == []
+    assert compared["status"] == "pass"
+    assert (current.model_dump_json(), old.model_dump_json()) == before
+
+
+@pytest.mark.usefixtures("local_tokenizer")
+@pytest.mark.parametrize("kind", ["load-prefix", "multi-user-prefix"])
+@pytest.mark.parametrize("change", ["prefix-settings", "source", "unverified-source", "generator",
+                                    "older-prefix-budget-generator"])
+def test_prefix_source_upgrade_keeps_changed_work_incomparable(monkeypatch, kind, change):
+    current = run_virtual(monkeypatch, generate_upgrade_report(monkeypatch, kind))
+    old = baseline(kind)
+    checks = old.manifest["config"]["checks"]
+    resolved = RunConfig.model_validate(old.manifest["config"])
+    identity = {"generator_source_sha256": old.manifest["test_fixture_provenance"]["generator_source_sha256"],
+                "settings": {field: getattr(resolved, field).model_dump(mode="json")
+                             for field in ("prefix", "load_test", "multi_user")
+                             if ("load" if field == "load_test" else field) in checks}}
+    source_field = "load_test_source_sha256" if kind == "load-prefix" else "multi_user_source_sha256"
+    identity[source_field] = BASE_LOAD_SOURCE if kind == "load-prefix" else BASE_MULTI_USER_SOURCE
+    if kind == "multi-user-prefix":
+        identity["multi_user_window_policy"] = "completed-output-v1"
+    else:
+        identity["settings"]["load_test"]["workloads"]["interference"].pop("mode")
+    assert fixture_hash(identity) == old.manifest["fixture_pack"]["workload_fixture_sha256"]
+    if change == "prefix-settings":
+        old.manifest["config"]["prefix"]["repeats"] += 1
+        identity["settings"]["prefix"]["repeats"] += 1
+    elif change == "source":
+        identity[source_field] = "unknown"
+    elif change == "unverified-source":
+        identity[source_field] = ("9b694c97a39d449d8ea15b09a9aeb406bf835179c0882827685c4d7888687d36"
+                                  if kind == "load-prefix" else
+                                  "bcef9038f2fc90862a69fde8d5529234b828757bb62f89468964ec5ee95c3d2e")
+    else:
+        identity["generator_source_sha256"] = (
+            "2c5cfa60063bd236302582d25e7fe37e7807b829f487168cd09407d37bd60e6e"
+            if change == "older-prefix-budget-generator" else "unknown")
+    old.manifest["fixture_pack"]["workload_fixture_sha256"] = fixture_hash(identity)
+    assert "Fixture pack identity differs." in _settings_reasons(current, old)
+    assert "Fixture pack identity differs." in _settings_reasons(old, current)
+
+
+@pytest.mark.usefixtures("local_tokenizer")
+@pytest.mark.parametrize("kind", ["load-prefix", "multi-user-prefix"])
+def test_prefix_source_upgrade_keeps_changed_actual_request_budgets_incomparable(monkeypatch, kind):
+    current = run_virtual(monkeypatch, generate_upgrade_report(monkeypatch, kind, prefix_budget=256))
+    old = baseline(kind)
+    assert {row.requested_max_tokens for row in current.requests if "prefix" in row.check_ids} == {256}
+    assert {row.requested_max_tokens for row in old.requests if "prefix" in row.check_ids} == {128}
+    assert _settings_reasons(current, old)
+    assert _settings_reasons(old, current)
+
+
 if __name__ == "__main__":
     import sys
     import tempfile
@@ -187,7 +278,7 @@ if __name__ == "__main__":
                    session_sampling, traffic)) == BASE_MULTI_USER_SOURCE
     assert workloads.FIXTURE_SOURCE_SHA256 == "a04c62a2e7b10ab0aef201cf5c283fe53df694d247ca5ce35caca1340a83f387"
     destination = Path(sys.argv[1])
-    for kind in ("multi-user", "migrated-load"):
+    for kind in sys.argv[3:] or ("multi-user", "migrated-load"):
         with tempfile.TemporaryDirectory() as temporary, pytest.MonkeyPatch.context() as patch:
             local_tokenizer.__wrapped__(patch, Path(temporary))
             report = run_virtual(patch, generate_upgrade_report(patch, kind))

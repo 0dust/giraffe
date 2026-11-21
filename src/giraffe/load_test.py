@@ -166,6 +166,16 @@ def _shape_sources(settings, size, sources, records=()):
     return matching or sources
 
 
+def _saved_shape_sources(run, settings, point, shape, sources):
+    if point["type"] == "interference" and settings.workloads.interference.mode == "short_during_long":
+        short = shape.endswith("_short")
+        cap = settings.profile.short.output_tokens
+        sources = [source for source in sources if (
+            (source.max_tokens if source.max_tokens is not None else run.config.max_output_tokens) <= cap
+        ) == short]
+    return _shape_sources(settings, shape.split("_")[0], sources, run.records)
+
+
 def stress_output_floor(settings):
     return math.ceil(settings.profile.long.output_tokens * settings.workloads.stress.min_output_percent / 100)
 
@@ -678,9 +688,17 @@ def build_spec(
                getattr(run, "pack_specs", []) or getattr(run, "load_custom_specs", []))
     if sources:
         if frozen_sources is None:
-            sources = _shape_sources(settings, size, sources, run.records)
-        index = point.get("_source_index", 0)
-        point["_source_index"] = index + 1
+            sources = _saved_shape_sources(run, settings, point, shape, sources)
+            if not sources:
+                return None
+        if (frozen_sources is None and point["type"] == "interference"
+                and settings.workloads.interference.mode == "short_during_long"):
+            indices = point.setdefault("_source_indices", {})
+            index = indices.get(shape, 0)
+            indices[shape] = index + 1
+        else:
+            index = point.get("_source_index", 0)
+            point["_source_index"] = index + 1
         if getattr(run, "pack_specs", []):
             cases = {case.fixture_id: case for case in run.config.request_pack.cases}
             rng = random.Random(settings.patterns.poisson.seed + index)
@@ -775,6 +793,8 @@ async def concurrent_window(run, target, client, settings, point, calibration, *
             if probe_request and not trigger_ready():
                 return None
             spec = build_spec(run, settings, point, shape, calibration, role=role, phase=phase)
+            if spec is None:
+                return None
             guarded = {}
             if reverse:
                 def eligible():
@@ -823,6 +843,10 @@ async def concurrent_window(run, target, client, settings, point, calibration, *
 
     async def probe():
         nonlocal triggered
+        if reverse:
+            sources = getattr(run, "pack_specs", []) or getattr(run, "load_custom_specs", [])
+            if sources and not _saved_shape_sources(run, settings, point, "short_short", sources):
+                return
         while not ended():
             changed.clear()
             if trigger_ready():
@@ -1340,7 +1364,7 @@ def measurements(run, target, settings, point, records, shape):
         request_ids=[r.id for r in rows],
     )
     if getattr(run, "pack_specs", []):
-        eligible = _shape_sources(settings, a, run.pack_specs, run.records)
+        eligible = _saved_shape_sources(run, settings, point, shape, run.pack_specs)
         group["case_coverage"] = {
             spec.workload["case_id"]: sum(
                 r.workload.get("case_id") == spec.workload["case_id"] and r.score is not None

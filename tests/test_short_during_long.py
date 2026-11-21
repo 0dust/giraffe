@@ -1,6 +1,7 @@
 """Short requests arriving after a long answer starts, with deterministic time."""
 
 import asyncio
+import json
 
 import pytest
 import yaml
@@ -246,24 +247,111 @@ def test_reverse_initial_budget_uses_one_baseline_short_and_requested_population
     assert load_test.minimum_reservation(restored.load_test) == 7
 
 
-def test_saved_long_answers_cannot_supply_short_comparison(monkeypatch):
+def test_oversized_actual_answers_remain_rejected_after_budget_selection(monkeypatch):
+    class OversizedAnswers(StreamingClient):
+        async def execute(self, spec, first_output_event=None):
+            response = await super().execute(spec, first_output_event)
+            response.output_tokens = response.completion_tokens = 256
+            return response
+
     async def scenario():
-        config = configuration()
-        values = config.model_dump()
-        values.update(request_source="request_pack", request_pack={"version": 1, "cases": [{
-            "fixture_id": "saved-long", "messages": [{"role": "user", "content": "Say K7P4"}],
-            "scorer": "exact", "expected": "K7P4", "max_tokens": 256,
-        }]})
-        config = RunConfig.model_validate(values)
+        config = saved_answer_config([("short-answer", 16), ("long-answer", 256)])
         run = _Run(config, None, None)
-        point, = (await load_test.execute(run, config.targets[0], StreamingClient()))["points"]
+        point, = (await load_test.execute(run, config.targets[0], OversizedAnswers()))["points"]
         shorts = [r for r in run.records if r.load_point.get("role") == "short_stream"]
-        assert shorts and all(r.requested_max_tokens == r.output_tokens == 256 for r in shorts)
+        assert shorts and all(r.requested_max_tokens == 16 and r.output_tokens == 256 for r in shorts)
         assert point["interference"]["baseline"]["matched_count"] > 0
         assert point["interference"]["probe"]["matched_count"] > 0
         assert point["interference"]["slowdown"] == pytest.approx(1)
+        assert not point["interference"]["work_comparison"]["qualified"]
+        assert "Short output cap" in point["interference"]["work_comparison"]["reason"]
+        assert point["status"] == "fail", point["reason"]
+        assert point["reason"] == "Endpoint exceeded the requested output cap."
+
+    run_virtual(monkeypatch, scenario())
+
+
+def saved_answer_config(budgets):
+    values = configuration().model_dump()
+    values.update(request_source="request_pack", request_pack={"version": 1, "cases": [{
+        "fixture_id": name, "messages": [{"role": "user", "content": "Say K7P4"}],
+        "scorer": "exact", "expected": "K7P4", "max_tokens": budget, "weight": 1,
+    } for name, budget in budgets]})
+    return RunConfig.model_validate(values)
+
+
+def test_saved_short_and_long_cases_supply_only_their_matching_roles(monkeypatch):
+    async def scenario():
+        config = saved_answer_config([("short-answer", 16), ("long-answer", 256)])
+        run = _Run(config, None, None)
+        point, = (await load_test.execute(run, config.targets[0], StreamingClient()))["points"]
+        for shape, case_id, budget in (("short_short", "short-answer", 16),
+                                       ("short_long", "long-answer", 256)):
+            rows = [r for r in run.records if r.load_point["shape"] == shape]
+            assert rows and {r.workload["case_id"] for r in rows} == {case_id}
+            assert all(r.requested_max_tokens == r.output_tokens == budget for r in rows)
+            group = next(group for group in point["groups"] if group["shape"] == shape)
+            assert set(group["case_coverage"]) == {case_id}
+            assert group["case_coverage"][case_id] > 0
+        assert point["status"] == "pass", point["reason"]
+
+    run_virtual(monkeypatch, scenario())
+
+
+def test_reverse_mode_does_not_filter_other_selected_workloads(monkeypatch):
+    async def scenario():
+        config = saved_answer_config([("short-answer", 16), ("long-answer", 256)])
+        config.load_test.workloads.combinations.enabled = True
+        config.load_test.workloads.combinations.selected = ["short_short"]
+        run = _Run(config, None, None)
+        points = (await load_test.execute(run, config.targets[0], StreamingClient()))["points"]
+        point = next(point for point in points if point["type"] == "combinations")
+        rows = [row for row in run.records if row.load_point["point_id"] == point["id"]]
+        assert {row.workload["case_id"] for row in rows} == {"short-answer", "long-answer"}
+        assert {row.requested_max_tokens for row in rows} == {16, 256}
+        assert set(point["groups"][0]["case_coverage"]) == {"short-answer", "long-answer"}
+
+    run_virtual(monkeypatch, scenario())
+
+
+def test_filtered_custom_pools_do_not_starve_short_cases_when_probes_queue(monkeypatch, tmp_path):
+    source = tmp_path / "saved-answers.json"
+    source.write_text(json.dumps([{
+        "fixture_id": name, "messages": [{"role": "user", "content": "Say K7P4"}],
+        "scorer": "exact", "expected": "K7P4", "max_tokens": budget,
+    } for name, budget in (("short-a", 16), ("short-b", 16), ("long", 256))]))
+
+    async def scenario():
+        values = configuration().model_dump()
+        values["custom_fixtures"] = str(source)
+        config = RunConfig.model_validate(values)
+        run = _Run(config, None, None)
+        point, = (await load_test.execute(run, config.targets[0], StreamingClient(queued=True)))["points"]
+        assert not run.pack_specs
+        assert len(run.load_custom_specs) == 3
+        for phase in ("baseline", "probe"):
+            shorts = [row for row in run.records if row.load_point["shape"] == "short_short"
+                      and row.load_point["phase"] == phase]
+            assert {row.fixture_id for row in shorts} == {"short-a", "short-b"}
+            assert all(row.requested_max_tokens == row.output_tokens == 16 for row in shorts)
+        evidence = point["interference"]
+        assert evidence["work_comparison"]["qualified"]
+        assert evidence["slowdown"] > 10
+        assert point["status"] == "fail", point["reason"]
+        assert "slowdown" in point["reason"].lower()
+
+    run_virtual(monkeypatch, scenario())
+
+
+@pytest.mark.parametrize("budget,shape", [(16, "short_short"), (256, "short_long")])
+def test_missing_saved_role_pool_stays_unexercised(monkeypatch, budget, shape):
+    async def scenario():
+        config = saved_answer_config([("only-case", budget)])
+        run = _Run(config, None, None)
+        point, = (await load_test.execute(run, config.targets[0], StreamingClient()))["points"]
+        assert run.records and all(r.load_point["shape"] == shape for r in run.records)
+        assert all(r.requested_max_tokens == budget for r in run.records)
         assert point["status"] == "inconclusive", point["reason"]
-        assert "Short output cap" in point["reason"]
 
     run_virtual(monkeypatch, scenario())
 
