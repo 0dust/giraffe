@@ -105,6 +105,21 @@ def test_load_source_compatibility_does_not_hide_unattested_work(change):
     assert "Fixture pack identity differs." in _settings_reasons(current, old)
 
 
+def test_historical_load_sources_never_attest_short_during_long_mode():
+    from giraffe.reporting import _same_load_workload
+
+    current, old, settings = load_reports(load_source=NONCE_ONLY_LOAD)
+    settings["load_test"]["workloads"]["interference"]["mode"] = "short_during_long"
+    for report, source in ((current, NONCE_ONLY_LOAD), (old, PRE_NONCE_LOAD)):
+        report.manifest["config"]["load_test"]["workloads"]["interference"]["mode"] = "short_during_long"
+        report.manifest["fixture_pack"]["workload_fixture_sha256"] = fixture_hash({
+            "generator_source_sha256": NONCE_LOAD_GENERATOR,
+            "settings": settings, "load_test_source_sha256": source})
+
+    assert not _same_load_workload(current.manifest, old.manifest)
+    assert "Fixture pack identity differs." in _settings_reasons(current, old)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("load", [False, True], ids=["quick-check", "load"])
 async def test_browser_safety_limits_preserve_real_baseline_comparability(load):
@@ -728,7 +743,9 @@ async def test_exact_policy_predecessor_preserves_measured_multi_user(monkeypatc
                    multi_user={"levels": [2], "duration_seconds": .4,
                                "think_time_seconds": {"values": [.01]}})
     predecessor_generator = "e4ddc7a7e8563f9ab3bba2fc42ad0232ee924c65f67d92dafd89c21025d202d0"
-    predecessor_source = "914d6728904a6790358feb7631fb690173a637a5deb73cbdb19947ea8104120e"
+    # This test changes only the generator label on the current runtime. The
+    # pre-mode runtime upgrade is covered by test_interference_upgrade_baseline.
+    predecessor_source = "a505fae2bd8c99931e6b0f70aae58d76d4499cfe52bca68035468bf49fc4e79c"
     if companion == "load":
         options.update(checks=["multi_user", "load"], load_test=load_config(duration=1).load_test)
     with monkeypatch.context() as policy:
@@ -753,7 +770,7 @@ async def test_exact_policy_predecessor_preserves_measured_multi_user(monkeypatc
                 "settings": {"multi_user": old.manifest["config"]["multi_user"]}}
     if companion == "load":
         identity["settings"]["load_test"] = options["load_test"].model_dump(mode="json")
-        identity["load_test_source_sha256"] = "fa40b2a909d2b067529ab02bd686c61adb8a175063e481d802ad33d308ef49fa"
+        identity["load_test_source_sha256"] = "ab442c8b54be31143ad52fa20f86cd896d2fcf39da495a80cc48db9bc5cb90ee"
     assert fixture_hash(identity) == old.manifest["fixture_pack"][fingerprint]
 
     assert _settings_reasons(current, old) == []

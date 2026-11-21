@@ -156,7 +156,7 @@ export function loadTestIssues(config, defaults, limits={}) {
   }
   if((standard&&p.concurrent.enabled||w.interference.enabled)&&config.concurrency!=null&&levels.some(n=>n>config.concurrency))issue('concurrency','Concurrency levels exceed the run ceiling. Update Run limits or lower the levels.');
   if(w.interference.enabled){
-    if(!levels.some(n=>Number.isInteger(n)&&n>=2))issue('patterns.concurrent.levels','The long-input / short-answer test needs a concurrency level of at least 2.');
+    if(!levels.some(n=>Number.isInteger(n)&&n>=2))issue('patterns.concurrent.levels',w.interference.mode==='short_during_long'?'The short-request / long-answer test needs a concurrency level of at least 2.':'The long-input / short-answer test needs a concurrency level of at least 2.');
     valid('workloads.interference.max_slowdown',w.interference.max_slowdown,1,{exclusive:true,label:'Maximum allowed slowdown of short answers (×)'});
   }
   if(w.stress.enabled&&w.stress.cases.some(shape=>shape.endsWith('_long'))){
