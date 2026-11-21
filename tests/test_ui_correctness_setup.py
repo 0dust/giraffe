@@ -7,6 +7,7 @@ from giraffe.planning import request_plan
 from tests.test_concurrent_load_ui_review import FORM
 from tests.test_run_limits_phase6_ui import Markup
 from tests.test_ux_catalogue import browser_logic
+from tests.test_ui_question_navigation import navigation_browser
 
 
 CORRECTNESS_FORM = (FORM.replace("config.checks=['load']", "config.checks=['correctness']")
@@ -59,6 +60,40 @@ console.log(JSON.stringify({markup:renderTestCard(check,config),summary:effectiv
     assert 'Manage questions' not in result['markup']
     assert 'View questions and expected answers' not in result['markup']
     assert 'The suite value is a default' not in result['markup']
+
+
+def test_question_setup_requirements_follow_live_form_without_replacing_controls():
+    navigation_browser(r'''
+for(const [check,value] of [['correctness',37],['load',85]]){
+ state.config.checks=[check];state.openTest=check;renderNew();
+ const form=document.querySelector('#new-run-form'),savedPack=JSON.stringify(state.config.request_pack);
+ const sources=[...form.querySelectorAll('[name="request_source"]')];
+ const name=check==='correctness'?'test_correctness_limit_min_correctness':'load_pass_criteria_min_correct_percent';
+ const input=form.elements[name];input.focus({preventScroll:true});window.scrollY=489;
+ type(input,String(value));
+ assert.match(document.querySelector('[data-question-setup-summary]').textContent,new RegExp(value+'%'));
+ assert.equal(form.elements[name],input);assert.equal(document.activeElement,input);assert.equal(window.scrollY,489);
+ assert.deepEqual([...form.querySelectorAll('[name="request_source"]')],sources);
+ assert.equal(state.config.request_source,'request_pack');assert.equal(JSON.stringify(state.config.request_pack),savedPack);
+}
+assert.equal(requests.length,0);
+''')
+
+
+def test_builtin_setup_hides_inactive_evaluator_action_and_preserves_configuration():
+    navigation_browser(r'''
+state.config.request_source='builtin';state.config.judging={...bootstrap.judging.defaults,judges:[{name:'reviewer',url:'http://judge/v1',model:'judge-model',api_key_env:null,headers_env:{}}]};
+const judging=JSON.stringify(state.config.judging),pack=JSON.stringify(state.config.request_pack);
+renderNew();const form=document.querySelector('#new-run-form'),summary=document.querySelector('[data-question-setup-summary]');
+assert.equal(Boolean(summary.querySelector('[data-action="configure-evaluator"]')),false);
+assert.match(summary.textContent,/Not needed/);assert(visible('[data-action="view-builtin-examples"]'));
+assert.equal(JSON.stringify(state.config.judging),judging);assert.equal(JSON.stringify(state.config.request_pack),pack);
+for(const input of form.querySelectorAll('[name="request_source"]'))input.checked=input.value==='request_pack';
+change(form.querySelector('[name="request_source"][value="request_pack"]'));
+assert.equal(document.querySelector('[data-question-setup-summary] [data-action="configure-evaluator"]').textContent,'Edit evaluator');
+assert.equal(JSON.stringify(state.config.judging),judging);assert.equal(JSON.stringify(state.config.request_pack),pack);
+assert.equal(requests.length,0);
+''')
 
 
 def test_reset_one_correctness_setting_preserves_other_overrides_and_percentage_serialization():

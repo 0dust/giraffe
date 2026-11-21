@@ -2564,17 +2564,20 @@ function renderQuestionSetupSummary(config) {
   const check=state.bootstrap.checks.find(check=>check.id==='correctness');
   const required=!config.checks.includes('correctness')&&config.checks.includes('load')?loadSettings(config).pass_criteria.min_correct_percent/100:limitValue(config,check,'min_correctness');
   const questions=custom?counted(count,'saved question'):`${state.bootstrap.builtin_questions?.length||3} built-in questions`;
-  return `<dl class="question-setup-status"><div><dt>Questions</dt><dd>${escape(questions)}</dd></div><div><dt>AI evaluator</dt><dd>${escape(readiness.label)}</dd></div><div><dt>Required correct answers</dt><dd>${Number.isFinite(required)?`${number(required*100,1)}%`:'Set a valid percentage'}</dd></div></dl><div class="actions"><button type="button" class="button small" data-action="${custom?'manage-questions':'view-builtin-examples'}">${custom?'Manage questions':'View examples'}</button>${readiness.needed||readiness.ready?`<button type="button" class="text-button" data-action="configure-evaluator">${readiness.ready?'Edit evaluator':'Configure evaluator'}</button>`:''}</div>`;
+  return `<dl class="question-setup-status"><div><dt>Questions</dt><dd>${escape(questions)}</dd></div><div><dt>AI evaluator</dt><dd>${escape(readiness.label)}</dd></div><div><dt>Required correct answers</dt><dd>${Number.isFinite(required)?`${number(required*100,1)}%`:'Set a valid percentage'}</dd></div></dl><div class="actions"><button type="button" class="button small" data-action="${custom?'manage-questions':'view-builtin-examples'}">${custom?'Manage questions':'View examples'}</button>${custom&&(readiness.needed||readiness.ready)?`<button type="button" class="text-button" data-action="configure-evaluator">${readiness.ready?'Edit evaluator':'Configure evaluator'}</button>`:''}</div>`;
 }
 function renderRequestSource(config) {
   const custom=config.request_source==='request_pack';
   return `<section class="setup-section" id="setup-dataset"><div class="setup-body"><fieldset class="dataset-source"><legend>Question source</legend><label><input type="radio" name="request_source" value="builtin" ${custom?'':'checked'}><span>Built-in examples</span></label><label><input type="radio" name="request_source" value="request_pack" ${custom?'checked':''}><span>My questions</span></label></fieldset><div data-question-setup-summary>${renderQuestionSetupSummary(config)}</div></div></section>`;
 }
+function syncQuestionSetupSummary(config) {
+  const summary=$('[data-question-setup-summary]');if(summary)summary.innerHTML=renderQuestionSetupSummary(config);
+}
 function refreshQuestionSetupSummary() {
   if(!state.config)return;
   const form=$('#new-run-form');
   for(const input of $$('[name="request_source"]',form||document))input.checked=input.value===state.config.request_source;
-  const summary=$('[data-question-setup-summary]');if(summary)summary.innerHTML=renderQuestionSetupSummary(state.config);
+  syncQuestionSetupSummary(state.config);
   const check=state.bootstrap.checks.find(check=>check.id==='correctness'),card=$('[data-test-card="correctness"]');
   if(check&&card)updateCheckRow(check,state.config,card);
   if(card)for(const group of $$('[data-correctness-builtin-settings]',card))group.hidden=state.config.request_source==='request_pack';
@@ -2831,7 +2834,7 @@ function sampleDataset(){
 }
 function openTryExample(index,targetName=null) {
   try{
-    datasetEditingAllowed();rememberQuestionManagerContext();const item=datasetCases()[index];if(!item)return;
+    datasetEditingAllowed();captureFormDraft();rememberQuestionManagerContext();const item=datasetCases()[index];if(!item)return;
     state.datasetTry={fixture_id:item.fixture_id,revision:state.configRevision,route:state.routeVersion};
     datasetDialog('Try one example',`<form id="dataset-try-form"><div class="dialog-body"><p><strong>${escape(item.fixture_id)}</strong></p><p class="hint">Sends this question once to the selected server, then checks the answer${item.scorer==='judge'?' with your configured AI evaluators':''}. No traffic stages or restart commands run.</p><div class="example-check">${selectField('try_target','Target',state.config.targets.map(target=>`<option value="${escape(target.name)}">${escape(target.name)} · ${escape(target.model || 'model needed')}</option>`).join(''))}</div><label class="trial-retention"><input name="save_try_output" type="checkbox" checked><span>Save this trial’s answer and judge reasons</span></label><p class="hint">Save the answer and evaluator reasons in this trial report so you can inspect them. If unchecked, only measurements and results are saved. This does not change what your main run saves.</p><div id="dataset-error" class="error-message" role="alert" hidden></div></div><div class="dialog-footer"><button type="button" class="button" data-action="close-dataset">Cancel</button><button type="submit" class="button primary" ${state.active?'disabled':''}>Send one request</button></div></form>`);
     if(targetName&&state.config.targets.some(target=>target.name===targetName))$('#dataset-try-form').elements.try_target.value=targetName;
@@ -3417,6 +3420,7 @@ function updateBounds() {
     derived.textContent=`At most ${number(c.concurrency)} ${c.concurrency===1?'request':'requests'} at once.`;
   }
   updateDatasetReadiness(c);
+  syncQuestionSetupSummary(c);
   for(const check of state.bootstrap.checks){
     const card=$(`[data-test-card="${check.id}"]`);
     updateCheckRow(check,c,card);
