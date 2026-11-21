@@ -186,6 +186,13 @@ def _comparison_manifest(manifest: dict) -> dict:
                     **settings} if isinstance(settings, dict) else settings
             for check, settings in value["effective_checks"].items()
         }
+        load = value["effective_checks"].get("load")
+        workloads = load.get("workloads") if isinstance(load, dict) else None
+        interference = workloads.get("interference") if isinstance(workloads, dict) else None
+        if isinstance(interference, dict) and "mode" not in interference:
+            value["effective_checks"]["load"] = {**load, "workloads": {
+                **workloads, "interference": {**interference, "mode": "long_input_during_short"}
+            }}
     for check, field in (("first_output", "first_output_ms"), ("generation", "stream_gap_ms")):
         settings = value.get("effective_checks", {}).get(check)
         if isinstance(settings, dict) and isinstance(settings.get("limits"), dict):
@@ -211,6 +218,8 @@ _MULTI_USER_COMPANION_REVISIONS = {"policy_after_all_shared_targets", "access_af
                                    "scale_down_gateway_access"}
 _CONVERSATION_BRIDGE_CHECKS = {"prefix", "sessions", "consistency"}
 _CONVERSATION_LOAD_SOURCE = "9b694c97a39d449d8ea15b09a9aeb406bf835179c0882827685c4d7888687d36"
+# The opt-in reverse experiment preserves dispatch for the existing default mode.
+_INTERFERENCE_MODES_LOAD_SOURCE = "427406583a39898e098463c2e05f996687fecbab4103a6f8735694ba2d875787"
 _ACCESS_CONVERSATION_SOURCE = "9ff9179300b4012552a7bd6fd6ef0ae60c016b9023dba33ffabc9ca03783ac2d"
 _COMPANION_LOAD_SOURCE = "113325dd5cffa04626cc7be7ee93bc6e9be67335531288bc329b3542a155c92a"
 
@@ -482,7 +491,8 @@ def _same_load_workload(current: dict, old: dict, *, fingerprint_key: str = "wor
         # Explicit multi-user stages preserve ordinary Load dispatch.
         (_CONVERSATION_LOAD_SOURCE,
          "df3b7bbf30cab87d2e8c1c6dab8819f9cfe592b181407caa7c32af4c5f720cd4",
-         "fa40b2a909d2b067529ab02bd686c61adb8a175063e481d802ad33d308ef49fa"),
+         "fa40b2a909d2b067529ab02bd686c61adb8a175063e481d802ad33d308ef49fa",
+         _INTERFERENCE_MODES_LOAD_SOURCE),
         # Interim versions also applied a post-preparation cutoff to Load.
         ("113325dd5cffa04626cc7be7ee93bc6e9be67335531288bc329b3542a155c92a",
          "788f4c8f0b14421d5fc00f8b32c0ffcef79c04c647730767cb44b16584ed4aa4",
@@ -504,13 +514,22 @@ def _same_load_workload(current: dict, old: dict, *, fingerprint_key: str = "wor
         fields = _baseline_workload_fields(resolved.checks, shared=shared)
         if "load_test" not in fields or "multi_user" in fields:
             return False  # The Multi-user bridge attests the exact Load source.
+        if resolved.load_test.workloads.interference.mode != "long_input_during_short":
+            return False  # Historical sources did not implement the reverse experiment.
         recorded = manifest.get("fixture_pack", {}).get(fingerprint_key)
         attestations = set()
         for index, sources in enumerate(families):
             for revision in revisions:
                 identity = _run_limits_workload_identity(manifest, revision=revision, include_load=True, shared=shared)
-                if identity is None or not any(fixture_hash({**identity, "load_test_source_sha256": source}) == recorded
-                                               for source in sources):
+                if identity is None:
+                    continue
+                fingerprints = {fixture_hash({**identity, "load_test_source_sha256": source})
+                                for source in sources}
+                historical = deepcopy(identity)
+                historical["settings"]["load_test"]["workloads"]["interference"].pop("mode", None)
+                fingerprints.update(fixture_hash({**historical, "load_test_source_sha256": source})
+                                    for source in sources if source != _INTERFERENCE_MODES_LOAD_SOURCE)
+                if recorded not in fingerprints:
                     continue
                 # The generator and Load source are attested by the family.
                 # Specialist sources and settings must still match exactly.
@@ -1127,6 +1146,12 @@ _LOAD_POINT_FIELDS = ("source", "type", "workload", "shape", "pattern", "level",
 def _load_work_comparison(current, old, *, compare_stream_options=True):
     if not current or not old:
         return "Request samples are absent from one run.", False
+    modes = [{point.get("interference_mode") or "long_input_during_short"
+              for record in records if (point := record.load_point or {}).get("pattern") == "interference"
+              or point.get("type") == "interference" or point.get("interference_mode") is not None}
+             for records in (current, old)]
+    if modes[0] != modes[1]:
+        return "Interference modes differ.", False
     cohorts = []
     for records in (current, old):
         groups = defaultdict(list)
@@ -2752,7 +2777,8 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                 load_point = ({field: point_records[0].load_point.get(field) for field in (*_LOAD_POINT_FIELDS, "point_id")}
                               if check == "load" and point_records else None)
                 if load_point and load_point["pattern"] == "interference":
-                    load_point.update({field: point_records[0].load_point.get(field) for field in ("phase", "role")})
+                    load_point.update({field: point_records[0].load_point.get(field)
+                                       for field in ("phase", "role", "interference_mode")})
                 # Requested shape is checked too, rather than relying on configuration alone.
                 def shapes(records: list[RequestRecord]) -> dict[tuple, Fraction]:
                     counts = Counter((r.fixture_id, r.input_chars, r.requested_max_tokens, r.stream)
@@ -3753,7 +3779,9 @@ def _comparison_load_label(point):
     from .load_test import LOAD_TITLES
 
     shape, pattern = point.get("shape") or point.get("workload"), point.get("pattern")
-    label = load_shape_label(shape) if shape in SHAPES else LOAD_TITLES.get(point.get("type"), str(shape))
+    short_during_long = point.get("interference_mode") == "short_during_long"
+    label = ("Short request during an active long answer" if short_during_long else
+             load_shape_label(shape) if shape in SHAPES else LOAD_TITLES.get(point.get("type"), str(shape)))
     traffic = {"constant": "constant arrivals", "poisson": "Poisson arrivals", "bursts": "bursts",
                "interference": "short-answer comparison"}.get(pattern, str(pattern))
     if pattern == "concurrent":
@@ -3766,7 +3794,11 @@ def _comparison_load_label(point):
     if point.get("source") and point["source"] != "primary":
         label += " · " + point["source"].replace("_", " ").capitalize()
     if pattern == "interference":
-        phase = "Long-input probe" if point.get("role") == "probe" else {"baseline": "Short-only control", "probe": "During long-input probe"}.get(point.get("phase"))
+        if short_during_long:
+            phase = ("Long-answer background" if point.get("role") == "long_stream" else
+                     {"baseline": "Short-only control", "probe": "During a long answer"}.get(point.get("phase")))
+        else:
+            phase = "Long-input probe" if point.get("role") == "probe" else {"baseline": "Short-only control", "probe": "During long-input probe"}.get(point.get("phase"))
         if phase:
             label += " · " + phase
     return label

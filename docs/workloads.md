@@ -120,13 +120,49 @@ The four `load_test.workloads` options are:
 - `mixed`: seeded request-frequency choices from at least two selected shapes,
   with equal shares or positive custom shares totaling 100%. Reports retain the
   requested and observed mix.
-- `interference`: replenished short streams compared across a full baseline window
-  and a full long-input probe window (2D per eligible concurrency level). Probes
-  wait for streaming to start or for five chunks, according to `trigger`.
+- `interference`: short-answer performance compared across a full short-only baseline
+  window and a full interference window (2D per eligible concurrency level).
+  The default `mode: long_input_during_short` introduces long inputs after short
+  answers start streaming. `mode: short_during_long` sends short requests after
+  long answers start streaming. `trigger` selects `streaming_started` or
+  `after_five_chunks` for the active answers in either mode.
 - `stress`: selected `long_short`, `short_long` or `long_long` cases. Long-output
   coverage requires `ceil(profile.long.output_tokens × min_output_percent / 100)`
   tokens in every valid response: 80% of the default 512-token cap is 410.
   Coverage alone never passes; early endings leave coverage inconclusive.
+
+To measure how an active long answer affects a new short request, use this
+interference-only configuration alongside your endpoint settings:
+
+```yaml
+checks: [load]
+stream: true
+concurrency: 2
+load_test:
+  workloads:
+    combinations:
+      enabled: false
+    interference:
+      enabled: true
+      mode: short_during_long
+      trigger: streaming_started
+      max_slowdown: 1.5
+  patterns:
+    concurrent:
+      levels: [2]
+    constant:
+      enabled: false
+```
+
+This mode uses short inputs requesting long outputs, then sends short-input,
+short-output probes while those answers are still active. The report compares
+the short requests' first-answer and completion times with the same short work
+running alone. If the server queues a short request until the long answer ends,
+that wait remains part of its measured delay. Only dispatch must occur during
+the long stream; the two answers do not need to stream simultaneously. Long-answer
+coverage requires endpoint-reported output tokens above `profile.short.output_tokens`;
+the Long output setting remains a cap. Missing streaming progress, early completion
+or insufficient measured long-output coverage can leave the comparison inconclusive.
 
 The shared `profile` defaults to input token targets 128/512/2048 and output caps
 64/256/512 for Short/Medium/Long. New profiles require strictly increasing sizes.
