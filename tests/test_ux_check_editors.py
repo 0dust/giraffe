@@ -205,7 +205,7 @@ config.test_options.correctness={samples:9};updateCheckFieldHints(config);assert
 assert.equal(testSettingsLabel(check,config),'Overrides');
 delete config.test_options.correctness;updateCheckFieldHints(config);assert.equal(reset.hidden,true);
 config.checks.push('load');markup=renderTestCard(check,config);
-assert.match(markup,/question-source-scope">Load test uses this question source too/);
+assert.doesNotMatch(markup,/question-source-scope/);
 assert.equal((markup.match(/name="request_source"/g)||[]).length,2);
 """)
 
@@ -233,7 +233,7 @@ assert.match(markup,/What is 2 \+ 2\?/);assert.match(markup,/<code>4<\/code>/);
 assert.doesNotMatch(markup,/Questions &amp; expected answers|Known-answer questions are ready|Ready to use|Add or import a dataset/);
 assert.match(markup,/id="field-request_source-help"[^>]*popover="auto"/);
 assert.match(markup,/Switching sources keeps your saved questions/);
-assert.match(markup,/Load test uses the same question source when selected/);
+assert.match(markup,/Answer correctness and Load test use the same saved questions/);
 assert.doesNotMatch(markup,/Each saved question runs once/);
 assert.equal(JSON.stringify(config),original);
 """)
