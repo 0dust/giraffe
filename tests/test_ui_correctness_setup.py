@@ -14,7 +14,7 @@ CORRECTNESS_FORM = (FORM.replace("config.checks=['load']", "config.checks=['corr
                     .replace("testSettings:'load'", "testSettings:'correctness'"))
 
 
-def test_correctness_controls_show_one_definition_effective_defaults_and_full_builtin_preview():
+def test_correctness_controls_keep_setup_compact_and_builtin_preview_available_to_management():
     result = browser_logic(r'''
 const check=bootstrap.checks.find(check=>check.id==='correctness');
 config.checks=['correctness'];
@@ -24,7 +24,10 @@ state.requestPreview.plan.rows=[{id:'correctness',requests_per_target:null,kind:
 assert.match(effectiveCheckSummary(check,local),/At least 6 requests/);
 assert.match(renderBuiltinQuestions(local),/Additional configured cases can increase the request count/);
 state.requestPreview.plan.rows=[{id:'correctness',requests_per_target:6}];
-console.log(JSON.stringify({markup:renderTestCard(check,config),summary:effectiveCheckSummary(check,config),builtins:bootstrap.builtin_questions}));
+const loadOnly={...config,checks:['load'],load_test:structuredClone(bootstrap.load_test.defaults)};
+loadOnly.load_test.pass_criteria.min_correct_percent=85;
+assert.match(renderQuestionSetupSummary(loadOnly),/85%/);
+console.log(JSON.stringify({markup:renderTestCard(check,config),summary:effectiveCheckSummary(check,config),builtins:bootstrap.builtin_questions,preview:renderBuiltinQuestions(config)}));
 ''')
     tree = Markup(result['markup'])
     assert result['summary'] == '6 requests · Up to 4 in progress · 100% correct required'
@@ -48,9 +51,11 @@ console.log(JSON.stringify({markup:renderTestCard(check,config),summary:effectiv
         assert result['markup'].index(inheritance) < result['markup'].index(f'name="test_correctness_{name}"')
     assert len(result['builtins']) == 3
     for item in result['builtins']:
-        assert item['question'] in next(node['text'] for node in tree.nodes if node.get('class') == 'builtin-example')
+        assert item['question'] not in result['markup']
+        assert item['question'] in next(node['text'] for node in Markup(result['preview']).nodes if node.get('class') == 'builtin-example')
     assert '3 built-in questions' in result['markup']
-    assert 'View questions and expected answers' in result['markup']
+    assert 'Manage questions' in result['markup']
+    assert 'View questions and expected answers' not in result['markup']
     assert 'The suite value is a default' not in result['markup']
 
 

@@ -103,6 +103,24 @@ hr { border: 0; border-top: 1px solid var(--line); margin: 22px 0; }
 dl { margin: 0; } dt { color: var(--text-2); } dd { margin: 0; }
 ul, ol { margin: 0; }
 [hidden] { display: none !important; }
+
+.setup-workspace { max-width: 1120px; margin: 0 auto; padding-bottom: 40px; }
+.workspace-heading { display: flex; flex-direction: column; align-items: flex-start; gap: 16px; margin-bottom: 28px; }
+.workspace-heading h1 { margin: 0; }
+.workspace-actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 12px; margin-top: 28px; }
+.setup-workspace .dialog-body { padding: 0; max-height: none; overflow: visible; }
+.setup-workspace .dialog-footer { padding: 24px 0 0; border: 0; }
+.setup-workspace .judging-editor { max-width: 760px; }
+.question-setup-status { margin: 16px 0; display: grid; gap: 8px; }
+.question-setup-status > div { display: flex; justify-content: space-between; align-items: baseline; gap: 16px; }
+.question-setup-status dt { color: var(--text-2); }
+.question-setup-status dd { margin: 0; text-align: right; }
+.question-filters { margin: 24px 0; }
+@media (max-width: 600px) {
+  .question-setup-status > div { flex-wrap: wrap; gap: 4px 12px; }
+  .question-setup-status dd { text-align: left; }
+  .workspace-actions > .button { flex: 1; }
+}
 ::selection { background: var(--accent); color: var(--accent-ink); }
 button, input, select, textarea { font: inherit; color: inherit; }
 button { cursor: pointer; }
