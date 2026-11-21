@@ -1,7 +1,5 @@
 """Question editing and imports explain their contracts without changing them."""
 
-import json
-
 from giraffe.dataset_import import preview_dataset
 from tests.test_run_limits_phase6_ui import Markup
 from tests.test_ux_catalogue import browser_logic
@@ -78,29 +76,24 @@ assert.match(nodes['#dataset-error'].textContent,/JSON string reference/);
 ''')
 
 
-def test_import_guidance_samples_and_conversation_example_are_valid_before_upload():
+def test_import_area_only_shows_downloadable_valid_samples():
     result = browser_logic(r'''
 const before=JSON.stringify(config);
-const markup=renderDatasetImportHelp(config),csv=datasetImportSample('csv'),json=datasetImportSample('json'),conversation=datasetConversationExample();
+const markup=renderDatasetImportHelp(config),csv=datasetImportSample('csv'),json=datasetImportSample('json');
 assert.equal(JSON.stringify(config),before);assert.equal(datasetImportSample('unknown'),null);
-console.log(JSON.stringify({markup,csv,json,conversation}));
+console.log(JSON.stringify({markup,csv,json}));
 ''')
     markup = result['markup']
-    assert 'One question and expected answer per row. Choose their columns after uploading.' in markup
-    assert '1 MiB / 1,000 questions' in markup
-    for label in ('Download sample CSV', 'Download sample JSON', 'View format example',
-                  'Advanced JSON format'):
+    for text in ('One question and expected answer per row.', 'Limit: 1 MiB / 1,000 questions.',
+                 'View format example', 'Advanced JSON format'):
+        assert text not in markup
+    for label in ('Download sample CSV', 'Download sample JSON'):
         assert label in markup
     for format in ('csv', 'json'):
         parsed = preview_dataset(result[format]['text'], format,
                                  input_field='question', expected_field='answer', scorer='exact')
         assert not parsed['errors']
         assert [case['expected'] for case in parsed['request_pack']['cases']] == ['4', 'Paris']
-    parsed = preview_dataset(json.dumps(result['conversation']), 'json')
-    assert not parsed['errors']
-    case, = parsed['request_pack']['cases']
-    assert case['expected'] == '30'
-    assert [message['role'] for message in case['messages']] == ['system', 'user', 'assistant', 'user']
 
 
 def test_sample_downloads_use_only_fixed_content_and_release_the_object_url():

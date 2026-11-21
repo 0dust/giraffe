@@ -64,7 +64,7 @@ config.checks=['correctness'];config.request_source='request_pack';config.reques
 config.test_options.correctness={samples:9,concurrency:2};
 const markup=renderTestCard(bootstrap.checks.find(x=>x.id==='correctness'),config);
 assert.doesNotMatch(markup,/name="test_correctness_(samples|concurrency|max_output_tokens|request_timeout_seconds)/);
-assert.match(markup,/Add questions to calculate their execution plan/);
+assert.doesNotMatch(markup,/Add questions to calculate their execution plan|Updating the question execution plan/);
 assert.doesNotMatch(markup,/per-check request-setting overrides/i);
 assert.match(markup,/name="test_correctness_limit_min_correctness"/);
 assert.equal(config.test_options.correctness.samples,9);

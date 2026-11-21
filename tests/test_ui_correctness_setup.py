@@ -87,11 +87,13 @@ def test_question_execution_refreshes_after_edits_success_errors_and_cold_start_
     plans = json.dumps({timeout: request_plan(config.model_copy(update={'request_timeout_seconds': timeout}))
                        for timeout in (300, 40, 50)})
     browser_logic('const plans=' + plans + r''';const plan=timeout=>plans[timeout];
-const panel={innerHTML:''};nodes['[data-correctness-execution]']=panel;
+const realSyncInlineErrors=syncInlineErrors;
+const panel={innerHTML:'',dataset:{},attributes:{},getAttribute(name){return this.attributes[name]||'';},setAttribute(name,value){this.attributes[name]=value;},removeAttribute(name){delete this.attributes[name];},focus(){this.focused=true;}};
+nodes['[data-correctness-execution]']=panel;nodes['#field-request_pack_correctness']=panel;nodes['#field-request_pack_correctness-error']={};
 syncInlineErrors=()=>{};renderRequestPlan=()=>{};syncLoadDisplay=()=>{};acceptMigrationNotes=()=>{};localSettingErrors=()=>[];
 readForm=()=>({config,mode:'cold-start',restart_target:'local'});
 state.requestPreview={status:'current',revision:state.configRevision,route:state.routeVersion,config:{...config,restart_target:'local'},plan:plan(300)};
-renderRequestPreview();assert.match(panel.innerHTML,/300 seconds/);
+renderRequestPreview();assert.match(panel.innerHTML,/300 seconds/);assert.equal(panel.hidden,false);
 config.request_timeout_seconds=40;configChanged();
 assert.match(panel.innerHTML,/Updating/);assert.doesNotMatch(panel.innerHTML,/300 seconds/);
 api=async()=>({config:{...config,restart_target:'local'},request_plan:plan(40)});
@@ -105,7 +107,15 @@ api=async()=>{throw new Error('invalid settings');};
 await assert.rejects(refreshRequestPreview(config,{draft:true}),/invalid settings/);
 assert.match(panel.innerHTML,/plan unavailable/);assert.doesNotMatch(panel.innerHTML,/Updating/);
 assert.match(renderCorrectnessExecution({...config,checks:['load']}),/Select Answer correctness/);
-assert.match(renderCorrectnessExecution({...config,request_pack:{cases:[]}}),/Add questions/);
+assert.equal(renderCorrectnessExecution({...config,request_pack:{cases:[]}}),'');
+updateCorrectnessExecution({...config,request_pack:{cases:[]}});assert.equal(panel.hidden,true);
+updateCorrectnessExecution(config);assert.equal(panel.hidden,false);assert.match(panel.innerHTML,/plan unavailable/);
+updateCorrectnessExecution({...config,request_pack:{cases:[]}});
+state.requestPreview.errors=[{fields:['test_options.correctness.samples'],msg:'Per-check request overrides are unavailable.'}];
+realSyncInlineErrors();assert.equal(panel.hidden,false);
+updateCorrectnessExecution({...config,request_pack:{cases:[]}});assert.equal(panel.hidden,false);
+revealSetupStep=revealCatalogueCheck=()=>{};focusSetting('test_options.correctness.samples');assert.equal(panel.focused,true);
+state.requestPreview.errors=[];realSyncInlineErrors();assert.equal(panel.hidden,true);
 ''', config)
 
 
@@ -116,7 +126,8 @@ def test_my_questions_uses_backend_pass_counts_and_load_timeout_without_claiming
                        request_pack={'version': 1, 'cases': [{'fixture_id': 'one', 'messages': [{'role': 'user', 'content': 'Q'}], 'scorer': 'exact', 'expected': 'A'}]})
     plan = json.dumps(request_plan(config))
     result = browser_logic('state.requestPreview={status:"current",revision:state.configRevision,route:state.routeVersion,plan:' + plan + r'''};
-console.log(JSON.stringify({execution:renderCorrectnessExecution(config),summary:effectiveCheckSummary(bootstrap.checks.find(check=>check.id==='correctness'),config),markup:renderTestCard(bootstrap.checks.find(check=>check.id==='correctness'),config)}));
+const check=bootstrap.checks.find(check=>check.id==='correctness');
+console.log(JSON.stringify({execution:renderCorrectnessExecution(config),summary:effectiveCheckSummary(check,config),markup:renderTestCard(check,config),emptyMarkup:renderTestCard(check,{...config,request_pack:{cases:[]}})}));
 ''', config)
     assert '1 request in an individual-question pass, one at a time' in result['execution']
     assert 'selected Load test traffic' in result['execution']
@@ -126,6 +137,9 @@ console.log(JSON.stringify({execution:renderCorrectnessExecution(config),summary
     assert 'each once' not in result['summary']
     assert 'These questions and answer checks are shared with Load test.' in result['markup']
     assert 'per-check request-setting overrides' not in result['markup']
+    tree = Markup(result['emptyMarkup'])
+    execution, = [node for node in tree.nodes if 'data-correctness-execution' in node]
+    assert 'hidden' in execution
 
 
 def test_evaluator_help_distinguishes_its_model_and_limits_without_capacity_policy_copy():

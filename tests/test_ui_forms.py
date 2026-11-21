@@ -1216,7 +1216,7 @@ readForm=()=>({config:structuredClone(state.config),mode:'normal'});captureFormD
 renderNew=()=>{state.jsonDraft=state.jsonBase='synced';};toast=()=>{};setActive=id=>{state.active=id;};
 const pack={version:1,cases:[{fixture_id:'one',messages:[{role:'user',content:'<question>'}],scorer:'judge',expected:'<answer>',weight:1}]};
 changeRequestSource('request_pack');assert.equal(state.config.request_source,'request_pack');assert.equal(state.config.request_pack,null);assert(!nodes['#request-pack-file'].clicked);
-let markup=renderRequestSource(state.config);assert.match(markup,/My questions/);assert.match(markup,/Add your first question/);assert(!markup.includes('dataset-bulk-scorer'));
+let markup=renderRequestSource(state.config);assert.match(markup,/My questions/);assert.match(markup,/data-action="add-example"/);assert.doesNotMatch(markup,/Add your first question|Enter a question and its expected answer, or use the sample questions to get started/);assert(!markup.includes('dataset-bulk-scorer'));
 const calls=[];api=async(path,options)=>{calls.push({path,body:JSON.parse(options.body)});if(path==='/api/datasets/preview')return {columns:[],preview_rows:pack.cases,request_pack:pack,errors:[],needs_mapping:false};if(path==='/api/config/draft')return {config:JSON.parse(options.body)};throw Error('Unexpected endpoint');};
 await importRequestPack({name:'examples.json',size:20,text:async()=>JSON.stringify(pack)});
 assert.equal(state.config.request_pack,null);assert.equal(calls.length,1);assert.equal(calls[0].path,'/api/datasets/preview');assert(nodes['#dataset-dialog'].open);
