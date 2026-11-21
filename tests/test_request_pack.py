@@ -7,7 +7,7 @@ from pydantic import ValidationError
 
 from giraffe.models import ConfigDraft, RequestPack, RunConfig, Target, TrafficConfig
 from giraffe.request_pack import (active_pack, case_sequence, load_request_pack,
-                                  pack_identity, pack_preview, pack_specs)
+                                  pack_identity, pack_preview, pack_settings, pack_specs)
 
 
 def case(fixture_id="one", **updates):
@@ -26,6 +26,44 @@ def config(cases=None, **updates):
                 "poisson": {"enabled": traffic.arrival == "poisson", "seed": traffic.seed},
                 "rates": traffic.rates},
             "schedule": {"duration_seconds": math.ceil(traffic.duration_seconds)}}, **updates)
+
+
+@pytest.mark.parametrize("checks,ceiling,shared,repeated,parallelism,timeout", [
+    (["correctness"], 128, None, 4, 4, 19),
+    (["correctness"], 2, None, 2, 2, 19),
+    (["correctness", "load"], 128, "load", None, None, 73),
+    (["correctness", "capacity"], 128, "load", None, None, 19),
+])
+def test_correctness_execution_metadata_tracks_phases_and_actual_request_sources(checks, ceiling, shared, repeated, parallelism, timeout):
+    configured = RunConfig(targets=[{"name": "local", "url": "http://localhost", "model": "test"}],
+        checks=checks, concurrency=ceiling, request_source="request_pack",
+        request_pack={"version": 1, "cases": [case("z", max_tokens=17), case("a")]},
+        request_timeout_seconds=19, max_output_tokens=96, load_test={"request_timeout_seconds": 73})
+    before = configured.model_dump_json()
+    execution = pack_settings(configured)["execution"]
+    assert execution["active"] and execution["quiet_requests"] == 2 and execution["quiet_concurrency"] == 1
+    assert execution["repeated_requests"] == repeated and execution["shared_with"] == shared
+    assert execution["concurrency"] == {"value": parallelism, "source": "load_test" if shared else "default_concurrency",
+                                         "limited_by": "concurrency" if ceiling == 2 else None}
+    assert execution["request_timeout_seconds"] == {"value": timeout,
+        "source": "load_test.request_timeout_seconds" if shared else "request_timeout_seconds"}
+    assert execution["max_output_tokens"] == {"value": 96, "source": "max_output_tokens"}
+    assert execution["case_output_limits"] == [
+        {"fixture_id": "z", "value": 17, "source": "request_pack.cases.0.max_tokens"},
+        {"fixture_id": "a", "value": 96, "source": "max_output_tokens"},
+    ]
+    actual = {spec.workload["case_id"]: spec for spec in pack_specs(configured)}
+    for setting in execution["case_output_limits"]:
+        assert actual[setting["fixture_id"]].max_tokens == setting["value"]
+        assert actual[setting["fixture_id"]].request_timeout_seconds == execution["request_timeout_seconds"]["value"]
+    from giraffe.planning import request_plan
+    plan = request_plan(configured)
+    assert plan["request_settings"]["correctness"]["execution"] == execution
+    counts = {row["id"]: row["requests_per_target"] for row in plan["rows"]}
+    assert counts["pack_control"] == execution["quiet_requests"]
+    if not shared:
+        assert counts["pack_loaded"] == repeated
+    assert configured.model_dump_json() == before
 
 
 @pytest.mark.parametrize("updates", [

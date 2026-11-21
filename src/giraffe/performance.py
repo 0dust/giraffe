@@ -118,6 +118,61 @@ def completion_buckets(records, start_ms, end_ms):
 
 _PERFORMANCE_CHECKS = {"load", "concurrency", "capacity", "arrivals", "sessions", "multi_user", "buckets"}
 
+_FORMER_CHECK_NAMES = {
+    "access": ("Endpoint access",), "serving": ("Invalid responses",),
+    "first_output": ("Time to first answer",), "generation": ("Generation speed",),
+    "context": ("Long-context recall",), "cancellation": ("Cancellation & limits",),
+    "prefix": ("Prefix cache",), "sessions": ("Multi-turn sessions",), "tools": ("Tool calling",),
+}
+
+
+def _display_performance_names(value):
+    """Refresh generated names in a display payload without changing saved data."""
+    from .conditions import condition_for
+    from .models import CHECK_NAMES
+
+    for target in value.get("targets", []):
+        renamed = {}
+        for cohort in target.get("cohorts", []):
+            check, label, scenarios = cohort.get("check"), cohort.get("label"), cohort.get("scenarios")
+            if check not in CHECK_NAMES or not isinstance(label, str) or not isinstance(scenarios, list) or not scenarios:
+                continue
+            current = CHECK_NAMES[check]
+            names = (current, *_FORMER_CHECK_NAMES.get(check, ()))
+            display = label
+            if all(scenario == check for scenario in scenarios):
+                default = condition_for(check, {})["label"]
+                if label in (*names, default, *(name + " · " + default for name in names)):
+                    display = current + (" · Recovery check" if check == "recovery" else "")
+            elif check == "json" and all(isinstance(scenario, str) and re.fullmatch(r"json_c\d+", scenario) for scenario in scenarios):
+                if label in (*names, "Structured JSON"):
+                    display = current
+            elif check == "sessions" and all(isinstance(scenario, str) and re.fullmatch(r"session_.+", scenario) for scenario in scenarios):
+                for name in names:
+                    if label.startswith(name + " · "):
+                        display = current + label[len(name):]
+                        break
+            if display != label:
+                cohort["label"] = display
+                renamed[cohort["id"]] = label, display
+        windows = [*target.get("windows", []), *(summary.get("window", {}) for summary in target.get("summaries", {}).values())]
+        for window in windows:
+            old, new = renamed.get(window.get("cohort_id"), (None, None))
+            if old is None or window.get("workload_label") != old:
+                continue
+            window["workload_label"] = new
+            selection = window.get("selection_label")
+            scope = "full run" if window.get("kind") == "full" else ("Drain" if window.get("includes_drain") else f"Stage {window.get('label')}")
+            count = window.get("request_count")
+            if not isinstance(selection, str) or not isinstance(count, int) or window.get("kind") not in {"full", "stage"}:
+                continue
+            generated = (re.escape(old + " · " + scope + " (")
+                         + r"(?:-?[\d,]+(?:\.\d+)?–-?[\d,]+(?:\.\d+)? s|timing not measured)"
+                         + re.escape(f", {count:,} requests)"))
+            if re.fullmatch(generated, selection):
+                window["selection_label"] = new + selection[len(old):]
+    return value
+
 
 def _cohort(record):
     """Comparable workload identity; schedule level/rate is a window, not a cohort.
@@ -912,7 +967,7 @@ def build_performance(report, *, target=None, window=None):
             records = sorted((r for r in report.requests if r.target == entry["target"] and r.identity is None),
                              key=lambda r: (r.dispatch_ms is None, r.dispatch_ms or 0, r.started_at, r.id))
             entry["request_series"] = _request_series(records)
-        return stored
+        return _display_performance_names(stored)
     requested_window = window
     config_targets = report.manifest.get("config", {}).get("targets", [])
     names = list(dict.fromkeys([t["name"] for t in config_targets if t.get("name")] + [r.target for r in report.requests]))
@@ -1010,9 +1065,9 @@ def build_performance(report, *, target=None, window=None):
             full_series_summary_window=selected_window if descriptor["kind"] == "full" and len(group) == len(records) else None,
             schedule_transitions=observation.get("schedule_transitions", []),
             scope_note="Headlines use one comparable workload across its recorded load stages; shapes, sources and control/probe roles remain separate. Every request remains in the dispatch-ordered series; observed throughput does not establish capacity."))
-    return dict(performance_schema=PERFORMANCE_SCHEMA, timing_schema=1,
+    return _display_performance_names(dict(performance_schema=PERFORMANCE_SCHEMA, timing_schema=1,
                 percentile_convention=PERCENTILES, default_target=names[0] if names else None,
-                selected_target=selected, available_targets=available, targets=targets)
+                selected_target=selected, available_targets=available, targets=targets))
 
 
 def refresh_performance(report, *, force=False):

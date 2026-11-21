@@ -239,7 +239,7 @@ const markup=renderSessionEditor(config);
 assert.match(markup,/name="profile_sessions_concurrency"[^>]*value="2"/);
 const first=bootstrap.checks.find(check=>check.id==='first_output');
 assert.match(renderTestCard(first,config),/name="test_first_output_request_timeout_seconds"[^>]*value="60"[^>]*readonly/);
-assert.match(renderTestCard(first,config),/Endpoint response owns this shared request setting/);
+assert.match(renderTestCard(first,config),/Response validity owns this shared request setting/);
 const input={name:'test_first_output_request_timeout_seconds',value:'30',dataset:{inherited:'true'}};
 nodes['#new-run-form']={elements:{test_first_output_request_timeout_seconds:input}};
 updateCheckFieldHints(config);assert.equal(input.value,60);assert.equal(input.readOnly,true);
@@ -430,7 +430,8 @@ def test_request_pack_inherited_notice_never_offers_a_forbidden_override():
 const plan=PLAN,markup=renderRunBlueprint(config,plan);
 assert.match(markup,/inherits 4 at once/);assert.match(markup,/Raise limit/);assert.match(markup,/Edit default concurrency \(JSON\)/);
 assert.doesNotMatch(markup,/data-action="use-check-concurrency"/);
-assert.match(renderTestCard(bootstrap.checks.find(check=>check.id==='correctness'),config),/Concurrency: 2 \(default\)/);
+state.requestPreview={status:'current',revision:state.configRevision,route:state.routeVersion,plan};
+assert.match(renderTestCard(bootstrap.checks.find(check=>check.id==='correctness'),config),/Maximum requests in progress: 2 · run default · limited by Run limits/);
 assert.equal(Object.keys(config.test_options).length,0);
 """.replace('PLAN', json.dumps(plan)), cfg)
 

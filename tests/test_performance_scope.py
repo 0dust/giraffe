@@ -1,7 +1,12 @@
 """Comparable performance workloads span schedule stages, never quality roles."""
+import json
+from copy import deepcopy
+
 import pytest
 
-from giraffe.performance import build_performance
+from giraffe.conditions import condition_for
+from giraffe.models import CHECK_NAMES
+from giraffe.performance import _cohort_label, build_performance
 from tests.performance_fixture import synthetic_report_1000
 from tests.test_performance import record, report
 
@@ -52,7 +57,7 @@ def test_default_prefers_largest_valid_performance_workload_then_earliest():
     assert data['metrics']['completed']['value'] == 2
     assert data['window']['workload_label'] == 'Load test · Short → Short'
     assert len(target['cohorts']) == 3
-    assert any(window['workload_label'] == 'Generation speed' for window in target['windows'])
+    assert any(window['workload_label'] == 'Generation' for window in target['windows'])
     rows.append(load_record('long-b', level=8, start=4000, shape='long_short'))
     assert selected(report(rows))[1]['window']['request_count'] == 3  # valid-count tie chooses earliest
 
@@ -67,6 +72,123 @@ def test_old_valid_completions_rank_workloads_even_without_lifetime_timing():
     assert data['window']['request_count'] == 2
     assert data['metrics']['request_throughput']['value'] is None
     assert data['window']['workload_label'] == 'Load test · Long → Short'
+
+
+@pytest.mark.parametrize('check', list(CHECK_NAMES))
+def test_whole_check_cohorts_use_current_names_without_rewriting_saved_conditions(check):
+    row = record().model_copy(update={'scenario': check, 'check_ids': [check], 'condition_id': check})
+    condition = condition_for(check, {})
+    value = report([row], observations={'targets': {'t': {'conditions': [{'condition': condition}]}}})
+    saved = json.dumps(value.observations, sort_keys=True)
+    target, data = selected(value)
+    cohort, = target['cohorts']
+    expected = CHECK_NAMES[check] + (' · Recovery check' if check == 'recovery' else '')
+    assert cohort['label'] == expected
+    assert data['window']['workload_label'] == expected
+    assert target['default_window'] == 'full:' + cohort['id']
+    assert data['metrics']['attempted']['value'] == 1
+    assert data['metrics']['completed']['value'] == 1
+    assert data['request_row_indices'] == [0]
+    assert json.dumps(value.observations, sort_keys=True) == saved
+    assert value.requests[0].scenario == check and value.requests[0].condition_id == check
+    cached = deepcopy(value.performance)
+    cached_target = cached['targets'][0]
+    cached_target['cohorts'][0]['label'] = condition['label']
+    for window in [*cached_target['windows'], *(summary['window'] for summary in cached_target['summaries'].values())]:
+        window['workload_label'] = condition['label']
+        if window['selection_label'].startswith(expected + ' · '):
+            window['selection_label'] = condition['label'] + window['selection_label'][len(expected):]
+    restored = report([row], performance=cached)
+    assert restored.performance['targets'][0]['cohorts'][0]['label'] == expected
+    assert cached_target['cohorts'][0]['label'] == condition['label']
+
+
+@pytest.mark.parametrize('scenario,check,saved_label,expected', [
+    ('generation', 'generation', None, 'Generation'),
+    ('generation', 'generation', 'Generation speed · 8 at once', 'Generation'),
+    ('generation', 'generation', 'Custom passage', 'Custom passage'),
+    ('first_output', 'first_output', 'Custom startup', 'Custom startup'),
+    ('prefix_shared', 'prefix', None, 'Shared prefix'),
+    ('client_deadline', 'cancellation', None, 'Client deadline'),
+    ('warm', 'serving', None, 'Warm-up'),
+])
+def test_cohort_names_preserve_custom_labels_and_distinct_phases(scenario, check, saved_label, expected):
+    row = record().model_copy(update={'scenario': scenario, 'check_ids': [check], 'condition_id': scenario})
+    conditions = [{'condition': {'id': scenario, 'label': saved_label}}] if saved_label else []
+    value = report([row], observations={'targets': {'t': {'conditions': conditions}}})
+    target, data = selected(value)
+    assert target['cohorts'][0]['label'] == expected
+    assert data['window']['workload_label'] == expected
+    assert value.observations['targets']['t']['conditions'] == conditions
+
+
+def test_saved_custom_subphase_label_does_not_parse_its_scenario_again():
+    scenario = 'load_primary_custom_r1e-'
+    row = record().model_copy(update={'scenario': scenario, 'check_ids': ['load'], 'condition_id': scenario})
+    observation = {'conditions': [{'condition': {'id': scenario, 'label': 'Imported workload'}}]}
+    assert _cohort_label([row], observation) == ('load', 'Load test · Imported workload')
+
+
+def archived_performance_names():
+    rows = [
+        ('generation', 'generation', 'Generation speed', ['generation']),
+        ('context', 'context', 'Long-context recall', ['context']),
+        ('json_c4', 'json', 'Structured JSON', ['json_c4']),
+        ('recovery_baseline', 'recovery', 'Recovery baseline', ['recovery_baseline']),
+        ('sustained', 'recovery', 'Sustained load', ['sustained']),
+        ('recovery', 'recovery', 'Recovery check', ['recovery']),
+        ('session_fixed:check=sessions', 'sessions', 'Multi-turn sessions · Fixed sessions', ['session_fixed_turn0', 'session_fixed_turn1']),
+        ('session_live:check=sessions', 'sessions', 'Multi-turn sessions · Live sessions', ['session_live_turn0', 'session_live_turn1']),
+        ('custom', 'generation', 'My custom workload', ['generation']),
+        ('custom_sessions', 'sessions', 'Recorded talks', ['session_fixed_turn0']),
+        ('unknown', 'future_check', 'Generation speed', ['generation']),
+    ]
+    cohorts = [dict(id=identifier, check=check, label=label, scenarios=scenarios) for identifier, check, label, scenarios in rows]
+    windows = [dict(id='full:' + row['id'], kind='full', cohort_id=row['id'], label='Full request window',
+                    workload_label=row['label'], selection_label=row['label'] + ' · full run (0–1 s, 6 requests)',
+                    request_count=6, start_ms=0, end_ms=1000) for row in cohorts]
+    windows += [dict(windows[0], id='custom-window', workload_label='Custom window', selection_label='Generation speed · custom label'),
+                dict(windows[0], id='custom-selection', selection_label='My selected view'),
+                dict(windows[0], id='prefixed-custom-selection', selection_label='Generation speed · my imported selection')]
+    summaries = {window['id']: {'window': deepcopy(window), 'metrics': {'throughput': {'value': 3.25, 'sample_count': 6}},
+                               'request_row_indices': [0, 1, 2, 3, 4, 5]} for window in windows}
+    target = dict(target='t', cohorts=cohorts, windows=windows, summaries=summaries,
+                  default_cohort='generation', default_window='full:generation', selected_window='full:generation', request_series=[])
+    return dict(performance_schema=1, targets=[target], default_target='t', selected_target='t',
+                available_targets=[{'target': 't'}])
+
+
+def test_archived_performance_names_change_only_display_copies():
+    source = archived_performance_names()
+    before = deepcopy(source)
+    value = report([], performance=source)
+    displayed = build_performance(value)
+    target = displayed['targets'][0]
+    labels = {row['id']: row['label'] for row in target['cohorts']}
+    assert labels == {
+        'generation': 'Generation', 'context': 'Context recall', 'json_c4': 'JSON correctness',
+        'recovery_baseline': 'Recovery baseline', 'sustained': 'Sustained load',
+        'recovery': 'Recovery after load · Recovery check',
+        'session_fixed:check=sessions': 'Concurrent conversations · Fixed sessions',
+        'session_live:check=sessions': 'Concurrent conversations · Live sessions',
+        'custom': 'My custom workload', 'custom_sessions': 'Recorded talks', 'unknown': 'Generation speed',
+    }
+    for window in target['windows']:
+        if window['id'] == 'custom-window':
+            assert window['workload_label'] == 'Custom window'
+            assert window['selection_label'] == 'Generation speed · custom label'
+        else:
+            assert window['workload_label'] == labels[window['cohort_id']]
+            custom = {'custom-selection': 'My selected view', 'prefixed-custom-selection': 'Generation speed · my imported selection'}
+            assert window['selection_label'] == custom.get(window['id'], labels[window['cohort_id']] + ' · full run (0–1 s, 6 requests)')
+        assert target['summaries'][window['id']]['window'] == window
+    def without_names(item):
+        if isinstance(item, dict):
+            return {key: without_names(value) for key, value in item.items() if key not in {'label', 'workload_label', 'selection_label'}}
+        return [without_names(value) for value in item] if isinstance(item, list) else item
+    assert without_names(displayed) == without_names(before)
+    assert source == before
+    assert build_performance(value) == displayed
 
 
 def test_shape_source_phase_and_role_stay_separate_when_levels_merge():

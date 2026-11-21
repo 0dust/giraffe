@@ -2488,10 +2488,11 @@ async def test_repeated_sse_headers_without_body_abort_hung_engine(monkeypatch):
 
 
 @pytest.mark.parametrize("overlap", [False, True])
-async def test_silent_target_stops_independently_and_healthy_target_finishes(monkeypatch, tmp_path, overlap):
+def test_silent_target_stops_independently_and_healthy_target_finishes(monkeypatch, tmp_path, overlap):
     import httpx
     from giraffe.reporting import write_report
     from tests.test_client import Chunks
+    from tests.virtual_clock import run_virtual
 
     streams = []
 
@@ -2506,23 +2507,27 @@ async def test_silent_target_stops_independently_and_healthy_target_finishes(mon
     mock_inference_transport(monkeypatch, handler)
     targets = [Target(name=name, model="test", url="http://" + name) for name in ("silent", "healthy")]
     events = []
-    report = await runner.run_suite(config(targets=targets, overlap_models=overlap, stream=False,
-        checks=["serving"], samples=8, stop_after_errors=100, request_timeout_seconds=.025,
-        unresponsive_after_failures=2, unresponsive_for_seconds=.03), progress=events.append)
-    assert report.abort_reason is None
-    assert report.overall != "pass"
-    assert check(report, "serving", "silent").status != "pass"
-    assert check(report, "serving", "healthy").status == "pass"
-    assert len([r for r in report.requests if r.target == "healthy"]) == 9
-    assert all(stream.closed for stream in streams)
-    reasons = report.observations["target_abort_reasons"]
-    assert list(reasons) == ["silent"] and "unresponsive" in reasons["silent"]
-    assert any(e["event"] == "target_stopping" and e["target"] == "silent"
-               and e["abort_reason"] == reasons["silent"] for e in events)
-    assert not any(e["event"] == "run_stopping" for e in events)
-    json_path, html_path = write_report(report, tmp_path, html=True)
-    assert json.loads(json_path.read_text())["observations"]["target_abort_reasons"] == reasons
-    assert reasons["silent"] in html_path.read_text()
+
+    async def scenario():
+        report = await runner.run_suite(config(targets=targets, overlap_models=overlap, stream=False,
+            checks=["serving"], samples=8, stop_after_errors=100, request_timeout_seconds=.025,
+            unresponsive_after_failures=2, unresponsive_for_seconds=.03), progress=events.append)
+        assert report.abort_reason is None
+        assert report.overall != "pass"
+        assert check(report, "serving", "silent").status != "pass"
+        assert check(report, "serving", "healthy").status == "pass"
+        assert len([r for r in report.requests if r.target == "healthy"]) == 9
+        assert all(stream.closed for stream in streams)
+        reasons = report.observations["target_abort_reasons"]
+        assert list(reasons) == ["silent"] and "unresponsive" in reasons["silent"]
+        assert any(e["event"] == "target_stopping" and e["target"] == "silent"
+                   and e["abort_reason"] == reasons["silent"] for e in events)
+        assert not any(e["event"] == "run_stopping" for e in events)
+        json_path, html_path = write_report(report, tmp_path, html=True)
+        assert json.loads(json_path.read_text())["observations"]["target_abort_reasons"] == reasons
+        assert reasons["silent"] in html_path.read_text()
+
+    run_virtual(monkeypatch, scenario())
 
 
 @pytest.mark.parametrize("scenario", ["traffic_stage_0", "sustained", "context", "context_calibration"])

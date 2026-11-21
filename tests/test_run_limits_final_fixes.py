@@ -17,14 +17,14 @@ def test_short_estimate_names_connection_risk_without_contradicting_headline():
     assert plan["unknown_time_components"] == []
     risk, = plan["time_warnings"]
     assert risk["msg"] == (
-        "Endpoint access for service may wait up to 30 s if the server is slow to respond; "
+        "Endpoint response for service may wait up to 30 s if the server is slow to respond; "
         "this allowance shares the time limit and is excluded from the estimated duration.")
     assert risk["fields"] == ["max_duration_seconds", "test_options.access.request_timeout_seconds"]
     assert [item["id"] for item in risk["components"]] == ["initial"]
     browser_logic("const plan=" + json.dumps(plan) + r""";
 const markup=renderPlanTime(plan);
 assert.match(markup,/Confidence: medium/);
-assert.match(markup,/Endpoint access for service may wait up to 30 s/);
+assert.match(markup,/Endpoint response for service may wait up to 30 s/);
 assert.doesNotMatch(markup,/estimated traffic duration may exceed|Unknown requests/);
 assert.match(markup,/data-setting-path="test_options.access.request_timeout_seconds"/);
 """)

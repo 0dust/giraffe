@@ -194,7 +194,7 @@ for traffic patterns, answer checks and configuration examples.
 
 ## Test multi-turn conversations
 
-Select **Multi-turn sessions** in the UI to test recall or conversation performance.
+Select **Concurrent conversations** in the UI to test recall or conversation performance.
 Choose fixed or dynamic pauses; performance runs can also vary new-message token
 lengths, output caps and turns per conversation with a reproducible seed.
 
@@ -237,32 +237,32 @@ The four defaults are `access, serving, correctness, first_output`; select addit
 
 | Check · CLI ID | What it checks |
 | --- | --- |
-| Endpoint access · `access` | Connection, authentication and ordinary inference |
+| Endpoint response · `access` | Connection, authentication and ordinary inference |
 | Response validity · `serving` | Complete, valid, nonempty responses |
-| Time to first answer · `first_output` | Time to the first useful answer |
-| Generation speed · `generation` | Answer rate, response time and stream pauses |
+| First answer · `first_output` | Time to the first useful answer |
+| Generation · `generation` | Answer rate, response time and stream pauses |
 | Load test · `load` | Correctness and timing under selected traffic patterns |
-| Long-context recall · `context` | Recall of known facts across long inputs |
+| Context recall · `context` | Recall of known facts across long inputs |
 | Answer correctness · `correctness` | Answers against expected values |
 | JSON correctness · `json` | Expected fields, types and values |
-| Cancellation & limits · `cancellation` | Caps, stop behavior, client cancellation and follow-up requests |
+| Cancellation & timeouts · `cancellation` | Caps, stop behavior, client cancellation and follow-up requests |
 | Recovery after load · `recovery` | Heavy traffic followed by matched light probes |
 | Scale-down continuity · `scale_down` | Active responses, backend draining and survivor capacity during one external replica removal |
 | GPU metrics · `gpu` | Available GPU telemetry |
-| Prefix cache · `prefix` | Reported cache reuse against independent controls |
-| Multi-turn sessions · `sessions` | Recall and timing across concurrent conversations |
+| Prompt cache evidence · `prefix` | Reported cache reuse against independent controls |
+| Concurrent conversations · `sessions` | Recall and timing across concurrent conversations |
 | Multi-user · `multi_user` | Persistent users sharing request slots, with individual delivery and timing outcomes |
 | Gateway quotas & priorities · `gateway_policy` | [Opt-in LiteLLM policy observations](https://github.com/0dust/giraffe/blob/main/docs/gateway-policy.md) with separate identities, bounded traffic and continued peer service |
 | Gateway usage attribution · `gateway_attribution` | Marked requests and final token counts matched to existing LiteLLM spend logs |
 | Gateway access policy · `gateway_access` | Declared allow/deny cases using existing test identity references |
 | Answer consistency · `consistency` | Answer agreement across repeated requests |
-| Tool calling · `tools` | Tool-call structure, names and expected arguments |
+| Tool-call correctness · `tools` | Tool-call structure, names and expected arguments |
 
 The catalog includes verdict checks and two server observations: **GPU metrics** and
-**Prefix cache**. Both remain in the selected checks and baseline configuration.
+**Prompt cache evidence**. Both remain in the selected checks and baseline configuration.
 Missing GPU telemetry and missing or inactive prefix caching do not change the
 verdict. GPU hardware faults and an exceeded configured temperature limit can
-still fail the run. Prefix cache never fails the run.
+still fail the run. Prompt cache evidence never fails the run.
 
 Gateway access is an optional LiteLLM check with explicit expected allow and deny
 cases. Configure it in the UI or run the [example](https://github.com/0dust/giraffe/blob/main/examples/gateway-access.yaml)
