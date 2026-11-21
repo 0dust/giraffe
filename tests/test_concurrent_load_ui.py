@@ -87,9 +87,15 @@ def test_plan_breakdown_and_duration_rows_use_server_numbers():
     plan=request_plan(config)
     browser_logic('const plan='+json.dumps(plan)+r''';
 config.checks=['load'];const html=renderRunBlueprint(config,plan);
-assert.match(html,/Load test plan/);assert.match(html,/Scheduled load tests/);assert.match(html,/12<\/dd>/);assert.match(html,/3m 0s/);assert.match(html,/63m 0s/);assert.match(html,/Unknown \+ 135/);
-assert.match(html,/Expected scheduled requests/);assert.match(html,/Execution order/);
-assert.equal((html.match(/Estimated duration:/g)||[]).length,1);assert.match(html,/test traffic only/);
+assert.equal((html.match(/data-plan-row="load"/g)||[]).length,1);
+assert.match(html,/aria-label="Load test details"/);assert.doesNotMatch(html,/Load test plan/);
+assert.match(html,/Scheduled load tests/);assert.match(html,/12<\/dd>/);assert.match(html,/3m 0s/);assert.match(html,/63m 0s/);
+assert.match(html,/Scheduled requests per endpoint/);assert.match(html,/135 scheduled requests per endpoint \+ completion-driven requests/);assert.doesNotMatch(html,/Unknown \+ 135/);
+assert.match(html,/Execution order/);
+for(const row of plan.rows){assert(html.includes('data-plan-phase="'+row.id+'"'));assert(html.includes(escape(row.summary||'')));}
+for(const phase of plan.load_test.execution_order)assert(html.includes(escape(phase)));
+assert.equal(plan.has_complete_time_estimate,false);
+assert.doesNotMatch(html,/Estimated duration:|Confidence:|test traffic only/);
 assert.doesNotMatch(renderLoadPlan(config),/12<\/dd>|3m 0s/); // No independent planner fallback.
 ''')
 

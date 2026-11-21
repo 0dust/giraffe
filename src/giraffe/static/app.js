@@ -524,11 +524,6 @@ function renderBeeswarm(records,{width=960}={}) {
   const markers=values.length>=4?[['p50',quantile(.5),top-8],['p95',quantile(.95),height-4]].map(([label,value,y])=>{const x=xOf(value),anchor=x>width-120?'end':x<120?'start':'middle';return `<g class="swarm-marker ${label}"><line x1="${x.toFixed(2)}" x2="${x.toFixed(2)}" y1="${top-4}" y2="${height-top+4}"/><text x="${x.toFixed(2)}" y="${y}" text-anchor="${anchor}">${label} ${escape(ms(value))}</text></g>`;}).join(''):'';
   return `<section class="latency-viz"><div class="viz-heading"><h2>Latency</h2><span class="hint">${number(measured.length)} measured${missing?` · ${number(missing)} missing`:''}${records.length>mosaicPageSize?' · current page':''}</span></div><div class="mosaic-scroll"><svg class="latency-beeswarm" viewBox="0 0 ${width} ${height}" role="group" aria-label="Elapsed latency in milliseconds; one dot per measured request"><path d="M16 ${mid}H${width-16}" class="swarm-axis"/>${markers}${placed.map(({r,x,y,packed},i)=>`<circle cx="${x.toFixed(2)}" cy="${(mid+y).toFixed(2)}" r="4.5" class="swarm-dot ${requestStatus(r)}${packed?' packed':''}" style="--i:${i}" tabindex="${i===0?0:-1}" role="button" data-request="${escape(r.id)}" aria-label="${escape(requestLabel(r,records,undefined,positions))}"></circle>`).join('')}</svg></div><div class="axis-labels mono"><span>${ms(low)}</span><span>${ms(max)}</span></div></section>`;
 }
-function renderFlightPlan(plan) {
-  if(!plan)return '';
-  const rows=(plan.rows || []).filter(r=>r.requests_per_target!==0),max=Math.max(1,...rows.map(r=>r.requests_per_target || 0));
-  return `<div class="flight-plan"><div class="viz-heading"><h3>Flight plan</h3><span class="hint">Per endpoint</span></div>${rows.map(r=>`<div class="flight-row"><div><span>${escape(checkGuide[r.id]?catalogTitle(r.id):r.title)}</span><span class="mono">${r.target_request_counts?escape(planTargetCounts(r.target_request_counts)):r.requests_per_target==null?(r.kind==='duration'?'Duration-based':'Adaptive'):`${r.kind==='estimate'?'~':''}${number(r.requests_per_target)}`}</span></div><div class="flight-track ${r.requests_per_target==null?'adaptive':''}">${r.requests_per_target==null?'':`<span style="width:${r.requests_per_target/max*100}%"></span>`}</div></div>`).join('')}</div>`;
-}
 const phaseNames={"gateway_access":"Gateway access policy","scale_down_baseline":"Scale-down baseline","scale_down_long":"Active answers during removal","scale_down_followup":"Traffic during and after removal","initial":"First request","readiness":"Readiness","warm":"Warm-up","short":"Short requests","long":"Long requests","generation":"Generation speed","context":"Long-context recall","correctness":"Answer correctness","json":"Structured JSON","sustained":"Sustained load","recovery":"Recovery check","recovery_baseline":"Recovery baseline","recovery_prime":"Recovery preparation","limits":"Output limits","stop_control":"Stop-sequence baseline","client_cancel":"Client cancellation","client_deadline":"Client deadline","backend_cancel":"Server cancellation","backend_cancel_control":"Server cancellation baseline","backend_cancel_followup":"Server cancellation follow-up","cancellation_probe":"Cancellation probes","cancellation_baseline":"Cancellation baseline","fairness":"Mixed long/short fairness","fairness_baseline":"Short requests alone","fairness_short":"Short requests with competing load","fairness_long":"Competing long requests","pack_control":"Quiet baseline","pack_loaded":"Your questions under load","request_pack":"Your questions","arrival":"Scheduled arrivals","mixed_control":"Short-request baseline","prefix_shared":"Shared prefix","prefix_independent":"Independent prefixes","prefix_history":"Growing conversation history","consistency":"Repeated-request consistency","judging":"AI evaluation","connection":"Connection","deadline_probe":"Client deadline","gateway_attribution":"Gateway usage attribution"};
 const phasePurposes={"concurrency":"Measures response quality, timing and evidenced concurrency for each duration-based test point.","access":"Checks that the server is reachable and can answer a request.","serving":"Checks that the server returns valid answers reliably.","generation":"Measures how quickly the server generates an answer.","context":"Checks whether the model can recall facts from a long input.","correctness":"Checks answers against the expected answers for different questions.","json":"Checks whether answers follow the required JSON structure.","recovery":"Checks whether normal answers return after sustained heavy traffic.","cancellation":"Checks request limits, cancellation, and the server's ability to keep serving afterwards.","fairness":"Checks whether competing long requests delay short answers.","mixed":"Checks whether a heavy partner delays a short request before or during its answer.","prefix":"Compares serving behavior when requests share an input prefix or use independent prefixes.","arrivals":"Checks whether the server keeps up with requests sent on a fixed schedule.","capacity":"Measures how many requests the server can handle at the configured arrival rate.","buckets":"Checks serving speed and reliability for this input size, output cap, and number of simultaneous requests.","token_stress":"Checks serving behavior with a large input or a long generated answer under load.","consistency":"Checks whether repeated copies of each prompt produce consistent answers under load.","sessions":"Checks whether answers stay correct as conversation history grows across turns.","tools":"Checks whether the model selects tools and uses their results correctly.","judging":"Asks an AI evaluator to check a recorded answer against its expected answer."};
 const phaseChecks={"initial":"access","readiness":"access","warm":"serving","short":"serving","long":"serving","generation":"generation","context":"context","correctness":"correctness","json":"json","sustained":"recovery","recovery":"recovery","recovery_baseline":"recovery","recovery_prime":"recovery","limits":"cancellation","stop_control":"cancellation","client_cancel":"cancellation","client_deadline":"cancellation","backend_cancel":"cancellation","backend_cancel_control":"cancellation","backend_cancel_followup":"cancellation","cancellation_probe":"cancellation","cancellation_baseline":"cancellation","fairness":"fairness","fairness_baseline":"fairness","fairness_short":"fairness","fairness_long":"fairness","pack_control":"correctness","pack_loaded":"correctness","request_pack":"correctness","arrival":"arrivals","mixed_control":"mixed","prefix_shared":"prefix","prefix_independent":"prefix","prefix_history":"prefix","consistency":"consistency","judging":"judging","connection":"access","deadline_probe":"cancellation"};
@@ -1212,7 +1207,6 @@ function runLimitIssues(config) {
   // workload waits for its new preview; no second count/time formula lives here.
   const plan=saved?.plan?.load_test;
   if(config.checks?.includes('load')&&plan&&sameConfig(loadSettings(config),loadSettings(saved.config))){
-    if(config.max_duration_seconds!=null&&plan.time_with_allowances_seconds>config.max_duration_seconds)issues.push({blocking:false,fields:['max_duration_seconds'],msg:'The configured windows and allowances exceed Maximum duration. Increase it or reduce this plan.'});
     if(config.max_requests!=null&&plan.expected_scheduled_requests*(config.targets?.length||1)>config.max_requests)issues.push({blocking:false,fields:['max_requests'],msg:'Expected scheduled requests exceed the total request budget.'});
     if(config.max_requests!=null&&plan.minimum_initial_requests_per_target*(config.targets?.length||1)>config.max_requests)issues.push({fields:['max_requests'],msg:'The request budget cannot cover even the initial concurrent groups.'});
   }
@@ -1251,10 +1245,11 @@ function issueFields(issue) {
   return [...new Set([...(issue.fields||[issue.field||'config']),...(issue.check?[concurrencySetting(issue.check)]:[])])];
 }
 function renderTimingRisk(warning) {
-  return `<p>Some checks may not finish within the time limit.</p><details class="setup-disclosure timing-warning-details"><summary>Show timing details</summary><p>${escape(warning.msg)}</p><div class="actions">${settingActions(warning.fields || [])}</div></details>`;
+  const groups=[...(warning.check_time_summaries || []),...(warning.setup_time_summaries || [])];
+  return `<p>${warning.schedule_exceeds_limit?'The configured schedule exceeds the time limit.':'Some checks may not finish within the time limit.'}</p><details class="setup-disclosure timing-warning-details"><summary>Show timing details</summary><p>${escape(warning.msg)}</p>${renderCheckTimeSummaries(groups)}<div class="actions">${settingActions(warning.fields || [])}</div></details>`;
 }
 function renderSettingIssues(errors=currentSettingErrors(),kind='error') {
-  return errors.map(error=>{
+  return errors.filter(error=>error.kind!=='context_window_unknown'||error.blocking===true).map(error=>{
     if(error.kind==='estimate_risk')return `<div class="notice ${kind} setting-issue">${renderTimingRisk(error)}</div>`;
     const actions=inheritedConcurrencyNotice(error)?concurrencyNoticeActions(error):error.actions?.map(action=>Object.hasOwn(action,'value')&&['max_requests','max_duration_seconds'].includes(action.field)
       ?`<button type="button" class="button small" data-action="${action.field==='max_requests'?'use-request-budget':'use-time-budget'}" data-budget="${escape(action.value)}">${escape(action.label)}</button>`
@@ -1285,7 +1280,7 @@ function syncInlineErrors() {
   }
   state.inlineErrorFields=[...messages.keys()];
   const warnings=new Map(),plan=currentRequestPlan();
-  for(const warning of [...localSettingWarnings(),...(plan?.load_warnings || []),...(plan?.concurrency_warnings || []),...(plan?.capacity_warnings || []),...(plan?.time_warnings || []),...(plan?.request_warnings || []),...(plan?.resource_warnings || [])])for(const path of warning.kind==='estimate_risk'?['max_duration_seconds']:issueFields(warning)){
+  for(const warning of [...localSettingWarnings(),...(plan?.load_warnings || []).filter(issue=>issue.kind!=='context_window_unknown'),...(plan?.concurrency_warnings || []),...(plan?.capacity_warnings || []),...(plan?.time_warnings || []),...(plan?.request_warnings || []),...(plan?.resource_warnings || [])])for(const path of warning.kind==='estimate_risk'?['max_duration_seconds']:issueFields(warning)){
     const {name}=settingDestination(path);warnings.set(name,[...(warnings.get(name) || []),warning]);
   }
   for(const name of new Set([...(state.inlineWarningFields || []),...warnings.keys()])){
@@ -1336,13 +1331,14 @@ function focusFirstSettingError(error=null) {
   if(errors.length)focusSetting(errors[0].fields?.[0]||errors[0].field||'config');
 }
 function renderPlanTime(plan) {
-  if(!plan||!Object.hasOwn(plan,'estimated_seconds'))return '';
+  if(!plan)return '';
   const low=plan.estimated_low_seconds,high=plan.estimated_high_seconds;
+  const complete=plan.has_complete_time_estimate===true&&Number.isFinite(low)&&Number.isFinite(high)&&low>=0&&high>=low;
   const duration=value=>value<60?`${new Intl.NumberFormat('en',{maximumSignificantDigits:2}).format(value)} s`:elapsed(value);
   const lower=low==null?null:duration(low),upper=high==null?null:duration(high);
-  const estimate=lower==null||upper==null?'awaiting comparable measurements':`about ${lower}${lower===upper?'':`–${upper}`}`;
+  const estimate=`about ${lower}${lower===upper?'':`–${upper}`}`;
   const assumptions=[...(plan.confidence_details?.insufficient_observations||[]),...(plan.time_estimate_assumptions||[])];
-  return `<div class="plan-time"><p>Estimated duration: ${escape(estimate)} · test traffic only</p><p class="hint">Confidence: ${escape(plan.confidence||'low')}. Excludes ${(plan.estimate_exclusions||['setup/connection','AI evaluation','report generation']).map(escape).join(', ')}.</p>${(plan.time_bound_reasons||[]).length?`<div class="unknown-time-components"><p class="hint">Additional work at unknown speed:</p><ul>${plan.time_bound_reasons.map(reason=>`<li>${escape(reason)}</li>`).join('')}</ul></div>`:''}${assumptions.length?`<details class="estimate-assumptions"><summary>Estimate assumptions</summary><ul>${assumptions.map(reason=>`<li>${escape(reason)}</li>`).join('')}</ul></details>`:''}${renderSettingIssues([...(plan.time_warnings||[]),...(plan.request_warnings||[]),...(plan.resource_warnings||[]),...(plan.concurrency_warnings||[]),...(plan.capacity_warnings||[])],'warning')}${renderSettingIssues((plan.resource_issues||[]).filter(issue=>issue.blocking))}</div>`;
+  return `${complete?`<div class="plan-time"><p>Estimated duration: ${escape(estimate)} · test traffic only</p><p class="hint">Confidence: ${escape(plan.confidence||'low')}. Excludes ${(plan.estimate_exclusions||['setup/connection','AI evaluation','report generation']).map(escape).join(', ')}.</p>${assumptions.length?`<details class="estimate-assumptions"><summary>Estimate assumptions</summary><ul>${assumptions.map(reason=>`<li>${escape(reason)}</li>`).join('')}</ul></details>`:''}</div>`:''}${renderSettingIssues([...(plan.time_warnings||[]),...(plan.request_warnings||[]),...(plan.resource_warnings||[]),...(plan.concurrency_warnings||[]),...(plan.capacity_warnings||[])],'warning')}${renderSettingIssues((plan.resource_issues||[]).filter(issue=>issue.blocking))}`;
 }
 function renderField(name,label,control,{hint,help,helpKey=name,hintAlways=false,full=false,wrapperId='',controlId=`field-${name}`,hintId=`field-${name}-hint`,hiddenLabel=false,hideInfo=false,helpDetails='',includeLimitHelp=true,hintAction=''}={}) {
   const copy=fieldDescription(helpKey);hint ??= copy.hint || '';help ??= copy.help || '';
@@ -1916,6 +1912,14 @@ function loadFieldLabel(path) {
 function selectedStandardWorkloads(workloads) {
   return (workloads.combinations.enabled?workloads.combinations.selected.length:0)+(workloads.mixed.enabled?1:0)+(workloads.stress.enabled?workloads.stress.cases.length:0);
 }
+function renderLoadContextWarning(config,plan=currentRequestPlan()) {
+  if(!config.checks.includes('load'))return '';
+  const warnings=(plan?.load_warnings||[]).filter(warning=>warning.kind==='context_window_unknown'&&!warning.blocking);
+  if(!warnings.length)return '';
+  const targets=[...new Set(warnings.map(warning=>warning.target).filter(Boolean))];
+  const fields=[...new Set(warnings.flatMap(warning=>warning.fields||[]))];
+  return `<p class="hint">${targets.length?`${targets.map(escape).join(', ')} · `:''}Giraffe can’t verify that your longest request fits this endpoint.</p>${settingActions(fields)}`;
+}
 function renderLoadEditor(config) {
   const s=loadSettings(config),w=s.workloads,p=s.patterns,live=loadDisplay(s),standard=selectedStandardWorkloads(w);
   const sourceNote=config.request_source==='request_pack'?'':config.custom_fixtures?'Uses the configured fixture file; its answer limits and checks are preserved.':'Generates prompts using these input token targets and output caps.';
@@ -1932,7 +1936,7 @@ function renderLoadEditor(config) {
   const descriptions={combinations:'Test each selected size combination separately.',mixed:'Randomly mix selected sizes in the same test.',interference:'Check whether a long question makes an ongoing short answer slower.',stress:'Check whether long inputs and generated answers were actually exercised.'};
   return `<div class="load-editor" data-load-settings><input type="hidden" name="load_rendered" value="1"><p>Choose what to send, how it arrives, and what a good response looks like.</p><div data-migration-notes>${renderMigrationNotes()}</div>
   <section class="load-section"><div class="field-label"><h3>Request timing &amp; delivery</h3>${infoHelp('load_request_timing','Request timing & delivery','For arrivals and bursts, a full client slot limit means the scheduled request is not sent. Show this as incomplete delivery; do not queue it silently or count it as an endpoint failure. Actual dispatch timing and burst spread are reported. Server queue time needs server telemetry.')}</div>${numberField('request_timeout_seconds','Request timeout (seconds)',s.request_timeout_seconds)}<p>Concurrency ceiling · Run limits <strong id="load-ceiling-label">${config.concurrency??'Not set'}</strong> <button type="button" class="text-button" data-action="edit-setting" data-setting-path="concurrency">Edit limit</button></p></section>
-  <section class="load-section"><div class="field-label"><h3>Data profile</h3>${infoHelp('load_data_profile','Data profile','Used by every selected workload below. Answers may finish before their cap; actual token lengths are reported.')}</div><span class="eyebrow">This check only</span><table class="load-profile"><thead><tr><th></th><th>Input tokens · target</th><th>Output tokens · cap</th></tr></thead><tbody>${loadSizes.map(size=>`<tr><th scope="row">${human(size)}</th>${['input_tokens','output_tokens'].map(kind=>`<td>${numberField(`profile.${size}.${kind}`,`${human(size)} ${kind==='input_tokens'?'input tokens':'output cap'}`,s.profile[size][kind],{step:1})}</td>`).join('')}</tr>`).join('')}</tbody></table>${sourceNote?`<p class="hint">${sourceNote}</p>`:''}${config.checks.includes('load')&&!config.checks.includes('correctness')?renderRequestSource(config):''}</section>
+  <section class="load-section"><div class="field-label"><h3>Data profile</h3>${infoHelp('load_data_profile','Data profile','Used by every selected workload below. Answers may finish before their cap; actual token lengths are reported.')}</div><span class="eyebrow">This check only</span><table class="load-profile"><thead><tr><th></th><th>Input tokens · target</th><th>Output tokens · cap</th></tr></thead><tbody>${loadSizes.map(size=>`<tr><th scope="row">${human(size)}</th>${['input_tokens','output_tokens'].map(kind=>`<td>${numberField(`profile.${size}.${kind}`,`${human(size)} ${kind==='input_tokens'?'input tokens':'output cap'}`,s.profile[size][kind],{step:1})}</td>`).join('')}</tr>`).join('')}</tbody></table>${sourceNote?`<p class="hint">${sourceNote}</p>`:''}<div data-load-context-warning>${renderLoadContextWarning(config)}</div>${config.checks.includes('load')&&!config.checks.includes('correctness')?renderRequestSource(config):''}</section>
   <section class="load-section"><div class="field-label"><h3>Workloads</h3>${infoHelp('load_workloads','Workloads','Select a workload to open its settings. Selected workloads run separately; mixed traffic combines request sizes within its own test.')}</div><div class="load-types">${Object.entries(loadTitles).map(([kind,title])=>{const open=state.loadPanels[kind]??w[kind].enabled;return `<section class="load-type${w[kind].enabled?' is-selected':''}" data-load-type="${kind}"><div class="load-type-heading">${checkbox(`workloads.${kind}.enabled`,`<span><strong>${title}</strong><small>${descriptions[kind]}</small></span>`,w[kind].enabled,{controls:`load-panel-${kind}`,extra:`data-load-enable="${kind}"`})}${kind==='stress'?infoHelp('load_stress_cases',title,'Each selection is a separate test using the traffic patterns below. Stress prompts ask for extended output; set minimum length coverage below.'):''}<button type="button" class="button ghost load-collapse" data-load-collapse="${kind}" aria-expanded="${open}" aria-controls="load-panel-${kind}" aria-label="${open?'Collapse':'Expand'} ${title} settings">${open?'⌃':'⌄'}</button></div><div class="load-type-panel" id="load-panel-${kind}" ${open?'':'hidden'}>${cards[kind]}</div></section>`;}).join('')}</div></section>
   <section class="load-section" id="load-traffic" ${standard||w.interference.enabled?'':'hidden'}><div class="field-label"><h3>Traffic patterns</h3>${infoHelp('load_traffic_patterns','Traffic patterns','Each selected pattern runs separately for combinations, mixed traffic and token stress.')}</div><span class="eyebrow">Choose one or more</span>${[['concurrent','Maintain concurrent requests','Replace each finished request to maintain the chosen level.'],['constant','Constant arrivals','New requests at evenly spaced intervals.'],['poisson','Poisson arrivals','Random intervals around the chosen average rate.']].map(([kind,title,description])=>checkbox(`patterns.${kind}.enabled`,`<span><strong>${title}</strong><small>${description}</small></span>`,p[kind].enabled)).join('')}<div id="load-arrival-fields" ${standard&&(p.constant.enabled||p.poisson.enabled)?'':'hidden'}>${field('load_patterns_rates','Rates (requests/second)',p.rates.join(', '))}<div id="load-seed-field" ${p.poisson.enabled?'':'hidden'}>${numberField('patterns.poisson.seed','Random seed',p.poisson.seed,{step:1})}</div></div>${checkbox('patterns.bursts.enabled','<span><strong>Bursts</strong><small>Send groups of requests on their own or alongside Constant / Poisson arrivals.</small></span>',p.bursts.enabled)}<div id="load-burst-fields" ${standard&&p.bursts.enabled?'':'hidden'}><div class="field-label"><h3>Burst schedule</h3>${infoHelp('load_burst_schedule','Burst schedule','Runs alone when neither Constant nor Poisson is selected. Otherwise, adds bursts to each selected arrival pattern. New bursts do not wait for earlier requests to finish. The concurrency ceiling still applies.')}</div><div class="fields">${numberField('patterns.bursts.size','Requests per burst',p.bursts.size,{step:1})}${numberField('patterns.bursts.first_seconds','First burst after (seconds)',p.bursts.first_seconds)}${numberField('patterns.bursts.gap_seconds','Time between burst starts (seconds)',p.bursts.gap_seconds)}</div><p id="load-burst-preview" class="hint">${escape(currentRequestPlan()?.load_test?.burst_previews?.[0]?.text||'Updating burst preview…')}</p></div><div id="load-concurrent-fields" ${p.concurrent.enabled||w.interference.enabled?'':'hidden'}>${field('load_patterns_concurrent_levels','Concurrency levels',p.concurrent.levels.join(', '),{hint:'Used by maintained-concurrency traffic and the long-input / short-answer test.'})}</div><div class="fields">${numberField('schedule.duration_seconds','Send new requests for (seconds)',s.schedule.duration_seconds,{step:1,hint:'',help:'Send new requests for this duration per workload, pattern and level. Requests already sent may finish within their request timeout. A run limit can stop traffic sooner. Minimum valid responses is an evidence requirement, not a stopping count.'})}</div></section>
   <details class="load-section load-pass-criteria"><summary>Pass criteria <span class="dim">Shared across this check</span></summary><div class="field-label"><h3>Pass criteria</h3>${infoHelp('load_pass_criteria','Pass criteria','Applied per response where measurable. Leave timing or speed limits blank to measure without that threshold. A result group is a request type at one traffic pattern and level. Mixed traffic reports each selected combination separately too. Too few valid responses means inconclusive. For scheduled arrivals, timing starts at planned arrival, including dispatch delay. Maintained-concurrency timing starts at dispatch. Correctness requires scorable answers; missing judgments stay unknown. Incomplete traffic delivery, missing timing evidence or missing required length coverage cannot establish a capacity pass.')}</div><p class="hint">Leave timing or speed limits blank to measure only.</p><div class="fields">${Object.entries(loadCriteriaLabels).map(([key,label])=>numberField('pass_criteria.'+key,label,s.pass_criteria[key],{step:key==='min_valid_responses'?1:'any',placeholder:['max_error_percent','min_correct_percent','min_valid_responses'].includes(key)?'':'Measure only'})).join('')}</div></details></div>`;
@@ -1960,14 +1964,18 @@ function syncLoadDisplay(config) {
   for(const node of $$('[data-load-share-row]'))node.hidden=!w.mixed.selected.includes(node.dataset.loadShareRow);
   for(const type of Object.keys(loadTitles))$(`[data-load-type="${type}"]`)?.classList?.toggle('is-selected',w[type].enabled);
   for(const node of $$('[data-load-tokens]')){const [input,output]=node.dataset.loadTokens.split('_');node.textContent=`${settings.profile[input].input_tokens} → ${settings.profile[output].output_tokens} tokens`;}
+  const context=$('[data-load-context-warning]');if(context){const html=renderLoadContextWarning(config);if(context.innerHTML!==html)patchHTML(context,html);}
 }
 function loadElapsed(seconds) {return `${Math.floor(seconds/60)}m ${Math.round(seconds%60)}s`;}
 function renderLoadPlan(config,plan=null) {
   if(!config?.checks?.includes('load'))return '';
-  const s=loadSettings(config),p=s.patterns,standard=selectedStandardWorkloads(s.workloads);
-  const patterns=[p.concurrent.enabled&&'Concurrent requests',p.constant.enabled&&('Constant'+(p.bursts.enabled?' + bursts':'')),p.poisson.enabled&&('Poisson'+(p.bursts.enabled?' + bursts':'')),p.bursts.enabled&&!p.constant.enabled&&!p.poisson.enabled&&'Bursts only'].filter(Boolean);
-  const title=standard&&patterns.length?patterns.join(' · '):s.workloads.interference.enabled?'Long-input / short-answer test':'Choose workloads',value=plan?.load_test;
-  return `<section class="configured-load-plan" aria-label="Load test plan"><h3>Load test plan</h3><h4>${escape(title)}</h4>${value?`<dl class="load-plan-numbers"><div><dt>Scheduled load tests</dt><dd>${number(value.scheduled_tests)}${value.comparison_checks?' + '+number(value.comparison_checks)+' short-answer checks':''}</dd></div><div><dt>Sending / maintained-load time</dt><dd>${loadElapsed(value.configured_load_seconds)}</dd></div><div><dt>Including request deadlines &amp; comparison checks</dt><dd>${loadElapsed(value.time_with_allowances_seconds)}</dd></div><div><dt>Expected scheduled requests</dt><dd>${escape(value.expected_requests_label)}</dd></div></dl><h4>Execution order</h4><ol class="load-plan-breakdown">${(value.execution_summary||value.execution_order).map(text=>`<li>${escape(text)}</li>`).join('')}</ol>${(value.execution_order_notes||[]).map(note=>`<p class="hint load-execution-note">${escape(note)}</p>`).join('')}<details data-plan-check="load-order"><summary>Each scheduled load test</summary><ol>${value.execution_order.map(text=>`<li>${escape(text)}</li>`).join('')}</ol>${(value.execution_order_notes||[]).map(note=>`<p class="hint">${escape(note)}</p>`).join('')}</details><p class="hint">${escape(value.note)}</p>`:'<p class="hint">Waiting for the current load plan…</p>'}</section>`;
+  const s=loadSettings(config),value=plan?.load_test;
+  const profiles=[{label:'',settings:s},...(s.migrated_tests||[]).map((item,index)=>({label:`Migrated ${item.source||index+1}`,settings:item.settings}))];
+  const settings=profiles.map(({label,settings})=>{
+    const p=settings.patterns,profile=settings.profile;
+    return `<div class="load-plan-profile">${label?`<h4>${escape(label)}</h4>`:''}<p><strong>Input target → output cap:</strong> ${loadSizes.map(size=>`${human(size)} ${number(profile[size].input_tokens)} → ${number(profile[size].output_tokens)} tokens`).map(escape).join(' · ')}</p><p>${[p.concurrent.enabled?`Maintained concurrency: ${p.concurrent.levels.join(', ')} requests`:null,p.constant.enabled||p.poisson.enabled?`${[p.constant.enabled?'Constant':null,p.poisson.enabled?'Poisson':null].filter(Boolean).join(' / ')} rates: ${p.rates.join(', ')} requests/second`:null,p.bursts.enabled?`${p.bursts.size} requests per burst`:null,`${settings.schedule.duration_seconds} seconds sending per test`].filter(Boolean).map(escape).join(' · ')}</p></div>`;
+  }).join('');
+  return `<section class="configured-load-plan" aria-label="Load test details">${settings}${value?`<dl class="load-plan-numbers"><div><dt>Scheduled load tests</dt><dd>${number(value.scheduled_tests)}${value.comparison_checks?' + '+number(value.comparison_checks)+' short-answer checks':''}</dd></div><div><dt>Sending / maintained-load time</dt><dd>${loadElapsed(value.configured_load_seconds)}</dd></div><div><dt>Upper allowance including request deadlines</dt><dd>${loadElapsed(value.time_with_allowances_seconds)}</dd></div><div><dt>Scheduled requests per endpoint</dt><dd>${escape(loadPlanRequestCount(value))}</dd></div></dl>${value.unknown_requests?'<p class="hint">Additional requests start as earlier requests finish; their count is unknown.</p>':''}<h4>Execution order</h4><ol class="load-plan-breakdown">${(value.execution_summary||value.execution_order).map(text=>`<li>${escape(text)}</li>`).join('')}</ol>${(value.execution_order_notes||[]).map(note=>`<p class="hint load-execution-note">${escape(note)}</p>`).join('')}<details data-plan-check="load-order"><summary>Each scheduled load test</summary><ol>${value.execution_order.map(text=>`<li>${escape(text)}</li>`).join('')}</ol></details><p class="hint">${escape(value.note)}</p>`:'<p class="hint">Waiting for the current load plan…</p>'}${plan?.bucket_cases?.length?`<h4>Question and answer sizes</h4><ul class="plan-cases">${plan.bucket_cases.map(item=>`<li>${number(item.actual_input_chars)} characters sent${item.actual_input_chars!==item.input_chars?` (${number(item.input_chars)} configured, plus instructions)`:""} · answer cap ${number(item.output_tokens)} tokens</li>`).join('')}</ul>`:''}${plan?.bucket_levels?.length?`<p class="hint">${plan.bucket_levels.map(level=>`${number(level.concurrency)} at once: ${number(level.requests_per_case)} requests per combination, ${number(level.requests_per_target)} per endpoint`).join(' · ')}</p>`:''}</section>`;
 }
 
 function renderLoadResults(metrics) {
@@ -2697,15 +2705,26 @@ function renderCorrectnessHistory(config,plan) {
   }).join('');
 }
 function renderArrivalHistory(plan) {
-  const rows=plan.arrival_history || [];
+  const rows=(plan.arrival_history || []).filter(row=>row.run_id&&['observed','warning'].includes(row.status)&&row.message);
   if(!rows.length)return '';
   return `<details class="request-planning arrival-history"><summary>Previous arrival delivery</summary>${rows.map(row=>`<p>${escape(row.message)}${row.run_id?` <a href="${linkRun(row.run_id)}">Open source run</a>`:''}</p>`).join('')}</details>`;
 }
 let requestPlanTimingDetails={route:null,open:false};
+let requestPlanDisclosures={route:null,outer:false,rows:[],checks:[]};
 function renderRequestPlan(config=null) {
   const element=$('#request-plan');if(!element)return;
   if(requestPlanTimingDetails.route!==state.routeVersion)requestPlanTimingDetails={route:state.routeVersion,open:false};
   else {const details=element.querySelector?.('.timing-warning-details');if(details)requestPlanTimingDetails.open=details.open;}
+  const sameRoute=requestPlanDisclosures.route===state.routeVersion;
+  if(!sameRoute)requestPlanDisclosures={route:state.routeVersion,outer:false,rows:[],checks:[]};
+  const previousBreakdown=sameRoute?element.querySelector?.('.workload-breakdown'):null;
+  if(previousBreakdown){
+    requestPlanDisclosures.outer=previousBreakdown.open;
+    requestPlanDisclosures.rows=[...(element.querySelectorAll?.('details[data-plan-row][open]')||[])].map(node=>node.dataset.planRow);
+    requestPlanDisclosures.checks=[...(element.querySelectorAll?.('details[data-plan-check][open]')||[])].map(node=>node.dataset.planCheck);
+  }
+  const focused=sameRoute&&element.contains?.(document.activeElement)?document.activeElement?.closest?.('[data-plan-row], [data-plan-check], .workload-breakdown'):null;
+  const focusRow=focused?.dataset?.planRow,focusCheck=focused?.dataset?.planCheck,focusOuter=focused?.classList?.contains('workload-breakdown');
   const saved=state.requestPreview,plan=currentRequestPlan();
   if(!config&&$('#run-blueprint')){try{config=readForm(true).config;}catch{}}
   config ||= (plan?saved.config:null) || state.config;
@@ -2719,13 +2738,13 @@ function renderRequestPlan(config=null) {
   const limits=config?renderPlanBounds(config,'review-limits'):'';
   if(!plan){
     const status=hasJsonChanges()?'Apply or discard JSON changes to confirm the request plan.':saved?.status==='error'?`Request plan unavailable: ${saved.error}`:saved?.status==='pending'?'Updating request plan…':'Request plan stale · updating current settings…';
-    element.innerHTML=`<div class="plan-hero">${heading}<p class="hint plan-status">${escape(status)}</p>${limits}${renderLoadPlan(config)}${renderMigrationNotes()}${renderSettingIssues()}${saved?.status==='error'&&!hasJsonChanges()?'<button type="button" class="button small" data-action="preview-pack">Retry request plan</button>':''}</div>`;return;
+    element.innerHTML=`<div class="plan-hero">${heading}<p class="hint plan-status">${escape(status)}</p>${limits}${renderMigrationNotes()}${renderSettingIssues()}${saved?.status==='error'&&!hasJsonChanges()?'<button type="button" class="button small" data-action="preview-pack">Retry request plan</button>':''}</div>`;return;
   }
   const count=setupPlanCount(plan);
   const evaluator=plan.evaluator || {},needed=plan.required_request_limit;
   const raise=plan.request_limit!=null&&Number.isInteger(needed)&&needed>plan.request_limit;
   const evaluatorScope='AI judge calls run separately from the target request budget and send cases and generated answers to each judge.';
-  const explained=new Set([...(plan.time_warnings||[]),...(plan.request_warnings||[]),...(plan.resource_warnings||[]),...(plan.concurrency_warnings||[]),...(plan.capacity_warnings||[])].map(item=>item.msg));
+  const explained=new Set([...(plan.load_warnings||[]),...(plan.time_warnings||[]),...(plan.request_warnings||[]),...(plan.resource_warnings||[]),...(plan.concurrency_warnings||[]),...(plan.capacity_warnings||[])].map(item=>item.msg));
   for(const row of [...(plan.arrival_history||[]),...(plan.correctness_history||[])])explained.add(row.message);
   const warnings=[...new Set([...(evaluator.readiness_errors || []),...(plan.warnings || [])])].filter(warning=>(!evaluator.active||warning!==evaluatorScope)&&!explained.has(warning));
   const filled=plan.request_limit==null?0:Math.min(100,(plan.planned_total ?? plan.known_total ?? 0)/plan.request_limit*100);
@@ -2733,10 +2752,21 @@ function renderRequestPlan(config=null) {
     :plan.known_target_counts?`Known requests by endpoint: ${escape(planTargetCounts(plan.known_target_counts))}, plus adaptive work`
     :plan.planned_per_target==null?`${number(plan.known_per_target)} known requests per endpoint, plus adaptive work`
     :`${plan.count_kind==='estimate'?'About ':''}${number(plan.planned_per_target)} requests per endpoint`;
-  element.innerHTML=`<div class="plan-hero${raise?' is-over':''}">${heading}<p class="plan-total">${escape(count)}</p>${plan.request_limit==null?'':`<div class="plan-ceiling${plan.count_kind==='exact'||plan.count_kind==='estimate'?'':' adaptive'}" aria-hidden="true"><span style="width:${raise?100:filled.toFixed(1)}%"></span></div>`}${limits}${renderLoadPlan(config,plan)}${renderSettingIssues([...localSettingWarnings(),...(plan?.load_warnings||[])],'warning')}${renderMigrationNotes()}${renderPlanTime(plan)}${renderSettingIssues()}${warnings.map(warning=>notice(warning,'warning')).join('')}</div><div class="plan-flight">${renderFlightPlan(plan)}${evaluator.active?`<div class="review-evaluator"><p>Up to ${number(evaluator.call_upper_bound)} evaluator calls after target traffic · ${number(evaluator.judge_count)} ${evaluator.judge_count===1?'evaluator':'evaluators'}.</p><p class="hint">Questions, expected answers and model answers go to every configured evaluator. These calls have separate limits.</p>${config?.judging?.judges?.length?`<ul class="review-evaluator-targets">${config.judging.judges.map(judge=>`<li><strong>${escape(judge.model || 'Model needed')}</strong> · ${escape(judge.url || 'Endpoint URL needed')}</li>`).join('')}</ul>`:''}</div>`:''}<details class="request-planning"><summary>Request breakdown</summary><p class="hint">${breakdown}. Time and request limits can leave checks unfinished.</p>${Object.keys(plan.target_quotas || {}).length?`<h4>Endpoint request budgets</h4><ul class="review-quotas">${Object.entries(plan.target_quotas).map(([name,quota])=>`<li>${escape(name)}: up to ${number(quota)} requests</li>`).join('')}</ul>`:''}<div class="plan-rows">${(plan.rows || []).filter(row=>row.requests_per_target!==0).map(row=>`<article><strong>${escape(checkGuide[row.id]?catalogTitle(row.id):row.title)}</strong><span>${row.target_request_counts?escape(planTargetCounts(row.target_request_counts)):row.requests_per_target==null?(row.kind==='duration'?`Duration-based${row.estimated_requests_per_target!=null?` · ~${number(row.estimated_requests_per_target)} (estimate, ${escape(row.estimate_source||'from your last run')})`:' · as many as complete'}`:'Adaptive / bounded'):`${row.kind==='estimate'?'About ':''}${number(row.requests_per_target)} per endpoint`}</span><p class="hint">${escape(row.summary)} · ${escape(row.source)}</p></article>`).join('')}</div>${plan.bucket_cases?.length?`<h4>Question and answer sizes</h4><ul class="plan-cases">${plan.bucket_cases.map(item=>`<li>${number(item.actual_input_chars)} characters sent${item.actual_input_chars!==item.input_chars?` (${number(item.input_chars)} configured, plus instructions)`:''} · answer cap ${number(item.output_tokens)} tokens</li>`).join('')}</ul>`:''}${plan.bucket_levels?.length?`<p class="hint">${plan.bucket_levels.map(level=>`${number(level.concurrency)} at once: ${number(level.requests_per_case)} requests per combination, ${number(level.requests_per_target)} per endpoint`).join(' · ')}</p>`:''}</details></div>${renderReviewPassCriteria(config)}`;
+  element.innerHTML=`<div class="plan-hero${raise?' is-over':''}">${heading}<p class="plan-total">${escape(count)}</p>${plan.request_limit==null?'':`<div class="plan-ceiling${plan.count_kind==='exact'||plan.count_kind==='estimate'?'':' adaptive'}" aria-hidden="true"><span style="width:${raise?100:filled.toFixed(1)}%"></span></div>`}${limits}${renderSettingIssues([...localSettingWarnings(),...(plan?.load_warnings||[])],'warning')}${renderMigrationNotes()}${renderPlanTime(plan)}${renderSettingIssues()}${warnings.map(warning=>notice(warning,'warning')).join('')}</div><div class="plan-flight">${evaluator.active?`<div class="review-evaluator"><p>Up to ${number(evaluator.call_upper_bound)} evaluator calls after target traffic · ${number(evaluator.judge_count)} ${evaluator.judge_count===1?'evaluator':'evaluators'}.</p><p class="hint">Questions, expected answers and model answers go to every configured evaluator. These calls have separate limits.</p>${config?.judging?.judges?.length?`<ul class="review-evaluator-targets">${config.judging.judges.map(judge=>`<li><strong>${escape(judge.model || 'Model needed')}</strong> · ${escape(judge.url || 'Endpoint URL needed')}</li>`).join('')}</ul>`:''}</div>`:''}<details class="request-planning workload-breakdown"><summary>Request breakdown</summary><p class="hint">${breakdown}. Time and request limits can leave checks unfinished.</p>${Object.keys(plan.target_quotas || {}).length?`<h4>Endpoint request budgets</h4><ul class="review-quotas">${Object.entries(plan.target_quotas).map(([name,quota])=>`<li>${escape(name)}: up to ${number(quota)} requests</li>`).join('')}</ul>`:''}${renderCheckPlan(config,plan)}</details></div>${renderReviewPassCriteria(config)}`;
   const timingDetails=element.querySelector?.('.timing-warning-details');
   if(timingDetails)timingDetails.open=requestPlanTimingDetails.open;
   else requestPlanTimingDetails.open=false;
+  const checkBreakdown=element.querySelector?.('.workload-breakdown');if(checkBreakdown)checkBreakdown.open=requestPlanDisclosures.outer;
+  const rows=new Set(requestPlanDisclosures.rows),checks=new Set(requestPlanDisclosures.checks);
+  for(const node of [...(element.querySelectorAll?.('details[data-plan-row]')||[]),...(element.querySelectorAll?.('details[data-plan-check]')||[])]){
+    node.open=node.dataset.planRow?rows.has(node.dataset.planRow):checks.has(node.dataset.planCheck);
+    if(node.dataset.planRow&&node.dataset.planRow===focusRow||node.dataset.planCheck&&node.dataset.planCheck===focusCheck)node.querySelector('summary')?.focus({preventScroll:true});
+  }
+  const presentRows=new Set([...(element.querySelectorAll?.('details[data-plan-row]')||[])].map(node=>node.dataset.planRow));
+  const presentChecks=new Set([...(element.querySelectorAll?.('details[data-plan-check]')||[])].map(node=>node.dataset.planCheck));
+  requestPlanDisclosures.rows=requestPlanDisclosures.rows.filter(id=>presentRows.has(id));
+  requestPlanDisclosures.checks=requestPlanDisclosures.checks.filter(id=>presentChecks.has(id));
+  if(focusOuter)checkBreakdown?.querySelector('summary')?.focus({preventScroll:true});
 }
 function scheduleRequestPlan() {
   if(state.planTimer!==null){clearTimeout(state.planTimer);state.planTimer=null;}
@@ -3050,23 +3080,76 @@ function planTargetCounts(counts) {
   return Object.entries(counts).map(([target,count])=>`${target}: ${number(count)}`).join(' · ');
 }
 function planRowCount(row) {
-  if(row.target_request_counts)return escape(planTargetCounts(row.target_request_counts));
-  return row.requests_per_target==null?(row.kind==='duration'?`Duration-based${row.estimated_requests_per_target!=null?` · ~${number(row.estimated_requests_per_target)} (estimate, ${escape(row.estimate_source||'from your last run')})`:''}`:'Adaptive'):`${row.kind==='estimate'?'~ ':''}${number(row.requests_per_target)}`;
+  if(row.users!=null&&row.configured_seconds!=null)return `${counted(row.users,'user')} for ${number(row.configured_seconds)} seconds per endpoint`;
+  if(row.target_request_counts)return Object.entries(row.target_request_counts).map(([target,count])=>`${target}: ${counted(count,'request')}`).join(' · ');
+  if(row.id==='scale_down')return `Up to ${counted(row.effective_request_upper_bound??row.max_requests,'request')} on ${row.target}`;
+  return row.requests_per_target==null?`Request count is adaptive per endpoint${row.estimated_requests_per_target!=null?` · about ${counted(row.estimated_requests_per_target,'request')} (estimate, ${row.estimate_source||'from your last run'})`:''}`:`${row.kind==='estimate'?'About ':row.kind==='bounded'?'Up to ':''}${counted(row.requests_per_target,'request')} per endpoint`;
 }
 function planRowDescriptor(row,config) {
   if(row.id==='arrivals'&&config.arrivals?.mode==='burst')return `in ${number(Math.ceil(config.arrivals.requests/config.arrivals.burst_size))} bursts`;
   if(row.id==='capacity'&&config.traffic?.arrival==='poisson')return 'exact count; seeded random timing';
   return '';
 }
+function selectedCheckPlan(config,plan) {
+  const groups=(config.checks||[]).map(id=>({id,title:catalogTitle(id),rows:[],shared:[],setup:[],unmapped:[]}));
+  const selected=new Map(groups.map(group=>[group.id,group])),owners=new Map();
+  const first=ids=>ids.find(id=>selected.has(id));
+  const aliases={pack_control:'correctness',pack_loaded:'correctness',context_first_batch:'context',recovery_prime:'recovery',recovery_baseline:'recovery',sustained:'recovery','limits.stop_control':'cancellation',backend_cancellation:'cancellation'};
+  for(const row of plan.rows||[]){
+    let owner=row.id==='initial'?first(['access','serving','first_output','generation']):row.id==='warm'?first(['serving','first_output']):selected.has(row.id)?row.id:aliases[row.id]||(row.id.startsWith('load_')?'load':row.id.startsWith('multi_user_')?'multi_user':null);
+    if(!selected.has(owner)&&selected.has('load')&&['capacity','arrivals','buckets','concurrency','fairness','mixed','token_stress'].includes(row.id))owner='load';
+    const group=selected.get(owner)||groups[0];if(!group)continue;
+    if(row.id==='restart_readiness'){group.setup.push(row);continue;}
+    group.rows.push(row);owners.set(row.id,{owner:group.id,row});
+    if(!selected.has(owner))group.unmapped.push(row);
+  }
+  for(const id of ['serving','first_output'])if(selected.has(id))for(const phase of ['initial','warm']){
+    const source=owners.get(phase);if(source&&source.owner!==id)selected.get(id).shared.push(source);
+  }
+  if(config.request_source==='request_pack'&&selected.has('correctness')){
+    const owner=first(['load','capacity']);if(owner&&selected.get(owner).rows.length)selected.get('correctness').shared.push({owner,row:null});
+  }
+  return groups;
+}
+function loadPlanRequestCount(value) {
+  if(!value)return 'Calculating requests';
+  const scheduled=`${value.approximate?'About ':''}${counted(value.expected_scheduled_requests||0,'scheduled request')} per endpoint`;
+  return value.unknown_requests?`${scheduled} + completion-driven requests`:scheduled;
+}
+function checkPlanCount(group,config,plan) {
+  if(group.id==='load'&&plan.load_test)return `${loadPlanRequestCount(plan.load_test)} · ${number(plan.load_test.configured_load_seconds)} seconds configured traffic`;
+  if(group.id==='multi_user')return `Completion-driven requests per endpoint · ${counted(group.rows.length,'user level')}`;
+  const scale=group.rows.find(row=>row.id==='scale_down');
+  if(scale)return `Up to ${counted(scale.effective_request_upper_bound??scale.max_requests,'request')} on ${scale.target} · up to ${number(scale.effective_duration_upper_bound??scale.max_duration_seconds)} seconds`;
+  if(group.rows.some(row=>row.requests_per_target==null&&!row.target_request_counts))return 'Request count is adaptive per endpoint';
+  const targets=[...new Set([...(config.targets||[]).map((target,index)=>target.name||`Endpoint ${index+1}`),...group.rows.flatMap(row=>Object.keys(row.target_request_counts||{}))])];
+  const counts=targets.map(target=>[target,group.rows.reduce((sum,row)=>sum+(row.target_request_counts?row.target_request_counts[target]||0:row.requests_per_target||0),0)]);
+  if(!counts.some(([,count])=>count))return group.id==='gpu'?'No inference requests · observes metrics':group.shared.length?'Shared requests · no additional requests':'No planned inference requests';
+  const prefix=group.rows.some(row=>row.kind==='bounded')?'Up to ':group.rows.some(row=>row.kind==='estimate')?'About ':'';
+  if(new Set(counts.map(([,count])=>count)).size>1)return prefix+counts.map(([target,count])=>`${target}: ${counted(count,'request')}`).join(' · ');
+  return `${prefix}${number(counts[0]?.[1]||0)} ${group.shared.length?'additional ':''}request${counts[0]?.[1]===1?'':'s'} per endpoint`;
+}
+function renderCheckTimeSummaries(groups) {
+  const seconds=value=>new Intl.NumberFormat('en',{maximumSignificantDigits:6}).format(value);
+  const duration=value=>value<60?`${seconds(value)} s`:elapsed(value);
+  return (groups||[]).map(group=>`<div class="check-time-summary"><h4>${escape(group.title)}${group.target?` · ${escape(group.target)}`:''}</h4><p>${group.total_seconds==null?'No finite complete timing allowance.':`Up to ${duration(group.total_seconds)} including request deadlines.`}${group.configured_seconds?` Configured schedule: ${duration(group.configured_seconds)}.`:''}</p><ul>${(group.phases||[]).map(phase=>`<li><strong>${escape(phase.title)}</strong>: ${[Number.isFinite(phase.requests)?counted(phase.requests,'request'):'',phase.batches!=null&&phase.request_timeout_seconds!=null?`${number(phase.batches)} batch${phase.batches===1?'':'es'} × ${seconds(phase.request_timeout_seconds)} s request timeout`:'',phase.configured_seconds?`${duration(phase.configured_seconds)} configured`:'',phase.allowance_seconds?`${duration(phase.allowance_seconds)} allowance`:''].filter(Boolean).map(escape).join(' · ')||'Duration is not bounded by these settings.'}</li>`).join('')}</ul></div>`).join('');
+}
+function renderCheckPlan(config,plan) {
+  return `<div class="check-plan-rows">${selectedCheckPlan(config,plan).map(group=>{
+    const phases=group.rows.filter(row=>!(row.requests_per_target===0&&['access','serving','first_output'].includes(row.id)));
+    const phaseTitle=row=>row.id==='initial'?'Initial request':row.id==='warm'?'Follow-up requests':row.id==='correctness'&&row.requests_per_target===0?'Answer evaluation':checkGuide[row.id]?catalogTitle(row.id):row.title;
+    const shared=group.shared.map(({owner,row})=>`<p class="hint">${row?`${escape(phaseTitle(row))} shared with`:'Answers also checked from'} ${escape(catalogTitle(owner))} · no additional requests.</p>`).join('');
+    return `<details data-plan-row="${escape(group.id)}"><summary><span class="check-plan-summary"><span class="check-plan-name">${escape(group.title)}</span><span class="check-plan-count"> · ${escape(checkPlanCount(group,config,plan))}</span></span></summary>${shared}${phases.length?`<ul class="check-plan-phases">${phases.map(row=>`<li data-plan-phase="${escape(row.id)}"><strong>${group.unmapped.includes(row)?'Shared work · ':''}${escape(phaseTitle(row))}</strong> · ${escape(planRowCount(row))}${planRowDescriptor(row,config)?` · ${escape(planRowDescriptor(row,config))}`:''}<p class="hint">${escape(row.summary||'')}${row.source?` · ${escape(row.source)}`:''}</p></li>`).join('')}</ul>`:''}${group.setup.map(row=>`<p class="hint" data-plan-setup="${escape(row.id)}"><strong>Setup and readiness · outside the target request budget.</strong> ${escape(row.summary)}</p>`).join('')}${group.id==='load'?renderLoadPlan(config,plan):''}${renderCheckTimeSummaries((plan.check_time_summaries||[]).filter(summary=>summary.check_id===group.id))}</details>`;
+  }).join('')}</div>`;
+}
 function renderRunBlueprint(config,plan=null) {
-  const traffic=(plan?.rows || []).filter(row=>row.requests_per_target!==0);
   const waiting=currentSettingErrors().length||state.requestPreview?.status==='error'?'Resolve the settings below to calculate traffic.':hasJsonChanges()?'Apply JSON changes to update this plan.':'Calculating traffic…';
   const split=config.max_requests!=null&&config.targets.length>1?`<p class="hint">Request budget split per endpoint: ${Object.entries(plan?.target_quotas||{}).map(([name,quota])=>`${escape(name)}: ${number(quota)}`).join(' · ')||'calculated in the current plan'}.</p>`:'';
   const status=currentSettingErrors().length||plan?.errors?.length||(plan?.resource_issues||[]).some(issue=>issue.blocking)?'error':plan?'valid':state.requestPreview?.status==='error'?'error':'pending';
   return `<header class="blueprint-heading"><h2>Run plan</h2></header><p class="blueprint-intro" data-plan-state="${status}" role="status" aria-live="polite">${escape(plan?setupPlanCount(plan):waiting)}</p>${hasJsonChanges()?'':renderPlanBounds(config)+split}
   <div class="field-label"><button type="button" class="text-button blueprint-edit" data-action="edit-run-limits" ${hasJsonChanges()?'disabled':''}>Edit limits</button>${infoHelp('run_plan_limits','Run limits','Optional limits you set. Tests also stop at their own durations, request counts and per-request timeouts.')}</div>
-  ${traffic.length?`<details class="workload-breakdown"><summary>Request breakdown</summary><div>${traffic.map(row=>`<details data-plan-row="${escape(row.id)}"><summary><strong>${planRowCount(row)}</strong> ${escape(row.title)}</summary><p>${escape(row.summary)}${planRowDescriptor(row,config)?` · ${escape(planRowDescriptor(row,config))}`:''}</p><small>${escape(row.source)} · ${row.target_request_counts?'by endpoint':row.requests_per_target==null?(config.max_requests==null&&config.max_duration_seconds==null?'bounded by this test’s own settings':'bounded by your limits'):'per endpoint'}</small></details>`).join('')}</div></details>`:''}
-  ${renderLoadPlan(config,plan)}${renderSettingIssues([...localSettingWarnings(),...(plan?.load_warnings||[])],'warning')}${renderMigrationNotes()}${renderSettingIssues()}${state.requestPreview?.status==='error'&&!currentSettingErrors().length?notice(state.requestPreview.error||'Plan unavailable. Retry the request plan.','error'):''}${renderPlanTime(plan)}${plan?.evaluator?.active?'<p class="blueprint-note">AI evaluation runs afterward with separate limits.</p>':''}`;
+  ${plan&&config.checks.length?`<details class="workload-breakdown"><summary>Request breakdown</summary>${renderCheckPlan(config,plan)}</details>`:''}
+  ${renderSettingIssues([...localSettingWarnings(),...(plan?.load_warnings||[])],'warning')}${renderMigrationNotes()}${renderSettingIssues()}${state.requestPreview?.status==='error'&&!currentSettingErrors().length?notice(state.requestPreview.error||'Plan unavailable. Retry the request plan.','error'):''}${renderPlanTime(plan)}${plan?.evaluator?.active?'<p class="blueprint-note">AI evaluation runs afterward with separate limits.</p>':''}`;
 }
 function syncRunBlueprint(config,plan=null) {
   const element=$('#run-blueprint');if(!element)return;
@@ -3077,12 +3160,12 @@ function syncRunBlueprint(config,plan=null) {
   if(previousChecks.length)expansion.checks=previousChecks.filter(item=>item.open).map(item=>item.dataset.planCheck);
   if(previousAssumptions)expansion.assumptions=previousAssumptions.open;
   const openRows=new Set(expansion.rows),openChecks=new Set(expansion.checks);
-  const focused=document.activeElement?.closest?.('[data-plan-row], [data-plan-check], .workload-breakdown');
+  const focused=element.contains?.(document.activeElement)?document.activeElement?.closest?.('[data-plan-row], [data-plan-check], .workload-breakdown'):null;
   const focusRow=focused?.dataset?.planRow,focusCheck=focused?.dataset?.planCheck,focusOuter=focused?.classList?.contains('workload-breakdown');
   element.innerHTML=renderRunBlueprint(config,plan);
   const outer=element.querySelector('.workload-breakdown');if(outer)outer.open=expansion.outer;else if(plan)expansion.outer=false;
   const assumptions=element.querySelector('.estimate-assumptions');if(assumptions)assumptions.open=expansion.assumptions;else if(plan)expansion.assumptions=false;
-  for(const node of element.querySelectorAll('details[data-plan-row], details[data-plan-check]')){
+  for(const node of [...element.querySelectorAll('details[data-plan-row]'),...element.querySelectorAll('details[data-plan-check]')]){
     node.open=node.dataset.planRow?openRows.has(node.dataset.planRow):openChecks.has(node.dataset.planCheck);
     if(node.dataset.planRow&&node.dataset.planRow===focusRow||node.dataset.planCheck&&node.dataset.planCheck===focusCheck)node.querySelector('summary')?.focus({preventScroll:true});
   }

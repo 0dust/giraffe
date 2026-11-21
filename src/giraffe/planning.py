@@ -106,6 +106,7 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
     from giraffe.latency import calibrated_context_fixtures, comparable_latency, input_bucket
 
     components, unknowns, timeline = [], [], []
+    timing_phases = []
     uncertain_observations = []
     observation_notes = []
     duration_estimates, duration_runs = {}, {}
@@ -206,12 +207,65 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
                 "gateway_access": "gateway_access.request_timeout_seconds",
                 "gateway_attribution": "request_timeout_seconds"}.get(check, "test_options." + check)
 
-    def unknown(target, row, count, timeout, bound):
+    def timing_check(identifier):
+        if identifier.startswith("load_"):
+            return "load"
+        if identifier.startswith("multi_user_"):
+            return "multi_user"
+        if identifier == "warm":
+            return "serving" if "serving" in selected else "first_output"
+        return {"context_first_batch": "context", "pack_control": "correctness",
+                "pack_loaded": "correctness", "limits.stop_control": "cancellation",
+                "backend_cancellation": "cancellation", "cancellation_intentional": "cancellation",
+                "cancellation_wait": "cancellation", "recovery_prime": "recovery",
+                "recovery_baseline": "recovery", "sustained": "recovery",
+                "recovery_wait": "recovery", "sessions_wait": "sessions",
+                "arrivals_pending": "arrivals", "gateway_attribution_preflight": "gateway_attribution",
+                "gateway_attribution_settle": "gateway_attribution"}.get(identifier, identifier)
+
+    def timing_phase(target, row, kind, *, requests=None, batches=None, timeout=0,
+                     configured=0, allowance=0, observed=False):
+        title = ("Follow-up requests" if row["id"] == "warm" else
+                 f"Multi-user · {row['users']} {'user' if row['users'] == 1 else 'users'}"
+                 if row["id"].startswith("multi_user_") and "users" in row else row["title"])
+        timing_phases.append({"check_id": timing_check(row["id"]), "target": target,
+            "id": row["id"], "title": title, "kind": kind, "requests": requests,
+            "batches": batches, "request_timeout_seconds": timeout,
+            "configured_seconds": configured, "allowance_seconds": allowance,
+            "total_seconds": configured + allowance if allowance is not None else None,
+            "has_timing_evidence": observed})
+
+    def timing_summaries(phases):
+        groups = {}
+        for item in phases:
+            key = item["check_id"], item["target"]
+            group = groups.setdefault(key, {"check_id": key[0], "target": key[1],
+                "title": CATALOGUE_NAMES.get(key[0], "Setup and connection"), "phases": {}})
+            phase_key = item["id"], item["title"], item["kind"], item["request_timeout_seconds"]
+            if phase_key not in group["phases"]:
+                group["phases"][phase_key] = {name: value for name, value in item.items()
+                                             if name not in {"check_id", "target", "has_timing_evidence"}}
+                continue
+            phase = group["phases"][phase_key]
+            for name in ("requests", "batches", "configured_seconds", "allowance_seconds", "total_seconds"):
+                phase[name] = phase[name] + item[name] if phase[name] is not None and item[name] is not None else None
+        for group in groups.values():
+            group["phases"] = list(group["phases"].values())
+            for name in ("configured_seconds", "allowance_seconds", "total_seconds"):
+                values = [phase[name] for phase in group["phases"]]
+                group[name] = sum(values) if all(value is not None for value in values) else None
+            group["unbounded"] = group["total_seconds"] is None
+        return list(groups.values())
+
+    def unknown(target, row, count, timeout, bound, *, batches=None):
         item = {"id": row["id"], "title": row["title"], "target": target,
                 "requests": count, "request_timeout_seconds": timeout, "timeout_bound_seconds": bound}
         unknowns.append(item)
         timeline.append({**item, "kind": "unknown", "field": time_field(row["id"]),
                          "low_seconds": 0, "high_seconds": bound})
+        timing_phase(target, row, "wait" if row["id"].endswith("_wait") else "requests",
+                     requests=count, batches=batches if batches is not None else count,
+                     timeout=timeout, allowance=bound)
 
     def setup(target, identifier, title, field, timeout):
         # Setup consumes the run deadline and stays outside the traffic estimate.
@@ -395,6 +449,9 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
                     **({"upper_bound": True} if pool_bound is not None else {})}
             components.append(item)
             timeline.append({**item, "field": time_field(row["id"])})
+            timing_phase(target, row, "requests", requests=count, batches=batches,
+                         timeout=options.request_timeout_seconds,
+                         allowance=batches * options.request_timeout_seconds, observed=True)
             # With n=150, the chance of missing an independent 2% slow tail is
             # .98**150 < 5%. Smaller pooled cohorts additionally require repeated-run stability.
             runs = observed["run_count"]
@@ -410,7 +467,8 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
             elif not pooled and uncertainty > .4 * mean:
                 uncertain_observations.append(f"{target} · {row['title']}: the prediction interval is too wide for medium confidence.")
         else:
-            unknown(target, row, count, options.request_timeout_seconds, batches * options.request_timeout_seconds)
+            unknown(target, row, count, options.request_timeout_seconds, batches * options.request_timeout_seconds,
+                    batches=batches)
 
     def fixed(target, row, seconds, field, *, count=1, timeout=0, observed=None, last_gaps=None, minimum_drain=False):
         if not seconds and not timeout:
@@ -426,6 +484,11 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
                 "low_seconds": seconds + drain_low, "high_seconds": seconds + drain_high,
                 "drain_uncertainty_seconds": max(0, drain_high - drain_low)}
         components.append(item)
+        waiting = row["id"].endswith("_wait") or row["id"] in {
+            "gateway_attribution_preflight", "gateway_attribution_settle"}
+        timing_phase(target, row, "wait" if waiting else "schedule", batches=count,
+                     timeout=timeout, configured=seconds, allowance=drain_high,
+                     observed=waiting or bool(observed))
         for index in range(count):
             timeline.append({**item, "title": row["title"] + (f" {index + 1}" if count > 1 else ""),
                              "field": field, "low_seconds": seconds / count + drain_low / count,
@@ -508,6 +571,8 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
                           "low_seconds": minimum, "high_seconds": settings.settle_seconds}
                 components.append(settle)
                 timeline.append({**settle, "field": field, "coverage_high_seconds": settings.settle_seconds})
+                timing_phase(target.name, settle, "wait", configured=minimum,
+                             allowance=settings.settle_seconds - minimum, observed=True)
                 continue
             if name == "load_calibration":
                 timeout = max(own.request_timeout_seconds for _, own in settings_sets(config.load_test))
@@ -873,11 +938,33 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
                                                      or deferred and pool >= len(probe_bounds))
         probe_allowance += max(probe_bounds, default=0) if parallel_probes else sum(probe_bounds)
     budget_high = timeline_high + setup_allowance + probe_allowance
+    initial_owner = next((check for check in ("access", "serving", "first_output", "generation")
+                          if check in selected), None)
+    initial_phases = [{
+        "check_id": initial_owner, "target": item["target"], "id": "initial", "title": "Initial request",
+        "kind": "requests", "requests": 1, "batches": 1,
+        "request_timeout_seconds": item["high_seconds"], "configured_seconds": 0,
+        "allowance_seconds": item["high_seconds"], "total_seconds": item["high_seconds"],
+        "has_timing_evidence": False,
+    } for item in timeline if item["id"] == "initial"]
+    check_time_summaries = timing_summaries([*initial_phases, *timing_phases])
+    setup_time_summaries = timing_summaries([{
+        "check_id": None, "target": item["target"], "id": item["id"], "title": item["title"],
+        "kind": "setup", "requests": None,
+        "batches": 1, "request_timeout_seconds": item["high_seconds"],
+        "configured_seconds": 0, "allowance_seconds": item["high_seconds"],
+        "total_seconds": item["high_seconds"], "has_timing_evidence": False,
+    } for item in timeline if item["kind"] == "setup" and item["id"] != "initial"])
+    # The legacy bounds exclude the initial inference request as connection
+    # setup. Its selected-check work still needs evidence for a complete ETA.
+    has_complete_time_estimate = bool(timing_phases) and not has_initial and not unknowns and all(
+        item["has_timing_evidence"] for item in timing_phases)
     errors, warnings = [], []
     budget = config.max_duration_seconds
+    schedule_exceeds_limit = budget is not None and fixed_seconds > budget
+    risk_over_budget = False
     if budget is not None:
         cut, first_start = [], None
-        risk_over_budget = False
         cursor_low = cursor_high = cursor_risk = 0
         for phase in phases(timeline):
             phase_start, phase_ends = (cursor_low, cursor_high, cursor_risk), []
@@ -926,37 +1013,57 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
                 warnings.append(notice)
         if budget_high > budget or risk_over_budget:
             reasons = []
-            if high > budget:
+            if has_complete_time_estimate and high > budget:
                 reasons.append("The estimated traffic duration may exceed the time limit, leaving checks unfinished.")
+            elif schedule_exceeds_limit:
+                reasons.append("The configured test schedule already exceeds the time limit, leaving checks unfinished.")
             risk_components = [item for item in timeline if item["kind"] in {"setup", "unknown"}
                                and (item["high_seconds"] is None or item["high_seconds"] > 0)]
-            for item in risk_components:
+            for item in (item for item in risk_components if item["kind"] == "setup"):
                 if item["id"] == "initial":
-                    reasons.append(f"{CHECK_NAMES['access']} for {item['target']} may wait up to {item['high_seconds']:,g} s "
+                    title = CHECK_NAMES["access"] if "access" in selected else "Initial connection"
+                    reasons.append(f"{title} for {item['target']} may wait up to {item['high_seconds']:,g} s "
                                    "if the server is slow to respond; this allowance shares the time limit and is excluded from the estimated duration.")
-                elif item["kind"] == "setup":
+                else:
                     reasons.append(f"{item['title']} for {item['target']} may take up to {item['high_seconds']:,g} s; "
                                    "this allowance shares the time limit and is excluded from the estimated duration.")
-                elif item.get("id") == "sessions_wait" and item.get("reason"):
-                    reasons.append(f"{item['target']} · conversation pauses can add up to {item['high_seconds']:,g} s. " + item["reason"])
-                elif item["high_seconds"] is not None:
-                    reasons.append(f"{item['target']} · {_warning_title(item)} has no comparable timing measurements; "
-                                   f"its requests may take up to {item['high_seconds']:,g} s in total "
-                                   f"if each reaches its {item['request_timeout_seconds']:,g} s timeout.")
-                else:
-                    reasons.append(f"{item['target']} · {_warning_title(item)} has an unknown workload size and request speed; "
+            unknown_checks = {(timing_check(item["id"]), item["target"]) for item in unknowns}
+            for group in check_time_summaries:
+                if (group["check_id"], group["target"]) not in unknown_checks:
+                    continue
+                label = f"{group['target']} · {group['title']}"
+                if group["unbounded"]:
+                    reasons.append(f"{label} has an unknown workload size and request speed; "
                                    "its completion time cannot be bounded.")
+                elif group["configured_seconds"] or any(phase["kind"] == "wait" for phase in group["phases"]):
+                    reasons.append(f"{label} has a {group['configured_seconds']:,g} s configured schedule plus up to "
+                                   f"{group['allowance_seconds']:,g} s of request and wait allowances "
+                                   f"({group['total_seconds']:,g} s in total).")
+                else:
+                    timeouts = {item["request_timeout_seconds"] for item in group["phases"] if item["kind"] == "requests"}
+                    ending = (f"if each reaches its {next(iter(timeouts)):,g} s timeout."
+                              if len(timeouts) == 1 else "across its request and wait allowances.")
+                    reasons.append(f"{label} has no comparable timing measurements; "
+                                   f"its requests may take up to {group['total_seconds']:,g} s in total {ending}")
             if not reasons:
-                reasons.append("The conservative completion allowance across all traffic components may exceed the time limit, "
-                               "even though the combined estimated duration fits.")
+                reasons.append("The configured schedule fits within the time limit, but request timeout and drain "
+                               "allowances may leave checks unfinished.")
             warnings.append({"kind": "estimate_risk",
                              "fields": list(dict.fromkeys(["max_duration_seconds", *(item["field"] for item in risk_components)])),
-                             "components": risk_components, "msg": " ".join(dict.fromkeys(reasons))})
+                             "components": risk_components, "check_time_summaries": check_time_summaries,
+                             "setup_time_summaries": setup_time_summaries,
+                             "schedule_exceeds_limit": schedule_exceeds_limit,
+                             "could_exceed_limit": not schedule_exceeds_limit,
+                             "msg": " ".join(reasons)})
     reasons = [f"{item['target']} · {item['title']}: " + (item["reason"] if "reason" in item else
                (("up to " if item.get("upper_bound") else "") + f"{item['requests']:,} requests at unknown speed (up to {item['timeout_bound_seconds']:g} s if every request hits its {item['request_timeout_seconds']:g} s timeout)"
                 if item["requests"] is not None else "workload size and request speed are unknown")) for item in unknowns]
     known = bool(components) or not unknowns
     return {"estimated_seconds": round(midpoint, 3) if known else None,
+            "has_complete_time_estimate": has_complete_time_estimate,
+            "check_time_summaries": check_time_summaries, "setup_time_summaries": setup_time_summaries,
+            "schedule_exceeds_limit": schedule_exceeds_limit,
+            "could_exceed_limit": budget is not None and not schedule_exceeds_limit and (budget_high > budget or risk_over_budget),
             "estimated_low_seconds": math.floor(math.nextafter(low * 1000, math.inf)) / 1000 if known else None,
             "estimated_high_seconds": math.ceil(math.nextafter(high * 1000, -math.inf)) / 1000 if known else None,
             "worst_case_seconds": round(high, 3) if known else None,
@@ -1274,8 +1381,8 @@ def request_plan(config: RunConfig | ConfigDraft, *,
             load_warnings.append({"fields":["load_test.pass_criteria.max_first_answer_ms","load_test.pass_criteria.max_completion_ms"],
                 "msg":"Measure only: a first-answer or completion limit is required to establish highest tested accepted capacity."})
         if any(context_window(t)[0] is None for t in config.targets):
-            load_warnings.append({"fields":["load_test.profile.long.input_tokens"],
-                "msg":"Endpoint context window unknown. Explicit token targets are not sized by the client Context length; server context errors may require smaller targets."})
+            load_warnings.append({"kind": "context_window_unknown", "fields":["load_test.profile.long.input_tokens"],
+                "msg":"Giraffe can't verify that your longest request fits this endpoint."})
         if config.max_requests is not None and load_plan["expected_scheduled_requests"]*target_count > config.max_requests:
             load_warnings.append({"fields":["max_requests","load_test.schedule.duration_seconds","load_test.patterns.rates"],
                 "msg":"Expected scheduled Load test requests exceed the total request budget; some tests will be truncated.",
