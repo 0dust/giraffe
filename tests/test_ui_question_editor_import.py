@@ -227,3 +227,35 @@ change(editor.elements.example_scorer,'judge');await submit(editor);await until(
 assert.equal(document.activeElement.name,'question_search','A filtered-out action falls back to Search questions');
 assert.equal(window.scrollY,503.5);
 """)
+
+
+
+def test_builtin_examples_are_read_only_and_saved_questions_survive_source_switches():
+    navigation_browser(r"""
+state.config.request_source='builtin';renderNew();
+const saved=JSON.stringify(state.config.request_pack),form=document.querySelector('#new-run-form');
+assert(visible('[data-action="view-builtin-examples"]'));
+assert.equal(visible('[data-action="manage-questions"]'),undefined);
+await click('view-builtin-examples');
+assert.equal(state.setupWorkspace.view,'builtin-examples');
+const workspace=document.querySelector('#setup-workspace'),examples=document.querySelector('#builtin-examples-view');
+assert(examples);assert(examples.querySelector('.builtin-example').open);
+assert.equal(examples.querySelectorAll('ol > li').length,bootstrap.builtin_questions.length);
+for(const example of bootstrap.builtin_questions){assert(examples.textContent.includes(example.question));assert(examples.textContent.includes(String(example.expected)));}
+for(const action of ['add-example','edit-example','remove-example','import-pack','sample-dataset','apply-answer-check','configure-evaluator'])assert.equal(workspace.querySelector('[data-action="'+action+'"]'),null,action);
+assert.equal(workspace.querySelector('input,select,textarea,form'),null);
+assert.equal(document.querySelector('#question-manager'),null);
+assert.equal(state.config.request_source,'builtin');assert.equal(JSON.stringify(state.config.request_pack),saved);
+await click('setup-workspace-back');assert.equal(document.activeElement.dataset.action,'view-builtin-examples');
+openQuestionManager();assert.equal(state.setupWorkspace.view,'builtin-examples','A stale Manage action cannot expose editing for the built-in source');
+await click('setup-workspace-back');
+function selectSource(source){for(const input of form.querySelectorAll('[name="request_source"]'))input.checked=input.value===source;change(form.querySelector('[name="request_source"][value="'+source+'"]'));}
+selectSource('request_pack');
+assert(visible('[data-action="manage-questions"]'));assert.equal(visible('[data-action="view-builtin-examples"]'),undefined);
+await click('manage-questions');assert(document.querySelector('#question-manager'));assert(visible('[data-action="add-example"]'));
+assert.equal(document.querySelector('#question-manager .builtin-example'),null);
+assert.equal(JSON.stringify(state.config.request_pack),saved);
+await click('setup-workspace-back');selectSource('builtin');selectSource('request_pack');
+assert.equal(JSON.stringify(state.config.request_pack),saved);assert.equal(state.config.request_source,'request_pack');
+assert.equal(requests.length,0,'Browsing examples and switching sources do not send requests');
+""")

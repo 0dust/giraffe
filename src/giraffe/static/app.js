@@ -2555,16 +2555,16 @@ function renderAnswerChecks(config) {
   const selected=selectedDatasetCases(),readiness=evaluatorReadiness({...config,request_source:'request_pack'});
   return `<section class="answer-checks">${selected.length?`<div class="dataset-bulk">${selectField('dataset_bulk_scorer',`Answer check for ${number(selected.length)} selected ${selected.length===1?'question':'questions'}`,'<option value="judge">AI evaluator · accepts correct paraphrases</option><option value="exact">Exact match</option><option value="contains">Contains text</option><option value="none">No answer check · removes expected answers</option>',{controlId:'dataset-bulk-scorer'})}<button type="button" class="button small" data-action="apply-answer-check">Apply to selected</button><button type="button" class="text-button" data-action="clear-question-selection">Clear selection</button></div>`:''}<div class="evaluator-status" id="question-manager-evaluator-status"><p>${escape(readiness.label)}</p><button type="button" class="text-button" data-action="configure-evaluator">${readiness.ready?'Edit evaluator':'Configure evaluator'}</button></div></section>`;
 }
-function renderBuiltinQuestions(config) {
+function renderBuiltinQuestions(config,{expanded=false}={}) {
   const questions=state.bootstrap.builtin_questions || (state.bootstrap.builtin_question_example?[state.bootstrap.builtin_question_example]:[]);
-  return `<p><strong>${questions.length} built-in questions</strong></p><p class="hint">Requests repeat these questions; they do not create new questions.${config.custom_fixtures?' Additional configured cases can increase the request count.':''}</p><details class="builtin-example"><summary>View questions and expected answers</summary><ol>${questions.map(item=>`<li><p>${escape(item.question)}</p><p><strong>Expected answer:</strong> <code>${escape(item.expected)}</code></p></li>`).join('')}</ol></details>`;
+  return `<p><strong>${questions.length} built-in questions</strong></p><p class="hint">Requests repeat these questions; they do not create new questions.${config.custom_fixtures?' Additional configured cases can increase the request count.':''}</p><details class="builtin-example" ${expanded?'open':''}><summary>View questions and expected answers</summary><ol>${questions.map(item=>`<li><p>${escape(item.question)}</p><p><strong>Expected answer:</strong> <code>${escape(item.expected)}</code></p></li>`).join('')}</ol></details>`;
 }
 function renderQuestionSetupSummary(config) {
   const custom=config.request_source==='request_pack',count=config.request_pack?.cases?.length||0,readiness=evaluatorReadiness(config);
   const check=state.bootstrap.checks.find(check=>check.id==='correctness');
   const required=!config.checks.includes('correctness')&&config.checks.includes('load')?loadSettings(config).pass_criteria.min_correct_percent/100:limitValue(config,check,'min_correctness');
   const questions=custom?counted(count,'saved question'):`${state.bootstrap.builtin_questions?.length||3} built-in questions`;
-  return `<dl class="question-setup-status"><div><dt>Questions</dt><dd>${escape(questions)}</dd></div><div><dt>AI evaluator</dt><dd>${escape(readiness.label)}</dd></div><div><dt>Required correct answers</dt><dd>${Number.isFinite(required)?`${number(required*100,1)}%`:'Set a valid percentage'}</dd></div></dl><div class="actions"><button type="button" class="button small" data-action="manage-questions">Manage questions</button>${readiness.needed||readiness.ready?`<button type="button" class="text-button" data-action="configure-evaluator">${readiness.ready?'Edit evaluator':'Configure evaluator'}</button>`:''}</div>`;
+  return `<dl class="question-setup-status"><div><dt>Questions</dt><dd>${escape(questions)}</dd></div><div><dt>AI evaluator</dt><dd>${escape(readiness.label)}</dd></div><div><dt>Required correct answers</dt><dd>${Number.isFinite(required)?`${number(required*100,1)}%`:'Set a valid percentage'}</dd></div></dl><div class="actions"><button type="button" class="button small" data-action="${custom?'manage-questions':'view-builtin-examples'}">${custom?'Manage questions':'View examples'}</button>${readiness.needed||readiness.ready?`<button type="button" class="text-button" data-action="configure-evaluator">${readiness.ready?'Edit evaluator':'Configure evaluator'}</button>`:''}</div>`;
 }
 function renderRequestSource(config) {
   const custom=config.request_source==='request_pack';
@@ -2621,10 +2621,18 @@ function updateQuestionManagerList() {
 }
 function renderQuestionManager() {
   const filters=`<div class="fields question-filters">${field('question_search','Search questions',questionManagerContext.search,{type:'search',help:''})}${selectField('question_scorer_filter','Answer check','<option value="all">All answer checks</option>'+Object.entries(answerChecks).map(([key,label])=>`<option value="${key}" ${questionManagerContext.scorer===key?'selected':''}>${label}</option>`).join(''),{help:''})}</div>`;
-  const builtins=state.config.request_source==='builtin'?`<section class="builtin-question-preview"><h2>Built-in questions (read-only)</h2>${renderBuiltinQuestions(state.config)}</section><h2>Saved questions</h2>`:'';
-  renderSetupWorkspace('Manage questions',`<section id="question-manager">${builtins}<div class="pack-actions actions"><button type="button" class="button primary" data-action="add-example">Add question</button><button type="button" class="button" data-action="import-pack">Import CSV / JSON</button><button type="button" class="text-button" data-action="sample-dataset">Use sample questions</button></div>${filters}<div id="question-manager-checks">${renderAnswerChecks(state.config)}</div><div id="question-manager-list">${questionManagerList()}</div><div id="question-manager-error" class="error-message" role="alert" hidden></div></section>`,{backAction:'setup',backLabel:'Back to test setup'});
+  renderSetupWorkspace('Manage questions',`<section id="question-manager"><div class="pack-actions actions"><button type="button" class="button primary" data-action="add-example">Add question</button><button type="button" class="button" data-action="import-pack">Import CSV / JSON</button><button type="button" class="text-button" data-action="sample-dataset">Use sample questions</button></div>${filters}<div id="question-manager-checks">${renderAnswerChecks(state.config)}</div><div id="question-manager-list">${questionManagerList()}</div><div id="question-manager-error" class="error-message" role="alert" hidden></div></section>`,{backAction:'setup',backLabel:'Back to test setup'});
+}
+function openBuiltinExamples() {
+  try{
+    datasetEditingAllowed();cleanupQuestionWorkspace();
+    openSetupWorkspace('builtin-examples',{returnTo:'setup',focusSelector:'[data-action="view-builtin-examples"]'});
+    renderSetupWorkspace('Built-in examples',`<section id="builtin-examples-view">${renderBuiltinQuestions(state.config,{expanded:true})}</section>`,{backAction:'setup',backLabel:'Back to test setup'});
+    focusSetupWorkspace();
+  }catch(error){configError(error);}
 }
 function openQuestionManager() {
+  if(state.config.request_source==='builtin')return openBuiltinExamples();
   if(!state.setupWorkspace)questionManagerContext.returnFocus=null;
   rememberQuestionManagerContext();cleanupQuestionWorkspace();
   openSetupWorkspace('questions',{returnTo:'setup'});renderQuestionManager();
@@ -2974,7 +2982,7 @@ function changeRequestSource(source,{remove=false}={}) {
     assertAppliedConfig();
     captureFormDraft();state.config.request_source=source;if(remove)state.config.request_pack=null;
     configChanged();state.jsonDraft=null;state.jsonBase=null;refreshQuestionSetupSummary();updateBounds();
-    $(`[name="request_source"][value="${source}"]`)?.focus();
+    $(`[name="request_source"][value="${source}"]`)?.focus({preventScroll:true});
   }catch(error){configError(error);}
 }
 function renderPackResults(pack) {
@@ -3282,7 +3290,7 @@ function openSetupWorkspace(view,{returnTo='setup',focusSelector=null}={}) {
   if(!state.setupWorkspace){
     datasetEditingAllowed();
     captureFormDraft();
-    state.setupWorkspace={view,returnTo,focusSelector:focusSelector||(view==='questions'?'[data-action="manage-questions"]':'[data-action="configure-evaluator"]'),setupFocus:document.activeElement,setupScroll:window.scrollY||0,
+    state.setupWorkspace={view,returnTo,focusSelector:focusSelector||(view==='questions'?'[data-action="manage-questions"]':view==='builtin-examples'?'[data-action="view-builtin-examples"]':'[data-action="configure-evaluator"]'),setupFocus:document.activeElement,setupScroll:window.scrollY||0,
       editorScrolls:$$('.test-editor').map(element=>[element.id,element.scrollTop])};
   }else Object.assign(state.setupWorkspace,{view,returnTo});
   const setup=$('#run-setup-content')||$('#new-run-form'),workspace=$('#setup-workspace');
@@ -4887,6 +4895,7 @@ document.addEventListener('click',async(event)=>{
     const heading=$('.check-detail h2');heading?.setAttribute('tabindex','-1');heading?.focus({preventScroll:true});return;}
   const request=event.target.closest('[data-request]');if(request){openRequest(request.dataset.request);return;}
   const action=event.target.closest('[data-action]')?.dataset.action;
+  if(action==='view-builtin-examples'){openBuiltinExamples();return;}
   if(action==='manage-questions'){openQuestionManager();return;}
   if(action==='setup-workspace-back'){
     if(state.setupWorkspace?.view==='evaluator')finishEvaluator();

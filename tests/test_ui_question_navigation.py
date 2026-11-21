@@ -131,23 +131,55 @@ function change(input,value){assert(input,'Missing input');if(value!==undefined)
 
 
 @pytest.mark.parametrize("source", ["builtin", "request_pack"])
-def test_setup_keeps_question_and_evaluator_collections_in_management(source):
-    navigation_browser("state.config.request_source=" + json.dumps(source) + r''';
-renderNew();
-const form=document.querySelector('#new-run-form'),original=JSON.stringify(state.config);
+def test_setup_routes_each_question_source_to_its_focused_view(source):
+    navigation_browser("const source=" + json.dumps(source) + r''';
+state.config.request_source=source;state.datasetSelection=['alpha'];renderNew();
+const form=document.querySelector('#new-run-form'),endpoint=form.elements.url,original=structuredClone(readForm(true).config);
 for(const selector of ['.question-table','.builtin-example','#dataset-example-form','#dataset-import-form','[name="judge_count"]'])assert.equal(form.querySelector(selector),null,selector);
-assert(visible('[data-action="manage-questions"]'));
-await click('manage-questions');
-assert(document.querySelector('#question-manager'));
-assert.equal(document.querySelectorAll('dialog[open]').length,0);
-assert.equal(state.config.request_source,JSON.parse(original).request_source);
-assert.equal(JSON.stringify(state.config.request_pack),JSON.stringify(JSON.parse(original).request_pack));
-assert.equal(Boolean(document.querySelector('#question-manager .builtin-example')),state.config.request_source==='builtin');
-await click('setup-workspace-back');
-assert.equal(state.setupWorkspace,null);
-assert.equal(document.querySelector('#new-run-form'),form);
+const assertDraft=expected=>{
+ assert.equal(state.config.request_source,expected);assert.equal(new FormData(form).get('request_source'),expected);
+ assert.equal(JSON.stringify(state.config.request_pack),JSON.stringify(original.request_pack));
+ assert.equal(JSON.stringify(state.config.targets),JSON.stringify(original.targets));
+ assert.deepEqual(new FormData(form).getAll('check'),original.checks);
+ for(const key of ['max_requests','max_duration_seconds','concurrency'])assert.equal(state.config[key],original[key]);
+ assert.equal(JSON.stringify(state.config.limits),JSON.stringify(original.limits));
+ assert.equal(document.querySelector('#new-run-form'),form);assert.equal(form.elements.url,endpoint);
+};
+const assertCurrentView=expected=>{
+ const workspace=document.querySelector('#setup-workspace');
+ assert.equal(document.querySelectorAll('dialog[open]').length,0);
+ if(expected==='builtin'){
+  assert.equal(state.setupWorkspace.view,'builtin-examples');
+  const preview=workspace.querySelector('#builtin-examples-view'),items=preview.querySelectorAll('ol li');
+  assert.equal(items.length,3);assert.equal(bootstrap.builtin_questions.length,3);
+  bootstrap.builtin_questions.forEach((example,index)=>{
+   assert(items[index].textContent.includes(example.question));
+   assert(items[index].textContent.includes(String(example.expected)));
+   assert(items[index].getClientRects().length,'All built-in questions and expected answers are immediately visible');
+  });
+  for(const selector of ['#question-manager','#question-manager-list','#question-manager-checks','[data-dataset-select]','#dataset-bulk-scorer','form'])assert.equal(workspace.querySelector(selector),null,selector);
+  for(const action of ['add-example','edit-example','remove-example','try-example','import-pack','sample-dataset','download-dataset-sample','apply-answer-check','configure-evaluator'])assert.equal(workspace.querySelector('[data-action="'+action+'"]'),null,action);
+ }else{
+  assert.equal(state.setupWorkspace.view,'questions');assert(workspace.querySelector('#question-manager'));
+  assert.equal(workspace.querySelector('#builtin-examples-view'),null);assert.equal(workspace.querySelector('.builtin-example'),null);
+  for(const action of ['add-example','edit-example','remove-example','try-example','import-pack','sample-dataset','apply-answer-check','configure-evaluator'])assert(visible('[data-action="'+action+'"]'),action);
+ }
+};
+const action=source==='builtin'?'view-builtin-examples':'manage-questions';
+assert(visible('[data-action="'+action+'"]'));
+assert.equal(visible('[data-action="'+(source==='builtin'?'manage-questions':'view-builtin-examples')+'"]'),undefined);
+window.scrollY=705;await click(action);assertCurrentView(source);assertDraft(source);
+if(source==='builtin'){openQuestionManager();assertCurrentView('builtin');assertDraft('builtin');}
+await click('setup-workspace-back');assert.equal(state.setupWorkspace,null);assertDraft(source);
+assert.equal(window.scrollY,705);assert.equal(document.activeElement.dataset.action,action);
+const other=source==='builtin'?'request_pack':'builtin';
+for(const input of form.querySelectorAll('[name="request_source"]'))input.checked=input.value===other;
+change(form.querySelector('[name="request_source"][value="'+other+'"]'));assertDraft(other);
+const nextAction=other==='builtin'?'view-builtin-examples':'manage-questions';
+await click(nextAction);assertCurrentView(other);assertDraft(other);
+await click('setup-workspace-back');assertDraft(other);assert.equal(window.scrollY,705);
+assert.equal(document.activeElement.dataset.action,nextAction);assert.equal(requests.length,0);
 ''')
-
 
 @pytest.mark.parametrize("source", ["builtin", "request_pack"])
 def test_typing_and_saving_questions_preserves_raw_setup_and_updates_only_summary(source):
@@ -156,7 +188,13 @@ state.config.test_options.correctness={request_timeout_seconds:125,limits:{min_c
 renderNew();
 const form=document.querySelector('#new-run-form'),endpoint=form.elements.url,levels=form.elements.load_patterns_concurrent_levels,maximum=form.elements.max_requests;
 type(endpoint,'unfinished endpoint /');type(levels,'1, unfinished');type(maximum,'0055');
-const originalChecks=new FormData(form).getAll('check'),options=JSON.stringify(state.config.test_options.correctness);
+const originalChecks=new FormData(form).getAll('check'),options=JSON.stringify(state.config.test_options.correctness),savedPack=JSON.stringify(state.config.request_pack);
+if(state.config.request_source==='builtin'){
+ await click('view-builtin-examples');assert(document.querySelector('#builtin-examples-view'));await click('setup-workspace-back');
+ for(const input of form.querySelectorAll('[name="request_source"]'))input.checked=input.value==='request_pack';
+ change(form.querySelector('[name="request_source"][value="request_pack"]'));
+ assert.equal(state.config.request_source,'request_pack');assert.equal(JSON.stringify(state.config.request_pack),savedPack);
+}
 const trigger=visible('[data-action="manage-questions"]');trigger.focus({preventScroll:true});window.scrollY=674;
 await click('manage-questions');
 assert(form.closest('#run-setup-content').hidden);assert(form.closest('#run-setup-content').inert);assert.equal(form.disabled,false);

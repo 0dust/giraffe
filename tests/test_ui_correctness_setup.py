@@ -14,7 +14,7 @@ CORRECTNESS_FORM = (FORM.replace("config.checks=['load']", "config.checks=['corr
                     .replace("testSettings:'load'", "testSettings:'correctness'"))
 
 
-def test_correctness_controls_keep_setup_compact_and_builtin_preview_available_to_management():
+def test_correctness_controls_keep_setup_compact_and_builtin_preview_read_only():
     result = browser_logic(r'''
 const check=bootstrap.checks.find(check=>check.id==='correctness');
 config.checks=['correctness'];
@@ -54,7 +54,9 @@ console.log(JSON.stringify({markup:renderTestCard(check,config),summary:effectiv
         assert item['question'] not in result['markup']
         assert item['question'] in next(node['text'] for node in Markup(result['preview']).nodes if node.get('class') == 'builtin-example')
     assert '3 built-in questions' in result['markup']
-    assert 'Manage questions' in result['markup']
+    assert 'View examples' in result['markup']
+    assert 'data-action="view-builtin-examples"' in result['markup']
+    assert 'Manage questions' not in result['markup']
     assert 'View questions and expected answers' not in result['markup']
     assert 'The suite value is a default' not in result['markup']
 

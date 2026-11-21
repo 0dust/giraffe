@@ -233,13 +233,19 @@ bootstrap.builtin_questions=[{question:'What is 2 + 2?',expected:'4'}];
 const original=JSON.stringify(config),markup=renderRequestSource(config);
 assert(markup.indexOf('value="builtin"')<markup.indexOf('value="request_pack"'));
 assert.match(markup,/value="builtin" checked/);
-assert.doesNotMatch(markup,/builtin-example|What is 2 \+ 2\?|<code>4<\/code>/);
+assert.doesNotMatch(markup,/class="builtin-example"|What is 2 \+ 2\?|<code>4<\/code>/);
 const preview=renderBuiltinQuestions(config);assert.match(preview,/What is 2 \+ 2\?/);assert.match(preview,/<code>4<\/code>/);
 assert.doesNotMatch(markup,/Questions &amp; expected answers|Known-answer questions are ready|Ready to use|Add or import a dataset/);
-assert.match(markup,/data-action="manage-questions"/);
+assert.match(markup,/data-action="view-builtin-examples">View examples/);
+assert.doesNotMatch(markup,/data-action="manage-questions"|Manage questions/);
 assert.match(markup,/Required correct answers/);
 assert.doesNotMatch(markup,/dataset-example-form|dataset-import-form|judge_count/);
 assert.doesNotMatch(markup,/Each saved question runs once/);
+assert.equal(JSON.stringify(config),original);
+const custom=structuredClone(config);custom.request_source='request_pack';
+const customMarkup=renderRequestSource(custom);
+assert.match(customMarkup,/data-action="manage-questions">Manage questions/);
+assert.doesNotMatch(customMarkup,/data-action="view-builtin-examples"|View examples/);
 assert.equal(JSON.stringify(config),original);
 """)
 
