@@ -1034,8 +1034,11 @@ async def arrival_window(run, target, client, settings, point, calibration):
     return [r for _, r in evidence.records]
 
 
-def _short_work_comparison(baseline, probes):
+def _short_work_comparison(baseline, probes, short_output_cap):
     """A changed question mix or generation length cannot establish interference."""
+    if any(row.output_tokens is None or row.output_tokens > short_output_cap
+           for rows in (baseline, probes) for row in rows):
+        return "Matched short work is not comparable: short answers need reported output at or below the Short output cap."
     cohorts = []
     for rows in (baseline, probes):
         grouped = {}
@@ -1149,7 +1152,7 @@ def interference_measurements(records, windows, delay_windows=(), *, mode="long_
     result["first_answer_slowdown"] = later / first if first and later is not None else None
     if reverse:
         result["comparison_metric"] = "short-answer completion and first-answer time after dispatch during a long answer"
-        work_reason = _short_work_comparison(matched["baseline"], matched["probe"])
+        work_reason = _short_work_comparison(matched["baseline"], matched["probe"], short_output_cap)
         result["work_comparison"] = {"qualified": work_reason is None, "reason": work_reason,
                                      "tolerance_percent": 10}
         result["long_output_coverage"] = {
@@ -1581,19 +1584,23 @@ def assess_point(run, target, settings, point, records):
         )
         window_load = []
         for window in point.get("measurement_windows", []):
+            serial_control = reverse and window["phase"] == "baseline"
             role = "long_stream" if reverse and window["phase"] == "probe" else "short_stream"
             shorts = [
                 r
                 for r in records
                 if r.load_point.get("phase") == window["phase"]
                 and r.load_point.get("role") == role
+                and (not serial_control or r.valid and r.status == "completed"
+                     and r.dispatch_ms is not None and r.completed_ms is not None)
             ]
-            average, _ = inflight(shorts, window["sending_start_ms"], window["sending_end_ms"])
+            average, client_peak = inflight(shorts, window["sending_start_ms"], window["sending_end_ms"])
             observed = peak_evidenced_concurrency(shorts, scheduling_delay_windows(run))
             window_load.append(
                 {
                     "phase": window["phase"],
                     "mean_inflight": average,
+                    "client_peak_inflight": client_peak,
                     "evidenced_concurrency": observed,
                     "required_concurrency": 1 if reverse and window["phase"] == "baseline" else point["level"] - 1,
                 }
@@ -1615,7 +1622,8 @@ def assess_point(run, target, settings, point, records):
             and len(window_load) == 2
             and all(
                 v["mean_inflight"] >= 0.9 * v["required_concurrency"]
-                and v["evidenced_concurrency"] >= v["required_concurrency"]
+                and (v["client_peak_inflight"] == 1 if reverse and v["phase"] == "baseline"
+                     else v["evidenced_concurrency"] >= v["required_concurrency"])
                 for v in window_load
             )
         )

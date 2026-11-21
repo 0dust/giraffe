@@ -244,3 +244,53 @@ def test_reverse_initial_budget_uses_one_baseline_short_and_requested_population
     assert load_test.minimum_reservation(restored.load_test) == 5
     restored.load_test.workloads.interference.mode = "long_input_during_short"
     assert load_test.minimum_reservation(restored.load_test) == 7
+
+
+def test_saved_long_answers_cannot_supply_short_comparison(monkeypatch):
+    async def scenario():
+        config = configuration()
+        values = config.model_dump()
+        values.update(request_source="request_pack", request_pack={"version": 1, "cases": [{
+            "fixture_id": "saved-long", "messages": [{"role": "user", "content": "Say K7P4"}],
+            "scorer": "exact", "expected": "K7P4", "max_tokens": 256,
+        }]})
+        config = RunConfig.model_validate(values)
+        run = _Run(config, None, None)
+        point, = (await load_test.execute(run, config.targets[0], StreamingClient()))["points"]
+        shorts = [r for r in run.records if r.load_point.get("role") == "short_stream"]
+        assert shorts and all(r.requested_max_tokens == r.output_tokens == 256 for r in shorts)
+        assert point["interference"]["baseline"]["matched_count"] > 0
+        assert point["interference"]["probe"]["matched_count"] > 0
+        assert point["interference"]["slowdown"] == pytest.approx(1)
+        assert point["status"] == "inconclusive", point["reason"]
+        assert "Short output cap" in point["reason"]
+
+    run_virtual(monkeypatch, scenario())
+
+
+def test_single_chunk_serial_control_preserves_measured_queue_slowdown(monkeypatch):
+    class OneReadClient(StreamingClient):
+        async def execute(self, spec, first_output_event=None):
+            response = await super().execute(spec, first_output_event)
+            if spec.load_point["shape"] == "short_short":
+                response.answer_chunks = response.answer_reads = 1
+                response.output_tokens = response.completion_tokens = 1
+                response.first_output_ms = response.last_output_ms = response.stream_end_ms = response.elapsed_ms
+                response.max_stream_gap_ms = None
+            return response
+
+    async def scenario():
+        config = configuration()
+        run = _Run(config, None, None)
+        point, = (await load_test.execute(run, config.targets[0], OneReadClient(queued=True)))["points"]
+        evidence = point["interference"]
+        control = next(window for window in evidence["background_load"] if window["phase"] == "baseline")
+        assert control["evidenced_concurrency"] == 0
+        assert control["mean_inflight"] >= .9
+        assert evidence["baseline"]["matched_count"] > evidence["probe"]["matched_count"] > 0
+        assert evidence["slowdown"] > 10
+        assert evidence["first_answer_slowdown"] > 10
+        assert point["status"] == "fail", point["reason"]
+        assert "slowdown" in point["reason"].lower()
+
+    run_virtual(monkeypatch, scenario())
