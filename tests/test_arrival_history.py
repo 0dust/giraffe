@@ -245,7 +245,7 @@ def test_cli_preview_exposes_same_advisory(tmp_path, capsys):
 def test_arrival_evidence_links_source_run_and_escapes_text():
     from tests.test_ux_setup import run_browser_logic
     run_browser_logic(r"""
-const html=renderArrivalHistory({arrival_history:[{message:'<private>',run_id:'saved/run'}]});
+const html=renderArrivalHistory({arrival_history:[{status:'observed',message:'<private>',run_id:'saved/run'}]});
 assert.ok(html.includes('&lt;private&gt;'));
 assert.ok(html.includes('#runs/saved%2Frun'));
 assert.ok(!html.includes('<private>'));

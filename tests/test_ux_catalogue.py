@@ -60,7 +60,9 @@ assert.equal((markup.match(/data-test-card="/g)||[]).length,bootstrap.checks.len
 assert.equal((markup.match(/data-test-card="/g)||[]).length,20);
 for(const check of bootstrap.checks){
   assert.equal((markup.match(new RegExp('data-test-card="'+check.id+'"','g'))||[]).length,1);
-  const row=renderTestCard(check,config);assert.match(row,/<dt>Sends<\/dt>/);assert.match(row,/<dt>Shows<\/dt>/);
+  const row=renderTestCard(check,config);
+  if(['serving','correctness'].includes(check.id))assert.doesNotMatch(row,/<dt>Sends<\/dt>|<dt>Shows<\/dt>/);
+  else {assert.match(row,/<dt>Sends<\/dt>/);assert.match(row,/<dt>Shows<\/dt>/);}
 }
 for(const group of checkGroups)assert(markup.includes('data-action="catalogue-category" data-category="'+group.id+'"'));
 assert.equal((markup.match(/id="setup-dataset"/g)||[]).length,1);
@@ -238,9 +240,9 @@ const check=bootstrap.checks.find(x=>x.id==='correctness');
 config.request_source='request_pack';config.request_pack={cases:Array.from({length:12},()=>({}))};
 config.test_options.correctness={samples:4,concurrency:2,limits:{min_correctness:.95}};
 const summary=effectiveCheckSummary(check,config);
-assert.match(summary,/12 saved questions · each once/);assert.match(summary,/95% correct required/);
+assert.match(summary,/12 saved questions · Individual pass, then repeated pass/);assert.match(summary,/95% correct required/);
 assert.doesNotMatch(summary,/sample requests|at a time/);
-config.request_pack.cases.length=1;assert.match(effectiveCheckSummary(check,config),/1 saved question · each once/);
+config.request_pack.cases.length=1;assert.match(effectiveCheckSummary(check,config),/1 saved question · Individual pass, then repeated pass/);
 """)
 
 
@@ -253,18 +255,23 @@ for(const check of bootstrap.checks){
   assert.match(row,new RegExp('</label><button type="button" class="field-info"[^>]*popovertarget="'+helpId+'"'));
   assert(row.includes('aria-label="About '+escape(catalogTitle(check.id))+'"'));
   assert(row.includes('id="'+helpId+'" class="field-help" popover="auto"'));
-  assert.match(row,/<dt>Sends<\/dt>/);assert.match(row,/<dt>Shows<\/dt>/);
-  assert.match(row,/<dt>Settings<\/dt><dd data-effective-settings>/);
-  assert.equal((row.match(/data-effective-settings/g)||[]).length,1);
+  if(['serving','correctness'].includes(check.id)){
+    assert(row.includes('id="'+helpId+'-text">'+escape(checkGuide[check.id].help)+'</p>'));
+    assert.doesNotMatch(row,/<dt>|data-effective-settings/);
+  }else{
+    assert.match(row,/<dt>Sends<\/dt>/);assert.match(row,/<dt>Shows<\/dt>/);
+    assert.match(row,/<dt>Settings<\/dt><dd data-effective-settings>/);
+    assert.equal((row.match(/data-effective-settings/g)||[]).length,1);
+  }
 }
 const check=bootstrap.checks.find(item=>item.id==='correctness');
 const status={},effective={};const card={querySelector:selector=>({'[data-setting-state]':status,'[data-effective-settings]':effective})[selector]};
-updateCheckRow(check,config,card);assert.match(effective.textContent,/At least 6 questions/);
+updateCheckRow(check,config,card);assert.match(effective.textContent,/At least 6 requests/);
 config.test_options.correctness={samples:9,limits:{min_correctness:.95}};
-updateCheckRow(check,config,card);assert.match(effective.textContent,/At least 9 questions/);assert.match(effective.textContent,/95% correct required/);
+updateCheckRow(check,config,card);assert.match(effective.textContent,/At least 9 requests/);assert.match(effective.textContent,/95% correct required/);
 assert.equal(status.textContent,'Overrides');
 config.checks=[];updateCheckRow(check,config,card);
-assert.equal(status.textContent,'Saved overrides');assert.match(effective.textContent,/At least 9 questions/);
+assert.equal(status.textContent,'Saved overrides');assert.match(effective.textContent,/At least 9 requests/);
 assert.equal(effective.hidden,undefined); // Info stays available for checks not selected.
 assert.equal(catalogTitle('access'),'Endpoint response');
 assert.equal(catalogTitle('prefix'),'Prompt cache evidence');

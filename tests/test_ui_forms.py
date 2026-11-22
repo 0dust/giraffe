@@ -60,9 +60,9 @@ renderRequestPlan();
 assert.match(nodes['#request-plan'].innerHTML,/164 requests/);
 assert.match(nodes['#request-plan'].innerHTML,/12 evaluator calls/);
 assert.match(nodes['#request-plan'].innerHTML,/data-action="use-request-budget"/);
-assert.match(nodes['#request-plan'].innerHTML,/<details class="request-planning">/);
+assert.match(nodes['#request-plan'].innerHTML,/<details class="(?:[^"]* +)?request-planning(?: +[^"]*)?">/);
 assert.match(nodes['#request-plan'].innerHTML,/96 characters sent/);assert.match(nodes['#request-plan'].innerHTML,/64 configured, plus instructions/);
-assert.match(nodes['#request-plan'].innerHTML,/Connection check/);assert.doesNotMatch(nodes['#request-plan'].innerHTML,/Shared accounting/);
+assert.match(nodes['#request-plan'].innerHTML,/Initial request/);assert.match(nodes['#request-plan'].innerHTML,/data-plan-phase="initial"/);assert.match(nodes['#request-plan'].innerHTML,/1 request per endpoint/);assert.match(nodes['#request-plan'].innerHTML,/One generated request checks the connection/);assert.doesNotMatch(nodes['#request-plan'].innerHTML,/Shared accounting/);
 configChanged();assert.match(nodes['#request-plan'].innerHTML,/stale/i);
 assert.doesNotMatch(nodes['#request-plan'].innerHTML,/data-action="use-request-budget"|164 requests/);
 let current=structuredClone(config),resolve;
@@ -329,7 +329,12 @@ vm.runInNewContext('state.bootstrap=bootstrap;state.bootstrap.config=config;',co
 for(const check of context.bootstrap.checks) {{
   context.check=check;
   const markup=vm.runInNewContext('renderTestCard(check,config)',context);
-  assert.match(markup,/class="check-info-details"/);assert(markup.includes('<dt>Sends</dt>'));
+  if(['serving','correctness'].includes(check.id)) {{
+    assert.doesNotMatch(markup,/class="check-info-details"/);assert(!markup.includes('<dt>Sends</dt>'));
+    assert(markup.includes(`popovertarget="field-check_${{check.id}}-help"`));
+  }} else {{
+    assert.match(markup,/class="check-info-details"/);assert(markup.includes('<dt>Sends</dt>'));
+  }}
   for(const name of check.option_fields) {{
     assert(markup.includes(`name="test_${{check.id}}_${{name}}"`));
     assert(markup.includes(`popovertarget="field-test_${{check.id}}_${{name}}-help"`));
@@ -1211,11 +1216,11 @@ readForm=()=>({config:structuredClone(state.config),mode:'normal'});captureFormD
 renderNew=()=>{state.jsonDraft=state.jsonBase='synced';};toast=()=>{};setActive=id=>{state.active=id;};
 const pack={version:1,cases:[{fixture_id:'one',messages:[{role:'user',content:'<question>'}],scorer:'judge',expected:'<answer>',weight:1}]};
 changeRequestSource('request_pack');assert.equal(state.config.request_source,'request_pack');assert.equal(state.config.request_pack,null);assert(!nodes['#request-pack-file'].clicked);
-let markup=renderRequestSource(state.config);assert.match(markup,/My questions/);assert.match(markup,/Add your first question/);assert(!markup.includes('dataset-bulk-scorer'));
+let markup=renderRequestSource(state.config);assert.match(markup,/My questions/);assert.match(markup,/data-action="add-example"/);assert.doesNotMatch(markup,/Add your first question|Enter a question and its expected answer, or use the sample questions to get started/);assert(!markup.includes('dataset-bulk-scorer'));
 const calls=[];api=async(path,options)=>{calls.push({path,body:JSON.parse(options.body)});if(path==='/api/datasets/preview')return {columns:[],preview_rows:pack.cases,request_pack:pack,errors:[],needs_mapping:false};if(path==='/api/config/draft')return {config:JSON.parse(options.body)};throw Error('Unexpected endpoint');};
 await importRequestPack({name:'examples.json',size:20,text:async()=>JSON.stringify(pack)});
 assert.equal(state.config.request_pack,null);assert.equal(calls.length,1);assert.equal(calls[0].path,'/api/datasets/preview');assert(nodes['#dataset-dialog'].open);
-markup=nodes['#dataset-dialog'].innerHTML;assert.match(markup,/Use dataset/);assert(markup.includes('<th>Input</th>'));assert.match(markup,/&lt;question&gt;/);assert(!markup.includes('<pre>'));
+markup=nodes['#dataset-dialog'].innerHTML;assert.match(markup,/Replace current questions with this question/);assert(markup.includes('<th>Input</th>'));assert.match(markup,/&lt;question&gt;/);assert(!markup.includes('<pre>'));
 await useImportedDataset({preventDefault(){}});assert.equal(state.config.request_pack.cases[0].fixture_id,'one');assert.equal(state.config.targets[0].model,'');assert.equal(calls[1].path,'/api/config/draft');assert(!nodes['#dataset-dialog'].open);
 const accepted=JSON.stringify(state.config);
 // Sample loading uses the same staged preview: cancelling preserves custom questions.

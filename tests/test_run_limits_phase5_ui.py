@@ -6,6 +6,7 @@ import pytest
 
 from giraffe.models import RunConfig
 from tests.test_ux_catalogue import browser_logic
+from tests.test_ux_results import run_render_checks
 from tests.test_ux_setup import run_browser_logic
 from tests.test_web import browser
 
@@ -115,6 +116,75 @@ assert.match(markup,/data-setting-path="traffic.expected_response_seconds"/);
 assert.equal((markup.match(/role="alert"/g)||[]).length,1);
 assert.equal(canStartRun(),false);
 """)
+
+
+def test_timing_risk_is_collapsed_once_at_duration_with_all_edit_links_in_details():
+    run_browser_logic(r"""
+state.config={checks:['access','correctness'],targets:[{}]};state.jsonDraft=state.jsonBase='synced';
+const risk={kind:'estimate_risk',msg:'Endpoint access may wait 300 s. Answer correctness has no comparable timing measurements. <unknown>',
+ fields:['max_duration_seconds','test_options.access.request_timeout_seconds','test_options.correctness']};
+const plan={estimated_seconds:1,time_warnings:[risk]};
+state.requestPreview={status:'current',revision:state.configRevision,route:state.routeVersion,plan};
+for(const path of risk.fields){
+ const {name}=settingDestination(path),input=element();input.getAttribute=key=>input.attributes[key];
+ nodes['#field-'+name]=input;nodes['#field-'+name+'-warning']=element({hidden:true});
+}
+syncInlineErrors();
+const warning=nodes['#field-max_duration_seconds-warning'];
+assert(!warning.hidden);
+assert.match(warning.innerHTML,/Some checks may not finish within the time limit/);
+const disclosure=warning.innerHTML.match(/<details\b[^>]*>[\s\S]*?<\/details>/)?.[0];
+assert(disclosure,'Timing diagnostics must be in a disclosure');assert.doesNotMatch(disclosure,/<details\b[^>]*\bopen(?:[\s=>])/);
+assert.match(disclosure,/Show timing details/);assert.match(disclosure,/300 s/);assert.match(disclosure,/&lt;unknown&gt;/);
+for(const path of risk.fields)assert(disclosure.includes('data-setting-path="'+path+'"'));
+assert.doesNotMatch(warning.innerHTML.replace(disclosure,''),/300 s|no comparable|data-setting-path/);
+for(const path of risk.fields.slice(1))assert(nodes['#field-'+settingDestination(path).name+'-warning'].hidden);
+const markup=renderPlanTime(plan);assert.match(markup,/<details\b/);assert.match(markup,/300 s/);
+state.requestPreview.plan={};syncInlineErrors();assert(warning.hidden);
+""")
+
+
+def test_open_timing_details_survive_repeated_previews():
+    run_render_checks(r"""
+$('#main').innerHTML=field('max_duration_seconds','Duration',10,{type:'number'});
+const risk={kind:'estimate_risk',msg:'No comparable timing measurements.',fields:['max_duration_seconds']};
+currentRequestPlan=()=>({time_warnings:[risk]});currentSettingErrors=currentResourceErrors=localSettingWarnings=()=>[];
+syncInlineErrors();const details=$('.timing-warning-details');details.open=true;
+syncInlineErrors();assert.equal($('.timing-warning-details'),details);assert(details.open);
+risk.msg='The configured timeout may exceed the time limit.';
+syncInlineErrors();assert.equal($('.timing-warning-details'),details);assert(details.open);assert.match(details.textContent,/configured timeout/);
+""", dom=True)
+
+
+def test_review_timing_expansion_survives_renders_and_pending_previews():
+    run_render_checks(r"""
+(async()=>{
+$('#main').innerHTML='<div id="request-plan"></div><form id="new-run-form"></form>';
+state.config={checks:[],limits:{},targets:[]};state.configRevision=1;state.routeVersion=1;
+const risk={kind:'estimate_risk',msg:'Specific timing explanation',fields:['max_duration_seconds']};
+const plan={estimated_seconds:10,time_warnings:[risk],rows:[],evaluator:{},planned_total:1};
+state.requestPreview={status:'current',revision:1,route:1,plan,config:state.config};
+readForm=()=>({config:state.config});syncRunBlueprint=()=>{};canStartRun=()=>false;currentSettingErrors=()=>[];localSettingWarnings=()=>[];renderPlanBounds=()=>'';renderLoadPlan=()=>'';renderMigrationNotes=()=>'';renderFlightPlan=()=>'';renderReviewPassCriteria=()=>'';setupPlanCount=()=>'';syncInlineErrors=()=>{};syncLoadDisplay=()=>{};updateCorrectnessExecution=()=>{};localSettingErrors=()=>[];acceptMigrationNotes=()=>{};
+renderRequestPlan();let details=$('.timing-warning-details');assert(details);assert.equal(details.open,false);
+details.open=true;renderRequestPlan();details=$('.timing-warning-details');assert(details.open,'expanded timing details survive direct review rendering');
+let finish;api=()=>new Promise(resolve=>finish=resolve);
+const pending=refreshRequestPreview(undefined,{draft:true});
+assert.equal($('.timing-warning-details'),null);assert.doesNotMatch($('#request-plan').textContent,/Specific timing explanation/);
+finish({request_plan:plan,config:state.config});await pending;
+details=$('.timing-warning-details');assert(details.open,'expanded timing details survive pending to current');
+assert(details.querySelector('[data-setting-path="max_duration_seconds"]'));
+details.open=false;renderRequestPlan();assert.equal($('.timing-warning-details').open,false);
+const closedPending=refreshRequestPreview(undefined,{draft:true});finish({request_plan:plan,config:state.config});await closedPending;
+assert.equal($('.timing-warning-details').open,false,'collapsed timing details stay collapsed');
+$('.timing-warning-details').open=true;risk.msg='Updated timing explanation';risk.fields=['max_requests'];renderRequestPlan();
+details=$('.timing-warning-details');assert(details.open);assert.match(details.textContent,/Updated timing explanation/);assert.doesNotMatch(details.textContent,/Specific timing explanation/);
+assert(details.querySelector('[data-setting-path="max_requests"]'));assert.equal(details.querySelector('[data-setting-path="max_duration_seconds"]'),null);
+plan.time_warnings=[];renderRequestPlan();assert.equal($('.timing-warning-details'),null);
+plan.time_warnings=[risk];renderRequestPlan();assert.equal($('.timing-warning-details').open,false,'resolved warnings clear expansion');
+$('.timing-warning-details').open=true;state.routeVersion++;state.requestPreview={status:'current',revision:state.configRevision,route:state.routeVersion,plan,config:state.config};renderRequestPlan();
+assert.equal($('.timing-warning-details').open,false,'new route starts collapsed');
+})()
+""", dom=True)
 
 
 async def test_tool_stream_conflict_reaches_both_inline_fields_and_plan(tmp_path):

@@ -9,6 +9,8 @@ import pytest
 from giraffe.models import RequestRecord, RunReport
 from giraffe.performance import build_performance
 from tests.performance_fixture import synthetic_report_1000
+from tests.test_performance import report
+from tests.test_performance_scope import archived_performance_names
 from tests.test_ux_results import run_render_checks, stylesheet_rules
 
 
@@ -30,6 +32,28 @@ const selected=fixture.targets[0],summary=selected.summaries[selected.selected_w
 const kpiHeadline=card=>card.childNodes.find(node=>node.tagName==='STRONG');
 """
     run_render_checks(setup + assertions, dom=True)
+
+
+def test_archived_measurement_selector_uses_current_names_and_keeps_saved_values():
+    source = archived_performance_names()
+    displayed = build_performance(report([], performance=source))
+    assert source['targets'][0]['cohorts'][0]['label'] == 'Generation speed'
+    run_render_checks('const fixture=' + json.dumps(displayed) + r''';
+const target=fixture.targets[0],before=JSON.stringify(fixture);
+const select=document.createElement('select');select.innerHTML=performanceWindowOptions(target,target.windows[0]);
+assert.deepEqual(Array.from(select.querySelectorAll('option'),option=>option.getAttribute('value')).sort(),target.windows.map(window=>window.id).sort());
+for(const [id,label] of Object.entries({generation:'Generation',context:'Context recall',json_c4:'JSON correctness',
+ recovery:'Recovery after load · Recovery check','session_fixed:check=sessions':'Concurrent conversations · Fixed sessions',
+ 'session_live:check=sessions':'Concurrent conversations · Live sessions'})){
+  assert(select.querySelector('option[value="full:'+id+'"]').textContent.startsWith(label+' · full run'));
+  assert(select.querySelectorAll('optgroup').some(group=>group.getAttribute('label')===label));
+}
+assert.equal(select.querySelector('option[value="custom-window"]').textContent,'Generation speed · custom label');
+assert.equal(select.querySelector('option[value="custom-selection"]').textContent,'My selected view');
+assert.equal(select.querySelector('option[value="prefixed-custom-selection"]').textContent,'Generation speed · my imported selection');
+assert.equal(select.querySelector('option[selected]').getAttribute('value'),'full:generation');
+assert.equal(JSON.stringify(fixture),before);
+''', dom=True)
 
 
 def test_synthetic_thousand_sections_kpis_and_bounded_charts(performance):

@@ -189,7 +189,7 @@ def test_time_estimate_and_warning_have_distinct_copy_and_edit_links_in_both_vie
     run_browser_logic(r"""
 state.config={checks:['access'],targets:[{}],concurrency:4,max_requests:100,max_duration_seconds:20};
 state.jsonDraft=state.jsonBase='synced';
-const plan={count_kind:'exact',planned_total:4,request_limit:100,rows:[],warnings:[],estimated_seconds:4,
+const plan={count_kind:'exact',planned_total:4,request_limit:100,rows:[],warnings:[],has_complete_time_estimate:true,estimated_seconds:4,
  estimated_low_seconds:3,estimated_high_seconds:5,confidence:'medium',estimate_exclusions:['setup/connection','AI evaluation','report generation'],
  time_warnings:[{msg:'The limit may leave checks unfinished.',fields:['max_duration_seconds','request_timeout_seconds'],actions:[{label:'Use 30 s',field:'max_duration_seconds',value:30},{label:'Edit request timeout',field:'request_timeout_seconds'}]}],
  request_warnings:[{msg:'Answer correctness will be cut.',fields:['max_requests'],actions:[{label:'Use 120 total requests',field:'max_requests',value:120}]}]};
@@ -206,8 +206,15 @@ for(const markup of [nodes['#request-plan'].innerHTML,renderRunBlueprint(state.c
 assert(canStartRun());
 plan.errors=[{field:'max_duration_seconds',fields:['max_duration_seconds','traffic.rates'],msg:'Fixed windows exceed Maximum duration.'}];
 assert(!canStartRun());renderRequestPlan();assert.match(nodes['#request-plan'].innerHTML,/data-setting-path="traffic.rates"/);
+plan.has_complete_time_estimate=false;
 plan.estimated_seconds=plan.estimated_low_seconds=plan.estimated_high_seconds=null;plan.time_bound_reasons=['+ 120 requests at unknown speed (up to 1 h if every request hits its timeout).'];
-assert.match(renderPlanTime(plan),/awaiting comparable measurements/);assert.match(renderPlanTime(plan),/120 requests at unknown speed/);
+renderRequestPlan();
+for(const markup of [nodes['#request-plan'].innerHTML,renderRunBlueprint(state.config,plan)]){
+  assert.doesNotMatch(markup,/Estimated duration:|Confidence:|awaiting comparable measurements|120 requests at unknown speed/);
+  assert.match(markup,/The limit may leave checks unfinished/);assert.match(markup,/Answer correctness will be cut/);
+  assert.match(markup,/Use 30 s/);assert.match(markup,/Edit request timeout/);assert.match(markup,/Use 120 total requests/);
+  assert.match(markup,/Fixed windows exceed Maximum duration/);assert.match(markup,/data-setting-path="traffic.rates"/);
+}
 """)
 
 
