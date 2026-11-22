@@ -108,21 +108,21 @@ def test_a1_a3_limits_dom_order_visible_headings_and_unique_check_owned_fields()
 
 def test_a2_exact_open_rows_and_outer_state_survive_repeated_refreshes():
     browser_logic(r"""
-const rows=['one','two','three'];let generation=[];
+const rows=['access','correctness','generation'];config.checks=[...rows];let generation=[];
 function node(id,open=false){return {dataset:id?{planRow:id}:{},open,querySelector:()=>({focus(){}})};}
-const element={outer:node(null,false),assumptions:node(null,false),rows:rows.map(id=>node(id,id!=='two')),
+const element={outer:node(null,false),assumptions:node(null,false),rows:rows.map(id=>node(id,id!=='correctness')),
  querySelector(q){return q==='.workload-breakdown'?this.outer:q==='.estimate-assumptions'?this.assumptions:null;},
  querySelectorAll(q){return q==='details[data-plan-row], details[data-plan-check]'?this.rows:q.includes('[data-plan-check]')?[]:q==='details[data-plan-row][open]'?this.rows.filter(row=>row.open):this.rows;},
  set innerHTML(value){this.outer=value.includes('workload-breakdown')?node(null):null;this.assumptions=value.includes('estimate-assumptions')?node(null):null;this.rows=value.includes('data-plan-row')?rows.map(id=>node(id)):[];generation.push(value);}};
 nodes['#run-blueprint']=element;
-const plan={estimated_seconds:1,estimated_low_seconds:0,estimated_high_seconds:2,time_estimate_assumptions:['Observed batch time.'],rows:rows.map(id=>({id,title:id,requests_per_target:1,summary:'kept',source:'built-in'}))};
+const plan={has_complete_time_estimate:true,estimated_seconds:1,estimated_low_seconds:0,estimated_high_seconds:2,time_estimate_assumptions:['Observed batch time.'],rows:rows.map(id=>({id,title:id,requests_per_target:1,summary:'kept',source:'built-in'}))};
 syncRunBlueprint(config,plan);
-assert.equal(element.outer.open,false);assert.equal(element.rows.filter(row=>row.open).map(row=>row.dataset.planRow).join(','),'one,three');
+assert.equal(element.outer.open,false);assert.equal(element.rows.filter(row=>row.open).map(row=>row.dataset.planRow).join(','),'access,generation');
 element.outer.open=true;element.rows[0].open=false;element.rows[1].open=true;element.assumptions.open=true;
 syncRunBlueprint(config,null);assert.equal(element.outer,null);assert.equal(element.rows.length,0);
 syncRunBlueprint(config,plan);
 assert.equal(element.outer.open,true);assert.equal(element.assumptions.open,true);
-assert.equal(element.rows.filter(row=>row.open).map(row=>row.dataset.planRow).join(','),'two,three');
+assert.equal(element.rows.filter(row=>row.open).map(row=>row.dataset.planRow).join(','),'correctness,generation');
 assert.equal(generation.length,3);assert.doesNotMatch(generation[2],/planCheck=undefined/);
 """)
 
@@ -176,10 +176,12 @@ def test_a7_a16_plan_copy_observed_counts_bursts_and_distinct_controls():
     cfg=RunConfig(targets=[{'name':'local','url':'http://localhost/v1','model':'test'}],checks=['load'],load_test={'workloads':{'combinations':{'selected':['short_short']}},'patterns':{'concurrent':{'enabled':False},'constant':{'enabled':False},'poisson':{'enabled':True},'bursts':{'enabled':True,'first_seconds':0,'gap_seconds':1,'size':4},'rates':[2]},'schedule':{'duration_seconds':3}})
     browser_logic('const plan='+json.dumps(request_plan(cfg))+r''';
 plan.estimated_seconds=3;plan.estimated_low_seconds=2;plan.estimated_high_seconds=4;plan.time_estimate_assumptions=['Finite batches use comparable observations.'];plan.confidence_details={insufficient_observations:['At least 150 comparable samples are required.']};plan.time_bound_reasons=['+ 10 requests at unknown speed'];
-const markup=renderRunBlueprint(config,plan),limits=renderSharedRunSettings(config);assert.equal((markup.match(/Estimated duration:/g)||[]).length,1);assert.equal(((markup+limits).match(/aria-live="polite"/g)||[]).length,1);
-for(const text of ['Confidence: low','Additional work at unknown speed','At least 150 comparable samples are required','Estimate assumptions','setup/connection, AI evaluation, report generation','Poisson + bursts','≈ 18'])assert(markup.includes(text),text);
+const markup=renderRunBlueprint(config,plan),limits=renderSharedRunSettings(config);assert.doesNotMatch(markup,/Estimated duration:|Confidence:|Additional work at unknown speed/);assert.equal(((markup+limits).match(/aria-live="polite"/g)||[]).length,1);
+for(const text of ['Poisson + bursts','≈ 18'])assert(markup.includes(text),text);
+const complete=renderPlanTime({...plan,has_complete_time_estimate:true,time_bound_reasons:[]});assert.equal((complete.match(/Estimated duration:/g)||[]).length,1);
+for(const text of ['Confidence: low','At least 150 comparable samples are required','Estimate assumptions','setup/connection, AI evaluation, report generation'])assert(complete.includes(text),text);
 assert.equal((markup.match(/Not set/g)||[]).length,3);assert.match(markup,/Maximum memory/);
-const duration={id:'load_combinations',kind:'duration',requests_per_target:null};assert.equal(planRowCount(duration),'Duration-based');duration.estimated_requests_per_target=12;assert.equal(planRowCount(duration),'Duration-based · ~12 (estimate, from your last run)');
+const duration={id:'load_combinations',kind:'duration',requests_per_target:null};assert.equal(planRowCount(duration),'Request count is adaptive per endpoint');duration.estimated_requests_per_target=12;assert.equal(planRowCount(duration),'Request count is adaptive per endpoint · about 12 requests (estimate, from your last run)');
 const editor=renderLoadEditor(config);for(const label of ['Requests per burst','Rates (requests/second)','First burst after (seconds)','Time between burst starts (seconds)','Concurrency ceiling · Run limits'])assert(editor.includes(label));assert.doesNotMatch(editor,/Pending queue|traffic_max_in_flight|profile_arrivals_max_in_flight/);
 ''',cfg)
 

@@ -338,10 +338,10 @@ def test_duration_row_discloses_pooled_observation_source_in_existing_ui():
 
     browser_logic(r"""
 assert.equal(planRowCount({kind:'duration',requests_per_target:null,estimated_requests_per_target:100,
-  estimate_source:'from your recent runs'}),'Duration-based · ~100 (estimate, from your recent runs)');
+  estimate_source:'from your recent runs'}),'Request count is adaptive per endpoint · about 100 requests (estimate, from your recent runs)');
 assert.equal(planRowCount({kind:'duration',requests_per_target:null,estimated_requests_per_target:100}),
-  'Duration-based · ~100 (estimate, from your last run)');
-assert.equal(planRowCount({kind:'duration',requests_per_target:null}),'Duration-based');
+  'Request count is adaptive per endpoint · about 100 requests (estimate, from your last run)');
+assert.equal(planRowCount({kind:'duration',requests_per_target:null}),'Request count is adaptive per endpoint');
 """)
 
 

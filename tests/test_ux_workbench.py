@@ -49,14 +49,14 @@ const plan={count_kind:'exact',planned_total:4,request_limit:12,required_request
 api=()=>{throw new Error('Preview rendering must not send traffic');};
 let html=renderRunBlueprint(state.config,plan);
 assert.match(html,/4 requests planned/);assert.match(html,/Maximum requests/);
-assert.match(html,/data-plan-row="initial"/);assert.doesNotMatch(html,/data-plan-row="access"/);
+assert.match(html,/data-plan-row="access"/);assert.doesNotMatch(html,/data-plan-row="initial"/);
 assert.doesNotMatch(html,/data-plan-check=/);assert.match(html,/per endpoint/);
 assert.doesNotMatch(html,/Play example|800 ms|Passed/);
 html=renderRunBlueprint(state.config,null);assert.doesNotMatch(html,/4 requests planned|data-plan-row=/);
 assert.match(html,/Calculating traffic/);
 plan.rows[0].requests_per_target=null;plan.rows[0].kind='bounded';
 plan.rows[2].kind='estimate';html=renderRunBlueprint(state.config,plan);
-assert.match(html,/Adaptive/);assert.match(html,/~ 3/);
+assert.match(html,/adaptive per endpoint/);assert.match(html,/About 3 requests per endpoint/);
 assert.equal(JSON.stringify(state.config),original);
 """)
 

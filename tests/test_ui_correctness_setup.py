@@ -25,7 +25,7 @@ state.requestPreview.plan.rows=[{id:'correctness',requests_per_target:null,kind:
 assert.match(effectiveCheckSummary(check,local),/At least 6 requests/);
 assert.match(renderBuiltinQuestions(local),/Additional configured cases can increase the request count/);
 state.requestPreview.plan.rows=[{id:'correctness',requests_per_target:6}];
-const loadOnly={...config,checks:['load'],load_test:structuredClone(bootstrap.load_test.defaults)};
+const loadOnly={...config,checks:['load'],request_source:'request_pack',load_test:structuredClone(bootstrap.load_test.defaults)};
 loadOnly.load_test.pass_criteria.min_correct_percent=85;
 assert.match(renderQuestionSetupSummary(loadOnly),/85%/);
 console.log(JSON.stringify({markup:renderTestCard(check,config),summary:effectiveCheckSummary(check,config),builtins:bootstrap.builtin_questions,preview:renderBuiltinQuestions(config)}));
@@ -46,8 +46,10 @@ console.log(JSON.stringify({markup:renderTestCard(check,config),summary:effectiv
     percent, = tree.named('test_correctness_limit_min_correctness')
     assert (percent['min'], percent['max']) == ('0', '100')
     assert 'Using run default: 300 seconds' in result['markup']
-    inheritance = 'Leave blank to use the shown default. Enter a value to override it.'
+    inheritance = 'Leave timeout, request count, concurrency or output limit blank to use the shown defaults.'
     assert result['markup'].count(inheritance) == 1
+    assert 'Leave blank to use the shown default.' not in result['markup']
+    assert 'required' in percent
     for name in ('request_timeout_seconds', 'samples', 'concurrency', 'max_output_tokens'):
         assert result['markup'].index(inheritance) < result['markup'].index(f'name="test_correctness_{name}"')
     assert len(result['builtins']) == 3
@@ -93,6 +95,65 @@ change(form.querySelector('[name="request_source"][value="request_pack"]'));
 assert.equal(document.querySelector('[data-question-setup-summary] [data-action="configure-evaluator"]').textContent,'Edit evaluator');
 assert.equal(JSON.stringify(state.config.judging),judging);assert.equal(JSON.stringify(state.config.request_pack),pack);
 assert.equal(requests.length,0);
+''')
+
+
+def test_builtin_preview_belongs_to_correctness_while_load_explains_its_actual_source():
+    browser_logic(r'''
+const original=JSON.stringify(config),correctness=bootstrap.checks.find(check=>check.id==='correctness'),load=bootstrap.checks.find(check=>check.id==='load');
+const generated='Generates prompts using these input token targets and output caps.';
+for(const checks of [['load'],['correctness'],['correctness','load']]){
+  const draft={...config,checks},correctnessMarkup=renderTestCard(correctness,draft),loadMarkup=renderTestCard(load,draft);
+  assert.equal(correctnessMarkup.includes('data-action="view-builtin-examples"'),checks.includes('correctness'));
+  assert.doesNotMatch(correctnessMarkup,/class="builtin-example"|Expected answer:<\/strong>/);
+  assert.doesNotMatch(loadMarkup,/data-action="view-builtin-examples"|3 built-in questions/);
+  assert.doesNotMatch(loadMarkup,/class="builtin-example"|Requests repeat these questions|Expected answer:<\/strong>/);
+  assert(loadMarkup.includes(generated));
+  if(checks.includes('correctness')){
+    assert.match(correctnessMarkup,/3 built-in questions/);
+    const preview=renderBuiltinQuestions(draft,{expanded:true});
+    for(const item of bootstrap.builtin_questions)assert(preview.includes('<code>'+escape(item.expected)+'</code>'));
+  }
+  assert.doesNotMatch(correctnessMarkup,/Load test uses this question source too/);
+  const sourceMarkup=checks.includes('correctness')?correctnessMarkup:loadMarkup;
+  assert.equal((sourceMarkup.match(/name="request_source"/g)||[]).length,2);
+}
+const fixtures=renderTestCard(load,{...config,checks:['load'],custom_fixtures:'local.jsonl'});
+assert.match(fixtures,/Uses the configured fixture file; its answer limits and checks are preserved/);
+assert(!fixtures.includes(generated));
+assert.doesNotMatch(fixtures,/class="builtin-example"|Requests repeat these questions/);
+const pack={...config,checks:['correctness','load'],request_source:'request_pack',request_pack:{version:1,cases:[{fixture_id:'saved',messages:[{role:'user',content:'My question'}],scorer:'exact',expected:'My answer'}]}};
+const packOriginal=JSON.stringify(pack),correctnessMarkup=renderTestCard(correctness,pack),loadMarkup=renderTestCard(load,pack);
+assert.match(correctnessMarkup,/These questions and answer checks are shared with Load test/);
+assert.match(correctnessMarkup,/1 saved question/);assert.match(correctnessMarkup,/Manage questions/);
+assert.doesNotMatch(correctnessMarkup,/>My question<|>My answer</);
+assert.doesNotMatch(correctnessMarkup,/class="builtin-example"/);
+assert(!loadMarkup.includes(generated));
+assert.equal((correctnessMarkup.match(/name="request_source"/g)||[]).length,2);
+assert.doesNotMatch(loadMarkup,/name="request_source"/);
+assert.equal(JSON.stringify(pack),packOriginal);assert.equal(JSON.stringify(config),original);
+''')
+
+
+def test_only_request_options_inherit_when_blank_and_percentages_keep_numeric_validation():
+    browser_logic(r'''
+for(const [id,criterion,percentage,expected] of [['serving','max_error_rate','5',.05],['correctness','min_correctness','95',.95]]){
+  const check=bootstrap.checks.find(check=>check.id===id),source=structuredClone(config);
+  source.checks=[id];source.test_options[id]={request_timeout_seconds:500,max_output_tokens:999,samples:12};
+  if(id==='correctness')source.test_options[id].concurrency=2;
+  const values=new FormData();values.append('check',id);values.set('test_mode_'+id,'custom');
+  for(const name of check.option_fields)values.set('test_'+id+'_'+name,'');
+  values.set('test_'+id+'_limit_'+criterion,percentage);
+  const read=configureTests(source,values,bootstrap.checks,bootstrap.traffic_defaults,{percentageInputs:true});
+  for(const name of check.option_fields)assert.equal(read.test_options[id][name],undefined);
+  assert.equal(read.test_options[id].limits[criterion],expected);
+  values.set('test_'+id+'_limit_'+criterion,'');
+  const blank=configureTests(source,values,bootstrap.checks,bootstrap.traffic_defaults,{percentageInputs:true});
+  assert.equal(blank.test_options[id].limits[criterion],null);
+  const markup=renderTestCard(check,read),input=markup.match(new RegExp('<input\\b[^>]*name="test_'+id+'_limit_'+criterion+'"[^>]*>'))[0];
+  assert.match(input,/\brequired\b/);assert.match(input,/\bmin="0"/);assert.match(input,/\bmax="100"/);
+  assert.doesNotMatch(markup,/Leave blank to use the shown default/);
+}
 ''')
 
 

@@ -210,7 +210,7 @@ config.test_options.correctness={samples:9};updateCheckFieldHints(config);assert
 assert.equal(testSettingsLabel(check,config),'Overrides');
 delete config.test_options.correctness;updateCheckFieldHints(config);assert.equal(reset.hidden,true);
 config.checks.push('load');markup=renderTestCard(check,config);
-assert.match(markup,/question-source-scope">Load test uses this question source too/);
+assert.doesNotMatch(markup,/question-source-scope/);
 assert.equal((markup.match(/name="request_source"/g)||[]).length,2);
 """)
 
@@ -240,6 +240,9 @@ assert.match(markup,/data-action="view-builtin-examples">View examples/);
 assert.doesNotMatch(markup,/data-action="manage-questions"|Manage questions/);
 assert.match(markup,/Required correct answers/);
 assert.doesNotMatch(markup,/dataset-example-form|dataset-import-form|judge_count/);
+assert.match(markup,/id="field-request_source-help"[^>]*popover="auto"/);
+assert.match(markup,/Switching sources keeps your saved questions/);
+assert.match(markup,/Answer correctness and Load test use the same saved questions/);
 assert.doesNotMatch(markup,/Each saved question runs once/);
 assert.equal(JSON.stringify(config),original);
 const custom=structuredClone(config);custom.request_source='request_pack';

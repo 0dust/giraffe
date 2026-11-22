@@ -497,3 +497,33 @@ assert.equal(state.config.max_requests,55);assert.equal(state.setupStep,step);as
 assert.equal(window.scrollY,418);assert.equal(document.activeElement,focus);
 assert(!state.migrationNotes.includes('Stale normalization'));assert.equal(location.hash,'#new');
 ''')
+
+
+@pytest.mark.parametrize("checks", [["load"], ["correctness", "load"]])
+@pytest.mark.parametrize("fixtures", [None, "local.jsonl"])
+def test_source_switch_refreshes_load_and_shared_question_explanations_without_replacing_controls(checks, fixtures):
+    navigation_browser("state.config.checks=" + json.dumps(checks) + ";state.config.custom_fixtures=" + json.dumps(fixtures) + r''';
+state.config.request_source='builtin';state.openTest='load';renderNew();
+const form=document.querySelector('#new-run-form'),controls=[...form.querySelectorAll('input,select,textarea')];
+const profile=form.querySelector('.load-profile').closest('.load-section'),pack=JSON.stringify(state.config.request_pack);
+const generated='Generates prompts using these input token targets and output caps.';
+const fixture='Uses the configured fixture file; its answer limits and checks are preserved.';
+const checkSource=source=>{
+ const prose=[...profile.querySelectorAll('p')].filter(node=>!node.hidden).map(node=>node.textContent).join(' ');
+ assert.equal(prose.includes(generated),source==='builtin'&&!state.config.custom_fixtures,'Generated source explanation');
+ assert.equal(prose.includes(fixture),source==='builtin'&&Boolean(state.config.custom_fixtures),'Fixture source explanation');
+ const scope=form.querySelector('.question-source-scope');
+ assert.equal(Boolean(scope&&!scope.hidden),source==='request_pack'&&state.config.checks.includes('correctness'),'Shared question explanation');
+ assert.equal(document.querySelector('#new-run-form'),form);
+ assert.deepEqual([...form.querySelectorAll('input,select,textarea')],controls);
+ assert.equal(JSON.stringify(state.config.request_pack),pack);
+};
+checkSource('builtin');
+for(const source of ['request_pack','builtin']){
+ const radios=[...form.querySelectorAll('[name="request_source"]')];
+ for(const radio of radios)radio.checked=radio.value===source;
+ const radio=radios.find(input=>input.value===source);window.scrollY=519;change(radio);
+ checkSource(source);assert.equal(window.scrollY,519);assert.equal(document.activeElement,radio);
+}
+assert.equal(requests.length,0);
+''')

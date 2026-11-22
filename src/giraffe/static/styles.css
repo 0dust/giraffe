@@ -563,6 +563,17 @@ main:has(.new-run-layout.connecting) .setup-lede { font-size: 16px; margin-top: 
 .workload-breakdown details > summary:is(:hover, :focus-visible), .workload-breakdown details[open] > summary { color: var(--text); background: var(--surface-2); }
 .workload-breakdown details summary strong { font-family: var(--mono); color: var(--accent); min-width: 2ch; overflow-wrap: anywhere; }
 .workload-breakdown details p, .workload-breakdown details small { display: block; padding: 0 0 6px 4px; color: var(--text-3); font-size: 12px; }
+.check-plan-rows > details { min-width: 0; border-bottom: 1px solid var(--line); padding-block: 4px; }
+.check-plan-summary { min-width: 0; overflow-wrap: anywhere; }
+.check-plan-name { font-weight: 600; color: var(--text); }
+.check-plan-count { color: var(--text-2); }
+.check-plan-phases { margin: 8px 0; padding-left: 22px; font-size: 12.5px; }
+.check-plan-phases li { margin-block: 8px; }
+.check-plan-phases strong, .check-time-summary strong { font-weight: 600; }
+.check-time-summary { margin-block: 12px; font-size: 12.5px; }
+.check-time-summary h4 { font-size: 12.5px; margin-bottom: 4px; }
+.check-time-summary ul { margin-block: 4px; padding-left: 22px; }
+.check-plan-rows .configured-load-plan { margin: 12px 4px; }
 .blueprint-note { font-size: 13px; color: var(--text-2); padding-left: 10px; border-left: 2px solid var(--accent-line); }
 
 /* Review (step 3) */

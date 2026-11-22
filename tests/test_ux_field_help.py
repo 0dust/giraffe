@@ -46,8 +46,10 @@ console.log(JSON.stringify({markup,other:renderTestCard(bootstrap.checks.find(ch
     assert result['cap'] not in result['markup']
     errors, = tree.named('test_serving_limit_max_error_rate')
     assert (errors['min'], errors['max']) == ('0', '100')
-    inheritance = 'Leave blank to use the shown default. Enter a value to override it.'
+    inheritance = 'Leave request timeout, sample count or output cap blank to use the shown defaults.'
     assert result['markup'].count(inheritance) == 1
+    assert 'Leave blank to use the shown default.' not in result['markup']
+    assert 'required' in errors
     assert result['markup'].index(inheritance) < result['markup'].index('name="test_serving_request_timeout_seconds"')
     shared, = [node for node in tree.nodes if 'data-serving-shared-settings' in node]
     assert shared['text'] == 'These requests and their settings are also used by First answer.'
