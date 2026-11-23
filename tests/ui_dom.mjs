@@ -42,6 +42,7 @@ export function browserDOM(listeners) {
     removeChild(child){if(child.isConnected&&child.contains(document.activeElement))document.activeElement=document.body;const index=this.childNodes.indexOf(child);if(index<0)throw Error('Not a child');this.childNodes.splice(index,1);child.parentNode=null;return child;}
     matches(selector){
       if(this.nodeType!==1)return false;
+      if(selector.includes(':popover-open')&&!this.popoverOpen)return false;
       let parsed=PARSED_SELECTORS.get(selector);
       if(!parsed){
         if(selector.includes(','))parsed={any:selector.split(',').map(part=>part.trim())};
@@ -67,6 +68,8 @@ export function browserDOM(listeners) {
     querySelector(selector){return this.querySelectorAll(selector)[0] || null;}
     focus(options){if(options?.preventScroll!==true)throw Error('Focus must preserve scroll');document.activeElement=this;}
     showModal(){this.open=true;}
+    showPopover(){this.popoverOpen=true;}
+    hidePopover(){this.popoverOpen=false;}
     close(){this.open=false;}
   }
   function parse(html,parent){
@@ -83,7 +86,7 @@ export function browserDOM(listeners) {
     }
   }
   const body=new Node('body');
-  document={body,activeElement:null,createElement(tag){const node=new Node(tag);if(tag==='template')node.content=new Node('fragment');return node;},querySelector:selector=>body.querySelector(selector),querySelectorAll:selector=>body.querySelectorAll(selector),addEventListener:(kind,fn)=>listeners[kind]=fn};
+  document={body,documentElement:{clientWidth:1280},activeElement:null,getElementById:id=>body.querySelector('#'+id),createElement(tag){const node=new Node(tag);if(tag==='template')node.content=new Node('fragment');return node;},querySelector:selector=>body.querySelector(selector),querySelectorAll:selector=>body.querySelectorAll(selector),addEventListener:(kind,fn)=>listeners[kind]=fn};
   body.innerHTML='<main id="main"></main><a id="active-run-link"></a><ol id="rail-runs"></ol><section id="rail-recent"></section><div id="connection-error"></div><section id="report-sections" hidden></section><dialog id="test-dialog"></dialog><dialog id="request-dialog"></dialog><div id="performance-chart-tooltip" class="performance-chart-tooltip" role="tooltip" hidden></div><div id="spot-tip"></div>';
   return document;
 }

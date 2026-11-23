@@ -64,7 +64,10 @@ def test_gateway_plan_shows_named_target_counts():
     browser_logic(r'''
 const row={id:'gateway_attribution',title:'Gateway attribution',kind:'exact',requests_per_target:null,
   target_request_counts:{'proxy<script>':2,other:0}};
-assert.equal(planRowCount(row),'proxy&lt;script&gt;: 2 · other: 0');
-assert.match(renderFlightPlan({rows:[row]}),/proxy&lt;script&gt;: 2 · other: 0/);
-assert.doesNotMatch(renderFlightPlan({rows:[row]}),/Adaptive|<script>/);
+assert.equal(planRowCount(row),'proxy<script>: 2 requests · other: 0 requests');
+config.checks=['gateway_attribution'];config.targets=[{name:'proxy<script>'},{name:'other'}];
+const html=renderCheckPlan(config,{rows:[row]});
+assert.match(html,/data-plan-row="gateway_attribution"/);
+assert.equal((html.match(/proxy&lt;script&gt;: 2 requests · other: 0 requests/g)||[]).length,2);
+assert.doesNotMatch(html,/Request count is adaptive|<script>/);
 ''')

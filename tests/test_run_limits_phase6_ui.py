@@ -108,21 +108,21 @@ def test_a1_a3_limits_dom_order_visible_headings_and_unique_check_owned_fields()
 
 def test_a2_exact_open_rows_and_outer_state_survive_repeated_refreshes():
     browser_logic(r"""
-const rows=['one','two','three'];let generation=[];
+const rows=['access','correctness','generation'];config.checks=[...rows];let generation=[];
 function node(id,open=false){return {dataset:id?{planRow:id}:{},open,querySelector:()=>({focus(){}})};}
-const element={outer:node(null,false),assumptions:node(null,false),rows:rows.map(id=>node(id,id!=='two')),
+const element={outer:node(null,false),assumptions:node(null,false),rows:rows.map(id=>node(id,id!=='correctness')),
  querySelector(q){return q==='.workload-breakdown'?this.outer:q==='.estimate-assumptions'?this.assumptions:null;},
  querySelectorAll(q){return q==='details[data-plan-row], details[data-plan-check]'?this.rows:q.includes('[data-plan-check]')?[]:q==='details[data-plan-row][open]'?this.rows.filter(row=>row.open):this.rows;},
  set innerHTML(value){this.outer=value.includes('workload-breakdown')?node(null):null;this.assumptions=value.includes('estimate-assumptions')?node(null):null;this.rows=value.includes('data-plan-row')?rows.map(id=>node(id)):[];generation.push(value);}};
 nodes['#run-blueprint']=element;
-const plan={estimated_seconds:1,estimated_low_seconds:0,estimated_high_seconds:2,time_estimate_assumptions:['Observed batch time.'],rows:rows.map(id=>({id,title:id,requests_per_target:1,summary:'kept',source:'built-in'}))};
+const plan={has_complete_time_estimate:true,estimated_seconds:1,estimated_low_seconds:0,estimated_high_seconds:2,time_estimate_assumptions:['Observed batch time.'],rows:rows.map(id=>({id,title:id,requests_per_target:1,summary:'kept',source:'built-in'}))};
 syncRunBlueprint(config,plan);
-assert.equal(element.outer.open,false);assert.equal(element.rows.filter(row=>row.open).map(row=>row.dataset.planRow).join(','),'one,three');
+assert.equal(element.outer.open,false);assert.equal(element.rows.filter(row=>row.open).map(row=>row.dataset.planRow).join(','),'access,generation');
 element.outer.open=true;element.rows[0].open=false;element.rows[1].open=true;element.assumptions.open=true;
 syncRunBlueprint(config,null);assert.equal(element.outer,null);assert.equal(element.rows.length,0);
 syncRunBlueprint(config,plan);
 assert.equal(element.outer.open,true);assert.equal(element.assumptions.open,true);
-assert.equal(element.rows.filter(row=>row.open).map(row=>row.dataset.planRow).join(','),'two,three');
+assert.equal(element.rows.filter(row=>row.open).map(row=>row.dataset.planRow).join(','),'correctness,generation');
 assert.equal(generation.length,3);assert.doesNotMatch(generation[2],/planCheck=undefined/);
 """)
 
@@ -138,7 +138,7 @@ for(const name of ['max_requests','max_duration_seconds','concurrency']){
 }
 nodes['#new-run-form']={elements};configChanged=updateBounds=()=>{};
 for(const name of ['max_requests','max_duration_seconds','concurrency']){
- const toggle={name:name+'_enabled',checked:true,dataset:{limitToggle:name},matches:()=>false};
+ const toggle={name:name+'_enabled',checked:true,dataset:{limitToggle:name},matches:()=>false,closest:()=>null};
  await listeners.change({target:toggle});assert.equal(elements[name].value,'');assert.equal(elements[name].required,true);
  elements[name].value='7';toggle.checked=false;
  await listeners.change({target:toggle});assert.equal(elements[name].value,'');assert.equal(elements[name].disabled,true);
@@ -176,10 +176,12 @@ def test_a7_a16_plan_copy_observed_counts_bursts_and_distinct_controls():
     cfg=RunConfig(targets=[{'name':'local','url':'http://localhost/v1','model':'test'}],checks=['load'],load_test={'workloads':{'combinations':{'selected':['short_short']}},'patterns':{'concurrent':{'enabled':False},'constant':{'enabled':False},'poisson':{'enabled':True},'bursts':{'enabled':True,'first_seconds':0,'gap_seconds':1,'size':4},'rates':[2]},'schedule':{'duration_seconds':3}})
     browser_logic('const plan='+json.dumps(request_plan(cfg))+r''';
 plan.estimated_seconds=3;plan.estimated_low_seconds=2;plan.estimated_high_seconds=4;plan.time_estimate_assumptions=['Finite batches use comparable observations.'];plan.confidence_details={insufficient_observations:['At least 150 comparable samples are required.']};plan.time_bound_reasons=['+ 10 requests at unknown speed'];
-const markup=renderRunBlueprint(config,plan),limits=renderSharedRunSettings(config);assert.equal((markup.match(/Estimated duration:/g)||[]).length,1);assert.equal(((markup+limits).match(/aria-live="polite"/g)||[]).length,1);
-for(const text of ['Confidence: low','Additional work at unknown speed','At least 150 comparable samples are required','Estimate assumptions','setup/connection, AI evaluation, report generation','Poisson + bursts','≈ 18'])assert(markup.includes(text),text);
+const markup=renderRunBlueprint(config,plan),limits=renderSharedRunSettings(config);assert.doesNotMatch(markup,/Estimated duration:|Confidence:|Additional work at unknown speed/);assert.equal(((markup+limits).match(/aria-live="polite"/g)||[]).length,1);
+for(const text of ['Poisson + bursts','≈ 18'])assert(markup.includes(text),text);
+const complete=renderPlanTime({...plan,has_complete_time_estimate:true,time_bound_reasons:[]});assert.equal((complete.match(/Estimated duration:/g)||[]).length,1);
+for(const text of ['Confidence: low','At least 150 comparable samples are required','Estimate assumptions','setup/connection, AI evaluation, report generation'])assert(complete.includes(text),text);
 assert.equal((markup.match(/Not set/g)||[]).length,3);assert.match(markup,/Maximum memory/);
-const duration={id:'load_combinations',kind:'duration',requests_per_target:null};assert.equal(planRowCount(duration),'Duration-based');duration.estimated_requests_per_target=12;assert.equal(planRowCount(duration),'Duration-based · ~12 (estimate, from your last run)');
+const duration={id:'load_combinations',kind:'duration',requests_per_target:null};assert.equal(planRowCount(duration),'Request count is adaptive per endpoint');duration.estimated_requests_per_target=12;assert.equal(planRowCount(duration),'Request count is adaptive per endpoint · about 12 requests (estimate, from your last run)');
 const editor=renderLoadEditor(config);for(const label of ['Requests per burst','Rates (requests/second)','First burst after (seconds)','Time between burst starts (seconds)','Concurrency ceiling · Run limits'])assert(editor.includes(label));assert.doesNotMatch(editor,/Pending queue|traffic_max_in_flight|profile_arrivals_max_in_flight/);
 ''',cfg)
 
@@ -239,7 +241,7 @@ const markup=renderSessionEditor(config);
 assert.match(markup,/name="profile_sessions_concurrency"[^>]*value="2"/);
 const first=bootstrap.checks.find(check=>check.id==='first_output');
 assert.match(renderTestCard(first,config),/name="test_first_output_request_timeout_seconds"[^>]*value="60"[^>]*readonly/);
-assert.match(renderTestCard(first,config),/Endpoint response owns this shared request setting/);
+assert.match(renderTestCard(first,config),/Response validity owns this shared request setting/);
 const input={name:'test_first_output_request_timeout_seconds',value:'30',dataset:{inherited:'true'}};
 nodes['#new-run-form']={elements:{test_first_output_request_timeout_seconds:input}};
 updateCheckFieldHints(config);assert.equal(input.value,60);assert.equal(input.readOnly,true);
@@ -408,11 +410,13 @@ def test_request_pack_override_error_is_inline_at_readonly_explanation_and_focus
 config.request_source='request_pack';config.request_pack={version:1,cases:[]};
 config.test_options.correctness={samples:9};state.jsonDraft=state.jsonBase='synced';
 const check=bootstrap.checks.find(check=>check.id==='correctness'),markup=renderTestCard(check,config);
-assert.doesNotMatch(markup,/name="test_correctness_(samples|concurrency|max_output_tokens|request_timeout_seconds)/);
+assert.match(markup,/data-correctness-builtin-settings hidden/);
 assert.match(markup,/id="field-request_pack_correctness" tabindex="-1"/);
 assert.match(markup,/id="field-request_pack_correctness-error"/);
 const input={dataset:{},setAttribute(){},focus(){this.focused=true;}};
-nodes['#field-request_pack_correctness']=input;nodes['#field-request_pack_correctness-error']={};nodes['#new-run-form']={elements:{}};
+const inactive=Object.fromEntries(['samples','concurrency','max_output_tokens','request_timeout_seconds'].map(name=>['test_correctness_'+name,{value:'saved raw value'}]));
+nodes['#field-request_pack_correctness']=input;nodes['#field-request_pack_correctness-error']={};nodes['#new-run-form']={elements:inactive};
+syncPackControls();for(const control of Object.values(inactive)){assert.equal(control.disabled,true);assert.equal(control.value,'saved raw value');}
 state.requestPreview={status:'error',revision:state.configRevision,route:state.routeVersion,errors:[{fields:['test_options.correctness.samples'],msg:'Request-pack correctness uses its cases and default_concurrency; per-check overrides are not supported.'}]};
 syncInlineErrors();assert.match(nodes['#field-request_pack_correctness-error'].textContent,/per-check overrides are not supported/);
 revealSetupStep=step=>assert.equal(step,2);revealCatalogueCheck=id=>assert.equal(id,'correctness');focusSetting('test_options.correctness.samples');assert(input.focused);
@@ -430,7 +434,8 @@ def test_request_pack_inherited_notice_never_offers_a_forbidden_override():
 const plan=PLAN,markup=renderRunBlueprint(config,plan);
 assert.match(markup,/inherits 4 at once/);assert.match(markup,/Raise limit/);assert.match(markup,/Edit default concurrency \(JSON\)/);
 assert.doesNotMatch(markup,/data-action="use-check-concurrency"/);
-assert.match(renderTestCard(bootstrap.checks.find(check=>check.id==='correctness'),config),/Concurrency: 2 \(default\)/);
+state.requestPreview={status:'current',revision:state.configRevision,route:state.routeVersion,plan};
+assert.match(renderTestCard(bootstrap.checks.find(check=>check.id==='correctness'),config),/Maximum requests in progress: 2 · run default · limited by Run limits/);
 assert.equal(Object.keys(config.test_options).length,0);
 """.replace('PLAN', json.dumps(plan)), cfg)
 
