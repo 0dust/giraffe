@@ -158,6 +158,18 @@ and any run deadline. Drained requests remain in the evidence. A truncated sendi
 window or incomplete delivery is inconclusive unless observed endpoint failures
 already establish failure. Stopping or reaching a run limit preserves partial results.
 
+During a run, Giraffe warns when at least three ordinary requests and at least 20%
+of finished ordinary requests for one target and timeout setting hit their request
+timeout. It counts requests that started answering, produced reasoning only, or
+received no output; readiness requests, evidence probes and intentional timeout
+tests are excluded. Nothing changes automatically. To allow more time, stop and
+rerun with a higher `request_timeout_seconds` (`--request-timeout`) for an inherited
+run timeout, `test_options.<check>.request_timeout_seconds` for a per-check override,
+or `load_test.request_timeout_seconds` for Load test (the warning names the nested
+settings path for migrated load tests). Equal deadlines can share a warning, which
+names all settings involved. An explicit custom-fixture timeout is changed in the
+named fixture file's `request_timeout_seconds` field; the run timeout does not override it.
+
 `pass_criteria` applies first-answer, completion, optional stream-pause and generation
 speed limits to individual responses, not p95. Defaults are 2,000 ms first answer,
 30,000 ms completion, 0% errors, 100% correct scored answers and five valid responses

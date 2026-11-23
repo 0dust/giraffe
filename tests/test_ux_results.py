@@ -803,3 +803,170 @@ def test_failed_checks_keep_applied_default_limits_and_qualified_evidence(check_
  assert.equal(JSON.stringify(value),original);
 })()
 """.replace('CHECK_ID', json.dumps(check_id)), dom=True)
+
+
+def test_live_timeout_warning_notice_and_event_updates():
+    run_render_checks(r"""
+const warning={key:'local|30|run',target:'local <server>',deadline_seconds:30,deadline_source:'run',setting:'request_timeout_seconds',finished:10,timed_out:3,answer_started:1,reasoning_only:1,no_output:1,checks:['serving']};
+state.detail={id:'live',state:'running',config:{targets:[{name:'local',model:'m'}],request_timeout_seconds:30,max_output_tokens:32},progress:{},events:[{event:'timeout_warning'}],timeout_warnings:[warning]};
+renderLive();let html=nodes['#main'].innerHTML;
+assert.match(html,/notice warning live-timeout-warning/);assert.match(html,/<strong>Requests are timing out<\/strong>/);assert.match(html,/role="status" aria-live="polite"/);
+assert.match(html,/local &lt;server&gt; · 3 of 10 requests hit the 30s request timeout/);
+assert.match(html,/1 had started answering · 1 produced reasoning only · 1 received no output/);
+assert.match(html,/data-action="show-timeouts"/);assert.match(html,/data-action="timeout-setting"/);
+assert.match(html,/Each request may take up to 30s\. Giraffe will not change this during the run\./);
+assert.match(html,/Intentional timeout tests are not counted here\./);assert.match(html,/Requests timing out/);
+state.detail.timeout_warnings=[{...warning,deadline_source:'load',setting:'load_test.request_timeout_seconds'}];renderLive();html=nodes['#main'].innerHTML;
+assert.match(html,/30s load request timeout/);assert.match(html,/higher Load request timeout/);
+state.detail.timeout_warnings=[{...warning,deadline_source:'check',setting:'test_options.serving.request_timeout_seconds'}];renderLive();html=nodes['#main'].innerHTML;
+assert(html.includes(`${catalogTitle('serving').toLowerCase()} request timeout`));
+state.detail.timeout_warnings=[{...warning,settings:['test_options.serving.request_timeout_seconds','test_options.generation.request_timeout_seconds']}];renderLive();html=nodes['#main'].innerHTML;
+assert(html.includes(`${catalogTitle('serving').toLowerCase()} request timeout and ${catalogTitle('generation').toLowerCase()} request timeout`));
+state.detail.timeout_warnings=[{...warning,setting:'custom_fixtures (cases.json, fixture slow).request_timeout_seconds',setting_field:'custom_fixtures'}];renderLive();html=nodes['#main'].innerHTML;
+assert.match(html,/30s fixture request timeout/);
+state.detail.timeout_warnings=Array.from({length:6},(_,i)=>({...warning,key:String(i)}));renderLive();html=nodes['#main'].innerHTML;
+assert.match(html,/and 2 more targets\/settings/);
+state.detail.timeout_warnings=[];renderLive();assert.doesNotMatch(nodes['#main'].innerHTML,/live-timeout-warning/);
+mergeRunEvents(state.detail,{seq:1,events:[],timeout_warnings:[warning]});assert.equal(state.detail.timeout_warnings[0].timed_out,3);
+""")
+
+
+
+def test_live_timeout_actions_filter_all_run_requests_and_rerun_settings():
+    run_render_checks(r"""
+(async()=>{
+const dialog=document.querySelector('#test-dialog');
+const warning={key:'local|30|run',target:'local',deadline_seconds:30,deadline_source:'run',setting:'request_timeout_seconds',finished:10,timed_out:3,no_output:3,checks:['serving']};
+state.detail={id:'live',state:'running',config:{...structuredClone(bootstrap.config),targets:[{name:'local',model:'m'}]},progress:{},events:[],timeout_warnings:[warning],live_conditions:[{target:'local',condition:{id:'other',check:'serving',label:'Other'},started:1,completed:1,failed:1,request_statuses:{failed:1}},{target:'local',condition:{id:'answer',check:'serving',label:'Answer'},started:3,completed:3,failed:3,request_statuses:{timed_out:3}}]};
+api=async path=>({rows:[],totals:{timed_out:3},page:1,pages:1,total:3});
+state.detail.timeout_warnings.push({...warning,key:'other|30|run',target:'other'});
+state.detail.live_requests=Array.from({length:10},(_,i)=>({id:'timeout-'+i,slot:i*30,target:i<5?'local':'other',scenario:i===0?'initial':'warm',condition_id:i===0?'other':'answer',status:'timeout',valid:false,elapsed_ms:2000,check_ids:['serving']}));
+state.detail.live_requests.push({id:'good',slot:301,target:'local',scenario:'warm',status:'completed',valid:true,score:true,check_ids:['serving']});
+renderLive();state.mosaicPage=2;showTimedOutRequests();await Promise.resolve();await Promise.resolve();
+assert.equal(reportView.tab,'results');assert.equal(state.requestStatusFilter,'timed_out');assert.equal(state.mosaicPage,0);
+assert.equal(conditionDialog,null);assert.equal(dialog.open,false);assert.equal(document.querySelector('#all-requests-filter').value,'timed_out');
+const requests=document.querySelector('.all-requests');assert.equal(requests.open,true);
+assert.equal(requests.querySelectorAll('.request-spot').length,10);
+for(let i=0;i<10;i++)assert(requests.querySelector('[data-request-id="timeout-'+i+'"]'));
+assert.equal(requests.querySelector('[data-request-id="good"]'),null);
+renderLive();assert.equal(state.requestStatusFilter,'timed_out');assert.equal(document.querySelector('.all-requests').querySelectorAll('.request-spot').length,10);
+const filter=document.querySelector('#all-requests-filter');filter.value='passed';await listeners.change({target:filter});
+assert.equal(state.requestStatusFilter,'passed');assert.equal(state.mosaicPage,0);
+assert.equal(document.querySelector('.all-requests').querySelectorAll('.request-spot').length,1);
+let passed;
+rerun=async options=>{passed=options;};
+for(const setting of ['request_timeout_seconds','load_test.request_timeout_seconds','test_options.serving.request_timeout_seconds']){
+  state.detail.timeout_warnings=[{...warning,setting}];
+  const button=document.querySelector('[data-action="timeout-setting"]');
+  await listeners.click({target:button,preventDefault(){}});
+  assert.equal(passed.focusPath,setting);
+}
+state.detail.timeout_warnings=[{...warning,setting:'custom_fixtures (cases.json, fixture slow).request_timeout_seconds',setting_field:'custom_fixtures'}];
+await listeners.click({target:document.querySelector('[data-action="timeout-setting"]'),preventDefault(){}});
+assert.equal(passed.focusPath,'custom_fixtures');
+})();
+""", dom=True)
+
+
+@pytest.mark.parametrize("setting,field", [
+    ("request_timeout_seconds", "request_timeout_seconds"),
+    ("load_test.request_timeout_seconds", "load_request_timeout_seconds"),
+    ("test_options.serving.request_timeout_seconds", "test_serving_request_timeout_seconds"),
+])
+def test_timeout_rerun_opens_and_focuses_actual_setting(setting, field):
+    run_render_checks(r"""
+(async()=>{
+state.config={...structuredClone(bootstrap.defaults),targets:[{name:'local',url:'http://localhost:8000/v1',model:'m'}]};state.bootstrap.config=structuredClone(state.config);
+state.config.checks=['serving','load'];
+state.detail={id:'live',state:'running',config:structuredClone(state.config)};
+api=async(path,options)=>path==='/api/config/draft'?{config:JSON.parse(options.body),migration_notes:[]}:{};
+updateNav=()=>{};
+Object.defineProperty(Object.getPrototypeOf(document.body),'parentElement',{get(){return this.parentNode;}});
+let revealedStep,revealedCheck;
+revealSetupStep=step=>{revealedStep=step;};revealCatalogueCheck=check=>{revealedCheck=check;};
+renderNew=()=>{document.querySelector('#main').innerHTML='<form id="new-run-form"><details id="timeout-details"><input id="field-'+FIELD+'" name="'+FIELD+'"></details></form>';};
+await rerun({focusPath:SETTING});await route();
+assert.equal(location.hash,'#new');
+assert.equal(document.activeElement.getAttribute('name'),FIELD,nodes['#main'].innerHTML);
+assert.equal(state.detail.state,'running');
+assert.equal(revealedStep,2);assert.equal(document.querySelector('#timeout-details').open,true);
+assert.equal(revealedCheck,SETTING.startsWith('load_test.')?'load':SETTING.startsWith('test_options.')?'serving':undefined);
+})();
+""".replace("SETTING", json.dumps(setting)).replace("FIELD", json.dumps(field)), dom=True)
+
+
+def test_timeout_setting_buttons_select_their_warning_group():
+    run_render_checks(r"""
+(async()=>{
+const warnings=[{key:'first|30|run',target:'first',deadline_seconds:30,deadline_source:'run',setting:'request_timeout_seconds',finished:10,timed_out:3,no_output:3},{key:'second|45|load',target:'second',deadline_seconds:45,deadline_source:'load',setting:'load_test.request_timeout_seconds',finished:8,timed_out:3,no_output:3}];
+state.detail={id:'live',state:'running',config:{targets:[{name:'local',model:'m'}]},events:[],progress:{},timeout_warnings:warnings};
+renderLive();
+const buttons=document.querySelectorAll('[data-action="timeout-setting"]');
+assert.equal(buttons.length,2);
+let passed;rerun=async options=>{passed=options;};
+for(let i=0;i<buttons.length;i++){
+  assert.equal(buttons[i].dataset.timeoutKey,warnings[i].key);
+  await listeners.click({target:buttons[i],preventDefault(){}});
+  assert.equal(passed.focusPath,warnings[i].setting);
+}
+})();
+""", dom=True)
+
+
+def test_finished_timeout_notice_and_actions_use_saved_target_warnings():
+    run_render_checks(r"""
+(async()=>{
+const warning={key:'local|30|run',target:'local',deadline_seconds:30,deadline_source:'run',setting:'request_timeout_seconds',finished:10,timed_out:3,answer_started:1,reasoning_only:1,no_output:1};
+const other={...warning,key:'other|45|load',target:'other',deadline_seconds:45,deadline_source:'load',setting:'load_test.request_timeout_seconds'};
+const value=report([check('serving','fail')],{requests:[
+ {id:'first-timeout',target:'local',scenario:'initial',status:'timeout',valid:false,elapsed_ms:30000,check_ids:['serving']},
+ {id:'other-timeout',target:'other',scenario:'warm',status:'timeout',valid:false,elapsed_ms:45000,check_ids:['serving']},
+ {id:'good',target:'local',scenario:'warm',status:'completed',valid:true,score:true,elapsed_ms:1,check_ids:['serving']}
+],observations:{targets:{local:{timeout_warnings:[warning]},other:{timeout_warnings:[other]}}}});
+detail(value);chooseReportTab('results');
+const panel=document.querySelector('#report-results'),notice=panel.querySelector('.report-timeout-warning');assert(notice);
+assert.equal(notice.querySelector('strong').textContent,'Requests timed out');
+assert.equal(notice.getAttribute('role'),'status');assert.equal(notice.getAttribute('aria-live'),null);
+assert.equal(panel.querySelector('.live-timeout-warning'),null);
+assert.match(notice.textContent,/local · 3 of 10 requests hit the 30s request timeout/);
+assert.match(notice.innerHTML,/Each request could take up to 30s\. To give the server more time, run again with a higher Request timeout\. Keep it if responses slower than 30s should count as failures\. Intentional timeout tests are not counted here\./);
+const siblings=panel.childNodes.filter(node=>node.nodeType===1);assert.equal(siblings[siblings.indexOf(document.querySelector('#results-checks'))+1],notice);
+assert(nodes['#main'].innerHTML.indexOf('report-timeout-warning')<nodes['#main'].innerHTML.indexOf('condition-mosaic'));
+const buttons=notice.querySelectorAll('[data-action="timeout-setting"]');assert.equal(buttons.length,2);
+let options;rerun=async value=>{options=value;};await listeners.click({target:buttons[1],preventDefault(){}});assert.equal(options.focusPath,'load_test.request_timeout_seconds');
+state.mosaicPage=2;await listeners.click({target:notice.querySelector('[data-action="show-timeouts"]'),preventDefault(){}});
+assert.equal(state.requestStatusFilter,'timed_out');assert.equal(state.mosaicPage,0);assert.equal(conditionDialog,null);assert.equal(document.querySelector('#test-dialog').open,false);
+const requests=document.querySelector('.all-requests');assert(requests.open);assert.equal(requests.querySelectorAll('.request-spot').length,2);assert.equal(requests.querySelector('[data-request-id="good"]'),null);
+})();
+""", dom=True)
+
+
+def test_old_reports_without_timeout_warning_observations_render_no_notice():
+    run_render_checks(r"""
+for(const observations of [undefined,{}, {targets:{local:{}}}, {targets:{local:{timeout_warnings:[]}}}]){
+  detail(report([check('serving','pass')],{observations}));
+  assert.doesNotMatch(nodes['#main'].innerHTML,/report-timeout-warning|live-timeout-warning/);
+}
+""")
+
+
+@pytest.mark.parametrize("live", [False, True])
+def test_run_timeout_filter_paginates_all_conditions_and_keeps_request_links(live):
+    run_render_checks(r"""
+(async()=>{
+const live=LIVE;
+const records=Array.from({length:241},(_,i)=>({id:'timeout-'+i,slot:i*2,target:'local',scenario:i%2?'warm':'initial',status:'timeout',valid:false,elapsed_ms:2000,check_ids:['serving']}));
+records.push({id:'good',slot:999,target:'local',scenario:'warm',status:'completed',valid:true,score:true,elapsed_ms:1,check_ids:['serving']});
+const config={targets:[{name:'local',model:'m'}],max_requests:1000};
+state.detail=live?{id:'live',state:'running',config,events:[],progress:{},live_requests:records}:{id:'saved',state:'completed',report:report([check('serving','fail')],{requests:records})};
+renderDetail();showTimedOutRequests();
+let requests=document.querySelector('.all-requests');
+assert.equal(requests.querySelectorAll('.request-spot').length,240);assert.equal(state.mosaicPage,0);
+await listeners.click({target:requests.querySelector('[data-action="mosaic-next"]'),preventDefault(){}});
+requests=document.querySelector('.all-requests');assert.equal(state.mosaicPage,1);assert.equal(requests.querySelectorAll('.request-spot').length,1);
+const last=requests.querySelector('[data-request-id="timeout-240"]');assert(last);assert.equal(last.getAttribute(live?'data-live-slot':'data-request'),live?'480':'timeout-240');
+assert.equal(requests.querySelector('[data-request-id="good"]'),null);assert.equal(document.querySelector('#test-dialog').open,false);
+renderDetail();assert.equal(state.mosaicPage,1);assert.equal(document.querySelector('#all-requests-filter').value,'timed_out');
+showTimedOutRequests();assert.equal(state.mosaicPage,0);
+})();
+""".replace("LIVE", "true" if live else "false"), dom=True)

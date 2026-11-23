@@ -585,6 +585,9 @@ async def _run(config: RunConfig, *, json_progress: bool = False, verbose: bool 
             pass
     last = (None, None)
     last_update = 0.0
+    timeout_warning_counts: dict[str, int] = {}
+    timeout_warning_lines: dict[str, str] = {}
+    latest_timeout_warnings: dict[str, dict] = {}
     writer = adapter = sink_token = report = None
 
     def progress(event: dict) -> None:
@@ -595,6 +598,21 @@ async def _run(config: RunConfig, *, json_progress: bool = False, verbose: bool 
             return
         if json_progress:
             _progress_print(json.dumps(event, allow_nan=False))
+            return
+        if event.get("event") == "timeout_warning":
+            from giraffe.timeout_warning import format_timeout_warning
+
+            payload = event["timeout_warning"]
+            key, count = payload["key"], payload["timed_out"]
+            latest_timeout_warnings[key] = payload
+            previous = timeout_warning_counts.get(key)
+            if previous is None or count >= previous * 2:
+                line = format_timeout_warning(payload)
+                _progress_print("Warning: " + line)
+                timeout_warning_lines[key] = line
+                if not timeout_warning_counts:
+                    _progress_print("  Press Ctrl+C to stop; completed results are kept.")
+                timeout_warning_counts[key] = count
             return
         current = (event.get("target"), event.get("scenario"))
         if current == last and time.monotonic() - last_update < 5:
@@ -654,6 +672,16 @@ async def _run(config: RunConfig, *, json_progress: bool = False, verbose: bool 
             for sig, previous in installed:
                 loop.remove_signal_handler(sig)
                 signal.signal(sig, previous)
+    if not quiet and not json_progress:
+        from giraffe.timeout_warning import format_timeout_warning
+
+        for target in (report.observations.get("targets", {}) if report is not None else {}).values():
+            for payload in target.get("timeout_warnings", []):
+                latest_timeout_warnings[payload["key"]] = payload
+        for key, payload in latest_timeout_warnings.items():
+            line = format_timeout_warning(payload)
+            if line != timeout_warning_lines.get(key):
+                _progress_print("Warning: " + line)
     if interrupted:
         # Include stops during journal finalization on the partial-report export path.
         error = asyncio.CancelledError()

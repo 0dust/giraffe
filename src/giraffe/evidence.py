@@ -103,7 +103,7 @@ class EvidenceWriter:
     def progress(self, event: dict) -> None:
         if (event.get("event", "").startswith(("check_", "condition_"))
                                  or event.get("check") or event.get("condition_summary")
-                                 or event.get("event") == "scale_down_updated"):
+                                 or event.get("event") in {"scale_down_updated", "timeout_warning"}):
             if self._closed or self._error is not None:
                 self.dropped_count += 1
                 return
@@ -111,7 +111,7 @@ class EvidenceWriter:
             # them when persisting a condition transition alongside a completion.
             value = {key: child for key, child in event.items() if key != "request"}
             for key in ("condition", "condition_summary", "scale_down",
-                        "scale_down_snapshots", "scale_down_control"):
+                        "scale_down_snapshots", "scale_down_control", "timeout_warning"):
                 if key in value:
                     value[key] = deepcopy(value[key])
             self._enqueue(("progress", value))

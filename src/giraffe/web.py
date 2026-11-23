@@ -584,6 +584,13 @@ def _track_live_progress(job: dict, event: dict, max_requests: int | None) -> No
     # Derived performance is requested separately, never copied into polling
     # progress/events (including events from third-party runner integrations).
     event = {key: value for key, value in event.items() if key != "performance"}
+    if event.get("event") == "timeout_warning" and isinstance(event.get("timeout_warning"), dict):
+        warning = deepcopy(event["timeout_warning"])
+        warnings = job.setdefault("live_timeout_warnings", OrderedDict())
+        warnings[warning["key"]] = warning
+        warnings.move_to_end(warning["key"])
+        while len(warnings) > 16:
+            warnings.popitem(last=False)
     if event.get("preparation"):
         preparation = {**event["preparation"], "target": event.get("target", "")}
         scenario = preparation.get("scenario") or event.get("scenario", "")
@@ -960,12 +967,55 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
     metadata_lock = storage_metadata_lock
     last_auto_cleanup: dict = {}
     observation_cache: dict = {}
+    timeout_journals: OrderedDict = OrderedDict()
+    timeout_journal_lock = threading.Lock()
+
+    def journal_timeout_warnings(directory: Path) -> list[dict]:
+        """Tail CLI warning events without rescanning completed request evidence."""
+        with timeout_journal_lock:
+            path = directory / "evidence.jsonl"
+            if path.is_symlink():
+                return []
+            try:
+                stat = path.stat()
+                identity = (stat.st_dev, stat.st_ino)
+                cached = timeout_journals.get(directory.name)
+                if cached is None or cached["identity"] != identity or stat.st_size < cached["offset"]:
+                    cached = {"identity": identity, "offset": 0, "warnings": OrderedDict()}
+                with path.open("rb") as stream:
+                    stream.seek(cached["offset"])
+                    while line := stream.readline():
+                        if not line.endswith(b"\n"):
+                            break  # Retry an incomplete append on the next poll.
+                        cached["offset"] = stream.tell()
+                        try:
+                            value = json.loads(line)
+                        except (ValueError, UnicodeError):
+                            continue
+                        event = value.get("progress", {}) if isinstance(value, dict) else {}
+                        if not isinstance(event, dict) or event.get("event") != "timeout_warning":
+                            continue
+                        warning = event.get("timeout_warning")
+                        if not isinstance(warning, dict) or not isinstance(warning.get("key"), str):
+                            continue
+                        warnings = cached["warnings"]
+                        warnings[warning["key"]] = warning
+                        warnings.move_to_end(warning["key"])
+                        while len(warnings) > 16:
+                            warnings.popitem(last=False)
+                timeout_journals[directory.name] = cached
+                timeout_journals.move_to_end(directory.name)
+                while len(timeout_journals) > 16:
+                    timeout_journals.popitem(last=False)
+                return list(cached["warnings"].values())
+            except OSError:
+                return []
 
     def live_snapshot() -> dict:
         if not active:
             return {}
         result = dict(active)
-        for key in ("requests", "conditions", "condition_plans", "live_preparations", "meta"):
+        for key in ("requests", "conditions", "condition_plans", "live_preparations", "live_timeout_warnings", "meta"):
             result[key] = active[key].copy()
         for key in ("events", "phases"):
             result[key] = list(active[key])
@@ -1389,7 +1439,11 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                 persisted["conditions"] = condition_rows
         if summary and meta.get("error_id") and meta.get("error") and meta["error_id"] not in meta["error"]:
             meta = {**meta, "error": meta["error"] + f' [error {meta["error_id"]}]'}
+        timeout_warnings = list(live["live_timeout_warnings"].values()) if "live_timeout_warnings" in live else meta.get("live_timeout_warnings", [])
+        if not live and not listing and state in states.RUN_IN_PROGRESS_STATES:
+            timeout_warnings = journal_timeout_warnings(directory) or timeout_warnings
         return {"id": identifier, "state": state,
+                "timeout_warnings": timeout_warnings,
                 "abort_reason": (persisted or summary or {}).get("abort_reason") or meta.get("abort_reason"),
                 "error": meta.get("error"), "error_id": meta.get("error_id"),
                 "seq": live.get("seq", meta.get("seq", 0)),
@@ -1550,7 +1604,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                         del feeds[identifier]
                 feeds[job["id"]] = {key: job[key] for key in (
                     "id", "state", "meta", "seq", "deltas", "changed", "terminal", "checks",
-                    "progress", "phases", "live_preparations", "live_request_count", "live_request_summary")}
+                    "progress", "phases", "live_preparations", "live_timeout_warnings", "live_request_count", "live_request_summary")}
             except Exception:
                 logger.exception("Could not retain terminal feed for %s", job["id"])
             finally:
@@ -1574,7 +1628,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
             # Completed request payloads are newly dumped, owned dictionaries.
             # Lifecycle dictionaries still share nested counters with the runner.
             event = dict(event)
-            for key in ("condition", "condition_summary", "preparation", "scale_down_control", "scale_down", "scale_down_snapshots"):
+            for key in ("condition", "condition_summary", "preparation", "timeout_warning", "scale_down_control", "scale_down", "scale_down_snapshots"):
                 if key in event:
                     event[key] = deepcopy(event[key])
             writer.progress(event)
@@ -1728,6 +1782,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                     meta["evidence_dropped_count"] = writer.dropped_count
                 meta.update(progress=job["progress"], events=job["events"], phases=job["phases"],
                             live_preparations=list(job.get("live_preparations", {}).values()),
+                            live_timeout_warnings=list(job.get("live_timeout_warnings", {}).values()),
                             conditions=list(job["conditions"].values()),
                             live_request_summary=job["live_request_summary"],
                             live_request_count=job["live_request_count"],
@@ -2052,6 +2107,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
             active = dict(id=identifier, state="running", directory=directory, meta=meta,
                           open_files=guard,
                           progress={}, events=[], requests=OrderedDict(), live_preparations=OrderedDict(),
+                          live_timeout_warnings=OrderedDict(),
                           conditions={(row["target"], row["condition_id"]): row for row in waiting},
                           condition_requests=condition_index,
                           condition_plans={(row["target"], row["condition_id"]): row for row in waiting}, phases=[],
@@ -2108,11 +2164,13 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                         return {"seq": detail["seq"], "reset": False, "idle": True,
                                 "events": [], "records": [], "checks": [], "state": detail["state"],
                                 "terminal": detail["terminal"], "recoverable": detail["recoverable"],
-                                "scale_down_control": detail.get("scale_down_control")}
+                                "scale_down_control": detail.get("scale_down_control"),
+                                "timeout_warnings": detail["timeout_warnings"]}
                 return {"seq": detail["seq"], "reset": True, "events": [], "records": [], "checks": [],
                         "state": detail["state"], "error": detail.get("error"),
                         "terminal": detail["terminal"], "recoverable": detail["recoverable"],
-                        "scale_down_control": detail.get("scale_down_control")}
+                        "scale_down_control": detail.get("scale_down_control"),
+                        "timeout_warnings": detail["timeout_warnings"]}
             seq = feed["seq"]
             oldest = feed["deltas"][0]["seq"] if feed["deltas"] else seq + 1
             reset = after < oldest - 1 or after > seq
@@ -2159,6 +2217,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                 "scale_down_control": feed.get("scale_down_control", feed["meta"].get("scale_down_control")),
                 "live_request_summary": feed["live_request_summary"],
                 "live_preparations": list(feed["live_preparations"].values()),
+                "timeout_warnings": list(feed["live_timeout_warnings"].values()),
                 "phases": feed["phases"], "abort_reason": feed["meta"].get("abort_reason"),
                 "error": feed["meta"].get("error"),
                 "error_id": feed["meta"].get("error_id")}
