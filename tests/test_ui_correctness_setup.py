@@ -7,6 +7,7 @@ from giraffe.planning import request_plan
 from tests.test_concurrent_load_ui_review import FORM
 from tests.test_run_limits_phase6_ui import Markup
 from tests.test_ux_catalogue import browser_logic
+from tests.test_ui_question_navigation import navigation_browser
 
 
 CORRECTNESS_FORM = (FORM.replace("config.checks=['load']", "config.checks=['correctness']")
@@ -14,7 +15,7 @@ CORRECTNESS_FORM = (FORM.replace("config.checks=['load']", "config.checks=['corr
                     .replace("testSettings:'load'", "testSettings:'correctness'"))
 
 
-def test_correctness_controls_show_one_definition_effective_defaults_and_full_builtin_preview():
+def test_correctness_controls_keep_setup_compact_and_builtin_preview_read_only():
     result = browser_logic(r'''
 const check=bootstrap.checks.find(check=>check.id==='correctness');
 config.checks=['correctness'];
@@ -24,7 +25,10 @@ state.requestPreview.plan.rows=[{id:'correctness',requests_per_target:null,kind:
 assert.match(effectiveCheckSummary(check,local),/At least 6 requests/);
 assert.match(renderBuiltinQuestions(local),/Additional configured cases can increase the request count/);
 state.requestPreview.plan.rows=[{id:'correctness',requests_per_target:6}];
-console.log(JSON.stringify({markup:renderTestCard(check,config),summary:effectiveCheckSummary(check,config),builtins:bootstrap.builtin_questions}));
+const loadOnly={...config,checks:['load'],request_source:'request_pack',load_test:structuredClone(bootstrap.load_test.defaults)};
+loadOnly.load_test.pass_criteria.min_correct_percent=85;
+assert.match(renderQuestionSetupSummary(loadOnly),/85%/);
+console.log(JSON.stringify({markup:renderTestCard(check,config),summary:effectiveCheckSummary(check,config),builtins:bootstrap.builtin_questions,preview:renderBuiltinQuestions(config)}));
 ''')
     tree = Markup(result['markup'])
     assert result['summary'] == '6 requests · Up to 4 in progress · 100% correct required'
@@ -50,10 +54,48 @@ console.log(JSON.stringify({markup:renderTestCard(check,config),summary:effectiv
         assert result['markup'].index(inheritance) < result['markup'].index(f'name="test_correctness_{name}"')
     assert len(result['builtins']) == 3
     for item in result['builtins']:
-        assert item['question'] in next(node['text'] for node in tree.nodes if node.get('class') == 'builtin-example')
+        assert item['question'] not in result['markup']
+        assert item['question'] in next(node['text'] for node in Markup(result['preview']).nodes if node.get('class') == 'builtin-example')
     assert '3 built-in questions' in result['markup']
-    assert 'View questions and expected answers' in result['markup']
+    assert 'View examples' in result['markup']
+    assert 'data-action="view-builtin-examples"' in result['markup']
+    assert 'Manage questions' not in result['markup']
+    assert 'View questions and expected answers' not in result['markup']
     assert 'The suite value is a default' not in result['markup']
+
+
+def test_question_setup_requirements_follow_live_form_without_replacing_controls():
+    navigation_browser(r'''
+for(const [check,value] of [['correctness',37],['load',85]]){
+ state.config.checks=[check];state.openTest=check;renderNew();
+ const form=document.querySelector('#new-run-form'),savedPack=JSON.stringify(state.config.request_pack);
+ const sources=[...form.querySelectorAll('[name="request_source"]')];
+ const name=check==='correctness'?'test_correctness_limit_min_correctness':'load_pass_criteria_min_correct_percent';
+ const input=form.elements[name];input.focus({preventScroll:true});window.scrollY=489;
+ type(input,String(value));
+ assert.match(document.querySelector('[data-question-setup-summary]').textContent,new RegExp(value+'%'));
+ assert.equal(form.elements[name],input);assert.equal(document.activeElement,input);assert.equal(window.scrollY,489);
+ assert.deepEqual([...form.querySelectorAll('[name="request_source"]')],sources);
+ assert.equal(state.config.request_source,'request_pack');assert.equal(JSON.stringify(state.config.request_pack),savedPack);
+}
+assert.equal(requests.length,0);
+''')
+
+
+def test_builtin_setup_hides_inactive_evaluator_action_and_preserves_configuration():
+    navigation_browser(r'''
+state.config.request_source='builtin';state.config.judging={...bootstrap.judging.defaults,judges:[{name:'reviewer',url:'http://judge/v1',model:'judge-model',api_key_env:null,headers_env:{}}]};
+const judging=JSON.stringify(state.config.judging),pack=JSON.stringify(state.config.request_pack);
+renderNew();const form=document.querySelector('#new-run-form'),summary=document.querySelector('[data-question-setup-summary]');
+assert.equal(Boolean(summary.querySelector('[data-action="configure-evaluator"]')),false);
+assert.match(summary.textContent,/Not needed/);assert(visible('[data-action="view-builtin-examples"]'));
+assert.equal(JSON.stringify(state.config.judging),judging);assert.equal(JSON.stringify(state.config.request_pack),pack);
+for(const input of form.querySelectorAll('[name="request_source"]'))input.checked=input.value==='request_pack';
+change(form.querySelector('[name="request_source"][value="request_pack"]'));
+assert.equal(document.querySelector('[data-question-setup-summary] [data-action="configure-evaluator"]').textContent,'Edit evaluator');
+assert.equal(JSON.stringify(state.config.judging),judging);assert.equal(JSON.stringify(state.config.request_pack),pack);
+assert.equal(requests.length,0);
+''')
 
 
 def test_builtin_preview_belongs_to_correctness_while_load_explains_its_actual_source():
@@ -62,12 +104,15 @@ const original=JSON.stringify(config),correctness=bootstrap.checks.find(check=>c
 const generated='Generates prompts using these input token targets and output caps.';
 for(const checks of [['load'],['correctness'],['correctness','load']]){
   const draft={...config,checks},correctnessMarkup=renderTestCard(correctness,draft),loadMarkup=renderTestCard(load,draft);
-  assert.equal(correctnessMarkup.includes('class="builtin-example"'),checks.includes('correctness'));
+  assert.equal(correctnessMarkup.includes('data-action="view-builtin-examples"'),checks.includes('correctness'));
+  assert.doesNotMatch(correctnessMarkup,/class="builtin-example"|Expected answer:<\/strong>/);
+  assert.doesNotMatch(loadMarkup,/data-action="view-builtin-examples"|3 built-in questions/);
   assert.doesNotMatch(loadMarkup,/class="builtin-example"|Requests repeat these questions|Expected answer:<\/strong>/);
   assert(loadMarkup.includes(generated));
   if(checks.includes('correctness')){
     assert.match(correctnessMarkup,/3 built-in questions/);
-    for(const item of bootstrap.builtin_questions)assert(correctnessMarkup.includes('<code>'+escape(item.expected)+'</code>'));
+    const preview=renderBuiltinQuestions(draft,{expanded:true});
+    for(const item of bootstrap.builtin_questions)assert(preview.includes('<code>'+escape(item.expected)+'</code>'));
   }
   assert.doesNotMatch(correctnessMarkup,/Load test uses this question source too/);
   const sourceMarkup=checks.includes('correctness')?correctnessMarkup:loadMarkup;
@@ -80,7 +125,8 @@ assert.doesNotMatch(fixtures,/class="builtin-example"|Requests repeat these ques
 const pack={...config,checks:['correctness','load'],request_source:'request_pack',request_pack:{version:1,cases:[{fixture_id:'saved',messages:[{role:'user',content:'My question'}],scorer:'exact',expected:'My answer'}]}};
 const packOriginal=JSON.stringify(pack),correctnessMarkup=renderTestCard(correctness,pack),loadMarkup=renderTestCard(load,pack);
 assert.match(correctnessMarkup,/These questions and answer checks are shared with Load test/);
-assert.match(correctnessMarkup,/My question/);assert.match(correctnessMarkup,/My answer/);
+assert.match(correctnessMarkup,/1 saved question/);assert.match(correctnessMarkup,/Manage questions/);
+assert.doesNotMatch(correctnessMarkup,/>My question<|>My answer</);
 assert.doesNotMatch(correctnessMarkup,/class="builtin-example"/);
 assert(!loadMarkup.includes(generated));
 assert.equal((correctnessMarkup.match(/name="request_source"/g)||[]).length,2);

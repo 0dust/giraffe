@@ -138,7 +138,7 @@ for(const name of ['max_requests','max_duration_seconds','concurrency']){
 }
 nodes['#new-run-form']={elements};configChanged=updateBounds=()=>{};
 for(const name of ['max_requests','max_duration_seconds','concurrency']){
- const toggle={name:name+'_enabled',checked:true,dataset:{limitToggle:name},matches:()=>false};
+ const toggle={name:name+'_enabled',checked:true,dataset:{limitToggle:name},matches:()=>false,closest:()=>null};
  await listeners.change({target:toggle});assert.equal(elements[name].value,'');assert.equal(elements[name].required,true);
  elements[name].value='7';toggle.checked=false;
  await listeners.change({target:toggle});assert.equal(elements[name].value,'');assert.equal(elements[name].disabled,true);
@@ -410,11 +410,13 @@ def test_request_pack_override_error_is_inline_at_readonly_explanation_and_focus
 config.request_source='request_pack';config.request_pack={version:1,cases:[]};
 config.test_options.correctness={samples:9};state.jsonDraft=state.jsonBase='synced';
 const check=bootstrap.checks.find(check=>check.id==='correctness'),markup=renderTestCard(check,config);
-assert.doesNotMatch(markup,/name="test_correctness_(samples|concurrency|max_output_tokens|request_timeout_seconds)/);
+assert.match(markup,/data-correctness-builtin-settings hidden/);
 assert.match(markup,/id="field-request_pack_correctness" tabindex="-1"/);
 assert.match(markup,/id="field-request_pack_correctness-error"/);
 const input={dataset:{},setAttribute(){},focus(){this.focused=true;}};
-nodes['#field-request_pack_correctness']=input;nodes['#field-request_pack_correctness-error']={};nodes['#new-run-form']={elements:{}};
+const inactive=Object.fromEntries(['samples','concurrency','max_output_tokens','request_timeout_seconds'].map(name=>['test_correctness_'+name,{value:'saved raw value'}]));
+nodes['#field-request_pack_correctness']=input;nodes['#field-request_pack_correctness-error']={};nodes['#new-run-form']={elements:inactive};
+syncPackControls();for(const control of Object.values(inactive)){assert.equal(control.disabled,true);assert.equal(control.value,'saved raw value');}
 state.requestPreview={status:'error',revision:state.configRevision,route:state.routeVersion,errors:[{fields:['test_options.correctness.samples'],msg:'Request-pack correctness uses its cases and default_concurrency; per-check overrides are not supported.'}]};
 syncInlineErrors();assert.match(nodes['#field-request_pack_correctness-error'].textContent,/per-check overrides are not supported/);
 revealSetupStep=step=>assert.equal(step,2);revealCatalogueCheck=id=>assert.equal(id,'correctness');focusSetting('test_options.correctness.samples');assert(input.focused);
