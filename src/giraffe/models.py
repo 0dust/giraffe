@@ -331,6 +331,7 @@ class MixedTraffic(Model):
 
 class StreamInterference(Model):
     enabled: bool = False
+    mode: Literal["long_input_during_short", "short_during_long"] = "long_input_during_short"
     trigger: Literal["streaming_started", "after_five_chunks"] = "streaming_started"
     max_slowdown: float = Field(default=1.5, gt=1)
 
