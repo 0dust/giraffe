@@ -399,8 +399,11 @@ def _window_summary(report, target, window, records, series, observation):
         ("client_ttft", "client_ttft_ms", "TTFT (client)"),
         ("first_reasoning", "first_reasoning_ms", "First reasoning latency")):
         observed_series = selected_series if key in {"client_ttft", "first_reasoning", "first_useful_output"} else valid_series
-        dist(key, [row["values"][field] for row in observed_series], label,
-             reason=("Versioned streamed generated-content receipt timing was not collected." if key == "client_ttft" else None))
+        row = dist(key, [row["values"][field] for row in observed_series], label)
+        if key == "client_ttft" and row["sample_count"] == 0:
+            row["reason"] = metrics[key]["reason"] = (
+                "Versioned streamed generated-content receipt timing was not collected."
+            )
     modern = [r for r in good if getattr(r, "timing_schema", 0) >= 1]
     event_records = [r for r in population if getattr(r, "timing_schema", 0) >= 1]
     gaps = [gap for r in event_records for gap in (getattr(r, "read_gaps_ms", None) or [])]
