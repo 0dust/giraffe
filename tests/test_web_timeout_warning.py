@@ -159,3 +159,94 @@ async def test_cli_journal_requests_are_bounded_measurements_in_detail_and_event
         assert [row["id"] for row in detail["live_requests"]] == ["3", "4", "5"]
         assert detail["live_request_count"] == 6
         assert detail["live_request_summary"] == {"evicted": 3, "through_slot": 2, "statuses": {"timeout": 3}}
+
+
+async def test_cli_journal_event_cursor_sends_only_new_rows_and_resets(tmp_path, monkeypatch):
+    monkeypatch.setattr("giraffe.web._EVENT_WAIT_SECONDS", 0)
+    directory = tmp_path / "cli"
+    write_metadata(directory, {"id": "cli", "state": "running", "heartbeat_at": _now(),
+        "owner_pid": os.getpid(), "owner_host": socket.gethostname(), "config": config()})
+    journal = directory / "evidence.jsonl"
+
+    def append(start, count):
+        with journal.open("a") as stream:
+            for index in range(start, start + count):
+                stream.write(json.dumps({"type": "record", "record": {
+                    "id": str(index), "target": "local", "scenario": "warm",
+                    "condition_id": "serving.warm", "status": "timeout" if index < 3 else "completed",
+                    "valid": index >= 3, "elapsed_ms": 2000, "first_output_ms": 10}}) + "\n")
+
+    append(0, 4096)
+    async with browser(tmp_path) as client:
+        detail = (await client.get('/api/runs/cli')).json()
+        assert len(detail["live_requests"]) == 4096
+        cursor = detail["seq"]
+        for _ in range(2):
+            response = await client.get(f'/api/runs/cli/events?after={cursor}')
+            idle = response.json()
+            assert idle["seq"] == cursor and idle["idle"] and not idle["reset"]
+            assert idle["records"] == []
+            assert len(response.content) < 10_000
+        append(4096, 2)
+        delta = (await client.get(f'/api/runs/cli/events?after={cursor}')).json()
+        assert delta["seq"] > cursor and not delta["reset"] and not delta["idle"]
+        assert [row["id"] for row in delta["records"]] == ["4096", "4097"]
+        current = delta["seq"]
+        # Warning-only appends also advance the cursor without replaying rows.
+        with journal.open("a") as stream:
+            stream.write(json.dumps({"type": "progress", "progress": {
+                "event": "timeout_warning", "timeout_warning": warning()}}) + "\n")
+        delta = (await client.get(f'/api/runs/cli/events?after={current}')).json()
+        assert delta["seq"] > current and delta["records"] == [] and not delta["reset"]
+        assert delta["timeout_warnings"] == [warning()]
+        current = delta["seq"]
+        for after in (0, cursor - 4095, current + 1):
+            reset = (await client.get(f'/api/runs/cli/events?after={after}')).json()
+            assert reset["reset"] and len(reset["records"]) == 4096
+            assert reset["records"][0]["id"] == "2"
+        # Replacing a journal invalidates a previously valid cursor, even if the
+        # replacement has exactly the same byte length and number of rows.
+        replacement = directory / "replacement.jsonl"
+        replacement.write_bytes(journal.read_bytes())
+        replacement.replace(journal)
+        reset = (await client.get(f'/api/runs/cli/events?after={current}')).json()
+        assert reset["reset"] and reset["seq"] > current
+        assert len(reset["records"]) == 4096
+        latest = (await client.get('/api/runs/cli')).json()
+        assert latest["seq"] == reset["seq"] and latest["live_requests"] == reset["records"]
+
+
+@pytest.mark.parametrize("state", ["queued", "running", "stopping"])
+@pytest.mark.parametrize("journal_state", ["missing", "unreadable", "symlink"])
+async def test_external_run_without_readable_journal_waits_and_returns_idle(
+        tmp_path, monkeypatch, state, journal_state):
+    import time
+    from pathlib import Path
+
+    monkeypatch.setattr("giraffe.web._EVENT_WAIT_SECONDS", .02)
+    directory = tmp_path / "cli"
+    write_metadata(directory, {"id": "cli", "state": state, "heartbeat_at": _now(),
+        "owner_pid": os.getpid(), "owner_host": socket.gethostname(), "config": config(), "seq": 17})
+    journal = directory / "evidence.jsonl"
+    if journal_state == "unreadable":
+        journal.write_text("\n")
+        original_open = Path.open
+
+        def open_path(path, *args, **kwargs):
+            if path == journal:
+                raise PermissionError("journal unavailable")
+            return original_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "open", open_path)
+    elif journal_state == "symlink":
+        source = tmp_path / "other.jsonl"
+        source.write_text("\n")
+        journal.symlink_to(source)
+    async with browser(tmp_path) as client:
+        begin = time.monotonic()
+        events = (await client.get('/api/runs/cli/events?after=17')).json()
+        assert time.monotonic() - begin >= .02
+        assert events["reset"] is False
+        assert events["idle"] is True
+        assert events["records"] == []
+        assert events["seq"] == 17

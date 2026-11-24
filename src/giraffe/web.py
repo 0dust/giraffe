@@ -969,9 +969,13 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
     observation_cache: dict = {}
     live_journals: OrderedDict = OrderedDict()
     live_journal_lock = threading.Lock()
+    # Microsecond epoch remains exact in JavaScript numbers. Allocate cursors
+    # across journal generations so replacement/reopened files invalidate clients.
+    journal_cursor = time.time_ns() // 1000
 
-    def journal_live_state(directory: Path) -> dict:
+    def journal_live_state(directory: Path, after: int | None = None) -> dict:
         """Tail CLI warnings and bounded request measurements without retaining bodies."""
+        nonlocal journal_cursor
         with live_journal_lock:
             path = directory / "evidence.jsonl"
             if path.is_symlink():
@@ -981,7 +985,10 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                 identity = (stat.st_dev, stat.st_ino)
                 cached = live_journals.get(directory.name)
                 if cached is None or cached["identity"] != identity or stat.st_size < cached["offset"]:
+                    journal_cursor += 1
                     cached = {"identity": identity, "offset": 0, "warnings": OrderedDict(),
+                              "seq": journal_cursor, "reset_after": journal_cursor,
+                              "request_versions": OrderedDict(),
                               "requests": OrderedDict(), "live_request_count": 0,
                               "live_request_summary": {"evicted": 0, "through_slot": None, "statuses": {}},
                               "evicted_running": set()}
@@ -991,6 +998,8 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                         if not line.endswith(b"\n"):
                             break  # Retry an incomplete append on the next poll.
                         cached["offset"] = stream.tell()
+                        journal_cursor += 1
+                        cached["seq"] = journal_cursor
                         try:
                             value = json.loads(line)
                         except (ValueError, UnicodeError):
@@ -1016,6 +1025,11 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                                     "intentional": record.get("intentional", False),
                                     **{key: record.get(key) for key in (
                                         "input_chars", "requested_max_tokens", "requested_input_tokens")}}, None)
+                                versions = cached["request_versions"]
+                                versions[cached["live_request_count"] - 1] = cached["seq"]
+                                while len(versions) > MAX_LIVE_REQUESTS:
+                                    _, evicted_seq = versions.popitem(last=False)
+                                    cached["reset_after"] = evicted_seq
                             continue
                         event = value.get("progress", {}) if isinstance(value, dict) else {}
                         if not isinstance(event, dict) or event.get("event") != "timeout_warning":
@@ -1032,8 +1046,13 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                 live_journals.move_to_end(directory.name)
                 while len(live_journals) > 16:
                     live_journals.popitem(last=False)
-                return {"timeout_warnings": deepcopy(list(cached["warnings"].values())),
-                        "requests": deepcopy(cached["requests"]),
+                reset = after is not None and (after < cached["reset_after"] or after > cached["seq"])
+                requests = {slot: row for slot, row in cached["requests"].items()
+                            if after is None or reset or cached["request_versions"][slot] > after}
+                return {"seq": cached["seq"], "reset": reset,
+                        "idle": after == cached["seq"] and not reset,
+                        "timeout_warnings": deepcopy(list(cached["warnings"].values())),
+                        "requests": deepcopy(requests),
                         "live_request_count": cached["live_request_count"],
                         "live_request_summary": deepcopy(cached["live_request_summary"])}
             except OSError:
@@ -1412,7 +1431,8 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                 report_available = True
         return states.run_recoverable(state, journal_present, bool(report_available))
 
-    def run_detail(identifier: str, *, listing: bool = False, snapshot: dict | None = None) -> dict:
+    def run_detail(identifier: str, *, listing: bool = False, snapshot: dict | None = None,
+                   journal_after: int | None = None) -> dict:
         directory = _directory(root, identifier)
         meta = metadata(directory)
         report_path = directory / "report.json"
@@ -1470,14 +1490,16 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
         timeout_warnings = list(live["live_timeout_warnings"].values()) if "live_timeout_warnings" in live else meta.get("live_timeout_warnings", [])
         journal = {}
         if not live and not listing and state in states.RUN_IN_PROGRESS_STATES:
-            journal = journal_live_state(directory)
+            journal = journal_live_state(directory, journal_after)
             timeout_warnings = journal.get("timeout_warnings") or timeout_warnings
         request_feed = live or journal
         return {"id": identifier, "state": state,
+                **({"journal_reset": journal.get("reset", False), "journal_idle": journal.get("idle", True)}
+                   if journal_after is not None else {}),
                 "timeout_warnings": timeout_warnings,
                 "abort_reason": (persisted or summary or {}).get("abort_reason") or meta.get("abort_reason"),
                 "error": meta.get("error"), "error_id": meta.get("error_id"),
-                "seq": live.get("seq", meta.get("seq", 0)),
+                "seq": request_feed.get("seq", meta.get("seq", 0)),
                 "progress": live.get("progress", meta.get("progress", {})),
                 "scale_down_control": control,
                 "events": live.get("events", meta.get("events", [])),
@@ -2185,14 +2207,14 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
         while True:
             feed = feeds.get(identifier)
             if feed is None:
-                detail = await run_in_threadpool(run_detail, identifier)
+                detail = await run_in_threadpool(run_detail, identifier, journal_after=after)
                 if detail["state"] in states.RUN_IN_PROGRESS_STATES:
                     remaining = deadline - asyncio.get_running_loop().time()
-                    if remaining > 0:
+                    if remaining > 0 and detail["journal_idle"]:
                         await asyncio.sleep(remaining)
-                        detail = await run_in_threadpool(run_detail, identifier)
+                        detail = await run_in_threadpool(run_detail, identifier, journal_after=after)
                     if detail["state"] in states.RUN_IN_PROGRESS_STATES:
-                        return {"seq": detail["seq"], "reset": False, "idle": True,
+                        return {"seq": detail["seq"], "reset": detail["journal_reset"], "idle": detail["journal_idle"],
                                 "events": [], "records": detail["live_requests"], "checks": [], "state": detail["state"],
                                 "terminal": detail["terminal"], "recoverable": detail["recoverable"],
                                 "scale_down_control": detail.get("scale_down_control"),

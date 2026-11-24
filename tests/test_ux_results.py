@@ -986,7 +986,8 @@ const selector=LIVE?'.live-timeout-warning':'.report-timeout-warning';
 let notice=document.querySelector(selector);assert(notice);
 assert.equal(notice.querySelector('strong').textContent,LIVE?'Requests are timing out':'Requests timed out');
 assert.equal(notice.querySelector('[data-action="show-timeouts"]'),null);
-assert.match(notice.textContent,/Timed-out requests appear here when the report is saved\./);
+assert(notice.textContent.includes(LIVE?'Timed-out requests have left the live request list. The saved report lists all of them.':'Timed-out request details were not kept in this report.'));
+assert(!notice.textContent.includes('Timed-out requests appear here when the report is saved.'));
 assert(notice.textContent.includes(`${catalogTitle('serving').toLowerCase()} request timeout and ${catalogTitle('generation').toLowerCase()} request timeout`));
 let passed;rerun=async options=>{passed=options;};
 const buttons=notice.querySelectorAll('[data-action="timeout-setting"]');assert.equal(buttons.length,2);
@@ -1007,3 +1008,39 @@ const show=document.querySelector(selector).querySelector('[data-action="show-ti
 await listeners.click({target:show,preventDefault(){}});assert.equal(reportView.tab,'results');assert.equal(state.requestStatusFilter,'timed_out');
 })();
 """.replace('LIVE', 'true' if live else 'false'), dom=True)
+
+
+@pytest.mark.parametrize("live", [False, True])
+@pytest.mark.parametrize("rows", [0, 4096])
+def test_timeout_notice_without_available_timeouts_uses_one_view_specific_hint(live, rows):
+    run_render_checks(r"""
+{
+const warning={key:'local|2|run',target:'local',deadline_seconds:2,setting:'request_timeout_seconds',finished:4099,timed_out:3,no_output:3};
+const records=Array.from({length:ROWS},(_,i)=>({id:'success-'+i,slot:i+3,target:'local',scenario:'warm',status:'completed',valid:true,score:true}));
+state.detail=LIVE?{id:'live',state:'running',config:{targets:[{name:'local',model:'m'}]},events:[],progress:{},timeout_warnings:[warning],live_requests:records}:{id:'saved',state:'completed',report:report([check('serving','fail')],{requests:records,observations:{targets:{local:{timeout_warnings:[warning]}}}})};
+renderDetail();
+const notice=document.querySelector(LIVE?'.live-timeout-warning':'.report-timeout-warning');assert(notice);
+assert.equal(notice.querySelector('[data-action="show-timeouts"]'),null);
+const hints=notice.querySelectorAll('p.hint');assert.equal(hints.length,1);
+assert.equal(hints[0].textContent,LIVE?'Timed-out requests have left the live request list. The saved report lists all of them.':'Timed-out request details were not kept in this report.');
+assert(!notice.textContent.includes('Timed-out requests appear here when the report is saved.'));
+(LIVE?state.detail.live_requests:state.detail.report.requests).push({id:'timeout',slot:5000,target:'local',scenario:'warm',status:'timeout',valid:false});renderDetail();
+const updated=document.querySelector(LIVE?'.live-timeout-warning':'.report-timeout-warning');
+assert(updated.querySelector('[data-action="show-timeouts"]'));assert.equal(updated.querySelectorAll('p.hint').length,0);
+}
+""".replace('LIVE', 'true' if live else 'false').replace('ROWS', str(rows)), dom=True)
+
+
+def test_cli_live_request_deltas_keep_cursor_and_merge_existing_rows():
+    run_render_checks(r"""
+{
+const original={id:'first',slot:0,target:'local',status:'timeout'};
+const detail={id:'cli',state:'running',stoppable:false,seq:100,live_requests:[original]};
+mergeRunEvents(detail,{seq:102,records:[{id:'second',slot:1,target:'local',status:'completed'},{id:'third',slot:2,target:'local',status:'completed'}],live_request_count:3});
+assert.equal(detail.seq,102);assert.deepEqual(detail.live_requests.map(row=>row.id),['first','second','third']);
+mergeRunEvents(detail,{seq:102,idle:true,records:[]});
+assert.equal(detail.seq,102);assert.equal(detail.live_requests.length,3);
+mergeRunEvents(detail,{seq:103,records:[{id:'third',slot:2,target:'local',status:'timeout'}]});
+assert.equal(detail.live_requests.length,3);assert.equal(detail.live_requests[2].status,'timeout');
+}
+""")
