@@ -287,3 +287,28 @@ async def test_recovery_traffic_keeps_explicit_recovery_timeout_owner(monkeypatc
     traffic = [record for record in report.requests if record.scenario == "sustained"]
     assert traffic and all(record.deadline_source == "check" and record.timeout_check == "recovery"
                            for record in traffic)
+
+
+async def test_report_warning_refreshes_after_successes(monkeypatch):
+    execute = FakeClient.execute
+    count = 0
+
+    async def first_three_timeout(self, spec, **kwargs):
+        nonlocal count
+        record = await execute(self, spec, **kwargs)
+        count += 1
+        if count <= 3:
+            record.status = "timeout"
+            record.termination_reason = "request_timeout"
+            record.valid = False
+        return record
+
+    monkeypatch.setattr(FakeClient, "execute", first_three_timeout)
+    events = []
+    report = await runner.run_suite(config(samples=22, concurrency=1), progress=events.append)
+    payload = report.observations["targets"]["service"]["timeout_warnings"][0]
+    assert payload["timed_out"] == 3 and payload["finished"] == 23
+    assert payload["update"] == 21
+    assert payload == [event["timeout_warning"] for event in events if event["event"] == "timeout_warning"][-1]
+    assert format_timeout_warning(payload) in report.warnings
+    assert any("3 of 23 requests" in message for message in report.warnings)

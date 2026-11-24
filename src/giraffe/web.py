@@ -967,21 +967,24 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
     metadata_lock = storage_metadata_lock
     last_auto_cleanup: dict = {}
     observation_cache: dict = {}
-    timeout_journals: OrderedDict = OrderedDict()
-    timeout_journal_lock = threading.Lock()
+    live_journals: OrderedDict = OrderedDict()
+    live_journal_lock = threading.Lock()
 
-    def journal_timeout_warnings(directory: Path) -> list[dict]:
-        """Tail CLI warning events without rescanning completed request evidence."""
-        with timeout_journal_lock:
+    def journal_live_state(directory: Path) -> dict:
+        """Tail CLI warnings and bounded request measurements without retaining bodies."""
+        with live_journal_lock:
             path = directory / "evidence.jsonl"
             if path.is_symlink():
-                return []
+                return {}
             try:
                 stat = path.stat()
                 identity = (stat.st_dev, stat.st_ino)
-                cached = timeout_journals.get(directory.name)
+                cached = live_journals.get(directory.name)
                 if cached is None or cached["identity"] != identity or stat.st_size < cached["offset"]:
-                    cached = {"identity": identity, "offset": 0, "warnings": OrderedDict()}
+                    cached = {"identity": identity, "offset": 0, "warnings": OrderedDict(),
+                              "requests": OrderedDict(), "live_request_count": 0,
+                              "live_request_summary": {"evicted": 0, "through_slot": None, "statuses": {}},
+                              "evicted_running": set()}
                 with path.open("rb") as stream:
                     stream.seek(cached["offset"])
                     while line := stream.readline():
@@ -991,6 +994,28 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                         try:
                             value = json.loads(line)
                         except (ValueError, UnicodeError):
+                            continue
+                        if isinstance(value, dict) and value.get("type") == "record":
+                            record = value.get("record")
+                            if isinstance(record, dict) and record.get("status") in {"completed", "failed", "timeout", "cancelled"}:
+                                # Explicit measurement allowlist: journal records can contain full responses.
+                                request = {key: record[key] for key in (
+                                    "id", "target", "fixture_id", "scenario", "condition_id", "intentional",
+                                    "status", "valid", "score", "elapsed_ms", "first_output_ms", "check_ids",
+                                    "http_status", "request_timeout_seconds", "termination_reason",
+                                    "termination_limit_seconds", "started_at", "dispatch_ms", "completed_ms",
+                                    "timing_start_ms", "request_body_sent_ms", "timing_schema", "first_token_ms",
+                                    "first_reasoning_ms", "last_output_ms", "stream", "stream_end_ms",
+                                    "answer_reads", "answer_chunks", "answer_chars", "first_read_answer_chars",
+                                    "first_read_output_tokens", "last_read_output_tokens", "read_output_tokens_source",
+                                    "max_stream_gap_ms", "input_tokens", "output_tokens", "completion_tokens",
+                                    "reasoning_tokens", "cached_prompt_tokens", "finish_reason",
+                                    "input_chars", "requested_max_tokens", "requested_input_tokens") if key in record}
+                                _track_live_request(cached, {"event": "request_completed",
+                                    "request_slot": cached["live_request_count"], "request": request,
+                                    "intentional": record.get("intentional", False),
+                                    **{key: record.get(key) for key in (
+                                        "input_chars", "requested_max_tokens", "requested_input_tokens")}}, None)
                             continue
                         event = value.get("progress", {}) if isinstance(value, dict) else {}
                         if not isinstance(event, dict) or event.get("event") != "timeout_warning":
@@ -1003,13 +1028,16 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                         warnings.move_to_end(warning["key"])
                         while len(warnings) > 16:
                             warnings.popitem(last=False)
-                timeout_journals[directory.name] = cached
-                timeout_journals.move_to_end(directory.name)
-                while len(timeout_journals) > 16:
-                    timeout_journals.popitem(last=False)
-                return list(cached["warnings"].values())
+                live_journals[directory.name] = cached
+                live_journals.move_to_end(directory.name)
+                while len(live_journals) > 16:
+                    live_journals.popitem(last=False)
+                return {"timeout_warnings": deepcopy(list(cached["warnings"].values())),
+                        "requests": deepcopy(cached["requests"]),
+                        "live_request_count": cached["live_request_count"],
+                        "live_request_summary": deepcopy(cached["live_request_summary"])}
             except OSError:
-                return []
+                return {}
 
     def live_snapshot() -> dict:
         if not active:
@@ -1440,8 +1468,11 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
         if summary and meta.get("error_id") and meta.get("error") and meta["error_id"] not in meta["error"]:
             meta = {**meta, "error": meta["error"] + f' [error {meta["error_id"]}]'}
         timeout_warnings = list(live["live_timeout_warnings"].values()) if "live_timeout_warnings" in live else meta.get("live_timeout_warnings", [])
+        journal = {}
         if not live and not listing and state in states.RUN_IN_PROGRESS_STATES:
-            timeout_warnings = journal_timeout_warnings(directory) or timeout_warnings
+            journal = journal_live_state(directory)
+            timeout_warnings = journal.get("timeout_warnings") or timeout_warnings
+        request_feed = live or journal
         return {"id": identifier, "state": state,
                 "timeout_warnings": timeout_warnings,
                 "abort_reason": (persisted or summary or {}).get("abort_reason") or meta.get("abort_reason"),
@@ -1451,9 +1482,9 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                 "scale_down_control": control,
                 "events": live.get("events", meta.get("events", [])),
                 "live_preparations": list(live["live_preparations"].values()) if "live_preparations" in live else meta.get("live_preparations", []),
-                "live_requests": list(live.get("requests", {}).values()),
-                "live_request_summary": live.get("live_request_summary", meta.get("live_request_summary", {})),
-                "live_request_count": live.get("live_request_count", meta.get("live_request_count", 0)),
+                "live_requests": list(request_feed.get("requests", {}).values()),
+                "live_request_summary": request_feed.get("live_request_summary", meta.get("live_request_summary", {})),
+                "live_request_count": request_feed.get("live_request_count", meta.get("live_request_count", 0)),
                 "live_conditions": condition_rows,
                 "live_checks": list(live.get("checks", {}).values()),
                 "stoppable": bool(live) and state in states.RUN_OWNED_STATES,
@@ -2162,15 +2193,19 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                         detail = await run_in_threadpool(run_detail, identifier)
                     if detail["state"] in states.RUN_IN_PROGRESS_STATES:
                         return {"seq": detail["seq"], "reset": False, "idle": True,
-                                "events": [], "records": [], "checks": [], "state": detail["state"],
+                                "events": [], "records": detail["live_requests"], "checks": [], "state": detail["state"],
                                 "terminal": detail["terminal"], "recoverable": detail["recoverable"],
                                 "scale_down_control": detail.get("scale_down_control"),
-                                "timeout_warnings": detail["timeout_warnings"]}
+                                "timeout_warnings": detail["timeout_warnings"],
+                                "live_request_summary": detail["live_request_summary"],
+                                "live_request_count": detail["live_request_count"]}
                 return {"seq": detail["seq"], "reset": True, "events": [], "records": [], "checks": [],
                         "state": detail["state"], "error": detail.get("error"),
                         "terminal": detail["terminal"], "recoverable": detail["recoverable"],
                         "scale_down_control": detail.get("scale_down_control"),
-                        "timeout_warnings": detail["timeout_warnings"]}
+                        "timeout_warnings": detail["timeout_warnings"],
+                        "live_request_summary": detail["live_request_summary"],
+                        "live_request_count": detail["live_request_count"]}
             seq = feed["seq"]
             oldest = feed["deltas"][0]["seq"] if feed["deltas"] else seq + 1
             reset = after < oldest - 1 or after > seq

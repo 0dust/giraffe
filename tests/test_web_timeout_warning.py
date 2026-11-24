@@ -116,3 +116,46 @@ def test_writer_snapshots_timeout_warning(tmp_path):
     writer.close()
     events = [json.loads(line) for line in (tmp_path / "evidence.jsonl").read_text().splitlines()]
     assert events[-1]["progress"]["timeout_warning"] == warning()
+
+
+async def test_cli_journal_requests_are_bounded_measurements_in_detail_and_events(tmp_path, monkeypatch):
+    from giraffe.models import RequestRecord
+
+    monkeypatch.setattr("giraffe.web._EVENT_WAIT_SECONDS", 0)
+    monkeypatch.setattr("giraffe.web.MAX_LIVE_REQUESTS", 3)
+    directory = tmp_path / "cli"
+    write_metadata(directory, {"id": "cli", "state": "running", "heartbeat_at": _now(),
+        "owner_pid": os.getpid(), "owner_host": socket.gethostname(), "config": config()})
+
+    def append(index):
+        writer = EvidenceWriter(directory)
+        writer.record_finished(RequestRecord(id=str(index), target="local", fixture_id="slow",
+            scenario="warm", condition_id="serving.warm", check_ids=["serving"], started_at=_now(),
+            status="timeout", request_timeout_seconds=2, termination_reason="request_deadline",
+            elapsed_ms=2000, first_output_ms=10, answer_chars=7, output="private answer",
+            reasoning="private reasoning"))
+        writer.progress({"event": "timeout_warning", "timeout_warning": warning()})
+        writer.close()
+
+    for index in range(5):
+        append(index)
+    async with browser(tmp_path) as client:
+        detail = (await client.get('/api/runs/cli')).json()
+        assert detail["stoppable"] is False
+        assert detail["timeout_warnings"] == [warning()]
+        rows = detail["live_requests"]
+        assert [row["id"] for row in rows] == ["2", "3", "4"]
+        assert all(row["status"] == "timeout" and row["condition_id"] == "serving.warm" for row in rows)
+        assert all(row["first_output_ms"] == 10 and row["elapsed_ms"] == 2000 for row in rows)
+        assert not any(key in row for row in rows for key in ("output", "reasoning", "messages", "error"))
+        assert detail["live_request_count"] == 5
+        assert detail["live_request_summary"] == {"evicted": 2, "through_slot": 1, "statuses": {"timeout": 2}}
+        delta = (await client.get('/api/runs/cli/events')).json()
+        assert delta["records"] == rows
+        assert delta["live_request_summary"] == detail["live_request_summary"]
+        assert delta["live_request_count"] == 5
+        append(5)
+        detail = (await client.get('/api/runs/cli')).json()
+        assert [row["id"] for row in detail["live_requests"]] == ["3", "4", "5"]
+        assert detail["live_request_count"] == 6
+        assert detail["live_request_summary"] == {"evicted": 3, "through_slot": 2, "statuses": {"timeout": 3}}

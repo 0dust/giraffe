@@ -92,3 +92,17 @@ async def test_final_report_warnings_stay_silent_in_quiet_and_json(monkeypatch, 
     await emit_events(monkeypatch, [], final_payloads=[warning(7)["timeout_warning"]], **options)
     captured = capsys.readouterr()
     assert captured.out == captured.err == ""
+
+
+async def test_success_only_updates_print_only_activation_and_changed_final_counts(monkeypatch, capsys):
+    events = [warning(3)]
+    events[0]["timeout_warning"]["finished"] = 3
+    for finished in range(4, 24):
+        event = warning(3)
+        event["timeout_warning"].update(finished=finished, update=finished - 2)
+        events.append(event)
+    await emit_events(monkeypatch, events, final_payloads=[events[-1]["timeout_warning"]])
+    lines = [line for line in capsys.readouterr().err.splitlines() if line.startswith("Warning: ")]
+    assert len(lines) == 2
+    assert "3 of 3 requests" in lines[0]
+    assert "3 of 23 requests" in lines[1]

@@ -73,10 +73,10 @@ def test_breakdown_checks_and_never_retracts():
     assert [payload[k] for k in ("answer_started", "reasoning_only", "no_output")] == [1, 1, 1]
     assert payload["checks"] == ["generation", "serving"]
     for i in range(30):
-        assert watch.observe(record(status="completed", termination_reason=None), 4 + i) is None
+        assert watch.observe(record(status="completed", termination_reason=None), 4 + i)["update"] == i + 2
     payload = watch.observe(record(first_output_ms=0, reasoning="also reasoning"), 34)
     assert payload["timed_out"] == 4 and payload["finished"] == 34
-    assert payload["answer_started"] == 2 and payload["update"] == 2
+    assert payload["answer_started"] == 2 and payload["update"] == 32
     assert payload["first_at_seconds"] == 3
 
 
@@ -184,3 +184,16 @@ def test_stop_terminations_do_not_dilute_finished_denominator(reason):
         assert watch.observe(record(status="cancelled", termination_reason=reason), elapsed) is None
     payload = activate(watch)
     assert payload is not None and payload["finished"] == payload["timed_out"] == 3
+
+
+def test_active_warning_refreshes_after_twenty_successes():
+    watch = TimeoutWatch()
+    original = activate(watch)
+    for index in range(20):
+        payload = watch.observe(record(status="completed", termination_reason=None), 10 + index)
+        assert payload["finished"] == 4 + index
+        assert payload["update"] == 2 + index
+    assert payload["timed_out"] == 3 and payload["finished"] == 23
+    assert payload["updated_at_seconds"] == 29
+    assert watch.warnings == [payload]
+    assert original["finished"] == 3 and original["update"] == 1

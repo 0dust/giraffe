@@ -51,23 +51,22 @@ class TimeoutWatch:
             "reasoning_only": 0, "no_output": 0, "checks": [],
             "first_at_seconds": None, "updated_at_seconds": None, "update": 0})
         group["finished"] += 1
-        if record.status != "timeout" or reason not in {
+        if record.status == "timeout" and reason in {
                 "request_timeout", "request_deadline", "read_timeout", "write_timeout",
                 "pool_timeout", "transport_timeout"}:
-            return None
-        group["timed_out"] += 1
-        settings = group.setdefault("settings", [])
-        if setting not in settings:
-            settings.append(setting)
-        group["setting"] = settings[0]
-        group["cli_flag"] = "--request-timeout" if settings == ["request_timeout_seconds"] else None
-        if settings[0].startswith("custom_fixtures ("):
-            group["setting_field"] = "custom_fixtures"
-        answer = record.answer_chars > 0 or record.first_output_ms is not None
-        reasoning = (bool(record.reasoning) or record.first_reasoning_ms is not None
-                     or bool(record.reasoning_tokens))
-        group["answer_started" if answer else "reasoning_only" if reasoning else "no_output"] += 1
-        group["checks"] = sorted(set(group["checks"]) | set(record.check_ids))
+            group["timed_out"] += 1
+            settings = group.setdefault("settings", [])
+            if setting not in settings:
+                settings.append(setting)
+            group["setting"] = settings[0]
+            group["cli_flag"] = "--request-timeout" if settings == ["request_timeout_seconds"] else None
+            if settings[0].startswith("custom_fixtures ("):
+                group["setting_field"] = "custom_fixtures"
+            answer = record.answer_chars > 0 or record.first_output_ms is not None
+            reasoning = (bool(record.reasoning) or record.first_reasoning_ms is not None
+                         or bool(record.reasoning_tokens))
+            group["answer_started" if answer else "reasoning_only" if reasoning else "no_output"] += 1
+            group["checks"] = sorted(set(group["checks"]) | set(record.check_ids))
         if not group["update"] and (group["timed_out"] < 3 or group["timed_out"] / group["finished"] < .2):
             return None
         if not group["update"]:
