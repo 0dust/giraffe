@@ -34,7 +34,7 @@ from functools import lru_cache
 from ipaddress import IPv4Address, IPv6Address
 from pathlib import Path
 from typing import Annotated, Literal
-from time import perf_counter
+from time import perf_counter, time_ns
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -971,7 +971,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
     live_journal_lock = threading.Lock()
     # Microsecond epoch remains exact in JavaScript numbers. Allocate cursors
     # across journal generations so replacement/reopened files invalidate clients.
-    journal_cursor = time.time_ns() // 1000
+    journal_cursor = time_ns() // 1000
 
     def journal_live_state(directory: Path, after: int | None = None) -> dict:
         """Tail CLI warnings and bounded request measurements without retaining bodies."""
