@@ -68,14 +68,20 @@ def test_a4_disabled_limit_wins_after_saved_values_and_flag_overrides(tmp_path, 
     assert config.model_dump(mode="json")[field] is None
 
 
-def test_a19_omitted_legacy_limits_are_not_set_with_one_note_each(capsys):
-    config = migrated_configuration({"targets": [TARGET], "checks": ["correctness"]})
+@pytest.mark.parametrize("block", [None, "load_test", "multi_user"])
+def test_a19_omitted_legacy_limits_are_not_set_with_one_combined_note(capsys, block):
+    values = {"targets": [TARGET], "checks": ["correctness"]}
+    if block:
+        values[block] = {}
+    config = migrated_configuration(values)
     assert config.concurrency is config.max_requests is config.max_duration_seconds is None
     assert config.default_concurrency == 4
-    assert len(config._migration_notes) == 3
+    expected = ("Earlier Giraffe versions capped runs at 300 requests, 300 s of traffic and "
+                "4 requests at once by default. This configuration sets none of these limits, "
+                "so they no longer apply. Use Edit limits to keep them.")
+    assert config._migration_notes == ([] if block else [expected])
     stderr = capsys.readouterr().err
-    assert stderr.count("Migration:") == 3
-    assert "300 requests" in stderr and "300" in stderr and "4" in stderr
+    assert stderr == ("" if block else f"Migration: {expected}\n")
 
 
 def test_a19_explicit_null_is_not_set_without_notes(capsys):

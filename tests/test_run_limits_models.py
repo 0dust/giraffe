@@ -41,7 +41,7 @@ def test_inherited_parallelism_notices_and_explicit_overlap_warning():
 
 def test_legacy_omissions_and_explicit_concurrency_preserve_parallelism():
     migrated, notes = migrate_run_limits({'targets': [TARGET]})
-    assert len(notes) == 3
+    assert len(notes) == 1
     assert all(migrated[field] is None for field in ('concurrency', 'max_requests', 'max_duration_seconds'))
     migrated, notes = migrate_run_limits({'targets': [TARGET], 'checks': ['correctness'], 'concurrency': 40,
                                         'max_requests': None, 'max_duration_seconds': 17})
@@ -162,7 +162,7 @@ def test_legacy_overlap_fixture_preserves_per_endpoint_work():
     values = yaml.safe_load(Path('tests/fixtures/legacy-run-limits-overlap.yaml').read_text())
     migrated, notes = migrate_run_limits(values)
     config = RunConfig.model_validate(migrated)
-    assert len(notes) == 3
+    assert len(notes) == 2
     assert config.concurrency == config.default_concurrency == 40
     assert all(config.effective_check(check)['concurrency'] == 40
                for check in ('correctness', 'json', 'recovery'))
@@ -185,3 +185,57 @@ def test_legacy_request_pack_overlap_keeps_limits_and_reports_inherited_parallel
     assert config.effective_check('correctness')['concurrency'] == 20
     assert any('no per-check concurrency override' in note and '20 per endpoint' in note for note in notes)
     assert config.concurrency_notices()[0]['effective_concurrency'] == 20
+
+
+@pytest.mark.parametrize("missing,parts", [
+    (("max_requests",), "300 requests"),
+    (("max_duration_seconds",), "300 s of traffic"),
+    (("concurrency",), "4 requests at once"),
+    (("max_requests", "max_duration_seconds"), "300 requests and 300 s of traffic"),
+    (("max_requests", "concurrency"), "300 requests and 4 requests at once"),
+    (("max_duration_seconds", "concurrency"), "300 s of traffic and 4 requests at once"),
+    (("max_requests", "max_duration_seconds", "concurrency"),
+     "300 requests, 300 s of traffic and 4 requests at once"),
+])
+def test_legacy_missing_limit_note_names_only_omitted_limits(missing, parts):
+    values = {"targets": [TARGET], "checks": ["correctness"],
+              **{field: None for field in ("max_requests", "max_duration_seconds", "concurrency")
+                 if field not in missing}}
+    migrated, notes = migrate_run_limits(values)
+    ending = ("This configuration doesn't set that limit, so it no longer applies. "
+              "Use Edit limits to keep it." if len(missing) == 1 else
+              "This configuration sets none of these limits, so they no longer apply. "
+              "Use Edit limits to keep them.")
+    assert notes == [f"Earlier Giraffe versions capped runs at {parts} by default. {ending}"]
+    assert all(migrated[field] is None for field in missing)
+    assert all(field not in values for field in missing)
+
+
+@pytest.mark.parametrize("key", ["config_version", "default_concurrency", "scale_down", "load_test",
+    "multi_user", "gateway_access", "gateway_policy", "gateway_attribution",
+    "legacy_custom_fixture_max_output_tokens"])
+def test_v2_only_top_level_fields_suppress_only_limit_notes(key):
+    from giraffe.models import is_legacy_config
+    values = {"targets": [TARGET], key: 2 if key == "config_version" else None}
+    assert is_legacy_config(values) == (key not in {"config_version", "default_concurrency"})
+    migrated, notes = migrate_run_limits(values)
+    assert not any(note.startswith("Earlier Giraffe versions") for note in notes)
+    if is_legacy_config(values):
+        assert all(migrated[field] is None for field in ("max_requests", "max_duration_seconds", "concurrency"))
+    else:
+        assert migrated == values
+
+
+@pytest.mark.parametrize("key", ["load_test", "multi_user"])
+def test_v2_blocks_without_checks_preserve_origin_main_legacy_defaults(key):
+    # Verified against origin/main's migrate_run_limits and RunConfig, including order.
+    expected = ["access", "serving", "first_output", "generation", "load", "context",
+                "correctness", "cancellation", "recovery"]
+    if key == "multi_user":
+        expected.append("multi_user")
+    migrated, notes = migrate_run_limits({"targets": [TARGET], key: {}})
+    config = RunConfig.model_validate(migrated)
+    assert config.checks == expected
+    assert config.default_concurrency == 4
+    assert all(migrated[field] is None for field in ("max_requests", "max_duration_seconds", "concurrency"))
+    assert not any(note.startswith("Earlier Giraffe versions") for note in notes)

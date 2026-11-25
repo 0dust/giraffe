@@ -698,6 +698,15 @@ class _LegacyLoadInput(Model):
     concurrent_workloads: _LegacyConcurrentWorkloads | None = None
 
 
+# Current RunConfig field names (including aliases; currently none) minus the
+# RunConfig fields at 27138490^, before migrate_run_limits was introduced.
+_V2_ONLY_CONFIG_KEYS = frozenset({
+    "config_version", "default_concurrency", "gateway_access", "gateway_attribution",
+    "gateway_policy", "legacy_custom_fixture_max_output_tokens", "load_test",
+    "multi_user", "scale_down",
+})
+
+
 def is_legacy_config(value) -> bool:
     """Only saved inputs without any v2-only setting need compatibility migration."""
     if not isinstance(value, dict) or {"config_version", "default_concurrency"}.intersection(value):
@@ -726,14 +735,21 @@ def migrate_run_limits(value):
                       if value.get(field) is not None and (field != "tool_calling" or value[field]))
         value["checks"] = list(dict.fromkeys(checks))
     descriptions = {
-        "max_requests": ("300 requests", "a request limit", "Maximum requests"),
-        "max_duration_seconds": ("300 seconds", "a traffic time limit", "Maximum duration"),
-        "concurrency": ("4 requests at once", "a simultaneous-request limit", "Simultaneous limit"),
+        "max_requests": "300 requests",
+        "max_duration_seconds": "300 s of traffic",
+        "concurrency": "4 requests at once",
     }
-    for field, (old, label, control) in descriptions.items():
+    missing = []
+    for field, description in descriptions.items():
         if field not in value:
             value[field] = None
-            notes.append(f"Earlier Giraffe versions stopped after {old} by default; this configuration did not set {label}, so none applies now. Enable {control} to keep that bound.")
+            missing.append(description)
+    if missing and not _V2_ONLY_CONFIG_KEYS.intersection(value):
+        parts = missing[0] if len(missing) == 1 else " and ".join([", ".join(missing[:-1]), missing[-1]])
+        ending = ("This configuration doesn't set that limit, so it no longer applies. Use Edit limits to keep it."
+                  if len(missing) == 1 else
+                  "This configuration sets none of these limits, so they no longer apply. Use Edit limits to keep them.")
+        notes.append(f"Earlier Giraffe versions capped runs at {parts} by default. {ending}")
     if value.get("concurrency") is not None:
         value.setdefault("default_concurrency", value["concurrency"])
         checks = value.get("checks", _LEGACY_DEFAULT_CHECKS)

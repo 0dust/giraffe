@@ -1909,7 +1909,7 @@ function loadDisplay(settings) {
 }
 function renderMigrationNotes() {
   const notes=(state.migrationNotes || []).filter(note=>!(state.dismissedMigrationNotes || []).includes(note));
-  return notes.length?`<div class="notice warning migration-notes"><strong>Review imported load settings</strong><ul>${notes.map(note=>`<li>${escape(note)}</li>`).join('')}</ul><button type="button" class="text-button" data-action="dismiss-migration-notes">Dismiss notes</button></div>`:'';
+  return notes.length?`<div class="notice migration-notes" role="status"><strong>Imported from an earlier Giraffe version</strong><ul>${notes.map(note=>`<li>${escape(note)}</li>`).join('')}</ul><button type="button" class="text-button" data-action="dismiss-migration-notes">Dismiss notes</button></div>`:'';
 }
 function acceptMigrationNotes(notes=[]) {
   state.migrationNotes=[...new Set([...(state.migrationNotes || []),...notes])];
@@ -3116,6 +3116,7 @@ function navigateSetup(step) {
 function setupPlanCount(plan) {
   if(plan.request_count_label!=null){
     const label=plan.request_count_label;
+    if(label==='Unknown')return 'Requests depend on response time';
     if(plan.count_kind==='bounded'&&label!=='Unknown'){
       const scheduled=label.replace(/^Unknown \+ /,'');
       return `${scheduled} ${scheduled.startsWith('≈')?'expected':'known'} requests + adaptive checks`;
