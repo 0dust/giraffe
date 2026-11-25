@@ -709,7 +709,7 @@ _V2_ONLY_CONFIG_KEYS = frozenset({
 
 def is_legacy_config(value) -> bool:
     """Only saved inputs without any v2-only setting need compatibility migration."""
-    if not isinstance(value, dict) or {"config_version", "default_concurrency"}.intersection(value):
+    if not isinstance(value, dict) or _V2_ONLY_CONFIG_KEYS.intersection(value):
         return False
     arrivals = value.get("arrivals")
     if isinstance(arrivals, BaseModel):
@@ -744,7 +744,7 @@ def migrate_run_limits(value):
         if field not in value:
             value[field] = None
             missing.append(description)
-    if missing and not _V2_ONLY_CONFIG_KEYS.intersection(value):
+    if missing:
         parts = missing[0] if len(missing) == 1 else " and ".join([", ".join(missing[:-1]), missing[-1]])
         ending = ("This configuration doesn't set that limit, so it no longer applies. Use Edit limits to keep it."
                   if len(missing) == 1 else

@@ -214,28 +214,46 @@ def test_legacy_missing_limit_note_names_only_omitted_limits(missing, parts):
 @pytest.mark.parametrize("key", ["config_version", "default_concurrency", "scale_down", "load_test",
     "multi_user", "gateway_access", "gateway_policy", "gateway_attribution",
     "legacy_custom_fixture_max_output_tokens"])
-def test_v2_only_top_level_fields_suppress_only_limit_notes(key):
+def test_v2_only_top_level_fields_identify_current_format(key):
     from giraffe.models import is_legacy_config
     values = {"targets": [TARGET], key: 2 if key == "config_version" else None}
-    assert is_legacy_config(values) == (key not in {"config_version", "default_concurrency"})
-    migrated, notes = migrate_run_limits(values)
-    assert not any(note.startswith("Earlier Giraffe versions") for note in notes)
-    if is_legacy_config(values):
-        assert all(migrated[field] is None for field in ("max_requests", "max_duration_seconds", "concurrency"))
-    else:
-        assert migrated == values
+    assert not is_legacy_config(values)
+    assert migrate_run_limits(values) == (values, [])
 
 
 @pytest.mark.parametrize("key", ["load_test", "multi_user"])
-def test_v2_blocks_without_checks_preserve_origin_main_legacy_defaults(key):
-    # Verified against origin/main's migrate_run_limits and RunConfig, including order.
-    expected = ["access", "serving", "first_output", "generation", "load", "context",
-                "correctness", "cancellation", "recovery"]
-    if key == "multi_user":
-        expected.append("multi_user")
-    migrated, notes = migrate_run_limits({"targets": [TARGET], key: {}})
-    config = RunConfig.model_validate(migrated)
-    assert config.checks == expected
+@pytest.mark.parametrize("checks", [None, ["load"]])
+def test_v2_blocks_use_current_defaults_without_version(key, checks):
+    from giraffe.cli import migrated_configuration
+    from giraffe.models import is_legacy_config
+    values = {"targets": [TARGET], key: {}}
+    if checks is not None:
+        values["checks"] = checks
+    assert not is_legacy_config(values)
+    assert migrate_run_limits(values) == (values, [])
+    config = migrated_configuration(values)
+    versioned = migrated_configuration({**values, "config_version": 2})
+    assert config.model_dump() == versioned.model_dump()
+    assert config._migration_notes == versioned._migration_notes == []
     assert config.default_concurrency == 4
-    assert all(migrated[field] is None for field in ("max_requests", "max_duration_seconds", "concurrency"))
-    assert not any(note.startswith("Earlier Giraffe versions") for note in notes)
+    assert config.concurrency is config.max_requests is config.max_duration_seconds is None
+    if checks is None:
+        expected = ["access", "serving", "correctness", "first_output"]
+        if key == "multi_user":
+            expected.append("multi_user")
+        assert config.checks == expected
+        assert "load" not in config.checks
+    else:
+        assert "load" in config.checks
+
+
+def test_genuine_legacy_omissions_keep_legacy_default_checks_and_combined_note():
+    from giraffe.models import is_legacy_config
+    values = {"targets": [TARGET]}
+    assert is_legacy_config(values)
+    migrated, notes = migrate_run_limits(values)
+    config = RunConfig.model_validate(migrated)
+    assert config.checks == ["access", "serving", "first_output", "generation", "load", "context",
+                             "correctness", "cancellation", "recovery"]
+    assert config.default_concurrency == 4
+    assert len(notes) == 1 and notes[0].startswith("Earlier Giraffe versions capped runs at")

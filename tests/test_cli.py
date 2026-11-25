@@ -582,10 +582,7 @@ def test_current_load_config_has_no_legacy_notes_in_api_or_preview(tmp_path, cap
                       "patterns": {"concurrent": {"levels": [1]}},
                       "schedule": {"duration_seconds": 20}},
     }
-    migrated, notes = migrate_run_limits(values)
-    assert notes == []
-    assert migrated["checks"] == ["load"]
-    assert all(migrated[field] is None for field in ("max_requests", "max_duration_seconds", "concurrency"))
+    assert migrate_run_limits(values) == (values, [])
     assert RunConfig.model_validate(values)._migration_notes == []
     config = migrated_configuration(values)
     assert config._migration_notes == []
