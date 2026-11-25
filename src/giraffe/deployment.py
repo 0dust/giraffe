@@ -406,10 +406,18 @@ async def probe_context_window(target, config, timeout=6, *, detail=False):
                         source = engine + " " + route
                     elif engine == "ollama":
                         info = await _read(client, origin + "/api/ps")
+                        requested = _ollama_model_name(target.model)
                         for item in info.get("models", []):
                             if not isinstance(item, dict):
                                 continue
-                            if item.get("model", item.get("name")) == target.model:
+                            name = item.get("model", item.get("name"))
+                            if not isinstance(name, str):
+                                continue
+                            try:
+                                normalized = _ollama_model_name(name)
+                            except ValueError:
+                                continue
+                            if normalized == requested:
                                 context = item.get("context_length")
                                 if type(context) is int and context > 0:
                                     value = context

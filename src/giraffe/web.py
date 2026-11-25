@@ -1002,7 +1002,6 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
         for target in config.targets:
             try:
                 url = models_url(target.url)
-                # Connect reads the generic /v1/models route, which holds for any discovery setting.
                 cached = (context_window_cache.get((url, target.model, target.deployment.discovery))
                           or context_window_cache.get((url, target.model, "none")))
             except httpx.InvalidURL:
@@ -1896,7 +1895,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
             if result.get("status") in {"connected", "unverified"}:
                 from giraffe.client import models_url
                 try:
-                    key = (models_url(body.url), result["model"], "none")
+                    key = (models_url(body.url), result["model"], body.deployment.discovery)
                     if result.get("context_window") is not None:
                         context_window_cache.pop(key, None)
                         context_window_cache[key] = (result["context_window"], time.time())

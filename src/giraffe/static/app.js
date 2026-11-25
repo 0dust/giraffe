@@ -3228,6 +3228,7 @@ function modelDiscoveryKey() {
   const form=$('#new-run-form');if(!form)return null;
   return JSON.stringify({url:form.elements.url.value.trim(),model:form.elements.model.value.trim() || null,
     api_key_env:form.elements.api_key_env?.value.trim() || null,headers_env:state.config?.targets?.[0]?.headers_env || {},
+    deployment:{discovery:state.config?.targets?.[0]?.deployment?.discovery || 'none'},
     ca_bundle:state.config?.ca_bundle || null,proxy:state.config?.proxy || null,request_options:state.config?.request_options || {}});
 }
 function invalidateModelDiscovery() {

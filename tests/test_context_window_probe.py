@@ -559,3 +559,202 @@ def test_context_window_exceeded_wording_uses_source_and_formatted_counts(source
     warning, = [w for w in plan['load_warnings'] if w.get('kind') == 'context_window_exceeded']
     assert warning['msg'] == (f'Long input → Short output needs 16,008 tokens; {description}. '
                               'Giraffe will block those Load test points instead of sending them.')
+
+
+def context_fit_values():
+    from tests.test_load_test_phase_a import values
+
+    payload = values()
+    payload['config_version'] = 2
+    payload['targets'] = [{'name': 'local', 'url': 'http://server/v1', 'model': 'test-model',
+                           'deployment': {'serving': {'context_limit': 4096}}}]
+    payload['load_test'].update(
+        workloads={'combinations': {'selected': ['long_short']}},
+        profile={'long': {'input_tokens': 4992}, 'short': {'output_tokens': 8}})
+    return payload
+
+
+@pytest.mark.parametrize('reported', [None, 8192])
+def test_saved_context_limit_is_advisory_with_reported_precedence(reported):
+    config = RunConfig.model_validate(context_fit_values())
+    windows = {'local': {'value': reported, 'source': '/v1/models max_model_len'}} if reported else {}
+    plan = request_plan(config, context_windows=windows)
+    warnings = [w for w in plan['load_warnings'] if w.get('kind', '').startswith('context_window_')]
+    warning, = warnings
+    assert not warning.get('blocking')
+    if reported:
+        assert warning['kind'] == 'context_window_conflict'
+        assert warning['msg'] == ('The local server reports an 8,192-token context window; '
+                                  'the configuration says 4,096. Giraffe uses the reported value.')
+    else:
+        assert warning['kind'] == 'context_window_exceeded'
+        assert "needs 5,000 tokens; the local server's configured context window is 4,096 tokens" in warning['msg']
+
+
+@pytest.mark.parametrize('reported', [None, 8192])
+async def test_context_fit_apis_and_start_accept_saved_limit(tmp_path, monkeypatch, local_tokenizer, reported):
+    from tests.test_connection import answer, endpoint
+    from tests.test_web import browser, finished, successful_runner
+
+    endpoint(monkeypatch, lambda request: httpx.Response(200, json=(
+        {'data': [{'id': 'test-model', **({'max_model_len': reported} if reported else {})}]}
+        if request.method == 'GET' else answer())))
+    monkeypatch.setattr('giraffe.web.run_suite', successful_runner)
+    payload = context_fit_values()
+    async with browser(tmp_path) as client:
+        assert (await client.post('/api/targets/test-connection', json={'url': 'http://server/v1'})).status_code == 200
+        for route in ('plan', 'preview', 'validate'):
+            response = await client.post('/api/config/' + route, json=payload)
+            assert response.status_code == 200, response.text
+            warnings = response.json()['request_plan']['load_warnings']
+            kinds = [w.get('kind') for w in warnings]
+            assert ('context_window_exceeded' in kinds) == (reported is None)
+            assert ('context_window_conflict' in kinds) == (reported is not None)
+        response = await client.post('/api/runs', json={'config': payload})
+        assert response.status_code == 202, response.text
+        await finished(client, response.json()['id'])
+
+
+@pytest.mark.parametrize('reported', [None, 8192])
+async def test_load_runtime_context_fit_blocks_before_any_send(local_tokenizer, reported):
+    from giraffe.load_test import execute, result
+    from giraffe.runner import _Run
+    from tests.test_load_test_phase_a import Client
+
+    config = RunConfig.model_validate(context_fit_values())
+    if reported:
+        config._preflight_context_windows = {'local': {'value': reported, 'source': 'test', 'collected_at': 'now'}}
+    target = config.targets[0]
+    run, client = _Run(config, None, None), Client()
+    run.observations['local']['deployment'] = await deployment.snapshot(
+        target, config, time.monotonic() + 1, asyncio.Event())
+    observation = await execute(run, target, client)
+    assert observation['context_windows']['local'] == (reported or 4096)
+    point, = observation['points']
+    if reported:
+        assert 'blocked' not in point
+        assert client.started
+    else:
+        assert not client.specs
+        assert '4096' in point['blocked']
+        assert result(run, target).metrics['points'][0]['reason_code'] == 'context_exceeded'
+
+
+@pytest.mark.parametrize('engine,path,body', [
+    ('ollama', '/api/ps', {'models': [{'model': 'test-model', 'context_length': 4096}]}),
+    ('llamacpp', '/props', {'total_slots': 1, 'default_generation_settings': {'n_ctx': 4096}}),
+    ('tgi', '/info', {'router': 'text-generation-router', 'model_id': 'test-model', 'max_total_tokens': 4096}),
+    ('sglang', '/get_server_info', {'server_args': {'context_length': 4096}}),
+    ('none', None, None),
+])
+async def test_connect_engine_window_reaches_preview_before_start(tmp_path, monkeypatch, engine, path, body):
+    from tests.test_connection import answer, endpoint
+    from tests.test_web import browser
+
+    def respond(request):
+        if request.method == 'POST':
+            return httpx.Response(200, json=answer())
+        if request.url.path == '/v1/models':
+            return httpx.Response(200, json={'data': [{'id': 'test-model'}]})
+        assert request.url.path == path
+        return httpx.Response(200, json=body)
+
+    requests, _ = endpoint(monkeypatch, respond)
+    payload = context_fit_values()
+    payload['targets'][0]['deployment'] = {'discovery': engine}
+    async with browser(tmp_path) as client:
+        response = await client.post('/api/targets/test-connection', json={
+            'url': 'http://server/v1', 'deployment': {'discovery': engine}})
+        assert response.status_code == 200, response.text
+        result = response.json()
+        if path:
+            assert result['context_window']['value'] == 4096
+            assert result['context_window']['source'] == engine + ' ' + path
+        else:
+            assert result['context_window'] is None
+            assert result['context_window_reason'] == 'no_window'
+        assert [(r.method, r.url.path) for r in requests] == [
+            ('GET', '/v1/models'), ('POST', '/v1/chat/completions'),
+            *([('GET', path)] if path else [])]
+        preview = await client.post('/api/config/preview', json=payload)
+        assert preview.status_code == 200, preview.text
+        plan = preview.json()['request_plan']
+        kinds = [w.get('kind') for w in plan['load_warnings']]
+        assert ('context_window_exceeded' in kinds) == bool(path)
+        assert ('context_window_unknown' in kinds) == (path is None)
+        if path:
+            assert plan['context_windows']['local']['source'] == engine + ' ' + path
+            # An engine reading must not leak into another discovery mode's preview.
+            payload['targets'][0]['deployment']['discovery'] = 'none'
+            plan = (await client.post('/api/config/preview', json=payload)).json()['request_plan']
+            assert plan['context_windows'] == {}
+
+
+async def test_discovered_engine_probe_deadline_preserves_success_and_unavailable_reason(monkeypatch):
+    from giraffe import preflight
+
+    original_timeout = asyncio.timeout
+
+    async def discovered(*args, **kwargs):
+        return {'models': ['test-model'], 'context_windows': {}}
+
+    async def connected(target, config):
+        return {'status': 'connected', 'model': target.model}
+
+    async def slow_probe(target, config, timeout, *, detail=False):
+        assert target.deployment.discovery == 'ollama'
+        assert 0 < timeout <= .05
+        await asyncio.sleep(1)
+
+    monkeypatch.setattr(preflight, 'discover_models', discovered)
+    monkeypatch.setattr(preflight, 'check_target', connected)
+    monkeypatch.setattr(deployment, 'probe_context_window', slow_probe)
+    monkeypatch.setattr(asyncio, 'timeout', lambda seconds: original_timeout(.05))
+    result = await preflight.check_connection(preflight.ConnectionTest(
+        url='http://server', deployment={'discovery': 'ollama'}))
+    assert result == {'status': 'connected', 'model': 'test-model', 'context_window': None,
+                      'context_window_reason': 'unavailable'}
+
+
+@pytest.mark.parametrize('reported,matched', [
+    ('m:latest', True), ('m', True), ('library/m:latest', True), ('m:7b', False),
+])
+@pytest.mark.parametrize('phase', ['connect', 'runtime'])
+async def test_ollama_context_matches_normalized_names(monkeypatch, reported, matched, phase):
+    from giraffe.preflight import ConnectionTest, check_connection
+    from tests.test_connection import answer, endpoint
+
+    def respond(request):
+        if request.method == 'POST':
+            return httpx.Response(200, json=answer())
+        if request.url.path == '/api/ps':
+            return httpx.Response(200, json={'models': [
+                {'model': None, 'context_length': 1},
+                {'model': 42, 'context_length': 1},
+                {'model': 'invalid model!', 'context_length': 1},
+                {'name': reported, 'context_length': 4096},
+                {'model': 'also invalid!', 'context_length': 1}]})
+        assert request.url.path == '/v1/models'
+        return httpx.Response(200, json={'data': [{'id': 'm'}]})
+
+    requests, _ = endpoint(monkeypatch, respond)
+    config = RunConfig(targets=[{'name': 'local', 'url': 'http://server/v1', 'model': 'm',
+                                'deployment': {'discovery': 'ollama'}}], checks=['load'])
+    if phase == 'connect':
+        result = await check_connection(ConnectionTest(url='http://server/v1',
+                                                       deployment={'discovery': 'ollama'}))
+        window = result['context_window']
+        assert result['status'] == 'connected'
+        assert [(r.method, r.url.path) for r in requests[:3]] == [
+            ('GET', '/v1/models'), ('POST', '/v1/chat/completions'), ('GET', '/api/ps')]
+    else:
+        windows = await deployment.probe_context_windows(config)
+        window = windows.get('local')
+        assert requests[0].url.path == '/api/ps'
+    if matched:
+        assert window['value'] == 4096
+        assert window['source'] == 'ollama /api/ps'
+        observation = {'deployment': {'fields': {'serving.context_limit': {'reported': window}}}}
+        assert concurrent_load.context_window(config.targets[0], observation)[0] == 4096
+    else:
+        assert window is None

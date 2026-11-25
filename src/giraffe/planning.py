@@ -1408,6 +1408,7 @@ def request_plan(config: RunConfig | ConfigDraft, *,
                 if configured is not None and configured != entry["value"]:
                     load_warnings.append({"kind": "context_window_conflict", "target": target.name, "fields": fields,
                         "msg": f"The {target.name} server reports {_context_window_article(entry['value'])} {entry['value']:,}-token context window; the configuration says {configured:,}. Giraffe uses the reported value."})
+            if window is not None:
                 settings = dict(settings_sets(config.load_test))
                 seen_shapes = set()
                 for point in test_points(config.load_test):

@@ -15,7 +15,7 @@ from .caps import (
     MAX_PREFLIGHT_BODY_BYTES, MAX_PREFLIGHT_HEADER_CHARS,
 )
 from giraffe.client import NO_ANSWER_ERROR, REASONING_BUDGET_ERROR, LLMClient, _headers, models_url
-from giraffe.models import Model, RequestSpec, RunConfig, Target
+from giraffe.models import Deployment, Model, RequestSpec, RunConfig, Target
 
 
 logger = logging.getLogger(__name__)
@@ -71,10 +71,12 @@ class ModelDiscovery(APIKeyInput):
     headers_env: dict[str, str] = Field(default_factory=dict)
     ca_bundle: str | None = None
     proxy: str | None = None
+    deployment: Deployment = Field(default_factory=Deployment)
 
     def target(self, model: str = "discovery") -> Target:
         target = Target(name="connection", model=model, url=self.url.strip(),
-                        api_key_env=self.api_key_env, headers_env=self.headers_env)
+                        api_key_env=self.api_key_env, headers_env=self.headers_env,
+                        deployment=self.deployment)
         attach_api_key(target, self.api_key)
         return target
 
@@ -229,7 +231,10 @@ async def check_connection(body: ConnectionTest) -> dict:
                     result["context_window_reason"] = None
                 else:
                     result["context_window_reason"] = "no_window"
-            elif remaining > 0:
+            if (result["context_window"] is None and remaining > 0
+                    and (discovered is None or config.targets[0].deployment.discovery
+                         in {"ollama", "llamacpp", "tgi", "sglang"})):
+                result["context_window_reason"] = "unavailable"
                 result["context_window"], result["context_window_reason"] = await probe_context_window(
                     config.targets[0], config, timeout=min(6, remaining), detail=True)
             return result

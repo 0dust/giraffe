@@ -314,3 +314,16 @@ for(const path of warning.fields)assert(actions.querySelector(`[data-setting-pat
 warning.fields=[];$('#main').innerHTML=renderLoadContextWarning(config,{load_warnings:[warning]});
 assert(!$('#main').querySelector('.actions'));
 ''', dom=True)
+
+
+def test_connect_body_and_identity_include_current_discovery_mode():
+    browser_logic(r'''
+nodes['#new-run-form']={elements:{url:{value:'http://server/v1'},model:{value:''}}};
+config.targets[0].deployment.discovery='ollama';
+const key=modelDiscoveryKey();
+assert.equal(JSON.parse(key).deployment.discovery,'ollama');
+config.targets[0].deployment.discovery='tgi';
+assert.notEqual(modelDiscoveryKey(),key);
+config.targets[0].deployment={};
+assert.equal(JSON.parse(modelDiscoveryKey()).deployment.discovery,'none');
+''')

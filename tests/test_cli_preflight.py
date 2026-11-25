@@ -658,3 +658,41 @@ def test_offline_load_commands_do_not_probe_context(command, tmp_path, monkeypat
     path.write_text(RunConfig(targets=[{"name": "local", "url": "http://server/v1", "model": "tiny"}],
                               checks=["load"]).model_dump_json())
     assert main([command, "--config", str(path)]) == 0
+
+
+@pytest.mark.parametrize('engine,path,body', [
+    ('ollama', '/api/ps', {'models': [{'model': 'test-model', 'context_length': 4096}]}),
+    ('llamacpp', '/props', {'total_slots': 1, 'default_generation_settings': {'n_ctx': 4096}}),
+    ('tgi', '/info', {'router': 'text-generation-router', 'model_id': 'test-model', 'max_total_tokens': 4096}),
+])
+def test_cli_engine_context_is_probed_after_loading(tmp_path, monkeypatch, capsys, engine, path, body):
+    from giraffe.models import RunReport
+    from tests.test_connection import answer, endpoint
+    from tests.test_context_window_probe import context_fit_values
+
+    def respond(request):
+        if request.method == 'POST':
+            return httpx.Response(200, json=answer())
+        assert request.url.path == path
+        return httpx.Response(200, json=body)
+
+    requests, _ = endpoint(monkeypatch, respond)
+    payload = context_fit_values()
+    payload['targets'][0]['deployment']['discovery'] = engine
+    config_path = tmp_path / 'config.json'
+    config_path.write_text(json.dumps(payload))
+
+    async def run(config, **kwargs):
+        assert config._preflight_context_windows['local']['value'] == 4096
+        assert config._preflight_context_windows['local']['source'] == engine + ' ' + path
+        return RunReport(run_id='context', started_at='now', finished_at='now', overall='pass',
+                         manifest={'config': config.model_dump(mode='json')})
+
+    monkeypatch.setattr('giraffe.cli._run', run)
+    assert main(['run', '--config', str(config_path), '--output', str(tmp_path / 'run'), '--json']) == 0
+    # Ollama also checks residency before the connection request.
+    assert [(r.method, r.url.path) for r in requests] == [
+        *([('GET', path)] if engine == 'ollama' else []),
+        ('POST', '/v1/chat/completions'), ('GET', path)]
+    captured = capsys.readouterr()
+    assert 'needs 5,000 tokens' in captured.err
