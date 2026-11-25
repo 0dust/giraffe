@@ -63,7 +63,7 @@ function renderProbeReason(record) {
   return reason?`<p class="${probePassed(record)?'hint':'notice warning'}">${escape(reason)}</p>`:'';
 }
 function requestStatus(record) {
-  if(record.scenario==='performance_evidence_probe')return probePassed(record)?'pass':'inconclusive';
+  if(record.scenario==='performance_evidence_probe'&&record.status==='completed')return probePassed(record)?'pass':'inconclusive';
   return ['running','queued','reserved','stopping','timeout','cancelled','skipped'].includes(record.status)?displayStatus(record.status):requestOutcome(record);
 }
 const runPath = (id) => `/api/runs/${encodeURIComponent(id)}`;
@@ -72,7 +72,7 @@ const notice = (message, kind='') => `<div class="notice ${kind}">${escape(messa
 
 // Request glyphs describe request evidence, not the parent check's verdict.
 function requestOutcome(record) {
-  if(record.scenario==='performance_evidence_probe')return probePassed(record)?'pass':'inconclusive';
+  if(record.scenario==='performance_evidence_probe'&&record.status==='completed')return probePassed(record)?'pass':'inconclusive';
   if(record.status==='running')return 'running';
   if(record.intentional||isProbe(record))return 'inconclusive';
   if(record.status==='cancelled')return 'inconclusive';
@@ -3780,7 +3780,7 @@ function measurementLabel(window) {
 }
 function performanceWindowOptions(target,selected) {
   const groups=new Map();
-  for(const item of target?.windows||[]){if(target.cohorts?.find(cohort=>cohort.id===item.cohort_id)?.scenarios?.includes('performance_evidence_probe'))continue;const label=item.workload_label||target.cohorts?.find(cohort=>cohort.id===item.cohort_id)?.label||'Recorded workload';if(!groups.has(label))groups.set(label,[]);groups.get(label).push(item);}
+  for(const item of target?.windows||[]){const cohort=target.cohorts?.find(cohort=>cohort.id===item.cohort_id);if(cohort?.measurement_scope===false&&![target.default_window,target.selected_window,selected?.id].includes(item.id))continue;const label=item.workload_label||cohort?.label||'Recorded workload';if(!groups.has(label))groups.set(label,[]);groups.get(label).push(item);}
   return [...groups].map(([label,windows])=>`<optgroup label="${escape(label)}">${windows.map(item=>`<option value="${escape(item.id)}" ${selected?.id===item.id?'selected':''}>${escape(measurementLabel(item))}</option>`).join('')}</optgroup>`).join('')||'<option>Full request window · not yet measured</option>';
 }
 function renderPreparation(detail=state.detail) {

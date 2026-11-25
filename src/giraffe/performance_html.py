@@ -345,8 +345,9 @@ def render_performance(performance, *, prefix='performance'):
             + ' ' + _e(window.get('population', '')) + ' ' + _e(target.get('scope_note', '')) + '</p>'
             + '<p class="html-note">Absent evidence stays unavailable. Collect eligible observations for this scope. Specific exclusions and collection instructions appear below.</p></div>')
         windows = [item for item in target.get('windows', [])
-                   if not any(cohort['id'] == item.get('cohort_id')
-                              and 'performance_evidence_probe' in cohort.get('scenarios', [])
+                   if item['id'] in (target.get('default_window'), target.get('selected_window'))
+                   or not any(cohort['id'] == item.get('cohort_id')
+                              and cohort.get('measurement_scope') is False
                               for cohort in target.get('cohorts', []))]
         if len(windows) > 1:
             parts.append('<details><summary>Measurement windows · static report</summary>'

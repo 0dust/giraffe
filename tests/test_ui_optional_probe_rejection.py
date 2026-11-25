@@ -154,7 +154,7 @@ assert.doesNotMatch(renderPreparation(),/Optional measurements unavailable/);
 def test_performance_measurement_selector_excludes_only_support_probe():
     run_render_checks(r'''
 const scenarios=['performance_evidence_probe','initial','warm'];
-const target={cohorts:scenarios.map(id=>({id,scenarios:[id]})),windows:scenarios.map(id=>({id,cohort_id:id,label:id,request_count:1}))};
+const target={cohorts:scenarios.map(id=>({id,scenarios:[id],measurement_scope:id!=='performance_evidence_probe'})),windows:scenarios.map(id=>({id,cohort_id:id,label:id,request_count:1}))};
 const html=performanceWindowOptions(target,target.windows[1]);
 assert.doesNotMatch(html,/performance_evidence_probe/);
 assert.match(html,/value="initial"/);assert.match(html,/value="warm"/);
@@ -174,4 +174,50 @@ state.detail={state:'completed',report:{requests:[r],conditions:[row]}};
 const html=renderRequestContext(r,[r]);
 assert(html.includes(single?'Single request':'Yes · repeated across this test'));
 assert(!html.includes(single?'Yes · repeated across this test':'Single request'));
+''')
+
+
+@pytest.mark.parametrize("selection", ["default_window", "selected_window", "argument", "legacy", "eligible", "mixed"])
+def test_performance_dropdown_retains_selected_and_legacy_windows(selection):
+    run_render_checks("const selection=" + json.dumps(selection) + r''';
+const probe={id:'probe',scenarios:['performance_evidence_probe'],measurement_scope:false};
+const target={cohorts:[probe,{id:'initial',measurement_scope:true}],windows:[
+{id:'full:probe',cohort_id:'probe',label:'Probe',request_count:1},
+{id:'full:initial',cohort_id:'initial',label:'Initial',request_count:1}]};
+if(['default_window','selected_window'].includes(selection))target[selection]='full:probe';
+if(selection==='legacy')delete probe.measurement_scope;
+if(selection==='eligible'||selection==='mixed')probe.measurement_scope=true;
+if(selection==='mixed')probe.scenarios.push('initial');
+const selected=target.windows[selection==='argument'?0:1];
+const html=performanceWindowOptions(target,selected);
+assert.match(html,/value="full:probe"/);
+assert(html.includes(`value="${selected.id}" selected`));
+if(selection==='default_window'||selection==='selected_window'||selection==='argument'){
+  target.windows=[target.windows[0]];
+  assert.match(performanceWindowOptions(target,target.windows[0]),/value="full:probe" selected/);
+}
+''')
+
+
+@pytest.mark.parametrize(("status", "expected_status", "expected_outcome"), [
+    ("running", "running", "running"), ("queued", "queued", "inconclusive"),
+    ("reserved", "reserved", "inconclusive"), ("stopping", "stopping", "inconclusive"),
+    ("timeout", "timeout", "fail"), ("cancelled", "cancelled", "inconclusive"),
+    ("skipped", "skipped", "inconclusive"), ("failed", "fail", "fail"),
+])
+@pytest.mark.parametrize("verdict", ["passed", "inconclusive"])
+def test_probe_transport_status_precedes_capability_verdict(status, expected_status, expected_outcome, verdict):
+    run_render_checks("const [status,expectedStatus,expectedOutcome,verdict]="
+                      + json.dumps([status, expected_status, expected_outcome, verdict]) + r''';
+const r={id:'probe',target:'local',scenario:'performance_evidence_probe',status,http_status:status==='failed'?500:null};
+state.detail={state:'running',report:{conditions:[{target:'local',condition_id:r.scenario,status:verdict,reason:'Capability reason'}]}};
+assert.equal(requestStatus(r),expectedStatus);
+assert.equal(requestOutcome(r),expectedOutcome);
+assert.match(renderProbeReason(r),/Capability reason/);
+if(status==='running')assert.equal(requestTiming(r),'Timing pending');
+if(status==='failed'){
+  r.http_status=400;r.workload={performance_evidence_probe:true,rejected_evidence_field:'logprobs'};
+  assert.equal(requestStatus(r),'fail');assert.equal(requestOutcome(r),'fail');
+  assert.equal(optionalProbeRejection(r),'logprobs');
+}
 ''')

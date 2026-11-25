@@ -995,9 +995,11 @@ def build_performance(report, *, target=None, window=None):
             cohorts.append(dict(id=key, label=label, check=check, request_count=len(group),
                 valid_completions=sum(row.status == "completed" and row.valid for row in group),
                 preparation=all(_preparation(row) for row in group),
+                measurement_scope=any(row.scenario != "performance_evidence_probe" for row in group),
                 performance_workload=bool(_PERFORMANCE_CHECKS.intersection(group[0].check_ids)),
                 scenarios=list(dict.fromkeys(row.scenario for row in group))))
-        candidates = [row for row in cohorts if not row["preparation"]] or cohorts
+        measurement_cohorts = [row for row in cohorts if row["measurement_scope"]] or cohorts
+        candidates = [row for row in measurement_cohorts if not row["preparation"]] or measurement_cohorts
         representative = max(candidates, key=lambda row: (row["performance_workload"], row["valid_completions"])) if candidates else None
         default = representative["id"] if representative else None
         windows, summaries = [], {}
