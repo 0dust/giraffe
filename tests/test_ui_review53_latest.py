@@ -46,7 +46,7 @@ assert.match(renderPreparation(),/9s/);
 state.detail.state='completed';state.detail.progress={};state.detail.report={observations:{targets:{local:{preparation:{step:'Local tokenization',status:'unavailable',elapsed_seconds:2,reason:'Matching tokenizer not cached'}}}}};
 html=renderPreparation();assert.match(html,/Preparation unavailable/);assert.match(html,/Matching tokenizer not cached/);
 assert.match(html,/The affected test traffic did not run/);assert.doesNotMatch(html,/Preparing test traffic/);
-state.detail.report.observations.targets.local.preparation={scenario:'performance_evidence_probe',step:'Streamed token and usage capability',status:'unavailable',elapsed_seconds:1,reason:'Endpoint does not provide token boundaries'};
+state.detail.report.observations.targets.local.preparation={scenario:'performance_evidence_probe',step:'Streamed token and usage support',status:'unavailable',elapsed_seconds:1,reason:'Endpoint does not provide token boundaries'};
 html=renderPreparation();assert.match(html,/Unsupported measurements stay unknown/);assert.doesNotMatch(html,/test traffic did not run/);
 ''')
 

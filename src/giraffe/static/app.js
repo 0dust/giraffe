@@ -48,7 +48,22 @@ function displayStatus(status,run=state.detail) {
   if(run?.state&&!activeState(run)&&['running','queued','reserved','stopping'].includes(status))return status==='queued'?'skipped':['cancelled','interrupted'].includes(run.state)?'cancelled':'inconclusive';
   return status;
 }
+function probeCondition(record,report=state.detail?.report) {
+  if(record.scenario!=='performance_evidence_probe')return null;
+  const rows=[...(state.detail?.live_conditions || []),...(report?.conditions || []),...Object.entries(report?.observations?.targets || {}).flatMap(([target,obs])=>(obs.conditions || []).map(row=>({...row,target})))];
+  return rows.find(row=>row.target===record.target&&(row.condition_id || row.condition?.id)==='performance_evidence_probe') || record.condition_summary || null;
+}
+function probePassed(record) {
+  const row=probeCondition(record);
+  return ['passed','pass'].includes(row?.aggregate_status || row?.condition_verdict || row?.status);
+}
+function renderProbeReason(record) {
+  if(record.scenario!=='performance_evidence_probe')return '';
+  const reason=probeCondition(record)?.reason || state.detail?.report?.observations?.targets?.[record.target]?.token_evidence?.reason;
+  return reason?`<p class="${probePassed(record)?'hint':'notice warning'}">${escape(reason)}</p>`:'';
+}
 function requestStatus(record) {
+  if(record.scenario==='performance_evidence_probe'&&record.status==='completed')return probePassed(record)?'pass':'inconclusive';
   return ['running','queued','reserved','stopping','timeout','cancelled','skipped'].includes(record.status)?displayStatus(record.status):requestOutcome(record);
 }
 const runPath = (id) => `/api/runs/${encodeURIComponent(id)}`;
@@ -57,6 +72,7 @@ const notice = (message, kind='') => `<div class="notice ${kind}">${escape(messa
 
 // Request glyphs describe request evidence, not the parent check's verdict.
 function requestOutcome(record) {
+  if(record.scenario==='performance_evidence_probe'&&record.status==='completed')return probePassed(record)?'pass':'inconclusive';
   if(record.status==='running')return 'running';
   if(record.intentional||isProbe(record))return 'inconclusive';
   if(record.status==='cancelled')return 'inconclusive';
@@ -567,7 +583,7 @@ function conditionInfo(record,report=state.detail?.report) {
   if(scenario==='arrival')workload.requests_per_second ??=config.arrivals?.requests_per_second;
   const id=record.condition_id || (scenario==='arrival'&&workload.requests_per_second?`arrival_r${workload.requests_per_second}`:fallbackConditionId(scenario));
   const summaries=[...(state.detail?.live_conditions || []),...Object.entries(report?.observations?.targets || {}).flatMap(([target,obs])=>(obs.conditions || []).map(row=>({...row,target})))];
-  const summary=record.condition_summary || summaries.find(row=>(record.target==null||row.target===record.target)&&row.condition?.id===id);
+  const summary=scenario==='performance_evidence_probe'?probeCondition(record,report):record.condition_summary || summaries.find(row=>(record.target==null||row.target===record.target)&&row.condition?.id===id);
   const loadPoint=record.load_point||loadPointIdentity(id);
   const check=record.check_ids?.[0] || (loadPoint?'load':fallbackCheck(scenario));
   return {check,...summary?.condition,id,label:(loadPoint&&/\.(baseline|probe)(?:\.|$)/.test(scenario)?phaseName(scenario,workload):loadPoint?loadPointLabel(loadPoint):summary?.condition?.label || phaseName(scenario,workload)),purpose:summary?.condition?.purpose || phasePurposes[check],parameters:summary?.condition?.parameters || {},summary};
@@ -616,7 +632,7 @@ function requestIdentityContent(record,records) {
 }
 function renderRequestContext(record,records) {
   const condition=conditionInfo(record),p=condition.parameters,value=v=>Array.isArray(v)?v.map(n=>number(n)).join('–'):v==null?'Not recorded':number(v),chars=record.input_chars>0?record.input_chars:(p.input_chars ?? record.input_chars),tokens=record.requested_input_tokens ?? record.workload?.requested_input_tokens ?? (typeof chars==='number'?Math.ceil(chars/4):p.input_tokens_approx),cap=record.requested_max_tokens || p.output_tokens;
-  return `<p class="request-identity">${requestIdentityContent(record,records)}</p><section class="request-sent"><h3>What was sent</h3><dl class="metrics-grid">${metric('Prompt size',`${value(chars)} characters · ~${value(tokens)} tokens`,'Approximate tokens; not server-reported usage')}${metric('Output cap',`${value(cap)} tokens`)}${metric('Concurrency',p.concurrency==null?'Not recorded':`${value(p.concurrency)} at once`)}${metric('Same prompt',condition.summary?.planned===1?'Single request':p.same_prompt===true?'Yes · repeated across this test':p.same_prompt===false?(p.repetitions_per_prompt?`Different prompts · each repeated ${value(p.repetitions_per_prompt)} times`:'No · inputs vary across this test'):'Not recorded in this legacy report')}</dl>${record.evaluation?.messages?.some(message=>typeof message.content==='string'&&message.content.trim())?'<p><button type="button" class="text-button" data-action="request-input">View input messages</button></p>':''}</section><p class="hint request-internal"><small>Internal ID: <span class="mono">${escape(record.scenario || '')}${record.fixture_id?` · ${escape(record.fixture_id)}`:''}</span></small></p>`;
+  return `<p class="request-identity">${requestIdentityContent(record,records)}</p>${renderProbeReason(record)}<section class="request-sent"><h3>What was sent</h3><dl class="metrics-grid">${metric('Prompt size',`${value(chars)} characters · ~${value(tokens)} tokens`,'Approximate tokens; not server-reported usage')}${metric('Output cap',`${value(cap)} tokens`)}${metric('Concurrency',p.concurrency==null?'Not recorded':`${value(p.concurrency)} at once`)}${metric('Same prompt',(condition.summary?.planned===1||(condition.summary?.planned==null&&condition.summary?.started===1))?'Single request':p.same_prompt===true?'Yes · repeated across this test':p.same_prompt===false?(p.repetitions_per_prompt?`Different prompts · each repeated ${value(p.repetitions_per_prompt)} times`:'No · inputs vary across this test'):'Not recorded in this legacy report')}</dl>${record.evaluation?.messages?.some(message=>typeof message.content==='string'&&message.content.trim())?'<p><button type="button" class="text-button" data-action="request-input">View input messages</button></p>':''}</section><p class="hint request-internal"><small>Internal ID: <span class="mono">${escape(record.scenario || '')}${record.fixture_id?` · ${escape(record.fixture_id)}`:''}</span></small></p>`;
 }
 function renderPhases(events) {
   const phases=[];
@@ -3764,7 +3780,7 @@ function measurementLabel(window) {
 }
 function performanceWindowOptions(target,selected) {
   const groups=new Map();
-  for(const item of target?.windows||[]){const label=item.workload_label||target.cohorts?.find(cohort=>cohort.id===item.cohort_id)?.label||'Recorded workload';if(!groups.has(label))groups.set(label,[]);groups.get(label).push(item);}
+  for(const item of target?.windows||[]){const cohort=target.cohorts?.find(cohort=>cohort.id===item.cohort_id);if(cohort?.measurement_scope===false&&![target.default_window,target.selected_window,selected?.id].includes(item.id))continue;const label=item.workload_label||cohort?.label||'Recorded workload';if(!groups.has(label))groups.set(label,[]);groups.get(label).push(item);}
   return [...groups].map(([label,windows])=>`<optgroup label="${escape(label)}">${windows.map(item=>`<option value="${escape(item.id)}" ${selected?.id===item.id?'selected':''}>${escape(measurementLabel(item))}</option>`).join('')}</optgroup>`).join('')||'<option>Full request window · not yet measured</option>';
 }
 function renderPreparation(detail=state.detail) {
@@ -3777,7 +3793,7 @@ function renderPreparation(detail=state.detail) {
   if(!snapshots.size)return '';
   const current=new Map();for(const item of snapshots.values())current.set(item.target || '',item);
   const optional=item=>['runtime_metrics_discovery','performance_evidence_probe'].includes(item.scenario);
-  const earlier=[...snapshots.values()].filter(item=>current.get(item.target || '')!==item&&!optional(item)&&(item.builtin||item.estimated||['failed','unavailable','cancelled'].includes(item.status)));
+  const earlier=[...snapshots.values()].filter(item=>current.get(item.target || '')!==item&&(!optional(item)||(item.scenario==='performance_evidence_probe'&&item.status==='unavailable'))&&(item.builtin||item.estimated||['failed','unavailable','cancelled'].includes(item.status)));
   const clocks=state.preparationClocks?.id===detail.id?state.preparationClocks.values:new Map();state.preparationClocks={id:detail.id,values:clocks};
   const notices=new Set();
   return [...current.values(),...earlier].filter(item=>{
@@ -3788,7 +3804,7 @@ function renderPreparation(detail=state.detail) {
     const running=item.status==='running'&&activeState(detail),key=JSON.stringify([item.target,item.step,item.started_elapsed_seconds]),sample=Number(item.elapsed_seconds || 0),previous=clocks.get(key);
     if(!previous||sample!==previous.sample)clocks.set(key,{sample,at:Date.now()});
     const clock=clocks.get(key),seconds=sample+(running?(Date.now()-clock.at)/1000:0),status=running?'running':item.status==='running'?'cancelled':item.status;
-    const label={running:'Preparing test traffic',completed:item.builtin?'Preparation complete · built-in tokenizer':item.estimated?'Preparation complete · estimated input size':'Preparation complete',failed:'Preparation failed',unavailable:'Preparation unavailable',cancelled:'Preparation stopped'}[status] || 'Preparation';
+    const label={running:'Preparing test traffic',completed:item.builtin?'Preparation complete · built-in tokenizer':item.estimated?'Preparation complete · estimated input size':'Preparation complete',failed:'Preparation failed',unavailable:optional(item)?'Optional measurements unavailable':'Preparation unavailable',cancelled:'Preparation stopped'}[status] || 'Preparation';
     const optionalEvidence=optional(item);
     const scope=item.scenario==='context_preparation'?catalogTitle('context'):item.scenario?.startsWith('load_preparation_')?catalogTitle('load'):'';
     const execution=optionalEvidence?(running?'Checking optional measurement support before continuing test traffic.':status==='completed'?'Supported measurements are available.':'Unsupported measurements stay unknown; this does not establish a workload failure.'):running?'Test traffic for this preparation has not started.':['failed','unavailable','cancelled'].includes(status)?'The affected test traffic did not run.':'';
@@ -4638,13 +4654,17 @@ function renderResponseEvents(record) {
   if(!record.response_events?.length&&!record.response_events_truncated)return '';
   return `<details class="response-events"><summary>Response event sequence</summary><p class="hint">Bounded protocol metadata in arrival order. Text and arguments are not included.${record.response_events_truncated?' The event list was truncated.':''}</p><pre>${escape(JSON.stringify(record.response_events || [],null,2))}</pre></details>`;
 }
-function renderEvaluationEvidence(record,report) {
+function requestEvaluation(record,report) {
   let evidence=record.evaluation;
   if(!evidence){
     const config=report.manifest?.config;
     const item=config?.request_source==='request_pack'?config.request_pack?.cases.find(item=>record.fixture_id===`pack:${item.fixture_id}`):null;
     if(item)evidence={...item,expected_provided:Object.hasOwn(item,'expected')};
   }
+  return evidence;
+}
+function renderEvaluationEvidence(record,report) {
+  const evidence=requestEvaluation(record,report);
   if(!evidence)return '<p class="hint">Input and answer-check details were not saved in this report.</p>';
   if(evidence.tool_expectation){
     const expected=evidence.tool_expectation,content=expected.expected_content;
@@ -4699,7 +4719,7 @@ async function openRequest(id) {
   const evidenceReport=report||{requests:detail.live_requests||[],manifest:{config:detail.config}};
   const retention=reportConfig(evidenceReport).retention || 'failures';
   // Render a full record only after the explicit inspection action; compact rows stay compact.
-  dialog.innerHTML=`<div class="dialog-head"><div><div class="eyebrow">Request evidence</div><h2 id="request-title">${escape(testLabel(r,evidenceReport))}</h2><p class="hint">${escape(conditionInfo(r,evidenceReport).purpose)}</p></div><button class="button ghost" data-action="close-dialog" aria-label="Close request evidence">✕</button></div><div class="dialog-body">${renderRequestEvidenceContext(r,evidenceReport,conditionContext)}${renderRequestTermination(r)}<div class="statline"><span class="pill">${escape(r.target)}</span><span>Response: ${escape(r.status)}</span>${r.score===false?badge('fail','Incorrect answer'):r.score===true?badge('pass','Correct answer'):'<span class="dim">Answer unscored</span>'}</div>${isProbe(r)?'<div class="notice" style="margin-top:20px">This request is an intentional cancellation or deadline probe. Its transport status alone does not indicate a failed suite check.</div>':''}${optionalProbeRejection(r)?`<div class="notice" style="margin-top:20px">Unsupported optional capability: the endpoint rejected <code>${escape(optionalProbeRejection(r))}</code> (HTTP ${r.http_status}). This setup probe is not a serving failure${optionalProbeRejection(r)==='stream_options'?'.':'; per-token timing stays unavailable.'}</div>`:''}${r.error?`<div class="notice ${isProbe(r)||optionalProbeRejection(r)?'':'error'}" style="margin-top:20px">${escape(r.error)}</div>`:''}${r.score_message?`<p class="hint" style="margin-top:18px">${escape(r.score_message)}</p>`:''}${renderToolEvaluation(r)}<div class="request-comparison"><section>${renderEvaluationEvidence(r,evidenceReport)}</section><section><h3>Actual answer <span class="hint">${number(r.output_chars)} recorded characters</span></h3><div class="body-output">${r.output?`<pre>${escape(r.output)}</pre>`:r.output_chars>0?`<p class="body-not-retained">Body not retained (retention: ${escape(retention)}). Measurements and scoring are preserved.</p>`:'<p class="body-not-retained">No answer text was recorded for this request.</p>'}</div>${renderLogprobEvidence(r)}${renderActualToolCalls(r)}</section></div>${renderResponseEvents(r)}${renderJudgement(r.judgement)}<details class="request-timing"><summary>Timing & transport details</summary><dl class="metrics-grid" style="margin-top:24px">${r.traffic_stage!=null?metric('Arrival rate',`${number(r.traffic_rate_rps,2)} requests/s`,r.traffic_class || '')+metric('Local dispatch delay',ms(r.dispatch_lag_ms),'Measured from planned arrival; not server queue time'):''}${metric('Elapsed',ms(r.elapsed_ms))}${metric('First answer',ms(r.first_output_ms))}${metric('Last answer',ms(r.last_output_ms))}${metric('First reasoning',ms(r.first_reasoning_ms))}${metric('Longest stream gap',ms(r.max_stream_gap_ms))}${metric('Input / output tokens',`${r.load_point&&r.input_tokens==null?'not reported':number(r.input_tokens)} / ${r.load_point&&r.output_tokens==null?'not reported':number(r.output_tokens)}`,'Server-reported usage')}${metric('HTTP / finish reason',`${r.http_status ?? '—'} / ${r.finish_reason || '—'}`)}</dl></details><details class="request-reasoning"><summary>Reasoning output</summary><div class="body-output">${r.reasoning?`<pre>${escape(r.reasoning)}</pre>`:`<p class="body-not-retained">${retention==='all'?'No reasoning text was recorded.':'No reasoning body retained. This does not establish whether the model reasoned.'}</p>`}</div></details><p class="hint" style="margin-top:18px">${r.valid?'Valid non-empty completion':'Completion not validated'} · ${r.stream?'Streaming':'Non-streaming'} · ${r.stream_terminated?'Stream termination observed':'Stream termination not recorded'}</p></div><div class="dialog-footer"><button class="button" data-action="close-dialog">${$('#test-dialog')?.open?'Back to test details':'Close'}</button></div>`;
+  dialog.innerHTML=`<div class="dialog-head"><div><div class="eyebrow">Request evidence</div><h2 id="request-title">${escape(testLabel(r,evidenceReport))}</h2><p class="hint">${escape(conditionInfo(r,evidenceReport).purpose)}</p></div><button class="button ghost" data-action="close-dialog" aria-label="Close request evidence">✕</button></div><div class="dialog-body">${renderRequestEvidenceContext(r,evidenceReport,conditionContext)}${renderRequestTermination(r)}<div class="statline"><span class="pill">${escape(r.target)}</span><span>Response: ${escape(r.status)}</span>${r.score===false?badge('fail','Incorrect answer'):r.score===true?badge('pass','Correct answer'):'<span class="dim">Answer unscored</span>'}</div>${isProbe(r)?'<div class="notice" style="margin-top:20px">This request is an intentional cancellation or deadline probe. Its transport status alone does not indicate a failed suite check.</div>':''}${optionalProbeRejection(r)?`<div class="notice" style="margin-top:20px">Unsupported optional capability: the endpoint rejected <code>${escape(optionalProbeRejection(r))}</code> (HTTP ${r.http_status}). This setup probe is not a serving failure${optionalProbeRejection(r)==='stream_options'?'.':'; per-token timing stays unavailable.'}</div>`:''}${r.error?`<div class="notice ${isProbe(r)||optionalProbeRejection(r)?'':'error'}" style="margin-top:20px">${escape(r.error)}</div>`:''}${r.score_message&&!(r.score_message==='No semantic scorer.'&&requestEvaluation(r,evidenceReport)?.scorer==='none'&&!requestEvaluation(r,evidenceReport)?.tool_expectation)?`<p class="hint" style="margin-top:18px">${escape(r.score_message)}</p>`:''}${renderToolEvaluation(r)}<div class="request-comparison"><section>${renderEvaluationEvidence(r,evidenceReport)}</section><section><h3>Actual answer <span class="hint">${number(r.output_chars)} recorded characters</span></h3><div class="body-output">${r.output?`<pre>${escape(r.output)}</pre>`:r.output_chars>0?`<p class="body-not-retained">Body not retained (retention: ${escape(retention)}). Measurements and scoring are preserved.</p>`:'<p class="body-not-retained">No answer text was recorded for this request.</p>'}</div>${renderLogprobEvidence(r)}${renderActualToolCalls(r)}</section></div>${renderResponseEvents(r)}${renderJudgement(r.judgement)}<details class="request-timing"><summary>Timing & transport details</summary><dl class="metrics-grid" style="margin-top:24px">${r.traffic_stage!=null?metric('Arrival rate',`${number(r.traffic_rate_rps,2)} requests/s`,r.traffic_class || '')+metric('Local dispatch delay',ms(r.dispatch_lag_ms),'Measured from planned arrival; not server queue time'):''}${metric('Elapsed',ms(r.elapsed_ms))}${metric('First answer',ms(r.first_output_ms))}${metric('Last answer',ms(r.last_output_ms))}${metric('First reasoning',ms(r.first_reasoning_ms))}${metric('Longest stream gap',ms(r.max_stream_gap_ms))}${metric('Input / output tokens',`${r.load_point&&r.input_tokens==null?'not reported':number(r.input_tokens)} / ${r.load_point&&r.output_tokens==null?'not reported':number(r.output_tokens)}`,'Server-reported usage')}${metric('HTTP / finish reason',`${r.http_status ?? '—'} / ${r.finish_reason || '—'}`)}</dl></details><details class="request-reasoning"><summary>Reasoning output</summary><div class="body-output">${r.reasoning?`<pre>${escape(r.reasoning)}</pre>`:`<p class="body-not-retained">${retention==='all'?'No reasoning text was recorded.':'No reasoning body retained. This does not establish whether the model reasoned.'}</p>`}</div></details><p class="hint" style="margin-top:18px">${r.valid?'Valid non-empty completion':'Completion not validated'} · ${r.stream?'Streaming':'Non-streaming'} · ${r.stream_terminated?'Stream termination observed':'Stream termination not recorded'}</p></div><div class="dialog-footer"><button class="button" data-action="close-dialog">${$('#test-dialog')?.open?'Back to test details':'Close'}</button></div>`;
   if(!dialog.open)dialog.showModal();
 }
 function openBaselineDialog(){

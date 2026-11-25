@@ -447,13 +447,34 @@ class LLMClient:
             self._evidence_probe_finished = True
             completed = record.http_status == 200 and record.stream_terminated
             returned_tokens = any(event.get("token_count") is not None for event in record.output_events)
-            returned_usage = record.input_tokens is not None or record.completion_tokens is not None
+            returned_usage = record.input_tokens is not None and record.completion_tokens is not None
             for key, available in (("logprobs", returned_tokens), ("usage", returned_usage)):
                 if self.token_evidence[key] != "rejected":
                     self.token_evidence[key] = "supported" if available else "not_returned" if completed else "unverified"
-            self.token_evidence.update(status="observed" if completed else "unavailable",
-                reason=("Compatibility probe inspected streamed token boundaries and usage; request-specific coverage is checked separately."
-                        if completed else f"Compatibility probe did not complete ({record.error or record.status})."))
+            if (completed and self.token_evidence["usage"] != "rejected"
+                    and (record.input_tokens is not None) != (record.completion_tokens is not None)):
+                self.token_evidence["usage"] = "partial"
+            if completed:
+                notes = []
+                if self.token_evidence["logprobs"] == "rejected":
+                    notes.append("Endpoint rejected the logprobs options.")
+                elif not returned_tokens:
+                    notes.append("The stream did not provide token boundaries (logprobs.content).")
+                missing_usage_fields = []
+                if self.token_evidence["usage"] == "rejected":
+                    notes.append("Endpoint rejected stream_options for requesting usage counts.")
+                else:
+                    missing_usage_fields = [field for field, count in (
+                        ("usage.prompt_tokens", record.input_tokens),
+                        ("usage.completion_tokens", record.completion_tokens),
+                    ) if count is None]
+                    if missing_usage_fields:
+                        notes.append(f"The stream did not provide usable {' and '.join(missing_usage_fields)}.")
+                self.token_evidence.update(status="observed", missing_usage_fields=missing_usage_fields,
+                    reason=" ".join(notes) or "Returned streamed token boundaries and both usage counts.")
+            else:
+                self.token_evidence.update(status="unavailable",
+                    reason=f"Compatibility probe did not complete ({record.error or record.status}).")
         self.token_evidence["probe_requests"] = self._evidence_probe_attempts
         if self._evidence_probe_finished and self.token_evidence["status"] == "probing":
             self.token_evidence["status"] = "unavailable"
@@ -651,7 +672,7 @@ class LLMClient:
         probing = spec.workload.get("performance_evidence_probe")
         # The shared key may route to a different backend from marked identities.
         if stream and not probing and not attribution:
-            if self.token_evidence["usage"] == "supported":
+            if self.token_evidence["usage"] in {"supported", "partial"}:
                 options = payload.setdefault("stream_options", {})
                 if isinstance(options, dict):
                     payload["stream_options"] = {"include_usage": True, **options}

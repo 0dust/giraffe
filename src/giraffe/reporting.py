@@ -4819,7 +4819,15 @@ def _render(report: RunReport) -> str:
                 parts.append(f'<p><strong>{label}:</strong> {_e(row.get("state", "unknown"))} · '
                              f'{_e(row.get("source") or "No runtime source")} · {_e(row.get("collected_at") or "Not observed")} · '
                              f'{_e(row.get("scope", "unknown"))}</p>')
-        parts.append(f'<h3>{_e(name)}</h3><details><summary>Deployment snapshot and unknowns</summary>'
+        parts.append(f'<h3>{_e(name)}</h3>')
+        probe = next((row for row in report.conditions if row.get("target") == name
+                      and row.get("condition_id") == "performance_evidence_probe"), None)
+        if probe:
+            passed = probe.get("status") == "passed"
+            reason = probe.get("reason") or observation.get("token_evidence", {}).get("reason", "")
+            parts.append(f'<p class="{"muted" if passed else "inconclusive"}">Streamed token and usage support: '
+                         f'{"Passed" if passed else "Inconclusive"} — {_e(reason)}</p>')
+        parts.append('<details><summary>Deployment snapshot and unknowns</summary>'
                      f'<pre>{_json(observation.get("deployment"))}</pre></details>'
                      f'<details><summary>Deployment observations during the run</summary>'
                      f'<pre>{_json(observation.get("deployment_history", []))}</pre></details>'
@@ -4839,8 +4847,12 @@ def _render(report: RunReport) -> str:
                      f' · {_number(record.elapsed_ms)} ms</summary>'
                      f'<p>Request {_e(record.id)} · scored: {_e(record.score)} · '
                      f'valid completion: {_e(record.valid)} · output characters: {record.output_chars}</p>')
-        if record.error or record.score_message:
-            parts.append(f'<p>{_e(record.error or "")} {_e(record.score_message or "")}</p>')
+        score_message = record.score_message
+        if (score_message == "No semantic scorer." and record.evaluation
+                and record.evaluation.scorer == "none" and record.evaluation.tool_expectation is None):
+            score_message = None
+        if record.error or score_message:
+            parts.append(f'<p>{_e(record.error or "")} {_e(score_message or "")}</p>')
         if record.evaluation:
             evidence = record.evaluation
             messages_key = sha256(json.dumps(evidence.messages, ensure_ascii=False, sort_keys=True).encode()).digest()

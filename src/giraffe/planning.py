@@ -536,7 +536,7 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
             quota = quotas[target.name]
             evidence_reserve = token_evidence_request_reserve(rows, target=target.name)
             if quota is None or quota - initial_count > max(1, evidence_reserve - initial_count):
-                setup(target.name, "performance_evidence_probe", "Streamed token and usage compatibility",
+                setup(target.name, "performance_evidence_probe", "Streamed token and usage support",
                       "request_timeout_seconds", config.request_timeout_seconds)
         for row in ordered:
             name = row["id"]
