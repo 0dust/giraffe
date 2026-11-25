@@ -196,3 +196,13 @@ def test_ambiguous_target_local_condition_requires_selector():
     with pytest.raises(ValueError, match="target-local"):
         index.page("bucket_c32_short_short")
     assert index.page("bucket_c32_short_short", target="other")["rows"][0]["request_id"] == "request-1"
+
+
+def test_any_preparation_condition_keeps_its_own_verdict():
+    from giraffe.models import CheckResult
+    condition = condition_for("warm")
+    condition["load_type"] = "preparation"
+    summary = lifecycle(condition=condition, condition_verdict="inconclusive")
+    check = CheckResult(id=condition["check"], target="local", title="Serving", status="fail", summary="Failed")
+    report = saved_report([record(0, scenario="warm", condition_id="warm", score=None)], summary, [check])
+    assert aggregate_conditions(report)[0]["status"] == "inconclusive"

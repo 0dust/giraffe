@@ -1477,7 +1477,7 @@ async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attributio
                 # A one-token inference can still have a slow first response.
                 # Share one configured timeout across compatibility retries.
                 probe_end = min(run.deadline, time.monotonic() + config.request_timeout_seconds)
-                run.preparation(target.name, "performance_evidence_probe", "Checking streamed token and usage evidence", "running")
+                run.preparation(target.name, "performance_evidence_probe", "Checking streamed token and usage support", "running")
                 client.on_response = None
                 probe_count = 0
                 planned_reserve = run.token_evidence_reserve(target)
@@ -1495,10 +1495,11 @@ async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attributio
                     run.observations[target.name]["token_evidence"] = client.observe_token_evidence_probe(record)
                 client.on_response = lambda: run.endpoint_response(target.name)
                 evidence = run.observations[target.name].setdefault("token_evidence", {"status": "unavailable", "reason": "No request budget or preparation time remained for a token-evidence compatibility probe."})
-                run.preparation(target.name, "performance_evidence_probe", "Streamed token and usage capability", "completed" if evidence.get("status") in {"available", "observed"} else "unavailable", evidence.get("reason"))
                 complete_evidence = (evidence.get("status") == "observed"
                                      and evidence.get("logprobs") == evidence.get("usage") == "supported"
                                      and not evidence.get("missing_usage_fields"))
+                run.preparation(target.name, "performance_evidence_probe", "Streamed token and usage support",
+                                "completed" if complete_evidence else "unavailable", evidence.get("reason"))
                 run.finish_condition(target.name, "performance_evidence_probe", reason=evidence.get("reason"),
                                      verdict="pass" if complete_evidence else "inconclusive")
             run.observations[target.name]["deployment"]["model_residency"]["after_preparation"] = (

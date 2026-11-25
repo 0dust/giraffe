@@ -197,7 +197,7 @@ async def test_runner_negotiation_is_budgeted_setup_and_optional_failure_does_no
     (False, True, "inconclusive", "logprobs.content"),
     (True, True, "passed", "Returned streamed token boundaries and both usage counts"),
 ])
-async def test_saved_probe_condition_explains_streamed_evidence(monkeypatch, tmp_path, tokens, usage, status, diagnostic):
+async def test_saved_probe_condition_explains_streamed_evidence(monkeypatch, tmp_path, capsys, tokens, usage, status, diagnostic):
     from giraffe.reporting import write_report
     from giraffe.runner import run_suite
 
@@ -208,7 +208,7 @@ async def test_saved_probe_condition_explains_streamed_evidence(monkeypatch, tmp
                        max_duration_seconds=5, metrics=False)
     events = []
     report = await run_suite(config, progress=events.append)
-    path, _ = write_report(report, tmp_path)
+    path, html_path = write_report(report, tmp_path, html=True)
     saved = json.loads(path.read_text())
     probe = next(row for row in saved["conditions"] if row["condition_id"] == "performance_evidence_probe")
     warm = next(row for row in saved["conditions"] if row["condition_id"] == "warm")
@@ -223,6 +223,31 @@ async def test_saved_probe_condition_explains_streamed_evidence(monkeypatch, tmp
     finished = next(event["condition_summary"] for event in events
                     if event["event"] == "condition_finished" and event["scenario"] == "performance_evidence_probe")
     assert finished["aggregate_status"] == status and finished["reason"] == probe["reason"]
+    preparation = saved["observations"]["targets"]["test"]["preparations"]["performance_evidence_probe"]
+    assert preparation["status"] == ("completed" if status == "passed" else "unavailable")
+    assert preparation["step"] == "Streamed token and usage support"
+    assert probe["condition"]["label"] == "Streamed token and usage support"
+    assert probe["condition"]["parameters"]["concurrency"] == 1
+    assert probe["condition"]["parameters"]["same_prompt"] is True
+    assert probe["concurrency_description"] == "1 at once"
+    running = next(event["preparation"] for event in events if event.get("preparation", {}).get("status") == "running"
+                   and event.get("scenario") == "performance_evidence_probe")
+    assert running["step"] == "Checking streamed token and usage support"
+    html = html_path.read_text()
+    assert "No semantic scorer.</p>" not in html
+    from html import escape
+    assert f'Streamed token and usage support: {status.title()} — {escape(probe["reason"])}' in html
+    assert f'<p class="{"muted" if status == "passed" else "inconclusive"}">Streamed token and usage support:' in html
+    # The static measurement catalog must retain first request and warm-up only.
+    catalog = html.split("Measurement windows · static report</summary>")[1].split("</details>")[0]
+    assert "Streamed token and usage support" not in catalog
+    assert "First request" in catalog and "Warm" in catalog
+    from giraffe.cli import _print_result
+    _print_result(report, path, html_path, tmp_path, {})
+    assert f'  test / streamed token and usage support: {status} — {probe["reason"]}' in capsys.readouterr().out
+    _print_result(report, path, html_path, tmp_path, {}, quiet=True)
+    assert "streamed token and usage support" not in capsys.readouterr().out
+
 
 
 @pytest.mark.parametrize("timeout", [.04, 8])
@@ -439,3 +464,34 @@ async def test_probe_reaches_reasoning_after_hidden_first_token_and_enables_logp
         assert client.token_evidence_probe() is None
         await client.execute(workload())
     assert len(calls) == 2 and calls[-1]["logprobs"] is True
+
+
+@pytest.mark.parametrize("usage", [{"prompt_tokens": 8}, {"completion_tokens": 1}])
+async def test_partial_usage_remains_requested_for_measured_traffic(monkeypatch, usage):
+    calls = []
+    def handler(request):
+        calls.append(json.loads(request.content))
+        return completion(usage=usage)
+    mock_http(monkeypatch, handler)
+    target = Target(name="test", url="http://runtime/v1", model="model")
+    async with LLMClient(target, RunConfig(targets=[target])) as client:
+        evidence = client.observe_token_evidence_probe(await client.execute(client.token_evidence_probe()))
+        assert evidence["usage"] == "partial"
+        result = await client.execute(workload())
+    assert result.workload["token_evidence"]["usage"] == "partial"
+    assert calls[-1]["stream_options"] == {"include_usage": True}
+
+
+async def test_nonstreamed_run_has_no_probe_summary(monkeypatch, tmp_path, capsys):
+    from giraffe.cli import _print_result
+    from giraffe.reporting import write_report
+    from giraffe.runner import run_suite
+    mock_http(monkeypatch, lambda request: httpx.Response(404) if request.method == "GET" else httpx.Response(
+        200, json={"choices": [{"message": {"content": "1"}, "finish_reason": "stop"}]}))
+    target = Target(name="test", url="http://runtime/v1", model="model")
+    report = await run_suite(RunConfig(targets=[target], checks=["serving"], samples=1,
+                                      max_requests=6, max_duration_seconds=5, metrics=False, stream=False))
+    path, html_path = write_report(report, tmp_path, html=True)
+    _print_result(report, path, html_path, tmp_path, {})
+    assert "streamed token and usage support:" not in capsys.readouterr().out
+    assert "Streamed token and usage support:" not in html_path.read_text()

@@ -344,16 +344,20 @@ def render_performance(performance, *, prefix='performance'):
             + _e(' · '.join(filter(None, (window.get('workload_label'), window.get('stages_description')))))
             + ' ' + _e(window.get('population', '')) + ' ' + _e(target.get('scope_note', '')) + '</p>'
             + '<p class="html-note">Absent evidence stays unavailable. Collect eligible observations for this scope. Specific exclusions and collection instructions appear below.</p></div>')
-        if len(target.get('windows', [])) > 1:
+        windows = [item for item in target.get('windows', [])
+                   if not any(cohort['id'] == item.get('cohort_id')
+                              and 'performance_evidence_probe' in cohort.get('scenarios', [])
+                              for cohort in target.get('cohorts', []))]
+        if len(windows) > 1:
             parts.append('<details><summary>Measurement windows · static report</summary>'
                 '<p>This document shows the default measurement for this target. Other windows are selectable in the app; populations are never pooled.</p>'
                 '<div class="table"><table><tr><th>Window<th>Bounds (ms)<th>Requests<th>Population'
                 + ''.join('<tr><th scope="row">' + _e(item.get('selection_label') or item['label']) + '<td>'
                     + _fmt(item.get('start_ms')) + '–' + _fmt(item.get('end_ms')) + '<td>'
                     + _fmt(item['request_count']) + '<td>' + _e(item.get('population', ''))
-                    for item in target['windows'][:50]) + '</table></div>'
-                + (f'<p>Showing 50 of {len(target["windows"])} windows; complete catalog in report.json.</p>'
-                   if len(target['windows']) > 50 else '') + '</details>')
+                    for item in windows[:50]) + '</table></div>'
+                + (f'<p>Showing 50 of {len(windows)} windows; complete catalog in report.json.</p>'
+                   if len(windows) > 50 else '') + '</details>')
         timing = [r for key, r in summary['distributions'].items() if not key.endswith('_length')]
         distributions = _distributions(timing, performance['percentile_convention'])
         headlines = [dict(metrics[key]) for key in KPI_IDS]

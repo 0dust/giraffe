@@ -73,7 +73,7 @@ def condition_labels() -> dict[str, str]:
         **{key: label for key, (label, _) in _SCENARIOS.items()},
         **CHECK_NAMES,
         "judging": "AI judge",
-        "performance_evidence_probe": "Compatibility probe",
+        "performance_evidence_probe": "Streamed token and usage support",
     }
 
 
@@ -270,13 +270,13 @@ def condition_for(scenario: str, workload: Mapping[str, Any] | None = None, conf
         workload.setdefault("requests_per_second", config.arrivals.requests_per_second)
     condition = _identity(scenario, workload)
     if scenario == "performance_evidence_probe":
-        condition.update(label="Streamed token evidence capability", load_type="preparation")
+        condition.update(label="Streamed token and usage support", load_type="preparation")
     check = condition["check"]
     parameters = {}
     if condition.get("level") is not None:
         parameters["concurrency"] = condition["level"]
     same = check in {"buckets", "token_stress", "arrivals", "generation"} or scenario in {
-        "mixed_control", "fairness", "fairness_baseline", "fairness_short", "initial", "readiness",
+        "performance_evidence_probe", "mixed_control", "fairness", "fairness_baseline", "fairness_short", "initial", "readiness",
         "recovery", "recovery_baseline", "recovery_prime", "stop_control", "client_cancel", "client_deadline",
         "backend_cancel", "backend_cancel_control", "backend_cancel_followup"}
     parameters["same_prompt"] = details.get("same_prompt", same)
@@ -333,6 +333,8 @@ def condition_for(scenario: str, workload: Mapping[str, Any] | None = None, conf
     rate = workload.get("rate_rps", workload.get("requests_per_second", workload.get("traffic_rate_rps")))
     if rate is not None:
         parameters["rate_rps"] = rate
+    if scenario == "performance_evidence_probe":
+        parameters["concurrency"] = 1
     purpose = {
         "performance_evidence_probe": "Checks whether the server returns streamed token boundaries and prompt and completion token counts.",
         "fairness_baseline": "Measures short-request timing without competing load for comparison.",
@@ -684,7 +686,7 @@ def aggregate_conditions(report: Any) -> list[dict[str, Any]]:
         owners.setdefault((key[0], summary["condition"].get("check")), []).append(key)
     for check in check_rows:
         owned = owners.get((check.get("target"), check.get("id")), [])
-        if (len(owned) == 1 and owned[0][1] != "performance_evidence_probe"
+        if (len(owned) == 1 and groups[owned[0]]["condition"].get("load_type") != "preparation"
                 and check.get("status") in {"pass", "fail", "inconclusive", "blocked", "skipped"}):
             verdicts.setdefault(owned[0], check["status"])
     for key, statuses in counts.items():
