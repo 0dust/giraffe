@@ -84,7 +84,23 @@ def test_sample_explanation_stays_in_duration_info_button():
     result = browser_logic('console.log(JSON.stringify({html:renderLoadEditor(config)}));', RunConfig.model_validate(values()))
     tree = Markup(result['html'])
     help_text, = [node for node in tree.nodes if node.get('id') == 'field-load_schedule_duration_seconds-help-text']
-    sentence = 'Before launch, Giraffe warns if recent timings suggest a condition can’t reach its required valid responses. Mixed traffic isn’t checked.'
+    sentence = 'If fewer than the required valid responses can start in this time, Giraffe keeps sending until they have started, within Maximum duration. Mixed traffic isn’t extended.'
     assert sentence in help_text['text']
-    assert result['html'].count('Mixed traffic isn’t checked.') == 1
+    assert result['html'].count('Mixed traffic isn’t extended.') == 1
     assert any(node.get('id') == 'field-load_schedule_duration_seconds-help' for node in help_text['parents'])
+
+
+def test_extension_reason_renders_in_condition_dialog_and_point():
+    from tests.test_ui_conditions import DIALOG_SETUP
+    from tests.test_ux_results import run_render_checks
+
+    run_render_checks(DIALOG_SETUP + r'''
+(async()=>{
+ const reason='Sending continued 0.2 s past the 1 s window so 5 requests could start.';
+ aggregate={...aggregate,reason,reasons:[reason],status:'passed',aggregate_status:'passed',running:0,completed:5,started:5};
+ draw();openConditionDialog([...conditionViews.keys()][0]);await settle();
+ assert($('#test-dialog').textContent.includes(reason));
+ const html=renderLoadTestResults({points:[{id:'load',type:'combinations',pattern:'concurrent',level:1,status:'pass',reason,groups:[]}]});
+ assert(html.includes(reason));
+})()
+''', dom=True)

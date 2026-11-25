@@ -153,8 +153,11 @@ async def test_preview_warns_when_a_concurrent_condition_is_likely_to_miss_its_s
     assert warning["msg"] == (
         f"Short input → Long output, 1 at once: about {estimated_requests} of the 5 required valid "
         f"responses can start in {duration:g} s (recent responses take about {latency_ms / 1000:.1f} s). "
-        f"Set “Send new requests for” to at least {required} s."
+        f"Giraffe will extend sending to about {required} s; set “Send new requests for” to {required} s to plan for it."
     )
+    load_times = [item for item in plan["time_timeline"] if item["id"] == "load_combinations"]
+    assert load_times
+    assert sorted(item["fixed_seconds"] for item in load_times) == sorted([duration] * 3 + [required])
     assert warning["values"]["estimated_requests"] == estimated_requests
     assert warning["values"]["min_valid_responses"] == 5
     assert warning["fields"] == ["load_test.schedule.duration_seconds"]
@@ -246,7 +249,7 @@ async def test_shortfall_groups_conditions_per_field_with_target_prefix_only_for
                for shape in ['Short input → Short output', 'Short input → Long output']]
     assert warning['msg'] == (
         f'{2 * targets} conditions may get fewer than the 5 required valid responses in 20 s: '
-        + '; '.join(details) + '. Set “Send new requests for” to at least 26 s.'
+        + '; '.join(details) + '. Giraffe will extend sending as needed (about 26 s); set “Send new requests for” to 26 s to plan for it.'
     )
     assert warning['actions'][0]['value'] == 26
     assert [row['required_seconds'] for row in warning['values']['conditions']] == [21, 26] * targets
@@ -258,13 +261,21 @@ async def test_timeout_shortfalls_group_per_timeout_field(tmp_path):
     load['request_timeout_seconds'] = 5
     load['workloads']['combinations']['selected'] = ['short_short', 'short_long']
     warning, = await shortfall_preview(tmp_path, payload, [
-        ('short_short', 1, 5000, 5000), ('short_long', 1, 6400, 6400),
+        ('short_short', 1, 6400, 6400), ('short_long', 1, 7100, 7100),
     ])
     assert warning['kind'] == 'load_timeout_shortfall'
     assert len(warning['values']['conditions']) == 2
-    assert 'Short input → Short output, 1 at once' in warning['msg']
-    assert 'Short input → Long output, 1 at once' in warning['msg']
-    assert warning['actions'][0]['value'] == 8
+    assert warning['msg'] == (
+        '2 conditions have recent responses longer than the 5 s request timeout, '
+        'so they will time out and none will count: '
+        'Short input → Short output, 1 at once (about 6.4 s); '
+        'Short input → Long output, 1 at once (about 7.1 s). '
+        'Raise the request timeout to at least 9 s.'
+    )
+    assert warning['msg'].count('none will count') == 1
+    assert warning['actions'] == [{
+        'label': 'Set timeout to 9 s', 'field': 'load_test.request_timeout_seconds', 'value': 9,
+    }]
 
 
 async def test_migrated_shortfalls_use_source_settings_paths(tmp_path):
@@ -305,5 +316,5 @@ async def test_single_estimated_response_uses_exact_response_copy(tmp_path):
     warning, = await shortfall_preview(tmp_path, payload, [('short_short', 1, 6400, 6400)])
     assert warning['msg'] == (
         'Short input → Short output, 1 at once: about 1 of the 5 required valid responses can start '
-        'in 1 s (recent responses take about 6.4 s). Set “Send new requests for” to at least 26 s.'
+        'in 1 s (recent responses take about 6.4 s). Giraffe will extend sending to about 26 s; set “Send new requests for” to 26 s to plan for it.'
     )

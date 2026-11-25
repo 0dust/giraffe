@@ -591,6 +591,7 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
                     for entry in entries
                 ]}
                 queries, completion_points = [], []
+                sending_estimates = {}
                 for point in points:
                     if point["pattern"] != "concurrent":
                         continue
@@ -636,6 +637,7 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
                             required = math.floor((rounds_needed - 1) * latency_s) + 1
                             kind, field = "load_sample_shortfall", f"{prefix}.schedule.duration_seconds"
                             current = duration
+                            sending_estimates[point["id"]] = required
                         condition = f"{load_shape_label(shape)}, {concurrency} at once"
                         if len(config.targets) > 1:
                             condition = f"{target.name}: {condition}"
@@ -659,7 +661,7 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
                 for point in points:
                     settings = own[point["source"]]
                     before = len(timeline)
-                    fixed(target.name, row, point["windows"] * settings.schedule.duration_seconds,
+                    fixed(target.name, row, point["windows"] * sending_estimates.get(point["id"], settings.schedule.duration_seconds),
                           "load_test.schedule.duration_seconds", count=point["windows"], timeout=settings.request_timeout_seconds)
                     for item in timeline[before:]:
                         # Outstanding requests can use their remaining request
@@ -1114,11 +1116,16 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
         first = conditions[0]
         current = first["current"]
         if kind == "load_timeout_shortfall":
-            message = " ".join(
-                f"{item['condition']}: recent responses take about {item['latency_s']:.1f} s, "
-                f"longer than the {current:g} s request timeout, so they will time out and none will count."
-                for item in conditions
-            ) + f" Raise the request timeout to at least {required} s."
+            if len(conditions) == 1:
+                message = (f"{first['condition']}: recent responses take about {first['latency_s']:.1f} s, "
+                           f"longer than the {current:g} s request timeout, so they will time out and none will count.")
+            else:
+                details = "; ".join(
+                    f"{item['condition']} (about {item['latency_s']:.1f} s)" for item in conditions
+                )
+                message = (f"{len(conditions)} conditions have recent responses longer than the {current:g} s "
+                           f"request timeout, so they will time out and none will count: {details}.")
+            message += f" Raise the request timeout to at least {required} s."
             label = f"Set timeout to {required} s"
         else:
             minimum = first["minimum"]
@@ -1135,7 +1142,9 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
                 )
                 message = (f"{len(conditions)} conditions may get fewer than {threshold} "
                            f"in {current:g} s: {details}.")
-            message += f" Set “Send new requests for” to at least {required} s."
+            continuation = (f"as needed (about {required} s)" if len(conditions) > 1 else f"to about {required} s")
+            message += (f" Giraffe will extend sending {continuation}; "
+                        f"set “Send new requests for” to {required} s to plan for it.")
             label = f"Set to {required} s"
         load_sample_warnings.append({
             "kind": kind, "fields": [field], "msg": message,

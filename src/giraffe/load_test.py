@@ -739,9 +739,18 @@ def build_spec(
 
 
 async def concurrent_window(run, target, client, settings, point, calibration, *, phase=None):
-    """Refill each slot independently; a minimum sample count never ends a window."""
+    """Refill each slot independently; a minimum sample count never ends a window.
+
+    Plain concurrent points extend sending until the required number of requests
+    have started, subject to the existing run and point limits.
+    """
     begin = time.monotonic()
     end = begin + settings.schedule.duration_seconds
+    sending_cutoff = end
+    minimum = settings.pass_criteria.min_valid_responses
+    extendable = phase is None and point["type"] != "mixed"
+    dispatched = 0
+    extended = False
     records, active = [], {}
     changed = asyncio.Event()
     rng = random.Random(settings.patterns.poisson.seed)
@@ -762,11 +771,21 @@ async def concurrent_window(run, target, client, settings, point, calibration, *
     )
 
     def ended():
-        nonlocal reason, cutoff
+        nonlocal reason, cutoff, sending_cutoff, extended
         if failure is not None:
             return True
-        if time.monotonic() >= end:
-            return True
+        now = time.monotonic()
+        if now >= sending_cutoff:
+            if extendable and not extended and dispatched < minimum and now >= end:
+                extension_cap = end + math.ceil((minimum - dispatched) / workers) * settings.request_timeout_seconds
+                sending_cutoff = min(run.deadline, extension_cap)
+                extended = sending_cutoff > end
+            else:
+                if extended and dispatched < minimum:
+                    reason = ("extension limit reached" if sending_cutoff < run.deadline
+                              else run.condition_reason(target.name))
+                    cutoff = sending_cutoff
+                return True
         if not run.allowed(target.name):
             reason = run.condition_reason(target.name)
         elif point.get("request_allowance") is not None and run.budget_counts[target.name] - point["budget_start"] >= point["request_allowance"]:
@@ -783,40 +802,50 @@ async def concurrent_window(run, target, client, settings, point, calibration, *
             ) for p in active.values()
         )
 
+    def request_started():
+        nonlocal dispatched, sending_cutoff
+        dispatched += 1
+        if extended and dispatched >= minimum:
+            sending_cutoff = min(time.monotonic(), run.deadline)
+            changed.set()
+
     async def send(shape, role, progress=None, index=None):
-        if ended():
-            return None
-        async with run.slot(False, min(end, run.deadline)) as admitted:
-            if not admitted or ended():
-                return None
-            probe_request = role == "probe" or reverse and phase == "probe" and role == "short_stream"
-            if probe_request and not trigger_ready():
-                return None
-            spec = build_spec(run, settings, point, shape, calibration, role=role, phase=phase)
-            if spec is None:
-                return None
-            guarded = {}
-            if reverse:
-                def eligible():
-                    return not ended() and (not probe_request or trigger_ready())
+        while not ended():
+            async with run.slot(False, min(sending_cutoff, run.deadline)) as admitted:
+                if not admitted:
+                    continue  # A slot wait may have used the original cutoff.
+                if ended():
+                    return None
+                probe_request = role == "probe" or reverse and phase == "probe" and role == "short_stream"
+                if probe_request and not trigger_ready():
+                    return None
+                spec = build_spec(run, settings, point, shape, calibration, role=role, phase=phase)
+                if spec is None:
+                    return None
+                guarded = dict(on_start=request_started)
+                if reverse:
+                    def eligible():
+                        return not ended() and (not probe_request or trigger_ready())
 
-                def dispatched():
-                    if index is not None and phase == "probe":
-                        active[index] = progress
-                        changed.set()
+                    def phase_started():
+                        request_started()
+                        if index is not None and phase == "probe":
+                            active[index] = progress
+                            changed.set()
 
-                guarded = dict(admission_deadline=min(end, run.deadline), prepared_admission=True,
-                               admission_check=eligible, on_start=dispatched)
-            try:
-                record = await run.request(target, client, spec, event=progress, slot_reserved=True, **guarded)
-            except asyncio.CancelledError as exc:
-                record = getattr(exc, "giraffe_record", None)
+                    guarded = dict(admission_deadline=min(sending_cutoff, run.deadline), prepared_admission=True,
+                                   admission_check=eligible, on_start=phase_started)
+                try:
+                    record = await run.request(target, client, spec, event=progress, slot_reserved=True, **guarded)
+                except asyncio.CancelledError as exc:
+                    record = getattr(exc, "giraffe_record", None)
+                    if record is not None:
+                        records.append(record)
+                    raise
                 if record is not None:
                     records.append(record)
-                raise
-            if record is not None:
-                records.append(record)
-            return record
+                return record
+        return None
 
     async def worker(index):
         while not ended():
@@ -856,7 +885,7 @@ async def concurrent_window(run, target, client, settings, point, calibration, *
                 continue  # One probe slot alongside the N-1 background streams.
             try:
                 await asyncio.wait_for(
-                    changed.wait(), max(0.0001, min(end, run.deadline) - time.monotonic())
+                    changed.wait(), max(0.0001, min(sending_cutoff, run.deadline) - time.monotonic())
                 )
             except TimeoutError:
                 return
@@ -882,17 +911,17 @@ async def concurrent_window(run, target, client, settings, point, calibration, *
     sending_end = None
     try:
         # Do not await workers directly: requests may outlive the sending window.
-        while time.monotonic() < end and not ended():
+        while not ended():
             changed.clear()
             try:
                 await asyncio.wait_for(
-                    changed.wait(), min(0.02, max(0.0001, end - time.monotonic()))
+                    changed.wait(), min(0.02, max(0.0001, sending_cutoff - time.monotonic()))
                 )
             except TimeoutError:
                 pass
         if failure is not None:
             raise failure
-        sending_end = min(end, cutoff if cutoff is not None else time.monotonic())
+        sending_end = min(sending_cutoff, cutoff if cutoff is not None else time.monotonic())
         intent.begin_drain(sending_end)
         finish_end = run.deadline
         while any(not t.done() for t in tasks) and time.monotonic() < finish_end:
@@ -905,7 +934,7 @@ async def concurrent_window(run, target, client, settings, point, calibration, *
             await asyncio.wait(tasks, timeout=min(0.02, max(0, finish_end - time.monotonic())),
                                return_when=asyncio.FIRST_EXCEPTION)
     except asyncio.CancelledError as exc:
-        sending_end = min(end, time.monotonic())
+        sending_end = min(sending_cutoff, time.monotonic())
         reason = run.stop_reason(target.name) or "execution cancelled"
         cancelled = exc
     except Exception as exc:
@@ -913,7 +942,7 @@ async def concurrent_window(run, target, client, settings, point, calibration, *
             failure = exc
     finally:
         if sending_end is None:
-            sending_end = min(end, time.monotonic())
+            sending_end = min(sending_cutoff, time.monotonic())
         intent.begin_drain(sending_end)
         for task in tasks:
             if not task.done():
@@ -949,6 +978,17 @@ async def concurrent_window(run, target, client, settings, point, calibration, *
             if record.termination_reason not in AUTHORITATIVE_TERMINATION_REASONS:
                 record.error = reason or "overall run deadline reached"
             record.load_point["cancellation_reason"] = record.error
+    if extended and sending_end > end:
+        point["window_extension"] = {
+            "configured_seconds": settings.schedule.duration_seconds,
+            "sending_seconds": sending_end - begin,
+            "reason": "min_valid_responses",
+        }
+        note = (f"Sending continued {sending_end - end:.1f} s past the "
+                f"{settings.schedule.duration_seconds:g} s window so {minimum} requests could start.")
+        if dispatched < minimum and reason:
+            note += f" It stopped early: {reason}."
+        point["window_extension_note"] = note
     window = {
         "phase": phase,
         "sending_start_ms": (begin - run.start) * 1000,
@@ -956,7 +996,7 @@ async def concurrent_window(run, target, client, settings, point, calibration, *
         "delivered_window_seconds": max(0, sending_end - begin),
         "observation_seconds": now - begin,
         "drain_seconds": max(0, now - sending_end),
-        "cut_short": sending_end + 1e-6 < end,
+        "cut_short": sending_end + 1e-6 < end or (extended and dispatched < minimum),
         "window_reason": reason,
         "triggered": triggered,
         "request_ids": [r.id for r in records],
@@ -1679,6 +1719,8 @@ def assess_point(run, target, settings, point, records):
                         "Short-answer completion slowdown exceeded the workload limit.",
                     )
     code = next((g["reason_code"] for g in point["groups"] if g["status"] == status), "comparison")
+    if point.get("window_extension_note"):
+        reason += " " + point["window_extension_note"]
     point.update(status=status, reason=reason, reason_code=code)
     bursts = {o["burst_index"]: [] for o in point.get("offers", []) if o.get("origin") == "burst"}
     for r in records:
@@ -1724,10 +1766,12 @@ def publish_point(run, target, point):
     # Live cards use aggregate delivery evidence; the complete offered schedule
     # remains in the report rather than being repeated in every progress event.
     payload = {key: value for key, value in point.items() if key != "offers"}
+    reason = (point["reason"] if point.get("window_extension") else point.get("window_reason"))
+    reason = reason or ("dropped: all request slots busy" if point.get("local_drops") else None) or point["reason"]
     for phase in ("baseline", "probe") if point["type"] == "interference" else (None,):
         scenario = point["id"] + ("." + phase if phase else "")
         run.finish_condition(
-            target.name, scenario, reason=point.get("window_reason") or ("dropped: all request slots busy" if point.get("local_drops") else None) or point["reason"], load_point_result=payload
+            target.name, scenario, reason=reason, load_point_result=payload
         )
 
 
@@ -2042,6 +2086,9 @@ def result(run, target):
     observation["highest_accepted"] = list(accepted.values())
     status = aggregate([p["status"] for p in observation["points"]])
     summary = _result_summary(run, target, observation["points"], status, settings)
+    for point in observation["points"]:
+        if point.get("window_extension_note"):
+            summary += " " + point["window_extension_note"]
     deciding = [p for p in observation["points"] if p["status"] == status]
     observation["reason_code"] = Counter(p.get("reason_code") for p in deciding).most_common(1)[0][0] if deciding else None
     return CheckResult(

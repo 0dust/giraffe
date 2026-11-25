@@ -981,3 +981,154 @@ async def test_repeated_cancellation_preserves_partial_window_records_and_slots(
 
 
 # Fake inference clients in this module use the matching local tokenizer.
+
+
+@pytest.mark.parametrize("minimum,extended", [(5, True), (3, False)])
+async def test_concurrent_window_extends_until_minimum_requests_start(minimum, extended, tmp_path, capsys):
+    c = config()
+    c.load_test.pass_criteria.min_valid_responses = minimum
+    run, client = _Run(c, None, None), Client((0.3,))
+    obs = await execute(run, c.targets[0], client)
+    point, = obs["points"]
+    assert len(client.started) == (5 if extended else 4)
+    assert point["status"] == "pass"
+    if extended:
+        extension = point["window_extension"]
+        assert extension["configured_seconds"] == 1
+        assert extension["sending_seconds"] > 1
+        assert extension["reason"] == "min_valid_responses"
+        note = (f"Sending continued {extension['sending_seconds'] - 1:.1f} s past the 1 s "
+                f"window so {minimum} requests could start.")
+        assert note in point["reason"]
+        condition, = (row for row in run.conditions.values() if row.get("load_point_result"))
+        assert note in condition["reason"]
+        from giraffe.cli import _print_result
+        from giraffe.models import RunReport
+
+        report = RunReport(run_id="extended", started_at="now", finished_at="now", overall="pass",
+                           manifest={}, requests=run.records, checks=[result(run, c.targets[0])],
+                           conditions=list(run.conditions.values()), performance={"available_targets": []})
+        saved = RunReport.model_validate_json(report.model_dump_json())
+        assert any(note in (row.get("reason") or "") for row in saved.conditions)
+        _print_result(saved, tmp_path / "report.json", None, tmp_path, {})
+        assert note in capsys.readouterr().out
+        assert note in _load_test_html(obs)
+        sending, drain = run.observations["local"]["schedule_transitions"]
+        assert sending["end_ms"] == point["sending_end_ms"] == drain["start_ms"]
+        assert sending["end_ms"] == pytest.approx(max(r.dispatch_ms for r in run.records), abs=2)
+    else:
+        assert "window_extension" not in point
+
+
+async def test_concurrent_extension_respects_maximum_duration():
+    c = config()
+    c.max_duration_seconds = 1.1
+    c.load_test.pass_criteria.min_valid_responses = 5
+    run, client = _Run(c, None, None), Client((0.3,))
+    obs = await execute(run, c.targets[0], client)
+    point, = obs["points"]
+    assert len(client.started) == 4
+    assert point["status"] == "inconclusive"
+    assert 1 < point["window_extension"]["sending_seconds"] <= 1.1
+    assert "It stopped early:" in point["reason"]
+    assert "overall run deadline reached" in point["reason"]
+
+
+@pytest.mark.parametrize("phase", [None, "baseline", "control", "probe"])
+async def test_mixed_and_interference_windows_never_extend(phase, monkeypatch):
+    from giraffe import load_test
+    from giraffe.models import RequestSpec
+
+    c = config()
+    c.load_test.schedule.duration_seconds = .05
+    c.load_test.pass_criteria.min_valid_responses = 5
+    run, client = _Run(c, None, None), Client((.03,))
+    point, = load_points(c.load_test)
+    point.update(type="interference" if phase else "mixed", level=2 if phase else 1, budget_start=0)
+
+    def build(*args, **kwargs):
+        return RequestSpec(fixture_id="short", scenario=point["id"] + ("." + phase if phase else ""),
+                           check_ids=["load"], messages=[{"role": "user", "content": "x"}],
+                           max_tokens=32, load_point=dict(point))
+
+    monkeypatch.setattr(load_test, "build_spec", build)
+    await load_test.concurrent_window(run, c.targets[0], client, c.load_test, point, {}, phase=phase)
+    assert "window_extension" not in point
+    assert point["delivered_window_seconds"] == pytest.approx(.05)
+
+
+async def test_extension_counts_failed_dispatches_without_claiming_valid_samples():
+    c = config()
+    c.load_test.schedule.duration_seconds = .05
+    c.load_test.pass_criteria.min_valid_responses = 5
+    c.load_test.pass_criteria.max_error_percent = 100
+
+    class FailingClient(Client):
+        async def execute(self, *args, **kwargs):
+            record = await super().execute(*args, **kwargs)
+            record.status, record.valid = "failed", False
+            return record
+
+    run, client = _Run(c, None, None), FailingClient((.03,))
+    obs = await execute(run, c.targets[0], client)
+    point, = obs["points"]
+    assert len(client.started) == 5
+    assert point["valid"] == 0
+    assert point["status"] == "inconclusive"
+    assert point["window_extension"]["sending_seconds"] > .05
+
+
+async def test_extension_refreshes_slot_admission_deadline():
+    c = config()
+    c.load_test.schedule.duration_seconds = .05
+    c.load_test.pass_criteria.min_valid_responses = 2
+    run, client = _Run(c, None, None), Client((.03,))
+    await run.slots.get()
+
+    async def release():
+        await asyncio.sleep(.08)
+        run.release_slot()
+
+    release_task = asyncio.create_task(release())
+    obs = await execute(run, c.targets[0], client)
+    await release_task
+    point, = obs["points"]
+    assert len(client.started) == 2
+    assert point["window_extension"]["sending_seconds"] >= .1
+    assert point["status"] == "pass"
+
+
+@pytest.mark.parametrize("stop", ["budget", "user", "point_allowance"])
+async def test_extension_honors_existing_stops(stop, monkeypatch):
+    from giraffe import load_test
+
+    c = config()
+    c.load_test.schedule.duration_seconds = .05
+    c.load_test.pass_criteria.min_valid_responses = 5
+    if stop == "budget":
+        c.max_requests = 3
+    run = _Run(c, None, None)
+
+    class StoppingClient(Client):
+        async def execute(self, *args, **kwargs):
+            record = await super().execute(*args, **kwargs)
+            if stop == "user" and len(self.started) == 3:
+                run.stop.set()
+            return record
+
+    if stop == "point_allowance":
+        original = load_test.concurrent_window
+
+        async def limited(*args, **kwargs):
+            args[4]["request_allowance"] = 3
+            return await original(*args, **kwargs)
+
+        monkeypatch.setattr(load_test, "concurrent_window", limited)
+    client = StoppingClient((.03,))
+    obs = await execute(run, c.targets[0], client)
+    point, = obs["points"]
+    assert len(client.started) == 3
+    assert point["status"] == "inconclusive"
+    assert point["cut_short"]
+    assert point["window_extension"]["sending_seconds"] > .05
+    assert f"It stopped early: {point['window_reason']}." in point["reason"]
