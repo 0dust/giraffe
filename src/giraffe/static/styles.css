@@ -1309,6 +1309,8 @@ details.connection-row > .row-control .form-field > .field-label { display: flex
 .load-editor { min-width: 0; display: grid; gap: 22px; }
 .load-section { min-width: 0; border-top: 1px solid var(--line); padding-top: 18px; }
 .load-section > h3 { margin-bottom: 12px; font-size: 15px; }
+[data-load-context-warning] > .notice:first-child { margin-top: 10px; }
+[data-load-context-warning] > .notice:last-child { margin-bottom: 16px; }
 .load-profile { width: 100%; border-collapse: collapse; table-layout: fixed; font-size: 12px; }
 .load-profile th, .load-profile td { padding: 5px 4px; text-align: left; vertical-align: top; }
 .load-profile th:first-child { width: 58px; }

@@ -168,16 +168,19 @@ state.config=config;state.bootstrap.config=config;
 state.requestPreview={status:'current',revision:state.configRevision,route:state.routeVersion,config,plan};
 $('#main').innerHTML='<div id="request-plan"></div>'+renderLoadEditor(config);
 const advisory=$('[data-load-context-warning]');assert(advisory);
-assert.equal((advisory.textContent.match(/Giraffe can’t verify/g)||[]).length,1);
+const unknown=advisory.querySelector('.notice.setting-issue');assert(unknown);
+assert(!unknown.classList.contains('warning'));assert.equal(unknown.getAttribute('role'),'status');
+assert(!unknown.textContent.includes('local · '));
+assert.equal((advisory.textContent.match(/Context window unknown/g)||[]).length,1);
 assert(advisory.closest('.load-section').textContent.includes('Data profile'));
 assert(advisory.querySelector('[data-setting-path="load_test.profile.long.input_tokens"]'));
 plan.errors=[{msg:'Input exceeds the known endpoint context window.',fields:['load_test.profile.long.input_tokens']}];
-const blueprint=renderRunBlueprint(config,plan);assert.doesNotMatch(blueprint,/Giraffe can.t verify|Endpoint context window unknown/);
+const blueprint=renderRunBlueprint(config,plan);assert.doesNotMatch(blueprint,/Context window unknown|Endpoint context window unknown/);
 assert.match(blueprint,/Input exceeds the known endpoint context window/);
-renderRequestPlan();assert.doesNotMatch($('#request-plan').textContent,/Giraffe can.t verify|Endpoint context window unknown/);
+renderRequestPlan();assert.doesNotMatch($('#request-plan').textContent,/Context window unknown|Endpoint context window unknown/);
 assert.match($('#request-plan').textContent,/Input exceeds the known endpoint context window/);
 state.requestPreview.status='pending';syncLoadDisplay(config);assert.equal(advisory.textContent,'');
-state.requestPreview.status='current';syncLoadDisplay(config);assert.match(advisory.textContent,/Giraffe can’t verify/);
+state.requestPreview.status='current';syncLoadDisplay(config);assert.match(advisory.textContent,/Context window unknown/);
 plan.load_warnings=plan.load_warnings.filter(row=>row.kind!=='context_window_unknown');syncLoadDisplay(config);assert.equal(advisory.textContent,'');
 ''', dom=True)
 
@@ -265,4 +268,49 @@ for(const status of ['pending','stale']){
  }
 }
 assert.equal(JSON.stringify({config,plan}),before);
+''', dom=True)
+
+
+def test_context_window_hints_and_all_advisories_render_once():
+    browser_logic(r'''
+config.checks=['load'];
+let plan={context_windows:{local:{value:4096,source:'configuration'}},load_warnings:[]};
+assert.match(renderLoadContextWarning(config,plan),/Context window: 4,096 tokens \(configured\)/);
+assert.doesNotMatch(renderLoadContextWarning(config,plan),/local · /);
+plan.context_windows.local.source='/v1/models max_model_len';
+assert.match(renderLoadContextWarning(config,plan),/reported by server/);
+config.targets.push({...config.targets[0],name:'other'});
+assert.match(renderLoadContextWarning(config,plan),/local · Context window: 4,096/);
+for(const kind of ['context_window_unknown','context_window_exceeded','context_window_conflict']){
+  const warning={kind,target:'local',msg:'Server context advisory.',fields:['load_test.profile.long.input_tokens']};
+  plan.load_warnings=[warning];
+  const html=renderLoadContextWarning(config,plan);
+  assert.match(html,/Server context advisory\./);
+  if(kind==='context_window_unknown')assert.match(html,/local · Server context advisory/);
+  else assert.doesNotMatch(html,/local · /);
+  assert.match(html,/data-setting-path="load_test.profile.long.input_tokens"/);
+  assert.doesNotMatch(html,/Context window: 4,096/);
+  assert.equal(renderSettingIssues([warning],'warning'),'');
+}
+''')
+
+
+@pytest.mark.parametrize('kind', ['context_window_exceeded', 'context_window_conflict'])
+def test_context_problems_use_warning_notices_with_grouped_edit_buttons(kind):
+    config = configuration(checks=['load'])
+    config.targets[0].name = 'fakevllm'
+    warning = {'kind': kind, 'target': 'fakevllm',
+               'msg': 'Long input → Short output needs 808 tokens; the fakevllm server reports a 700-token context window. Giraffe will block those Load test points instead of sending them.',
+               'fields': ['load_test.profile.long.input_tokens', 'load_test.profile.short.output_tokens']}
+    run_render_checks('const config=' + config.model_dump_json() + ',warning=' + json.dumps(warning) + r''';
+$('#main').innerHTML=renderLoadContextWarning(config,{load_warnings:[warning]});
+const contextNotice=$('#main').querySelector('.notice.warning.setting-issue');assert(contextNotice);
+assert.equal(contextNotice.getAttribute('role'),'status');
+assert.equal(contextNotice.querySelector('p').textContent,warning.msg);
+assert(!contextNotice.textContent.includes('fakevllm · '));
+const actions=contextNotice.querySelector('.actions');assert(actions);
+assert.equal(actions.querySelectorAll('button').length,2);
+for(const path of warning.fields)assert(actions.querySelector(`[data-setting-path="${path}"]`));
+warning.fields=[];$('#main').innerHTML=renderLoadContextWarning(config,{load_warnings:[warning]});
+assert(!$('#main').querySelector('.actions'));
 ''', dom=True)

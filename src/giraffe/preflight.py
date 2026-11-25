@@ -170,6 +170,10 @@ async def discover_models(body: ModelDiscovery, *, allow_manual: bool = False,
                     "Enter the model name to test the connection."}
         raise PreflightError("The server returned an unreadable model list. "
                             "You can still enter the model name manually.") from None
+    from giraffe.deployment import _models_context_limit
+
+    context_windows = {model: value for model in models
+                       if (value := _models_context_limit(payload, model)) is not None}
     extra = {}
     if include_tokenizers:
         import re
@@ -183,15 +187,17 @@ async def discover_models(body: ModelDiscovery, *, allow_manual: bool = False,
                     and ".." not in root and not Path(root).exists()):
                 roots.setdefault(item["id"], set()).add(root)
         extra["tokenizers"] = {model: next(iter(values)) for model, values in roots.items() if len(values) == 1}
-    return {**extra, "models": models, "message": "Model list received. No inference requests were sent."
+    return {**extra, "models": models, "context_windows": context_windows, "message": "Model list received. No inference requests were sent."
             if models else "The server returned no models. Enter an installed model name manually."}
 
 
 async def check_connection(body: ConnectionTest) -> dict:
     """Resolve a model, then send at most one bounded inference without saving a run."""
     model = body.model
+    result = None
+    discovered = None
     try:
-        async with asyncio.timeout(15):
+        async with asyncio.timeout(15) as budget:
             if not model:
                 discovered = await discover_models(body, allow_manual=True)
                 models = discovered["models"]
@@ -202,17 +208,36 @@ async def check_connection(body: ConnectionTest) -> dict:
                 model = models[0]
             config = body.configuration(model, request_options=body.request_options)
             try:
-                return await check_target(config.targets[0], config)
+                result = await check_target(config.targets[0], config)
             except PreflightError as error:
                 if not error.no_answer or (body.model and not body.discovered):
                     raise
                 # Discovery succeeded, now or before a retry; an answerless test must not
                 # discard its result.
-                return {"status": "unverified", "model": model, "models": [model],
+                result = {"status": "unverified", "model": model, "models": [model],
                         "message": f'Found "{model}". The 32-token test ended before the model '
                                    "produced a visible answer. Choose checks to continue, "
                                    "or retry the connection test."}
+            from giraffe.deployment import now, probe_context_window
+            remaining = budget.when() - asyncio.get_running_loop().time()
+            result["context_window"] = None
+            result["context_window_reason"] = "unavailable"
+            if discovered is not None:
+                value = discovered.get("context_windows", {}).get(model)
+                if value is not None:
+                    result["context_window"] = {"value": value, "source": "/v1/models max_model_len", "collected_at": now()}
+                    result["context_window_reason"] = None
+                else:
+                    result["context_window_reason"] = "no_window"
+            elif remaining > 0:
+                result["context_window"], result["context_window_reason"] = await probe_context_window(
+                    config.targets[0], config, timeout=min(6, remaining), detail=True)
+            return result
     except TimeoutError:
+        if result is not None:
+            result.setdefault("context_window", None)
+            result.setdefault("context_window_reason", "unavailable")
+            return result
         raise PreflightError("Connection test timed out after 15 seconds. "
                             "Check that the model is loaded, then try again.") from None
     except OSError:

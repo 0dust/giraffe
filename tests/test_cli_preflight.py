@@ -597,3 +597,64 @@ def test_probe_exception_policy_before_a_request_record(error, blocking, tmp_pat
         assert result["message"].endswith("Use --skip-preflight to run anyway.")
     else:
         assert any(warning.startswith("preflight for local:") for warning in result["warnings"])
+
+
+@pytest.mark.parametrize("checks,skip,expected_probes", [("load", False, 1), ("load", True, 0), ("access", False, 0)])
+def test_run_probes_context_after_preflight_only_for_load(tmp_path, monkeypatch, capsys, checks, skip, expected_probes):
+    from giraffe.models import RunReport
+    from giraffe.planning import request_plan as original_plan
+    from tests.test_connection import answer, endpoint
+
+    loaded = False
+
+    def respond(request):
+        nonlocal loaded
+        if request.method == "POST":
+            loaded = True
+            return httpx.Response(200, json=answer())
+        assert loaded, "Context probe ran before preflight loaded the model"
+        return httpx.Response(200, json={"data": [
+            {"id": "tiny", "max_model_len": 16, "root": "/private/model"}]})
+
+    requests, _ = endpoint(monkeypatch, respond)
+    planned = []
+
+    def plan(config, **kwargs):
+        if "context_windows" in kwargs:
+            planned.append(kwargs["context_windows"])
+            assert len([r for r in requests if r.method == "GET"]) == expected_probes
+        return original_plan(config, **kwargs)
+
+    async def run(config, **kwargs):
+        assert bool(config._preflight_context_windows) == bool(expected_probes)
+        assert "_preflight_context_windows" not in config.model_dump()
+        return RunReport(run_id="context", started_at="now", finished_at="now", overall="pass",
+                         manifest={"config": config.model_dump(mode="json")})
+
+    monkeypatch.setattr("giraffe.planning.request_plan", plan)
+    monkeypatch.setattr("giraffe.cli._run", run)
+    assert main(["run", "--url", "http://server/proxy/v1", "--model", "tiny", "--checks", checks,
+                 "--output", str(tmp_path / "run"), "--json", *(["--skip-preflight"] if skip else [])]) == 0
+    assert len(planned) == expected_probes
+    assert len([r for r in requests if r.url.path == "/proxy/v1/models"]) == expected_probes
+    captured = capsys.readouterr()
+    if expected_probes:
+        messages = [w for w in json.loads(captured.out)["warnings"] if "16-token context window" in w]
+        assert messages and "Context window unknown" not in captured.err
+        for message in messages:
+            assert captured.err.count("Warning: " + message + "\n") == 1
+    assert "/private/model" not in captured.out + captured.err
+
+
+@pytest.mark.parametrize("command", ["validate", "preview"])
+def test_offline_load_commands_do_not_probe_context(command, tmp_path, monkeypatch, capsys):
+    from giraffe.models import RunConfig
+
+    async def probe(config):
+        pytest.fail("Offline command probed context window")
+
+    monkeypatch.setattr("giraffe.deployment.probe_context_windows", probe)
+    path = tmp_path / "config.json"
+    path.write_text(RunConfig(targets=[{"name": "local", "url": "http://server/v1", "model": "tiny"}],
+                              checks=["load"]).model_dump_json())
+    assert main([command, "--config", str(path)]) == 0

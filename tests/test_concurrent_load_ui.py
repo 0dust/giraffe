@@ -15,8 +15,10 @@ for(const title of ['Request timing &amp; delivery','Data profile','Workloads','
  const index=html.indexOf((title==='Pass criteria'?'<summary>':'<h3>')+title);assert(index>previous,title);previous=index;
 }
 assert(html.indexOf('name="load_request_timeout_seconds"')<html.indexOf('<h3>Data profile'));
-for(const label of ['Input tokens · target','Output tokens · cap','Choose one or more','This check only','Bursts use this same mix. Shares describe request counts, not tokens or time.',...Object.values(loadTitles),...Object.values(loadCriteriaLabels)])assert(html.includes(label),label);
+for(const label of ['Input tokens · target','Output tokens · cap','Choose one or more','Bursts use this same mix. Shares describe request counts, not tokens or time.',...Object.values(loadTitles),...Object.values(loadCriteriaLabels)])assert(html.includes(label),label);
 for(const type of Object.keys(loadTitles)){assert(html.includes('name="load_workloads_'+type+'_enabled"'));assert(html.includes('data-load-collapse="'+type+'"'));assert(html.includes('aria-controls="load-panel-'+type+'"'));}
+assert.doesNotMatch(html,/<span class="eyebrow">This check only<\/span>/);
+assert.match(html,/Load test only\./);
 assert.equal((html.match(/name="load_workloads_combinations_selected_/g)||[]).length,9);
 assert.equal((html.match(/name="load_workloads_mixed_selected_/g)||[]).length,9);
 assert.equal((html.match(/name="load_workloads_stress_cases_/g)||[]).length,3);

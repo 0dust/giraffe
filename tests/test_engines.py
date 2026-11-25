@@ -7,7 +7,7 @@ import time
 import httpx
 import pytest
 
-from giraffe import telemetry
+from giraffe import concurrent_load, telemetry
 from giraffe.deployment import snapshot
 from giraffe.models import RunConfig, Target
 
@@ -33,6 +33,104 @@ DISCOVERY = [
      {"runtime.version": "test-tgi", "model.revision": "model-revision",
       "runtime.commit": "runtime-commit", "serving.context_limit": 4096}),
 ]
+
+
+@pytest.mark.parametrize("configured_context", [None, 8192])
+async def test_vllm_discovery_reports_matching_model_context(monkeypatch, configured_context):
+    actual = httpx.AsyncClient
+    seen = []
+
+    def respond(request):
+        seen.append(request.url.path)
+        if request.url.path == "/version":
+            return httpx.Response(200, json={"version": "test-vllm"})
+        assert request.url.path == "/v1/models"
+        return httpx.Response(200, json={"object": "list", "data": [
+            {"id": "another-model", "max_model_len": 8192},
+            {"id": "test-model", "max_model_len": 4096, "root": "/private/model",
+             "owned_by": "vllm", "api_key": "private-key"},
+        ]})
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: actual(
+        **kw, transport=httpx.MockTransport(respond)))
+    deployment = {"discovery": "vllm"}
+    if configured_context is not None:
+        deployment["serving"] = {"context_limit": configured_context}
+    target = Target(name="vllm", url="http://localhost:8000/v1", model="test-model",
+                    deployment=deployment)
+    result = await snapshot(target, RunConfig(targets=[target]), time.monotonic()+5, asyncio.Event())
+    assert seen == ["/version", "/v1/models"]
+    assert result["discovery"] == [
+        {"status": "available", "source": "vllm /version"},
+        {"status": "available", "source": "vllm /v1/models"},
+    ]
+    fields = result["fields"]
+    for key, value in (("runtime.engine", "vllm"), ("runtime.version", "test-vllm"),
+                       ("model.served", "test-model"), ("serving.context_limit", 4096)):
+        assert fields[key]["reported"]["value"] == value
+        assert fields[key]["reported"]["provenance"] == "runtime-reported"
+    assert concurrent_load.context_window(target, {"deployment": result}) == (
+        4096, "deployment.fields.serving.context_limit.reported (runtime-reported)")
+    if configured_context is not None:
+        assert fields["serving.context_limit"]["configured"]["value"] == configured_context
+        assert fields["serving.context_limit"]["status"] == "conflicting"
+    saved = json.dumps(result)
+    assert "/private/model" not in saved and "private-key" not in saved
+    assert "root" not in saved and "owned_by" not in saved
+
+
+@pytest.mark.parametrize("status,body", [
+    (404, "not found"), (200, "garbage"), (200, "[]"),
+    (200, '{"version": "test-version"}'), (200, '{"data": null}'),
+    (200, '{"data": {}}'),
+])
+async def test_vllm_optional_models_failure_preserves_version(monkeypatch, status, body):
+    actual = httpx.AsyncClient
+
+    def respond(request):
+        if request.url.path == "/version":
+            return httpx.Response(200, json={"version": "test-vllm"})
+        return httpx.Response(status, text=body)
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: actual(
+        **kw, transport=httpx.MockTransport(respond)))
+    target = Target(name="vllm", url="http://localhost:8000/v1", model="test-model",
+                    deployment={"discovery": "vllm"})
+    result = await snapshot(target, RunConfig(targets=[target]), time.monotonic()+5, asyncio.Event())
+    assert result["fields"]["runtime.version"]["reported"]["value"] == "test-vllm"
+    assert result["discovery"] == [
+        {"status": "available", "source": "vllm /version"},
+        {"status": "unavailable", "source": "vllm /v1/models"},
+    ]
+    assert "serving.context_limit" not in result["fields"]
+    assert "model.served" not in result["fields"]
+
+
+@pytest.mark.parametrize("model,context", [
+    ("test-model", True), ("test-model", False), ("test-model", 0),
+    ("test-model", -1), ("test-model", "4096"), ("test-model", 4096.0),
+    ("test-model", None), ("another-model", 4096),
+])
+async def test_vllm_models_ignores_invalid_context_or_other_models(monkeypatch, model, context):
+    actual = httpx.AsyncClient
+
+    def respond(request):
+        if request.url.path == "/version":
+            return httpx.Response(200, json={"version": "test-vllm"})
+        return httpx.Response(200, json={"data": [None, "test-model",
+            {"id": model, "max_model_len": context}]})
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: actual(
+        **kw, transport=httpx.MockTransport(respond)))
+    target = Target(name="vllm", url="http://localhost:8000/v1", model="test-model",
+                    deployment={"discovery": "vllm"})
+    result = await snapshot(target, RunConfig(targets=[target]), time.monotonic()+5, asyncio.Event())
+    assert result["discovery"][-1] == {"status": "available", "source": "vllm /v1/models"}
+    assert "serving.context_limit" not in result["fields"]
+    if model == target.model:
+        assert result["fields"]["model.served"]["reported"]["value"] == target.model
+    else:
+        assert "model.served" not in result["fields"]
 
 
 @pytest.mark.parametrize("engine,path,body,expected", DISCOVERY)

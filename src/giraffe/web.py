@@ -37,6 +37,8 @@ from typing import Annotated, Literal
 from time import perf_counter
 from urllib.parse import urlsplit
 
+import httpx
+
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
@@ -57,7 +59,7 @@ from .caps import (
 from giraffe.configuration_errors import configuration_errors as _configuration_errors
 from giraffe.capabilities import capabilities
 from giraffe.conditions import ConditionRequestIndex, aggregate_conditions, condition_aggregate, planned_conditions
-from giraffe.deployment import safe_config
+from giraffe.deployment import probe_context_windows, safe_config
 from giraffe.fixtures import load_custom_fixtures
 from giraffe.latency import load_observations
 from giraffe.models import (ConfigDraft, CleanupCriteria, Model, RequestRecord, RunConfig, RunReport, ScaleDownMarker,
@@ -960,6 +962,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
     metadata_lock = storage_metadata_lock
     last_auto_cleanup: dict = {}
     observation_cache: dict = {}
+    context_window_cache: dict[tuple[str, str, str], tuple[dict, float]] = {}
 
     def live_snapshot() -> dict:
         if not active:
@@ -992,9 +995,31 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
         return _report_cache.get(("api", path, modified, size, inode, changed), max(size * 8, 1024),
                                 lambda: _api_report(_report(Path(path))))
 
+    def cached_context_windows(config):
+        from giraffe.client import models_url
+
+        values = {}
+        for target in config.targets:
+            try:
+                url = models_url(target.url)
+                # Connect reads the generic /v1/models route, which holds for any discovery setting.
+                cached = (context_window_cache.get((url, target.model, target.deployment.discovery))
+                          or context_window_cache.get((url, target.model, "none")))
+            except httpx.InvalidURL:
+                continue
+            if cached is not None:
+                entry, inserted_at = cached
+                try:
+                    collected_at = datetime.fromisoformat(entry["collected_at"]).timestamp()
+                except (KeyError, TypeError, ValueError):
+                    collected_at = inserted_at
+                if 0 <= time.time() - collected_at < 600:
+                    values[target.name] = entry
+        return values
+
     def preview_plan(config: RunConfig | ConfigDraft, *, pack_details: dict | None = None,
                      validate: bool = False) -> dict:
-        plan = request_plan(config, pack_details=pack_details,
+        plan = request_plan(config, pack_details=pack_details, context_windows=cached_context_windows(config),
                             observations=load_observations(root, config, cache=observation_cache))
         guard = open_file_guard(config, web=True)
         plan["open_files"] = guard
@@ -1867,7 +1892,21 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
         # No await between checking and reserving: probes and runs share the event loop.
         connection_pending = True
         try:
-            return await check_connection(body)
+            result = await check_connection(body)
+            if result.get("status") in {"connected", "unverified"}:
+                from giraffe.client import models_url
+                try:
+                    key = (models_url(body.url), result["model"], "none")
+                    if result.get("context_window") is not None:
+                        context_window_cache.pop(key, None)
+                        context_window_cache[key] = (result["context_window"], time.time())
+                        if len(context_window_cache) > 64:
+                            context_window_cache.pop(next(iter(context_window_cache)))
+                    elif result.get("context_window_reason") == "no_window":
+                        context_window_cache.pop(key, None)
+                except httpx.InvalidURL:
+                    pass
+            return result
         finally:
             connection_pending = False
 
@@ -2023,6 +2062,9 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                                     "before starting a run.",
                                     headers={"X-Giraffe-Error-Code": "connection_test_running"})
             config, baseline = await run_in_threadpool(prepare_run, body)
+            if "load" in config.checks:
+                windows = await probe_context_windows(config)
+                config._preflight_context_windows = {**cached_context_windows(config), **windows}
             _validated_plan(config)
             guard = open_file_guard(config, raise_limit=True, web=True)
             if guard["errors"]:
