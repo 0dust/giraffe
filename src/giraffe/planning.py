@@ -22,7 +22,7 @@ from giraffe.gateway_policy import deferred_for_shared_targets as defer_gateway_
 from giraffe.concurrent_load import prompt_overhead
 from giraffe.identities import gateway_identities_only
 from giraffe.logprob_workload import corpus_width, sample_count
-from giraffe.load_test import context_window, calibration_keys, load_time_plan, minimum_reservation, test_points, point_shapes, settings_sets, saved_shape_warnings
+from giraffe.load_test import context_window, calibration_keys, load_time_plan, minimum_reservation, test_points, point_label, point_shapes, settings_sets, saved_shape_warnings
 from giraffe.models import (CATALOGUE_NAMES, CHECK_NAMES, CHECK_OPTION_FIELDS, CORE_CHECKS, MAX_PLANNED_ARRIVALS,
                             SHARED_BASELINE_EXCLUDED_WORKLOADS, ConfigDraft, RunConfig, required_concurrency)
 from giraffe.request_pack import active_pack, pack_summary, pack_settings
@@ -110,6 +110,7 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
     uncertain_observations = []
     observation_notes = []
     duration_estimates, duration_runs = {}, {}
+    load_sample_warnings = []
     selected = set(config.checks)
     quotas = _request_quotas(config)
     shared_gateway = (not gateway_identities_only(selected) and any(
@@ -581,6 +582,7 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
             if name.startswith("load_"):
                 points = [p for p in test_points(config.load_test) if p["type"] == name.removeprefix("load_")]
                 own = dict(settings_sets(config.load_test))
+                entries = (observations or {}).get(target.name, [])
                 queries, completion_points = [], []
                 for point in points:
                     if point["pattern"] != "concurrent":
@@ -588,13 +590,44 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
                     settings = own[point["source"]]
                     shapes = point_shapes(settings, point)
                     completion_points.append((point,len(shapes)))
+                    concurrency = min(point["level"], shares[target.name])
                     for shape in shapes:
                         input_size, output_size = shape.split("_")
-                        queries.append(dict(family=f"load.{point['type']}.{point['pattern']}",
-                            concurrency=min(point["level"],shares[target.name]),stream=config.stream,
+                        query = dict(family=f"load.{point['type']}.{point['pattern']}",
+                            concurrency=concurrency, stream=config.stream,
                             output_cap=getattr(settings.profile,output_size).output_tokens,
-                            input_bucket=input_bucket(getattr(settings.profile,input_size).input_tokens*4)))
-                observed = pooled_matches(target.name,queries,(observations or {}).get(target.name,[])) if queries else None
+                            input_bucket=input_bucket(getattr(settings.profile,input_size).input_tokens*4))
+                        queries.append(query)
+                        if point["shape"] is None:
+                            continue  # A mixed window needs separate evidence for each result group.
+                        sample = comparable_latency(observations, target.name, **query)
+                        if sample is None or sample["p50_ms"] <= 0:
+                            continue
+                        duration = point["configured_window_seconds"]
+                        # Each slot sends at time zero and refills until the cutoff.
+                        # The last request in each slot can finish during drain.
+                        rounds = math.ceil(Decimal(str(duration)) * 1000 / Decimal(str(sample["p50_ms"])))
+                        estimated_requests = rounds * concurrency
+                        minimum = settings.pass_criteria.min_valid_responses
+                        if estimated_requests >= minimum:
+                            continue
+                        source = point["source"]
+                        prefix = ("load_test" if source == "primary" else
+                                  f"load_test.migrated_tests.{source.split('_')[1]}.settings")
+                        duration_field = f"{prefix}.schedule.duration_seconds"
+                        load_sample_warnings.append({
+                            "kind": "load_sample_shortfall",
+                            "fields": [duration_field],
+                            "values": {"estimated_requests": estimated_requests, "min_valid_responses": minimum,
+                                       duration_field: duration},
+                            "msg": (f"Recent timings for {target.name} · {point_label(point)} suggest "
+                                    f"about {estimated_requests:,} "
+                                    f"{'request' if estimated_requests == 1 else 'requests'} can start in the "
+                                    f"{duration:g} s sending window. "
+                                    f"This condition needs {minimum:,} valid responses. "
+                                    "Lengthen the sending window to collect more samples."),
+                        })
+                observed = pooled_matches(target.name, queries, entries) if queries else None
                 if observed and all(item["p50_ms"] > 0 for item in observed["matches"]):
                     estimates, offset = [], 0
                     for point,size in completion_points:
@@ -1080,7 +1113,7 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
                   ", ".join(dict.fromkeys(item["title"] for item in unknowns)) + "."] if unknowns else []) +
                 ([f"Request deadlines after sending stops contribute {combine('drain_uncertainty_seconds'):g} seconds of uncertainty; more latency samples cannot remove that configured bound."]
                  if confidence == "low" and drain_fraction > .2 else []),
-            "errors": errors, "time_warnings": warnings}
+            "errors": errors, "time_warnings": warnings, "load_sample_warnings": load_sample_warnings}
 
 
 def request_plan(config: RunConfig | ConfigDraft, *,
@@ -1671,6 +1704,9 @@ def request_plan(config: RunConfig | ConfigDraft, *,
         warnings.append(combined["msg"])
     request_warnings = grouped
     timing = _time_plan(config, rows, observations)
+    sample_warnings = timing.pop("load_sample_warnings")
+    load_warnings.extend(sample_warnings)
+    warnings.extend(notice["msg"] for notice in sample_warnings)
     warnings.extend(notice["msg"] for notice in timing["time_warnings"] if notice["msg"] not in warnings)
     for notice in [*concurrency_warnings, *load_warnings, *capacity_warnings,
                    *request_warnings, *timing["time_warnings"]]:

@@ -1,8 +1,13 @@
 """ASGI transport only: structured config errors and migration/planning I/O."""
 
+import json
+from datetime import datetime, timezone
+
 import httpx
 import pytest
 
+from giraffe.latency import input_bucket
+from giraffe.models import RunConfig
 from giraffe.web import create_app
 from tests.test_load_test_phase_a import values
 
@@ -92,3 +97,59 @@ async def test_budget_and_time_conflicts_warn_before_start_with_field_actions(tm
     assert any(
         "max_duration_seconds" in w["fields"] and w["actions"] for w in plan["time_warnings"]
     )
+
+
+@pytest.mark.parametrize(("duration", "latency_ms", "estimated_requests"), [
+    (20, 6400, 4),
+    (20, 5000, 4),  # A request ready to start exactly at the cutoff is too late.
+    (26, 6400, None),  # The fifth request can finish after sending stops.
+    (20, None, None),
+])
+async def test_preview_warns_when_a_concurrent_condition_is_likely_to_miss_its_sample_minimum(
+    tmp_path, duration, latency_ms, estimated_requests,
+):
+    payload = values()
+    load = payload["load_test"]
+    load["workloads"]["combinations"]["selected"] = ["short_short", "short_long"]
+    load["patterns"]["concurrent"]["levels"] = [1, 2]
+    load["schedule"]["duration_seconds"] = duration
+    del load["pass_criteria"]["min_valid_responses"]
+    config = RunConfig.model_validate(payload)
+    profile = config.load_test.profile
+
+    if latency_ms is not None:
+        previous = tmp_path / "previous"
+        previous.mkdir()
+        (previous / ".web.json").write_text(json.dumps({"latency_summary": {
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+            "targets": [{"url": "http://unused.test/v1/chat/completions", "model": "test",
+                         "measurements": [{
+                             "family": "load.combinations.concurrent",
+                             "concurrency": 1,
+                             "stream": config.stream,
+                             "output_cap": profile.long.output_tokens,
+                             "input_bucket": input_bucket(profile.short.input_tokens * 4),
+                             "n": 4,
+                             "p50_ms": latency_ms,
+                             "p90_ms": latency_ms,
+                         }]}],
+        }}))
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_app(tmp_path)), base_url="http://127.0.0.1:8787"
+    ) as client:
+        response = await client.post("/api/config/preview", json=payload)
+    assert response.status_code == 200, response.text
+    plan = response.json()["request_plan"]
+    warnings = [row for row in plan["load_warnings"] if row.get("kind") == "load_sample_shortfall"]
+    if estimated_requests is None:
+        assert warnings == []
+        return
+
+    warning, = warnings
+    assert warning["msg"] in plan["warnings"]
+    assert "concurrency 1" in warning["msg"]
+    assert warning["values"]["estimated_requests"] == estimated_requests
+    assert warning["values"]["min_valid_responses"] == 5
+    assert warning["fields"] == ["load_test.schedule.duration_seconds"]
+    assert warning["actions"]
