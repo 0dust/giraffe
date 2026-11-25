@@ -20,6 +20,7 @@ PRE_MULTI_USER_GENERATOR = "ab5875f7c635f8f454429a88aac87d52ce3a141a84bcf7b936fa
 PRE_NONCE_LOAD = "9b694c97a39d449d8ea15b09a9aeb406bf835179c0882827685c4d7888687d36"
 NONCE_ONLY_LOAD = "df3b7bbf30cab87d2e8c1c6dab8819f9cfe592b181407caa7c32af4c5f720cd4"
 NONCE_LOAD_GENERATOR = "d9a9e921584262148e06b636f0e8f195b7e530fd2a69c5e98f013359cf947ede"
+PRE_REFUSAL_DIAGNOSTICS_LOAD = "ab442c8b54be31143ad52fa20f86cd896d2fcf39da495a80cc48db9bc5cb90ee"
 INTERIM_LOAD_SOURCES = (
     "113325dd5cffa04626cc7be7ee93bc6e9be67335531288bc329b3542a155c92a",
     "788f4c8f0b14421d5fc00f8b32c0ffcef79c04c647730767cb44b16584ed4aa4",
@@ -118,6 +119,25 @@ def test_historical_load_sources_never_attest_short_during_long_mode():
 
     assert not _same_load_workload(current.manifest, old.manifest)
     assert "Fixture pack identity differs." in _settings_reasons(current, old)
+
+
+def test_refusal_diagnostics_preserve_existing_reverse_load_baselines():
+    from giraffe.reporting import _load_test_workload_source_sha256, _same_load_workload
+
+    current, old, settings = load_reports(old_source=PRE_REFUSAL_DIAGNOSTICS_LOAD)
+    settings["load_test"]["workloads"]["interference"]["mode"] = "short_during_long"
+    for report, source in (
+        (current, _load_test_workload_source_sha256()),
+        (old, PRE_REFUSAL_DIAGNOSTICS_LOAD),
+    ):
+        report.manifest["config"]["load_test"]["workloads"]["interference"]["mode"] = "short_during_long"
+        report.manifest["fixture_pack"]["workload_fixture_sha256"] = fixture_hash({
+            "generator_source_sha256": NONCE_LOAD_GENERATOR,
+            "settings": settings,
+            "load_test_source_sha256": source,
+        })
+
+    assert _same_load_workload(current.manifest, old.manifest)
 
 
 @pytest.mark.asyncio
@@ -737,14 +757,13 @@ def test_access_sampled_session_bridge_preserves_exact_predecessors(profile, rev
 
 @pytest.mark.parametrize("companion", [None, "gateway_access", "load"])
 async def test_exact_policy_predecessor_preserves_measured_multi_user(monkeypatch, companion):
+    from giraffe.reporting import _load_test_workload_source_sha256, _multi_user_workload_identity
     from tests.test_runner import config, load_config
 
     options = dict(checks=["multi_user"], max_requests=None, max_duration_seconds=3,
                    multi_user={"levels": [2], "duration_seconds": .4,
                                "think_time_seconds": {"values": [.01]}})
     predecessor_generator = "e4ddc7a7e8563f9ab3bba2fc42ad0232ee924c65f67d92dafd89c21025d202d0"
-    # This test changes only the generator label on the current runtime. The
-    # pre-mode runtime upgrade is covered by test_interference_upgrade_baseline.
     predecessor_source = "a505fae2bd8c99931e6b0f70aae58d76d4499cfe52bca68035468bf49fc4e79c"
     if companion == "load":
         options.update(checks=["multi_user", "load"], load_test=load_config(duration=1).load_test)
@@ -765,13 +784,16 @@ async def test_exact_policy_predecessor_preserves_measured_multi_user(monkeypatc
     current_key = "shared_workload_fixture_sha256" if companion == "gateway_access" else fingerprint
     assert current.manifest["fixture_pack"][current_key] != old.manifest["fixture_pack"][fingerprint]
     identity = {"generator_source_sha256": predecessor_generator,
-                "multi_user_source_sha256": predecessor_source,
-                "multi_user_window_policy": "completed-output-v1",
+                **_multi_user_workload_identity(),
                 "settings": {"multi_user": old.manifest["config"]["multi_user"]}}
     if companion == "load":
         identity["settings"]["load_test"] = options["load_test"].model_dump(mode="json")
-        identity["load_test_source_sha256"] = "ab442c8b54be31143ad52fa20f86cd896d2fcf39da495a80cc48db9bc5cb90ee"
+        identity["load_test_source_sha256"] = _load_test_workload_source_sha256()
     assert fixture_hash(identity) == old.manifest["fixture_pack"][fingerprint]
+    identity["multi_user_source_sha256"] = predecessor_source
+    if companion == "load":
+        identity["load_test_source_sha256"] = PRE_REFUSAL_DIAGNOSTICS_LOAD
+    old.manifest["fixture_pack"][fingerprint] = fixture_hash(identity)
 
     assert _settings_reasons(current, old) == []
     assert _settings_reasons(old, current) == []

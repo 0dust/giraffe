@@ -552,6 +552,42 @@ def test_unknown_judgments_and_measure_only():
     assert score_group(c.load_test, p, g, rows)["reason_code"] == "measure_only"
 
 
+@pytest.mark.parametrize(
+    "answer, refused",
+    [
+        ("<think>The task is to read a label.</think> I can’t fulfill that request.", 1),
+        ("Sorry, the label is A1B2.", 0),
+    ],
+)
+def test_load_correctness_reports_explicit_refusals(answer, refused):
+    c = config()
+    target = c.targets[0]
+    run = _Run(c, None, None)
+    point = load_points(c.load_test)[0]
+    run.observations[target.name]["load_test"] = {"points": [point]}
+    response = record().model_copy(
+        update={
+            "output": answer,
+            "score": False,
+            "load_point": {"shape": "short_short", "point_id": point["id"]},
+        }
+    )
+    run.records.append(response)
+
+    check = result(run, target)
+
+    assert check.status == "fail"
+    group = check.metrics["points"][0]["groups"][0]
+    assert (group["scored"], group["correct"], group["refused"]) == (1, 0, refused)
+    if refused:
+        assert "model refusals accounted for 1 of 1 wrong answers" in check.finding_summary
+        assert "Review the recorded responses" in check.summary
+        assert "scoring configuration" not in check.summary
+    else:
+        assert "refusals" not in check.summary
+        assert "scoring configuration" in check.summary
+
+
 def test_stress_long_long_and_ceil_coverage():
     c = config()
     w = c.load_test.workloads

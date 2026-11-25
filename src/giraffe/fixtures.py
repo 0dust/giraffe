@@ -692,6 +692,23 @@ def answer_difference(expected, received) -> str:
     return f" Expected: {excerpt(expected)}; received: {excerpt(received)}."
 
 
+_LOAD_REFUSAL_OPENING = re.compile(
+    r"\s*(?:(?:sorry|i['’]m sorry),?\s+(?:but\s+)?)?"
+    r"(?:(?:i|we)\s+(?:can['’]t|cannot|can not|won['’]t|will not|am unable to|are unable to)"
+    r"|(?:i['’]m|we['’]re) unable to)\s+"
+    r"(?:assist|comply|complete|fulfill?|generate|help|provide|respond|write)\b",
+    re.IGNORECASE,
+)
+
+
+def is_load_refusal(record: RequestRecord, answer: str | None = None) -> bool:
+    if record._load_refusal:
+        return True
+    if answer is None:
+        answer, _, _ = final_answer(record.output)
+    return bool(_LOAD_REFUSAL_OPENING.match(answer))
+
+
 def score_response(spec: RequestSpec, record: RequestRecord) -> RequestRecord:
     """Score only a valid, completed answer; return a new record.
 
@@ -725,6 +742,8 @@ def score_response(spec: RequestSpec, record: RequestRecord) -> RequestRecord:
     if unclosed or (stripped and not answer.strip() and spec.scorer != "tool"):
         return record.model_copy(update={"score": None, "score_message": REASONING_WITHOUT_ANSWER})
     if spec.scorer == "label":
+        if "load" in spec.check_ids and is_load_refusal(record, answer):
+            return record.model_copy(update={"score": False, "score_message": "Model refused the request."})
         actual = re.sub(r"^(?:(?:box\s+)?label)\s*:\s*", "", _normalized(answer), flags=re.I)
         expected = str(spec.expected)
         score = bool(re.match(r"^" + re.escape(expected) + r"(?![A-Za-z0-9])", actual))
