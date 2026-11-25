@@ -61,6 +61,17 @@ def test_distributions_timing_origins_dispatch_order_and_no_decimation():
     assert series[0]["values"]["completion_tail_ms"] == 775
 
 
+@pytest.mark.parametrize(("first_token_ms", "state", "sample_count", "reason"), [
+    (0, "measured", 1, None),
+    (None, "not_measured", 0, "Versioned streamed generated-content receipt timing was not collected."),
+])
+def test_client_ttft_explains_missing_samples_only(first_token_ms, state, sample_count, reason):
+    result = summary(report([record(timing_schema=1, first_token_ms=first_token_ms)]))
+    for section in ("metrics", "distributions"):
+        row = result[section]["client_ttft"]
+        assert (row["state"], row["sample_count"], row["reason"]) == (state, sample_count, reason)
+
+
 def test_concurrency_clips_carry_in_and_uses_completion_before_dispatch_ties():
     records = [record("carry", -100, 500), record("next", 500, 1500), record("zero",500,500), record("partial",750,3000)]
     result = concurrency_series(records, 0, 1000)
