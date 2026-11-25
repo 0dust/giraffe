@@ -22,9 +22,9 @@ from giraffe.gateway_policy import deferred_for_shared_targets as defer_gateway_
 from giraffe.concurrent_load import prompt_overhead
 from giraffe.identities import gateway_identities_only
 from giraffe.logprob_workload import corpus_width, sample_count
-from giraffe.load_test import context_window, calibration_keys, load_time_plan, minimum_reservation, test_points, point_label, point_shapes, settings_sets, saved_shape_warnings
+from giraffe.load_test import context_window, calibration_keys, load_time_plan, minimum_reservation, test_points, point_shapes, settings_sets, saved_shape_warnings
 from giraffe.models import (CATALOGUE_NAMES, CHECK_NAMES, CHECK_OPTION_FIELDS, CORE_CHECKS, MAX_PLANNED_ARRIVALS,
-                            SHARED_BASELINE_EXCLUDED_WORKLOADS, ConfigDraft, RunConfig, required_concurrency)
+                            SHARED_BASELINE_EXCLUDED_WORKLOADS, ConfigDraft, RunConfig, load_shape_label, required_concurrency)
 from giraffe.request_pack import active_pack, pack_summary, pack_settings
 from giraffe.workloads import fixed_session_turns, label_prompt, prefix_admitted
 from giraffe.tool_checks import resolved_tool_fixtures, resolved_tool_modes
@@ -110,7 +110,7 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
     uncertain_observations = []
     observation_notes = []
     duration_estimates, duration_runs = {}, {}
-    load_sample_warnings = []
+    load_warning_groups = {}
     selected = set(config.checks)
     quotas = _request_quotas(config)
     shared_gateway = (not gateway_identities_only(selected) and any(
@@ -583,6 +583,13 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
                 points = [p for p in test_points(config.load_test) if p["type"] == name.removeprefix("load_")]
                 own = dict(settings_sets(config.load_test))
                 entries = (observations or {}).get(target.name, [])
+                # Comparable matching requires both quantiles, including for older samples.
+                sample_observations = {target.name: [
+                    {**entry, "p90_ms": entry.get("p50_ms")}
+                    if entry.get("p90_ms") is None or (isinstance(entry["p90_ms"], (int, float))
+                                                       and entry["p90_ms"] <= 0) else entry
+                    for entry in entries
+                ]}
                 queries, completion_points = [], []
                 for point in points:
                     if point["pattern"] != "concurrent":
@@ -600,32 +607,42 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
                         queries.append(query)
                         if point["shape"] is None:
                             continue  # A mixed window needs separate evidence for each result group.
-                        sample = comparable_latency(observations, target.name, **query)
-                        if sample is None or sample["p50_ms"] <= 0:
+                        sample = comparable_latency(sample_observations, target.name, **query)
+                        if sample is None:
                             continue
+                        latency_ms = sample.get("p90_ms") or 0
+                        if latency_ms <= 0:
+                            latency_ms = sample["p50_ms"]
+                        if latency_ms <= 0:
+                            continue
+                        latency_s = Decimal(str(latency_ms)) / 1000
                         duration = point["configured_window_seconds"]
-                        # Each slot sends at time zero and refills until the cutoff.
-                        # The last request in each slot can finish during drain.
-                        rounds = math.ceil(Decimal(str(duration)) * 1000 / Decimal(str(sample["p50_ms"])))
-                        estimated_requests = rounds * concurrency
+                        timeout_s = settings.request_timeout_seconds
                         minimum = settings.pass_criteria.min_valid_responses
-                        if estimated_requests >= minimum:
-                            continue
                         source = point["source"]
                         prefix = ("load_test" if source == "primary" else
                                   f"load_test.migrated_tests.{source.split('_')[1]}.settings")
-                        duration_field = f"{prefix}.schedule.duration_seconds"
-                        load_sample_warnings.append({
-                            "kind": "load_sample_shortfall",
-                            "fields": [duration_field],
-                            "values": {"estimated_requests": estimated_requests, "min_valid_responses": minimum,
-                                       duration_field: duration},
-                            "msg": (f"Recent timings for {target.name} · {point_label(point)} suggest "
-                                    f"about {estimated_requests:,} "
-                                    f"{'request' if estimated_requests == 1 else 'requests'} can start in the "
-                                    f"{duration:g} s sending window. "
-                                    f"This condition needs {minimum:,} valid responses. "
-                                    "Lengthen the sending window to collect more samples."),
+                        if latency_s >= Decimal(str(timeout_s)):
+                            kind, field = "load_timeout_shortfall", f"{prefix}.request_timeout_seconds"
+                            estimated_requests = 0
+                            required = math.ceil(latency_s * Decimal("1.25"))
+                            current = timeout_s
+                        else:
+                            # Slots start at time zero and refill strictly before the cutoff.
+                            estimated_requests = math.ceil(Decimal(str(duration)) / latency_s) * concurrency
+                            if estimated_requests >= minimum:
+                                continue
+                            rounds_needed = math.ceil(Decimal(minimum) / concurrency)
+                            required = math.floor((rounds_needed - 1) * latency_s) + 1
+                            kind, field = "load_sample_shortfall", f"{prefix}.schedule.duration_seconds"
+                            current = duration
+                        condition = f"{load_shape_label(shape)}, {concurrency} at once"
+                        if len(config.targets) > 1:
+                            condition = f"{target.name}: {condition}"
+                        load_warning_groups.setdefault((kind, field), []).append({
+                            "target": target.name, "condition": condition,
+                            "estimated_requests": estimated_requests, "required_seconds": required,
+                            "minimum": minimum, "latency_s": latency_s, "current": current,
                         })
                 observed = pooled_matches(target.name, queries, entries) if queries else None
                 if observed and all(item["p50_ms"] > 0 for item in observed["matches"]):
@@ -1091,6 +1108,45 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
     reasons = [f"{item['target']} · {item['title']}: " + (item["reason"] if "reason" in item else
                (("up to " if item.get("upper_bound") else "") + f"{item['requests']:,} requests at unknown speed (up to {item['timeout_bound_seconds']:g} s if every request hits its {item['request_timeout_seconds']:g} s timeout)"
                 if item["requests"] is not None else "workload size and request speed are unknown")) for item in unknowns]
+    load_sample_warnings = []
+    for (kind, field), conditions in load_warning_groups.items():
+        required = max(item["required_seconds"] for item in conditions)
+        first = conditions[0]
+        current = first["current"]
+        if kind == "load_timeout_shortfall":
+            message = " ".join(
+                f"{item['condition']}: recent responses take about {item['latency_s']:.1f} s, "
+                f"longer than the {current:g} s request timeout, so they will time out and none will count."
+                for item in conditions
+            ) + f" Raise the request timeout to at least {required} s."
+            label = f"Set timeout to {required} s"
+        else:
+            minimum = first["minimum"]
+            if len(conditions) == 1:
+                message = (f"{first['condition']}: about {first['estimated_requests']} of the {minimum} "
+                           f"required valid responses can start in {current:g} s "
+                           f"(recent responses take about {first['latency_s']:.1f} s).")
+            else:
+                same_minimum = all(item["minimum"] == minimum for item in conditions)
+                threshold = f"the {minimum} required valid responses" if same_minimum else "their required valid responses"
+                details = "; ".join(
+                    f"{item['condition']} (about {item['estimated_requests']}" +
+                    ("" if same_minimum else f" of {item['minimum']}") + ")" for item in conditions
+                )
+                message = (f"{len(conditions)} conditions may get fewer than {threshold} "
+                           f"in {current:g} s: {details}.")
+            message += f" Set “Send new requests for” to at least {required} s."
+            label = f"Set to {required} s"
+        load_sample_warnings.append({
+            "kind": kind, "fields": [field], "msg": message,
+            "values": {field: current,
+                       "estimated_requests": min(item["estimated_requests"] for item in conditions),
+                       "min_valid_responses": min(item["minimum"] for item in conditions),
+                       "conditions": [{key: item[key] for key in
+                                       ("target", "condition", "estimated_requests", "required_seconds")}
+                                      for item in conditions]},
+            "actions": [{"label": label, "field": field, "value": required}],
+        })
     known = bool(components) or not unknowns
     return {"estimated_seconds": round(midpoint, 3) if known else None,
             "has_complete_time_estimate": has_complete_time_estimate,

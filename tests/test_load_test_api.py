@@ -1,11 +1,13 @@
 """ASGI transport only: structured config errors and migration/planning I/O."""
 
 import json
+from copy import deepcopy
 from datetime import datetime, timezone
 
 import httpx
 import pytest
 
+from giraffe.client import completion_url
 from giraffe.latency import input_bucket
 from giraffe.models import RunConfig
 from giraffe.web import create_app
@@ -99,14 +101,14 @@ async def test_budget_and_time_conflicts_warn_before_start_with_field_actions(tm
     )
 
 
-@pytest.mark.parametrize(("duration", "latency_ms", "estimated_requests"), [
-    (20, 6400, 4),
-    (20, 5000, 4),  # A request ready to start exactly at the cutoff is too late.
-    (26, 6400, None),  # The fifth request can finish after sending stops.
-    (20, None, None),
+@pytest.mark.parametrize(("duration", "latency_ms", "estimated_requests", "required"), [
+    (20, 6400, 4, 26),
+    (20, 5000, 4, 21),  # A request ready to start exactly at the cutoff is too late.
+    (26, 6400, None, None),  # The fifth request can finish after sending stops.
+    (20, None, None, None),
 ])
 async def test_preview_warns_when_a_concurrent_condition_is_likely_to_miss_its_sample_minimum(
-    tmp_path, duration, latency_ms, estimated_requests,
+    tmp_path, duration, latency_ms, estimated_requests, required,
 ):
     payload = values()
     load = payload["load_test"]
@@ -148,8 +150,160 @@ async def test_preview_warns_when_a_concurrent_condition_is_likely_to_miss_its_s
 
     warning, = warnings
     assert warning["msg"] in plan["warnings"]
-    assert "concurrency 1" in warning["msg"]
+    assert warning["msg"] == (
+        f"Short input → Long output, 1 at once: about {estimated_requests} of the 5 required valid "
+        f"responses can start in {duration:g} s (recent responses take about {latency_ms / 1000:.1f} s). "
+        f"Set “Send new requests for” to at least {required} s."
+    )
     assert warning["values"]["estimated_requests"] == estimated_requests
     assert warning["values"]["min_valid_responses"] == 5
     assert warning["fields"] == ["load_test.schedule.duration_seconds"]
-    assert warning["actions"]
+    assert warning["actions"] == [{"label": f"Set to {required} s",
+                                   "field": "load_test.schedule.duration_seconds", "value": required}]
+
+
+async def shortfall_preview(tmp_path, payload, samples):
+    config = RunConfig.model_validate(payload)
+    measurements = []
+    for shape, concurrency, p50, p90 in samples:
+        input_size, output_size = shape.split('_')
+        measurement = {
+            'family': 'load.combinations.concurrent', 'concurrency': concurrency,
+            'stream': config.stream, 'output_cap': getattr(config.load_test.profile, output_size).output_tokens,
+            'input_bucket': input_bucket(getattr(config.load_test.profile, input_size).input_tokens * 4),
+            'n': 4, 'p50_ms': p50,
+        }
+        if p90 is not None:
+            measurement['p90_ms'] = p90
+        measurements.append(measurement)
+    previous = tmp_path / 'previous'
+    previous.mkdir()
+    (previous / '.web.json').write_text(json.dumps({'latency_summary': {
+        'finished_at': datetime.now(timezone.utc).isoformat(),
+        'targets': [{'url': completion_url(target.url), 'model': target.model, 'measurements': measurements}
+                    for target in config.targets],
+    }}))
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_app(tmp_path)), base_url='http://127.0.0.1:8787'
+    ) as client:
+        response = await client.post('/api/config/preview', json=payload)
+    assert response.status_code == 200, response.text
+    plan = response.json()['request_plan']
+    warnings = [row for row in plan['load_warnings']
+                if row.get('kind') in {'load_sample_shortfall', 'load_timeout_shortfall'}]
+    assert all(row['msg'] in plan['warnings'] for row in warnings)
+    return warnings
+
+
+@pytest.mark.parametrize('p50,p90', [(4000, 6400), (6400, None), (6400, 0), (6400, -1)])
+async def test_shortfall_uses_p90_with_p50_fallback(tmp_path, p50, p90):
+    payload = values()
+    payload['load_test']['schedule']['duration_seconds'] = 20
+    payload['load_test']['pass_criteria']['min_valid_responses'] = 5
+    warning, = await shortfall_preview(tmp_path, payload, [('short_short', 1, p50, p90)])
+    assert warning['kind'] == 'load_sample_shortfall'
+    assert warning['values']['estimated_requests'] == 4
+    assert warning['actions'] == [{'label': 'Set to 26 s', 'field': 'load_test.schedule.duration_seconds', 'value': 26}]
+    assert warning['values']['conditions'] == [{
+        'target': 'local', 'condition': 'Short input → Short output, 1 at once',
+        'estimated_requests': 4, 'required_seconds': 26,
+    }]
+
+
+@pytest.mark.parametrize('timeout', [5, 6.4])
+async def test_shortfall_warns_about_timeout_instead_of_duration(tmp_path, timeout):
+    payload = values()
+    payload['load_test']['schedule']['duration_seconds'] = 30
+    payload['load_test']['request_timeout_seconds'] = timeout
+    warning, = await shortfall_preview(tmp_path, payload, [('short_short', 1, 4000, 6400)])
+    assert warning['kind'] == 'load_timeout_shortfall'
+    assert warning['fields'] == ['load_test.request_timeout_seconds']
+    assert warning['msg'] == (
+        f'Short input → Short output, 1 at once: recent responses take about 6.4 s, longer than the '
+        f'{timeout:g} s request timeout, so they will time out and none will count. '
+        'Raise the request timeout to at least 8 s.'
+    )
+    assert warning['actions'] == [{'label': 'Set timeout to 8 s', 'field': 'load_test.request_timeout_seconds', 'value': 8}]
+    assert warning['values']['estimated_requests'] == 0
+    assert warning['values']['min_valid_responses'] == 1
+
+
+@pytest.mark.parametrize('targets', [1, 2])
+async def test_shortfall_groups_conditions_per_field_with_target_prefix_only_for_comparisons(tmp_path, targets):
+    payload = values()
+    if targets == 2:
+        payload['targets'].append({**payload['targets'][0], 'name': 'second', 'url': 'http://second.test/v1'})
+    load = payload['load_test']
+    load['schedule']['duration_seconds'] = 20
+    load['pass_criteria']['min_valid_responses'] = 5
+    load['workloads']['combinations']['selected'] = ['short_short', 'short_long']
+    warning, = await shortfall_preview(tmp_path, payload, [
+        ('short_short', 1, 5000, 5000), ('short_long', 1, 6400, 6400),
+    ])
+    assert warning['kind'] == 'load_sample_shortfall'
+    details = [f'{target + ": " if targets > 1 else ""}{shape}, 1 at once (about 4)'
+               for target in ['local', 'second'][:targets]
+               for shape in ['Short input → Short output', 'Short input → Long output']]
+    assert warning['msg'] == (
+        f'{2 * targets} conditions may get fewer than the 5 required valid responses in 20 s: '
+        + '; '.join(details) + '. Set “Send new requests for” to at least 26 s.'
+    )
+    assert warning['actions'][0]['value'] == 26
+    assert [row['required_seconds'] for row in warning['values']['conditions']] == [21, 26] * targets
+
+
+async def test_timeout_shortfalls_group_per_timeout_field(tmp_path):
+    payload = values()
+    load = payload['load_test']
+    load['request_timeout_seconds'] = 5
+    load['workloads']['combinations']['selected'] = ['short_short', 'short_long']
+    warning, = await shortfall_preview(tmp_path, payload, [
+        ('short_short', 1, 5000, 5000), ('short_long', 1, 6400, 6400),
+    ])
+    assert warning['kind'] == 'load_timeout_shortfall'
+    assert len(warning['values']['conditions']) == 2
+    assert 'Short input → Short output, 1 at once' in warning['msg']
+    assert 'Short input → Long output, 1 at once' in warning['msg']
+    assert warning['actions'][0]['value'] == 8
+
+
+async def test_migrated_shortfalls_use_source_settings_paths(tmp_path):
+    payload = values()
+    load = payload['load_test']
+    load['schedule']['duration_seconds'] = 20
+    load['pass_criteria']['min_valid_responses'] = 5
+    migrated = deepcopy(load)
+    migrated['request_timeout_seconds'] = 5
+    load['migrated_tests'] = [{'source': 'concurrency', 'settings': migrated}]
+    warnings = await shortfall_preview(tmp_path, payload, [('short_short', 1, 6400, 6400)])
+    assert [(row['kind'], row['fields']) for row in warnings] == [
+        ('load_sample_shortfall', ['load_test.schedule.duration_seconds']),
+        ('load_timeout_shortfall', ['load_test.migrated_tests.0.settings.request_timeout_seconds']),
+    ]
+    assert warnings[1]['actions'][0]['field'] == warnings[1]['fields'][0]
+
+
+async def test_group_uses_smallest_estimate_and_largest_required_duration(tmp_path):
+    payload = values()
+    load = payload['load_test']
+    load['schedule']['duration_seconds'] = 20
+    load['pass_criteria']['min_valid_responses'] = 5
+    load['workloads']['combinations']['selected'] = ['short_short', 'short_long']
+    warning, = await shortfall_preview(tmp_path, payload, [
+        ('short_short', 1, 9000, 9000), ('short_long', 1, 6400, 6400),
+    ])
+    assert warning['values']['estimated_requests'] == 3
+    assert warning['actions'][0]['value'] == 37
+    assert '(about 3); Short input → Long output, 1 at once (about 4)' in warning['msg']
+
+
+async def test_single_estimated_response_uses_exact_response_copy(tmp_path):
+    payload = values()
+    load = payload['load_test']
+    load['schedule']['duration_seconds'] = 1
+    load['pass_criteria']['min_valid_responses'] = 5
+    warning, = await shortfall_preview(tmp_path, payload, [('short_short', 1, 6400, 6400)])
+    assert warning['msg'] == (
+        'Short input → Short output, 1 at once: about 1 of the 5 required valid responses can start '
+        'in 1 s (recent responses take about 6.4 s). Set “Send new requests for” to at least 26 s.'
+    )
