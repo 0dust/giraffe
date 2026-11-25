@@ -334,6 +334,7 @@ def condition_for(scenario: str, workload: Mapping[str, Any] | None = None, conf
     if rate is not None:
         parameters["rate_rps"] = rate
     purpose = {
+        "performance_evidence_probe": "Checks whether the server returns streamed token boundaries and prompt and completion token counts.",
         "fairness_baseline": "Measures short-request timing without competing load for comparison.",
         "mixed_control": "Measures short-request timing alone for comparison with heavy partners.",
         "prefix_shared": "Measures serving behavior with a shared input prefix and a different ending on each request.",
@@ -683,7 +684,8 @@ def aggregate_conditions(report: Any) -> list[dict[str, Any]]:
         owners.setdefault((key[0], summary["condition"].get("check")), []).append(key)
     for check in check_rows:
         owned = owners.get((check.get("target"), check.get("id")), [])
-        if len(owned) == 1 and check.get("status") in {"pass", "fail", "inconclusive", "blocked", "skipped"}:
+        if (len(owned) == 1 and owned[0][1] != "performance_evidence_probe"
+                and check.get("status") in {"pass", "fail", "inconclusive", "blocked", "skipped"}):
             verdicts.setdefault(owned[0], check["status"])
     for key, statuses in counts.items():
         summary = groups[key]

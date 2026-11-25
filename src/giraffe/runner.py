@@ -439,10 +439,12 @@ class _Run:
         row["status"] = "finished"
         if load_point_result is not None:
             row["load_point_result"] = dict(load_point_result)
-        if scheduled_multi_user_window(scenario) or scenario in SHARED_BASELINE_EXCLUDED_WORKLOADS:
+        if verdict is not None:
+            row["condition_verdict"] = verdict
+        elif scheduled_multi_user_window(scenario) or scenario in SHARED_BASELINE_EXCLUDED_WORKLOADS:
             # Scheduled windows and gateway probes need evidence qualification
             # after request dispatch finishes.
-            row["condition_verdict"] = verdict or row.get("condition_verdict") or "pending"
+            row["condition_verdict"] = row.get("condition_verdict") or "pending"
         self.emit_condition("condition_finished", scenario, row)
 
     def record_finished(self, record: RequestRecord) -> None:
@@ -1494,6 +1496,11 @@ async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attributio
                 client.on_response = lambda: run.endpoint_response(target.name)
                 evidence = run.observations[target.name].setdefault("token_evidence", {"status": "unavailable", "reason": "No request budget or preparation time remained for a token-evidence compatibility probe."})
                 run.preparation(target.name, "performance_evidence_probe", "Streamed token and usage capability", "completed" if evidence.get("status") in {"available", "observed"} else "unavailable", evidence.get("reason"))
+                complete_evidence = (evidence.get("status") == "observed"
+                                     and evidence.get("logprobs") == evidence.get("usage") == "supported"
+                                     and not evidence.get("missing_usage_fields"))
+                run.finish_condition(target.name, "performance_evidence_probe", reason=evidence.get("reason"),
+                                     verdict="pass" if complete_evidence else "inconclusive")
             run.observations[target.name]["deployment"]["model_residency"]["after_preparation"] = (
                 await deployment.model_residency(target, config, deadline=run.deadline, stop=run.stop))
             if enabled & {"serving", "first_output"}:

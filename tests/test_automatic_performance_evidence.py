@@ -18,9 +18,11 @@ def completion(*, tokens=True, usage=True):
     if tokens:
         choice["logprobs"] = {"content": [{"token": "1", "logprob": -0.1}]}
     body = {"choices": [choice]}
+    payloads = [body]
     if usage:
-        body["usage"] = {"completion_tokens": 1, "prompt_tokens": 8}
-    return httpx.Response(200, text=f"data: {json.dumps(body)}\n\ndata: [DONE]\n\n",
+        payloads.append({"choices": [], "usage": {"completion_tokens": 1, "prompt_tokens": 8} if usage is True else usage})
+    stream = "".join(f"data: {json.dumps(payload)}\n\n" for payload in payloads)
+    return httpx.Response(200, text=f"{stream}data: [DONE]\n\n",
                           headers={"content-type": "text/event-stream"})
 
 
@@ -183,7 +185,44 @@ async def test_runner_negotiation_is_budgeted_setup_and_optional_failure_does_no
     assert len(report.requests) <= config.max_requests
     assert next(check for check in report.checks if check.id == "serving").status != "fail"
     assert report.observations["targets"][target.name]["token_evidence"]["logprobs"] == "rejected"
+    probe = next(row for row in report.conditions if row["condition_id"] == "performance_evidence_probe")
+    assert probe["status"] == "inconclusive"
+    assert "rejected" in probe["reason"] and "logprobs" in probe["reason"]
     assert len([r for r in calls if r.method == "GET" and r.url.path == "/metrics"]) == 1
+
+
+@pytest.mark.parametrize(("tokens", "usage", "status", "diagnostic"), [
+    (False, False, "inconclusive", "usage.prompt_tokens and usage.completion_tokens"),
+    (True, {"prompt_tokens": 8}, "inconclusive", "usage.completion_tokens"),
+    (False, True, "inconclusive", "logprobs.content"),
+    (True, True, "passed", "Returned streamed token boundaries and both usage counts"),
+])
+async def test_saved_probe_condition_explains_streamed_evidence(monkeypatch, tmp_path, tokens, usage, status, diagnostic):
+    from giraffe.reporting import write_report
+    from giraffe.runner import run_suite
+
+    mock_http(monkeypatch, lambda request: httpx.Response(404) if request.method == "GET"
+              else completion(tokens=tokens, usage=usage))
+    target = Target(name="test", url="http://runtime/v1", model="model")
+    config = RunConfig(targets=[target], checks=["serving"], samples=1, max_requests=6,
+                       max_duration_seconds=5, metrics=False)
+    events = []
+    report = await run_suite(config, progress=events.append)
+    path, _ = write_report(report, tmp_path)
+    saved = json.loads(path.read_text())
+    probe = next(row for row in saved["conditions"] if row["condition_id"] == "performance_evidence_probe")
+    warm = next(row for row in saved["conditions"] if row["condition_id"] == "warm")
+    assert probe["status"] == status
+    assert probe["reason"] and diagnostic in probe["reason"]
+    assert probe["reasons"] == [probe["reason"]]
+    assert "streamed" in probe["condition"]["purpose"]
+    assert warm["condition"]["purpose"] != probe["condition"]["purpose"]
+    assert probe["started"] == probe["completed"] == 1
+    assert probe["request_statuses"] == {"unscored": 1}
+
+    finished = next(event["condition_summary"] for event in events
+                    if event["event"] == "condition_finished" and event["scenario"] == "performance_evidence_probe")
+    assert finished["aggregate_status"] == status and finished["reason"] == probe["reason"]
 
 
 @pytest.mark.parametrize("timeout", [.04, 8])
@@ -251,6 +290,8 @@ async def test_probe_rejection_retries_share_one_timeout_budget(monkeypatch):
     assert records[1].status == "timeout"
     evidence = report.observations["targets"][target.name]["token_evidence"]
     assert evidence["status"] == "unavailable" and evidence["usage"] == "unverified"
+    probe = next(row for row in report.conditions if row["condition_id"] == "performance_evidence_probe")
+    assert probe["status"] == "inconclusive" and "did not complete" in probe["reason"]
     assert all(r.valid for r in report.requests if r not in records)
 
 
