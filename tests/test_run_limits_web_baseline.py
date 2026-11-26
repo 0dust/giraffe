@@ -37,8 +37,14 @@ async def test_a19_legacy_web_config_migrates_before_validation_and_reports_note
     result = response.json()
     assert result["config"]["concurrency"] == result["config"]["default_concurrency"] == 40
     assert result["config"]["max_requests"] is result["config"]["max_duration_seconds"] is None
-    assert len(result["migration_notes"]) == 3
-    assert any("default_concurrency" in note for note in result["migration_notes"])
+    assert len(result["migration_notes"]) == 2
+    limit_notes = [note for note in result["migration_notes"] if note.startswith("Earlier Giraffe versions")]
+    expected = (
+        "Earlier Giraffe versions capped runs at 300 requests and 300 s of traffic by default. "
+        "This configuration sets none of these limits, so they no longer apply. "
+        "Use Edit limits to keep them.")
+    assert limit_notes == [expected]
+    assert "default_concurrency" in result["migration_notes"][-1]
 
 
 async def test_a4_fresh_bootstrap_has_browser_limits_without_migration_notes(tmp_path):
@@ -63,9 +69,14 @@ async def test_a19_start_preserves_migration_notes_and_null_limits_in_saved_conf
         identifier = await start(client, values)
         detail = await finished(client, identifier)
         saved = await client.get(f"/api/runs/{identifier}/config.json")
-    assert len(seen[0]._migration_notes) == 3
+    expected = (
+        "Earlier Giraffe versions capped runs at 300 requests, 300 s of traffic and "
+        "4 requests at once by default. This configuration sets none of these limits, "
+        "so they no longer apply. Use Edit limits to keep them.")
+    assert seen[0]._migration_notes == [expected]
     assert saved.status_code == 200
-    assert saved.json()["max_requests"] is saved.json()["concurrency"] is None
+    assert all(saved.json()[field] is None for field in
+               ("max_requests", "max_duration_seconds", "concurrency"))
     assert detail["config"]["config_version"] == 2
 
 

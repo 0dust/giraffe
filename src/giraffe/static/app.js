@@ -28,7 +28,7 @@ function updateAPIKeySummary() {
   const key=apiKeyFor(form.elements.url.value),ref=form.elements.api_key_env?.value.trim();
   $('.row-value',summary).textContent=key?'Set for this tab':ref||'Not set';
 }
-const state = {bootstrap:null, runs:[], storage:null, storageUnavailable:false, cleanup:null, cleanupResult:null, baselines:[], detail:null, mosaicFollow:true, config:null, active:null, diskActive:null, routeVersion:0, poll:null, tab:'checks', selectedCheck:null, checkNavigatorOpen:false, filter:'all', historySearch:'', comparisonFilter:null, comparisonCheck:'all', submitting:false, openTest:null, configView:'form', jsonDraft:null, jsonBase:null, configRevision:0, configBusy:false, showAvailableTests:false, formMode:'normal', formRestartTarget:null, requestPreview:null, previewSequence:0, planTimer:null, setupPreset:null, catalogueFilter:'all', catalogueCategory:'all', catalogueSearch:'', setupStep:1, returnToReview:false, modelDiscovery:null, modelDiscoverySequence:0, autoModel:null, datasetSelection:[], datasetImportSequence:0, judgeEditorOpen:null, datasetImport:null, datasetEditor:null, datasetTry:null, migrationNotes:[], dismissedMigrationNotes:[], loadPanels:{}, limitValues:{}, jsonValidation:null};
+const state = {bootstrap:null, runs:[], storage:null, storageUnavailable:false, cleanup:null, cleanupResult:null, baselines:[], detail:null, mosaicFollow:true, config:null, active:null, diskActive:null, routeVersion:0, poll:null, tab:'checks', selectedCheck:null, checkNavigatorOpen:false, filter:'all', historySearch:'', comparisonFilter:null, comparisonCheck:'all', submitting:false, openTest:null, configView:'form', jsonDraft:null, jsonBase:null, configRevision:0, configBusy:false, showAvailableTests:false, formMode:'normal', formRestartTarget:null, requestPreview:null, previewSequence:0, planTimer:null, setupPreset:null, catalogueFilter:'all', catalogueCategory:'all', catalogueSearch:'', setupStep:1, returnToReview:false, modelDiscovery:null, modelDiscoverySequence:0, autoModel:null, datasetSelection:[], datasetImportSequence:0, judgeEditorOpen:null, datasetImport:null, datasetEditor:null, datasetTry:null, migrationNotes:[], migrationLimitNotes:[], migrationWarnings:[], dismissedMigrationNotes:[], loadPanels:{}, limitValues:{}, jsonValidation:null};
 state.setupWorkspace=null;
 const statusLabels = {not_applicable:'Not applicable',measured:'Measured',warmup:'Warmup',pass:'Passed',fail:'Failed',failed:'Failed',timeout:'Timed out',inconclusive:'Inconclusive',skipped:'Not run',idle:'Unused',blocked:'Blocked',running:'Running',queued:'Queued',reserved:'Reserved',stopping:'Stopping',error:'Runner error',completed:'Finished',stopped:'Stopped',cancelled:'Cancelled',interrupted:'Interrupted'};
 const statusIcons = {pass:'✓',fail:'×',failed:'×',timeout:'◷',inconclusive:'?',skipped:'–',idle:'○',blocked:'!',running:'·',queued:'○',reserved:'○',stopping:'·',error:'×',completed:'✓',stopped:'⊘',cancelled:'⊘',interrupted:'!'};
@@ -1940,15 +1940,29 @@ function loadDisplay(settings) {
 }
 function renderMigrationNotes() {
   const notes=(state.migrationNotes || []).filter(note=>!(state.dismissedMigrationNotes || []).includes(note));
-  return notes.length?`<div class="notice warning migration-notes"><strong>Review imported load settings</strong><ul>${notes.map(note=>`<li>${escape(note)}</li>`).join('')}</ul><button type="button" class="text-button" data-action="dismiss-migration-notes">Dismiss notes</button></div>`:'';
+  const limits=notes.filter(note=>(state.migrationLimitNotes || []).includes(note));
+  const details=notes.filter(note=>!limits.includes(note));
+  const list=items=>`<ul>${items.map(note=>`<li>${escape(note)}</li>`).join('')}</ul>`;
+  return notes.length?`<div class="notice migration-notes" role="status"><strong>Imported from an earlier Giraffe version</strong>${limits.length?list(limits):''}${details.length?`<details><summary>${details.length} other ${details.length===1?'setting':'settings'} converted</summary>${list(details)}</details>`:''}<button type="button" class="text-button" data-action="dismiss-migration-notes">Dismiss notes</button></div>`:'';
 }
-function acceptMigrationNotes(notes=[]) {
+function activeMigrationWarnings() {
+  return (state.migrationWarnings || []).filter(warning=>!warning.removed_check||!state.config?.checks?.includes(warning.removed_check));
+}
+function renderMigrationWarnings() {
+  return activeMigrationWarnings().map(warning=>`<div class="notice warning setting-issue"><p>${escape(warning.msg)}</p></div>`).join('');
+}
+function mergeMigrationWarnings(...groups) {
+  return [...new Map(groups.flat().map(warning=>[JSON.stringify(warning),warning])).values()];
+}
+function acceptMigrationNotes(notes=[],warnings=[],limitNotes=[]) {
+  state.migrationLimitNotes=[...new Set([...(state.migrationLimitNotes || []),...limitNotes])];
+  state.migrationWarnings=mergeMigrationWarnings(state.migrationWarnings || [],warnings);
   state.migrationNotes=[...new Set([...(state.migrationNotes || []),...notes])];
   for(const element of $$('[data-migration-notes]'))element.innerHTML=renderMigrationNotes();
 }
-function replaceMigrationNotes(notes=[]) {
-  state.migrationNotes=[];state.dismissedMigrationNotes=[];state.loadPanels={};
-  acceptMigrationNotes(notes);
+function replaceMigrationNotes(notes=[],warnings=[],limitNotes=[]) {
+  state.migrationNotes=[];state.migrationLimitNotes=[];state.migrationWarnings=[];state.dismissedMigrationNotes=[];state.loadPanels={};
+  acceptMigrationNotes(notes,warnings,limitNotes);
 }
 const loadCriteriaLabels={max_first_answer_ms:'Maximum time to first answer per response (ms)',max_completion_ms:'Maximum completion time per response (ms)',max_error_percent:'Errors allowed (%)',min_correct_percent:'Correct answers required (%)',max_stream_pause_ms:'Maximum pause between streamed chunks (ms)',min_generation_tokens_per_second:'Minimum generation speed per response (tokens/sec)',min_valid_responses:'Minimum valid responses per result group'};
 function loadFieldLabel(path) {
@@ -2982,7 +2996,7 @@ function renderRequestPlan(config=null) {
   const limits=config?renderPlanBounds(config,'review-limits'):'';
   if(!plan){
     const status=hasJsonChanges()?'Apply or discard JSON changes to confirm the request plan.':saved?.status==='error'?`Request plan unavailable: ${saved.error}`:saved?.status==='pending'?'Updating request plan…':'Request plan stale · updating current settings…';
-    element.innerHTML=`<div class="plan-hero">${heading}<p class="hint plan-status">${escape(status)}</p>${limits}${renderMigrationNotes()}${renderSettingIssues()}${saved?.status==='error'&&!hasJsonChanges()?'<button type="button" class="button small" data-action="preview-pack">Retry request plan</button>':''}</div>`;return;
+    element.innerHTML=`<div class="plan-hero">${heading}<p class="hint plan-status">${escape(status)}</p>${limits}${renderMigrationWarnings()}${renderMigrationNotes()}${renderSettingIssues()}${saved?.status==='error'&&!hasJsonChanges()?'<button type="button" class="button small" data-action="preview-pack">Retry request plan</button>':''}</div>`;return;
   }
   const count=setupPlanCount(plan);
   const evaluator=plan.evaluator || {},needed=plan.required_request_limit;
@@ -2996,7 +3010,7 @@ function renderRequestPlan(config=null) {
     :plan.known_target_counts?`Known requests by endpoint: ${escape(planTargetCounts(plan.known_target_counts))}, plus adaptive work`
     :plan.planned_per_target==null?`${number(plan.known_per_target)} known requests per endpoint, plus adaptive work`
     :`${plan.count_kind==='estimate'?'About ':''}${number(plan.planned_per_target)} requests per endpoint`;
-  element.innerHTML=`<div class="plan-hero${raise?' is-over':''}">${heading}<p class="plan-total">${escape(count)}</p>${plan.request_limit==null?'':`<div class="plan-ceiling${plan.count_kind==='exact'||plan.count_kind==='estimate'?'':' adaptive'}" aria-hidden="true"><span style="width:${raise?100:filled.toFixed(1)}%"></span></div>`}${limits}${renderSettingIssues([...localSettingWarnings(),...(plan?.load_warnings||[])],'warning')}${renderMigrationNotes()}${renderPlanTime(plan)}${renderSettingIssues()}${warnings.map(warning=>notice(warning,'warning')).join('')}</div><div class="plan-flight">${evaluator.active?`<div class="review-evaluator"><p>Up to ${number(evaluator.call_upper_bound)} evaluator calls after target traffic · ${number(evaluator.judge_count)} ${evaluator.judge_count===1?'evaluator':'evaluators'}.</p><p class="hint">Questions, expected answers and model answers go to every configured evaluator. These calls have separate limits.</p>${config?.judging?.judges?.length?`<ul class="review-evaluator-targets">${config.judging.judges.map(judge=>`<li><strong>${escape(judge.model || 'Model needed')}</strong> · ${escape(judge.url || 'Endpoint URL needed')}</li>`).join('')}</ul>`:''}</div>`:''}<details class="request-planning workload-breakdown"><summary>Request breakdown</summary><p class="hint">${breakdown}. Time and request limits can leave checks unfinished.</p>${Object.keys(plan.target_quotas || {}).length?`<h4>Endpoint request budgets</h4><ul class="review-quotas">${Object.entries(plan.target_quotas).map(([name,quota])=>`<li>${escape(name)}: up to ${number(quota)} requests</li>`).join('')}</ul>`:''}${renderCheckPlan(config,plan)}</details></div>${renderReviewPassCriteria(config)}`;
+  element.innerHTML=`<div class="plan-hero${raise?' is-over':''}">${heading}<p class="plan-total">${escape(count)}</p>${plan.request_limit==null?'':`<div class="plan-ceiling${plan.count_kind==='exact'||plan.count_kind==='estimate'?'':' adaptive'}" aria-hidden="true"><span style="width:${raise?100:filled.toFixed(1)}%"></span></div>`}${limits}${renderSettingIssues([...localSettingWarnings(),...(plan?.load_warnings||[])],'warning')}${renderMigrationWarnings()}${renderMigrationNotes()}${renderPlanTime(plan)}${renderSettingIssues()}${warnings.map(warning=>notice(warning,'warning')).join('')}</div><div class="plan-flight">${evaluator.active?`<div class="review-evaluator"><p>Up to ${number(evaluator.call_upper_bound)} evaluator calls after target traffic · ${number(evaluator.judge_count)} ${evaluator.judge_count===1?'evaluator':'evaluators'}.</p><p class="hint">Questions, expected answers and model answers go to every configured evaluator. These calls have separate limits.</p>${config?.judging?.judges?.length?`<ul class="review-evaluator-targets">${config.judging.judges.map(judge=>`<li><strong>${escape(judge.model || 'Model needed')}</strong> · ${escape(judge.url || 'Endpoint URL needed')}</li>`).join('')}</ul>`:''}</div>`:''}<details class="request-planning workload-breakdown"><summary>Request breakdown</summary><p class="hint">${breakdown}. Time and request limits can leave checks unfinished.</p>${Object.keys(plan.target_quotas || {}).length?`<h4>Endpoint request budgets</h4><ul class="review-quotas">${Object.entries(plan.target_quotas).map(([name,quota])=>`<li>${escape(name)}: up to ${number(quota)} requests</li>`).join('')}</ul>`:''}${renderCheckPlan(config,plan)}</details></div>${renderReviewPassCriteria(config)}`;
   const timingDetails=element.querySelector?.('.timing-warning-details');
   if(timingDetails)timingDetails.open=requestPlanTimingDetails.open;
   else requestPlanTimingDetails.open=false;
@@ -3051,7 +3065,7 @@ async function refreshRequestPreview(snapshot,{draft=false}={}) {
     const result=await api(draft?'/api/config/draft':'/api/config/preview',{method:'POST',body:JSON.stringify(config)});
     if(version!==state.routeVersion||revision!==state.configRevision||sequence!==state.previewSequence)throw new Error('Configuration changed during preview. Refresh the current settings before running.');
     assertAppliedConfig();
-    acceptMigrationNotes(result.migration_notes);
+    acceptMigrationNotes(result.migration_notes,result.migration_warnings,result.migration_limit_notes);
     const previous=state.requestPreview;
     state.requestPreview={status:'current',revision,route:version,plan:result.request_plan,config:result.config,
       data:draft?previous?.data:result.request_pack_preview,
@@ -3156,6 +3170,7 @@ function navigateSetup(step) {
 function setupPlanCount(plan) {
   if(plan.request_count_label!=null){
     const label=plan.request_count_label;
+    if(label==='Unknown')return 'Requests depend on response time';
     if(plan.count_kind==='bounded'&&label!=='Unknown'){
       const scheduled=label.replace(/^Unknown \+ /,'');
       return `${scheduled} ${scheduled.startsWith('≈')?'expected':'known'} requests + adaptive checks`;
@@ -3395,7 +3410,7 @@ function renderRunBlueprint(config,plan=null) {
   return `<header class="blueprint-heading"><h2>Run plan</h2></header><p class="blueprint-intro" data-plan-state="${status}" role="status" aria-live="polite">${escape(plan?setupPlanCount(plan):waiting)}</p>${hasJsonChanges()?'':renderPlanBounds(config)+split}
   <div class="field-label"><button type="button" class="text-button blueprint-edit" data-action="edit-run-limits" ${hasJsonChanges()?'disabled':''}>Edit limits</button>${infoHelp('run_plan_limits','Run limits','Optional limits you set. Tests also stop at their own durations, request counts and per-request timeouts.')}</div>
   ${plan&&config.checks.length?`<details class="workload-breakdown"><summary>Request breakdown</summary>${renderCheckPlan(config,plan)}</details>`:''}
-  ${renderSettingIssues(warningsOutsideFields([...localSettingWarnings(),...(plan?.load_warnings||[])]),'warning')}${renderMigrationNotes()}${renderSettingIssues()}${state.requestPreview?.status==='error'&&!currentSettingErrors().length?notice(state.requestPreview.error||'Plan unavailable. Retry the request plan.','error'):''}${renderPlanTime(plan)}${plan?.evaluator?.active?'<p class="blueprint-note">AI evaluation runs afterward with separate limits.</p>':''}`;
+  ${renderSettingIssues(warningsOutsideFields([...localSettingWarnings(),...(plan?.load_warnings||[])]),'warning')}${renderMigrationWarnings()}${renderMigrationNotes()}${renderSettingIssues()}${state.requestPreview?.status==='error'&&!currentSettingErrors().length?notice(state.requestPreview.error||'Plan unavailable. Retry the request plan.','error'):''}${renderPlanTime(plan)}${plan?.evaluator?.active?'<p class="blueprint-note">AI evaluation runs afterward with separate limits.</p>':''}`;
 }
 function syncRunBlueprint(config,plan=null) {
   const element=$('#run-blueprint');if(!element)return;
@@ -3613,7 +3628,7 @@ async function startRun(event) {
     if(payload.mode==='cold-start'&&!payload.config.targets.find(t=>t.name===payload.restart_target)?.restart_command?.length)throw new Error('Cold start requires a configured restart_command for the selected target.');
     if(version!==state.routeVersion)return;
     $('#start-run').textContent='Checking input preparation…';
-    const result=await api('/api/runs',{method:'POST',body:JSON.stringify({...payload,migration_notes:[...(state.migrationNotes || [])],api_keys:sessionAPIKeys(payload.config)})});state.config=clone(payload.config);state.config.targets[0].tokenizer=draft.targets[0].tokenizer;
+    const result=await api('/api/runs',{method:'POST',body:JSON.stringify({...payload,migration_notes:[...(state.migrationNotes || [])],migration_warnings:activeMigrationWarnings(),api_keys:sessionAPIKeys(payload.config)})});state.config=clone(payload.config);state.config.targets[0].tokenizer=draft.targets[0].tokenizer;
     state.gatewayAccessDraft=gatewayAccessDraft;
     if(draft.request_source==='request_pack'&&!draft.request_pack&&!draft.checks.some(id=>['correctness','load'].includes(id)))state.config.request_source=draft.request_source;
     setActive(result.id);if(version===state.routeVersion)location.hash=linkRun(result.id);
@@ -4605,7 +4620,7 @@ function comparisonValue(row,value){if(value==null)return '—';if(typeof value!
 function renderDeployment(report){
   return `<section class="panel"><div class="section-heading"><h2>Deployment and serving observations</h2></div><p class="hint">Changes provide investigation context, not proof of causality. Source freshness and other replicas remain qualified in the evidence.</p>${Object.entries(report.observations?.targets || {}).map(([name,obs])=>`<h3>${escape(name)}</h3><details><summary>Deployment snapshot and unknown fields</summary><pre>${escape(JSON.stringify(obs.deployment,null,2))}</pre></details><details><summary>Deployment observations during the run</summary><pre>${escape(JSON.stringify(obs.deployment_history || [],null,2))}</pre></details><details><summary>Serving telemetry and phase coverage</summary><pre>${escape(JSON.stringify(obs.serving_telemetry,null,2))}</pre></details>`).join('')}<a class="button" href="${runPath(state.detail.id)}/reproduction.json" download>Export reproduction JSON</a></section>`;
 }
-function renderConfig(report){return `${renderDeployment(report)}${report.warnings?.length?`<div class="notice warning">${report.warnings.map(w=>`<p>${escape(w)}</p>`).join('')}</div>`:''}<section class="panel"><div class="section-heading"><h2>Recorded configuration</h2><div class="actions"><span class="hint">Suite ${escape(report.suite_version)}</span><a class="text-button" href="${runPath(state.detail.id)}/config.json" download>Download config</a></div></div><pre class="config-display">${escape(JSON.stringify(report.manifest,null,2))}</pre></section>`;}
+function renderConfig(report){return `${renderDeployment(report)}${(report.manifest?.config_migration_warnings||[]).map(warning=>notice(warning.msg,'warning')).join('')}${report.warnings?.length?`<div class="notice warning">${report.warnings.map(w=>`<p>${escape(w)}</p>`).join('')}</div>`:''}<section class="panel"><div class="section-heading"><h2>Recorded configuration</h2><div class="actions"><span class="hint">Suite ${escape(report.suite_version)}</span><a class="text-button" href="${runPath(state.detail.id)}/config.json" download>Download config</a></div></div><pre class="config-display">${escape(JSON.stringify(report.manifest,null,2))}</pre></section>`;}
 function liveStopReasons(detail) {
   const events=detail.events||[],progress=detail.progress||{},stops=events.filter(event=>event.event==='run_stopping'),reasons=new Set();
   const add=(value,target='')=>{
@@ -4841,7 +4856,7 @@ async function startNewRun(){
     const config=omitInactiveGatewayAccess(state.config || state.bootstrap.config,state.gatewayAccessDraft ||= {});
     const result=await api('/api/config/draft',{method:'POST',body:JSON.stringify(config)});
     if(intent!==state.setupNavigationSequence||version!==state.routeVersion||revision!==state.configRevision)return;
-    state.config=result.config;replaceMigrationNotes(result.migration_notes);
+    state.config=result.config;replaceMigrationNotes(result.migration_notes,result.migration_warnings,result.migration_limit_notes);
   }catch(error){if(intent===state.setupNavigationSequence)toast(error.message);return;}
   state.setupStep=1;state.returnToReview=false;state.openTest=null;configChanged();
   if(location.hash!=='#new'){location.hash='#new';return;}
@@ -4855,13 +4870,13 @@ function normalizeRateThreshold(config){
 async function rerun(){
   const version=state.routeVersion;let source=state.detail.report?.manifest?.config || state.detail.config;
   if(!source){toast('No configuration was saved for this run.');return;}
-  let notes=[];
+  let notes=[],limitNotes=[],warnings=state.detail.report?.manifest?.config_migration_warnings || [];
   if(source.config_version==null || 'concurrent_workloads' in source || 'buckets' in source || source.test_options?.concurrency || (source.checks || []).some(id=>['fairness','buckets','mixed','token_stress'].includes(id))){
-    try{const result=await api('/api/config/draft',{method:'POST',body:JSON.stringify(source)});if(version!==state.routeVersion)return;source=result.config;notes=result.migration_notes;}
+    try{const result=await api('/api/config/draft',{method:'POST',body:JSON.stringify(source)});if(version!==state.routeVersion)return;source=result.config;notes=result.migration_notes;warnings=result.migration_warnings || [];limitNotes=result.migration_limit_notes || [];}
     catch(error){toast(error.message);return;}
   }
   source=normalizeRateThreshold(source);
-  replaceMigrationNotes(notes);state.config=clone(source);state.gatewayAccessDraft={};state.autoModel=null;state.setupStep=1;invalidateModelDiscovery();state.datasetSelection=[];state.config.restart_target=null;state.formMode='normal';state.formRestartTarget=null;state.jsonDraft=null;state.jsonBase=null;state.configView='form';configChanged();state.prefillBaseline=state.detail.baseline_id || '';location.hash='#new';
+  replaceMigrationNotes(notes,warnings,limitNotes);state.config=clone(source);state.gatewayAccessDraft={};state.autoModel=null;state.setupStep=1;invalidateModelDiscovery();state.datasetSelection=[];state.config.restart_target=null;state.formMode='normal';state.formRestartTarget=null;state.jsonDraft=null;state.jsonBase=null;state.configView='form';configChanged();state.prefillBaseline=state.detail.baseline_id || '';location.hash='#new';
 }
 function portableConfig(payload) {return {...payload.config,restart_target:payload.mode==='cold-start'?payload.restart_target:null};}
 function hasJsonChanges() {return state.jsonDraft!==null&&state.jsonDraft!==state.jsonBase;}
@@ -4879,9 +4894,11 @@ async function restoreDraft() {
     const legacy=draft?.config?.config_version==null;
     if(draft&&draft.config?.targets?.length&&(legacy||sameConfig(draft.bootstrap&&normalizeRateThreshold(draft.bootstrap),normalizeRateThreshold(state.bootstrap.config)))){
       const gatewayAccessDraft=draft.gatewayAccessDraft || {};
-      let config=omitInactiveGatewayAccess(draft.config,gatewayAccessDraft),notes=[];
-      if(legacy){const result=await api('/api/config/draft',{method:'POST',body:JSON.stringify(config)});config=result.config;notes=result.migration_notes || [];}
+      let config=omitInactiveGatewayAccess(draft.config,gatewayAccessDraft),notes=[],warnings=[],limitNotes=[];
+      if(legacy){const result=await api('/api/config/draft',{method:'POST',body:JSON.stringify(config)});config=result.config;notes=result.migration_notes || [];warnings=result.migration_warnings || [];limitNotes=result.migration_limit_notes || [];}
       state.config=normalizeRateThreshold(config);state.gatewayAccessDraft=gatewayAccessDraft;state.dismissedMigrationNotes=draft.dismissedMigrationNotes || [];
+      state.migrationLimitNotes=[...new Set([...(draft.migrationLimitNotes || []),...limitNotes])];
+      state.migrationWarnings=mergeMigrationWarnings(draft.migrationWarnings || [],warnings);
       state.migrationNotes=[...new Set([...(draft.migrationNotes || []),...state.dismissedMigrationNotes,...notes])];
     }else sessionStorage.removeItem('giraffe-draft-v1');
   }catch{}
@@ -4889,7 +4906,7 @@ async function restoreDraft() {
 function saveDraft() {
   if(!state.bootstrap||!state.config)return;
   captureFormDraft();
-  try{sessionStorage.setItem('giraffe-draft-v1',JSON.stringify({bootstrap:state.bootstrap.config,config:state.config,gatewayAccessDraft:state.gatewayAccessDraft,migrationNotes:state.migrationNotes,dismissedMigrationNotes:state.dismissedMigrationNotes}));}catch{}
+  try{sessionStorage.setItem('giraffe-draft-v1',JSON.stringify({bootstrap:state.bootstrap.config,config:state.config,gatewayAccessDraft:state.gatewayAccessDraft,migrationNotes:state.migrationNotes,migrationLimitNotes:state.migrationLimitNotes,migrationWarnings:state.migrationWarnings,dismissedMigrationNotes:state.dismissedMigrationNotes}));}catch{}
 }
 function syncConfigView() {
   const dirty=hasJsonChanges();
@@ -4937,7 +4954,7 @@ async function applyConfig(text=state.jsonDraft,{importing=false}={}) {
     const result=await api('/api/config/draft',{method:'POST',body:JSON.stringify(parsed)});
     if(version!==state.routeVersion||revision!==state.configRevision)return;
     captureFormDraft();
-    replaceMigrationNotes(result.migration_notes);
+    replaceMigrationNotes(result.migration_notes,result.migration_warnings,result.migration_limit_notes);
     state.config=result.config;state.gatewayAccessDraft={};state.autoModel=null;invalidateModelDiscovery();state.datasetSelection=[];
     // An explicit restart target in imported/edited JSON remains visible and intentional.
     state.formMode=result.config.restart_target?'cold-start':'normal';state.formRestartTarget=result.config.restart_target;
@@ -4966,11 +4983,11 @@ async function validatedSnapshot({draft=false}={}) {
       throw new Error(`Enter a model for target "${payload.config.targets[missing].name}" before running or copying a CLI command. You can still apply or export this draft.`);
     }
   }
-  try{const localErrors=localSettingErrors(payload.config);if(localErrors.length)throw Object.assign(new Error(localErrors[0].msg),{errors:localErrors});const result=await api(draft?'/api/config/draft':'/api/config/validate',{method:'POST',body:JSON.stringify(payload.config)});if(version===state.routeVersion&&revision===state.configRevision)acceptMigrationNotes(result.migration_notes);payload.config=result.config;}
+  try{const localErrors=localSettingErrors(payload.config);if(localErrors.length)throw Object.assign(new Error(localErrors[0].msg),{errors:localErrors});const result=await api(draft?'/api/config/draft':'/api/config/validate',{method:'POST',body:JSON.stringify(payload.config)});if(version===state.routeVersion&&revision===state.configRevision)acceptMigrationNotes(result.migration_notes,result.migration_warnings,result.migration_limit_notes);payload.config=result.config;}
   catch(error){if(version===state.routeVersion&&revision===state.configRevision&&error.errors?.length){state.requestPreview={status:'error',revision,route:version,error:error.message,errors:error.errors};renderRequestPreview();focusFirstSettingError(error);}throw error;}
   if(version!==state.routeVersion||revision!==state.configRevision)throw new Error('Configuration changed during validation. Try again with the current settings.');
   assertAppliedConfig();if(!draft&&!tokenizerSetupReady())throw new Error(currentTokenizerSelection()?.message || 'Wait for the Token ID check on the connection page before continuing.');
-  return {...payload,migration_notes:[...(state.migrationNotes || [])]};
+  return {...payload,migration_notes:[...(state.migrationNotes || [])],migration_warnings:activeMigrationWarnings()};
 }
 async function exportConfig() {
   configError();
@@ -5389,5 +5406,5 @@ document.addEventListener('visibilitychange',()=>{
   else if(location.hash==='#new')schedulePoll(pollNew,version,state.active?300:10000);
   else if(state.active)schedulePoll(pollRunStatus,version,300);
 });
-async function init(){initReticulate();try{const [bootstrap,baselines]=await Promise.all([api('/api/bootstrap'),api('/api/baselines')]);state.bootstrap=bootstrap;connectionError();state.baselines=baselines.baselines || [];state.config=clone(bootstrap.config);replaceMigrationNotes(bootstrap.migration_notes);await restoreDraft();state.config.restart_target=null;state.diskActive=bootstrap.disk_active_id || null;setActive(bootstrap.active_run_id);$('#suite-version').textContent=`suite ${bootstrap.suite_version || 'unknown'}`;$('#runner-location').textContent=bootstrap.hostname || 'UI server connected';const detailLink=location.hash.startsWith('#runs/');if(!detailLink)await refreshRuns().catch(()=>{});await route();if(detailLink)refreshRuns().catch(()=>{});}catch(error){if(state.accessExpired){$('#main').innerHTML='<div class="page-heading"><h1>Access expired</h1></div>';return;}if(document.body)document.body.dataset.runner='unavailable';$('#main').innerHTML=`<div class="page-heading"><h1>Local runner unavailable</h1></div>${notice(error.message,'error')}<button class="button" data-action="reconnect">Reconnect</button>`;}}
+async function init(){initReticulate();try{const [bootstrap,baselines]=await Promise.all([api('/api/bootstrap'),api('/api/baselines')]);state.bootstrap=bootstrap;connectionError();state.baselines=baselines.baselines || [];state.config=clone(bootstrap.config);replaceMigrationNotes(bootstrap.migration_notes,bootstrap.migration_warnings,bootstrap.migration_limit_notes);await restoreDraft();state.config.restart_target=null;state.diskActive=bootstrap.disk_active_id || null;setActive(bootstrap.active_run_id);$('#suite-version').textContent=`suite ${bootstrap.suite_version || 'unknown'}`;$('#runner-location').textContent=bootstrap.hostname || 'UI server connected';const detailLink=location.hash.startsWith('#runs/');if(!detailLink)await refreshRuns().catch(()=>{});await route();if(detailLink)refreshRuns().catch(()=>{});}catch(error){if(state.accessExpired){$('#main').innerHTML='<div class="page-heading"><h1>Access expired</h1></div>';return;}if(document.body)document.body.dataset.runner='unavailable';$('#main').innerHTML=`<div class="page-heading"><h1>Local runner unavailable</h1></div>${notice(error.message,'error')}<button class="button" data-action="reconnect">Reconnect</button>`;}}
 init();

@@ -628,7 +628,7 @@ def test_legacy_migration_no_blending_notes_and_roundtrip():
         "traffic": {"arrival": "poisson", "rates": [10], "duration_seconds": 60},
         "arrivals": {"mode": "burst", "requests": 8, "burst_size": 2, "interval_seconds": 3},
     }
-    converted, notes = migrate_load_test(v)
+    converted, notes, warnings = migrate_load_test(v)
     assert converted["checks"] == ["load"]
     c = RunConfig.model_validate(v)
     assert c._migration_notes

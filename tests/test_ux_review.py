@@ -37,7 +37,7 @@ assert.doesNotMatch(visible,/evaluator calls|Endpoint request budgets|Pass crite
 assert.match(markup,/<details class="request-planning workload-breakdown"><summary>Request breakdown<\/summary>/);
 assert.equal(nodes['#run-bar-summary'].textContent,'unchanged'); // No second traffic count in the footer.
 assert.equal(nodes['#start-run'].disabled,false);
-if(plan.count_kind==='bounded'){assert.match(visible,/Unknown requests/);assert.match(markup,/Sending \/ maintained-load time/);assert.doesNotMatch(visible,/0 requests/);assert.match(markup,/completion-driven requests/i);}
+if(plan.count_kind==='bounded'){assert.match(visible,/Requests depend on response time/);assert.match(markup,/Sending \/ maintained-load time/);assert.doesNotMatch(visible,/0 requests/);assert.match(markup,/completion-driven requests/i);}
 if(plan.count_kind==='estimate')assert.match(visible,/≈ /);
 state.configRevision++;renderRequestPlan();assert.equal(nodes['#start-run'].disabled,true);
 assert.match(nodes['#request-plan'].innerHTML,/stale/);assert.doesNotMatch(nodes['#request-plan'].innerHTML,/plan-total|Request breakdown/);
