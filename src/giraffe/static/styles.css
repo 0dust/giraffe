@@ -579,7 +579,7 @@ main:has(.new-run-layout.connecting) .setup-lede { font-size: 16px; margin-top: 
 /* Review (step 3) */
 #setup-review { padding: 0 32px 8px; border-radius: var(--r-xl); background: var(--surface); border: 1px solid var(--line); box-shadow: var(--highlight); }
 /* Pre-flight sheet: a full-width traffic hero, then "where requests go" beside "what and where". */
-#setup-review > .setup-body { display: grid; grid-template-columns: minmax(0, 1fr); grid-template-areas: "hero" "flight" "scope" "criteria" "options" "guide"; }
+#setup-review > .setup-body { display: grid; grid-template-columns: minmax(0, 1fr); grid-template-areas: "hero" "flight" "scope" "criteria" "options" "guide"; container-type: inline-size; }
 #setup-review .review-main, #setup-review #request-plan { display: contents; }
 .plan-hero { grid-area: hero; display: grid; grid-template-columns: minmax(0, 1fr) auto; column-gap: 48px; align-items: end; padding: 26px 0 24px; border-bottom: 1px solid var(--line); }
 .plan-hero > .review-section-heading, .plan-hero > .plan-ceiling, .plan-hero > :is(.review-load, .notice, .actions, .plan-status, .button) { grid-column: 1 / -1; }
@@ -594,6 +594,10 @@ main:has(.new-run-layout.connecting) .setup-lede { font-size: 16px; margin-top: 
 .plan-hero.is-over .plan-ceiling span { background: var(--blocked); }
 .plan-hero > .review-load, .plan-hero > .notice { margin-top: 16px; }
 .plan-hero > .actions { margin-top: 10px; }
+@container (max-width: 840px) {
+  .plan-hero { grid-template-columns: minmax(0, 1fr); }
+  .plan-hero > .review-limits { grid-column: 1; grid-row: auto; flex-wrap: wrap; row-gap: 14px; margin-top: 18px; }
+}
 .plan-status { font-size: 18px; color: var(--text-2); padding: 6px 0 2px; }
 .plan-flight { grid-area: flight; padding: 22px 0; min-width: 0; }
 .plan-flight .flight-plan { padding: 0; background: none; border: 0; border-radius: 0; gap: 14px; }
