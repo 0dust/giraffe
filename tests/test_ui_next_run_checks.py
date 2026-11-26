@@ -33,13 +33,14 @@ assert.equal(disclosure.querySelector('p').textContent,'No traffic was sent for 
 '''.replace('VERDICT', repr(verdict)).replace('CUSTOM', str(custom).lower()).replace('DEFAULT_CHECKS', json.dumps(RunConfig(targets=[{'name': 'local', 'url': 'http://localhost/v1', 'model': 'test'}]).checks)), dom=True)
 
 
-def test_button_requires_unselected_checks_and_completed_saved_report():
+def test_button_requires_available_checks_and_completed_saved_report():
     run_render_checks(r'''
 const saved=report([check('access','pass'),check('generation','skipped',{summary:'Not selected for this run.'})]);
 for(const status of ['running','stopping','queued','error']){
  detail(saved,{state:status});assert.equal(document.querySelector('[data-action="choose-next-checks"]'),null);
 }
-detail(report([check('access','pass')]));
+const all=checkGroups.flatMap(group=>group.checks).filter(id=>bootstrap.checks.some(c=>c.id===id));
+detail(report(all.map(id=>check(id,'pass'))));
 assert.equal(document.querySelector('[data-action="choose-next-checks"]'),null);
 detail(null,{config:saved.manifest.config});
 assert.equal(document.querySelector('[data-action="choose-next-checks"]'),null);
@@ -142,4 +143,65 @@ def test_post_run_guard_ignores_choose_next_checks_until_it_expires():
  assert.equal(state.config,configBefore);assert.equal(state.setupStep,stepBefore);assert.equal(location.hash,hashBefore);
  now+=601;await listeners.click({target:$('[data-action="choose-next-checks"]')});assert.equal(reruns,1);
 })()
+""", dom=True)
+
+
+
+def test_omitted_unselected_rows_still_offer_next_run_checks():
+    run_render_checks(r"""
+const ids=['access','serving','first_output','generation','load','context','correctness','json','cancellation','recovery','gpu'];
+for(const id of checkGroups.flatMap(group=>group.checks))assert(bootstrap.checks.some(c=>c.id===id));
+const saved=report(ids.map((id,index)=>check(id,index<4?'fail':'pass')),{overall:'fail'});
+const html=detail(saved);
+assert.match(document.querySelector('.check-count').textContent,/11 checks · 4 need attention · 7 passed/);
+const buttons=document.querySelectorAll('[data-action="choose-next-checks"]');
+assert.equal(buttons.length,1);
+const row=buttons[0].closest('.checks-not-selected-row');assert(row);assert.equal(row.childNodes.length,1);
+assert.equal(buttons[0].textContent,'Choose checks for next run');
+assert.equal(document.querySelector('.checks-not-selected'),null);
+assert.doesNotMatch(html,/<details class="checks-not-selected">/);
+""", dom=True)
+
+
+def test_available_checks_match_setup_catalogue_and_missing_bootstrap_fallback():
+    run_render_checks(r"""
+const saved=report([check('access','pass')]);
+state.bootstrap={...bootstrap,checks:bootstrap.checks.filter(c=>c.id==='access')};
+state.bootstrap.checks.push({id:'baseline'});
+detail(saved);assert.equal(document.querySelector('[data-action="choose-next-checks"]'),null);
+state.bootstrap.checks.push(bootstrap.checks.find(c=>c.id==='multi_user'));
+detail(saved);assert.equal(document.querySelectorAll('[data-action="choose-next-checks"]').length,1);
+state.bootstrap=null;
+state.detail={state:'completed',report:saved};
+assert.match(renderChecks(saved),/data-action="choose-next-checks"/);
+saved.manifest.config.checks=checkGroups.flatMap(group=>group.checks);
+assert.doesNotMatch(renderChecks(saved),/data-action="choose-next-checks"/);
+""", dom=True)
+
+
+def test_legacy_selection_falls_back_to_report_rows():
+    run_render_checks(r"""
+const saved=report([check('access','pass')]);delete saved.manifest.config.checks;
+detail(saved);assert.equal(document.querySelector('[data-action="choose-next-checks"]'),null);
+saved.checks.push(check('multi_user','skipped',{summary:'Not selected for this run.'}));
+detail(saved);
+assert.equal(document.querySelectorAll('[data-action="choose-next-checks"]').length,1);
+const disclosure=document.querySelector('.checks-not-selected');
+assert.equal(disclosure.hasAttribute('open'),false);
+assert(disclosure.closest('.checks-not-selected-row'));
+assert.equal(disclosure.querySelector('summary').textContent,'Not selected: Multi-user');
+assert.equal(disclosure.querySelector('p').textContent,'No traffic was sent for these checks.');
+detail(saved,{state:'error'});
+assert.equal(document.querySelector('[data-action="choose-next-checks"]'),null);
+assert.equal(document.querySelector('.checks-not-selected-row'),null);
+assert(document.querySelector('.checks-not-selected'));
+""", dom=True)
+
+
+def test_lone_button_precedes_no_selected_results_message():
+    run_render_checks(r"""
+const html=detail(report([]));
+assert.equal(document.querySelectorAll('[data-action="choose-next-checks"]').length,1);
+assert.equal(document.querySelector('.checks-not-selected'),null);
+assert(html.indexOf('data-action="choose-next-checks"')<html.indexOf('No selected checks produced a result.'));
 """, dom=True)
