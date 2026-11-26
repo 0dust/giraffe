@@ -106,14 +106,16 @@ def test_extension_reason_renders_in_condition_dialog_and_point():
 ''', dom=True)
 
 
-@pytest.mark.parametrize('predicted', [False, True])
-def test_upper_allowance_renders_extension_label_and_help(predicted):
+@pytest.mark.parametrize('kind', ['before_extension', 'estimate', 'upper'])
+def test_upper_allowance_renders_extension_label_and_help(kind):
     config = RunConfig.model_validate(values())
     config.load_test.schedule.duration_seconds = 20
     config.load_test.request_timeout_seconds = 7
     config.load_test.pass_criteria.min_valid_responses = 5
     observations = None
-    if predicted:
+    if kind == 'upper':
+        config.load_test.pass_criteria.min_valid_responses = 1
+    if kind != 'before_extension':
         from giraffe.latency import input_bucket
         observations = {'local': [{
             'family': 'load.combinations.concurrent', 'concurrency': 1,
@@ -122,13 +124,24 @@ def test_upper_allowance_renders_extension_label_and_help(predicted):
             'n': 4, 'p50_ms': 6400, 'p90_ms': 6400,
         }]}
     plan = request_plan(config, observations=observations)
-    label = ('Upper allowance including request deadlines' if predicted
-             else 'Upper allowance before any window extension')
-    assert plan['load_test']['time_with_allowances_seconds'] == (33 if predicted else 27)
+    label = {'upper': 'Upper allowance including request deadlines',
+             'before_extension': 'Upper allowance before any window extension',
+             'estimate': 'Estimated duration including request deadlines'}[kind]
+    assert plan['load_test']['upper_allowance_kind'] == kind
+    assert plan['load_test']['time_with_allowances_seconds'] == (33 if kind == 'estimate' else 27)
     browser_logic('const plan=' + json.dumps(plan) + ',label=' + json.dumps(label) + r''';
 const html=renderLoadPlan(config,plan);
 assert(html.includes(label));
 assert(html.includes(loadElapsed(plan.load_test.time_with_allowances_seconds)));
+if(plan.load_test.upper_allowance_kind==='estimate'){
+assert(html.includes('Estimated duration</strong>'));
+assert(html.includes('Configured sending time, extra sending time predicted from recent response times, and request deadlines. If responses are slower than recent runs, sending continues longer, up to one request timeout per remaining round and within Maximum duration.'));
+}else{
+assert(html.includes('Upper allowance</strong>'));
 assert(html.includes('If fewer than the required valid responses start in a window, sending continues until they have, up to one request timeout per remaining round and within Maximum duration.'));
+}
 assert(html.includes('id="field-load_upper_allowance-info"'));
+// Tooltip selection follows metadata even if display wording changes.
+plan.load_test.upper_allowance_label='Independent wording';
+assert(renderLoadPlan(config,plan).includes(plan.load_test.upper_allowance_kind==='estimate'?'Estimated duration</strong>':'Upper allowance</strong>'));
 ''', config)

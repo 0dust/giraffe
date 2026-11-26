@@ -213,17 +213,20 @@ async def test_shortfall_uses_p90_with_p50_fallback(tmp_path, p50, p90):
     }]
 
 
-async def test_load_upper_allowance_adds_only_predicted_extension(tmp_path):
+@pytest.mark.parametrize('latency,extension,total', [(6400, 6, 33), (1000, 0, 27), (8000, 0, 27)])
+async def test_load_upper_allowance_adds_only_predicted_extension(tmp_path, latency, extension, total):
     payload = values()
     load = payload['load_test']
+    load['workloads']['combinations']['selected'] = ['short_long']
     load['schedule']['duration_seconds'] = 20
     load['request_timeout_seconds'] = 7
     load['pass_criteria']['min_valid_responses'] = 5
-    plan = await shortfall_preview(tmp_path, payload, [('short_short', 1, 6400, 6400)], full_plan=True)
-    assert plan['load_test']['time_with_allowances_seconds'] == 33
-    assert plan['load_test']['sending_extension_seconds'] == 6
-    assert plan['load_test']['upper_allowance_label'] == 'Upper allowance including request deadlines'
-    assert plan['check_time_summaries'][0]['total_seconds'] == 33
+    plan = await shortfall_preview(tmp_path, payload, [('short_long', 1, latency, latency)], full_plan=True)
+    assert plan['load_test']['time_with_allowances_seconds'] == total
+    assert plan['load_test']['sending_extension_seconds'] == extension
+    assert plan['load_test']['upper_allowance_label'] == 'Estimated duration including request deadlines'
+    assert plan['load_test']['upper_allowance_kind'] == 'estimate'
+    assert plan['check_time_summaries'][0]['total_seconds'] == total
 
 
 @pytest.mark.parametrize('latencies_ms', [(6400, 8000), (8000, 6400)])
@@ -253,7 +256,7 @@ async def test_load_upper_allowance_uses_largest_extension_across_targets(tmp_pa
     assert plan['load_test']['time_with_allowances_seconds'] == 43
 
 
-async def test_load_upper_allowance_labels_unpredicted_points_even_with_other_predictions(tmp_path):
+async def test_load_upper_allowance_is_estimated_with_partial_history(tmp_path):
     payload = values()
     load = payload['load_test']
     load['schedule']['duration_seconds'] = 20
@@ -262,7 +265,8 @@ async def test_load_upper_allowance_labels_unpredicted_points_even_with_other_pr
     load['patterns']['concurrent']['levels'] = [1, 2]
     plan = await shortfall_preview(tmp_path, payload, [('short_short', 1, 6400, 6400)], full_plan=True)
     assert plan['load_test']['time_with_allowances_seconds'] == 60
-    assert plan['load_test']['upper_allowance_label'] == 'Upper allowance before any window extension'
+    assert plan['load_test']['upper_allowance_label'] == 'Estimated duration including request deadlines'
+    assert plan['load_test']['upper_allowance_kind'] == 'estimate'
 
 
 @pytest.mark.parametrize('timeout', [5, 6.4])

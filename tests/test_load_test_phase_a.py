@@ -179,7 +179,10 @@ def test_load_upper_allowance_without_history_keeps_configured_bound(level, mini
         "Upper allowance before any window extension" if unpredicted
         else "Upper allowance including request deadlines"
     )
-    summary, = request_plan(c)["check_time_summaries"]
+    preview = request_plan(c)
+    assert preview["load_test"]["upper_allowance_kind"] == ("before_extension" if unpredicted else "upper")
+    assert preview["load_test"]["upper_allowance_label"] == plan["upper_allowance_label"]
+    summary, = preview["check_time_summaries"]
     assert summary["total_seconds"] == 27
 
 
@@ -195,6 +198,7 @@ def test_load_upper_allowance_does_not_extend_mixed_or_interference(kind):
     plan = load_time_plan(c.load_test)
     assert plan["time_with_allowances_seconds"] == plan["windows"] * 27
     assert plan["upper_allowance_label"] == "Upper allowance including request deadlines"
+    assert request_plan(c)["load_test"]["upper_allowance_kind"] == "upper"
 
 
 def test_true_poisson_counts_and_seed_reproducibility():

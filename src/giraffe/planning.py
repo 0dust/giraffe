@@ -472,6 +472,7 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
                     batches=batches)
 
     load_sending_extensions = {}
+    load_upper_allowance_kind = "upper"
 
     def fixed(target, row, seconds, field, *, count=1, timeout=0, observed=None, last_gaps=None, minimum_drain=False):
         if not seconds and not timeout:
@@ -598,6 +599,10 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
                     if point["pattern"] != "concurrent":
                         continue
                     settings = own[point["source"]]
+                    extendable = (point["type"] not in {"mixed", "interference"}
+                                  and settings.pass_criteria.min_valid_responses > point["level"])
+                    if extendable and load_upper_allowance_kind == "upper":
+                        load_upper_allowance_kind = "before_extension"
                     shapes = point_shapes(settings, point)
                     completion_points.append((point,len(shapes)))
                     concurrency = min(point["level"], shares[target.name])
@@ -618,6 +623,9 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
                             latency_ms = sample["p50_ms"]
                         if latency_ms <= 0:
                             continue
+                        # History makes this an estimate even when it predicts no extension.
+                        if extendable:
+                            load_upper_allowance_kind = "estimate"
                         latency_s = Decimal(str(latency_ms)) / 1000
                         duration = point["configured_window_seconds"]
                         timeout_s = settings.request_timeout_seconds
@@ -1204,7 +1212,8 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
                 ([f"Request deadlines after sending stops contribute {combine('drain_uncertainty_seconds'):g} seconds of uncertainty; more latency samples cannot remove that configured bound."]
                  if confidence == "low" and drain_fraction > .2 else []),
             "errors": errors, "time_warnings": warnings, "load_sample_warnings": load_sample_warnings,
-            "load_sending_extensions": load_sending_extensions}
+            "load_sending_extensions": load_sending_extensions,
+            "load_upper_allowance_kind": load_upper_allowance_kind}
 
 
 def _context_window_article(value):
@@ -1842,8 +1851,15 @@ def request_plan(config: RunConfig | ConfigDraft, *,
     request_warnings = grouped
     timing = _time_plan(config, rows, observations)
     predicted_extensions = timing.pop("load_sending_extensions")
+    allowance_kind = timing.pop("load_upper_allowance_kind")
     if load_plan:
         load_plan.update(load_time_plan(config.load_test, predicted_extensions=predicted_extensions))
+        load_plan["upper_allowance_kind"] = allowance_kind
+        load_plan["upper_allowance_label"] = {
+            "upper": "Upper allowance including request deadlines",
+            "before_extension": "Upper allowance before any window extension",
+            "estimate": "Estimated duration including request deadlines",
+        }[allowance_kind]
     sample_warnings = timing.pop("load_sample_warnings")
     load_warnings.extend(sample_warnings)
     warnings.extend(notice["msg"] for notice in sample_warnings)
