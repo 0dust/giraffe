@@ -285,9 +285,12 @@ reply per saved prompt with `id` matching its `fixture_id` in `prompts.json`,
 since the loaded pass repeats prompts:
 
 ```sh
-jq -c '.requests[] | select(.scenario == "pack_control") | {id: .workload.case_id, reply: .output, completion_tokens, finish_reason}' runs/replay/report.json
+jq -c '.requests[] | select(.scenario == "pack_control") | {id: .workload.case_id, reply: .output, completion_tokens, finish_reason, status, valid, error}' runs/replay/report.json
 ```
 
+Use a reply only when `status` is `completed` and `valid` is `true`; otherwise
+`error` explains the failure (for example `HTTP 503` or a stream that ended early),
+and `reply`, `completion_tokens` and `finish_reason` may be empty or partial.
 A `finish_reason` of `"length"` means the reply hit its token limit.
 
 Judge scoring requires an explicit evaluator endpoint in `judging.judges` and a
