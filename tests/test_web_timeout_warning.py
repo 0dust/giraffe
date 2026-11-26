@@ -250,3 +250,22 @@ async def test_external_run_without_readable_journal_waits_and_returns_idle(
         assert events["idle"] is True
         assert events["records"] == []
         assert events["seq"] == 17
+
+
+async def test_cli_live_config_comes_from_safe_journal_header(tmp_path):
+    from giraffe.deployment import safe_config
+
+    directory = tmp_path / "cli"
+    write_metadata(directory, {"id": "cli", "state": "running", "heartbeat_at": _now(),
+        "owner_pid": os.getpid(), "owner_host": socket.gethostname()})
+    safe = safe_config(config(request_options={"api_key": "secret-value"}))
+    writer = EvidenceWriter(directory, manifest={"config": safe})
+    writer.close()
+    async with browser(tmp_path) as client:
+        detail = (await client.get('/api/runs/cli')).json()
+        assert detail["config"] == safe
+        assert detail["config"]["targets"][0]["name"] == "local"
+        assert "secret-value" not in json.dumps(detail["config"])
+        response = await client.post('/api/config/draft', json=detail["config"])
+        assert response.status_code == 200, response.text
+        assert (await client.get('/api/runs/cli')).json()["config"] == safe

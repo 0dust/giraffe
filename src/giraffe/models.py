@@ -2965,6 +2965,7 @@ class RequestSpec(Model):
     deadline_source: Literal["run", "check", "load"] | None = Field(default=None, exclude=True)
     timeout_check: str | None = Field(default=None, exclude=True)
     timeout_setting: str | None = Field(default=None, exclude=True)
+    _fixture_request_timeout_seconds: float | None = PrivateAttr(default=None)
     load_point: dict[str, Any] | None = None
     requested_input_tokens: int | None = None
     requested_output_tokens: int | None = None

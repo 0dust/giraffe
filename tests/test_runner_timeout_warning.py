@@ -197,12 +197,17 @@ async def test_custom_fixture_timeout_names_file_and_field(monkeypatch, tmp_path
     assert format_timeout_warning(payload) in report.warnings
 
 
-def test_custom_fixture_provenance_for_other_consumers():
-    run = runner._Run(config(custom_fixtures="cases.json"), None, None)
-    source, check, setting = run.timeout_origin(spec(checks=["scale_down"],
-        request_timeout_seconds=1, workload={"request_source": "custom_fixtures"}))
-    assert (source, check) == ("run", None)
-    assert setting == "custom_fixtures (cases.json, fixture warning).request_timeout_seconds"
+def test_custom_fixture_provenance_for_other_consumers(tmp_path):
+    import json
+    from giraffe.fixtures import load_custom_fixtures
+
+    path = tmp_path / "cases.json"
+    path.write_text(json.dumps([{"fixture_id": "warning", "scorer": "none",
+        "messages": [{"role": "user", "content": "hi"}], "request_timeout_seconds": 1}]))
+    request = load_custom_fixtures(str(path))[0].model_copy(update={"check_ids": ["scale_down"]})
+    run = runner._Run(config(custom_fixtures=str(path)), None, None)
+    assert run.timeout_origin(request) == ("run", None,
+        f"custom_fixtures ({path}, fixture warning).request_timeout_seconds")
 
 
 @pytest.mark.parametrize("partial", [False, True])
@@ -312,3 +317,67 @@ async def test_report_warning_refreshes_after_successes(monkeypatch):
     assert payload == [event["timeout_warning"] for event in events if event["event"] == "timeout_warning"][-1]
     assert format_timeout_warning(payload) in report.warnings
     assert any("3 of 23 requests" in message for message in report.warnings)
+
+
+@pytest.mark.parametrize("source", ["pack", "custom_inherited", "custom_declared"])
+async def test_multi_user_warning_validates_actual_timeout_owner(tmp_path, monkeypatch, source):
+    import json
+    from giraffe.multi_user import execute
+
+    options = {}
+    if source == "pack":
+        options = {"request_source": "request_pack", "request_pack": {"version": 1, "cases": [
+            {"fixture_id": "one", "scorer": "none", "messages": [{"role": "user", "content": "hi"}]}]}}
+    else:
+        path = tmp_path / "cases.json"
+        entry = {"fixture_id": "one", "scorer": "none", "messages": [{"role": "user", "content": "hi"}]}
+        if source == "custom_declared":
+            entry["request_timeout_seconds"] = .025
+        path.write_text(json.dumps([entry]))
+        options = {"custom_fixtures": str(path)}
+    cfg = config(checks=["multi_user", "load"], request_timeout_seconds=.025,
+        load_test={"request_timeout_seconds": 13}, multi_user={"levels": [3], "duration_seconds": .15,
+        "think_time_seconds": {"values": [0]}}, **options)
+    monkeypatch.setattr(FakeClient, "delay", .08)
+    run = runner._Run(cfg, None, None)
+    await execute(run, cfg.targets[0], FakeClient(cfg.targets[0], cfg))
+    assert len(run.records) >= 3
+    payload = run.timeout_watch.warnings[0]
+    assert payload["timed_out"] >= 3 and payload["deadline_seconds"] == .025
+    if source == "custom_declared":
+        assert str(path) in payload["setting"] and payload["cli_flag"] is None
+    else:
+        assert payload["setting"] == "request_timeout_seconds" and payload["cli_flag"] == "--request-timeout"
+
+
+@pytest.mark.parametrize("source,check,timeout,expected", [
+    ("load", None, 13, ("load", None, "load_test.request_timeout_seconds")),
+    ("load", None, .025, ("run", None, None)),
+    ("check", "generation", 7, ("check", "generation", None)),
+    ("check", "generation", .025, ("run", None, None)),
+])
+def test_explicit_provenance_must_match_deadline(source, check, timeout, expected):
+    cfg = config(checks=["generation", "load"], request_timeout_seconds=.025,
+        load_test={"request_timeout_seconds": 13}, test_options={"generation": {"request_timeout_seconds": 7}})
+    request = spec(checks=["multi_user"], request_timeout_seconds=timeout,
+                   deadline_source=source, timeout_check=check)
+    assert runner._Run(cfg, None, None).timeout_origin(request) == expected
+
+
+def test_fixture_timeout_marker_survives_copy_without_changing_identity(tmp_path):
+    import json
+    from giraffe.fixtures import load_custom_fixtures
+    from giraffe.deployment import fixture_hash
+
+    path = tmp_path / "cases.json"
+    path.write_text(json.dumps([{"fixture_id": "one", "scorer": "none",
+        "messages": [{"role": "user", "content": "hi"}], "request_timeout_seconds": 1}]))
+    request = load_custom_fixtures(str(path))[0]
+    copied = request.model_copy(update={"request_timeout_seconds": 2})
+    assert copied._fixture_request_timeout_seconds == 1
+    assert runner._Run(config(custom_fixtures=str(path)), None, None).timeout_origin(copied) == ("run", None, None)
+    serialized = request.model_dump()
+    assert "_fixture_request_timeout_seconds" not in serialized
+    plain = request.model_copy()
+    plain._fixture_request_timeout_seconds = None
+    assert fixture_hash(serialized) == fixture_hash(plain.model_dump())

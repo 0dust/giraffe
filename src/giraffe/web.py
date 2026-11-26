@@ -987,7 +987,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                 if cached is None or cached["identity"] != identity or stat.st_size < cached["offset"]:
                     journal_cursor += 1
                     cached = {"identity": identity, "offset": 0, "warnings": OrderedDict(),
-                              "seq": journal_cursor, "reset_after": journal_cursor,
+                              "seq": journal_cursor, "reset_after": journal_cursor, "config": {},
                               "request_versions": OrderedDict(),
                               "requests": OrderedDict(), "live_request_count": 0,
                               "live_request_summary": {"evicted": 0, "through_slot": None, "statuses": {}},
@@ -1003,6 +1003,12 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                         try:
                             value = json.loads(line)
                         except (ValueError, UnicodeError):
+                            continue
+                        if isinstance(value, dict) and value.get("type") == "header":
+                            manifest = value.get("manifest")
+                            config = manifest.get("config") if isinstance(manifest, dict) else None
+                            if isinstance(config, dict):
+                                cached["config"] = config
                             continue
                         if isinstance(value, dict) and value.get("type") == "record":
                             record = value.get("record")
@@ -1049,7 +1055,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                 reset = after is not None and (after < cached["reset_after"] or after > cached["seq"])
                 requests = {slot: row for slot, row in cached["requests"].items()
                             if after is None or reset or cached["request_versions"][slot] > after}
-                return {"seq": cached["seq"], "reset": reset,
+                return {"seq": cached["seq"], "reset": reset, "config": deepcopy(cached["config"]),
                         "idle": after == cached["seq"] and not reset,
                         "timeout_warnings": deepcopy(list(cached["warnings"].values())),
                         "requests": deepcopy(requests),
@@ -1514,7 +1520,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                 "recoverable": pending_recovery(directory,
                     report_available=None if listing else persisted is not None),
                 "phases": live.get("phases", meta.get("phases", [])),
-                "config": meta.get("config") or (persisted or {}).get("manifest", {}).get("config", {}),
+                "config": meta.get("config") or (persisted or {}).get("manifest", {}).get("config") or journal.get("config", {}),
                 "baseline_id": ((persisted or {}).get("baseline") or {}).get("saved_baseline_id", meta.get("baseline_id")),
                 "report": persisted, "summary": summary,
                 "resources": meta.get("resources", {}), "auto_cleanup": meta.get("auto_cleanup"),

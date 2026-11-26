@@ -1044,3 +1044,17 @@ mergeRunEvents(detail,{seq:103,records:[{id:'third',slot:2,target:'local',status
 assert.equal(detail.live_requests.length,3);assert.equal(detail.live_requests[2].status,'timeout');
 }
 """)
+
+
+def test_timeout_setting_shortcuts_are_hidden_without_run_config():
+    run_render_checks(r"""
+{
+const warning={key:'local|2|run',target:'local',deadline_seconds:2,setting:'request_timeout_seconds',settings:['request_timeout_seconds','load_test.request_timeout_seconds'],finished:3,timed_out:3,no_output:3};
+state.detail={id:'cli',state:'running',stoppable:false,config:{},events:[],progress:{},live_requests:[],timeout_warnings:[warning]};
+renderLive();
+assert(document.querySelector('.live-timeout-warning'));
+assert.equal(document.querySelectorAll('[data-action="timeout-setting"]').length,0);
+state.detail.config={targets:[{name:'local',model:'m'}]};renderLive();
+assert.equal(document.querySelectorAll('[data-action="timeout-setting"]').length,2);
+}
+""", dom=True)

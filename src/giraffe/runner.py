@@ -719,28 +719,34 @@ class _Run:
                 self.release_slot()
 
     def timeout_origin(self, spec):
-        """Follow the configuration owner, including shared response precedence.
-
-        Resolve this alongside the effective deadline, rather than guessing its
-        source from equal timeout values. Explicit producer context wins.
-        """
-        if spec.deadline_source is not None and not ("load" in spec.check_ids and spec.load_point):
-            return spec.deadline_source, spec.timeout_check, spec.timeout_setting
+        """Validate producer provenance against the request's actual deadline."""
         timeout = spec.request_timeout_seconds
-        if "load" in spec.check_ids and timeout is not None:
+        if timeout is None:
+            return "run", None, None
+        if (spec.workload.get("request_source") == "custom_fixtures"
+                and spec._fixture_request_timeout_seconds == timeout):
+            return "run", None, (f"custom_fixtures ({self.config.custom_fixtures}, fixture {spec.fixture_id})"
+                                 ".request_timeout_seconds")
+        if spec.deadline_source == "load" or spec.deadline_source is None and "load" in spec.check_ids:
             source = (spec.load_point or {}).get("source", "native")
             setting = "load_test.request_timeout_seconds"
             settings = self.config.load_test
             if source.startswith("legacy_"):
-                index = int(source.split("_")[1])
-                settings = settings.migrated_tests[index].settings
+                try:
+                    index = int(source.split("_")[1])
+                    settings = settings.migrated_tests[index].settings
+                except (ValueError, IndexError):
+                    return "run", None, None
                 setting = f"load_test.migrated_tests.{index}.settings.request_timeout_seconds"
             if settings.request_timeout_seconds == timeout:
                 return "load", None, setting
-        if spec.workload.get("request_source") == "custom_fixtures" and spec.request_timeout_seconds is not None:
-            return "run", None, (f"custom_fixtures ({self.config.custom_fixtures}, fixture {spec.fixture_id})"
-                                 ".request_timeout_seconds")
-        if timeout is None:
+        if spec.deadline_source is not None:
+            check = spec.timeout_check
+            options = self.config.test_options.get(check)
+            if (spec.deadline_source == "check" and check in self.config.checks and options is not None
+                    and options.request_timeout_seconds is not None
+                    and self.config.effective_check(check)["request_timeout_seconds"] == timeout):
+                return "check", check, None
             return "run", None, None
         if spec.scenario in {"initial", "readiness", "warm"}:
             if spec.scenario in {"initial", "readiness"} and "access" in self.config.checks:
