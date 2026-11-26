@@ -1740,6 +1740,9 @@ main > #report-results { padding-top:20px; }
 .answer-excerpt summary { display:inline-block; max-width:calc(100% - 70px); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; vertical-align:top; cursor:pointer; text-decoration:underline dotted; }
 .answer-excerpt pre { white-space:pre-wrap; overflow-wrap:anywhere; max-height:240px; overflow:auto; }
 .finding-expanded { margin-top:14px; border-top:1px solid var(--line); }
+.checks-not-selected-row { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; flex-wrap:wrap; }
+.checks-not-selected-row > .checks-not-selected { flex:1 1 320px; min-width:0; }
+.checks-not-selected-row > .button { flex:none; margin-top:2px; }
 .passed-checks > summary, .checks-not-selected > summary, .run-diagnostics > summary, .preparation-status > summary { padding:8px 0; cursor:pointer; color:var(--text-2); font-size:12px; }
 .passed-checks .finding-check { margin-top:8px; }
 .passed-checks { min-width:0; }
