@@ -182,6 +182,7 @@ def test_waiting_for_shared_slots_ends_with_point_window(monkeypatch):
         monkeypatch.setattr("tests.test_concurrent_load.time", load.time)
         clock = asyncio.get_running_loop().time
         c = short_windows(configuration(load={'schedule': {'levels': [2]}}), .03)
+        c.load_test.pass_criteria.min_valid_responses = 1
         run = _Run(c, None, None)
         admitted = 0
         @asynccontextmanager
@@ -431,3 +432,60 @@ def test_finite_arrival_corrections_revalidate_or_explain_impossible_minimum(rat
 
 
 # Fake inference clients in this module use the matching local tokenizer.
+
+
+
+def test_shared_slots_never_free_extension_ends_at_finite_cap(monkeypatch):
+    from tests.virtual_clock import run_virtual
+
+    async def scenario():
+        c = short_windows(configuration(load={'schedule': {'levels': [2]}}), .03)
+        c.max_duration_seconds = None
+        c.load_test.pass_criteria.min_valid_responses = 5
+        c.load_test.request_timeout_seconds = .2
+        run = _Run(c, None, None)
+        deadlines, finished = [], []
+        clock = asyncio.get_running_loop().time
+
+        @asynccontextmanager
+        async def unavailable_slot(reserved, deadline=None, *, gateway_probe=False):
+            assert not reserved
+            deadlines.append(deadline)
+            try:
+                async with asyncio.timeout_at(deadline):
+                    await asyncio.Event().wait()
+            except TimeoutError:
+                finished.append(clock())
+                yield False
+
+        monkeypatch.setattr(run, 'slot', unavailable_slot)
+        p = load.test_points(c.load_test)[0]
+        before = clock()
+        # Five remaining requests / two workers need three timeout rounds.
+        extension_cap = before + .03 + 3 * .2
+        try:
+            records, window = await asyncio.wait_for(
+                load.concurrent_window(run, c.targets[0], Client(), c.load_test, p, {}),
+                extension_cap - before + .1,
+            )
+        except TimeoutError:
+            pytest.fail('shared slot waits outlived the finite extension cap')
+        assert records == []
+        assert clock() == pytest.approx(extension_cap)
+        assert max(deadlines) == pytest.approx(extension_cap)
+        assert max(finished) <= extension_cap
+        assert p['window_extension'] == {
+            'configured_seconds': .03, 'sending_seconds': pytest.approx(.63),
+            'reason': 'min_valid_responses',
+        }
+        assert window['window_reason'] == 'extension limit reached'
+        assert window['cut_short']
+        assert p['window_extension_note'] == (
+            'Sending continued 0.6 s past the 0.03 s window so 5 requests could start.'
+            ' It stopped early: extension limit reached.'
+        )
+        sending, drain = run.observations['local']['schedule_transitions']
+        assert sending['end_ms'] == pytest.approx(extension_cap * 1000)
+        assert drain['end_ms'] == pytest.approx(extension_cap * 1000)
+
+    run_virtual(monkeypatch, scenario())
