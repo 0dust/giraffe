@@ -1065,6 +1065,11 @@ def _main(argv: list[str] | None = None) -> int:
                 if json_output:
                     emit("blocked", states.EXIT_CODE_BLOCKED, target=target, message=message)
                 return states.EXIT_CODE_BLOCKED
+        if args.command == "run" and not args.skip_preflight and "load" in config.checks:
+            from giraffe.deployment import probe_context_windows
+            windows = asyncio.run(probe_context_windows(config))
+            config._preflight_context_windows = windows
+            plan = request_plan(config, observations=load_observations(runs_root, config), context_windows=windows)
         planning_warnings = plan["warnings"]
         for warning in planning_warnings:
             print(f"Warning: {warning}", file=sys.stderr)

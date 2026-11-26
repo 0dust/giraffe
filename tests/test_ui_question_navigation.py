@@ -510,7 +510,7 @@ const generated='Generates prompts using these input token targets and output ca
 const fixture='Uses the configured fixture file; its answer limits and checks are preserved.';
 const checkSource=source=>{
  const prose=[...profile.querySelectorAll('p')].filter(node=>!node.hidden).map(node=>node.textContent).join(' ');
- assert.equal(prose.includes(generated),source==='builtin'&&!state.config.custom_fixtures,'Generated source explanation');
+ assert.equal(prose.includes(generated),false,'Generated source explanation stays out of visible prose');
  assert.equal(prose.includes(fixture),source==='builtin'&&Boolean(state.config.custom_fixtures),'Fixture source explanation');
  const scope=form.querySelector('.question-source-scope');
  assert.equal(Boolean(scope&&!scope.hidden),source==='request_pack'&&state.config.checks.includes('correctness'),'Shared question explanation');

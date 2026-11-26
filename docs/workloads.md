@@ -717,7 +717,12 @@ Arbitrary environment dumps and unknown top-level configuration fields are exclu
 
 Discovery is optional and read-only: `discovery: ollama` reads `/api/version` and
 `/api/show`, with optional `/api/tags` and `/api/ps` for matching model digests and
-active context length; `discovery: vllm` reads `/version`. Served model identifiers also come
+active context length; `discovery: vllm` reads `/version`, and optionally `/v1/models`
+for the served model's `max_model_len` (context window). Before a run (CLI
+`giraffe run` preflight, UI Connect), Giraffe reads the context window from
+`/v1/models` (vLLM, SGLang) or the configured discovery route and uses it to plan
+the Load test; LMDeploy and TensorRT-LLM do not report one, so set it in
+`deployment.serving.context_limit`. Served model identifiers also come
 from inference responses. A separately configured `collector_url` can return an
 allowlisted JSON export with `scope` and `collected_at`. A collector never inherits
 inference credentials. Use an accessible read-only export, not a privileged agent
