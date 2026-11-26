@@ -33,7 +33,7 @@ GATEWAY_GENERATORS = (
     # Output-budget changes affect prefixes; dedicated Load requests are unchanged.
     "a04c62a2e7b10ab0aef201cf5c283fe53df694d247ca5ce35caca1340a83f387",
 )
-CURRENT_LOAD_SOURCE = "ab442c8b54be31143ad52fa20f86cd896d2fcf39da495a80cc48db9bc5cb90ee"
+CURRENT_LOAD_SOURCE = "3d2fd5628600a0d75e7c15edd2b1414ab376172cba2c15928a44d80014e99498"
 
 
 @pytest.mark.asyncio

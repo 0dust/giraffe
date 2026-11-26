@@ -48,10 +48,12 @@ async def test_explicit_model_sends_one_bounded_request_and_preserves_auth(monke
         url="http://server" + suffix, model="  manual-model  ", api_key_env=" CONNECTION_KEY ",
         headers_env={"X-Gateway": "CONNECTION_HEADER"}, request_options={"temperature": 0},
     ))
-    assert set(result) == {"status", "model", "latency_ms", "message"}
+    assert set(result) == {"status", "model", "latency_ms", "message", "context_window", "context_window_reason"}
+    assert result["context_window"] is None
     assert result["status"] == "connected" and result["model"] == "manual-model"
     assert result["latency_ms"] >= 0
-    assert len(requests) == 1 and requests[0].method == "POST"
+    assert len(requests) == 2 and requests[0].method == "POST"
+    assert requests[1].method == "GET" and requests[1].url.path.endswith("/models")
     base = "/gateway/v1" if suffix.startswith("/gateway") else "/v1"
     assert str(requests[0].url) == "http://server" + base + "/chat/completions"
     assert requests[0].headers["Authorization"] == "Bearer private-key"
@@ -228,9 +230,9 @@ async def test_same_ca_proxy_and_environment_transport_apply_to_discovery_and_pr
     result = await check_connection(ConnectionTest(url="https://server", ca_bundle="private-ca.pem",
                                                  proxy="http://proxy:8080"))
     assert result["status"] == "connected" and len(requests) == 2
-    assert ca_files == ["private-ca.pem", "private-ca.pem"]
+    assert ca_files == ["private-ca.pem"] * 2
     assert all(client["verify"] is trust and client["proxy"] == "http://proxy:8080"
-               and client["trust_env"] and not client["follow_redirects"] for client in clients)
+               and client.get("trust_env", True) and not client["follow_redirects"] for client in clients)
 
 
 @pytest.mark.parametrize("model", [None, "model"])
