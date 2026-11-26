@@ -293,25 +293,25 @@ def _rejected_evidence_field(body: bytes) -> str | None:
     return None
 
 
-def _rejected_request_option(body: bytes, keys: Iterable[str]) -> str | None:
-    """Retain only a rejected key supplied by the caller, never server error text."""
+def _rejected_request_option(body: bytes, keys: Iterable[str]) -> tuple[str | None, bool]:
+    """Retain a configured key or an other-field flag, never server error text."""
     try:
         data = json.loads(body)
     except (ValueError, UnicodeDecodeError):
-        return None
+        return None, False
     if not isinstance(data, dict):
-        return None
+        return None, False
     error = data.get("error")
     detail = data.get("detail")
     keys = set(keys)
-    if isinstance(error, dict) and isinstance(error.get("param"), str) and error["param"] in keys:
-        return error["param"]
-    if isinstance(detail, list):
+    if isinstance(error, dict) and isinstance(error.get("param"), str) and error["param"]:
+        return (error["param"], False) if error["param"] in keys else (None, True)
+    if isinstance(detail, list) and any(
+            isinstance(item, dict) and isinstance(item.get("loc"), list) for item in detail):
         matches = {key for key in keys if any(
             isinstance(item, dict) and isinstance(item.get("loc"), list) and key in item["loc"]
             for item in detail)}
-        if matches:
-            return next(iter(matches)) if len(matches) == 1 else None
+        return (next(iter(matches)) if len(matches) == 1 else None), not matches
     if isinstance(error, dict):
         message = error.get("message")
     elif isinstance(error, str):
@@ -321,7 +321,7 @@ def _rejected_request_option(body: bytes, keys: Iterable[str]) -> str | None:
     # Common-word keys can occur in error prose without identifying a rejected option.
     matches = {key for key in keys if "_" in key and isinstance(message, str)
                and re.search(r"\b" + re.escape(key) + r"\b", message)}
-    return next(iter(matches)) if len(matches) == 1 else None
+    return (next(iter(matches)) if len(matches) == 1 else None), False
 
 
 def _answer_spans(
@@ -1232,9 +1232,11 @@ class LLMClient:
                         if spec.scenario == "connection" and response.status_code in {400, 404, 422}:
                             if response.status_code in {400, 422} and request_option_keys:
                                 record.workload["request_option_keys"] = request_option_keys
-                                rejected_option = _rejected_request_option(error_body, request_option_keys)
+                                rejected_option, other_field_named = _rejected_request_option(error_body, request_option_keys)
                                 if rejected_option:
                                     record.workload["rejected_request_option"] = rejected_option
+                                if other_field_named:
+                                    record.workload["rejected_other_field"] = True
                             # Keep only the classification, never arbitrary server error text.
                             body = error_body.decode("utf-8", errors="replace").lower()
                             try:

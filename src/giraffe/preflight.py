@@ -322,6 +322,9 @@ async def check_target(target: Target, config: RunConfig) -> dict:
                 message = (f"The server returned HTTP {record.http_status} and rejected "
                            f"request_options.{rejected_option}. Check that field's value or remove it "
                            "from the configuration.")
+            elif record.workload.get("rejected_other_field"):
+                message = (f"The server returned HTTP {record.http_status}. "
+                           "Check the model name and OpenAI-compatible endpoint.")
             elif record.http_status in {400, 422} and option_keys:
                 option_names = ", ".join(option_keys[:5])
                 if len(option_keys) > 5:

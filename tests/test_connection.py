@@ -338,6 +338,32 @@ async def test_api_connection_rejection_prefers_param_over_prose(tmp_path, monke
     assert len(requests) == 1
 
 
+@pytest.mark.parametrize("status,body", [
+    pytest.param(400, {"error": {"param": "max_tokens", "message":
+                               "max_tokens must be at least 64 when reasoning_effort is high."}},
+                 id="param-with-prose"),
+    pytest.param(400, {"error": {"param": "max_tokens", "message":
+                               "max_tokens must be at least 64."}}, id="param-without-prose"),
+    pytest.param(422, {"detail": [{"loc": ["body", "max_tokens"], "msg": "x"}],
+                       "message": "max_tokens must be at least 64 when reasoning_effort is high."},
+                 id="loc-with-prose"),
+])
+async def test_api_connection_other_structured_field_keeps_generic_warning(tmp_path, monkeypatch, status, body):
+    requests, _ = endpoint(monkeypatch, lambda request: httpx.Response(status, json=body))
+    async with browser(tmp_path) as client:
+        response = await client.post("/api/targets/test-connection", json={
+            "url": "http://server", "model": "tiny", "request_options": {"reasoning_effort": "high"},
+        })
+    assert response.status_code == 422
+    message = response.json()["detail"]
+    assert message == (f"The server returned HTTP {status}. "
+                       "Check the model name and OpenAI-compatible endpoint.")
+    assert "reasoning_effort" not in message and "rejected request_options" not in message
+    assert len(requests) == 1
+    payload = json.loads(requests[0].content)
+    assert payload["max_tokens"] == 32 and payload["reasoning_effort"] == "high"
+
+
 async def test_active_run_blocks_extra_connection_traffic(tmp_path, monkeypatch, local_tokenizer):
     async def running(configuration, *, progress, stop_event):
         await stop_event.wait()

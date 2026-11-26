@@ -77,6 +77,44 @@ async def test_request_option_rejection_message_is_private(monkeypatch, status, 
         assert private not in json.dumps(workload)
 
 
+@pytest.mark.parametrize("status,body", [
+    pytest.param(400, {"error": {"param": "max_tokens", "message":
+                               "max_tokens must be at least 64 when reasoning_effort is high."}},
+                 id="param-with-prose"),
+    pytest.param(400, {"error": {"param": "max_tokens", "message":
+                               "max_tokens must be at least 64."}}, id="param-without-prose"),
+    pytest.param(422, {"detail": [{"loc": ["body", "max_tokens"], "msg": "x"}],
+                       "message": "max_tokens must be at least 64 when reasoning_effort is high."},
+                 id="loc-with-prose"),
+])
+async def test_other_structured_field_keeps_generic_preflight_warning(monkeypatch, status, body):
+    requests, _ = endpoint(monkeypatch, lambda request: httpx.Response(status, json=body))
+    records = []
+    execute = LLMClient.execute
+
+    async def capture(client, spec):
+        record = await execute(client, spec)
+        records.append(record)
+        return record
+
+    monkeypatch.setattr(LLMClient, "execute", capture)
+    target = Target(name="local", url="http://server", model="tiny")
+    with pytest.raises(PreflightError) as error:
+        await check_target(target, RunConfig(targets=[target], request_options={"reasoning_effort": "high"}))
+
+    message = str(error.value)
+    assert message == (f"The server returned HTTP {status}. "
+                       "Check the model name and OpenAI-compatible endpoint.")
+    assert "reasoning_effort" not in message and "rejected request_options" not in message
+    assert not error.value.blocking
+    assert len(requests) == 1
+    payload = json.loads(requests[0].content)
+    assert payload["max_tokens"] == 32 and payload["reasoning_effort"] == "high"
+    assert records[0].workload["rejected_other_field"] is True
+    assert "rejected_request_option" not in records[0].workload
+    assert "max_tokens" not in json.dumps(records[0].workload)
+
+
 async def test_request_option_fallback_lists_at_most_five_keys(monkeypatch):
     endpoint(monkeypatch, lambda request: httpx.Response(400, json={"error": {"message": "bad"}}))
     target = Target(name="local", url="http://server", model="tiny")
@@ -144,43 +182,49 @@ async def test_rejection_records_only_configured_preflight_options(monkeypatch, 
 
 
 @pytest.mark.parametrize("body,keys,expected", [
-    (b"not JSON", ["temperature"], None),
-    (b"[]", ["temperature"], None),
-    (b'{"error":"bad reasoning_effort"}', ["reasoning_effort"], "reasoning_effort"),
-    (b'{"detail":"bad reasoning_effort"}', ["reasoning_effort"], "reasoning_effort"),
-    (b'{"message":"bad reasoning_effort"}', ["reasoning_effort"], "reasoning_effort"),
-    (b'{"error":{"message":"bad reasoning_effort_extra"}}', ["reasoning_effort"], None),
-    (b'{"error":{"message":"bad option_name.value"}}', ["option_name.value"], "option_name.value"),
-    (b'{"error":{"message":"bad option_nameXvalue"}}', ["option_name.value"], None),
-    (b'{"error":{"message":"invalid user input"}}', ["user"], None),
-    (b'{"error":{"message":"bad seed"}}', ["seed"], None),
-    (b'{"error":{"message":"stop now"}}', ["stop"], None),
-    (b'{"error":{"param":"seed"}}', ["seed"], "seed"),
-    (b'{"detail":[{"loc":["body","stop"]}]}', ["stop"], "stop"),
-    (b'{"error":{"param":"z"},"detail":[{"loc":["a"]}]}', ["z", "a"], "z"),
+    (b"not JSON", ["temperature"], (None, False)),
+    (b"[]", ["temperature"], (None, False)),
+    (b'{"error":"bad reasoning_effort"}', ["reasoning_effort"], ("reasoning_effort", False)),
+    (b'{"detail":"bad reasoning_effort"}', ["reasoning_effort"], ("reasoning_effort", False)),
+    (b'{"message":"bad reasoning_effort"}', ["reasoning_effort"], ("reasoning_effort", False)),
+    (b'{"error":{"message":"bad reasoning_effort_extra"}}', ["reasoning_effort"], (None, False)),
+    (b'{"error":{"message":"bad option_name.value"}}', ["option_name.value"], ("option_name.value", False)),
+    (b'{"error":{"message":"bad option_nameXvalue"}}', ["option_name.value"], (None, False)),
+    (b'{"error":{"message":"invalid user input"}}', ["user"], (None, False)),
+    (b'{"error":{"message":"bad seed"}}', ["seed"], (None, False)),
+    (b'{"error":{"message":"stop now"}}', ["stop"], (None, False)),
+    (b'{"error":{"param":"seed"}}', ["seed"], ("seed", False)),
+    (b'{"detail":[{"loc":["body","stop"]}]}', ["stop"], ("stop", False)),
+    (b'{"error":{"param":"z"},"detail":[{"loc":["a"]}]}', ["z", "a"], ("z", False)),
     (b'{"error":{"param":"reasoning_effort","message":"bad chat_template_kwargs"}}',
-     ["reasoning_effort", "chat_template_kwargs"], "reasoning_effort"),
+     ["reasoning_effort", "chat_template_kwargs"], ("reasoning_effort", False)),
     (b'{"error":{"param":"temperature"},"detail":[{"loc":["body","reasoning_effort"]}]}',
-     ["reasoning_effort"], "reasoning_effort"),
+     ["reasoning_effort"], (None, True)),
     (b'{"error":{"param":"temperature","message":"bad reasoning_effort"}}',
-     ["reasoning_effort"], "reasoning_effort"),
-    (b'{"error":{"param":"temperature"}}', ["reasoning_effort"], None),
+     ["reasoning_effort"], (None, True)),
+    (b'{"error":{"param":"temperature"}}', ["reasoning_effort"], (None, True)),
     (b'{"error":{"param":["reasoning_effort"],"message":"bad reasoning_effort"}}',
-     ["reasoning_effort"], "reasoning_effort"),
+     ["reasoning_effort"], ("reasoning_effort", False)),
     (b'{"detail":[{"loc":["body","reasoning_effort"]}],"message":"bad chat_template_kwargs"}',
-     ["reasoning_effort", "chat_template_kwargs"], "reasoning_effort"),
+     ["reasoning_effort", "chat_template_kwargs"], ("reasoning_effort", False)),
     (b'{"detail":[{"loc":["reasoning_effort"]},{"loc":["reasoning_effort"]}]}',
-     ["reasoning_effort"], "reasoning_effort"),
+     ["reasoning_effort"], ("reasoning_effort", False)),
     (b'{"detail":[{"loc":["reasoning_effort"]},{"loc":["chat_template_kwargs"]}],'
-     b'"message":"bad reasoning_effort"}', ["reasoning_effort", "chat_template_kwargs"], None),
+     b'"message":"bad reasoning_effort"}', ["reasoning_effort", "chat_template_kwargs"], (None, False)),
     (b'{"detail":[{"loc":["temperature"]}],"message":"bad reasoning_effort"}',
-     ["reasoning_effort"], "reasoning_effort"),
+     ["reasoning_effort"], (None, True)),
     (b'{"error":{"message":"reasoning_effort and chat_template_kwargs"}}',
-     ["reasoning_effort", "chat_template_kwargs"], None),
+     ["reasoning_effort", "chat_template_kwargs"], (None, False)),
     (b'{"error":{"message":"bad reasoning_effort"}}',
-     ["reasoning_effort", "reasoning_effort"], "reasoning_effort"),
-    (b'{"detail":[null,{"loc":"temperature"}]}', ["temperature"], None),
-    (b'{"error":{"message":null}}', ["temperature"], None),
+     ["reasoning_effort", "reasoning_effort"], ("reasoning_effort", False)),
+    (b'{"detail":[null,{"loc":"temperature"}]}', ["temperature"], (None, False)),
+    (b'{"error":{"param":"","message":"bad reasoning_effort"}}',
+     ["reasoning_effort"], ("reasoning_effort", False)),
+    (b'{"detail":[{"loc":[]}],"message":"bad reasoning_effort"}',
+     ["reasoning_effort"], (None, True)),
+    (b'{"detail":[null,{"loc":"temperature"}],"message":"bad reasoning_effort"}',
+     ["reasoning_effort"], ("reasoning_effort", False)),
+    (b'{"error":{"message":null}}', ["temperature"], (None, False)),
 ])
 def test_rejected_request_option_matches_only_supplied_keys(body, keys, expected):
     from giraffe.client import _rejected_request_option
