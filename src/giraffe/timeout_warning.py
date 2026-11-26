@@ -16,8 +16,13 @@ def format_timeout_warning(payload: dict, check_label=None) -> str:
         for path in payload.get("settings", [payload["setting"]]))
     fixtures = {item["setting"]: item for item in payload.get("fixture_settings", [])}
     if fixtures:
-        edits = "; ".join(f'edit {item["field"]} on fixture {item["fixture_id"]} in {item["file"]}'
-                          for item in fixtures.values())
+        groups = {}
+        for item in fixtures.values():
+            ids = groups.setdefault((item["file"], item["field"]), [])
+            if item["fixture_id"] not in ids:
+                ids.append(item["fixture_id"])
+        edits = "; ".join(f"edit {field} on {'fixture' if len(ids) == 1 else 'fixtures'} "
+                          f"{', '.join(ids)} in {file}" for (file, field), ids in groups.items())
         other = [path for path in payload.get("settings", [payload["setting"]]) if path not in fixtures]
         remedy = f"{edits}" + (f" and raise {' and '.join(other)}" if other else "") + ", then stop and rerun"
     else:

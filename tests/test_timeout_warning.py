@@ -205,3 +205,31 @@ def test_active_warning_refreshes_after_twenty_successes():
 def test_warning_formats_precise_deadline(seconds, label):
     assert f"the {label} request timeout" in format_timeout_warning(
         activate(TimeoutWatch(), request_timeout_seconds=seconds))
+
+
+@pytest.mark.parametrize("ids", [["slow"], ["slow", "slow-2", "slow-3"]])
+def test_formatter_groups_fixture_remedies_by_file_and_field_without_mutating_payload(ids):
+    from copy import deepcopy
+    payload = activate(TimeoutWatch())
+    fixtures = [{"setting": f"fixture:{name}", "file": "/long/path/cases.json",
+                 "field": "request_timeout_seconds", "fixture_id": name} for name in ids]
+    payload.update(setting=fixtures[0]["setting"], settings=[item["setting"] for item in fixtures],
+                   fixture_settings=fixtures)
+    before = deepcopy(payload)
+    message = format_timeout_warning(payload)
+    noun = "fixture" if len(ids) == 1 else "fixtures"
+    assert f"edit request_timeout_seconds on {noun} {', '.join(ids)} in /long/path/cases.json, then stop and rerun" in message
+    assert message.count("/long/path/cases.json") == 1
+    assert payload == before
+
+
+def test_formatter_keeps_different_fixture_files_and_fields_separate():
+    payload = activate(TimeoutWatch())
+    fixtures = [{"setting": str(index), "file": file, "field": field, "fixture_id": name}
+                for index, (file, field, name) in enumerate([
+                    ("a.json", "request_timeout_seconds", "one"),
+                    ("a.json", "other_timeout", "two"),
+                    ("b.json", "request_timeout_seconds", "three")])]
+    payload.update(setting="0", settings=["0", "1", "2"], fixture_settings=fixtures)
+    message = format_timeout_warning(payload)
+    assert "edit request_timeout_seconds on fixture one in a.json; edit other_timeout on fixture two in a.json; edit request_timeout_seconds on fixture three in b.json" in message

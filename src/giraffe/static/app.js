@@ -4659,12 +4659,12 @@ function liveStopReasons(detail) {
   return [...reasons];
 }
 function timeoutSettingLabel(warning,setting) {
-  return (setting?[setting]:(warning.settings || [warning.setting])).map(setting=>{
+  return [...new Set((setting?[setting]:(warning.settings || [warning.setting])).map(setting=>{
     if((warning.fixture_settings || []).some(item=>item.setting===setting))return 'Fixture request timeout';
     if(setting.startsWith('load_test.'))return 'Load request timeout';
     if(setting.startsWith('test_options.'))return `${catalogTitle(setting.split('.')[1])} request timeout`;
     return 'Request timeout';
-  }).join(' and ');
+  }))].join(' and ');
 }
 function timeoutBreakdown(warning) {
   return [['answer_started','had started answering'],['reasoning_only','produced reasoning only'],['no_output','received no output']].filter(([key])=>warning[key]>0).map(([key,label])=>`${number(warning[key])} ${label}`).join(' · ');
@@ -4673,13 +4673,22 @@ function timeoutWarnings(detail) {
   return activeState(detail)?detail.timeout_warnings || []:Object.values(detail.report?.observations?.targets || {}).flatMap(target=>target?.timeout_warnings || []);
 }
 const timeoutDeadline=seconds=>seconds<1?`${Number((seconds*1000).toPrecision(12))} ms`:elapsed(seconds);
+function timeoutFixtureGroups(warning) {
+  const groups=new Map();
+  for(const item of warning.fixture_settings || []){
+    const key=JSON.stringify([item.file,item.field]);
+    if(!groups.has(key))groups.set(key,{file:item.file,field:item.field,ids:[]});
+    const group=groups.get(key);if(!group.ids.includes(item.fixture_id))group.ids.push(item.fixture_id);
+  }
+  return [...groups.values()];
+}
 function renderTimeoutWarnings(detail,{live=activeState(detail)}={}) {
   const warnings=timeoutWarnings(detail);if(!warnings.length)return '';
   const title=live?'Requests are timing out':'Requests timed out',config=detail.config || detail.report?.manifest?.config,canChangeTimeout=Boolean(config?.targets?.length);
-  const help=warnings.map(warning=>{const deadline=timeoutDeadline(warning.deadline_seconds),label=timeoutSettingLabel(warning),fixtures=warning.fixture_settings || [],remedy=fixtures.length?`${fixtures.map(item=>`edit ${item.field} on fixture ${item.fixture_id} in ${item.file}`).join('; ')}, then run again`:`run again with a higher ${label}`;return live?`Each request may take up to ${deadline}. Giraffe will not change this during the run. Stop run keeps the results collected so far. To give the server more time, ${remedy}. Keep it if responses slower than ${deadline} should count as failures. Intentional timeout tests are not counted here.`:`Each request could take up to ${deadline}. To give the server more time, ${remedy}. Keep it if responses slower than ${deadline} should count as failures. Intentional timeout tests are not counted here.`;}).join(' ');
-  const row=warning=>{const fixtures=warning.fixture_settings || [],settings=(warning.settings || [warning.setting]).filter(setting=>!fixtures.some(item=>item.setting===setting));return `<li>${escape(warning.target)} · ${number(warning.timed_out)} of ${number(warning.finished)} requests hit the ${escape(timeoutDeadline(warning.deadline_seconds))} ${escape(timeoutSettingLabel(warning).toLowerCase())} · ${escape(timeoutBreakdown(warning))} ${fixtures.map(item=>`<span>Edit <code>${escape(item.field)}</code> on fixture <code>${escape(item.fixture_id)}</code> in ${escape(item.file)}</span>`).join(' · ')} ${(canChangeTimeout?settings:[]).map(setting=>`<button type="button" class="text-button" data-action="timeout-setting" data-timeout-key="${escape(warning.key)}" data-timeout-setting="${escape(setting)}">${settings.length>1?`Change ${escape(timeoutSettingLabel(warning,setting))}`:'Change timeout for next run'}</button>`).join(' ')}</li>`;};
+  const help=warnings.map(warning=>{const deadline=timeoutDeadline(warning.deadline_seconds),label=timeoutSettingLabel(warning),fixtures=warning.fixture_settings || [],remedy=fixtures.length?`${timeoutFixtureGroups(warning).map(item=>`edit ${item.field} on ${item.ids.length===1?'fixture':'fixtures'} ${item.ids.join(', ')} in ${item.file}`).join('; ')}, then run again`:`run again with a higher ${label}`;return live?`Each request may take up to ${deadline}. Giraffe will not change this during the run. Stop run keeps the results collected so far. To give the server more time, ${remedy}. Keep it if responses slower than ${deadline} should count as failures. Intentional timeout tests are not counted here.`:`Each request could take up to ${deadline}. To give the server more time, ${remedy}. Keep it if responses slower than ${deadline} should count as failures. Intentional timeout tests are not counted here.`;}).join(' ');
+  const row=warning=>{const fixtures=warning.fixture_settings || [],settings=(warning.settings || [warning.setting]).filter(setting=>!fixtures.some(item=>item.setting===setting));return `<li>${escape(warning.target)} · ${number(warning.timed_out)} of ${number(warning.finished)} requests hit the ${escape(timeoutDeadline(warning.deadline_seconds))} ${escape(timeoutSettingLabel(warning).toLowerCase())} · ${escape(timeoutBreakdown(warning))}${timeoutFixtureGroups(warning).map(item=>` · <span>Edit <code>${escape(item.field)}</code> on ${item.ids.length===1?'fixture':'fixtures'} ${item.ids.map(id=>`<code>${escape(id)}</code>`).join(', ')} in <span title="${escape(item.file)}">${escape(item.file.split(/[\\/]/).pop())}</span></span>`).join('')} ${(canChangeTimeout?settings:[]).map(setting=>`<button type="button" class="text-button" data-action="timeout-setting" data-timeout-key="${escape(warning.key)}" data-timeout-setting="${escape(setting)}">${settings.length>1?`Change ${escape(timeoutSettingLabel(warning,setting))}`:'Change timeout for next run'}</button>`).join(' ')}</li>`;};
   const expanded=state.timeoutWarningExpansion?.id===detail.id&&state.timeoutWarningExpansion.open;
-  return `<section class="notice warning ${live?'live':'report'}-timeout-warning" role="status"${live?' aria-live="polite"':''}><strong>${title}</strong> ${infoHelp(`${live?'live':'report'}_timeout_warning`,title,help)}<ul>${warnings.slice(0,4).map(row).join('')}</ul>${warnings.length>4?`<details data-timeout-more${expanded?' open':''}><summary>and ${number(warnings.length-4)} more targets/settings</summary><ul>${warnings.slice(4).map(row).join('')}</ul></details>`:''}${(live?detail.live_requests:detail.report?.requests)?.some(record=>requestFilterStatus(record)==='timed_out')?'<div class="actions"><button type="button" class="text-button" data-action="show-timeouts">Show timed-out requests</button></div>':`<p class="hint">${live?'Timed-out requests have left the live request list. The saved report lists all of them.':'Timed-out request details were not kept in this report.'}</p>`}</section>`;
+  return `<section class="notice warning ${live?'live':'report'}-timeout-warning" role="status"${live?' aria-live="polite"':''}><strong>${title}</strong> ${infoHelp(`${live?'live':'report'}_timeout_warning`,title,help)}<ul>${warnings.slice(0,4).map(row).join('')}</ul>${warnings.length>4?`<details class="timeout-warning-more" data-timeout-more${expanded?' open':''}><summary><span class="when-closed">Show ${number(warnings.length-4)} more ${warnings.length===5?'target/setting':'targets/settings'}</span><span class="when-open">Show fewer</span></summary><ul>${warnings.slice(4).map(row).join('')}</ul></details>`:''}${(live?detail.live_requests:detail.report?.requests)?.some(record=>requestFilterStatus(record)==='timed_out')?'<div class="actions"><button type="button" class="text-button" data-action="show-timeouts">Show timed-out requests</button></div>':`<p class="hint">${live?'Timed-out requests have left the live request list. The saved report lists all of them.':'Timed-out request details were not kept in this report.'}</p>`}</section>`;
 }
 function showTimedOutRequests() {
   chooseReportTab('results');filterAllRequests('timed_out');

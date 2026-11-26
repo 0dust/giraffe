@@ -825,7 +825,7 @@ assert(html.includes(`${catalogTitle('serving').toLowerCase()} request timeout a
 state.detail.timeout_warnings=[{...warning,setting:'custom_fixtures (cases.json, fixture slow).request_timeout_seconds',fixture_settings:[{setting:'custom_fixtures (cases.json, fixture slow).request_timeout_seconds',file:'cases.json',fixture_id:'slow',field:'request_timeout_seconds'}]}];renderLive();html=nodes['#main'].innerHTML;
 assert.match(html,/30s fixture request timeout/);
 state.detail.timeout_warnings=Array.from({length:6},(_,i)=>({...warning,key:String(i)}));renderLive();html=nodes['#main'].innerHTML;
-assert.match(html,/and 2 more targets\/settings/);
+assert.match(html,/Show 2 more targets\/settings/);
 state.detail.timeout_warnings=[];renderLive();assert.doesNotMatch(nodes['#main'].innerHTML,/live-timeout-warning/);
 mergeRunEvents(state.detail,{seq:1,events:[],timeout_warnings:[warning]});assert.equal(state.detail.timeout_warnings[0].timed_out,3);
 """)
@@ -1092,3 +1092,57 @@ assert.equal(document.querySelector('[data-request-id="request-1"]').getAttribut
 const dot=document.querySelector('.swarm-dot');assert(dot.getAttribute('aria-label').includes('Request 2 of 3'));
 }
 """, dom=True)
+
+
+@pytest.mark.parametrize("ids", [["slow"], ["slow", "slow-2", "slow-3"]])
+def test_timeout_fixture_remedy_groups_labels_paths_and_escapes(ids):
+    run_render_checks(r"""
+{
+const ids=IDS,file='/long/path/cases.json';
+const fixtures=ids.map(id=>({setting:'fixture:'+id,file,field:'request_timeout_seconds',fixture_id:id}));
+const warning={key:'group',target:'local',deadline_seconds:.3,setting:fixtures[0].setting,settings:fixtures.map(item=>item.setting),fixture_settings:fixtures,finished:3,timed_out:3,no_output:3};
+const before=JSON.stringify(warning);
+state.detail={id:'live',state:'running',config:{targets:[{name:'local',model:'m'}]},events:[],progress:{},timeout_warnings:[warning]};renderLive();
+const notice=document.querySelector('.live-timeout-warning'),row=notice.querySelector('li'),noun=ids.length===1?'fixture':'fixtures';
+assert.equal(timeoutSettingLabel(warning),'Fixture request timeout');
+assert.equal(timeoutSettingLabel({...warning,settings:[...warning.settings,'request_timeout_seconds']}),'Fixture request timeout and Request timeout');
+assert(row.textContent.includes('300 ms fixture request timeout · 3 received no output · Edit request_timeout_seconds on '+noun+' '+ids.join(', ')+' in cases.json'));
+assert(!row.textContent.includes('/long/path'));
+assert.equal(row.querySelector('[title]').getAttribute('title'),file);
+assert.equal(row.querySelector('[title]').textContent,'cases.json');
+const help=notice.querySelector('.field-help').textContent;
+assert(help.includes('edit request_timeout_seconds on '+noun+' '+ids.join(', ')+' in '+file));
+assert.equal(help.split(file).length-1,1);
+assert.equal(JSON.stringify(warning),before);
+const hostile={setting:'hostile',file:'/long/"<bad>/cases&.json',field:'timeout<field>',fixture_id:'slow<script>'};
+state.detail.timeout_warnings=[{...warning,setting:'hostile',settings:['hostile'],fixture_settings:[hostile]}];renderLive();
+const escaped=document.querySelector('.live-timeout-warning'),escapedRow=escaped.querySelector('li');
+assert.equal(escapedRow.querySelector('[title]').getAttribute('title'),hostile.file);
+assert.equal(escapedRow.querySelector('[title]').textContent,'cases&.json');
+assert.equal(escaped.querySelector('script'),null);
+assert.equal(escapedRow.querySelector('code').textContent,hostile.field);
+assert(escapedRow.textContent.includes(hostile.fixture_id));assert.equal(escapedRow.querySelector('field'),null);
+}
+""".replace('IDS', json.dumps(ids)), dom=True)
+
+
+@pytest.mark.parametrize("extra", [1, 2])
+def test_timeout_disclosure_reuses_chevrons_and_open_closed_copy(extra):
+    css = (Path(__file__).parents[1] / "src/giraffe/static/styles.css").read_text()
+    assert re.search(r":is\([^)]*\.timeout-warning-more[^)]*\) > summary::before", css)
+    assert re.search(r":is\([^)]*\.timeout-warning-more[^)]*\)\[open\] > summary::before", css)
+    run_render_checks(r"""
+{
+const warning={key:'group',target:'local',deadline_seconds:2,setting:'request_timeout_seconds',finished:3,timed_out:3,no_output:3};
+state.detail={id:'live',state:'running',config:{targets:[{name:'local',model:'m'}]},events:[],progress:{},timeout_warnings:Array.from({length:4+EXTRA},(_,i)=>({...warning,key:'group-'+i}))};
+renderLive();
+let more=document.querySelector('.timeout-warning-more');assert(more);
+assert.equal(more.querySelector('.when-closed').textContent,'Show '+EXTRA+' more '+(EXTRA===1?'target/setting':'targets/settings'));
+assert.equal(more.querySelector('.when-open').textContent,'Show fewer');
+assert.equal(more.querySelector('ul').getAttribute('class'),document.querySelector('.live-timeout-warning').querySelector('ul').getAttribute('class'));
+assert.equal(more.querySelectorAll('li').length,EXTRA);
+assert.equal(more.querySelectorAll('[data-action="timeout-setting"]').length,EXTRA);
+more.open=true;listeners.toggle({target:more});renderLive();
+assert.equal(document.querySelector('.timeout-warning-more').open,true);
+}
+""".replace('EXTRA', str(extra)), dom=True)
