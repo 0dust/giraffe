@@ -648,8 +648,8 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
                         required = math.floor((rounds_needed - 1) * latency_s) + 1
                         field = f"{prefix}.schedule.duration_seconds"
                         sending_estimates[point["id"]] = required
-                        load_sending_extensions[point["id"]] = (
-                            load_sending_extensions.get(point["id"], 0) + required - duration
+                        load_sending_extensions[point["id"]] = max(
+                            load_sending_extensions.get(point["id"], 0), required - duration
                         )
                         load_warning_groups.setdefault(("load_sample_shortfall", field), []).append({
                             **base, "estimated_requests": estimated_requests, "required_seconds": required,

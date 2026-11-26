@@ -226,6 +226,33 @@ async def test_load_upper_allowance_adds_only_predicted_extension(tmp_path):
     assert plan['check_time_summaries'][0]['total_seconds'] == 33
 
 
+@pytest.mark.parametrize('latencies_ms', [(6400, 8000), (8000, 6400)])
+async def test_load_upper_allowance_uses_largest_extension_across_targets(tmp_path, latencies_ms):
+    payload = values()
+    payload['targets'].append({**payload['targets'][0], 'name': 'other', 'model': 'other'})
+    load = payload['load_test']
+    load['schedule']['duration_seconds'] = 20
+    load['request_timeout_seconds'] = 10
+    load['pass_criteria']['min_valid_responses'] = 5
+    await shortfall_preview(tmp_path, payload, [('short_short', 1, 6400, 6400)])
+    history_path = tmp_path / 'previous' / '.web.json'
+    history = json.loads(history_path.read_text())
+    for target, latency in zip(history['latency_summary']['targets'], latencies_ms):
+        target['measurements'][0].update(p50_ms=latency, p90_ms=latency)
+    history_path.write_text(json.dumps(history))
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_app(tmp_path)), base_url='http://127.0.0.1:8787'
+    ) as client:
+        response = await client.post('/api/config/preview', json=payload)
+    assert response.status_code == 200, response.text
+    plan = response.json()['request_plan']
+    warning, = [row for row in plan['load_warnings'] if row.get('kind') == 'load_sample_shortfall']
+    assert sorted(item['required_seconds'] for item in warning['values']['conditions']) == [26, 33]
+    assert plan['load_test']['sending_extension_seconds'] == 13
+    assert plan['load_test']['time_with_allowances_seconds'] == 43
+
+
 async def test_load_upper_allowance_labels_unpredicted_points_even_with_other_predictions(tmp_path):
     payload = values()
     load = payload['load_test']
