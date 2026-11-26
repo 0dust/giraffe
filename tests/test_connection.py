@@ -319,6 +319,25 @@ async def test_api_connection_rejection_mentions_request_options(tmp_path, monke
     assert len(requests) == 1
 
 
+async def test_api_connection_rejection_prefers_param_over_prose(tmp_path, monkeypatch):
+    requests, _ = endpoint(monkeypatch, lambda request: httpx.Response(400, json={"error": {
+        "param": "reasoning_effort",
+        "message": "Invalid value for reasoning_effort. The supplied chat_template_kwargs was accepted.",
+    }}))
+    async with browser(tmp_path) as client:
+        response = await client.post("/api/targets/test-connection", json={
+            "url": "http://server", "model": "tiny", "request_options": {
+                "reasoning_effort": "bogus", "chat_template_kwargs": {"enable_thinking": False},
+            },
+        })
+    assert response.status_code == 422
+    assert response.json()["detail"] == (
+        "The server returned HTTP 400 and rejected request_options.reasoning_effort. "
+        "Check that field's value or remove it from the configuration.")
+    assert "chat_template_kwargs" not in response.text and "bogus" not in response.text
+    assert len(requests) == 1
+
+
 async def test_active_run_blocks_extra_connection_traffic(tmp_path, monkeypatch, local_tokenizer):
     async def running(configuration, *, progress, stop_event):
         await stop_event.wait()

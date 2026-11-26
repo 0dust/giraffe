@@ -303,23 +303,25 @@ def _rejected_request_option(body: bytes, keys: Iterable[str]) -> str | None:
         return None
     error = data.get("error")
     detail = data.get("detail")
+    keys = set(keys)
+    if isinstance(error, dict) and isinstance(error.get("param"), str) and error["param"] in keys:
+        return error["param"]
+    if isinstance(detail, list):
+        matches = {key for key in keys if any(
+            isinstance(item, dict) and isinstance(item.get("loc"), list) and key in item["loc"]
+            for item in detail)}
+        if matches:
+            return next(iter(matches)) if len(matches) == 1 else None
     if isinstance(error, dict):
         message = error.get("message")
     elif isinstance(error, str):
         message = error
     else:
         message = detail if isinstance(detail, str) else data.get("message")
-    for key in sorted(keys):
-        if isinstance(error, dict) and error.get("param") == key:
-            return key
-        if isinstance(detail, list) and any(
-                isinstance(item, dict) and isinstance(item.get("loc"), list) and key in item["loc"]
-                for item in detail):
-            return key
-        # Common-word keys can occur in error prose without identifying a rejected option.
-        if "_" in key and isinstance(message, str) and re.search(r"\b" + re.escape(key) + r"\b", message):
-            return key
-    return None
+    # Common-word keys can occur in error prose without identifying a rejected option.
+    matches = {key for key in keys if "_" in key and isinstance(message, str)
+               and re.search(r"\b" + re.escape(key) + r"\b", message)}
+    return next(iter(matches)) if len(matches) == 1 else None
 
 
 def _answer_spans(
