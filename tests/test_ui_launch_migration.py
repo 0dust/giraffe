@@ -1,5 +1,7 @@
 """Launch notes and traffic headlines preserve warning and count semantics."""
 
+import pytest
+
 from tests.test_ux_catalogue import browser_logic
 
 
@@ -54,6 +56,8 @@ async def test_removed_load_warning_survives_all_import_and_bootstrap_paths(tmp_
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://localhost') as client:
         for path in ['/api/config/draft', '/api/config/validate', '/api/config/preview', '/api/config/plan']:
             body = (await client.post(path, json=legacy_removed_load())).json()
+            assert body['migration_limit_notes'] == body['migration_notes'][:1]
+            assert len(body['migration_notes']) == 12
             assert body['config']['checks'] == ['access']
             assert body['migration_warnings'] == expected
             assert all('won\'t run' not in note and 'unselected' not in note for note in body['migration_notes'])
@@ -65,15 +69,16 @@ async def test_removed_load_warning_survives_all_import_and_bootstrap_paths(tmp_
         body = (await client.get('/api/bootstrap')).json()
         assert body['migration_warnings'] == expected
     import json
-    browser_logic('''
+    browser_logic(r'''
 const imported=IMPORT;
 state.config=imported.config;
-acceptMigrationNotes(imported.migration_notes,imported.migration_warnings);
+acceptMigrationNotes(imported.migration_notes,imported.migration_warnings,imported.migration_limit_notes);
 assert.equal(activeMigrationWarnings().length,1);
 let launch=renderRunBlueprint(state.config);
 assert.equal((launch.match(/notice warning setting-issue/g)||[]).length,1);
 assert(launch.includes(escape(imported.migration_warnings[0].msg)));
 assert(!renderMigrationNotes().includes('sending windows'));
+assert.match(renderMigrationNotes(),/<summary>11 other settings converted<\/summary>/);
 state.dismissedMigrationNotes=[...state.migrationNotes];acceptMigrationNotes();
 assert.equal(renderMigrationNotes(),'');
 assert.equal(activeMigrationWarnings().length,1);
@@ -87,16 +92,23 @@ assert.match(renderMigrationWarnings(),/will not run &lt;example&gt;/);
 '''.replace('IMPORT', json.dumps(body)), config=resolved)
 
 
-def test_cli_preview_prints_removal_as_warning(tmp_path, capsys):
+@pytest.mark.parametrize('command', ['preview', 'validate'])
+def test_cli_preview_prints_removal_as_warning(tmp_path, capsys, command):
     import json
-    from giraffe.cli import main
+    from giraffe.cli import main, migrated_configuration
     source = tmp_path / 'legacy.json'
     source.write_text(json.dumps(legacy_removed_load()))
-    assert main(['preview', '--config', str(source)]) == 0
-    stderr = capsys.readouterr().err
+    expected = migrated_configuration(legacy_removed_load())._migration_notes
+    capsys.readouterr()
+    assert main([command, '--config', str(source), '--output-format', 'json']) == 0
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)['migration_notes'] == expected
+    stderr = captured.err
     assert 'Warning: ' + REMOVED_LOAD in stderr
     assert 'Migration: ' + REMOVED_LOAD not in stderr
-    assert 'Migration: Earlier Giraffe versions' in stderr
+    assert [line for line in stderr.splitlines() if line.startswith('Migration:')] == [
+        f'Migration: {note}' for note in expected]
+    assert len(expected) == 12
 
 
 def test_routine_defaults_remain_one_neutral_note():
@@ -182,12 +194,18 @@ def test_ui_startup_prints_warning_and_passes_explicit_severity(tmp_path, monkey
     monkeypatch.setattr(giraffe.web, 'create_app', app)
     monkeypatch.setattr(uvicorn.Server, 'run', lambda *args, **kwargs: None)
     assert main(['ui', '--config', str(source), '--runs-dir', str(tmp_path)]) == 0
-    assert 'Warning: ' + REMOVED_LOAD in capsys.readouterr().err
+    stderr = capsys.readouterr().err
+    assert 'Warning: ' + REMOVED_LOAD in stderr
+    assert [line for line in stderr.splitlines() if line.startswith('Migration:')] == [
+        'Migration: ' + captured['migration_notes'][0],
+        f'Migration: 11 other settings were converted from an earlier Giraffe version. Run giraffe preview --config {source} to list them.',
+    ]
     assert captured['migration_warnings'] == [{'msg': REMOVED_LOAD, 'removed_check': 'load'}]
     assert REMOVED_LOAD not in captured['migration_notes']
 
 
-def test_cli_run_prints_removal_as_warning(tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize('verbose', [False, True])
+def test_cli_run_prints_removal_as_warning(tmp_path, monkeypatch, capsys, verbose):
     import json
     from giraffe import cli
     from tests.test_web import report
@@ -198,5 +216,62 @@ def test_cli_run_prints_removal_as_warning(tmp_path, monkeypatch, capsys):
         assert config._migration_warnings == [{'msg': REMOVED_LOAD, 'removed_check': 'load'}]
         return report(config)
     monkeypatch.setattr(cli, '_run', run)
-    assert cli.main(['run', '--config', str(source), '--skip-preflight', '--output', str(tmp_path / 'output')]) == 0
-    assert 'Warning: ' + REMOVED_LOAD in capsys.readouterr().err
+    expected = cli.migrated_configuration(legacy_removed_load())._migration_notes
+    capsys.readouterr()
+    assert cli.main(['run', '--config', str(source), '--skip-preflight', '--output', str(tmp_path / 'output'),
+                     *(['--verbose'] if verbose else [])]) == 0
+    stderr = capsys.readouterr().err
+    assert 'Warning: ' + REMOVED_LOAD in stderr
+    lines = [line for line in stderr.splitlines() if line.startswith('Migration:')]
+    assert lines == ([f'Migration: {note}' for note in expected] if verbose else [
+        f'Migration: {expected[0]}',
+        f'Migration: 11 other settings were converted from an earlier Giraffe version. Run giraffe preview --config {source} to list them.',
+    ])
+
+
+def test_conversion_details_are_collapsed_and_dismissed():
+    browser_logic(r'''
+const limit='Limits stay visible <example>';
+acceptMigrationNotes([limit,'First detail <example>','Second detail'],[],[limit]);
+let markup=renderMigrationNotes();
+assert.match(markup,/<ul><li>Limits stay visible &lt;example&gt;<\/li><\/ul><details><summary>2 other settings converted<\/summary><ul><li>First detail &lt;example&gt;<\/li><li>Second detail<\/li><\/ul><\/details>/);
+assert.doesNotMatch(markup,/<details open/);
+state.dismissedMigrationNotes=['Second detail'];
+assert.match(renderMigrationNotes(),/<summary>1 other setting converted<\/summary>/);
+renderRequestPlan=()=>{};
+await listeners.click({target:{closest:q=>q==='[data-action]'?{dataset:{action:'dismiss-migration-notes'}}:null}});
+assert.equal(renderMigrationNotes(),'');
+replaceMigrationNotes([limit],[],[limit]);
+assert.doesNotMatch(renderMigrationNotes(),/<details>|<summary>/);
+saveDraft();state.migrationLimitNotes=[];await restoreDraft();
+assert.doesNotMatch(renderMigrationNotes(),/<details>|<summary>/);
+''')
+
+
+def test_cli_startup_summarizes_conversion_details(tmp_path, capsys):
+    import json
+    from giraffe.cli import configuration, parser, migrated_configuration
+    source = tmp_path / 'legacy.json'
+    source.write_text(json.dumps(legacy_removed_load()))
+    full = migrated_configuration(legacy_removed_load())._migration_notes
+    capsys.readouterr()
+    for extra in ([], ['--verbose']):
+        config = configuration(parser().parse_args(['run', '--config', str(source), *extra]))
+        lines = [line for line in capsys.readouterr().err.splitlines() if line.startswith('Migration:')]
+        expected = [f'Migration: {note}' for note in full] if extra else [
+            f'Migration: {full[0]}',
+            f'Migration: {len(full)-1} other settings were converted from an earlier Giraffe version. '
+            f'Run giraffe preview --config {source} to list them.',
+        ]
+        assert lines == expected
+        assert config._migration_notes == full
+
+
+def test_startup_only_limits_and_singular_detail_without_path(capsys):
+    from giraffe.cli import migrated_configuration
+    config = migrated_configuration({'targets': legacy_removed_load()['targets'], 'checks': ['access']}, startup=True)
+    assert capsys.readouterr().err == f'Migration: {config._migration_notes[0]}\n'
+    config = migrated_configuration({'targets': legacy_removed_load()['targets'], 'checks': ['access'],
+        'concurrency': 4, 'max_requests': 300, 'max_duration_seconds': 300}, startup=True)
+    assert len(config._migration_notes) == 1
+    assert capsys.readouterr().err == 'Migration: 1 other setting was converted from an earlier Giraffe version.\n'

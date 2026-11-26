@@ -139,7 +139,12 @@ def test_cli_prints_notes_on_stderr(command, capsys, monkeypatch, tmp_path):
     if command == 'run':
         args += ['--output', str(tmp_path), '--skip-preflight']
     assert main(args) in (0, 2)
-    assert 'Migration: Mixed load is new' in capsys.readouterr().err
+    stderr = capsys.readouterr().err
+    if command == 'run':
+        assert 'other settings were converted from an earlier Giraffe version.' in stderr
+        assert 'Migration: Mixed load is new' not in stderr
+    else:
+        assert 'Migration: Mixed load is new' in stderr
 
 
 async def test_run_start_accepts_notes_as_metadata_and_manifest_stores_them(tmp_path, monkeypatch):
@@ -176,7 +181,9 @@ def test_manifest_rerun_recomputes_legacy_notes(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(cli, '_run', run)
     output = tmp_path / 'rerun'
     assert main(['run', '--manifest', str(source), '--skip-preflight', '--output', str(output)]) == 0
-    assert 'Migration: Mixed load is new' in capsys.readouterr().err
+    lines = [line for line in capsys.readouterr().err.splitlines() if line.startswith('Migration:')]
+    assert len(lines) == 1
+    assert lines[0].endswith('other settings were converted from an earlier Giraffe version.')
     assert json.loads((output / 'report.json').read_text())['manifest']['config_migration_notes']
 
 

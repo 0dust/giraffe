@@ -28,7 +28,7 @@ function updateAPIKeySummary() {
   const key=apiKeyFor(form.elements.url.value),ref=form.elements.api_key_env?.value.trim();
   $('.row-value',summary).textContent=key?'Set for this tab':ref||'Not set';
 }
-const state = {bootstrap:null, runs:[], storage:null, storageUnavailable:false, cleanup:null, cleanupResult:null, baselines:[], detail:null, mosaicFollow:true, config:null, active:null, diskActive:null, routeVersion:0, poll:null, tab:'checks', selectedCheck:null, checkNavigatorOpen:false, filter:'all', historySearch:'', comparisonFilter:null, comparisonCheck:'all', submitting:false, openTest:null, configView:'form', jsonDraft:null, jsonBase:null, configRevision:0, configBusy:false, showAvailableTests:false, formMode:'normal', formRestartTarget:null, requestPreview:null, previewSequence:0, planTimer:null, setupPreset:null, catalogueFilter:'all', catalogueCategory:'all', catalogueSearch:'', setupStep:1, returnToReview:false, modelDiscovery:null, modelDiscoverySequence:0, autoModel:null, datasetSelection:[], datasetImportSequence:0, judgeEditorOpen:null, datasetImport:null, datasetEditor:null, datasetTry:null, migrationNotes:[], migrationWarnings:[], dismissedMigrationNotes:[], loadPanels:{}, limitValues:{}, jsonValidation:null};
+const state = {bootstrap:null, runs:[], storage:null, storageUnavailable:false, cleanup:null, cleanupResult:null, baselines:[], detail:null, mosaicFollow:true, config:null, active:null, diskActive:null, routeVersion:0, poll:null, tab:'checks', selectedCheck:null, checkNavigatorOpen:false, filter:'all', historySearch:'', comparisonFilter:null, comparisonCheck:'all', submitting:false, openTest:null, configView:'form', jsonDraft:null, jsonBase:null, configRevision:0, configBusy:false, showAvailableTests:false, formMode:'normal', formRestartTarget:null, requestPreview:null, previewSequence:0, planTimer:null, setupPreset:null, catalogueFilter:'all', catalogueCategory:'all', catalogueSearch:'', setupStep:1, returnToReview:false, modelDiscovery:null, modelDiscoverySequence:0, autoModel:null, datasetSelection:[], datasetImportSequence:0, judgeEditorOpen:null, datasetImport:null, datasetEditor:null, datasetTry:null, migrationNotes:[], migrationLimitNotes:[], migrationWarnings:[], dismissedMigrationNotes:[], loadPanels:{}, limitValues:{}, jsonValidation:null};
 state.setupWorkspace=null;
 const statusLabels = {not_applicable:'Not applicable',measured:'Measured',warmup:'Warmup',pass:'Passed',fail:'Failed',failed:'Failed',timeout:'Timed out',inconclusive:'Inconclusive',skipped:'Not run',idle:'Unused',blocked:'Blocked',running:'Running',queued:'Queued',reserved:'Reserved',stopping:'Stopping',error:'Runner error',completed:'Finished',stopped:'Stopped',cancelled:'Cancelled',interrupted:'Interrupted'};
 const statusIcons = {pass:'✓',fail:'×',failed:'×',timeout:'◷',inconclusive:'?',skipped:'–',idle:'○',blocked:'!',running:'·',queued:'○',reserved:'○',stopping:'·',error:'×',completed:'✓',stopped:'⊘',cancelled:'⊘',interrupted:'!'};
@@ -1909,7 +1909,10 @@ function loadDisplay(settings) {
 }
 function renderMigrationNotes() {
   const notes=(state.migrationNotes || []).filter(note=>!(state.dismissedMigrationNotes || []).includes(note));
-  return notes.length?`<div class="notice migration-notes" role="status"><strong>Imported from an earlier Giraffe version</strong><ul>${notes.map(note=>`<li>${escape(note)}</li>`).join('')}</ul><button type="button" class="text-button" data-action="dismiss-migration-notes">Dismiss notes</button></div>`:'';
+  const limits=notes.filter(note=>(state.migrationLimitNotes || []).includes(note));
+  const details=notes.filter(note=>!limits.includes(note));
+  const list=items=>`<ul>${items.map(note=>`<li>${escape(note)}</li>`).join('')}</ul>`;
+  return notes.length?`<div class="notice migration-notes" role="status"><strong>Imported from an earlier Giraffe version</strong>${limits.length?list(limits):''}${details.length?`<details><summary>${details.length} other ${details.length===1?'setting':'settings'} converted</summary>${list(details)}</details>`:''}<button type="button" class="text-button" data-action="dismiss-migration-notes">Dismiss notes</button></div>`:'';
 }
 function activeMigrationWarnings() {
   return (state.migrationWarnings || []).filter(warning=>!warning.removed_check||!state.config?.checks?.includes(warning.removed_check));
@@ -1920,14 +1923,15 @@ function renderMigrationWarnings() {
 function mergeMigrationWarnings(...groups) {
   return [...new Map(groups.flat().map(warning=>[JSON.stringify(warning),warning])).values()];
 }
-function acceptMigrationNotes(notes=[],warnings=[]) {
+function acceptMigrationNotes(notes=[],warnings=[],limitNotes=[]) {
+  state.migrationLimitNotes=[...new Set([...(state.migrationLimitNotes || []),...limitNotes])];
   state.migrationWarnings=mergeMigrationWarnings(state.migrationWarnings || [],warnings);
   state.migrationNotes=[...new Set([...(state.migrationNotes || []),...notes])];
   for(const element of $$('[data-migration-notes]'))element.innerHTML=renderMigrationNotes();
 }
-function replaceMigrationNotes(notes=[],warnings=[]) {
-  state.migrationNotes=[];state.migrationWarnings=[];state.dismissedMigrationNotes=[];state.loadPanels={};
-  acceptMigrationNotes(notes,warnings);
+function replaceMigrationNotes(notes=[],warnings=[],limitNotes=[]) {
+  state.migrationNotes=[];state.migrationLimitNotes=[];state.migrationWarnings=[];state.dismissedMigrationNotes=[];state.loadPanels={};
+  acceptMigrationNotes(notes,warnings,limitNotes);
 }
 const loadCriteriaLabels={max_first_answer_ms:'Maximum time to first answer per response (ms)',max_completion_ms:'Maximum completion time per response (ms)',max_error_percent:'Errors allowed (%)',min_correct_percent:'Correct answers required (%)',max_stream_pause_ms:'Maximum pause between streamed chunks (ms)',min_generation_tokens_per_second:'Minimum generation speed per response (tokens/sec)',min_valid_responses:'Minimum valid responses per result group'};
 function loadFieldLabel(path) {
@@ -3021,7 +3025,7 @@ async function refreshRequestPreview(snapshot,{draft=false}={}) {
     const result=await api(draft?'/api/config/draft':'/api/config/preview',{method:'POST',body:JSON.stringify(config)});
     if(version!==state.routeVersion||revision!==state.configRevision||sequence!==state.previewSequence)throw new Error('Configuration changed during preview. Refresh the current settings before running.');
     assertAppliedConfig();
-    acceptMigrationNotes(result.migration_notes,result.migration_warnings);
+    acceptMigrationNotes(result.migration_notes,result.migration_warnings,result.migration_limit_notes);
     const previous=state.requestPreview;
     state.requestPreview={status:'current',revision,route:version,plan:result.request_plan,config:result.config,
       data:draft?previous?.data:result.request_pack_preview,
@@ -4807,7 +4811,7 @@ async function startNewRun(){
     const config=omitInactiveGatewayAccess(state.config || state.bootstrap.config,state.gatewayAccessDraft ||= {});
     const result=await api('/api/config/draft',{method:'POST',body:JSON.stringify(config)});
     if(intent!==state.setupNavigationSequence||version!==state.routeVersion||revision!==state.configRevision)return;
-    state.config=result.config;replaceMigrationNotes(result.migration_notes,result.migration_warnings);
+    state.config=result.config;replaceMigrationNotes(result.migration_notes,result.migration_warnings,result.migration_limit_notes);
   }catch(error){if(intent===state.setupNavigationSequence)toast(error.message);return;}
   state.setupStep=1;state.returnToReview=false;state.openTest=null;configChanged();
   if(location.hash!=='#new'){location.hash='#new';return;}
@@ -4821,13 +4825,13 @@ function normalizeRateThreshold(config){
 async function rerun(){
   const version=state.routeVersion;let source=state.detail.report?.manifest?.config || state.detail.config;
   if(!source){toast('No configuration was saved for this run.');return;}
-  let notes=[],warnings=state.detail.report?.manifest?.config_migration_warnings || [];
+  let notes=[],limitNotes=[],warnings=state.detail.report?.manifest?.config_migration_warnings || [];
   if(source.config_version==null || 'concurrent_workloads' in source || 'buckets' in source || source.test_options?.concurrency || (source.checks || []).some(id=>['fairness','buckets','mixed','token_stress'].includes(id))){
-    try{const result=await api('/api/config/draft',{method:'POST',body:JSON.stringify(source)});if(version!==state.routeVersion)return;source=result.config;notes=result.migration_notes;warnings=result.migration_warnings || [];}
+    try{const result=await api('/api/config/draft',{method:'POST',body:JSON.stringify(source)});if(version!==state.routeVersion)return;source=result.config;notes=result.migration_notes;warnings=result.migration_warnings || [];limitNotes=result.migration_limit_notes || [];}
     catch(error){toast(error.message);return;}
   }
   source=normalizeRateThreshold(source);
-  replaceMigrationNotes(notes,warnings);state.config=clone(source);state.gatewayAccessDraft={};state.autoModel=null;state.setupStep=1;invalidateModelDiscovery();state.datasetSelection=[];state.config.restart_target=null;state.formMode='normal';state.formRestartTarget=null;state.jsonDraft=null;state.jsonBase=null;state.configView='form';configChanged();state.prefillBaseline=state.detail.baseline_id || '';location.hash='#new';
+  replaceMigrationNotes(notes,warnings,limitNotes);state.config=clone(source);state.gatewayAccessDraft={};state.autoModel=null;state.setupStep=1;invalidateModelDiscovery();state.datasetSelection=[];state.config.restart_target=null;state.formMode='normal';state.formRestartTarget=null;state.jsonDraft=null;state.jsonBase=null;state.configView='form';configChanged();state.prefillBaseline=state.detail.baseline_id || '';location.hash='#new';
 }
 function portableConfig(payload) {return {...payload.config,restart_target:payload.mode==='cold-start'?payload.restart_target:null};}
 function hasJsonChanges() {return state.jsonDraft!==null&&state.jsonDraft!==state.jsonBase;}
@@ -4845,9 +4849,10 @@ async function restoreDraft() {
     const legacy=draft?.config?.config_version==null;
     if(draft&&draft.config?.targets?.length&&(legacy||sameConfig(draft.bootstrap&&normalizeRateThreshold(draft.bootstrap),normalizeRateThreshold(state.bootstrap.config)))){
       const gatewayAccessDraft=draft.gatewayAccessDraft || {};
-      let config=omitInactiveGatewayAccess(draft.config,gatewayAccessDraft),notes=[],warnings=[];
-      if(legacy){const result=await api('/api/config/draft',{method:'POST',body:JSON.stringify(config)});config=result.config;notes=result.migration_notes || [];warnings=result.migration_warnings || [];}
+      let config=omitInactiveGatewayAccess(draft.config,gatewayAccessDraft),notes=[],warnings=[],limitNotes=[];
+      if(legacy){const result=await api('/api/config/draft',{method:'POST',body:JSON.stringify(config)});config=result.config;notes=result.migration_notes || [];warnings=result.migration_warnings || [];limitNotes=result.migration_limit_notes || [];}
       state.config=normalizeRateThreshold(config);state.gatewayAccessDraft=gatewayAccessDraft;state.dismissedMigrationNotes=draft.dismissedMigrationNotes || [];
+      state.migrationLimitNotes=[...new Set([...(draft.migrationLimitNotes || []),...limitNotes])];
       state.migrationWarnings=mergeMigrationWarnings(draft.migrationWarnings || [],warnings);
       state.migrationNotes=[...new Set([...(draft.migrationNotes || []),...state.dismissedMigrationNotes,...notes])];
     }else sessionStorage.removeItem('giraffe-draft-v1');
@@ -4856,7 +4861,7 @@ async function restoreDraft() {
 function saveDraft() {
   if(!state.bootstrap||!state.config)return;
   captureFormDraft();
-  try{sessionStorage.setItem('giraffe-draft-v1',JSON.stringify({bootstrap:state.bootstrap.config,config:state.config,gatewayAccessDraft:state.gatewayAccessDraft,migrationNotes:state.migrationNotes,migrationWarnings:state.migrationWarnings,dismissedMigrationNotes:state.dismissedMigrationNotes}));}catch{}
+  try{sessionStorage.setItem('giraffe-draft-v1',JSON.stringify({bootstrap:state.bootstrap.config,config:state.config,gatewayAccessDraft:state.gatewayAccessDraft,migrationNotes:state.migrationNotes,migrationLimitNotes:state.migrationLimitNotes,migrationWarnings:state.migrationWarnings,dismissedMigrationNotes:state.dismissedMigrationNotes}));}catch{}
 }
 function syncConfigView() {
   const dirty=hasJsonChanges();
@@ -4904,7 +4909,7 @@ async function applyConfig(text=state.jsonDraft,{importing=false}={}) {
     const result=await api('/api/config/draft',{method:'POST',body:JSON.stringify(parsed)});
     if(version!==state.routeVersion||revision!==state.configRevision)return;
     captureFormDraft();
-    replaceMigrationNotes(result.migration_notes,result.migration_warnings);
+    replaceMigrationNotes(result.migration_notes,result.migration_warnings,result.migration_limit_notes);
     state.config=result.config;state.gatewayAccessDraft={};state.autoModel=null;invalidateModelDiscovery();state.datasetSelection=[];
     // An explicit restart target in imported/edited JSON remains visible and intentional.
     state.formMode=result.config.restart_target?'cold-start':'normal';state.formRestartTarget=result.config.restart_target;
@@ -4933,7 +4938,7 @@ async function validatedSnapshot({draft=false}={}) {
       throw new Error(`Enter a model for target "${payload.config.targets[missing].name}" before running or copying a CLI command. You can still apply or export this draft.`);
     }
   }
-  try{const localErrors=localSettingErrors(payload.config);if(localErrors.length)throw Object.assign(new Error(localErrors[0].msg),{errors:localErrors});const result=await api(draft?'/api/config/draft':'/api/config/validate',{method:'POST',body:JSON.stringify(payload.config)});if(version===state.routeVersion&&revision===state.configRevision)acceptMigrationNotes(result.migration_notes,result.migration_warnings);payload.config=result.config;}
+  try{const localErrors=localSettingErrors(payload.config);if(localErrors.length)throw Object.assign(new Error(localErrors[0].msg),{errors:localErrors});const result=await api(draft?'/api/config/draft':'/api/config/validate',{method:'POST',body:JSON.stringify(payload.config)});if(version===state.routeVersion&&revision===state.configRevision)acceptMigrationNotes(result.migration_notes,result.migration_warnings,result.migration_limit_notes);payload.config=result.config;}
   catch(error){if(version===state.routeVersion&&revision===state.configRevision&&error.errors?.length){state.requestPreview={status:'error',revision,route:version,error:error.message,errors:error.errors};renderRequestPreview();focusFirstSettingError(error);}throw error;}
   if(version!==state.routeVersion||revision!==state.configRevision)throw new Error('Configuration changed during validation. Try again with the current settings.');
   assertAppliedConfig();if(!draft&&!tokenizerSetupReady())throw new Error(currentTokenizerSelection()?.message || 'Wait for the Token ID check on the connection page before continuing.');
@@ -5343,5 +5348,5 @@ document.addEventListener('visibilitychange',()=>{
   else if(location.hash==='#new')schedulePoll(pollNew,version,state.active?300:10000);
   else if(state.active)schedulePoll(pollRunStatus,version,300);
 });
-async function init(){initReticulate();try{const [bootstrap,baselines]=await Promise.all([api('/api/bootstrap'),api('/api/baselines')]);state.bootstrap=bootstrap;connectionError();state.baselines=baselines.baselines || [];state.config=clone(bootstrap.config);replaceMigrationNotes(bootstrap.migration_notes,bootstrap.migration_warnings);await restoreDraft();state.config.restart_target=null;state.diskActive=bootstrap.disk_active_id || null;setActive(bootstrap.active_run_id);$('#suite-version').textContent=`suite ${bootstrap.suite_version || 'unknown'}`;$('#runner-location').textContent=bootstrap.hostname || 'UI server connected';const detailLink=location.hash.startsWith('#runs/');if(!detailLink)await refreshRuns().catch(()=>{});await route();if(detailLink)refreshRuns().catch(()=>{});}catch(error){if(state.accessExpired){$('#main').innerHTML='<div class="page-heading"><h1>Access expired</h1></div>';return;}if(document.body)document.body.dataset.runner='unavailable';$('#main').innerHTML=`<div class="page-heading"><h1>Local runner unavailable</h1></div>${notice(error.message,'error')}<button class="button" data-action="reconnect">Reconnect</button>`;}}
+async function init(){initReticulate();try{const [bootstrap,baselines]=await Promise.all([api('/api/bootstrap'),api('/api/baselines')]);state.bootstrap=bootstrap;connectionError();state.baselines=baselines.baselines || [];state.config=clone(bootstrap.config);replaceMigrationNotes(bootstrap.migration_notes,bootstrap.migration_warnings,bootstrap.migration_limit_notes);await restoreDraft();state.config.restart_target=null;state.diskActive=bootstrap.disk_active_id || null;setActive(bootstrap.active_run_id);$('#suite-version').textContent=`suite ${bootstrap.suite_version || 'unknown'}`;$('#runner-location').textContent=bootstrap.hostname || 'UI server connected';const detailLink=location.hash.startsWith('#runs/');if(!detailLink)await refreshRuns().catch(()=>{});await route();if(detailLink)refreshRuns().catch(()=>{});}catch(error){if(state.accessExpired){$('#main').innerHTML='<div class="page-heading"><h1>Access expired</h1></div>';return;}if(document.body)document.body.dataset.runner='unavailable';$('#main').innerHTML=`<div class="page-heading"><h1>Local runner unavailable</h1></div>${notice(error.message,'error')}<button class="button" data-action="reconnect">Reconnect</button>`;}}
 init();

@@ -61,7 +61,7 @@ from giraffe.deployment import safe_config
 from giraffe.fixtures import load_custom_fixtures
 from giraffe.latency import load_observations
 from giraffe.models import (ConfigDraft, CleanupCriteria, Model, RequestRecord, RunConfig, RunReport, ScaleDownMarker,
-                            migrate_concurrent_load, migrate_load_test, migrate_run_limits, MigrationWarning, merge_migration_warnings)
+                            migrate_concurrent_load, migrate_load_test, migrate_run_limits, migration_limit_notes, MigrationWarning, merge_migration_warnings)
 from giraffe.planning import request_plan
 from giraffe.open_files import open_file_guard
 from giraffe.preflight import APIKeyInput, ConnectionTest, ModelDiscovery, PreflightError, TokenizerSelection, attach_api_key
@@ -1836,6 +1836,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
         return {**capabilities(resolved, restart_allowed=allow_restart_command), "config": resolved.model_dump(mode="json"),
                 "baseline_configs": await run_in_threadpool(setup_baseline_configs),
                 "migration_notes": list(dict.fromkeys([*(migration_notes or []), *limit_notes, *load_notes, *combined_notes, *resolved._migration_notes])),
+                "migration_limit_notes": migration_limit_notes([*(migration_notes or []), *limit_notes]),
                 "migration_warnings": merge_migration_warnings(migration_warnings or [], load_warnings, combined_warnings, resolved._migration_warnings),
                 "active_run_id": active.get("id"), "disk_active_id": await run_in_threadpool(disk_active_id), "request_plan": await run_in_threadpool(preview_plan, resolved)}
 
@@ -1879,19 +1880,19 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
     @app.post("/api/config/draft")
     def validate_draft(config: ConfigDraftInput):
         """Normalize a draft for editing or export without requiring run readiness."""
-        return {"config": config.model_dump(mode="json"), "migration_notes": config._migration_notes, "migration_warnings": config._migration_warnings, "request_plan": preview_plan(config)}
+        return {"config": config.model_dump(mode="json"), "migration_notes": config._migration_notes, "migration_limit_notes": migration_limit_notes(config._migration_notes), "migration_warnings": config._migration_warnings, "request_plan": preview_plan(config)}
 
     @app.post("/api/config/plan")
     @app.post("/api/config/validate")
     def validate_config(config: RunConfigInput):
         """Normalize edits using the same contract as a run without sending traffic."""
-        return {"config": config.model_dump(mode="json"), "migration_notes": config._migration_notes, "migration_warnings": config._migration_warnings, "request_plan": preview_plan(config, validate=True)}
+        return {"config": config.model_dump(mode="json"), "migration_notes": config._migration_notes, "migration_limit_notes": migration_limit_notes(config._migration_notes), "migration_warnings": config._migration_warnings, "request_plan": preview_plan(config, validate=True)}
 
     @app.post("/api/config/preview")
     def preview_config(config: ConfigDraftInput):
         """Describe effective requests and coverage without target calls or file imports."""
         preview = pack_preview(config)
-        return {"config": config.model_dump(mode="json"), "migration_notes": config._migration_notes, "migration_warnings": config._migration_warnings, "request_pack_preview": preview,
+        return {"config": config.model_dump(mode="json"), "migration_notes": config._migration_notes, "migration_limit_notes": migration_limit_notes(config._migration_notes), "migration_warnings": config._migration_warnings, "request_pack_preview": preview,
                 "request_plan": preview_plan(config, pack_details=preview, validate=True)}
 
     @app.post("/api/datasets/preview")

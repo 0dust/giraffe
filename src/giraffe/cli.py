@@ -43,7 +43,7 @@ if _required_modules_available():
     from giraffe.configuration_errors import configuration_errors
     from giraffe.diagnostics import configure_logging, run_logging
     from giraffe.models import (CATALOGUE_NAMES, CHECK_NAMES, ConfigDraft, RunConfig, RunReport, is_legacy_config,
-                               migrate_concurrent_load, migrate_load_test, migrate_run_limits, merge_migration_warnings)
+                               migrate_concurrent_load, migrate_load_test, migrate_run_limits, migration_limit_notes, merge_migration_warnings)
     from giraffe.storage import DEFAULT_LIMITS, Heartbeat, format_size as _disk_size, parse_size
     from giraffe.resources import PhaseSampler, SAMPLING
 else:
@@ -414,19 +414,27 @@ def _migrated_values(values):
     return values, limit_notes + load_notes + combined_notes, merge_migration_warnings(warnings, combined_warnings)
 
 
-def _configuration_notes(config, notes, warnings):
+def _configuration_notes(config, notes, warnings, *, startup=False, verbose=False, path=None):
     config._migration_notes = list(dict.fromkeys([*notes, *config._migration_notes]))
     config._migration_warnings = merge_migration_warnings(warnings, config._migration_warnings)
     for warning in config._migration_warnings:
         print(f"Warning: {warning['msg']}", file=sys.stderr)
-    for note in notes:
+    visible = migration_limit_notes(config._migration_notes)
+    details = [note for note in config._migration_notes if note not in visible]
+    for note in (visible if startup and not verbose else config._migration_notes):
         print(f"Migration: {note}", file=sys.stderr)
+    if startup and not verbose and details:
+        settings = "setting was" if len(details) == 1 else "settings were"
+        summary = f"Migration: {len(details)} other {settings} converted from an earlier Giraffe version."
+        if path is not None:
+            summary += f" Run giraffe preview --config {path} to list them."
+        print(summary, file=sys.stderr)
     return config
 
 
-def migrated_configuration(values, model=RunConfig):
+def migrated_configuration(values, model=RunConfig, **note_options):
     values, notes, warnings = _migrated_values(values)
-    return _configuration_notes(model.model_validate(values), notes, warnings)
+    return _configuration_notes(model.model_validate(values), notes, warnings, **note_options)
 
 
 def configuration(args: argparse.Namespace) -> RunConfig:
@@ -517,7 +525,8 @@ def configuration(args: argparse.Namespace) -> RunConfig:
         if getattr(args, key, None) is not None:
             values["targets"][0][key] = getattr(args, key)
     args._configuration_input = values
-    return _configuration_notes(RunConfig.model_validate(values), notes, warnings)
+    return _configuration_notes(RunConfig.model_validate(values), notes, warnings,
+                                startup=args.command == "run", verbose=getattr(args, "verbose", False), path=args.config)
 
 
 def _discover_model(args: argparse.Namespace, values: dict | None = None, target: dict | None = None) -> str:
@@ -906,7 +915,7 @@ def _main(argv: list[str] | None = None) -> int:
                 raise ValueError("Port must be between 1 and 65535")
             defaults, migration_notes, migration_warnings = None, [], []
             if args.config:
-                resolved = migrated_configuration(load_configuration(args.config))
+                resolved = migrated_configuration(load_configuration(args.config), startup=True, path=args.config)
                 defaults = resolved.model_dump(mode="json")
                 migration_notes = resolved._migration_notes
                 migration_warnings = resolved._migration_warnings

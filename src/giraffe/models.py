@@ -750,6 +750,14 @@ def is_legacy_config(value) -> bool:
     return not isinstance(arrivals, dict) or "max_in_flight" not in arrivals
 
 
+class RunLimitsNote(str):
+    """The visible combined limits note; other migration strings are conversion details."""
+
+
+def migration_limit_notes(notes: list[str]) -> list[str]:
+    return [note for note in notes if isinstance(note, RunLimitsNote)]
+
+
 def migrate_run_limits(value):
     """Upgrade saved input only; Python-constructed configs already use v2."""
     value = _validated_migration_input(value)
@@ -782,7 +790,7 @@ def migrate_run_limits(value):
         ending = ("This configuration doesn't set that limit, so it no longer applies. Use Edit limits to keep it."
                   if len(missing) == 1 else
                   "This configuration sets none of these limits, so they no longer apply. Use Edit limits to keep them.")
-        notes.append(f"Earlier Giraffe versions capped runs at {parts} by default. {ending}")
+        notes.append(RunLimitsNote(f"Earlier Giraffe versions capped runs at {parts} by default. {ending}"))
     if value.get("concurrency") is not None:
         value.setdefault("default_concurrency", value["concurrency"])
         checks = value.get("checks", _LEGACY_DEFAULT_CHECKS)

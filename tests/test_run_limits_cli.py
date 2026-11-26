@@ -28,7 +28,8 @@ def test_a24_legacy_concurrency_sets_ceiling_and_parallelism_with_note(capsys):
     config = configuration(parser().parse_args(BASE + ["--concurrency", "40"]))
     assert config.concurrency == config.default_concurrency == 40
     assert config.effective_check("correctness")["concurrency"] == 40
-    assert "--concurrency 40 sets both" in capsys.readouterr().err
+    assert capsys.readouterr().err == "Migration: 1 other setting was converted from an earlier Giraffe version.\n"
+    assert "--concurrency 40 sets both" in config._migration_notes[0]
     assert config._migration_notes
 
 
@@ -45,7 +46,8 @@ def test_default_concurrency_can_override_legacy_flag_independently(capsys):
     ]))
     assert config.concurrency == 64 and config.default_concurrency == 8
     assert config.effective_check("correctness")["concurrency"] == 8
-    assert "--concurrency" in capsys.readouterr().err
+    assert capsys.readouterr().err == "Migration: 1 other setting was converted from an earlier Giraffe version.\n"
+    assert "--concurrency" in config._migration_notes[0]
 
 
 @pytest.mark.parametrize("flag,field", [
