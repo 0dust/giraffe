@@ -751,7 +751,7 @@ async def test_exact_policy_predecessor_preserves_measured_multi_user(monkeypatc
     predecessor_generator = "e4ddc7a7e8563f9ab3bba2fc42ad0232ee924c65f67d92dafd89c21025d202d0"
     # This test changes only the generator label on the current runtime. The
     # pre-mode runtime upgrade is covered by test_interference_upgrade_baseline.
-    predecessor_source = "5b875b7eb09d4dd03842bb2fe48f12e0ff58749cb3ab73299727cb8ef31cc6e9"
+    predecessor_source = "1f7c1ad09cd892dfe3d8a1929075f245341cbc4ee2c4e6a54de74553454854f4"
     if companion == "load":
         options.update(checks=["multi_user", "load"], load_test=load_config(duration=1).load_test)
     with monkeypatch.context() as policy:
@@ -776,7 +776,7 @@ async def test_exact_policy_predecessor_preserves_measured_multi_user(monkeypatc
                 "settings": {"multi_user": old.manifest["config"]["multi_user"]}}
     if companion == "load":
         identity["settings"]["load_test"] = options["load_test"].model_dump(mode="json")
-        identity["load_test_source_sha256"] = "0d13d56c3870441748998308f32f3e7959111eaf31cf06f19fd46fe1e66c2d0a"
+        identity["load_test_source_sha256"] = "55a11a95edaf1f01336ec1879340df0e27adcfd8cc69d05a8ea726a011d3f07b"
     assert fixture_hash(identity) == old.manifest["fixture_pack"][fingerprint]
 
     assert _settings_reasons(current, old) == []

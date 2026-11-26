@@ -91,7 +91,7 @@ def nonce_prefix(nonce):
 
 def prompt(filler_chars, variant, *, nonce=None):
     instruction = (f"{_LOAD_QUESTION}." if variant == "short_answer" else
-                   f"{_LOAD_QUESTION}, then write every whole number from 1 to 10000 in order, separated by commas.")
+                   f"{_LOAD_QUESTION}, then write every whole number from 1 to 100000 in order, separated by commas.")
     filler = ("The team reviewed the neutral delivery notes. " * (filler_chars // 44 + 1))[:filler_chars]
     return f"{nonce_prefix(nonce or uuid.uuid4().hex)}{filler}\nThe box label is K7P4.\n{instruction}"
 

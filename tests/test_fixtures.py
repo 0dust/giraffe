@@ -340,3 +340,30 @@ def test_label_refusal_signal(answer, refused):
     if refused:
         assert scored.score_message == REFUSAL_SCORE_MESSAGE
     assert RequestRecord.model_validate_json(scored.model_dump_json()).refused is refused
+
+
+@pytest.mark.parametrize("scorer", ["exact", "contains", "json", "label"])
+def test_structured_refusal_fails_every_deterministic_answer_scorer(scorer):
+    from giraffe.fixtures import REFUSAL_SCORE_MESSAGE
+
+    refusal = "I can't provide the label K7P4."
+    spec = RequestSpec(fixture_id="refusal", scenario="request_pack", check_ids=["load"],
+                       messages=[{"role": "user", "content": "Return K7P4."}],
+                       scorer=scorer, expected="K7P4", schema={"type": "string"})
+    scored = score_response(spec, record(spec, refusal, refused=True))
+
+    assert scored.score is False
+    assert scored.score_message == REFUSAL_SCORE_MESSAGE
+    assert scored.refused is True
+    assert scored.output == refusal
+
+
+def test_structured_refusal_leaves_judge_decision_pending():
+    spec = RequestSpec(fixture_id="refusal", scenario="request_pack", check_ids=["correctness"],
+                       messages=[{"role": "user", "content": "Decline this request."}],
+                       scorer="judge", rubric="A refusal is acceptable.")
+    scored = score_response(spec, record(spec, "I can't provide that.", refused=True))
+
+    assert scored.score is None
+    assert scored.score_message == "AI judgment pending."
+    assert scored.refused is True

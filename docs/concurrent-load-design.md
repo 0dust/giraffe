@@ -192,7 +192,7 @@ Its result is then labelled e.g. "pass · budget-limited window 3.2 s of 10 s". 
 
 **Prompt construction.**
 - Input prompts are built to **token targets**: a nonce line, neutral filler, then "The box label is K7P4" and a question asking the model to start its reply with the label.
-- The long-output variant then asks for the numbers 1 to 10000 in order, separated by commas.
+- The long-output variant then asks for the numbers 1 to 100000 in order, separated by commas.
 
 **Calibration.**
 - Calibration happens once per (input size, output-instruction variant: short-answer vs long-output instruction), using the token-stress method: `max_tokens=1` requests read `usage.prompt_tokens`, and the filler is rescaled until it is within `input_token_tolerance`, up to `calibration_attempts`.

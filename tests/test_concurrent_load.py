@@ -2,6 +2,7 @@ import asyncio
 import copy
 import json
 import math
+import re
 import time
 import uuid
 
@@ -9,10 +10,12 @@ import httpx
 import pytest
 from pydantic import ValidationError
 
+from giraffe.concurrent_load import prompt
+from giraffe.local_tokenizer import _builtin_encoding
 from giraffe.load_test import (
     execute, interference_measurements, load_time_plan, minimum_reservation, result, assess_point, score_group,
 )
-from giraffe.models import CHECK_LIMIT_FIELDS, CHECK_OPTION_FIELDS, LoadTest, RequestRecord, RunConfig, SHAPES
+from giraffe.models import CHECK_LIMIT_FIELDS, CHECK_OPTION_FIELDS, LoadSize, LoadTest, RequestRecord, RunConfig, SHAPES
 from giraffe.planning import request_plan
 from giraffe.runner import _Run, run_suite
 from giraffe.web import _configuration_errors, create_app
@@ -22,6 +25,18 @@ pytestmark = pytest.mark.usefixtures("local_tokenizer")
 
 
 TARGET = {"name": "local", "url": "http://localhost:1/v1", "model": "test"}
+
+
+def test_long_output_prompt_covers_maximum_output_cap(local_tokenizer):
+    instruction = prompt(0, "long_output")
+    count = int(re.search(r"whole number from 1 to (\d+)", instruction).group(1))
+    max_output_cap = next(bound.le for bound in LoadSize.model_fields["output_tokens"].metadata
+                          if hasattr(bound, "le"))
+    threshold = math.ceil(LoadTest().workloads.stress.min_output_percent / 100 * max_output_cap)
+    # N numbers require at least N tokens under any tokenizer, giving a tokenizer-independent lower bound.
+    assert count >= threshold
+    complete_answer = "K7P4," + ",".join(str(number) for number in range(1, count + 1))
+    assert len(_builtin_encoding().encode(complete_answer)) >= threshold
 
 
 def configuration(**values):

@@ -740,6 +740,9 @@ def score_response(spec: RequestSpec, record: RequestRecord) -> RequestRecord:
         })
     if unclosed or (stripped and not answer.strip() and spec.scorer != "tool"):
         return record.model_copy(update={"score": None, "score_message": REASONING_WITHOUT_ANSWER})
+    # Judge rubrics decide whether a refusal is acceptable.
+    if record.refused and spec.scorer != "judge":
+        return record.model_copy(update={"score": False, "score_message": REFUSAL_SCORE_MESSAGE, "refused": True})
     if spec.scorer == "label":
         if is_refusal(record, answer):
             return record.model_copy(update={"score": False, "score_message": REFUSAL_SCORE_MESSAGE, "refused": True})
