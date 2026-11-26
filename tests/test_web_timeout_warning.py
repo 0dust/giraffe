@@ -269,3 +269,24 @@ async def test_cli_live_config_comes_from_safe_journal_header(tmp_path):
         response = await client.post('/api/config/draft', json=detail["config"])
         assert response.status_code == 200, response.text
         assert (await client.get('/api/runs/cli')).json()["config"] == safe
+
+
+async def test_cli_journal_preserves_out_of_order_runner_slots(tmp_path):
+    from giraffe.models import RequestRecord
+    directory = tmp_path / "cli"
+    write_metadata(directory, {"id": "cli", "state": "running", "heartbeat_at": _now(),
+        "owner_pid": os.getpid(), "owner_host": socket.gethostname(), "config": config()})
+    writer = EvidenceWriter(directory)
+    for slot in (1, 0):
+        record = RequestRecord(id=f"request-{slot}", target="local", fixture_id="slow", scenario="warm",
+            check_ids=["serving"], started_at=_now(), status="timeout")
+        record._request_slot = slot
+        writer.record_finished(record)
+    writer.close()
+    lines = [json.loads(line) for line in (directory / "evidence.jsonl").read_text().splitlines()]
+    assert [line["request_slot"] for line in lines if line["type"] == "record"] == [1, 0]
+    assert all("request_slot" not in line["record"] for line in lines if line["type"] == "record")
+    async with browser(tmp_path) as client:
+        detail = (await client.get('/api/runs/cli')).json()
+        assert [(row["id"], row["slot"]) for row in detail["live_requests"]] == [("request-0", 0), ("request-1", 1)]
+        assert detail["live_request_count"] == 2

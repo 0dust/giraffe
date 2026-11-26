@@ -193,18 +193,20 @@ async def test_custom_fixture_timeout_names_file_and_field(monkeypatch, tmp_path
     payload = report.observations["targets"]["service"]["timeout_warnings"][0]
     assert payload["cli_flag"] is None
     assert str(path) in payload["setting"] and "slow-case" in payload["setting"]
-    assert payload["setting_field"] == "custom_fixtures"
+    assert payload["fixture_settings"] == [{"setting": payload["setting"], "file": str(path),
+        "fixture_id": "slow-case", "field": "request_timeout_seconds"}]
     assert format_timeout_warning(payload) in report.warnings
 
 
-def test_custom_fixture_provenance_for_correctness(tmp_path):
+@pytest.mark.parametrize("check", ["correctness", "scale_down"])
+def test_custom_fixture_provenance_for_preserved_deadline(tmp_path, check):
     import json
     from giraffe.fixtures import load_custom_fixtures
 
     path = tmp_path / "cases.json"
     path.write_text(json.dumps([{"fixture_id": "warning", "scorer": "none",
         "messages": [{"role": "user", "content": "hi"}], "request_timeout_seconds": 1}]))
-    request = load_custom_fixtures(str(path))[0].model_copy(update={"check_ids": ["correctness"]})
+    request = load_custom_fixtures(str(path))[0].model_copy(update={"check_ids": [check]})
     run = runner._Run(config(custom_fixtures=str(path)), None, None)
     assert run.timeout_origin(request) == ("run", None,
         f"custom_fixtures ({path}, fixture warning).request_timeout_seconds")
@@ -403,3 +405,46 @@ def test_load_builder_overrides_equal_fixture_timeout_provenance(tmp_path, sourc
     setting = ("load_test.request_timeout_seconds" if source == "native" else
                "load_test.migrated_tests.0.settings.request_timeout_seconds")
     assert run.timeout_origin(request) == ("load", None, setting)
+
+
+@pytest.mark.parametrize("window,explicit,intentional", [(3, False, False), (.005, False, True), (.005, True, True)])
+async def test_scale_down_window_only_intentional_when_binding(tmp_path, monkeypatch, window, explicit, intentional):
+    import time
+    import json
+    from giraffe.fixtures import load_custom_fixtures
+    monkeypatch.setattr(FakeClient, "delay", .08)
+    path = tmp_path / "cases.json"
+    path.write_text(json.dumps([{"fixture_id": "held", "scorer": "none",
+        "messages": [{"role": "user", "content": "hi"}], "request_timeout_seconds": .025}]))
+    fixture = load_custom_fixtures(str(path))[0]
+    cfg = config(checks=["scale_down"], scale_down={"target": "service", "long_cohort_size": 1},
+                 custom_fixtures=str(path), request_timeout_seconds=2)
+    events = []
+    run = runner._Run(cfg, events.append, None)
+    for _ in range(3):
+        kwargs = {"timeout_override": window} if explicit else {"deadline_override": time.monotonic() + window}
+        await run.request(cfg.targets[0], FakeClient(cfg.targets[0], cfg),
+            fixture.model_copy(update={"scenario": "scale_down_baseline", "check_ids": ["scale_down"]}), **kwargs)
+    assert [record.intentional for record in run.records] == [intentional] * 3
+    assert [record._request_slot for record in run.records] == [0, 1, 2]
+    assert all("_request_slot" not in record.model_dump() for record in run.records)
+    assert bool(run.timeout_watch.warnings) is not intentional
+    if not intentional:
+        payload = run.timeout_watch.warnings[0]
+        assert payload["fixture_settings"][0]["file"] == str(path)
+        assert payload["fixture_settings"][0]["fixture_id"] == "held"
+        assert payload["cli_flag"] is None
+        assert f"edit request_timeout_seconds on fixture held in {path}" in format_timeout_warning(payload)
+    assert any(event["event"] == "timeout_warning" for event in events) is not intentional
+    assert all(record.termination_reason == ("intentional_deadline" if intentional else "request_timeout")
+               for record in run.records)
+
+
+async def test_run_limit_remains_unintentional_when_it_precedes_request_override(monkeypatch):
+    monkeypatch.setattr(FakeClient, "delay", .1)
+    cfg = config(request_timeout_seconds=.1, max_duration_seconds=.02)
+    run = runner._Run(cfg, None, None)
+    await run.request(cfg.targets[0], FakeClient(cfg.targets[0], cfg), spec(), timeout_override=.05)
+    assert run.records[0].termination_reason == "run_duration_limit"
+    assert run.records[0].intentional is False
+    assert run.timeout_watch.warnings == []

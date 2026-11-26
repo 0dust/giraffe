@@ -3136,6 +3136,8 @@ class RequestRecord(PersistedModel):
             if getattr(self, name) is None:
                 result.pop(name, None)
         return result
+    _request_slot: int | None = PrivateAttr(default=None)
+    _timeout_fixture: dict | None = PrivateAttr(default=None)
     _timing_started_monotonic: float | None = PrivateAttr(default=None)
     _gateway_key_hash: str | None = PrivateAttr(default=None)
     _gateway_terminal_usage: bool = PrivateAttr(default=False)

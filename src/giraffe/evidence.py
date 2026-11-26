@@ -159,6 +159,7 @@ class EvidenceWriter:
                     if item is not None:
                         kind, value = item
                         non_finite = _has_non_finite(value) if kind != "record" else False
+                        slot = value._request_slot if kind == "record" else None
                         if kind == "record":
                             non_finite = _has_non_finite(value.model_dump(mode="python"))
                             value = self._retained(value).requests[0].model_dump(mode="json")
@@ -177,7 +178,7 @@ class EvidenceWriter:
                             for key in ("summary", "reason"):
                                 if isinstance(value.get(key), str):
                                     value[key] = _without_answer_excerpts(value[key])
-                        stream.write(_json_line({"type": kind, kind: value}, non_finite=non_finite))
+                        stream.write(_json_line({"type": kind, kind: value, **({"request_slot": slot} if slot is not None else {})}, non_finite=non_finite))
                         pending += 1
                     if pending and (pending >= self.fsync_records
                                     or time.monotonic() - last_sync >= self.fsync_seconds):

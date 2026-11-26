@@ -570,7 +570,10 @@ def _track_live_request(job: dict, event: dict, max_requests: int | None) -> Non
             status = request["status"]
             summary["statuses"][status] = summary["statuses"].get(status, 0) + 1
         return
+    out_of_order = slot not in requests and bool(requests) and slot < next(reversed(requests))
     requests[slot] = request
+    if out_of_order:
+        job["requests"] = requests = OrderedDict(sorted(requests.items()))
     while len(requests) > MAX_LIVE_REQUESTS:
         evicted_slot, evicted = requests.popitem(last=False)
         summary["evicted"] += 1
@@ -1031,16 +1034,20 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                                     "max_stream_gap_ms", "input_tokens", "output_tokens", "completion_tokens",
                                     "reasoning_tokens", "cached_prompt_tokens", "finish_reason",
                                     "input_chars", "requested_max_tokens", "requested_input_tokens") if key in record}
+                                slot = value.get("request_slot")
+                                if not isinstance(slot, int) or isinstance(slot, bool) or slot < 0:
+                                    slot = cached["live_request_count"]
                                 _track_live_request(cached, {"event": "request_completed",
-                                    "request_slot": cached["live_request_count"], "request": request,
+                                    "request_slot": slot, "request": request,
                                     "intentional": record.get("intentional", False),
                                     **{key: record.get(key) for key in (
                                         "input_chars", "requested_max_tokens", "requested_input_tokens")}}, None)
                                 versions = cached["request_versions"]
-                                versions[cached["live_request_count"] - 1] = cached["seq"]
-                                while len(versions) > MAX_LIVE_REQUESTS:
-                                    _, evicted_seq = versions.popitem(last=False)
-                                    cached["reset_after"] = evicted_seq
+                                if slot in cached["requests"]:
+                                    versions[slot] = cached["seq"]
+                                for evicted_slot in list(versions):
+                                    if evicted_slot not in cached["requests"]:
+                                        cached["reset_after"] = max(cached["reset_after"], versions.pop(evicted_slot))
                             continue
                         event = value.get("progress", {}) if isinstance(value, dict) else {}
                         if not isinstance(event, dict) or event.get("event") != "timeout_warning":

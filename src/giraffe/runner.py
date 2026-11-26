@@ -742,7 +742,7 @@ class _Run:
             if settings.request_timeout_seconds == timeout:
                 return "load", None, setting
             return "run", None, None
-        if ("correctness" in spec.check_ids and spec.workload.get("request_source") == "custom_fixtures"
+        if (spec.workload.get("request_source") == "custom_fixtures"
                 and spec._fixture_request_timeout_seconds == timeout):
             return "run", None, (f"custom_fixtures ({self.config.custom_fixtures}, fixture {spec.fixture_id})"
                                  ".request_timeout_seconds")
@@ -1041,6 +1041,12 @@ class _Run:
             record.deadline_source = spec.deadline_source
             record.timeout_check = spec.timeout_check
             record.timeout_setting = spec.timeout_setting
+            record._request_slot = request_slot
+            if (spec.deadline_source == "run" and spec.timeout_setting is not None
+                    and spec.workload.get("request_source") == "custom_fixtures"
+                    and spec._fixture_request_timeout_seconds == record.request_timeout_seconds):
+                record._timeout_fixture = {"setting": spec.timeout_setting, "file": self.config.custom_fixtures,
+                    "fixture_id": spec.fixture_id, "field": "request_timeout_seconds"}
             if record.status in {"timeout", "cancelled"}:
                 try:
                     reason = self.stop_reason(target.name)
@@ -1095,7 +1101,7 @@ class _Run:
             intentional = (record.status == "cancelled" and record.termination_reason in {
                 "generation_chunk_limit", "intentional_cancellation", "intentional_cancellation_deadline",
             }) or (
-                timeout_override is not None and record.status == "timeout")
+                record.status == "timeout" and record.termination_reason == "intentional_deadline")
             record.intentional = intentional
             propagating_error = False
             try:

@@ -2,6 +2,10 @@
 from copy import deepcopy
 
 
+def format_timeout_deadline(seconds: float) -> str:
+    return f"{seconds * 1000:g} ms" if seconds < 1 else f"{seconds:g}s"
+
+
 def format_timeout_warning(payload: dict, check_label=None) -> str:
     parts = [f"{payload[key]} {text}" for key, text in (
         ("answer_started", "had started answering"),
@@ -10,10 +14,18 @@ def format_timeout_warning(payload: dict, check_label=None) -> str:
     setting = " and ".join(
         "--request-timeout (request_timeout_seconds)" if path == "request_timeout_seconds" else path
         for path in payload.get("settings", [payload["setting"]]))
+    fixtures = {item["setting"]: item for item in payload.get("fixture_settings", [])}
+    if fixtures:
+        edits = "; ".join(f'edit {item["field"]} on fixture {item["fixture_id"]} in {item["file"]}'
+                          for item in fixtures.values())
+        other = [path for path in payload.get("settings", [payload["setting"]]) if path not in fixtures]
+        remedy = f"{edits}" + (f" and raise {' and '.join(other)}" if other else "") + ", then stop and rerun"
+    else:
+        remedy = f"stop and rerun with a higher {setting}"
     return (f'{payload["target"]}: {payload["timed_out"]} of {payload["finished"]} requests hit '
-            f'the {payload["deadline_seconds"]:g}s request timeout ({", ".join(parts)}). '
-            'Giraffe does not extend timeouts during a run. To allow more time, stop and rerun '
-            f'with a higher {setting}; keep it if slower responses should count as failures.')
+            f'the {format_timeout_deadline(payload["deadline_seconds"])} request timeout ({", ".join(parts)}). '
+            'Giraffe does not extend timeouts during a run. To allow more time, '
+            f'{remedy}; keep it if slower responses should count as failures.')
 
 
 class TimeoutWatch:
@@ -60,8 +72,11 @@ class TimeoutWatch:
                 settings.append(setting)
             group["setting"] = settings[0]
             group["cli_flag"] = "--request-timeout" if settings == ["request_timeout_seconds"] else None
-            if settings[0].startswith("custom_fixtures ("):
-                group["setting_field"] = "custom_fixtures"
+            fixture = getattr(record, "_timeout_fixture", None)
+            if fixture:
+                fixtures = group.setdefault("fixture_settings", [])
+                if fixture not in fixtures:
+                    fixtures.append(deepcopy(fixture))
             answer = record.answer_chars > 0 or record.first_output_ms is not None
             reasoning = (bool(record.reasoning) or record.first_reasoning_ms is not None
                          or bool(record.reasoning_tokens))

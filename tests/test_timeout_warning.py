@@ -162,10 +162,12 @@ def test_equal_deadlines_keep_one_group_and_name_all_timeout_settings():
 
 
 def test_fixture_override_names_actual_file_field_without_global_cli_flag():
-    payload = activate(TimeoutWatch(), timeout_setting="custom_fixtures (cases.json, fixture slow).request_timeout_seconds")
-    assert payload["cli_flag"] is None and payload["setting_field"] == "custom_fixtures"
+    fixture = {"setting": "custom_fixtures (cases.json, fixture slow).request_timeout_seconds",
+               "file": "cases.json", "fixture_id": "slow", "field": "request_timeout_seconds"}
+    payload = activate(TimeoutWatch(), timeout_setting=fixture["setting"], _timeout_fixture=fixture)
+    assert payload["cli_flag"] is None and payload["fixture_settings"] == [fixture]
     message = format_timeout_warning(payload)
-    assert "cases.json, fixture slow" in message and "--request-timeout" not in message
+    assert "edit request_timeout_seconds on fixture slow in cases.json" in message and "--request-timeout" not in message
 
 
 @pytest.mark.parametrize("reason", ["request_timeout", "request_deadline", "read_timeout",
@@ -197,3 +199,9 @@ def test_active_warning_refreshes_after_twenty_successes():
     assert payload["updated_at_seconds"] == 29
     assert watch.warnings == [payload]
     assert original["finished"] == 3 and original["update"] == 1
+
+
+@pytest.mark.parametrize("seconds,label", [(.025, "25 ms"), (2.5, "2.5s")])
+def test_warning_formats_precise_deadline(seconds, label):
+    assert f"the {label} request timeout" in format_timeout_warning(
+        activate(TimeoutWatch(), request_timeout_seconds=seconds))

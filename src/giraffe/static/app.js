@@ -231,7 +231,7 @@ function orderedRequests(report) {
     return (Date.parse(a.started_at)||0)-(Date.parse(b.started_at)||0);
   });
 }
-function renderMosaic(records,{budget=records.length,live=false,budgetUsed=records.length,attempted=records.length,droppedOffers=0,filtered=false}={}) {
+function renderMosaic(records,{budget=records.length,live=false,budgetUsed=records.length,attempted=records.length,droppedOffers=0,filtered=false,positions=requestPositions(records)}={}) {
   const liveBudget=live&&!filtered,countOnly=liveBudget&&budget==null;
   const total=countOnly?records.reduce((total,record)=>Math.max(total,record.slot+1),0):Math.max(records.length,budget || 0);
   if(!total)return '<section class="request-viz"><h2>Request mosaic</h2><p class="viz-empty">No requests recorded.</p></section>';
@@ -250,7 +250,6 @@ function renderMosaic(records,{budget=records.length,live=false,budgetUsed=recor
   const count=Math.min(mosaicPageSize,total-offset),geometry=reticulateCells(count,pages>1?mosaicPageSize:count);
   if(countOnly&&records.length&&!records.some(record=>record.slot>=offset&&record.slot<offset+count))return `<section class="request-viz"><h2>Requests</h2><p class="hint">Earlier request evidence was evicted from the live window. ${number(state.detail?.live_request_summary?.evicted||0)} earlier requests; ${Object.entries(state.detail?.live_request_summary?.statuses||{}).map(([status,n])=>`${number(n)} ${escape(human(status))}`).join(' · ')}.</p><div class="mosaic-pages"><button type="button" class="text-button" data-action="mosaic-prev" ${page===0?'disabled':''}>←</button><span>${offset+1}–${offset+count} / ${number(total)}</span><button type="button" class="text-button" data-action="mosaic-next" ${page===pages-1?'disabled':''}>→</button></div></section>`;
   const entrance=!live&&state.mosaicAnimated!==state.detail?.id;state.mosaicAnimated=state.detail?.id;
-  const positions=requestPositions(records);
   const firstVisibleSlot=countOnly?records.reduce((slot,record)=>record.slot>=offset&&record.slot<offset+count?Math.min(slot,record.slot):slot,Infinity):offset;
   const bySlot=new Map(records.map((r,i)=>[liveBudget?r.slot:i,r]));
   // Request slots are compact dispatch IDs; unsent offers occupy the remaining budget.
@@ -524,9 +523,9 @@ function handleConditionKeydown(event) {
 }
 function renderAllRequests(records,options={}) {
   const filter=state.requestStatusFilter || 'all',filtered=filter!=='all',shown=filtered?records.filter(record=>requestFilterStatus(record)===filter):records;
-  const mosaicOptions={...options,filtered,...(filtered?{budget:shown.length,budgetUsed:shown.length,attempted:shown.length,droppedOffers:0}:{})};
+  const positions=requestPositions(records),mosaicOptions={...options,positions,filtered,...(filtered?{budget:shown.length,budgetUsed:shown.length,attempted:shown.length,droppedOffers:0}:{})};
   const controls=`<div class="request-tools"><label>Status <select id="all-requests-filter" aria-label="Request status">${requestFilterOptions(filter,records.map(requestFilterStatus))}</select></label></div>`;
-  return `<details class="all-requests"${state.allRequestsOpen?' open':''}><summary>Individual requests · ${number(records.length)}</summary>${controls}${options.live?renderMosaic(shown,mosaicOptions):`<div class="evidence-band${shown.length<=72?' is-compact':''}">${renderMosaic(shown,mosaicOptions)}${renderBeeswarm(shown,{width:shown.length<=72?500:960})}</div>`}</details>`;
+  return `<details class="all-requests"${state.allRequestsOpen?' open':''}><summary>Individual requests · ${number(records.length)}</summary>${controls}${options.live?renderMosaic(shown,mosaicOptions):`<div class="evidence-band${shown.length<=72?' is-compact':''}">${renderMosaic(shown,mosaicOptions)}${renderBeeswarm(shown,{positions,width:shown.length<=72?500:960})}</div>`}</details>`;
 }
 function syncAllRequestsFilter() {
   const filter=$('#all-requests-filter');if(filter)filter.value=state.requestStatusFilter || 'all';
@@ -540,8 +539,8 @@ function filterAllRequests(status) {
 function focusMosaicStart() {
   const spot=$('.request-mosaic [tabindex="0"]');state.mosaicAutoFocus=spot?.dataset?.liveSlot;spot?.focus({preventScroll:true});
 }
-function renderBeeswarm(records,{width=960}={}) {
-  const positions=requestPositions(records),measured=records.filter(r=>Number.isFinite(r.elapsed_ms)&&r.elapsed_ms>=0),missing=records.length-measured.length;
+function renderBeeswarm(records,{width=960,positions=requestPositions(records)}={}) {
+  const measured=records.filter(r=>Number.isFinite(r.elapsed_ms)&&r.elapsed_ms>=0),missing=records.length-measured.length;
   if(!measured.length)return '<section class="latency-viz"><h2>Request latency</h2><p class="viz-empty">No latency measurements.</p></section>';
   // Use the mosaic's page so every rendered dot remains individually inspectable.
   const page=records.slice((state.mosaicPage || 0)*mosaicPageSize,((state.mosaicPage || 0)+1)*mosaicPageSize).filter(r=>Number.isFinite(r.elapsed_ms)&&r.elapsed_ms>=0);
@@ -4661,7 +4660,7 @@ function liveStopReasons(detail) {
 }
 function timeoutSettingLabel(warning,setting) {
   return (setting?[setting]:(warning.settings || [warning.setting])).map(setting=>{
-    if(setting.startsWith('custom_fixtures ('))return 'Fixture request timeout';
+    if((warning.fixture_settings || []).some(item=>item.setting===setting))return 'Fixture request timeout';
     if(setting.startsWith('load_test.'))return 'Load request timeout';
     if(setting.startsWith('test_options.'))return `${catalogTitle(setting.split('.')[1])} request timeout`;
     return 'Request timeout';
@@ -4673,11 +4672,14 @@ function timeoutBreakdown(warning) {
 function timeoutWarnings(detail) {
   return activeState(detail)?detail.timeout_warnings || []:Object.values(detail.report?.observations?.targets || {}).flatMap(target=>target?.timeout_warnings || []);
 }
+const timeoutDeadline=seconds=>seconds<1?`${Number((seconds*1000).toPrecision(12))} ms`:elapsed(seconds);
 function renderTimeoutWarnings(detail,{live=activeState(detail)}={}) {
   const warnings=timeoutWarnings(detail);if(!warnings.length)return '';
   const title=live?'Requests are timing out':'Requests timed out',config=detail.config || detail.report?.manifest?.config,canChangeTimeout=Boolean(config?.targets?.length);
-  const help=warnings.map(warning=>{const deadline=elapsed(warning.deadline_seconds),label=timeoutSettingLabel(warning);return live?`Each request may take up to ${deadline}. Giraffe will not change this during the run. Stop run keeps the results collected so far. To give the server more time, run again with a higher ${label}. Keep it if responses slower than ${deadline} should count as failures. Intentional timeout tests are not counted here.`:`Each request could take up to ${deadline}. To give the server more time, run again with a higher ${label}. Keep it if responses slower than ${deadline} should count as failures. Intentional timeout tests are not counted here.`;}).join(' ');
-  return `<section class="notice warning ${live?'live':'report'}-timeout-warning" role="status"${live?' aria-live="polite"':''}><strong>${title}</strong> ${infoHelp(`${live?'live':'report'}_timeout_warning`,title,help)}<ul>${warnings.slice(0,4).map(warning=>`<li>${escape(warning.target)} · ${number(warning.timed_out)} of ${number(warning.finished)} requests hit the ${escape(elapsed(warning.deadline_seconds))} ${escape(timeoutSettingLabel(warning).toLowerCase())} · ${escape(timeoutBreakdown(warning))} ${(canChangeTimeout?(warning.settings || [warning.setting]):[]).map(setting=>`<button type="button" class="text-button" data-action="timeout-setting" data-timeout-key="${escape(warning.key)}" data-timeout-setting="${escape(setting)}">${(warning.settings?.length || 1)>1?`Change ${escape(timeoutSettingLabel(warning,setting))}`:'Change timeout for next run'}</button>`).join(' ')}</li>`).join('')}${warnings.length>4?`<li>and ${number(warnings.length-4)} more targets/settings</li>`:''}</ul>${(live?detail.live_requests:detail.report?.requests)?.some(record=>requestFilterStatus(record)==='timed_out')?'<div class="actions"><button type="button" class="text-button" data-action="show-timeouts">Show timed-out requests</button></div>':`<p class="hint">${live?'Timed-out requests have left the live request list. The saved report lists all of them.':'Timed-out request details were not kept in this report.'}</p>`}</section>`;
+  const help=warnings.map(warning=>{const deadline=timeoutDeadline(warning.deadline_seconds),label=timeoutSettingLabel(warning),fixtures=warning.fixture_settings || [],remedy=fixtures.length?`${fixtures.map(item=>`edit ${item.field} on fixture ${item.fixture_id} in ${item.file}`).join('; ')}, then run again`:`run again with a higher ${label}`;return live?`Each request may take up to ${deadline}. Giraffe will not change this during the run. Stop run keeps the results collected so far. To give the server more time, ${remedy}. Keep it if responses slower than ${deadline} should count as failures. Intentional timeout tests are not counted here.`:`Each request could take up to ${deadline}. To give the server more time, ${remedy}. Keep it if responses slower than ${deadline} should count as failures. Intentional timeout tests are not counted here.`;}).join(' ');
+  const row=warning=>{const fixtures=warning.fixture_settings || [],settings=(warning.settings || [warning.setting]).filter(setting=>!fixtures.some(item=>item.setting===setting));return `<li>${escape(warning.target)} · ${number(warning.timed_out)} of ${number(warning.finished)} requests hit the ${escape(timeoutDeadline(warning.deadline_seconds))} ${escape(timeoutSettingLabel(warning).toLowerCase())} · ${escape(timeoutBreakdown(warning))} ${fixtures.map(item=>`<span>Edit <code>${escape(item.field)}</code> on fixture <code>${escape(item.fixture_id)}</code> in ${escape(item.file)}</span>`).join(' · ')} ${(canChangeTimeout?settings:[]).map(setting=>`<button type="button" class="text-button" data-action="timeout-setting" data-timeout-key="${escape(warning.key)}" data-timeout-setting="${escape(setting)}">${settings.length>1?`Change ${escape(timeoutSettingLabel(warning,setting))}`:'Change timeout for next run'}</button>`).join(' ')}</li>`;};
+  const expanded=state.timeoutWarningExpansion?.id===detail.id&&state.timeoutWarningExpansion.open;
+  return `<section class="notice warning ${live?'live':'report'}-timeout-warning" role="status"${live?' aria-live="polite"':''}><strong>${title}</strong> ${infoHelp(`${live?'live':'report'}_timeout_warning`,title,help)}<ul>${warnings.slice(0,4).map(row).join('')}</ul>${warnings.length>4?`<details data-timeout-more${expanded?' open':''}><summary>and ${number(warnings.length-4)} more targets/settings</summary><ul>${warnings.slice(4).map(row).join('')}</ul></details>`:''}${(live?detail.live_requests:detail.report?.requests)?.some(record=>requestFilterStatus(record)==='timed_out')?'<div class="actions"><button type="button" class="text-button" data-action="show-timeouts">Show timed-out requests</button></div>':`<p class="hint">${live?'Timed-out requests have left the live request list. The saved report lists all of them.':'Timed-out request details were not kept in this report.'}</p>`}</section>`;
 }
 function showTimedOutRequests() {
   chooseReportTab('results');filterAllRequests('timed_out');
@@ -5267,7 +5269,7 @@ document.addEventListener('click',async(event)=>{
   if(action==='choose-baseline'){const options=$('#execution-settings');if(options){options.open=true;const select=$('#field-baseline_id');select?.focus();select?.scrollIntoView?.({block:'center'});}return;}
   if(action==='retry')route();if(action==='clear-filter'){state.filter='all';state.historySearch='';renderRuns();}
   if(action==='show-timeouts'){showTimedOutRequests();return;}
-  if(action==='timeout-setting'){const {timeoutKey:key,timeoutSetting:setting}=event.target.closest('[data-action]').dataset,warning=timeoutWarnings(state.detail).find(warning=>warning.key===key);if(warning&&(warning.settings || [warning.setting]).includes(setting))await rerun({focusPath:setting.startsWith('custom_fixtures (')?'custom_fixtures':setting});return;}
+  if(action==='timeout-setting'){const {timeoutKey:key,timeoutSetting:setting}=event.target.closest('[data-action]').dataset,warning=timeoutWarnings(state.detail).find(warning=>warning.key===key);if(warning&&(warning.settings || [warning.setting]).includes(setting)&&!(warning.fixture_settings || []).some(item=>item.setting===setting))await rerun({focusPath:setting});return;}
   if(action==='stop')await confirmStop();if(action==='show-failing')showFailingRequests();if(action==='show-inconclusive'){chooseReportTab('results',{anchor:false});const findings=$('#failing-requests');findings?.scrollIntoView?.({block:'start'});findings?.focus({preventScroll:true});}if(action==='show-comparison'){chooseReportTab('results',{anchor:false});revealReportSection('baseline');location.hash=`${linkRun(state.detail.id)}/results/baseline`;}if(action==='rerun')await rerun();if(action==='baseline-dialog')openBaselineDialog();
   if(action==='close-dialog'){if(event.target.closest('dialog')?.id==='request-dialog')closeRequestEvidence();else event.target.closest('dialog').close();}if(action==='apply-config')await applyConfig();
   if(action==='discard-config')discardConfig();
@@ -5427,6 +5429,7 @@ document.addEventListener('keydown',event=>{
   }
   const configTab=event.target.closest('[data-config-tab]');if(configTab&&['ArrowLeft','ArrowRight','Home','End'].includes(event.key)){event.preventDefault();switchConfigView(event.key==='Home'?'form':event.key==='End'?'json':state.configView==='form'?'json':'form');return;}});
 document.addEventListener('toggle',event=>{
+  if(event.target.matches('[data-timeout-more]'))state.timeoutWarningExpansion={id:state.detail?.id,open:event.target.open};
   if(event.target.matches('.all-requests'))cancelLandings(event.target);
   if(event.target.matches('.all-requests'))state.allRequestsOpen=event.target.open;
   if(event.target.matches('.judge-configuration'))state.judgeEditorOpen=event.target.open;
