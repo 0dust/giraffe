@@ -214,6 +214,6 @@ def test_context_warning_has_a_stable_kind_and_explains_the_consequence():
     plan = request_plan(configuration(checks=["load"]))
     warning, = [item for item in plan["load_warnings"] if item.get("kind") == "context_window_unknown"]
 
-    assert warning["msg"] == "Giraffe can't verify that your longest request fits this endpoint."
-    assert warning["fields"] == ["load_test.profile.long.input_tokens"]
+    assert warning["msg"] == "Context window unknown. Set the server's context window, or connect to a server that reports it."
+    assert warning["fields"] == ["load_test.profile.long.input_tokens", "targets.0.deployment.serving.context_limit"]
     assert warning["actions"]

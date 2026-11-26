@@ -70,6 +70,18 @@ def test_single_condition_uses_check_verdict_but_matrix_does_not_share_it():
     assert all(row["status"] == "passed" for row in aggregate_conditions(report))
 
 
+def test_compatibility_probe_keeps_its_verdict_when_serving_has_no_other_condition():
+    from giraffe.models import CheckResult
+
+    scenario = "performance_evidence_probe"
+    check = CheckResult(id="serving", target="local", title="Serving", status="fail", summary="Serving failed")
+    summary = lifecycle(condition=condition_for(scenario), condition_verdict="inconclusive", started=1,
+                        completed=1, failed=0, reason="The stream did not provide usable usage.completion_tokens.")
+    report = saved_report([record(0, scenario=scenario, condition_id=scenario, check_ids=[], score=None)], summary, [check])
+    assert aggregate_conditions(report)[0]["status"] == "inconclusive"
+    assert ConditionRequestIndex.from_report(report).page(scenario)["aggregate"]["reason"] == summary["reason"]
+
+
 def test_cancelled_and_unscored_remain_real_statuses_and_completed_subset():
     report = saved_report([record(0, status="cancelled"), record(1, score=None)])
     result = ConditionRequestIndex.from_report(report).page("bucket_c32_short_short")
@@ -184,3 +196,13 @@ def test_ambiguous_target_local_condition_requires_selector():
     with pytest.raises(ValueError, match="target-local"):
         index.page("bucket_c32_short_short")
     assert index.page("bucket_c32_short_short", target="other")["rows"][0]["request_id"] == "request-1"
+
+
+def test_any_preparation_condition_keeps_its_own_verdict():
+    from giraffe.models import CheckResult
+    condition = condition_for("warm")
+    condition["load_type"] = "preparation"
+    summary = lifecycle(condition=condition, condition_verdict="inconclusive")
+    check = CheckResult(id=condition["check"], target="local", title="Serving", status="fail", summary="Failed")
+    report = saved_report([record(0, scenario="warm", condition_id="warm", score=None)], summary, [check])
+    assert aggregate_conditions(report)[0]["status"] == "inconclusive"

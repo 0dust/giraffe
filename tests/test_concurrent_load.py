@@ -240,7 +240,7 @@ def test_other_structured_errors(updates, fields):
     assert _configuration_errors(exc.value.errors(), values)[0]['fields'] == fields
 
 
-@pytest.mark.parametrize("which", ["stream", "overlap", "context"])
+@pytest.mark.parametrize("which", ["stream", "overlap"])
 def test_cross_field_errors(which):
     values = configuration().model_dump()
     expected = []
@@ -253,9 +253,6 @@ def test_cross_field_errors(which):
         values.update(overlap_models=True, targets=[TARGET, {**TARGET, "name": "other"}], concurrency=3)
         values["load_test"]["patterns"]["concurrent"]["levels"] = [2]
         expected = ["load_test.patterns.concurrent.levels", "concurrency"]
-    if which == "context":
-        values["targets"][0]["deployment"]["serving"]["context_limit"] = 50
-        expected = ["load_test.profile.short.input_tokens", "load_test.profile.short.output_tokens"]
     with pytest.raises(ValidationError) as exc:
         RunConfig.model_validate(values)
     assert _configuration_errors(exc.value.errors(), values)[0]["fields"] == expected

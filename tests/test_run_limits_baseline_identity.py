@@ -56,7 +56,13 @@ def test_ordinary_load_baseline_survives_optional_nonce_builder_argument(additio
 
 
 @pytest.mark.parametrize("additional_checks", [[], ["access"]], ids=["load", "access-and-load"])
-@pytest.mark.parametrize("old_source", [PRE_NONCE_LOAD, NONCE_ONLY_LOAD], ids=["before-nonce", "before-explicit-stage"])
+@pytest.mark.parametrize("old_source", [
+    PRE_NONCE_LOAD, NONCE_ONLY_LOAD,
+    "ab442c8b54be31143ad52fa20f86cd896d2fcf39da495a80cc48db9bc5cb90ee",
+    "3d2fd5628600a0d75e7c15edd2b1414ab376172cba2c15928a44d80014e99498",
+    "656aa277b6f2d1eebbe4c0cc4f56d6875bdf4547bae6a36c63c3fe613f8d6b75",
+], ids=["before-nonce", "before-explicit-stage", "before-context-validation-removal",
+        "main-before-plan-messages", "branch-before-plan-messages"])
 def test_ordinary_load_baseline_survives_explicit_multi_user_stage(additional_checks, old_source):
     current, old, _ = load_reports(old_source=old_source)
     for report in (current, old):
@@ -745,7 +751,7 @@ async def test_exact_policy_predecessor_preserves_measured_multi_user(monkeypatc
     predecessor_generator = "e4ddc7a7e8563f9ab3bba2fc42ad0232ee924c65f67d92dafd89c21025d202d0"
     # This test changes only the generator label on the current runtime. The
     # pre-mode runtime upgrade is covered by test_interference_upgrade_baseline.
-    predecessor_source = "a505fae2bd8c99931e6b0f70aae58d76d4499cfe52bca68035468bf49fc4e79c"
+    predecessor_source = "4961a84674471755a3845a4c0b730435d6aa4c9fa8a4a8f50a4c396331d7af7c"
     if companion == "load":
         options.update(checks=["multi_user", "load"], load_test=load_config(duration=1).load_test)
     with monkeypatch.context() as policy:
@@ -770,7 +776,7 @@ async def test_exact_policy_predecessor_preserves_measured_multi_user(monkeypatc
                 "settings": {"multi_user": old.manifest["config"]["multi_user"]}}
     if companion == "load":
         identity["settings"]["load_test"] = options["load_test"].model_dump(mode="json")
-        identity["load_test_source_sha256"] = "ab442c8b54be31143ad52fa20f86cd896d2fcf39da495a80cc48db9bc5cb90ee"
+        identity["load_test_source_sha256"] = "d26d065e633fe1b2693cb67504c238ebb6d26f24abb26fda26f35bc7f028b007"
     assert fixture_hash(identity) == old.manifest["fixture_pack"][fingerprint]
 
     assert _settings_reasons(current, old) == []

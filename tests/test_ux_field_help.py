@@ -122,7 +122,7 @@ def test_load_explanations_and_live_status_ids_are_inside_popovers():
         ('load_combinations_grid', 'Each selected combination runs under every selected traffic pattern and level.'),
         ('load_mixed_grid', 'Bursts use this same mix. Shares describe request counts, not tokens or time.'),
         ('load_stress_cases', 'Each selection is a separate test using the traffic patterns below. Stress prompts ask for extended output; set minimum length coverage below.'),
-        ('load_data_profile', 'Used by every selected workload below. Answers may finish before their cap; actual token lengths are reported.'),
+        ('load_data_profile', 'Load test only. Built-in examples are generated to these input token targets. Used by every selected workload below. Answers may finish before their cap; actual token lengths are reported.'),
         ('load_workloads', 'Select a workload to open its settings. Selected workloads run separately; mixed traffic combines request sizes within its own test.'),
         ('load_traffic_patterns', 'Each selected pattern runs separately for combinations, mixed traffic and token stress.'),
         ('load_burst_schedule', 'Runs alone when neither Constant nor Poisson is selected. Otherwise, adds bursts to each selected arrival pattern.'),
