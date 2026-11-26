@@ -250,7 +250,7 @@ def configuration_errors(items: list[dict], body: Any) -> list[dict]:
             actions.append(result)
         if not actions:
             actions = [{"label": "Edit " + edit_label(field), "field": field} for field in fields]
-        error = {"loc": loc, "msg": message, "field": fields[0], "fields": fields,
+        error = {"loc": loc, "msg": message, "type": item.get("type"), "field": fields[0], "fields": fields,
                  "values": values, "actions": actions}
         if isinstance(context.get("note"), str):
             error["note"] = context["note"]

@@ -237,9 +237,20 @@ assert.equal(state.config.targets[0].model,'latest-model');
 assert.equal(state.config.checks.join(','),bootstrap.defaults.checks.join(','));
 assert.equal(JSON.stringify(state.config.request_pack),savedPack);
 assert.equal(state.config.max_requests,config.max_requests);
+// A failed comparison cannot prefill a subsequent fresh New run.
+location.hash='#runs/saved';state.detail={{id:'saved',config}};
+state.baselines=[{{id:'failed-baseline',run_id:'saved',name:'Saved baseline'}}];state.prefillBaseline='';
+let comparisonToast;toast=text=>{{comparisonToast=text;}};
+api=async()=>{{throw Object.assign(new Error('Extra inputs are not permitted'),{{status:422,errors:[{{type:'extra_forbidden',field:'targets.0.bogus_setting'}}]}});}};
+await listeners.click({{target:{{closest:q=>q==='[data-action]'?{{dataset:{{action:'compare-run'}}}}:null}}}});
+assert.equal(state.prefillBaseline,'');assert.equal(location.hash,'#runs/saved');assert.match(comparisonToast,/bogus_setting/);
+api=async(path,options)=>{{assert.equal(path,'/api/config/draft');return {{config:JSON.parse(options.body),migration_notes:[]}};}};
+delete nodes['#new-run-form'];await startNewRun();nodes['#new-run-form']=form;
+assert.equal(location.hash,'#new');renderNew();assert.equal(form.elements.baseline_id.value,'');
 // Reruns and imported advanced selections infer Custom without rewriting them.
 const custom={{...structuredClone(config),checks:['access','correctness','recovery'],concurrency:16}};
-state.detail={{report:{{manifest:{{config:custom}}}},baseline_id:'saved-baseline'}};rerun();
+api=async(path,options)=>{{assert.equal(path,'/api/config/draft');return {{config:JSON.parse(options.body),migration_notes:[]}};}};
+state.detail={{report:{{manifest:{{config:custom}}}},baseline_id:'saved-baseline'}};await rerun();
 const rerunBefore=JSON.stringify(state.config);renderNew();
 assert.equal(state.setupPreset,'custom');assert.equal(JSON.stringify(state.config),rerunBefore);
 assert.equal(state.config.concurrency,16);assert.equal(state.prefillBaseline,'saved-baseline');

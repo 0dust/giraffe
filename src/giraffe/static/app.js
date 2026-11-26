@@ -4867,7 +4867,7 @@ function normalizeRateThreshold(config){
   if(defaultValue!==undefined){result.limits ||= {};if(result.limits.regression_rate_points==null)result.limits.regression_rate_points=defaultValue;}
   return result;
 }
-async function rerun(){
+async function rerun({baseline}={}){
   const version=state.routeVersion;let source=state.detail.report?.manifest?.config || state.detail.config;
   if(!source){toast('No configuration was saved for this run.');return;}
   let notes=[],limitNotes=[],warnings=[];
@@ -4879,7 +4879,7 @@ async function rerun(){
     return;
   }
   source=normalizeRateThreshold(source);
-  replaceMigrationNotes(notes,warnings,limitNotes);state.config=clone(source);state.gatewayAccessDraft={};state.autoModel=null;state.setupStep=1;invalidateModelDiscovery();state.datasetSelection=[];state.config.restart_target=null;state.formMode='normal';state.formRestartTarget=null;state.jsonDraft=null;state.jsonBase=null;state.configView='form';configChanged();state.prefillBaseline=state.detail.baseline_id || '';location.hash='#new';
+  replaceMigrationNotes(notes,warnings,limitNotes);state.config=clone(source);state.gatewayAccessDraft={};state.autoModel=null;state.setupStep=1;invalidateModelDiscovery();state.datasetSelection=[];state.config.restart_target=null;state.formMode='normal';state.formRestartTarget=null;state.jsonDraft=null;state.jsonBase=null;state.configView='form';configChanged();state.prefillBaseline=baseline ?? (state.detail.baseline_id || '');location.hash='#new';
 }
 function portableConfig(payload) {return {...payload.config,restart_target:payload.mode==='cold-start'?payload.restart_target:null};}
 function hasJsonChanges() {return state.jsonDraft!==null&&state.jsonDraft!==state.jsonBase;}
@@ -5215,7 +5215,7 @@ document.addEventListener('click',async(event)=>{
   if(action==='select-tests'||action==='clear-tests'){configChanged();for(const input of $$('#new-run-form input[name="check"]'))input.checked=action==='select-tests';captureFormDraft();renderNew('custom');$(`[data-action="${action}"]`)?.focus({preventScroll:true});return;}
   if(action==='reset-traffic'){configChanged();const form=$('#new-run-form');form.elements.traffic_mode.value='default';const defaults=state.bootstrap.config.traffic;for(const [key,value] of Object.entries(defaults)){if(key==='mix'){for(const [kind,weight] of Object.entries(value))form.elements[`traffic_mix_${kind}`].value=weight;}else form.elements[`traffic_${key}`].value=Array.isArray(value)?value.join(', '):value ?? '';}syncTestControls();updateBounds();return;}
   if(action==='compare-saved'){await openComparisonDialog();return;}
-  if(action==='compare-run'){const saved=(state.baselines || []).find(item=>item.run_id===state.detail?.id);await rerun();if(saved)state.prefillBaseline=saved.id;return;}
+  if(action==='compare-run'){const saved=(state.baselines || []).find(item=>item.run_id===state.detail?.id);await rerun({baseline:saved?.id});return;}
   if(action==='choose-baseline'){const options=$('#execution-settings');if(options){options.open=true;const select=$('#field-baseline_id');select?.focus();select?.scrollIntoView?.({block:'center'});}return;}
   if(action==='retry')route();if(action==='clear-filter'){state.filter='all';state.historySearch='';renderRuns();}
   if(action==='stop')await confirmStop();if(action==='show-failing')showFailingRequests();if(action==='show-inconclusive'){chooseReportTab('results',{anchor:false});const findings=$('#failing-requests');findings?.scrollIntoView?.({block:'start'});findings?.focus({preventScroll:true});}if(action==='show-comparison'){chooseReportTab('results',{anchor:false});revealReportSection('baseline');location.hash=`${linkRun(state.detail.id)}/results/baseline`;}if(action==='rerun')await rerun();if(action==='baseline-dialog')openBaselineDialog();

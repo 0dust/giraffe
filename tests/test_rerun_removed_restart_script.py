@@ -1,5 +1,6 @@
 """Saved pre-release restart scripts are removed without arming commands."""
 
+import json
 from copy import deepcopy
 
 import pytest
@@ -128,24 +129,47 @@ assert.equal(location.hash,'#new');
 ''')
 
 
-def test_rerun_explains_unsupported_fields_and_stays_on_run():
-    browser_logic(r'''
-location.hash='#runs/saved';state.detail={report:{manifest:{config}},baseline_id:null};
+def test_draft_preserves_unsupported_field_type_and_rerun_explains_it(tmp_path):
+    source = saved_config()
+    source["targets"][0]["bogus_setting"] = True
+    with TestClient(create_app(tmp_path), base_url="http://127.0.0.1:8787") as client:
+        response = client.post("/api/config/draft", json=source)
+    assert response.status_code == 422, response.text
+    body = response.json()
+    error = next(item for item in body["detail"] if item["field"] == "targets.0.bogus_setting")
+    assert error["type"] == "extra_forbidden"
+    browser_logic("const responseBody=" + json.dumps(body) + ";const savedSource=" + json.dumps(source) + r'''
+location.hash='#runs/saved';state.detail={report:{manifest:{config:savedSource}},baseline_id:null};
 let message;toast=text=>{message=text;};
-api=async()=>{const error=new Error('Extra inputs are not permitted');
- error.errors=[{type:'extra_forbidden',field:'targets.0.foo',msg:error.message},
- {type:'extra_forbidden',field:'targets.0.foo',msg:error.message}];throw error;};
+fetch=async(path,options)=>{
+ assert.equal(path,'/api/config/draft');assert.equal(options.body,JSON.stringify(savedSource));
+ return {ok:false,status:422,json:async()=>responseBody};
+};
 await rerun();
-assert.equal(message,'This run was saved by an earlier Giraffe version with settings this version no longer supports: targets.0.foo. Start a new run from Setup instead.');
+assert.equal(message,'This run was saved by an earlier Giraffe version with settings this version no longer supports: targets.0.bogus_setting. Start a new run from Setup instead.');
 assert.equal(location.hash,'#runs/saved');
+''')
+
+
+def test_compare_run_uses_saved_baseline_after_success():
+    browser_logic(r'''
+renderRequestPreview=()=>{};
+location.hash='#runs/saved';state.detail={id:'saved',config,baseline_id:'previous-baseline'};
+state.baselines=[{id:'saved-baseline',run_id:'saved'}];
+api=async(path,options)=>{assert.equal(path,'/api/config/draft');return {config:JSON.parse(options.body)};};
+await listeners.click({target:{closest:q=>q==='[data-action]'?{dataset:{action:'compare-run'}}:null}});
+assert.equal(state.prefillBaseline,'saved-baseline');assert.equal(location.hash,'#new');
 ''')
 
 
 def test_rerun_preserves_route_guard():
     browser_logic(r'''
-location.hash='#runs/saved';state.detail={config};const original=state.config;
+location.hash='#runs/saved';state.detail={id:'saved',config};const original=state.config;
+state.baselines=[{id:'saved-baseline',run_id:'saved'}];state.prefillBaseline='existing-baseline';
 api=async()=>{state.routeVersion++;location.hash='#runs/other';return {config,migration_notes:['Old run']};};
-await rerun();assert.equal(location.hash,'#runs/other');assert.equal(state.config,original);
+await listeners.click({target:{closest:q=>q==='[data-action]'?{dataset:{action:'compare-run'}}:null}});
+assert.equal(location.hash,'#runs/other');assert.equal(state.config,original);
+assert.equal(state.prefillBaseline,'existing-baseline');
 assert.deepEqual(state.migrationNotes,[]);
 ''')
 
