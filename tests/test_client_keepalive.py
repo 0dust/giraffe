@@ -3,6 +3,7 @@
 import asyncio
 import json
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
 
 import pytest
 
@@ -100,6 +101,28 @@ async def test_done_without_http_eof_has_bounded_cleanup(monkeypatch):
         assert len(connections) == 2
 
 
+async def test_connection_wait_counts_as_preparation_instead_of_response_latency(monkeypatch):
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr('giraffe.client.time', SimpleNamespace(perf_counter=lambda: clock.now))
+    monkeypatch.setattr('giraffe.client._STREAM_DRAIN_SECONDS', None)
+    release = asyncio.Event()
+    async with endpoint(eof_release=release) as (target, connections):
+        async with LLMClient(target, RunConfig(targets=[target]), max_connections=1) as client:
+            try:
+                assert (await client.execute(request())).valid
+                waiting = asyncio.create_task(client.execute(request()))
+                await asyncio.sleep(0)  # Let the second request reach the occupied lane.
+                assert not waiting.done()
+                clock.now = 1.0
+            finally:
+                release.set()
+            record = await waiting
+        assert len(connections) == 1
+    assert record.valid
+    assert record.client_preparation_ms == 1000
+    assert record.first_output_ms == record.first_token_ms == record.elapsed_ms == 0
+
+
 async def test_cancelled_client_shutdown_closes_pending_stream():
     async with endpoint(eof_delay=10) as (target, _):
         client = await LLMClient(target, RunConfig(targets=[target])).__aenter__()
@@ -152,6 +175,8 @@ async def test_waiting_request_timeout_does_not_release_a_draining_connection(mo
                 impatient = request().model_copy(update={'request_timeout_seconds': .005})
                 timed_out = await client.execute(impatient)
                 assert timed_out.status == 'timeout'
+                assert timed_out.client_preparation_ms > 0
+                assert timed_out.elapsed_ms == 0 and timed_out.first_output_ms is None
                 assert client._stream_drains and client._client._slots._value == 0
                 release.set()
                 await asyncio.gather(*client._stream_drains)

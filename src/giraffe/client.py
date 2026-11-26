@@ -711,9 +711,7 @@ class LLMClient:
             "messages": spec.messages, "options": {k: v for k, v in payload.items() if k not in {"model", "messages"}},
         }, sort_keys=True).encode()).hexdigest()
         record.history_hash = hashlib.sha256(json.dumps(spec.messages[:-1], sort_keys=True).encode()).hexdigest()
-        start = time.perf_counter()
-        record._timing_started_monotonic = monotonic()
-        record.client_preparation_ms = (start - preparation_start) * 1000
+        start = preparation_start
         tool_parts: dict[int, dict] = {}
         last_answer: float | None = None
         tool_output: float | None = None
@@ -1113,7 +1111,7 @@ class LLMClient:
         )
         timeout = min(request_timeout,
                       spec.cancel_after_ms / 1000 if spec.cancel_after_ms else float("inf"))
-        transport_started = _before_send is None
+        transport_started = False
         try:
             observe("started")
             async with asyncio.timeout(None if _before_send is not None else timeout) as request_deadline:
@@ -1143,23 +1141,22 @@ class LLMClient:
                             sending_post = False
 
                     request.extensions["trace"] = observe_send
-                if _before_send is not None:
-                    def begin_transport():
-                        nonlocal start, transport_started
+                def begin_transport():
+                    nonlocal start, transport_started
+                    if _before_send is not None:
                         _before_send()
-                        transport_started = True
-                        start = time.perf_counter()
-                        record._timing_started_monotonic = monotonic()
-                        record.started_at = datetime.now(timezone.utc).isoformat()
-                        record.client_preparation_ms = (start - preparation_start) * 1000
                         request_deadline.reschedule(asyncio.get_running_loop().time() + timeout)
+                    # The pool calls this after leasing a connection lane.
+                    start = time.perf_counter()
+                    record._timing_started_monotonic = monotonic()
+                    record.started_at = datetime.now(timezone.utc).isoformat()
+                    record.client_preparation_ms = (start - preparation_start) * 1000
+                    transport_started = True
 
-                    if isinstance(self._client, HTTPClientPool):
-                        response = await self._client.send(request, stream=True, _before_send=begin_transport)
-                    else:
-                        begin_transport()
-                        response = await self._client.send(request, stream=True)
+                if isinstance(self._client, HTTPClientPool):
+                    response = await self._client.send(request, stream=True, _before_send=begin_transport)
                 else:
+                    begin_transport()
                     response = await self._client.send(request, stream=True)
                 events = None
                 try:
@@ -1385,7 +1382,10 @@ class LLMClient:
                     evidence = evidence.model_copy(update={"status": "incomplete", "reason": "Response did not complete validly."})
                 record.logprob_evidence = self.logprob_budget.retain(evidence)
             now = time.perf_counter()
-            record.elapsed_ms = (now - start) * 1000
+            if transport_started:
+                record.elapsed_ms = (now - start) * 1000
+            else:
+                record.client_preparation_ms = (now - preparation_start) * 1000
             record.output_chars = len(record.output)
             record.tool_calls = [tool_parts[index] for index in sorted(tool_parts)]
             # Answer timing excludes inline reasoning and counts network reads,
