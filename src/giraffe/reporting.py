@@ -268,6 +268,10 @@ def _limits_reached(report: RunReport) -> set[str]:
     return reached
 
 
+def _is_workload_digest(value: Any) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+
 def _settings_reasons(report: RunReport, baseline: RunReport, *, details: dict[str, dict[str, Any]] | None = None) -> list[str]:
     reasons = []
 
@@ -500,16 +504,15 @@ def _settings_reasons(report: RunReport, baseline: RunReport, *, details: dict[s
                 pack if excluded else {**pack, shared_key: pack.get(fingerprint_key)}
                 for pack, excluded in zip((current_pack, old_pack), excluded_checks))
             shared_digests = [pack.get(shared_key) for pack in (current_pack, old_pack)]
-            has_identity = all(isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest)
-                               for digest in shared_digests)
+            has_identity = all(_is_workload_digest(digest) for digest in shared_digests)
             current_pack, old_pack = ({**pack, fingerprint_key: pack.get(shared_key)}
                                       for pack in (current_pack, old_pack))
         else:
-            has_identity = all(isinstance(pack.get(fingerprint_key), str) and pack[fingerprint_key]
+            has_identity = all(_is_workload_digest(pack.get(fingerprint_key))
                                for pack in (current_pack, old_pack))
             full_match = has_identity and current_pack[fingerprint_key] == old_pack[fingerprint_key]
-            if not full_match and all(
-                isinstance(pack.get(shared_key), str) and re.fullmatch(r"[0-9a-f]{64}", pack[shared_key])
+            if has_identity and not full_match and all(
+                _is_workload_digest(pack.get(shared_key))
                 for pack in (current_pack, old_pack)
             ):
                 has_identity = True
@@ -2298,7 +2301,7 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                 else:
                     version = report.manifest.get("gateway_access_workload_version")
                     old_version = baseline.manifest.get("gateway_access_workload_version")
-                    if not isinstance(version, int) or version != old_version:
+                    if type(version) is not int or type(old_version) is not int or version != old_version:
                         access_reasons.append("Gateway access workload version differs or is missing. Rerun the access check and baseline.")
             if access_settings is not None:
                 rows.extend(_compare_gateway_access(current_access, old_access,
@@ -2331,7 +2334,7 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
             version = report.manifest.get("gateway_policy_workload_version")
             old_version = baseline.manifest.get("gateway_policy_workload_version")
             compatible = (not target_reasons and refs_match and outcomes_match
-                          and isinstance(version, int) and version == old_version
+                          and type(version) is int and type(old_version) is int and version == old_version
                           and current_policy.get("version") == old_policy.get("version") == POLICY_VERSION
                           and settings == old_settings
                           and settings.model_dump(mode="json") == current_policy.get("settings") == old_policy.get("settings")

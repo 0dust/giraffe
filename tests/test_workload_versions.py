@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from giraffe import concurrent_load, load_test, multi_user, session_sampling
+from giraffe import concurrent_load, load_test, multi_user, session_sampling, workloads
 from giraffe.deployment import fixture_hash
 from giraffe.fixtures import builtin_fixtures
 from giraffe.logprob_workload import logprob_fixtures
@@ -19,6 +19,7 @@ from giraffe.workload_versions import WORKLOAD_VERSIONS
 NONCE = "0" * 32
 PINNED = {
     "generator": (1, "ed642bed3e3a013c33edb0fbbd2238e684095a64f1487fbbf21fa5cf6e5d9873"),
+    "fixed_sessions": (1, "84e2056aa1e6fb8068c2848480478dfdc4e39f41e1e66512d2d37a4a02815b1d"),
     "session_sampling": (1, "54c8029050f0f728e9d5a78f03c06d786c533d5154119bfb9855489dd5d130bc"),
     "multi_user": (1, "5f1f0f51dd70726696e20ce9f033c15bd2fdabc40fb97406ca6009769d987516"),
     "scale_down": (1, "3403a497536a5c37c6a28f46c7ec3a6e09c71b20ee11bec196c93e5497041541"),
@@ -45,6 +46,30 @@ def _requests(specs):
 
 def _generator():
     return {name: _requests(specs) for name, specs in builtin_fixtures(_config()).items()}
+
+
+def _fixed_sessions():
+    config = _config(checks=["sessions"])
+    settings = config.sessions
+    requests = []
+    for mode in settings.modes:
+        for index in range(settings.sessions):
+            value = f"Session_{index:04d}_{mode}"
+            history = []
+            for turn, prompt in enumerate(settings.turns):
+                prompt = workloads.session_prompt(prompt, turn, value)
+                messages = [*history, {"role": "user", "content": prompt}]
+                request = workloads.spec(
+                    prompt, f"session_{mode}_turn{turn}", "sessions",
+                    max_tokens=settings.max_tokens,
+                    request_timeout_seconds=config.request_timeout_seconds,
+                    options=workloads.deterministic_options(config),
+                )
+                request.messages = messages
+                requests.append(request)
+                # A deterministic valid reply makes live history reproducible too.
+                history = [*messages, {"role": "assistant", "content": value}]
+    return _requests(requests)
 
 
 def _load_test():
@@ -95,7 +120,7 @@ def _logprob():
     return {name: _requests([spec]) for name, spec in logprob_fixtures(config, builtin_fixtures(config)).items()}
 
 
-BUILDERS = {"generator": _generator, "session_sampling": _session_sampling, "multi_user": _multi_user,
+BUILDERS = {"generator": _generator, "fixed_sessions": _fixed_sessions, "session_sampling": _session_sampling, "multi_user": _multi_user,
             "scale_down": _scale_down, "load_test": _load_test, "logprob": _logprob}
 
 
@@ -139,17 +164,17 @@ def test_module_comments_do_not_affect_workload_fingerprint(monkeypatch):
 
 @pytest.mark.parametrize(("checks", "settings", "names"), [
     (["serving"], {}, set()),
-    (["load"], {}, {"generator", "load_test"}),
-    (["multi_user"], {}, {"generator", "multi_user"}),
-    (["sessions"], {}, {"generator"}),
-    (["sessions"], {"sessions": {"sampling": {}}}, {"generator", "session_sampling"}),
+    (["load"], {}, {"load_test"}),
+    (["multi_user"], {}, {"multi_user"}),
+    (["sessions"], {}, {"generator", "fixed_sessions"}),
+    (["sessions"], {"sessions": {"sampling": {}}}, {"generator", "fixed_sessions", "session_sampling"}),
     (["consistency"], {}, {"generator"}),
     (["consistency"], {"consistency": {"logprobs": {}}}, {"generator", "logprob"}),
     (["gateway_access"], {}, {"gateway_access"}),
-    (["gateway_access"], {"gateway_access": {}}, {"generator", "gateway_access"}),
+    (["gateway_access"], {"gateway_access": {}}, {"gateway_access"}),
     (["tools"], {}, {"generator"}),
     (["gateway_policy"], {}, {"gateway_policy"}),
-    (["scale_down"], {"scale_down": {"target": "service"}}, {"generator", "scale_down"}),
+    (["scale_down"], {"scale_down": {"target": "service"}}, {"scale_down"}),
 ])
 def test_identity_versions_follow_selected_workloads(checks, settings, names):
     from giraffe.runner import build_workload_identity
@@ -195,12 +220,16 @@ def test_shared_identity_removes_gateway_versions_and_recomputes_generator(share
     base, _ = build_workload_identity(_config(checks=shared_checks))
     config = _config(checks=[*shared_checks, "gateway_access"], gateway_access={})
     full, shared = build_workload_identity(config)
-    assert "generator" in full["workload_versions"]
+    assert "generator" not in full["workload_versions"]
     assert shared["shared_workload_fixture_sha256"] == fixture_hash(base)
     monkeypatch.setitem(WORKLOAD_VERSIONS, "gateway_access", 2)
     changed, changed_shared = build_workload_identity(config)
     assert fixture_hash(changed) != fixture_hash(full)
     assert changed_shared == shared
+    monkeypatch.setitem(WORKLOAD_VERSIONS, "generator", 2)
+    generator_changed, generator_shared = build_workload_identity(config)
+    assert fixture_hash(generator_changed) == fixture_hash(changed)
+    assert generator_shared == changed_shared
 
 
 def test_workload_version_bump_changes_selected_identity(monkeypatch):
@@ -208,7 +237,7 @@ def test_workload_version_bump_changes_selected_identity(monkeypatch):
 
     config = _config(checks=["load"])
     before, _ = build_workload_identity(config)
-    monkeypatch.setitem(WORKLOAD_VERSIONS, "generator", 2)
+    monkeypatch.setitem(WORKLOAD_VERSIONS, "load_test", 2)
     after, _ = build_workload_identity(config)
     assert fixture_hash(before) != fixture_hash(after)
 
@@ -237,3 +266,54 @@ def test_gateway_settings_preserve_shared_comparability_but_generator_version_do
     changed = report("other-gateway")
     assert reason in _settings_reasons(changed, baseline)
     assert reason in _settings_reasons(baseline, changed)
+
+
+def test_fixed_session_guard_covers_prompt_changes(monkeypatch):
+    before = hashlib.sha256(json.dumps(_fixed_sessions(), sort_keys=True).encode()).hexdigest()
+    original = workloads.session_prompt
+    monkeypatch.setattr(workloads, "session_prompt",
+                        lambda *args: original(*args).replace("bakery name", "bakery code"))
+    after = hashlib.sha256(json.dumps(_fixed_sessions(), sort_keys=True).encode()).hexdigest()
+    assert before != after
+
+
+@pytest.mark.parametrize("checks", [["load"], ["load", "serving", "first_output", "generation", "context"]])
+def test_generator_bump_does_not_change_load_identity(checks, monkeypatch):
+    from giraffe.runner import build_workload_identity
+
+    config = _config(checks=checks)
+    before, _ = build_workload_identity(config)
+    monkeypatch.setitem(WORKLOAD_VERSIONS, "generator", 2)
+    after, _ = build_workload_identity(config)
+    assert fixture_hash(before) == fixture_hash(after)
+
+
+@pytest.mark.parametrize(("checks", "settings", "changes"), [
+    (["sessions"], {}, True),
+    (["load"], {}, False),
+    (["multi_user"], {"multi_user": {"conversations": {}}}, True),
+    (["sessions"], {"sessions": {"workloads": [{"name": "unused", "turns": ["Hi", "More"]}]}}, True),
+    (["multi_user"], {"multi_user": {"conversations": {
+        "workloads": [{"name": "unused", "turns": ["Hi", "More"]}]}}}, True),
+    (["sessions"], {"sessions": {"profile": "performance", "modes": ["live"],
+                                 "workloads": [{"name": "chat", "turns": ["Hi", "More"]}]}}, False),
+])
+def test_fixed_sessions_version_follows_prompt_consumers(checks, settings, changes, monkeypatch):
+    from giraffe.runner import build_workload_identity
+
+    config = _config(checks=checks, **settings)
+    before, _ = build_workload_identity(config)
+    monkeypatch.setitem(WORKLOAD_VERSIONS, "fixed_sessions", 2)
+    after, _ = build_workload_identity(config)
+    assert (fixture_hash(before) != fixture_hash(after)) is changes
+
+
+@pytest.mark.parametrize("sampling", [None, {"think_time_seconds": {"values": [0, .25]}}])
+def test_multi_user_session_sampling_version_follows_sampling(sampling, monkeypatch):
+    from giraffe.runner import build_workload_identity
+
+    config = _config(checks=["multi_user"], multi_user={"conversations": {"sampling": sampling}})
+    before, _ = build_workload_identity(config)
+    monkeypatch.setitem(WORKLOAD_VERSIONS, "session_sampling", 2)
+    after, _ = build_workload_identity(config)
+    assert (fixture_hash(before) != fixture_hash(after)) is (sampling is not None)

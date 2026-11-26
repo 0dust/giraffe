@@ -68,7 +68,7 @@ def arrival_report(shapes=("short_short",), *, concurrent=False, count=None):
     })
     report = empty_report(config)
     report.manifest.update(timing_measurement_version=2,
-        fixture_pack={"version": "1", "builtin_sha256": "fixed", "workload_fixture_sha256": "fixed"},
+        fixture_pack={"version": "1", "builtin_sha256": "fixed", "workload_fixture_sha256": "a" * 64},
         effective_checks={"load": config.load_test.model_dump()}, effective_traffic=None,
         load_shape={}, run_location={})
     report.requests = []

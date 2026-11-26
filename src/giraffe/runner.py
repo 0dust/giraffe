@@ -62,11 +62,24 @@ def build_workload_identity(config: RunConfig) -> tuple[dict, dict]:
                               if hasattr(getattr(config, key), "model_dump") else getattr(config, key))
                          for key, checks in WORKLOAD_CHECKS.items()
                          if checks.intersection(config.checks)}
+    def uses_generator(settings):
+        # Core built-ins are attested separately by fixture_pack.builtin_sha256.
+        # Load and ordinary Multi-user requests use load_test's own builders.
+        return (any(settings.get(key) for key in ("prefix", "sessions", "consistency", "tool_calling"))
+                or bool((settings.get("multi_user") or {}).get("conversations")))
+
     versions = {}
-    if any(workload_settings.values()):
+    if uses_generator(workload_settings):
         versions["generator"] = WORKLOAD_VERSIONS["generator"]
     workload_identity = {"workload_versions": versions, "settings": workload_settings}
-    if "sessions" in config.checks and config.sessions and config.sessions.sampling:
+    conversations = []
+    if "sessions" in config.checks and config.sessions:
+        conversations.append(config.sessions)
+    if "multi_user" in config.checks and config.multi_user and config.multi_user.conversations:
+        conversations.append(config.multi_user.conversations)
+    if any(settings.profile != "performance" for settings in conversations):
+        versions["fixed_sessions"] = WORKLOAD_VERSIONS["fixed_sessions"]
+    if any(settings.sampling is not None for settings in conversations):
         versions["session_sampling"] = WORKLOAD_VERSIONS["session_sampling"]
     if "multi_user" in config.checks:
         from .multi_user import WINDOW_POLICY
@@ -97,7 +110,7 @@ def build_workload_identity(config: RunConfig) -> tuple[dict, dict]:
                            if key not in SHARED_BASELINE_EXCLUDED_WORKLOADS}
         shared_versions = {key: value for key, value in versions.items()
                            if key not in SHARED_BASELINE_EXCLUDED_WORKLOADS and key != "generator"}
-        if any(shared_settings.values()):
+        if uses_generator(shared_settings):
             shared_versions["generator"] = WORKLOAD_VERSIONS["generator"]
         shared_workload_hash["shared_workload_fixture_sha256"] = fixture_hash({
             **workload_identity,

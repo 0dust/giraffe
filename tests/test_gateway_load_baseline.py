@@ -106,3 +106,35 @@ async def test_saved_fixed_sessions_baseline_survives_gateway_dispatch(monkeypat
     unverified.manifest["fixture_pack"]["workload_fixture_sha256"] = "unknown"
     unverified.manifest["fixture_pack"]["shared_workload_fixture_sha256"] = "unknown"
     assert "Fixture pack identity differs." in _settings_reasons(current, unverified)
+
+
+@pytest.mark.parametrize("bad_digest", ["unknown", "a" * 63, "A" * 64, "g" * 64, None])
+async def test_load_fixture_identity_requires_well_formed_full_digests(monkeypatch, local_tokenizer, bad_digest):
+    def handler(request):
+        if request.method != "POST":
+            return httpx.Response(404)
+        return httpx.Response(200, json={"choices": [{"message": {"content": "OK"}, "finish_reason": "stop"}],
+                                        "usage": {"prompt_tokens": 128, "completion_tokens": 4}})
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
+    cfg = RunConfig.model_validate({**config().model_dump(), "stream": False})
+    current = await runner.run_suite(cfg)
+    baseline = await runner.run_suite(cfg)
+    assert _settings_reasons(current, baseline) == []
+    assert compare_baseline(current, baseline).baseline["status"] == "pass"
+
+    for report in (current, baseline):
+        report.manifest["fixture_pack"]["shared_workload_fixture_sha256"] = "a" * 64
+    # Matching placeholders must not attest Load's exemption from builtin identity.
+    current.manifest["fixture_pack"]["workload_fixture_sha256"] = bad_digest
+    baseline.manifest["fixture_pack"]["workload_fixture_sha256"] = bad_digest
+    baseline.manifest["fixture_pack"]["builtin_sha256"] = "different-builtins"
+    assert "Fixture pack identity differs." in _settings_reasons(current, baseline)
+    assert "Fixture pack identity differs." in _settings_reasons(baseline, current)
+
+    # Either side being malformed is enough, even with valid matching shared digests.
+    for report in (current, baseline):
+        report.manifest["fixture_pack"]["workload_fixture_sha256"] = "a" * 64
+        assert "Fixture pack identity differs." in _settings_reasons(current, baseline)
+        report.manifest["fixture_pack"]["workload_fixture_sha256"] = bad_digest

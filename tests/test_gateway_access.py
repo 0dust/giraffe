@@ -298,3 +298,36 @@ def test_limits_and_example_are_valid():
             GatewayAccess.model_validate(changes)
     values = yaml.safe_load((Path(__file__).parents[1] / "examples/gateway-access.yaml").read_text())
     assert RunConfig.model_validate(values).checks == ["gateway_access"]
+
+
+@pytest.mark.parametrize("version", [True, 1.0, "1", None, 1], ids=["bool", "float", "string", "missing", "int"])
+@pytest.mark.parametrize("side", ["current", "baseline"])
+async def test_access_baseline_requires_integer_workload_versions_on_both_sides(monkeypatch, version, side):
+    from giraffe.reporting import compare_baseline
+    from giraffe.runner import run_suite
+
+    monkeypatch.setenv("ALLOW_KEY", "allow-secret")
+    monkeypatch.setenv("DENY_KEY", "deny-secret")
+
+    def handler(request):
+        if request.method != "POST":
+            return httpx.Response(404)
+        if request.headers["authorization"] == "Bearer deny-secret":
+            return httpx.Response(401, json={"error": {"type": "token_not_found_in_db"}})
+        return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "OK"}, "finish_reason": "stop"}]})
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
+    current = await run_suite(config())
+    baseline = current.model_copy(deep=True)
+    changed = current if side == "current" else baseline
+    if version is None:
+        changed.manifest.pop("gateway_access_workload_version")
+    else:
+        changed.manifest["gateway_access_workload_version"] = version
+    rows = compare_baseline(current, baseline).baseline["targets"][0]["comparisons"]
+    assert rows and all(row["check"] == "gateway_access" for row in rows)
+    expected = "pass" if type(version) is int else "inconclusive"
+    assert all(row["status"] == expected for row in rows)
+    if expected == "inconclusive":
+        assert all("workload version differs or is missing" in row["reason"] for row in rows)

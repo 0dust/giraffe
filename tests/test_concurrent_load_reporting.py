@@ -19,7 +19,7 @@ async def saved_report(interference=False):
     report = empty_report(config)
     report.requests, report.checks = run.records, [check]
     report.manifest.update(timing_measurement_version=2,
-        fixture_pack={'version': '1', 'builtin_sha256': 'fixed', 'workload_fixture_sha256': 'fixed'},
+        fixture_pack={'version': '1', 'builtin_sha256': 'fixed', 'workload_fixture_sha256': 'a' * 64},
         effective_checks={'load': config.load_test.model_dump()}, effective_traffic=None, load_shape={}, run_location={})
     return report
 
