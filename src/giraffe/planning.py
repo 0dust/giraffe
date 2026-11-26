@@ -19,12 +19,12 @@ from giraffe.gateway_access import (configured_probe_count as configured_access_
 from giraffe.gateway_attribution import (POLL_FRACTIONS, configured_probe_count,
                                          deferred_for_shared_targets, reader_preflight_bound)
 from giraffe.gateway_policy import deferred_for_shared_targets as defer_gateway_policy
-from giraffe.concurrent_load import prompt_overhead
+from giraffe.concurrent_load import context_window as observed_context_window, prompt_overhead
 from giraffe.identities import gateway_identities_only
 from giraffe.logprob_workload import corpus_width, sample_count
-from giraffe.load_test import context_window, calibration_keys, load_time_plan, minimum_reservation, test_points, point_shapes, settings_sets, saved_shape_warnings
+from giraffe.load_test import calibration_keys, load_time_plan, minimum_reservation, test_points, point_shapes, settings_sets, saved_shape_warnings
 from giraffe.models import (CATALOGUE_NAMES, CHECK_NAMES, CHECK_OPTION_FIELDS, CORE_CHECKS, MAX_PLANNED_ARRIVALS,
-                            SHARED_BASELINE_EXCLUDED_WORKLOADS, ConfigDraft, RunConfig, required_concurrency)
+                            SHARED_BASELINE_EXCLUDED_WORKLOADS, ConfigDraft, RunConfig, load_shape_label, required_concurrency)
 from giraffe.request_pack import active_pack, pack_summary, pack_settings
 from giraffe.workloads import fixed_session_turns, label_prompt, prefix_admitted
 from giraffe.tool_checks import resolved_tool_fixtures, resolved_tool_modes
@@ -536,7 +536,7 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
             quota = quotas[target.name]
             evidence_reserve = token_evidence_request_reserve(rows, target=target.name)
             if quota is None or quota - initial_count > max(1, evidence_reserve - initial_count):
-                setup(target.name, "performance_evidence_probe", "Streamed token and usage compatibility",
+                setup(target.name, "performance_evidence_probe", "Streamed token and usage support",
                       "request_timeout_seconds", config.request_timeout_seconds)
         for row in ordered:
             name = row["id"]
@@ -1083,14 +1083,30 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
             "errors": errors, "time_warnings": warnings}
 
 
+def _context_window_article(value):
+    leading = f"{value:,}".split(",")[0]
+    return "an" if leading.startswith("8") or leading in {"11", "18"} else "a"
+
+
 def request_plan(config: RunConfig | ConfigDraft, *,
-                 pack_details: dict[str, Any] | None = None, observations=None) -> dict[str, Any]:
+                 pack_details: dict[str, Any] | None = None, observations=None,
+                 context_windows: dict[str, dict] | None = None) -> dict[str, Any]:
     """Count complete fixed work before hard caps; leave adaptive totals unknown.
 
     Rows account for shared controls only once. ``known`` includes only exact
     fixed portions, and evaluator calls share the dataset preview's count rules.
     The optional preview avoids rebuilding request-pack schedules in the API.
     """
+    if context_windows is None:
+        context_windows = getattr(config, "_preflight_context_windows", None) or {}
+    effective_windows = {}
+    for target in config.targets:
+        entry = (context_windows or {}).get(target.name)
+        observation = ({"deployment": {"fields": {"serving.context_limit": {"reported": {
+            "value": entry["value"], "provenance": entry["source"]}}}}} if entry else None)
+        value, _ = observed_context_window(target, observation)
+        if value is not None:
+            effective_windows[target.name] = {"value": value, "source": entry["source"] if entry else "configuration"}
     selected = set(config.checks)
     rows: list[dict[str, Any]] = []
     warnings: list[str] = []
@@ -1380,9 +1396,39 @@ def request_plan(config: RunConfig | ConfigDraft, *,
         if criteria.max_first_answer_ms is None and criteria.max_completion_ms is None:
             load_warnings.append({"fields":["load_test.pass_criteria.max_first_answer_ms","load_test.pass_criteria.max_completion_ms"],
                 "msg":"Measure only: a first-answer or completion limit is required to establish highest tested accepted capacity."})
-        if any(context_window(t)[0] is None for t in config.targets):
-            load_warnings.append({"kind": "context_window_unknown", "fields":["load_test.profile.long.input_tokens"],
-                "msg":"Giraffe can't verify that your longest request fits this endpoint."})
+        for index, target in enumerate(config.targets):
+            fields = ["load_test.profile.long.input_tokens", f"targets.{index}.deployment.serving.context_limit"]
+            window = effective_windows.get(target.name)
+            entry = (context_windows or {}).get(target.name)
+            if window is None:
+                load_warnings.append({"kind": "context_window_unknown", "target": target.name, "fields": fields,
+                    "msg": "Context window unknown. Set the server's context window, or connect to a server that reports it."})
+            if entry:
+                configured, _ = observed_context_window(target)
+                if configured is not None and configured != entry["value"]:
+                    load_warnings.append({"kind": "context_window_conflict", "target": target.name, "fields": fields,
+                        "msg": f"The {target.name} server reports {_context_window_article(entry['value'])} {entry['value']:,}-token context window; the configuration says {configured:,}. Giraffe uses the reported value."})
+            if window is not None:
+                settings = dict(settings_sets(config.load_test))
+                seen_shapes = set()
+                for point in test_points(config.load_test):
+                    source = point["source"]
+                    own = settings[source]
+                    prefix = ("load_test" if source == "primary" else
+                              f"load_test.migrated_tests.{source.split('_')[1]}.settings")
+                    for shape in point_shapes(own, point):
+                        if (source, shape) in seen_shapes:
+                            continue
+                        seen_shapes.add((source, shape))
+                        a, b = shape.split("_")
+                        need = getattr(own.profile, a).input_tokens + getattr(own.profile, b).output_tokens
+                        if need > window["value"]:
+                            context = (f"the {target.name} server's configured context window is {window['value']:,} tokens"
+                                       if window["source"] == "configuration" else
+                                       f"the {target.name} server reports {_context_window_article(window['value'])} {window['value']:,}-token context window")
+                            load_warnings.append({"kind": "context_window_exceeded", "target": target.name,
+                                "fields": [f"{prefix}.profile.{a}.input_tokens", f"{prefix}.profile.{b}.output_tokens"],
+                                "msg": f"{load_shape_label(shape)} needs {need:,} tokens; {context}. Giraffe will block those Load test points instead of sending them."})
         if config.max_requests is not None and load_plan["expected_scheduled_requests"]*target_count > config.max_requests:
             load_warnings.append({"fields":["max_requests","load_test.schedule.duration_seconds","load_test.patterns.rates"],
                 "msg":"Expected scheduled Load test requests exceed the total request budget; some tests will be truncated.",
@@ -1694,7 +1740,7 @@ def request_plan(config: RunConfig | ConfigDraft, *,
     correctness_history = correctness_guidance(config, observations)
     warnings.extend(row["message"] for row in arrival_history if row["status"] == "warning")
     warnings.extend(row["message"] for row in correctness_history if row["status"] == "warning")
-    return {**timing, "arrival_history": arrival_history, "correctness_history": correctness_history,
+    return {**timing, "context_windows": effective_windows, "arrival_history": arrival_history, "correctness_history": correctness_history,
             "count_kind": kind, "planned_per_target": planned,
             **({"request_count_label": request_count_label} if load_plan else {}),
             "planned_total": planned_total,

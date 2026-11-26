@@ -179,6 +179,7 @@ and evaluator endpoints use their own credentials. Open local endpoints need no 
 
 By default, `giraffe run` sends a bounded preflight completion request per target
 before printing its request, simultaneous, duration, timeout and output settings.
+`--skip-preflight` skips the connection check and context-window probe.
 Those settings appear before suite traffic. **Ctrl+C** stops new requests and
 saves partial results after the suite starts. A blocking preflight failure does
 not produce a run report. Ordinary runs do not restart the service; cold-start

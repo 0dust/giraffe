@@ -399,8 +399,11 @@ def _window_summary(report, target, window, records, series, observation):
         ("client_ttft", "client_ttft_ms", "TTFT (client)"),
         ("first_reasoning", "first_reasoning_ms", "First reasoning latency")):
         observed_series = selected_series if key in {"client_ttft", "first_reasoning", "first_useful_output"} else valid_series
-        dist(key, [row["values"][field] for row in observed_series], label,
-             reason=("Versioned streamed generated-content receipt timing was not collected." if key == "client_ttft" else None))
+        row = dist(key, [row["values"][field] for row in observed_series], label)
+        if key == "client_ttft" and row["sample_count"] == 0:
+            row["reason"] = metrics[key]["reason"] = (
+                "Versioned streamed generated-content receipt timing was not collected."
+            )
     modern = [r for r in good if getattr(r, "timing_schema", 0) >= 1]
     event_records = [r for r in population if getattr(r, "timing_schema", 0) >= 1]
     gaps = [gap for r in event_records for gap in (getattr(r, "read_gaps_ms", None) or [])]
@@ -992,9 +995,11 @@ def build_performance(report, *, target=None, window=None):
             cohorts.append(dict(id=key, label=label, check=check, request_count=len(group),
                 valid_completions=sum(row.status == "completed" and row.valid for row in group),
                 preparation=all(_preparation(row) for row in group),
+                measurement_scope=any(row.scenario != "performance_evidence_probe" for row in group),
                 performance_workload=bool(_PERFORMANCE_CHECKS.intersection(group[0].check_ids)),
                 scenarios=list(dict.fromkeys(row.scenario for row in group))))
-        candidates = [row for row in cohorts if not row["preparation"]] or cohorts
+        measurement_cohorts = [row for row in cohorts if row["measurement_scope"]] or cohorts
+        candidates = [row for row in measurement_cohorts if not row["preparation"]] or measurement_cohorts
         representative = max(candidates, key=lambda row: (row["performance_workload"], row["valid_completions"])) if candidates else None
         default = representative["id"] if representative else None
         windows, summaries = [], {}

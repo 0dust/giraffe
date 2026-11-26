@@ -331,6 +331,7 @@ class MixedTraffic(Model):
 
 class StreamInterference(Model):
     enabled: bool = False
+    mode: Literal["long_input_during_short", "short_during_long"] = "long_input_during_short"
     trigger: Literal["streaming_started", "after_five_chunks"] = "streaming_started"
     max_slowdown: float = Field(default=1.5, gt=1)
 
@@ -2464,6 +2465,7 @@ class RunConfig(Model):
     load_test: LoadTest = Field(default_factory=LoadTest)
     _preparation_residency: dict = PrivateAttr(default_factory=dict)
     _request_timeout_check: str | None = PrivateAttr(default=None)
+    _preflight_context_windows: dict = PrivateAttr(default_factory=dict)
     _migration_notes: list[str] = PrivateAttr(default_factory=list)
     _concurrency_warnings: list[dict[str, Any]] = PrivateAttr(default_factory=list)
     sessions: Sessions | None = None
