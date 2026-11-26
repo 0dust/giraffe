@@ -115,9 +115,9 @@ assertValues();
 validateRunForm=()=>true;validateSetupChecks=()=>{};revealSetupStep=step=>state.setupStep=step;
 for(const step of [2,3,1]){navigateSetup(step);assert.equal(state.setupStep,step);renderNew();assertValues();}
 const saved=readForm(false).config;
+api=async(path,options)=>{assert.equal(path,'/api/config/draft');return {config:JSON.parse(options.body),migration_notes:[]};};
 state.detail={report:{manifest:{config:saved}},baseline_id:null};await rerun();renderNew();assertValues();
 state.config=structuredClone(bootstrap.config);state.jsonDraft=state.jsonBase='synced';renderNew();
-api=async(path,options)=>{assert.equal(path,'/api/config/draft');return {config:JSON.parse(options.body),migration_notes:[]};};
 toast=()=>{};
 await importConfig({text:async()=>JSON.stringify(saved)});assertValues();
 for(const name of Object.keys(edits)){

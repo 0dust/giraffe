@@ -4870,10 +4870,13 @@ function normalizeRateThreshold(config){
 async function rerun(){
   const version=state.routeVersion;let source=state.detail.report?.manifest?.config || state.detail.config;
   if(!source){toast('No configuration was saved for this run.');return;}
-  let notes=[],limitNotes=[],warnings=state.detail.report?.manifest?.config_migration_warnings || [];
-  if(source.config_version==null || 'concurrent_workloads' in source || 'buckets' in source || source.test_options?.concurrency || (source.checks || []).some(id=>['fairness','buckets','mixed','token_stress'].includes(id))){
-    try{const result=await api('/api/config/draft',{method:'POST',body:JSON.stringify(source)});if(version!==state.routeVersion)return;source=result.config;notes=result.migration_notes;warnings=result.migration_warnings || [];limitNotes=result.migration_limit_notes || [];}
-    catch(error){toast(error.message);return;}
+  let notes=[],limitNotes=[],warnings=[];
+  try{const result=await api('/api/config/draft',{method:'POST',body:JSON.stringify(source)});if(version!==state.routeVersion)return;source=result.config;notes=result.migration_notes || [];limitNotes=result.migration_limit_notes || [];warnings=result.migration_warnings?.length?result.migration_warnings:(state.detail.report?.manifest?.config_migration_warnings || []);}
+  catch(error){
+    const unsupported=(error.errors || []).filter(item=>item.type==='extra_forbidden');
+    if(unsupported.length){const fields=[...new Set(unsupported.map(item=>item.field))].join(', ');toast(`This run was saved by an earlier Giraffe version with settings this version no longer supports: ${fields}. Start a new run from Setup instead.`);}
+    else toast(error.message);
+    return;
   }
   source=normalizeRateThreshold(source);
   replaceMigrationNotes(notes,warnings,limitNotes);state.config=clone(source);state.gatewayAccessDraft={};state.autoModel=null;state.setupStep=1;invalidateModelDiscovery();state.datasetSelection=[];state.config.restart_target=null;state.formMode='normal';state.formRestartTarget=null;state.jsonDraft=null;state.jsonBase=null;state.configView='form';configChanged();state.prefillBaseline=state.detail.baseline_id || '';location.hash='#new';

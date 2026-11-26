@@ -532,6 +532,35 @@ def _finish_migration_warnings(value: dict, warnings: list[MigrationWarning]) ->
     return warnings
 
 
+def migrate_removed_restart_script(value):
+    """Drop removed script settings without turning saved data into commands."""
+    if not isinstance(value, dict):
+        return value, []
+    targets = value.get("targets")
+    if "restart_script_timeout_seconds" not in value and not (
+        isinstance(targets, list) and any(
+            isinstance(target, dict) and "restart_script" in target for target in targets
+        )
+    ):
+        return value, []
+    value = deepcopy(value)
+    value.pop("restart_script_timeout_seconds", None)
+    notes = []
+    targets = value.get("targets")
+    for index, target in enumerate(targets if isinstance(targets, list) else []):
+        if not isinstance(target, dict) or "restart_script" not in target:
+            continue
+        script = target.pop("restart_script")
+        if isinstance(script, str) and script:
+            name = target.get("name")
+            if not isinstance(name, str):
+                name = f"#{index + 1}"
+            notes.append(f"Endpoint {name}: restart_script ({script}) is no longer supported and was removed. To use cold start, set restart_command for this endpoint.")
+    if not notes:
+        notes.append("Removed restart_script settings saved by an earlier Giraffe build; this version does not use them.")
+    return value, notes
+
+
 def migrate_load_test(value):
     """Preserve legacy traffic as separate tests and explain changed semantics."""
     value = _validated_migration_input(value)
@@ -2568,10 +2597,11 @@ class RunConfig(Model):
     @classmethod
     def migrate_load_input(cls, value, handler):
         if isinstance(value, dict):
+            value, restart_notes = migrate_removed_restart_script(value)
             value, notes, warnings = migrate_load_test(value)
             result = handler(value)
             result._migration_warnings = merge_migration_warnings(warnings, result._migration_warnings)
-            result._migration_notes = list(dict.fromkeys([*notes, *result._migration_notes]))
+            result._migration_notes = list(dict.fromkeys([*restart_notes, *notes, *result._migration_notes]))
             return result
         return handler(value)
 
