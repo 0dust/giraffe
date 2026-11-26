@@ -722,14 +722,13 @@ class _Run:
 
     def timeout_origin(self, spec):
         """Validate producer provenance against the request's actual deadline."""
+        # These producers overwrite copied pack/fixture deadlines in build_spec.
+        if "multi_user" in spec.check_ids:
+            return "run", None, None
         timeout = spec.request_timeout_seconds
         if timeout is None:
             return "run", None, None
-        if (spec.workload.get("request_source") == "custom_fixtures"
-                and spec._fixture_request_timeout_seconds == timeout):
-            return "run", None, (f"custom_fixtures ({self.config.custom_fixtures}, fixture {spec.fixture_id})"
-                                 ".request_timeout_seconds")
-        if spec.deadline_source == "load" or spec.deadline_source is None and "load" in spec.check_ids:
+        if "load" in spec.check_ids or spec.deadline_source == "load":
             source = (spec.load_point or {}).get("source", "native")
             setting = "load_test.request_timeout_seconds"
             settings = self.config.load_test
@@ -742,6 +741,11 @@ class _Run:
                 setting = f"load_test.migrated_tests.{index}.settings.request_timeout_seconds"
             if settings.request_timeout_seconds == timeout:
                 return "load", None, setting
+            return "run", None, None
+        if ("correctness" in spec.check_ids and spec.workload.get("request_source") == "custom_fixtures"
+                and spec._fixture_request_timeout_seconds == timeout):
+            return "run", None, (f"custom_fixtures ({self.config.custom_fixtures}, fixture {spec.fixture_id})"
+                                 ".request_timeout_seconds")
         if spec.deadline_source is not None:
             check = spec.timeout_check
             options = self.config.test_options.get(check)

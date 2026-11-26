@@ -197,14 +197,14 @@ async def test_custom_fixture_timeout_names_file_and_field(monkeypatch, tmp_path
     assert format_timeout_warning(payload) in report.warnings
 
 
-def test_custom_fixture_provenance_for_other_consumers(tmp_path):
+def test_custom_fixture_provenance_for_correctness(tmp_path):
     import json
     from giraffe.fixtures import load_custom_fixtures
 
     path = tmp_path / "cases.json"
     path.write_text(json.dumps([{"fixture_id": "warning", "scorer": "none",
         "messages": [{"role": "user", "content": "hi"}], "request_timeout_seconds": 1}]))
-    request = load_custom_fixtures(str(path))[0].model_copy(update={"check_ids": ["scale_down"]})
+    request = load_custom_fixtures(str(path))[0].model_copy(update={"check_ids": ["correctness"]})
     run = runner._Run(config(custom_fixtures=str(path)), None, None)
     assert run.timeout_origin(request) == ("run", None,
         f"custom_fixtures ({path}, fixture warning).request_timeout_seconds")
@@ -320,7 +320,8 @@ async def test_report_warning_refreshes_after_successes(monkeypatch):
 
 
 @pytest.mark.parametrize("source", ["pack", "custom_inherited", "custom_declared"])
-async def test_multi_user_warning_validates_actual_timeout_owner(tmp_path, monkeypatch, source):
+@pytest.mark.parametrize("load_timeout", [.025, 13])
+async def test_multi_user_warning_validates_actual_timeout_owner(tmp_path, monkeypatch, source, load_timeout):
     import json
     from giraffe.multi_user import execute
 
@@ -336,7 +337,7 @@ async def test_multi_user_warning_validates_actual_timeout_owner(tmp_path, monke
         path.write_text(json.dumps([entry]))
         options = {"custom_fixtures": str(path)}
     cfg = config(checks=["multi_user", "load"], request_timeout_seconds=.025,
-        load_test={"request_timeout_seconds": 13}, multi_user={"levels": [3], "duration_seconds": .15,
+        load_test={"request_timeout_seconds": load_timeout}, multi_user={"levels": [3], "duration_seconds": .15,
         "think_time_seconds": {"values": [0]}}, **options)
     monkeypatch.setattr(FakeClient, "delay", .08)
     run = runner._Run(cfg, None, None)
@@ -344,10 +345,7 @@ async def test_multi_user_warning_validates_actual_timeout_owner(tmp_path, monke
     assert len(run.records) >= 3
     payload = run.timeout_watch.warnings[0]
     assert payload["timed_out"] >= 3 and payload["deadline_seconds"] == .025
-    if source == "custom_declared":
-        assert str(path) in payload["setting"] and payload["cli_flag"] is None
-    else:
-        assert payload["setting"] == "request_timeout_seconds" and payload["cli_flag"] == "--request-timeout"
+    assert payload["setting"] == "request_timeout_seconds" and payload["cli_flag"] == "--request-timeout"
 
 
 @pytest.mark.parametrize("source,check,timeout,expected", [
@@ -359,7 +357,7 @@ async def test_multi_user_warning_validates_actual_timeout_owner(tmp_path, monke
 def test_explicit_provenance_must_match_deadline(source, check, timeout, expected):
     cfg = config(checks=["generation", "load"], request_timeout_seconds=.025,
         load_test={"request_timeout_seconds": 13}, test_options={"generation": {"request_timeout_seconds": 7}})
-    request = spec(checks=["multi_user"], request_timeout_seconds=timeout,
+    request = spec(checks=["generation"], request_timeout_seconds=timeout,
                    deadline_source=source, timeout_check=check)
     assert runner._Run(cfg, None, None).timeout_origin(request) == expected
 
@@ -381,3 +379,27 @@ def test_fixture_timeout_marker_survives_copy_without_changing_identity(tmp_path
     plain = request.model_copy()
     plain._fixture_request_timeout_seconds = None
     assert fixture_hash(serialized) == fixture_hash(plain.model_dump())
+
+
+@pytest.mark.parametrize("source", ["native", "legacy_0_arrivals"])
+def test_load_builder_overrides_equal_fixture_timeout_provenance(tmp_path, source):
+    import json
+    from giraffe.fixtures import load_custom_fixtures
+    from giraffe.load_test import build_spec
+
+    path = tmp_path / "cases.json"
+    path.write_text(json.dumps([{"fixture_id": "one", "scorer": "none",
+        "messages": [{"role": "user", "content": "hi"}], "request_timeout_seconds": .025}]))
+    cfg = config(checks=["load"], request_timeout_seconds=.025, custom_fixtures=str(path),
+        load_test={"request_timeout_seconds": .025, "migrated_tests": [
+            {"source": "arrivals", "settings": {"request_timeout_seconds": .025}}]})
+    run = runner._Run(cfg, None, None)
+    fixture = load_custom_fixtures(str(path))[0]
+    settings = cfg.load_test if source == "native" else cfg.load_test.migrated_tests[0].settings
+    point = {"id": "load-one", "type": "constant", "workload": "combinations",
+             "pattern": "constant", "level": 1, "rate": 1, "bursts": None, "source": source}
+    request = build_spec(run, settings, point, "short_short", {}, frozen_sources=[fixture])
+    assert request.request_timeout_seconds == request._fixture_request_timeout_seconds == .025
+    setting = ("load_test.request_timeout_seconds" if source == "native" else
+               "load_test.migrated_tests.0.settings.request_timeout_seconds")
+    assert run.timeout_origin(request) == ("load", None, setting)
