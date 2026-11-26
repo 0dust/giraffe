@@ -110,6 +110,7 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
     uncertain_observations = []
     observation_notes = []
     duration_estimates, duration_runs = {}, {}
+    load_warning_groups = {}
     selected = set(config.checks)
     quotas = _request_quotas(config)
     shared_gateway = (not gateway_identities_only(selected) and any(
@@ -470,6 +471,9 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
             unknown(target, row, count, options.request_timeout_seconds, batches * options.request_timeout_seconds,
                     batches=batches)
 
+    load_sending_extensions = {}
+    load_upper_allowance_kind = "upper"
+
     def fixed(target, row, seconds, field, *, count=1, timeout=0, observed=None, last_gaps=None, minimum_drain=False):
         if not seconds and not timeout:
             return
@@ -581,20 +585,85 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
             if name.startswith("load_"):
                 points = [p for p in test_points(config.load_test) if p["type"] == name.removeprefix("load_")]
                 own = dict(settings_sets(config.load_test))
+                entries = (observations or {}).get(target.name, [])
+                # Comparable matching requires both quantiles, including for older samples.
+                sample_observations = {target.name: [
+                    {**entry, "p90_ms": entry.get("p50_ms")}
+                    if entry.get("p90_ms") is None or (isinstance(entry["p90_ms"], (int, float))
+                                                       and entry["p90_ms"] <= 0) else entry
+                    for entry in entries
+                ]}
                 queries, completion_points = [], []
+                sending_estimates = {}
                 for point in points:
                     if point["pattern"] != "concurrent":
                         continue
                     settings = own[point["source"]]
+                    extendable = (point["type"] not in {"mixed", "interference"}
+                                  and settings.pass_criteria.min_valid_responses > point["level"])
+                    if extendable and load_upper_allowance_kind == "upper":
+                        load_upper_allowance_kind = "before_extension"
                     shapes = point_shapes(settings, point)
                     completion_points.append((point,len(shapes)))
+                    concurrency = min(point["level"], shares[target.name])
                     for shape in shapes:
                         input_size, output_size = shape.split("_")
-                        queries.append(dict(family=f"load.{point['type']}.{point['pattern']}",
-                            concurrency=min(point["level"],shares[target.name]),stream=config.stream,
+                        query = dict(family=f"load.{point['type']}.{point['pattern']}",
+                            concurrency=concurrency, stream=config.stream,
                             output_cap=getattr(settings.profile,output_size).output_tokens,
-                            input_bucket=input_bucket(getattr(settings.profile,input_size).input_tokens*4)))
-                observed = pooled_matches(target.name,queries,(observations or {}).get(target.name,[])) if queries else None
+                            input_bucket=input_bucket(getattr(settings.profile,input_size).input_tokens*4))
+                        queries.append(query)
+                        if point["shape"] is None:
+                            continue  # A mixed window needs separate evidence for each result group.
+                        sample = comparable_latency(sample_observations, target.name, **query)
+                        if sample is None:
+                            continue
+                        latency_ms = sample.get("p90_ms") or 0
+                        if latency_ms <= 0:
+                            latency_ms = sample["p50_ms"]
+                        if latency_ms <= 0:
+                            continue
+                        # History makes this an estimate even when it predicts no extension.
+                        if extendable:
+                            load_upper_allowance_kind = "estimate"
+                        latency_s = Decimal(str(latency_ms)) / 1000
+                        duration = point["configured_window_seconds"]
+                        timeout_s = settings.request_timeout_seconds
+                        minimum = settings.pass_criteria.min_valid_responses
+                        source = point["source"]
+                        prefix = ("load_test" if source == "primary" else
+                                  f"load_test.migrated_tests.{source.split('_')[1]}.settings")
+                        condition = f"{load_shape_label(shape)}, {concurrency} at once"
+                        if len(config.targets) > 1:
+                            condition = f"{target.name}: {condition}"
+                        base = {"target": target.name, "condition": condition, "minimum": minimum}
+                        if latency_s >= Decimal(str(timeout_s)):
+                            median_s = Decimal(str(sample["p50_ms"])) / 1000
+                            kind = "load_timeout_shortfall" if median_s >= Decimal(str(timeout_s)) else "load_timeout_risk"
+                            field = f"{prefix}.request_timeout_seconds"
+                            load_warning_groups.setdefault((kind, field), []).append({
+                                **base, "required_seconds": math.ceil(latency_s * Decimal("1.25")),
+                                "latency_s": median_s if kind == "load_timeout_shortfall" else latency_s,
+                                "current": timeout_s,
+                            })
+                            if kind == "load_timeout_shortfall":
+                                continue
+                        # Slots start at time zero and refill strictly before the cutoff.
+                        estimated_requests = math.ceil(Decimal(str(duration)) / latency_s) * concurrency
+                        if estimated_requests >= minimum:
+                            continue
+                        rounds_needed = math.ceil(Decimal(minimum) / concurrency)
+                        required = math.floor((rounds_needed - 1) * latency_s) + 1
+                        field = f"{prefix}.schedule.duration_seconds"
+                        sending_estimates[point["id"]] = required
+                        load_sending_extensions[point["id"]] = max(
+                            load_sending_extensions.get(point["id"], 0), required - duration
+                        )
+                        load_warning_groups.setdefault(("load_sample_shortfall", field), []).append({
+                            **base, "estimated_requests": estimated_requests, "required_seconds": required,
+                            "latency_s": latency_s, "current": duration,
+                        })
+                observed = pooled_matches(target.name, queries, entries) if queries else None
                 if observed and all(item["p50_ms"] > 0 for item in observed["matches"]):
                     estimates, offset = [], 0
                     for point,size in completion_points:
@@ -609,7 +678,7 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
                 for point in points:
                     settings = own[point["source"]]
                     before = len(timeline)
-                    fixed(target.name, row, point["windows"] * settings.schedule.duration_seconds,
+                    fixed(target.name, row, point["windows"] * sending_estimates.get(point["id"], settings.schedule.duration_seconds),
                           "load_test.schedule.duration_seconds", count=point["windows"], timeout=settings.request_timeout_seconds)
                     for item in timeline[before:]:
                         # Outstanding requests can use their remaining request
@@ -1058,6 +1127,68 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
     reasons = [f"{item['target']} · {item['title']}: " + (item["reason"] if "reason" in item else
                (("up to " if item.get("upper_bound") else "") + f"{item['requests']:,} requests at unknown speed (up to {item['timeout_bound_seconds']:g} s if every request hits its {item['request_timeout_seconds']:g} s timeout)"
                 if item["requests"] is not None else "workload size and request speed are unknown")) for item in unknowns]
+    load_sample_warnings = []
+    for (kind, field), conditions in load_warning_groups.items():
+        required = max(item["required_seconds"] for item in conditions)
+        first = conditions[0]
+        current = first["current"]
+        if kind == "load_timeout_shortfall":
+            if len(conditions) == 1:
+                message = (f"{first['condition']}: recent responses typically take about {first['latency_s']:.1f} s, "
+                           f"longer than the {current:g} s request timeout, so most will time out.")
+            else:
+                details = "; ".join(
+                    f"{item['condition']} (about {item['latency_s']:.1f} s)" for item in conditions
+                )
+                message = (f"{len(conditions)} conditions typically take longer than the {current:g} s "
+                           f"request timeout, so most responses will time out: {details}.")
+            message += f" Raise the request timeout to at least {required} s."
+            label = f"Set timeout to {required} s"
+        elif kind == "load_timeout_risk":
+            minimum = first["minimum"]
+            if len(conditions) == 1:
+                message = (f"{first['condition']}: at least 1 in 10 recent responses took longer than the "
+                           f"{current:g} s request timeout (90th percentile about {first['latency_s']:.1f} s), "
+                           f"so some may time out and the test may miss its {minimum} required valid responses.")
+            else:
+                details = "; ".join(
+                    f"{item['condition']} (90th percentile about {item['latency_s']:.1f} s)" for item in conditions
+                )
+                message = (f"{len(conditions)} conditions had at least 1 in 10 recent responses longer than the "
+                           f"{current:g} s request timeout, so some may time out and miss the {minimum} "
+                           f"required valid responses: {details}.")
+            message += f" Raise the request timeout to at least {required} s."
+            label = f"Set timeout to {required} s"
+        else:
+            minimum = first["minimum"]
+            if len(conditions) == 1:
+                message = (f"{first['condition']}: about {first['estimated_requests']} of the {minimum} "
+                           f"required valid responses can start in {current:g} s "
+                           f"(recent responses take about {first['latency_s']:.1f} s).")
+            else:
+                same_minimum = all(item["minimum"] == minimum for item in conditions)
+                threshold = f"the {minimum} required valid responses" if same_minimum else "their required valid responses"
+                details = "; ".join(
+                    f"{item['condition']} (about {item['estimated_requests']}" +
+                    ("" if same_minimum else f" of {item['minimum']}") + ")" for item in conditions
+                )
+                message = (f"{len(conditions)} conditions may get fewer than {threshold} "
+                           f"in {current:g} s: {details}.")
+            continuation = (f"as needed (about {required} s)" if len(conditions) > 1 else f"to about {required} s")
+            message += (f" Giraffe will extend sending {continuation}; "
+                        f"set “Send new requests for” to {required} s to plan for it.")
+            label = f"Set to {required} s"
+        load_sample_warnings.append({
+            "kind": kind, "fields": [field], "msg": message,
+            "values": {field: current,
+                       **({"estimated_requests": min(item["estimated_requests"] for item in conditions)}
+                          if kind == "load_sample_shortfall" else {}),
+                       "min_valid_responses": min(item["minimum"] for item in conditions),
+                       "conditions": [{key: item[key] for key in
+                                       ("target", "condition", "estimated_requests", "required_seconds") if key in item}
+                                      for item in conditions]},
+            "actions": [{"label": label, "field": field, "value": required}],
+        })
     known = bool(components) or not unknowns
     return {"estimated_seconds": round(midpoint, 3) if known else None,
             "has_complete_time_estimate": has_complete_time_estimate,
@@ -1080,7 +1211,9 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
                   ", ".join(dict.fromkeys(item["title"] for item in unknowns)) + "."] if unknowns else []) +
                 ([f"Request deadlines after sending stops contribute {combine('drain_uncertainty_seconds'):g} seconds of uncertainty; more latency samples cannot remove that configured bound."]
                  if confidence == "low" and drain_fraction > .2 else []),
-            "errors": errors, "time_warnings": warnings}
+            "errors": errors, "time_warnings": warnings, "load_sample_warnings": load_sample_warnings,
+            "load_sending_extensions": load_sending_extensions,
+            "load_upper_allowance_kind": load_upper_allowance_kind}
 
 
 def _context_window_article(value):
@@ -1717,6 +1850,19 @@ def request_plan(config: RunConfig | ConfigDraft, *,
         warnings.append(combined["msg"])
     request_warnings = grouped
     timing = _time_plan(config, rows, observations)
+    predicted_extensions = timing.pop("load_sending_extensions")
+    allowance_kind = timing.pop("load_upper_allowance_kind")
+    if load_plan:
+        load_plan.update(load_time_plan(config.load_test, predicted_extensions=predicted_extensions))
+        load_plan["upper_allowance_kind"] = allowance_kind
+        load_plan["upper_allowance_label"] = {
+            "upper": "Upper allowance including request deadlines",
+            "before_extension": "Upper allowance before any window extension",
+            "estimate": "Estimated duration including request deadlines",
+        }[allowance_kind]
+    sample_warnings = timing.pop("load_sample_warnings")
+    load_warnings.extend(sample_warnings)
+    warnings.extend(notice["msg"] for notice in sample_warnings)
     warnings.extend(notice["msg"] for notice in timing["time_warnings"] if notice["msg"] not in warnings)
     for notice in [*concurrency_warnings, *load_warnings, *capacity_warnings,
                    *request_warnings, *timing["time_warnings"]]:

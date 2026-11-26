@@ -28,7 +28,7 @@ function updateAPIKeySummary() {
   const key=apiKeyFor(form.elements.url.value),ref=form.elements.api_key_env?.value.trim();
   $('.row-value',summary).textContent=key?'Set for this tab':ref||'Not set';
 }
-const state = {bootstrap:null, runs:[], storage:null, storageUnavailable:false, cleanup:null, cleanupResult:null, baselines:[], detail:null, mosaicFollow:true, config:null, active:null, diskActive:null, routeVersion:0, poll:null, tab:'checks', selectedCheck:null, checkNavigatorOpen:false, filter:'all', historySearch:'', comparisonFilter:null, comparisonCheck:'all', submitting:false, openTest:null, configView:'form', jsonDraft:null, jsonBase:null, configRevision:0, configBusy:false, showAvailableTests:false, formMode:'normal', formRestartTarget:null, requestPreview:null, previewSequence:0, planTimer:null, setupPreset:null, catalogueFilter:'all', catalogueCategory:'all', catalogueSearch:'', setupStep:1, returnToReview:false, modelDiscovery:null, modelDiscoverySequence:0, autoModel:null, datasetSelection:[], datasetImportSequence:0, judgeEditorOpen:null, datasetImport:null, datasetEditor:null, datasetTry:null, migrationNotes:[], dismissedMigrationNotes:[], loadPanels:{}, limitValues:{}, jsonValidation:null};
+const state = {bootstrap:null, runs:[], storage:null, storageUnavailable:false, cleanup:null, cleanupResult:null, baselines:[], detail:null, mosaicFollow:true, config:null, active:null, diskActive:null, routeVersion:0, poll:null, tab:'checks', selectedCheck:null, checkNavigatorOpen:false, filter:'all', historySearch:'', comparisonFilter:null, comparisonCheck:'all', submitting:false, openTest:null, configView:'form', jsonDraft:null, jsonBase:null, configRevision:0, configBusy:false, showAvailableTests:false, formMode:'normal', formRestartTarget:null, requestPreview:null, previewSequence:0, planTimer:null, setupPreset:null, catalogueFilter:'all', catalogueCategory:'all', catalogueSearch:'', setupStep:1, returnToReview:false, modelDiscovery:null, modelDiscoverySequence:0, autoModel:null, datasetSelection:[], datasetImportSequence:0, judgeEditorOpen:null, datasetImport:null, datasetEditor:null, datasetTry:null, migrationNotes:[], migrationLimitNotes:[], migrationWarnings:[], dismissedMigrationNotes:[], loadPanels:{}, limitValues:{}, jsonValidation:null};
 state.setupWorkspace=null;
 const statusLabels = {not_applicable:'Not applicable',measured:'Measured',warmup:'Warmup',pass:'Passed',fail:'Failed',failed:'Failed',timeout:'Timed out',inconclusive:'Inconclusive',skipped:'Not run',idle:'Unused',blocked:'Blocked',running:'Running',queued:'Queued',reserved:'Reserved',stopping:'Stopping',error:'Runner error',completed:'Finished',stopped:'Stopped',cancelled:'Cancelled',interrupted:'Interrupted'};
 const statusIcons = {pass:'✓',fail:'×',failed:'×',timeout:'◷',inconclusive:'?',skipped:'–',idle:'○',blocked:'!',running:'·',queued:'○',reserved:'○',stopping:'·',error:'×',completed:'✓',stopped:'⊘',cancelled:'⊘',interrupted:'!'};
@@ -1270,14 +1270,29 @@ function renderTimingRisk(warning) {
   const groups=[...(warning.check_time_summaries || []),...(warning.setup_time_summaries || [])];
   return `<p>${warning.schedule_exceeds_limit?'The configured schedule exceeds the time limit.':'Some checks may not finish within the time limit.'}</p><details class="setup-disclosure timing-warning-details"><summary>Show timing details</summary><p>${escape(warning.msg)}</p>${renderCheckTimeSummaries(groups)}<div class="actions">${settingActions(warning.fields || [])}</div></details>`;
 }
+function settingIssueActions(error,inlineName=null) {
+  if(inheritedConcurrencyNotice(error))return concurrencyNoticeActions(error);
+  const actions=error.actions ?? [{fields:error.fields||[error.field||'config']}];
+  if(inlineName&&actions.length===1&&!Object.hasOwn(actions[0],'value')){
+    const fields=actions[0].fields||[actions[0].field];
+    if(fields.length===1&&settingDestination(fields[0]).name===inlineName)return '';
+  }
+  return actions.map(action=>Object.hasOwn(action,'value')&&['max_requests','max_duration_seconds'].includes(action.field)
+      ?`<button type="button" class="button small" data-action="${action.field==='max_requests'?'use-request-budget':'use-time-budget'}" data-budget="${escape(action.value)}">${escape(action.label)}</button>`
+      :Object.hasOwn(action,'value')&&(action.field==='traffic.duration_seconds'||action.field?.startsWith('load_test.'))
+        ?`<button type="button" class="button small" data-action="use-setting-correction" data-setting-path="${escape(action.field)}" data-setting-value="${escape(action.value)}">${escape(action.label)}</button>`
+        :action.fields?settingActions(action.fields):!Object.hasOwn(action,'value')&&action.field?.startsWith('load_test.')?settingActions([action.field]):`<button type="button" class="text-button" data-action="edit-setting" data-setting-path="${escape(action.field)}">${escape(action.label)}</button>`).join(' ');
+}
+function warningsOutsideFields(warnings) {
+  return warnings.filter(warning=>!issueFields(warning).some(path=>{
+    const {name}=settingDestination(path);
+    return state.configView!=='json'&&$(`#field-${name}`)&&$(`#field-${name}-warning`);
+  }));
+}
 function renderSettingIssues(errors=currentSettingErrors(),kind='error') {
   return errors.filter(error=>!['context_window_unknown','context_window_exceeded','context_window_conflict'].includes(error.kind)||error.blocking===true).map(error=>{
     if(error.kind==='estimate_risk')return `<div class="notice ${kind} setting-issue">${renderTimingRisk(error)}</div>`;
-    const actions=inheritedConcurrencyNotice(error)?concurrencyNoticeActions(error):error.actions?.map(action=>Object.hasOwn(action,'value')&&['max_requests','max_duration_seconds'].includes(action.field)
-      ?`<button type="button" class="button small" data-action="${action.field==='max_requests'?'use-request-budget':'use-time-budget'}" data-budget="${escape(action.value)}">${escape(action.label)}</button>`
-      :Object.hasOwn(action,'value')&&action.field==='traffic.duration_seconds'
-        ?`<button type="button" class="button small" data-action="use-setting-correction" data-setting-path="${escape(action.field)}" data-setting-value="${escape(action.value)}">${escape(action.label)}</button>`
-        :action.fields?settingActions(action.fields):!Object.hasOwn(action,'value')&&action.field?.startsWith('load_test.')?settingActions([action.field]):`<button type="button" class="text-button" data-action="edit-setting" data-setting-path="${escape(action.field)}">${escape(action.label)}</button>`).join(' ') ?? settingActions(error.fields||[error.field||'config']);
+    const actions=settingIssueActions(error);
     return `<div class="notice ${kind} setting-issue" ${kind==='error'?'role="alert"':''}><p>${escape(error.msg)}</p>${error.note?`<p class="hint">${escape(error.note)}</p>`:''}<div class="actions">${actions}</div></div>`;
   }).join('');
 }
@@ -1308,7 +1323,7 @@ function syncInlineErrors() {
   for(const name of new Set([...(state.inlineWarningFields || []),...warnings.keys()])){
     const input=name==='config_editor'?$('#config-editor'):$(`#field-${name}`),message=$(`#field-${name}-warning`);if(!input||!message)continue;
     const rows=warnings.get(name) || [],id=`field-${name}-warning`;
-    const html=rows.map(row=>row.kind==='estimate_risk'?renderTimingRisk(row):`${escape(row.msg)} ${inheritedConcurrencyNotice(row)?concurrencyNoticeActions(row):settingActions(row.fields || [])}`).join(' ');
+    const html=rows.map(row=>row.kind==='estimate_risk'?renderTimingRisk(row):`${escape(row.msg)} ${settingIssueActions(row,name)}`).join(' ');
     if(message.innerHTML!==html)patchHTML(message,html);message.hidden=!rows.length;
     const described=(input.getAttribute('aria-describedby') || '').split(/\s+/).filter(value=>value&&value!==id);
     if(rows.length)described.push(id);
@@ -1925,15 +1940,29 @@ function loadDisplay(settings) {
 }
 function renderMigrationNotes() {
   const notes=(state.migrationNotes || []).filter(note=>!(state.dismissedMigrationNotes || []).includes(note));
-  return notes.length?`<div class="notice warning migration-notes"><strong>Review imported load settings</strong><ul>${notes.map(note=>`<li>${escape(note)}</li>`).join('')}</ul><button type="button" class="text-button" data-action="dismiss-migration-notes">Dismiss notes</button></div>`:'';
+  const limits=notes.filter(note=>(state.migrationLimitNotes || []).includes(note));
+  const details=notes.filter(note=>!limits.includes(note));
+  const list=items=>`<ul>${items.map(note=>`<li>${escape(note)}</li>`).join('')}</ul>`;
+  return notes.length?`<div class="notice migration-notes" role="status"><strong>Imported from an earlier Giraffe version</strong>${limits.length?list(limits):''}${details.length?`<details><summary>${details.length} other ${details.length===1?'setting':'settings'} converted</summary>${list(details)}</details>`:''}<button type="button" class="text-button" data-action="dismiss-migration-notes">Dismiss notes</button></div>`:'';
 }
-function acceptMigrationNotes(notes=[]) {
+function activeMigrationWarnings() {
+  return (state.migrationWarnings || []).filter(warning=>!warning.removed_check||!state.config?.checks?.includes(warning.removed_check));
+}
+function renderMigrationWarnings() {
+  return activeMigrationWarnings().map(warning=>`<div class="notice warning setting-issue"><p>${escape(warning.msg)}</p></div>`).join('');
+}
+function mergeMigrationWarnings(...groups) {
+  return [...new Map(groups.flat().map(warning=>[JSON.stringify(warning),warning])).values()];
+}
+function acceptMigrationNotes(notes=[],warnings=[],limitNotes=[]) {
+  state.migrationLimitNotes=[...new Set([...(state.migrationLimitNotes || []),...limitNotes])];
+  state.migrationWarnings=mergeMigrationWarnings(state.migrationWarnings || [],warnings);
   state.migrationNotes=[...new Set([...(state.migrationNotes || []),...notes])];
   for(const element of $$('[data-migration-notes]'))element.innerHTML=renderMigrationNotes();
 }
-function replaceMigrationNotes(notes=[]) {
-  state.migrationNotes=[];state.dismissedMigrationNotes=[];state.loadPanels={};
-  acceptMigrationNotes(notes);
+function replaceMigrationNotes(notes=[],warnings=[],limitNotes=[]) {
+  state.migrationNotes=[];state.migrationLimitNotes=[];state.migrationWarnings=[];state.dismissedMigrationNotes=[];state.loadPanels={};
+  acceptMigrationNotes(notes,warnings,limitNotes);
 }
 const loadCriteriaLabels={max_first_answer_ms:'Maximum time to first answer per response (ms)',max_completion_ms:'Maximum completion time per response (ms)',max_error_percent:'Errors allowed (%)',min_correct_percent:'Correct answers required (%)',max_stream_pause_ms:'Maximum pause between streamed chunks (ms)',min_generation_tokens_per_second:'Minimum generation speed per response (tokens/sec)',min_valid_responses:'Minimum valid responses per result group'};
 function loadFieldLabel(path) {
@@ -1985,7 +2014,7 @@ function renderLoadEditor(config) {
   <section class="load-section"><div class="field-label"><h3>Request timing &amp; delivery</h3>${infoHelp('load_request_timing','Request timing & delivery','For arrivals and bursts, a full client slot limit means the scheduled request is not sent. Show this as incomplete delivery; do not queue it silently or count it as an endpoint failure. Actual dispatch timing and burst spread are reported. Server queue time needs server telemetry.')}</div>${numberField('request_timeout_seconds','Request timeout (seconds)',s.request_timeout_seconds)}<p>Concurrency ceiling · Run limits <strong id="load-ceiling-label">${config.concurrency??'Not set'}</strong> <button type="button" class="text-button" data-action="edit-setting" data-setting-path="concurrency">Edit limit</button></p></section>
   <section class="load-section"><div class="field-label"><h3>Data profile</h3>${infoHelp('load_data_profile','Data profile','Load test only. Built-in examples are generated to these input token targets. Used by every selected workload below. Answers may finish before their cap; actual token lengths are reported.')}</div><table class="load-profile"><thead><tr><th></th><th>Input tokens · target</th><th>Output tokens · cap</th></tr></thead><tbody>${loadSizes.map(size=>`<tr><th scope="row">${human(size)}</th>${['input_tokens','output_tokens'].map(kind=>`<td>${numberField(`profile.${size}.${kind}`,`${human(size)} ${kind==='input_tokens'?'input tokens':'output cap'}`,s.profile[size][kind],{step:1})}</td>`).join('')}</tr>`).join('')}</tbody></table><p class="hint" data-load-source-note ${sourceNote?'':'hidden'}>${sourceNote}</p><div data-load-context-warning>${renderLoadContextWarning(config)}</div>${config.checks.includes('load')&&!config.checks.includes('correctness')?renderRequestSource(config):''}</section>
   <section class="load-section"><div class="field-label"><h3>Workloads</h3>${infoHelp('load_workloads','Workloads','Select a workload to open its settings. Selected workloads run separately; mixed traffic combines request sizes within its own test.')}</div><div class="load-types">${Object.entries(titles).map(([kind,title])=>{const open=state.loadPanels[kind]??w[kind].enabled;return `<section class="load-type${w[kind].enabled?' is-selected':''}" data-load-type="${kind}"><div class="load-type-heading">${checkbox(`workloads.${kind}.enabled`,`<span><strong>${title}</strong><small>${descriptions[kind]}</small></span>`,w[kind].enabled,{controls:`load-panel-${kind}`,extra:`data-load-enable="${kind}"`})}${kind==='stress'?infoHelp('load_stress_cases',title,'Each selection is a separate test using the traffic patterns below. Stress prompts ask for extended output; set minimum length coverage below.'):''}<button type="button" class="button ghost load-collapse" data-load-collapse="${kind}" aria-expanded="${open}" aria-controls="load-panel-${kind}" aria-label="${open?'Collapse':'Expand'} ${title} settings">${open?'⌃':'⌄'}</button></div><div class="load-type-panel" id="load-panel-${kind}" ${open?'':'hidden'}>${cards[kind]}</div></section>`;}).join('')}</div></section>
-  <section class="load-section" id="load-traffic" ${standard||w.interference.enabled?'':'hidden'}><div class="field-label"><h3>Traffic patterns</h3>${infoHelp('load_traffic_patterns','Traffic patterns','Each selected pattern runs separately for combinations, mixed traffic and token stress.')}</div><span class="eyebrow">Choose one or more</span>${[['concurrent','Maintain concurrent requests','Replace each finished request to maintain the chosen level.'],['constant','Constant arrivals','New requests at evenly spaced intervals.'],['poisson','Poisson arrivals','Random intervals around the chosen average rate.']].map(([kind,title,description])=>checkbox(`patterns.${kind}.enabled`,`<span><strong>${title}</strong><small>${description}</small></span>`,p[kind].enabled)).join('')}<div id="load-arrival-fields" ${standard&&(p.constant.enabled||p.poisson.enabled)?'':'hidden'}>${field('load_patterns_rates','Rates (requests/second)',p.rates.join(', '))}<div id="load-seed-field" ${p.poisson.enabled?'':'hidden'}>${numberField('patterns.poisson.seed','Random seed',p.poisson.seed,{step:1})}</div></div>${checkbox('patterns.bursts.enabled','<span><strong>Bursts</strong><small>Send groups of requests on their own or alongside Constant / Poisson arrivals.</small></span>',p.bursts.enabled)}<div id="load-burst-fields" ${standard&&p.bursts.enabled?'':'hidden'}><div class="field-label"><h3>Burst schedule</h3>${infoHelp('load_burst_schedule','Burst schedule','Runs alone when neither Constant nor Poisson is selected. Otherwise, adds bursts to each selected arrival pattern. New bursts do not wait for earlier requests to finish. The concurrency ceiling still applies.')}</div><div class="fields">${numberField('patterns.bursts.size','Requests per burst',p.bursts.size,{step:1})}${numberField('patterns.bursts.first_seconds','First burst after (seconds)',p.bursts.first_seconds)}${numberField('patterns.bursts.gap_seconds','Time between burst starts (seconds)',p.bursts.gap_seconds)}</div><p id="load-burst-preview" class="hint">${escape(currentRequestPlan()?.load_test?.burst_previews?.[0]?.text||'Updating burst preview…')}</p></div><div id="load-concurrent-fields" ${p.concurrent.enabled||w.interference.enabled?'':'hidden'}>${field('load_patterns_concurrent_levels','Concurrency levels',p.concurrent.levels.join(', '),{hint:runLimitHint('load_patterns_concurrent_levels',config)})}</div><div class="fields">${numberField('schedule.duration_seconds','Send new requests for (seconds)',s.schedule.duration_seconds,{step:1,hint:'',help:'Send new requests for this duration per workload, pattern and level. Requests already sent may finish within their request timeout. A run limit can stop traffic sooner. Minimum valid responses is an evidence requirement, not a stopping count.'})}</div></section>
+  <section class="load-section" id="load-traffic" ${standard||w.interference.enabled?'':'hidden'}><div class="field-label"><h3>Traffic patterns</h3>${infoHelp('load_traffic_patterns','Traffic patterns','Each selected pattern runs separately for combinations, mixed traffic and token stress.')}</div><span class="eyebrow">Choose one or more</span>${[['concurrent','Maintain concurrent requests','Replace each finished request to maintain the chosen level.'],['constant','Constant arrivals','New requests at evenly spaced intervals.'],['poisson','Poisson arrivals','Random intervals around the chosen average rate.']].map(([kind,title,description])=>checkbox(`patterns.${kind}.enabled`,`<span><strong>${title}</strong><small>${description}</small></span>`,p[kind].enabled)).join('')}<div id="load-arrival-fields" ${standard&&(p.constant.enabled||p.poisson.enabled)?'':'hidden'}>${field('load_patterns_rates','Rates (requests/second)',p.rates.join(', '))}<div id="load-seed-field" ${p.poisson.enabled?'':'hidden'}>${numberField('patterns.poisson.seed','Random seed',p.poisson.seed,{step:1})}</div></div>${checkbox('patterns.bursts.enabled','<span><strong>Bursts</strong><small>Send groups of requests on their own or alongside Constant / Poisson arrivals.</small></span>',p.bursts.enabled)}<div id="load-burst-fields" ${standard&&p.bursts.enabled?'':'hidden'}><div class="field-label"><h3>Burst schedule</h3>${infoHelp('load_burst_schedule','Burst schedule','Runs alone when neither Constant nor Poisson is selected. Otherwise, adds bursts to each selected arrival pattern. New bursts do not wait for earlier requests to finish. The concurrency ceiling still applies.')}</div><div class="fields">${numberField('patterns.bursts.size','Requests per burst',p.bursts.size,{step:1})}${numberField('patterns.bursts.first_seconds','First burst after (seconds)',p.bursts.first_seconds)}${numberField('patterns.bursts.gap_seconds','Time between burst starts (seconds)',p.bursts.gap_seconds)}</div><p id="load-burst-preview" class="hint">${escape(currentRequestPlan()?.load_test?.burst_previews?.[0]?.text||'Updating burst preview…')}</p></div><div id="load-concurrent-fields" ${p.concurrent.enabled||w.interference.enabled?'':'hidden'}>${field('load_patterns_concurrent_levels','Concurrency levels',p.concurrent.levels.join(', '),{hint:runLimitHint('load_patterns_concurrent_levels',config)})}</div><div class="fields">${numberField('schedule.duration_seconds','Send new requests for (seconds)',s.schedule.duration_seconds,{step:1,hint:'',help:'Send new requests for this duration per workload, pattern and level. Requests already sent may finish within their request timeout. A run limit can stop traffic sooner. Minimum valid responses is an evidence requirement, not a stopping count. If fewer than the required valid responses can start in this time, Giraffe keeps sending until they have started, within Maximum duration. Mixed traffic isn’t extended.'})}</div></section>
   <details class="load-section load-pass-criteria"><summary>Pass criteria <span class="dim">Shared across this check</span></summary><div class="field-label"><h3>Pass criteria</h3>${infoHelp('load_pass_criteria','Pass criteria','Applied per response where measurable. Leave timing or speed limits blank to measure without that threshold. A result group is a request type at one traffic pattern and level. Mixed traffic reports each selected combination separately too. Too few valid responses means inconclusive. For scheduled arrivals, timing starts at planned arrival, including dispatch delay. Maintained-concurrency timing starts at dispatch. Correctness requires scorable answers; missing judgments stay unknown. Incomplete traffic delivery, missing timing evidence or missing required length coverage cannot establish a capacity pass.')}</div><p class="hint">Leave timing or speed limits blank to measure only.</p><div class="fields">${Object.entries(loadCriteriaLabels).map(([key,label])=>numberField('pass_criteria.'+key,label,s.pass_criteria[key],{step:key==='min_valid_responses'?1:'any',placeholder:['max_error_percent','min_correct_percent','min_valid_responses'].includes(key)?'':'Measure only'})).join('')}</div></details></div>`;
 }
 function setLoadPanel(type,open) {
@@ -2018,13 +2047,17 @@ function loadElapsed(seconds) {return `${Math.floor(seconds/60)}m ${Math.round(s
 function renderLoadPlan(config,plan=null) {
   if(!config?.checks?.includes('load'))return '';
   const s=loadSettings(config),value=plan?.load_test;
+  const allowanceEstimate=value?.upper_allowance_kind==='estimate';
+  const allowanceHelp=infoHelp('load_upper_allowance',allowanceEstimate?'Estimated duration':'Upper allowance',allowanceEstimate
+    ?'Configured sending time, extra sending time predicted from recent response times, and request deadlines. If responses are slower than recent runs, sending continues longer, up to one request timeout per remaining round and within Maximum duration.'
+    :'Configured sending time plus request deadlines. If fewer than the required valid responses start in a window, sending continues until they have, up to one request timeout per remaining round and within Maximum duration.');
   const profiles=[{label:'',settings:s},...(s.migrated_tests||[]).map((item,index)=>({label:`Migrated ${item.source||index+1}`,settings:item.settings}))];
   const settings=profiles.map(({label,settings})=>{
     const p=settings.patterns,profile=settings.profile,interference=settings.workloads.interference;
     const interferenceTitle=interference.enabled&&interference.mode==='short_during_long'?loadInterferenceTitle(interference.mode):'';
     return `<div class="load-plan-profile">${label?`<h4>${escape(label)}</h4>`:''}${interferenceTitle?`<p><strong>${escape(interferenceTitle)}</strong></p>`:''}<p><strong>Input target → output cap:</strong> ${loadSizes.map(size=>`${human(size)} ${number(profile[size].input_tokens)} → ${number(profile[size].output_tokens)} tokens`).map(escape).join(' · ')}</p><p>${[p.concurrent.enabled?`Maintained concurrency: ${p.concurrent.levels.join(', ')} requests`:null,p.constant.enabled||p.poisson.enabled?`${[p.constant.enabled?'Constant':null,p.poisson.enabled?'Poisson':null].filter(Boolean).join(' / ')} rates: ${p.rates.join(', ')} requests/second`:null,p.bursts.enabled?`${p.bursts.size} requests per burst`:null,`${settings.schedule.duration_seconds} seconds sending per test`].filter(Boolean).map(escape).join(' · ')}</p></div>`;
   }).join('');
-  return `<section class="configured-load-plan" aria-label="Load test details">${settings}${value?`<dl class="load-plan-numbers"><div><dt>Scheduled load tests</dt><dd>${number(value.scheduled_tests)}${value.comparison_checks?' + '+number(value.comparison_checks)+' short-answer checks':''}</dd></div><div><dt>Sending / maintained-load time</dt><dd>${loadElapsed(value.configured_load_seconds)}</dd></div><div><dt>Upper allowance including request deadlines</dt><dd>${loadElapsed(value.time_with_allowances_seconds)}</dd></div><div><dt>Scheduled requests per endpoint</dt><dd>${escape(loadPlanRequestCount(value))}</dd></div></dl>${value.unknown_requests?'<p class="hint">Additional requests start as earlier requests finish; their count is unknown.</p>':''}<h4>Execution order</h4><ol class="load-plan-breakdown">${(value.execution_summary||value.execution_order).map(text=>`<li>${escape(text)}</li>`).join('')}</ol>${(value.execution_order_notes||[]).map(note=>`<p class="hint load-execution-note">${escape(note)}</p>`).join('')}<details data-plan-check="load-order"><summary>Each scheduled load test</summary><ol>${value.execution_order.map(text=>`<li>${escape(text)}</li>`).join('')}</ol></details><p class="hint">${escape(value.note)}</p>`:'<p class="hint">Waiting for the current load plan…</p>'}${plan?.bucket_cases?.length?`<h4>Question and answer sizes</h4><ul class="plan-cases">${plan.bucket_cases.map(item=>`<li>${number(item.actual_input_chars)} characters sent${item.actual_input_chars!==item.input_chars?` (${number(item.input_chars)} configured, plus instructions)`:""} · answer cap ${number(item.output_tokens)} tokens</li>`).join('')}</ul>`:''}${plan?.bucket_levels?.length?`<p class="hint">${plan.bucket_levels.map(level=>`${number(level.concurrency)} at once: ${number(level.requests_per_case)} requests per combination, ${number(level.requests_per_target)} per endpoint`).join(' · ')}</p>`:''}</section>`;
+  return `<section class="configured-load-plan" aria-label="Load test details">${settings}${value?`<dl class="load-plan-numbers"><div><dt>Scheduled load tests</dt><dd>${number(value.scheduled_tests)}${value.comparison_checks?' + '+number(value.comparison_checks)+' short-answer checks':''}</dd></div><div><dt>Sending / maintained-load time</dt><dd>${loadElapsed(value.configured_load_seconds)}</dd></div><div><dt>${escape(value.upper_allowance_label||'Upper allowance including request deadlines')}${allowanceHelp}</dt><dd>${loadElapsed(value.time_with_allowances_seconds)}</dd></div><div><dt>Scheduled requests per endpoint</dt><dd>${escape(loadPlanRequestCount(value))}</dd></div></dl>${value.unknown_requests?'<p class="hint">Additional requests start as earlier requests finish; their count is unknown.</p>':''}<h4>Execution order</h4><ol class="load-plan-breakdown">${(value.execution_summary||value.execution_order).map(text=>`<li>${escape(text)}</li>`).join('')}</ol>${(value.execution_order_notes||[]).map(note=>`<p class="hint load-execution-note">${escape(note)}</p>`).join('')}<details data-plan-check="load-order"><summary>Each scheduled load test</summary><ol>${value.execution_order.map(text=>`<li>${escape(text)}</li>`).join('')}</ol></details><p class="hint">${escape(value.note)}</p>`:'<p class="hint">Waiting for the current load plan…</p>'}${plan?.bucket_cases?.length?`<h4>Question and answer sizes</h4><ul class="plan-cases">${plan.bucket_cases.map(item=>`<li>${number(item.actual_input_chars)} characters sent${item.actual_input_chars!==item.input_chars?` (${number(item.input_chars)} configured, plus instructions)`:""} · answer cap ${number(item.output_tokens)} tokens</li>`).join('')}</ul>`:''}${plan?.bucket_levels?.length?`<p class="hint">${plan.bucket_levels.map(level=>`${number(level.concurrency)} at once: ${number(level.requests_per_case)} requests per combination, ${number(level.requests_per_target)} per endpoint`).join(' · ')}</p>`:''}</section>`;
 }
 
 function renderLoadResults(metrics) {
@@ -2963,7 +2996,7 @@ function renderRequestPlan(config=null) {
   const limits=config?renderPlanBounds(config,'review-limits'):'';
   if(!plan){
     const status=hasJsonChanges()?'Apply or discard JSON changes to confirm the request plan.':saved?.status==='error'?`Request plan unavailable: ${saved.error}`:saved?.status==='pending'?'Updating request plan…':'Request plan stale · updating current settings…';
-    element.innerHTML=`<div class="plan-hero">${heading}<p class="hint plan-status">${escape(status)}</p>${limits}${renderMigrationNotes()}${renderSettingIssues()}${saved?.status==='error'&&!hasJsonChanges()?'<button type="button" class="button small" data-action="preview-pack">Retry request plan</button>':''}</div>`;return;
+    element.innerHTML=`<div class="plan-hero">${heading}<p class="hint plan-status">${escape(status)}</p>${limits}${renderMigrationWarnings()}${renderMigrationNotes()}${renderSettingIssues()}${saved?.status==='error'&&!hasJsonChanges()?'<button type="button" class="button small" data-action="preview-pack">Retry request plan</button>':''}</div>`;return;
   }
   const count=setupPlanCount(plan);
   const evaluator=plan.evaluator || {},needed=plan.required_request_limit;
@@ -2977,7 +3010,7 @@ function renderRequestPlan(config=null) {
     :plan.known_target_counts?`Known requests by endpoint: ${escape(planTargetCounts(plan.known_target_counts))}, plus adaptive work`
     :plan.planned_per_target==null?`${number(plan.known_per_target)} known requests per endpoint, plus adaptive work`
     :`${plan.count_kind==='estimate'?'About ':''}${number(plan.planned_per_target)} requests per endpoint`;
-  element.innerHTML=`<div class="plan-hero${raise?' is-over':''}">${heading}<p class="plan-total">${escape(count)}</p>${plan.request_limit==null?'':`<div class="plan-ceiling${plan.count_kind==='exact'||plan.count_kind==='estimate'?'':' adaptive'}" aria-hidden="true"><span style="width:${raise?100:filled.toFixed(1)}%"></span></div>`}${limits}${renderSettingIssues([...localSettingWarnings(),...(plan?.load_warnings||[])],'warning')}${renderMigrationNotes()}${renderPlanTime(plan)}${renderSettingIssues()}${warnings.map(warning=>notice(warning,'warning')).join('')}</div><div class="plan-flight">${evaluator.active?`<div class="review-evaluator"><p>Up to ${number(evaluator.call_upper_bound)} evaluator calls after target traffic · ${number(evaluator.judge_count)} ${evaluator.judge_count===1?'evaluator':'evaluators'}.</p><p class="hint">Questions, expected answers and model answers go to every configured evaluator. These calls have separate limits.</p>${config?.judging?.judges?.length?`<ul class="review-evaluator-targets">${config.judging.judges.map(judge=>`<li><strong>${escape(judge.model || 'Model needed')}</strong> · ${escape(judge.url || 'Endpoint URL needed')}</li>`).join('')}</ul>`:''}</div>`:''}<details class="request-planning workload-breakdown"><summary>Request breakdown</summary><p class="hint">${breakdown}. Time and request limits can leave checks unfinished.</p>${Object.keys(plan.target_quotas || {}).length?`<h4>Endpoint request budgets</h4><ul class="review-quotas">${Object.entries(plan.target_quotas).map(([name,quota])=>`<li>${escape(name)}: up to ${number(quota)} requests</li>`).join('')}</ul>`:''}${renderCheckPlan(config,plan)}</details></div>${renderReviewPassCriteria(config)}`;
+  element.innerHTML=`<div class="plan-hero${raise?' is-over':''}">${heading}<p class="plan-total">${escape(count)}</p>${plan.request_limit==null?'':`<div class="plan-ceiling${plan.count_kind==='exact'||plan.count_kind==='estimate'?'':' adaptive'}" aria-hidden="true"><span style="width:${raise?100:filled.toFixed(1)}%"></span></div>`}${limits}${renderSettingIssues([...localSettingWarnings(),...(plan?.load_warnings||[])],'warning')}${renderMigrationWarnings()}${renderMigrationNotes()}${renderPlanTime(plan)}${renderSettingIssues()}${warnings.map(warning=>notice(warning,'warning')).join('')}</div><div class="plan-flight">${evaluator.active?`<div class="review-evaluator"><p>Up to ${number(evaluator.call_upper_bound)} evaluator calls after target traffic · ${number(evaluator.judge_count)} ${evaluator.judge_count===1?'evaluator':'evaluators'}.</p><p class="hint">Questions, expected answers and model answers go to every configured evaluator. These calls have separate limits.</p>${config?.judging?.judges?.length?`<ul class="review-evaluator-targets">${config.judging.judges.map(judge=>`<li><strong>${escape(judge.model || 'Model needed')}</strong> · ${escape(judge.url || 'Endpoint URL needed')}</li>`).join('')}</ul>`:''}</div>`:''}<details class="request-planning workload-breakdown"><summary>Request breakdown</summary><p class="hint">${breakdown}. Time and request limits can leave checks unfinished.</p>${Object.keys(plan.target_quotas || {}).length?`<h4>Endpoint request budgets</h4><ul class="review-quotas">${Object.entries(plan.target_quotas).map(([name,quota])=>`<li>${escape(name)}: up to ${number(quota)} requests</li>`).join('')}</ul>`:''}${renderCheckPlan(config,plan)}</details></div>${renderReviewPassCriteria(config)}`;
   const timingDetails=element.querySelector?.('.timing-warning-details');
   if(timingDetails)timingDetails.open=requestPlanTimingDetails.open;
   else requestPlanTimingDetails.open=false;
@@ -3032,7 +3065,7 @@ async function refreshRequestPreview(snapshot,{draft=false}={}) {
     const result=await api(draft?'/api/config/draft':'/api/config/preview',{method:'POST',body:JSON.stringify(config)});
     if(version!==state.routeVersion||revision!==state.configRevision||sequence!==state.previewSequence)throw new Error('Configuration changed during preview. Refresh the current settings before running.');
     assertAppliedConfig();
-    acceptMigrationNotes(result.migration_notes);
+    acceptMigrationNotes(result.migration_notes,result.migration_warnings,result.migration_limit_notes);
     const previous=state.requestPreview;
     state.requestPreview={status:'current',revision,route:version,plan:result.request_plan,config:result.config,
       data:draft?previous?.data:result.request_pack_preview,
@@ -3137,6 +3170,7 @@ function navigateSetup(step) {
 function setupPlanCount(plan) {
   if(plan.request_count_label!=null){
     const label=plan.request_count_label;
+    if(label==='Unknown')return 'Requests depend on response time';
     if(plan.count_kind==='bounded'&&label!=='Unknown'){
       const scheduled=label.replace(/^Unknown \+ /,'');
       return `${scheduled} ${scheduled.startsWith('≈')?'expected':'known'} requests + adaptive checks`;
@@ -3376,7 +3410,7 @@ function renderRunBlueprint(config,plan=null) {
   return `<header class="blueprint-heading"><h2>Run plan</h2></header><p class="blueprint-intro" data-plan-state="${status}" role="status" aria-live="polite">${escape(plan?setupPlanCount(plan):waiting)}</p>${hasJsonChanges()?'':renderPlanBounds(config)+split}
   <div class="field-label"><button type="button" class="text-button blueprint-edit" data-action="edit-run-limits" ${hasJsonChanges()?'disabled':''}>Edit limits</button>${infoHelp('run_plan_limits','Run limits','Optional limits you set. Tests also stop at their own durations, request counts and per-request timeouts.')}</div>
   ${plan&&config.checks.length?`<details class="workload-breakdown"><summary>Request breakdown</summary>${renderCheckPlan(config,plan)}</details>`:''}
-  ${renderSettingIssues([...localSettingWarnings(),...(plan?.load_warnings||[])],'warning')}${renderMigrationNotes()}${renderSettingIssues()}${state.requestPreview?.status==='error'&&!currentSettingErrors().length?notice(state.requestPreview.error||'Plan unavailable. Retry the request plan.','error'):''}${renderPlanTime(plan)}${plan?.evaluator?.active?'<p class="blueprint-note">AI evaluation runs afterward with separate limits.</p>':''}`;
+  ${renderSettingIssues(warningsOutsideFields([...localSettingWarnings(),...(plan?.load_warnings||[])]),'warning')}${renderMigrationWarnings()}${renderMigrationNotes()}${renderSettingIssues()}${state.requestPreview?.status==='error'&&!currentSettingErrors().length?notice(state.requestPreview.error||'Plan unavailable. Retry the request plan.','error'):''}${renderPlanTime(plan)}${plan?.evaluator?.active?'<p class="blueprint-note">AI evaluation runs afterward with separate limits.</p>':''}`;
 }
 function syncRunBlueprint(config,plan=null) {
   const element=$('#run-blueprint');if(!element)return;
@@ -3594,7 +3628,7 @@ async function startRun(event) {
     if(payload.mode==='cold-start'&&!payload.config.targets.find(t=>t.name===payload.restart_target)?.restart_command?.length)throw new Error('Cold start requires a configured restart_command for the selected target.');
     if(version!==state.routeVersion)return;
     $('#start-run').textContent='Checking input preparation…';
-    const result=await api('/api/runs',{method:'POST',body:JSON.stringify({...payload,migration_notes:[...(state.migrationNotes || [])],api_keys:sessionAPIKeys(payload.config)})});state.config=clone(payload.config);state.config.targets[0].tokenizer=draft.targets[0].tokenizer;
+    const result=await api('/api/runs',{method:'POST',body:JSON.stringify({...payload,migration_notes:[...(state.migrationNotes || [])],migration_warnings:activeMigrationWarnings(),api_keys:sessionAPIKeys(payload.config)})});state.config=clone(payload.config);state.config.targets[0].tokenizer=draft.targets[0].tokenizer;
     state.gatewayAccessDraft=gatewayAccessDraft;
     if(draft.request_source==='request_pack'&&!draft.request_pack&&!draft.checks.some(id=>['correctness','load'].includes(id)))state.config.request_source=draft.request_source;
     setActive(result.id);if(version===state.routeVersion)location.hash=linkRun(result.id);
@@ -4586,7 +4620,7 @@ function comparisonValue(row,value){if(value==null)return '—';if(typeof value!
 function renderDeployment(report){
   return `<section class="panel"><div class="section-heading"><h2>Deployment and serving observations</h2></div><p class="hint">Changes provide investigation context, not proof of causality. Source freshness and other replicas remain qualified in the evidence.</p>${Object.entries(report.observations?.targets || {}).map(([name,obs])=>`<h3>${escape(name)}</h3><details><summary>Deployment snapshot and unknown fields</summary><pre>${escape(JSON.stringify(obs.deployment,null,2))}</pre></details><details><summary>Deployment observations during the run</summary><pre>${escape(JSON.stringify(obs.deployment_history || [],null,2))}</pre></details><details><summary>Serving telemetry and phase coverage</summary><pre>${escape(JSON.stringify(obs.serving_telemetry,null,2))}</pre></details>`).join('')}<a class="button" href="${runPath(state.detail.id)}/reproduction.json" download>Export reproduction JSON</a></section>`;
 }
-function renderConfig(report){return `${renderDeployment(report)}${report.warnings?.length?`<div class="notice warning">${report.warnings.map(w=>`<p>${escape(w)}</p>`).join('')}</div>`:''}<section class="panel"><div class="section-heading"><h2>Recorded configuration</h2><div class="actions"><span class="hint">Suite ${escape(report.suite_version)}</span><a class="text-button" href="${runPath(state.detail.id)}/config.json" download>Download config</a></div></div><pre class="config-display">${escape(JSON.stringify(report.manifest,null,2))}</pre></section>`;}
+function renderConfig(report){return `${renderDeployment(report)}${(report.manifest?.config_migration_warnings||[]).map(warning=>notice(warning.msg,'warning')).join('')}${report.warnings?.length?`<div class="notice warning">${report.warnings.map(w=>`<p>${escape(w)}</p>`).join('')}</div>`:''}<section class="panel"><div class="section-heading"><h2>Recorded configuration</h2><div class="actions"><span class="hint">Suite ${escape(report.suite_version)}</span><a class="text-button" href="${runPath(state.detail.id)}/config.json" download>Download config</a></div></div><pre class="config-display">${escape(JSON.stringify(report.manifest,null,2))}</pre></section>`;}
 function liveStopReasons(detail) {
   const events=detail.events||[],progress=detail.progress||{},stops=events.filter(event=>event.event==='run_stopping'),reasons=new Set();
   const add=(value,target='')=>{
@@ -4822,7 +4856,7 @@ async function startNewRun(){
     const config=omitInactiveGatewayAccess(state.config || state.bootstrap.config,state.gatewayAccessDraft ||= {});
     const result=await api('/api/config/draft',{method:'POST',body:JSON.stringify(config)});
     if(intent!==state.setupNavigationSequence||version!==state.routeVersion||revision!==state.configRevision)return;
-    state.config=result.config;replaceMigrationNotes(result.migration_notes);
+    state.config=result.config;replaceMigrationNotes(result.migration_notes,result.migration_warnings,result.migration_limit_notes);
   }catch(error){if(intent===state.setupNavigationSequence)toast(error.message);return;}
   state.setupStep=1;state.returnToReview=false;state.openTest=null;configChanged();
   if(location.hash!=='#new'){location.hash='#new';return;}
@@ -4836,13 +4870,13 @@ function normalizeRateThreshold(config){
 async function rerun(){
   const version=state.routeVersion;let source=state.detail.report?.manifest?.config || state.detail.config;
   if(!source){toast('No configuration was saved for this run.');return;}
-  let notes=[];
+  let notes=[],limitNotes=[],warnings=state.detail.report?.manifest?.config_migration_warnings || [];
   if(source.config_version==null || 'concurrent_workloads' in source || 'buckets' in source || source.test_options?.concurrency || (source.checks || []).some(id=>['fairness','buckets','mixed','token_stress'].includes(id))){
-    try{const result=await api('/api/config/draft',{method:'POST',body:JSON.stringify(source)});if(version!==state.routeVersion)return;source=result.config;notes=result.migration_notes;}
+    try{const result=await api('/api/config/draft',{method:'POST',body:JSON.stringify(source)});if(version!==state.routeVersion)return;source=result.config;notes=result.migration_notes;warnings=result.migration_warnings || [];limitNotes=result.migration_limit_notes || [];}
     catch(error){toast(error.message);return;}
   }
   source=normalizeRateThreshold(source);
-  replaceMigrationNotes(notes);state.config=clone(source);state.gatewayAccessDraft={};state.autoModel=null;state.setupStep=1;invalidateModelDiscovery();state.datasetSelection=[];state.config.restart_target=null;state.formMode='normal';state.formRestartTarget=null;state.jsonDraft=null;state.jsonBase=null;state.configView='form';configChanged();state.prefillBaseline=state.detail.baseline_id || '';location.hash='#new';
+  replaceMigrationNotes(notes,warnings,limitNotes);state.config=clone(source);state.gatewayAccessDraft={};state.autoModel=null;state.setupStep=1;invalidateModelDiscovery();state.datasetSelection=[];state.config.restart_target=null;state.formMode='normal';state.formRestartTarget=null;state.jsonDraft=null;state.jsonBase=null;state.configView='form';configChanged();state.prefillBaseline=state.detail.baseline_id || '';location.hash='#new';
 }
 function portableConfig(payload) {return {...payload.config,restart_target:payload.mode==='cold-start'?payload.restart_target:null};}
 function hasJsonChanges() {return state.jsonDraft!==null&&state.jsonDraft!==state.jsonBase;}
@@ -4860,9 +4894,11 @@ async function restoreDraft() {
     const legacy=draft?.config?.config_version==null;
     if(draft&&draft.config?.targets?.length&&(legacy||sameConfig(draft.bootstrap&&normalizeRateThreshold(draft.bootstrap),normalizeRateThreshold(state.bootstrap.config)))){
       const gatewayAccessDraft=draft.gatewayAccessDraft || {};
-      let config=omitInactiveGatewayAccess(draft.config,gatewayAccessDraft),notes=[];
-      if(legacy){const result=await api('/api/config/draft',{method:'POST',body:JSON.stringify(config)});config=result.config;notes=result.migration_notes || [];}
+      let config=omitInactiveGatewayAccess(draft.config,gatewayAccessDraft),notes=[],warnings=[],limitNotes=[];
+      if(legacy){const result=await api('/api/config/draft',{method:'POST',body:JSON.stringify(config)});config=result.config;notes=result.migration_notes || [];warnings=result.migration_warnings || [];limitNotes=result.migration_limit_notes || [];}
       state.config=normalizeRateThreshold(config);state.gatewayAccessDraft=gatewayAccessDraft;state.dismissedMigrationNotes=draft.dismissedMigrationNotes || [];
+      state.migrationLimitNotes=[...new Set([...(draft.migrationLimitNotes || []),...limitNotes])];
+      state.migrationWarnings=mergeMigrationWarnings(draft.migrationWarnings || [],warnings);
       state.migrationNotes=[...new Set([...(draft.migrationNotes || []),...state.dismissedMigrationNotes,...notes])];
     }else sessionStorage.removeItem('giraffe-draft-v1');
   }catch{}
@@ -4870,7 +4906,7 @@ async function restoreDraft() {
 function saveDraft() {
   if(!state.bootstrap||!state.config)return;
   captureFormDraft();
-  try{sessionStorage.setItem('giraffe-draft-v1',JSON.stringify({bootstrap:state.bootstrap.config,config:state.config,gatewayAccessDraft:state.gatewayAccessDraft,migrationNotes:state.migrationNotes,dismissedMigrationNotes:state.dismissedMigrationNotes}));}catch{}
+  try{sessionStorage.setItem('giraffe-draft-v1',JSON.stringify({bootstrap:state.bootstrap.config,config:state.config,gatewayAccessDraft:state.gatewayAccessDraft,migrationNotes:state.migrationNotes,migrationLimitNotes:state.migrationLimitNotes,migrationWarnings:state.migrationWarnings,dismissedMigrationNotes:state.dismissedMigrationNotes}));}catch{}
 }
 function syncConfigView() {
   const dirty=hasJsonChanges();
@@ -4918,7 +4954,7 @@ async function applyConfig(text=state.jsonDraft,{importing=false}={}) {
     const result=await api('/api/config/draft',{method:'POST',body:JSON.stringify(parsed)});
     if(version!==state.routeVersion||revision!==state.configRevision)return;
     captureFormDraft();
-    replaceMigrationNotes(result.migration_notes);
+    replaceMigrationNotes(result.migration_notes,result.migration_warnings,result.migration_limit_notes);
     state.config=result.config;state.gatewayAccessDraft={};state.autoModel=null;invalidateModelDiscovery();state.datasetSelection=[];
     // An explicit restart target in imported/edited JSON remains visible and intentional.
     state.formMode=result.config.restart_target?'cold-start':'normal';state.formRestartTarget=result.config.restart_target;
@@ -4947,11 +4983,11 @@ async function validatedSnapshot({draft=false}={}) {
       throw new Error(`Enter a model for target "${payload.config.targets[missing].name}" before running or copying a CLI command. You can still apply or export this draft.`);
     }
   }
-  try{const localErrors=localSettingErrors(payload.config);if(localErrors.length)throw Object.assign(new Error(localErrors[0].msg),{errors:localErrors});const result=await api(draft?'/api/config/draft':'/api/config/validate',{method:'POST',body:JSON.stringify(payload.config)});if(version===state.routeVersion&&revision===state.configRevision)acceptMigrationNotes(result.migration_notes);payload.config=result.config;}
+  try{const localErrors=localSettingErrors(payload.config);if(localErrors.length)throw Object.assign(new Error(localErrors[0].msg),{errors:localErrors});const result=await api(draft?'/api/config/draft':'/api/config/validate',{method:'POST',body:JSON.stringify(payload.config)});if(version===state.routeVersion&&revision===state.configRevision)acceptMigrationNotes(result.migration_notes,result.migration_warnings,result.migration_limit_notes);payload.config=result.config;}
   catch(error){if(version===state.routeVersion&&revision===state.configRevision&&error.errors?.length){state.requestPreview={status:'error',revision,route:version,error:error.message,errors:error.errors};renderRequestPreview();focusFirstSettingError(error);}throw error;}
   if(version!==state.routeVersion||revision!==state.configRevision)throw new Error('Configuration changed during validation. Try again with the current settings.');
   assertAppliedConfig();if(!draft&&!tokenizerSetupReady())throw new Error(currentTokenizerSelection()?.message || 'Wait for the Token ID check on the connection page before continuing.');
-  return {...payload,migration_notes:[...(state.migrationNotes || [])]};
+  return {...payload,migration_notes:[...(state.migrationNotes || [])],migration_warnings:activeMigrationWarnings()};
 }
 async function exportConfig() {
   configError();
@@ -5084,6 +5120,19 @@ document.addEventListener('click',async(event)=>{
   }
   if(action==='use-setting-correction'){
     try{
+      const correction=event.target.closest('[data-setting-value]');
+      if(correction?.dataset.settingPath?.startsWith('load_test.')){
+        assertAppliedConfig();
+        const field=correction.dataset.settingPath,value=Number(correction.dataset.settingValue);
+        const issue=currentRequestPlan()?.load_warnings?.find(warning=>warning.actions?.some(item=>item.field===field&&item.value===value));
+        if(!issue)throw new Error('The request plan changed. Review the updated correction before applying it.');
+        captureFormDraft();
+        const parts=field.split('.');let target=state.config;
+        for(const part of parts.slice(0,-1))target=target[part] ||= {};
+        target[parts.at(-1)]=value;
+        state.jsonDraft=null;state.jsonBase=null;configChanged();renderNew();focusSetting(field,{explicit:true});return;
+      }
+
       if(hasJsonChanges()){
         const button=event.target.closest('[data-setting-value]'),field=button.dataset.settingPath,value=Number(button.dataset.settingValue);
         const issue=currentSettingErrors().find(error=>error.actions?.some(action=>action.field===field&&action.value===value));
@@ -5357,5 +5406,5 @@ document.addEventListener('visibilitychange',()=>{
   else if(location.hash==='#new')schedulePoll(pollNew,version,state.active?300:10000);
   else if(state.active)schedulePoll(pollRunStatus,version,300);
 });
-async function init(){initReticulate();try{const [bootstrap,baselines]=await Promise.all([api('/api/bootstrap'),api('/api/baselines')]);state.bootstrap=bootstrap;connectionError();state.baselines=baselines.baselines || [];state.config=clone(bootstrap.config);replaceMigrationNotes(bootstrap.migration_notes);await restoreDraft();state.config.restart_target=null;state.diskActive=bootstrap.disk_active_id || null;setActive(bootstrap.active_run_id);$('#suite-version').textContent=`suite ${bootstrap.suite_version || 'unknown'}`;$('#runner-location').textContent=bootstrap.hostname || 'UI server connected';const detailLink=location.hash.startsWith('#runs/');if(!detailLink)await refreshRuns().catch(()=>{});await route();if(detailLink)refreshRuns().catch(()=>{});}catch(error){if(state.accessExpired){$('#main').innerHTML='<div class="page-heading"><h1>Access expired</h1></div>';return;}if(document.body)document.body.dataset.runner='unavailable';$('#main').innerHTML=`<div class="page-heading"><h1>Local runner unavailable</h1></div>${notice(error.message,'error')}<button class="button" data-action="reconnect">Reconnect</button>`;}}
+async function init(){initReticulate();try{const [bootstrap,baselines]=await Promise.all([api('/api/bootstrap'),api('/api/baselines')]);state.bootstrap=bootstrap;connectionError();state.baselines=baselines.baselines || [];state.config=clone(bootstrap.config);replaceMigrationNotes(bootstrap.migration_notes,bootstrap.migration_warnings,bootstrap.migration_limit_notes);await restoreDraft();state.config.restart_target=null;state.diskActive=bootstrap.disk_active_id || null;setActive(bootstrap.active_run_id);$('#suite-version').textContent=`suite ${bootstrap.suite_version || 'unknown'}`;$('#runner-location').textContent=bootstrap.hostname || 'UI server connected';const detailLink=location.hash.startsWith('#runs/');if(!detailLink)await refreshRuns().catch(()=>{});await route();if(detailLink)refreshRuns().catch(()=>{});}catch(error){if(state.accessExpired){$('#main').innerHTML='<div class="page-heading"><h1>Access expired</h1></div>';return;}if(document.body)document.body.dataset.runner='unavailable';$('#main').innerHTML=`<div class="page-heading"><h1>Local runner unavailable</h1></div>${notice(error.message,'error')}<button class="button" data-action="reconnect">Reconnect</button>`;}}
 init();

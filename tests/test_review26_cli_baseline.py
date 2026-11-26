@@ -42,7 +42,11 @@ def test_legacy_concurrency_flag_rebuilds_migrated_overlap_defaults(source, tmp_
     assert all(notice["msg"].startswith(CATALOGUE_NAMES[notice["check"]] + ": ") for notice in notices)
     assert all(notice["msg"].count("Shared across") == 1 for notice in notices)
     assert not any("default_concurrency=40" in note or "concurrency: 40" in note for note in config._migration_notes)
-    assert capsys.readouterr().err.count("--concurrency 8 sets both") == 1
+    assert sum("--concurrency 8 sets both" in note for note in config._migration_notes) == 1
+    summary = "Migration: 7 other settings were converted from an earlier Giraffe version."
+    if source == "config":
+        summary += f" Run giraffe preview --config {path} to list them."
+    assert capsys.readouterr().err == summary + "\n"
 
 
 def test_legacy_concurrency_flag_preserves_explicit_check_settings(tmp_path):
