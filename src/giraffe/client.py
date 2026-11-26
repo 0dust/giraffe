@@ -294,7 +294,7 @@ def _rejected_evidence_field(body: bytes) -> str | None:
 
 
 def _rejected_request_option(body: bytes, keys: Iterable[str]) -> tuple[str | None, bool]:
-    """Retain a configured key or an other-field flag, never server error text."""
+    """Retain a configured key or an other-field flag only from structured fields."""
     try:
         data = json.loads(body)
     except (ValueError, UnicodeDecodeError):
@@ -312,16 +312,7 @@ def _rejected_request_option(body: bytes, keys: Iterable[str]) -> tuple[str | No
             isinstance(item, dict) and isinstance(item.get("loc"), list) and key in item["loc"]
             for item in detail)}
         return (next(iter(matches)) if len(matches) == 1 else None), not matches
-    if isinstance(error, dict):
-        message = error.get("message")
-    elif isinstance(error, str):
-        message = error
-    else:
-        message = detail if isinstance(detail, str) else data.get("message")
-    # Common-word keys can occur in error prose without identifying a rejected option.
-    matches = {key for key in keys if "_" in key and isinstance(message, str)
-               and re.search(r"\b" + re.escape(key) + r"\b", message)}
-    return (next(iter(matches)) if len(matches) == 1 else None), False
+    return None, False
 
 
 def _answer_spans(

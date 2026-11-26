@@ -16,6 +16,9 @@ from tests.test_connection import endpoint
     (400, {"error": {"message": 'invalid reasoning value: "bogus" (must be ...)',
                      "type": "invalid_request_error", "param": None, "code": None}},
      {"reasoning_effort": "bogus"}, None),
+    pytest.param(400, {"error": {"param": None, "message":
+                               "max_tokens must be at least 64 when reasoning_effort is high."}},
+                 {"reasoning_effort": "high"}, None, id="null-param-with-prose"),
     (400, {"error": {"message": "bad", "param": "reasoning_effort"}},
      {"reasoning_effort": "bogus"}, "reasoning_effort"),
     (400, {"error": {"param": "reasoning_effort", "message":
@@ -34,7 +37,7 @@ from tests.test_connection import endpoint
      "chat_template_kwargs"),
     (400, {"error": {"message": "Unknown field chat_template_kwargs SECRET-ECHO"}},
      {"reasoning_effort": "bogus", "chat_template_kwargs": {"enable_thinking": False}},
-     "chat_template_kwargs"),
+     None),
     (422, {"detail": [{"type": "extra_forbidden", "loc": ["body", "reasoning_effort"], "msg": "x"}]},
      {"reasoning_effort": "bogus"}, "reasoning_effort"),
     (400, {"error": {"message": "invalid user input"}}, {"user": "x"}, None),
@@ -67,8 +70,14 @@ async def test_request_option_rejection_message_is_private(monkeypatch, status, 
         expected = (f"The server returned HTTP {status}. "
                     "Check the model name and OpenAI-compatible endpoint.")
     assert str(error.value) == expected
+    if rejected is None:
+        assert "rejected request_options" not in str(error.value)
     assert error.value.blocking is (status == 404)
     assert len(requests) == 1
+    payload = json.loads(requests[0].content)
+    assert payload["max_tokens"] == 32
+    if "reasoning_effort" in options:
+        assert payload["reasoning_effort"] == options["reasoning_effort"]
     workload = records[0].workload
     assert workload.get("rejected_request_option") == rejected
     assert workload.get("request_option_keys") == (sorted(options) if options and status != 404 else None)
@@ -184,11 +193,12 @@ async def test_rejection_records_only_configured_preflight_options(monkeypatch, 
 @pytest.mark.parametrize("body,keys,expected", [
     (b"not JSON", ["temperature"], (None, False)),
     (b"[]", ["temperature"], (None, False)),
-    (b'{"error":"bad reasoning_effort"}', ["reasoning_effort"], ("reasoning_effort", False)),
-    (b'{"detail":"bad reasoning_effort"}', ["reasoning_effort"], ("reasoning_effort", False)),
-    (b'{"message":"bad reasoning_effort"}', ["reasoning_effort"], ("reasoning_effort", False)),
+    (b'{"error":"bad reasoning_effort"}', ["reasoning_effort"], (None, False)),
+    (b'{"detail":"bad reasoning_effort"}', ["reasoning_effort"], (None, False)),
+    (b'{"message":"bad reasoning_effort"}', ["reasoning_effort"], (None, False)),
+    (b'{"error":{"message":"bad reasoning_effort"}}', ["reasoning_effort"], (None, False)),
     (b'{"error":{"message":"bad reasoning_effort_extra"}}', ["reasoning_effort"], (None, False)),
-    (b'{"error":{"message":"bad option_name.value"}}', ["option_name.value"], ("option_name.value", False)),
+    (b'{"error":{"message":"bad option_name.value"}}', ["option_name.value"], (None, False)),
     (b'{"error":{"message":"bad option_nameXvalue"}}', ["option_name.value"], (None, False)),
     (b'{"error":{"message":"invalid user input"}}', ["user"], (None, False)),
     (b'{"error":{"message":"bad seed"}}', ["seed"], (None, False)),
@@ -204,7 +214,7 @@ async def test_rejection_records_only_configured_preflight_options(monkeypatch, 
      ["reasoning_effort"], (None, True)),
     (b'{"error":{"param":"temperature"}}', ["reasoning_effort"], (None, True)),
     (b'{"error":{"param":["reasoning_effort"],"message":"bad reasoning_effort"}}',
-     ["reasoning_effort"], ("reasoning_effort", False)),
+     ["reasoning_effort"], (None, False)),
     (b'{"detail":[{"loc":["body","reasoning_effort"]}],"message":"bad chat_template_kwargs"}',
      ["reasoning_effort", "chat_template_kwargs"], ("reasoning_effort", False)),
     (b'{"detail":[{"loc":["reasoning_effort"]},{"loc":["reasoning_effort"]}]}',
@@ -216,14 +226,14 @@ async def test_rejection_records_only_configured_preflight_options(monkeypatch, 
     (b'{"error":{"message":"reasoning_effort and chat_template_kwargs"}}',
      ["reasoning_effort", "chat_template_kwargs"], (None, False)),
     (b'{"error":{"message":"bad reasoning_effort"}}',
-     ["reasoning_effort", "reasoning_effort"], ("reasoning_effort", False)),
+     ["reasoning_effort", "reasoning_effort"], (None, False)),
     (b'{"detail":[null,{"loc":"temperature"}]}', ["temperature"], (None, False)),
     (b'{"error":{"param":"","message":"bad reasoning_effort"}}',
-     ["reasoning_effort"], ("reasoning_effort", False)),
+     ["reasoning_effort"], (None, False)),
     (b'{"detail":[{"loc":[]}],"message":"bad reasoning_effort"}',
      ["reasoning_effort"], (None, True)),
     (b'{"detail":[null,{"loc":"temperature"}],"message":"bad reasoning_effort"}',
-     ["reasoning_effort"], ("reasoning_effort", False)),
+     ["reasoning_effort"], (None, False)),
     (b'{"error":{"message":null}}', ["temperature"], (None, False)),
 ])
 def test_rejected_request_option_matches_only_supplied_keys(body, keys, expected):

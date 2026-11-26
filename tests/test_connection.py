@@ -302,21 +302,30 @@ async def test_api_validates_sensitive_inputs_and_creates_no_run_artifacts(tmp_p
     assert not list(tmp_path.iterdir())
 
 
-async def test_api_connection_rejection_mentions_request_options(tmp_path, monkeypatch):
-    requests, _ = endpoint(monkeypatch, lambda request: httpx.Response(400, json={"error": {
+@pytest.mark.parametrize("body,effort", [
+    ({"error": {
         "message": 'invalid reasoning value: "bogus" (must be ...)',
         "type": "invalid_request_error", "param": None, "code": None,
-    }}))
+    }}, "bogus"),
+    pytest.param({"error": {"param": None, "message":
+                           "max_tokens must be at least 64 when reasoning_effort is high."}},
+                 "high", id="null-param-with-prose"),
+])
+async def test_api_connection_rejection_mentions_request_options(tmp_path, monkeypatch, body, effort):
+    requests, _ = endpoint(monkeypatch, lambda request: httpx.Response(400, json=body))
     async with browser(tmp_path) as client:
         response = await client.post("/api/targets/test-connection", json={
-            "url": "http://server", "model": "tiny", "request_options": {"reasoning_effort": "bogus"},
+            "url": "http://server", "model": "tiny", "request_options": {"reasoning_effort": effort},
         })
     assert response.status_code == 422
     assert response.json()["detail"] == (
         "The server returned HTTP 400. Check the model name, the OpenAI-compatible endpoint "
         "and request_options (reasoning_effort).")
     assert "invalid reasoning value" not in response.text and "bogus" not in response.text
+    assert "rejected request_options" not in response.text
     assert len(requests) == 1
+    payload = json.loads(requests[0].content)
+    assert payload["max_tokens"] == 32 and payload["reasoning_effort"] == effort
 
 
 async def test_api_connection_rejection_prefers_param_over_prose(tmp_path, monkeypatch):
