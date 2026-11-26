@@ -692,21 +692,20 @@ def answer_difference(expected, received) -> str:
     return f" Expected: {excerpt(expected)}; received: {excerpt(received)}."
 
 
-_LOAD_REFUSAL_OPENING = re.compile(
+_REFUSAL_OPENING = re.compile(
     r"\s*(?:(?:sorry|i['’]m sorry),?\s+(?:but\s+)?)?"
     r"(?:(?:i|we)\s+(?:can['’]t|cannot|can not|won['’]t|will not|am unable to|are unable to)"
-    r"|(?:i['’]m|we['’]re) unable to)\s+"
+    r"|(?:i['’]m|we['’]re) unable to|(?:i['’]m|i am|we['’]re) not able to)\s+"
     r"(?:assist|comply|complete|fulfill?|generate|help|provide|respond|write)\b",
     re.IGNORECASE,
 )
 
 
-def is_load_refusal(record: RequestRecord, answer: str | None = None) -> bool:
-    if record._load_refusal:
-        return True
-    if answer is None:
-        answer, _, _ = final_answer(record.output)
-    return bool(_LOAD_REFUSAL_OPENING.match(answer))
+REFUSAL_SCORE_MESSAGE = "Model refused the request."
+
+
+def is_refusal(record: RequestRecord, answer: str) -> bool:
+    return record.refused or bool(_REFUSAL_OPENING.match(answer))
 
 
 def score_response(spec: RequestSpec, record: RequestRecord) -> RequestRecord:
@@ -742,8 +741,8 @@ def score_response(spec: RequestSpec, record: RequestRecord) -> RequestRecord:
     if unclosed or (stripped and not answer.strip() and spec.scorer != "tool"):
         return record.model_copy(update={"score": None, "score_message": REASONING_WITHOUT_ANSWER})
     if spec.scorer == "label":
-        if "load" in spec.check_ids and is_load_refusal(record, answer):
-            return record.model_copy(update={"score": False, "score_message": "Model refused the request."})
+        if is_refusal(record, answer):
+            return record.model_copy(update={"score": False, "score_message": REFUSAL_SCORE_MESSAGE, "refused": True})
         actual = re.sub(r"^(?:(?:box\s+)?label)\s*:\s*", "", _normalized(answer), flags=re.I)
         expected = str(spec.expected)
         score = bool(re.match(r"^" + re.escape(expected) + r"(?![A-Za-z0-9])", actual))

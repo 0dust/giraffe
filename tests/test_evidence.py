@@ -48,15 +48,18 @@ def test_recover_finished_records_before_runner_finalizes(tmp_path):
 @pytest.mark.parametrize("retention,expected", [("all", "sensitive answer"), ("none", ""), ("failures", "")])
 def test_evidence_applies_retention_and_snapshots_pre_judging_record(tmp_path, retention, expected):
     writer = EvidenceWriter(tmp_path, {"config": {"retention": retention}})
-    finished = record()
+    finished = record().model_copy(update={"refused": True})
     writer.record_finished(finished)
     finished.score = False
     finished.output = "changed by judging"
     writer.close()
     report = recover_evidence(tmp_path, {})
+    assert report.requests[0].refused is True
     assert report.requests[0].score is None
     assert report.requests[0].output == expected
     assert (tmp_path / "evidence.jsonl").stat().st_mode & 0o777 == 0o600
+    saved, _ = write_report(report, tmp_path)
+    assert RunReport.model_validate_json(saved.read_bytes()).requests[0].refused is True
 
 
 def test_evidence_fsync_is_on_writer_thread_and_happens_without_close(tmp_path, monkeypatch):

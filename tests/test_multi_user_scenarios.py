@@ -1195,7 +1195,7 @@ def test_cancel_selected_request_before_admission_sends_nothing_and_peers_surviv
         state = runner._Run(cfg, None, None)
         peer_started = asyncio.Event()
         spec = RequestSpec(fixture_id="peer", scenario="multi_user_2_cancellation", check_ids=["multi_user"],
-                           messages=[{"role": "user", "content": "The box label is K7P4. Write the box label first, then continue a numbered list."}],
+                           messages=[{"role": "user", "content": "The box label is K7P4. Question: what is the box label? Start your reply with the label, then write every whole number from 1 to 10000 in order, separated by commas."}],
                            max_tokens=16, workload={"user_id": "user-01"})
         async with LLMClient(cfg.targets[0], cfg, max_connections=1) as client:
             peer = asyncio.create_task(state.request(cfg.targets[0], client, spec, event=peer_started))

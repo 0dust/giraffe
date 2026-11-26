@@ -81,11 +81,19 @@ def minimum_reservation(settings):
     return len(test_points(settings))
 
 
+_LOAD_QUESTION = "Question: what is the box label? Start your reply with the label"
+
+
+def nonce_prefix(nonce):
+    """Cache-busting first line shared by Load and Multi-user prompts."""
+    return f"Notes {nonce}\n"
+
+
 def prompt(filler_chars, variant, *, nonce=None):
-    instruction = ("Write the box label first, with no introduction." if variant == "short_answer" else
-                   "Write the box label first, then continue a numbered list from 1 to 1000000, well beyond the output cap.")
+    instruction = (f"{_LOAD_QUESTION}." if variant == "short_answer" else
+                   f"{_LOAD_QUESTION}, then write every whole number from 1 to 10000 in order, separated by commas.")
     filler = ("The team reviewed the neutral delivery notes. " * (filler_chars // 44 + 1))[:filler_chars]
-    return f"Request {nonce or uuid.uuid4().hex}. The box label is K7P4.\n{filler}\n{instruction}"
+    return f"{nonce_prefix(nonce or uuid.uuid4().hex)}{filler}\nThe box label is K7P4.\n{instruction}"
 
 
 def prompt_overhead(variant):

@@ -3065,7 +3065,6 @@ class RequestRecord(PersistedModel):
     _gateway_access_routing_issue: str | None = PrivateAttr(default=None)
     _gateway_access_refusal: bool = PrivateAttr(default=False)
     _gateway_access_metered_reasoning: bool = PrivateAttr(default=False)
-    _load_refusal: bool = PrivateAttr(default=False)
     _request_body_sent_monotonic: float | None = PrivateAttr(default=None)
     id: str
     target: str
@@ -3126,6 +3125,7 @@ class RequestRecord(PersistedModel):
     valid: bool = False
     score: bool | None = None
     score_message: str | None = None
+    refused: bool = False
     evaluation: EvaluationEvidence | None = None
     evaluation_error: str | None = None
     logprob_evidence: LogprobEvidence | None = None

@@ -315,3 +315,28 @@ def test_productive_recursive_schema_still_scores():
                        messages=[{"role": "user", "content": "Return a tree"}],
                        scorer="json", schema=schema)
     assert score_response(spec, record(spec, '{"child": {"child": {}}}')).score is True
+
+
+@pytest.mark.parametrize("answer, refused", [
+    ("I'm not able to help with that.", True),
+    ("I am not able to help with that.", True),
+    ("We’re not able to help with that.", True),
+    ("I can’t fulfill that request.", True),
+    ("<think>The task is to read a label.</think> I can’t fulfill that request.", True),
+    ("Sorry, the label is A1B2.", False),
+    ("K7P4", False),
+])
+def test_label_refusal_signal(answer, refused):
+    from giraffe.fixtures import REFUSAL_SCORE_MESSAGE, final_answer, is_refusal
+
+    spec = RequestSpec(fixture_id="label", scenario="correctness", check_ids=["correctness"],
+                       messages=[{"role": "user", "content": "The box label is K7P4."}],
+                       scorer="label", expected="K7P4")
+    response = record(spec, answer)
+    assert is_refusal(response, final_answer(answer)[0]) is refused
+    scored = score_response(spec, response)
+    assert scored.refused is refused
+    assert scored.score is (answer == "K7P4")
+    if refused:
+        assert scored.score_message == REFUSAL_SCORE_MESSAGE
+    assert RequestRecord.model_validate_json(scored.model_dump_json()).refused is refused

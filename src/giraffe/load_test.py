@@ -26,7 +26,7 @@ from giraffe.concurrent_load import (
     later_reservation,
     window_cause,
 )
-from giraffe.fixtures import deterministic_options, is_load_refusal, reasoning_budget
+from giraffe.fixtures import deterministic_options, reasoning_budget
 from giraffe.models import (
     CheckResult,
     MAX_PLANNED_ARRIVALS,
@@ -1321,7 +1321,7 @@ def measurements(run, target, settings, point, records, shape):
         error_percent=(len(failed) + len(timed_out)) / denominator * 100 if denominator else 0,
         scored=len(scored),
         correct=sum(r.score is True for r in scored),
-        refused=sum(r.score is False and is_load_refusal(r) for r in scored),
+        refused=sum(r.score is False and r.refused for r in scored),
         unscored=len(valid) - len(scored),
         correct_percent=sum(r.score is True for r in scored) / len(scored) * 100
         if scored

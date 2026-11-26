@@ -988,8 +988,8 @@ class LLMClient:
             else:
                 answer = _text(content.get("content"))
                 refusal = content.get("refusal")
-                if "load" in spec.check_ids and isinstance(refusal, str) and refusal:
-                    record._load_refusal |= bool(refusal.strip())
+                if isinstance(refusal, str) and refusal.strip():
+                    record.refused = True
                     if not answer.strip():
                         answer = _text(refusal)
             if logprob_collector is not None:

@@ -676,3 +676,30 @@ async def test_endpoint_failure_does_not_mislabel_unreached_levels_as_calibratio
 
 
 # Fake inference clients in this module use the matching local tokenizer.
+
+
+@pytest.mark.parametrize("variant", ["short_answer", "long_output"])
+def test_load_nonce_prefix(variant):
+    import re
+    from giraffe.concurrent_load import nonce_prefix, prompt
+
+    text = prompt(100, variant, nonce="abc")
+    assert text.startswith(nonce_prefix("abc"))
+    assert not re.search(r"Request [0-9a-f]{32}", text)
+    from tests.fake_endpoint import FakeEndpoint
+
+    answer = FakeEndpoint._answer(text)
+    assert answer == "K7P4"
+    if variant == "long_output":
+        assert len(FakeEndpoint._continue_numbered_list(text, answer, 32).split()) > 32
+
+
+def test_multi_user_matched_work_ignores_load_nonce():
+    from giraffe.concurrent_load import make_spec
+    from giraffe.multi_user import _matched_work_sha256
+
+    settings = configuration().load_test
+    point = {"type": "combinations", "level": 1}
+    first = make_spec(settings, "short_short", "multi_user", point, 100, nonce="abc")
+    second = make_spec(settings, "short_short", "multi_user", point, 100, nonce="different")
+    assert _matched_work_sha256(first, nonce="abc") == _matched_work_sha256(second, nonce="different")

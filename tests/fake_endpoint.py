@@ -472,7 +472,7 @@ class FakeEndpoint:
         # the normal response path still performs truncation and usage counting.
         label = re.search(r"The box label is\s*([A-Z0-9]+)", prompt)
         if (label and answer == label.group(1)
-                and "then continue a numbered list from 1 to 1000000" in prompt):
+                and "then write every whole number from 1 to 10000" in prompt):
             return " ".join([answer, *(str(number) for number in range(1, budget + 1))])
         return answer
 

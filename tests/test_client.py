@@ -350,7 +350,8 @@ async def test_stream_metadata_and_terminal_sentinel_compatibility(monkeypatch, 
 
 
 @pytest.mark.parametrize("stream", [False, True])
-async def test_load_retains_structured_refusal_as_a_scored_response(monkeypatch, stream):
+@pytest.mark.parametrize("check_ids", [["load"], ["correctness"]])
+async def test_load_retains_structured_refusal_as_a_scored_response(monkeypatch, stream, check_ids):
     from giraffe.fixtures import score_response
 
     refusal = "Declined by the model."
@@ -365,12 +366,13 @@ async def test_load_retains_structured_refusal_as_a_scored_response(monkeypatch,
         client, _, _ = setup_client(monkeypatch, stream=False, body={
             "choices": [{"message": {"content": None, "refusal": refusal}, "finish_reason": "stop"}],
         })
-    request = spec(scorer="label", expected="K7P4").model_copy(update={"check_ids": ["load"]})
+    request = spec(scorer="label", expected="K7P4").model_copy(update={"check_ids": check_ids})
     async with client:
         response = score_response(request, await client.execute(request))
 
     assert response.valid and response.status == "completed"
     assert response.output == refusal
+    assert response.refused is True
     assert response.score is False
     assert response.score_message == "Model refused the request."
 

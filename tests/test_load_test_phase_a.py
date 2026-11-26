@@ -569,6 +569,7 @@ def test_load_correctness_reports_explicit_refusals(answer, refused):
         update={
             "output": answer,
             "score": False,
+            "refused": bool(refused),
             "load_point": {"shape": "short_short", "point_id": point["id"]},
         }
     )
