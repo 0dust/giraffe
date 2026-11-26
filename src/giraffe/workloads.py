@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import random
 import time
 import uuid
 from collections import Counter
-from pathlib import Path
 
 from giraffe.fixtures import final_answer, reasoning_budget
 from giraffe.logprob_workload import corpus_width, refill, sample_count
@@ -31,8 +29,6 @@ WORKLOAD_CHECKS = {
 }
 
 
-# Capture the loaded generator's identity, including deterministic fixture construction.
-FIXTURE_SOURCE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
 
 def spec(prompt, scenario, check, *, expected=None, max_tokens=24,

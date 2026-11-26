@@ -162,8 +162,8 @@ async def test_full_runner_keeps_policy_separate_and_preserves_exports(monkeypat
     ("old_baseline", "inconclusive"),
     ("previous_denial_rules", "inconclusive"),
     ("previous_usage_rules", "inconclusive"),
-    ("legacy_source", "pass"),
-    ("changed_source", "inconclusive"),
+    ("missing_version", "inconclusive"),
+    ("changed_version", "inconclusive"),
     ("changed_endpoint", "inconclusive"),
     ("changed_proxy", "inconclusive"),
     ("irrelevant_fixture_change", "pass"),
@@ -197,10 +197,10 @@ async def test_baseline_compares_qualified_access_cases(monkeypatch, mode, expec
     elif mode == "previous_usage_rules":
         check = next(check for check in baseline.checks if check.id == "gateway_access")
         check.metrics["gateway_access"]["evidence_version"] = 3
-    elif mode == "legacy_source":
-        del baseline.manifest["gateway_access_source_sha256"]
-    elif mode == "changed_source":
-        baseline.manifest["gateway_access_source_sha256"] = "different-source"
+    elif mode == "missing_version":
+        del baseline.manifest["gateway_access_workload_version"]
+    elif mode == "changed_version":
+        baseline.manifest["gateway_access_workload_version"] = 2
     elif mode == "changed_endpoint":
         baseline.manifest["config"]["targets"][0]["url"] = "http://another-proxy/v1"
     elif mode == "changed_proxy":
@@ -225,8 +225,8 @@ async def test_baseline_compares_qualified_access_cases(monkeypatch, mode, expec
     if mode in {"old_baseline", "previous_denial_rules", "previous_usage_rules"}:
         assert all(row["status"] == "inconclusive" for row in rows.values())
         assert all("credential evidence is missing" in row["reason"] for row in rows.values())
-    if mode == "changed_source":
-        assert all(row["status"] == "inconclusive" and "source identity" in row["reason"] for row in rows.values())
+    if mode in {"missing_version", "changed_version"}:
+        assert all(row["status"] == "inconclusive" and "workload version" in row["reason"] for row in rows.values())
     if mode == "unexpected_access":
         failure = next(check for check in compared.checks if check.id == "baseline")
         assert failure.evidence_ids == rows["invalid"]["evidence_ids"]

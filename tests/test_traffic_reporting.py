@@ -46,7 +46,7 @@ def traffic_report(run_id="current", *, high_failure=None):
     return RunReport(
         run_id=run_id, suite_version="0.2.0", started_at="2026-10-09T00:00:00Z",
         finished_at="2026-10-09T00:00:10Z", overall="fail" if high_failure else "pass",
-        manifest={"config": config.model_dump(), "fixture_pack": {"version": "0.2.0"},
+        manifest={"config": config.model_dump(), "fixture_pack": {"version": "0.2.0", "workload_fixture_sha256": "same-traffic-workload"},
                   "run_location": {"hostname": "test"},
                   "load_shape": {"arrival_rates_rps": [1, 4], "arrival": "steady"},
                   "effective_checks": {"capacity": config.effective_check("capacity")},

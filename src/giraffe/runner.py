@@ -53,6 +53,60 @@ class _DispatchRefused(Exception):
     """The scheduled request never entered transport."""
 
 
+def build_workload_identity(config: RunConfig) -> tuple[dict, dict]:
+    """Describe selected request workloads and their shared baseline fingerprint."""
+    from .workload_versions import WORKLOAD_VERSIONS
+    from .workloads import WORKLOAD_CHECKS
+
+    workload_settings = {key: (getattr(config, key).model_dump(mode="json")
+                              if hasattr(getattr(config, key), "model_dump") else getattr(config, key))
+                         for key, checks in WORKLOAD_CHECKS.items()
+                         if checks.intersection(config.checks)}
+    versions = {}
+    if any(workload_settings.values()):
+        versions["generator"] = WORKLOAD_VERSIONS["generator"]
+    workload_identity = {"workload_versions": versions, "settings": workload_settings}
+    if "sessions" in config.checks and config.sessions and config.sessions.sampling:
+        versions["session_sampling"] = WORKLOAD_VERSIONS["session_sampling"]
+    if "multi_user" in config.checks:
+        from .multi_user import WINDOW_POLICY
+
+        versions["multi_user"] = WORKLOAD_VERSIONS["multi_user"]
+        workload_identity["multi_user_window_policy"] = WINDOW_POLICY
+    for name in ("gateway_access", "gateway_policy", "scale_down"):
+        if name in config.checks:
+            versions[name] = WORKLOAD_VERSIONS[name]
+    if "load" in config.checks:
+        versions["load_test"] = WORKLOAD_VERSIONS["load_test"]
+    if "consistency" in config.checks and config.consistency and config.consistency.logprobs:
+        versions["logprob"] = WORKLOAD_VERSIONS["logprob"]
+    if "tools" in config.checks:
+        from .tool_checks import resolved_tool_fixtures, resolved_tool_modes
+
+        workload_identity["resolved_tool_checks"] = {
+            "fixtures": [fixture.model_dump(mode="json") for fixture in resolved_tool_fixtures(config)],
+            "modes": resolved_tool_modes(config),
+            **({"conversations": [fixture.model_dump(mode="json") for fixture in config.tool_checks.conversations]}
+               if config.tool_checks and config.tool_checks.conversations else {}),
+        }
+        if config.tool_checks and config.tool_checks.conversations:
+            versions["tool_conversations"] = WORKLOAD_VERSIONS["tool_conversations"]
+    shared_workload_hash = {}
+    if SHARED_BASELINE_EXCLUDED_WORKLOADS.intersection(workload_settings):
+        shared_settings = {key: value for key, value in workload_settings.items()
+                           if key not in SHARED_BASELINE_EXCLUDED_WORKLOADS}
+        shared_versions = {key: value for key, value in versions.items()
+                           if key not in SHARED_BASELINE_EXCLUDED_WORKLOADS and key != "generator"}
+        if any(shared_settings.values()):
+            shared_versions["generator"] = WORKLOAD_VERSIONS["generator"]
+        shared_workload_hash["shared_workload_fixture_sha256"] = fixture_hash({
+            **workload_identity,
+            "settings": shared_settings,
+            "workload_versions": shared_versions,
+        })
+    return workload_identity, shared_workload_hash
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -3244,66 +3298,13 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
                         "observed_models": sorted({r.observed_model for r in run.records if r.target == t.name and r.observed_model}),
                         "observed_backend_ids": sorted({r.backend_id for r in run.records if r.target == t.name and r.backend_id}),
                         "other_replicas": "unverified"} for t in config.targets]}
-    from .reporting import (_load_test_workload_source_sha256, _multi_user_workload_identity,
-                            connection_summary)
+    from .reporting import connection_summary
     connection_failures = [message for target in config.targets if (message := connection_summary(
         [r for r in run.records if r.target == target.name], target.url))]
     if connection_failures:
         observations["summary"] = "; ".join(connection_failures)
-    from giraffe.workloads import FIXTURE_SOURCE_SHA256, WORKLOAD_CHECKS
     config_values = public_config.model_dump(mode="json")
-    workload_settings = {key: (getattr(config, key).model_dump(mode="json")
-                              if hasattr(getattr(config, key), "model_dump") else getattr(config, key))
-                         for key, checks in WORKLOAD_CHECKS.items()
-                         if checks.intersection(config.checks)}
-    workload_identity = {
-        "generator_source_sha256": FIXTURE_SOURCE_SHA256 if any(workload_settings.values()) else None,
-        "settings": workload_settings,
-    }
-    if "sessions" in config.checks and config.sessions and config.sessions.sampling:
-        from giraffe import session_sampling
-        workload_identity["session_sampling_source_sha256"] = hashlib.sha256(
-            Path(session_sampling.__file__).read_bytes()).hexdigest()
-    if "multi_user" in config.checks:
-        workload_identity.update(_multi_user_workload_identity())
-    if "gateway_access" in config.checks:
-        from giraffe import gateway_access, gateway_json
-        workload_identity["gateway_access_source_sha256"] = hashlib.sha256(b"".join(
-            Path(module.__file__).read_bytes() for module in (gateway_access, gateway_json))).hexdigest()
-    if "gateway_policy" in config.checks:
-        from giraffe import gateway_json, gateway_policy, gateway_response
-        workload_identity["gateway_policy_source_sha256"] = hashlib.sha256(b"".join(
-            Path(module.__file__).read_bytes() for module in (gateway_policy, gateway_response, gateway_json))).hexdigest()
-    if "scale_down" in config.checks:
-        from giraffe import scale_down
-        workload_identity["scale_down_source_sha256"] = hashlib.sha256(Path(scale_down.__file__).read_bytes()).hexdigest()
-    if "load" in config.checks:
-        workload_identity["load_test_source_sha256"] = _load_test_workload_source_sha256()
-    if "consistency" in config.checks and config.consistency and config.consistency.logprobs:
-        from giraffe import logprobs, logprob_workload
-        workload_identity["logprob_source_sha256"] = hashlib.sha256(
-            Path(logprobs.__file__).read_bytes() + Path(logprob_workload.__file__).read_bytes()
-        ).hexdigest()
-    if "tools" in config.checks:
-        from giraffe.tool_checks import resolved_tool_fixtures, resolved_tool_modes
-        from giraffe.tool_conversations import SOURCE_SHA256
-        workload_identity["resolved_tool_checks"] = {
-            "fixtures": [fixture.model_dump(mode="json") for fixture in resolved_tool_fixtures(config)],
-            "modes": resolved_tool_modes(config),
-            **({"conversations": [fixture.model_dump(mode="json") for fixture in config.tool_checks.conversations],
-                "conversation_source_sha256": SOURCE_SHA256}
-               if config.tool_checks and config.tool_checks.conversations else {}),
-        }
-    shared_workload_hash = {}
-    if SHARED_BASELINE_EXCLUDED_WORKLOADS.intersection(workload_settings):
-        shared_settings = {key: value for key, value in workload_settings.items()
-                           if key not in SHARED_BASELINE_EXCLUDED_WORKLOADS}
-        excluded_sources = {f"{key}_source_sha256" for key in SHARED_BASELINE_EXCLUDED_WORKLOADS}
-        shared_workload_hash["shared_workload_fixture_sha256"] = fixture_hash({
-            **{key: value for key, value in workload_identity.items() if key not in excluded_sources},
-            "settings": shared_settings,
-            "generator_source_sha256": FIXTURE_SOURCE_SHA256 if any(shared_settings.values()) else None,
-        })
+    workload_identity, shared_workload_hash = build_workload_identity(config)
     fixture_values = {key: [spec.model_dump() for spec in specs] for key, specs in fixtures.items()}
     # An unused optional field must not invalidate existing baseline fingerprints.
     for specs in fixture_values.values():
@@ -3320,10 +3321,10 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
                 "invocation": {"source": "python_api", "argv": None},
                 "config_migration_notes": list(config._migration_notes),
                 "timing_measurement_version": 3,
-                **({"gateway_access_source_sha256": workload_identity["gateway_access_source_sha256"]}
-                   if "gateway_access_source_sha256" in workload_identity else {}),
-                **({"gateway_policy_source_sha256": workload_identity["gateway_policy_source_sha256"]}
-                   if "gateway_policy_source_sha256" in workload_identity else {}),
+                **({"gateway_access_workload_version": workload_identity["workload_versions"]["gateway_access"]}
+                   if "gateway_access" in workload_identity["workload_versions"] else {}),
+                **({"gateway_policy_workload_version": workload_identity["workload_versions"]["gateway_policy"]}
+                   if "gateway_policy" in workload_identity["workload_versions"] else {}),
                 **({"request_pack": pack_identity(config)} if run.pack_specs else {}),
                 "workload_selection": {key: "selected" if key in public_config.checks else "not selected"
                                        for key in PUBLIC_CHECK_NAMES if key not in CORE_CHECKS},

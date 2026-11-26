@@ -181,17 +181,17 @@ async def test_matching_legacy_policy_summaries_do_not_establish_a_baseline(monk
 
 
 @pytest.mark.usefixtures("local_tokenizer")
-async def test_policy_baseline_attests_source_separately_from_shared_work(monkeypatch):
+async def test_policy_baseline_attests_workload_version_separately_from_shared_work(monkeypatch):
     check, report, _ = await exercise(monkeypatch, full=True)
     assert check.status == "pass"
 
     legacy = report.model_copy(deep=True)
-    legacy.manifest.pop("gateway_policy_source_sha256")
+    legacy.manifest.pop("gateway_policy_workload_version")
     legacy.manifest["fixture_pack"].pop("shared_workload_fixture_sha256")
-    assert compare_baseline(report, legacy).baseline["status"] == "pass"
+    assert compare_baseline(report, legacy).baseline["status"] == "inconclusive"
 
     different = report.model_copy(deep=True)
-    different.manifest["gateway_policy_source_sha256"] = "0" * 64
+    different.manifest["gateway_policy_workload_version"] = 2
     compared = compare_baseline(report, different).baseline
     assert compared["status"] == "inconclusive"
     assert all(row["status"] == "inconclusive" for row in compared["targets"][0]["comparisons"])

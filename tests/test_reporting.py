@@ -23,7 +23,8 @@ def make_report(run_id: str = "current", *, latency: float = 100, count: int = 8
     return RunReport(
         run_id=run_id, started_at="2026-10-04T10:00:00Z", finished_at="2026-10-04T10:00:01Z",
         overall="pass", manifest={"config": config.model_dump(),
-                                  "fixture_pack": {"version": "0.1.0", "custom": None},
+                                  "fixture_pack": {"version": "0.1.0", "custom": None,
+                                                   "workload_fixture_sha256": "same-current-workload"},
                                   "run_location": {"hostname": "laptop", "system": "Darwin"},
                                   "load_shape": {"levels": [1, 2, 4]}},
         checks=[CheckResult(id="correctness", target="local", title="Known-answer correctness",

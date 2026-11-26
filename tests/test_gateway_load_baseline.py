@@ -1,98 +1,16 @@
-"""Optional gateway dispatch preserves shared identities only at attested sources."""
+"""Current saved gateway companion runs preserve workload identity."""
 
 import asyncio
-import hashlib
 import json
-from pathlib import Path
 import re
 
 import httpx
 import pytest
 
-from giraffe import concurrent_load, load_test, runner, traffic, workloads
-from giraffe.deployment import fixture_hash
+from giraffe import runner
 from giraffe.models import RunConfig, RunReport
 from giraffe.reporting import _settings_reasons, compare_baseline, write_report
 from tests.test_load_test_phase_a import config
-
-
-CORE_GENERATOR = "d9a9e921584262148e06b636f0e8f195b7e530fd2a69c5e98f013359cf947ede"
-GATEWAY_GENERATORS = (
-    "7a16b503242045f808ecfdb41df6bc8c507ca68181aaf019f003dc2d4d2ffb72",
-    "8037d490881621f37f1aef446474bc52a1ba276bcfcd174f39a14e37032dc9f0",
-    "60eac0571375a103c1ebe7b23c3107b9814ceb0c002797736c55a6248a168f86",
-    "d72acf540fbf8fbd8c45d3ab76d6041054209bb45913c681df171525f8ddc158",
-    "ffda4bac34b3ab331e55c050a91707b1a0bfa16322347e7109646540e5fc4891",
-    "16c362d1f79e5dd0b3f0601e0100ec9b19d7a512f5cee081af72594a683bf49f",
-    "2d8a82427a1c241c95e2719c8ab307513d970ba7f14c80db77201d85c35a0897",
-    "13a3e111a4f8985fa4dd8f763a093ade7ec118a6272e875b5f8abe0e1f104d94",
-    "67da297a94f8a07f9ab21008c9c6ca87090a7fac3d30e4ff9a543e7491427667",
-    "49dcdfb6b173a93720e4e9e5a9bc54ffcea7580346d2ea0210e600e0779a03e6",
-    "e4ddc7a7e8563f9ab3bba2fc42ad0232ee924c65f67d92dafd89c21025d202d0",
-    "2c5cfa60063bd236302582d25e7fe37e7807b829f487168cd09407d37bd60e6e",
-    # Output-budget changes affect prefixes; dedicated Load requests are unchanged.
-    "a04c62a2e7b10ab0aef201cf5c283fe53df694d247ca5ce35caca1340a83f387",
-)
-CURRENT_LOAD_SOURCE = "ab442c8b54be31143ad52fa20f86cd896d2fcf39da495a80cc48db9bc5cb90ee"
-
-
-@pytest.mark.asyncio
-async def test_completed_load_survives_only_known_gateway_dispatch_changes(monkeypatch, local_tokenizer):
-    cfg = config().model_copy(update={"stream": False})
-    payloads = []
-
-    async def handler(request):
-        if request.method != "POST":
-            return httpx.Response(404)
-        await asyncio.sleep(.005)
-        payloads.append(json.loads(request.content))
-        return httpx.Response(200, json={
-            "choices": [{"message": {"content": "K7P4"}, "finish_reason": "stop"}],
-            "usage": {"prompt_tokens": 128, "completion_tokens": 4}})
-
-    original = httpx.AsyncClient
-    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: original(
-        transport=httpx.MockTransport(handler), **kwargs))
-    current = await runner.run_suite(cfg)
-    assert current.abort_reason is None and not current.limits_reached
-    assert payloads and all(row.status == "completed" for row in current.requests)
-    assert _settings_reasons(current, current) == []
-    source = hashlib.sha256(b"".join(Path(module.__file__).read_bytes()
-                                    for module in (load_test, concurrent_load, traffic))).hexdigest()
-    assert source == CURRENT_LOAD_SOURCE
-    assert workloads.FIXTURE_SOURCE_SHA256 in GATEWAY_GENERATORS
-    identity = {"generator_source_sha256": workloads.FIXTURE_SOURCE_SHA256,
-                "load_test_source_sha256": source,
-                "settings": {"load_test": cfg.load_test.model_dump(mode="json")}}
-    assert fixture_hash(identity) == current.manifest["fixture_pack"]["workload_fixture_sha256"]
-    baseline = current.model_copy(deep=True)
-    baseline.run_id = "core-load"
-    identity["generator_source_sha256"] = CORE_GENERATOR
-    baseline.manifest["fixture_pack"]["workload_fixture_sha256"] = fixture_hash(identity)
-    assert _settings_reasons(current, baseline) == []
-    assert _settings_reasons(baseline, current) == []
-    compared = compare_baseline(current, baseline)
-    assert compared.baseline["targets"][0]["load_test"]["points"]
-
-    for change in ("interim_traffic", "pre_final_admission", "unknown_traffic", "unknown_generator", "settings", "missing_settings"):
-        changed = baseline.model_copy(deep=True)
-        altered = json.loads(json.dumps(identity))
-        if change == "interim_traffic":
-            altered["load_test_source_sha256"] = "113325dd5cffa04626cc7be7ee93bc6e9be67335531288bc329b3542a155c92a"
-        elif change == "pre_final_admission":
-            altered["load_test_source_sha256"] = "b7b9faf687f2e5f96f3642b65e347960860211969d1be2a6e9d9a9144ec4e628"
-        elif change == "unknown_traffic":
-            altered["load_test_source_sha256"] = "unknown"
-        elif change == "unknown_generator":
-            altered["generator_source_sha256"] = "unknown"
-        elif change == "settings":
-            changed.manifest["config"]["load_test"]["profile"]["short"]["input_tokens"] += 1
-            altered["settings"]["load_test"] = changed.manifest["config"]["load_test"]
-        else:
-            del changed.manifest["config"]["load_test"]
-        changed.manifest["fixture_pack"]["workload_fixture_sha256"] = fixture_hash(altered)
-        assert "Fixture pack identity differs." in _settings_reasons(current, changed), change
-        assert "Fixture pack identity differs." in _settings_reasons(changed, current), change
 
 
 @pytest.mark.usefixtures("local_tokenizer")
@@ -174,21 +92,8 @@ async def test_saved_fixed_sessions_baseline_survives_gateway_dispatch(monkeypat
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
     current = await runner.run_suite(cfg)
     assert current.overall == "pass"
-    identity = {"generator_source_sha256": workloads.FIXTURE_SOURCE_SHA256,
-                "settings": {"sessions": cfg.sessions.model_dump(mode="json")}}
-    if "load" in checks:
-        identity["load_test_source_sha256"] = CURRENT_LOAD_SOURCE
-        identity["settings"]["load_test"] = cfg.load_test.model_dump(mode="json")
-    shared = "gateway_attribution" in checks
-    fingerprint_key = "shared_workload_fixture_sha256" if shared else "workload_fixture_sha256"
-    assert fixture_hash(identity) == current.manifest["fixture_pack"][fingerprint_key]
-    identity["generator_source_sha256"] = GATEWAY_GENERATORS[0] if shared else CORE_GENERATOR
     baseline = current.model_copy(deep=True)
-    baseline.run_id = "older-ordinary-workload"
-    baseline.manifest["fixture_pack"][fingerprint_key] = fixture_hash(identity)
-    if shared:
-        baseline.manifest["fixture_pack"]["workload_fixture_sha256"] = fixture_hash({
-            **identity, "settings": {**identity["settings"], "gateway_attribution": None}})
+    baseline.run_id = "saved-current-workload"
     saved, _ = write_report(baseline, tmp_path)
     baseline = RunReport.model_validate_json(saved.read_bytes())
     for report, previous in ((current, baseline), (baseline, current)):
@@ -197,12 +102,7 @@ async def test_saved_fixed_sessions_baseline_survives_gateway_dispatch(monkeypat
         assert result["status"] == "pass"
         assert {row["check"] for row in result["comparisons"]} >= set(checks) - {"gateway_attribution"}
 
-    for change in (
-        {"load_test_source_sha256": "113325dd5cffa04626cc7be7ee93bc6e9be67335531288bc329b3542a155c92a"},
-        {"load_test_source_sha256": "unknown"},
-        {"generator_source_sha256": "unknown"},
-        {"session_sampling_source_sha256": "unknown"},
-    ):
-        unverified = baseline.model_copy(deep=True)
-        unverified.manifest["fixture_pack"][fingerprint_key] = fixture_hash({**identity, **change})
-        assert "Fixture pack identity differs." in _settings_reasons(current, unverified)
+    unverified = baseline.model_copy(deep=True)
+    unverified.manifest["fixture_pack"]["workload_fixture_sha256"] = "unknown"
+    unverified.manifest["fixture_pack"]["shared_workload_fixture_sha256"] = "unknown"
+    assert "Fixture pack identity differs." in _settings_reasons(current, unverified)

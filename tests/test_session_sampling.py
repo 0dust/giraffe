@@ -1,9 +1,7 @@
 """Sampled session traffic through the real runner and local HTTP endpoint."""
 
 import asyncio
-import hashlib
 import json
-from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -235,13 +233,12 @@ async def test_sampled_live_history_lengths_pauses_planning_and_report_roundtrip
     measured = check(report, "sessions").metrics["conversation_performance"]
     assert measured["planned_turns"] == expected_count
     assert measured["completed_conversations"] == 4
-    from giraffe import session_sampling, workloads
+    from giraffe.workload_versions import WORKLOAD_VERSIONS
     from giraffe.deployment import fixture_hash
 
     assert report.manifest["fixture_pack"]["workload_fixture_sha256"] == fixture_hash({
-        "generator_source_sha256": workloads.FIXTURE_SOURCE_SHA256,
+        "workload_versions": {name: WORKLOAD_VERSIONS[name] for name in ("generator", "session_sampling")},
         "settings": {"sessions": value.sessions.model_dump(mode="json")},
-        "session_sampling_source_sha256": hashlib.sha256(Path(session_sampling.__file__).read_bytes()).hexdigest(),
     })
     write_report(report, tmp_path, html=True)
     saved = json.loads((tmp_path / "report.json").read_text())

@@ -1,32 +1,16 @@
-"""Compare an actual pre-output-budget Load report with current generated work.
-
-Regenerate the baseline using Python 3.12 and the dev dependencies:
-    mkdir -p /tmp/issue78-base
-    git archive b58fe37bf28338feb25df0a04fc5fb6c968eefe4 src | tar -x -C /tmp/issue78-base
-    PYTHONPATH=/tmp/issue78-base/src:. python -m tests.test_issue78_load_baseline \
-        tests/fixtures/issue78-load-baseline.json.gz
-
-The saved report is complete, including all 40 requests. Only run_location is
-normalized to identify the controlled mock environment rather than the host.
-Gzip has a fixed mtime; measured request timestamps and durations remain intact.
-"""
+"""Generated Load only ignores unused built-in fixtures for exact workloads."""
 
 import asyncio
-import gzip
 import json
-from pathlib import Path
 
 import httpx
 import pytest
 
 from giraffe import runner
 from giraffe.models import RunConfig, RunReport
-from giraffe.reporting import _same_load_workload, _settings_reasons, compare_baseline
+from giraffe.deployment import fixture_hash
+from giraffe.reporting import _settings_reasons, compare_baseline
 from tests.virtual_clock import run_virtual
-
-
-BASE_REPORT = Path(__file__).parent / "fixtures" / "issue78-load-baseline.json.gz"
-BASE_COMMIT = "b58fe37bf28338feb25df0a04fc5fb6c968eefe4"
 
 
 async def generate_load_report(monkeypatch, *, restart=False):
@@ -80,31 +64,23 @@ async def generate_load_report(monkeypatch, *, restart=False):
 
 
 @pytest.mark.usefixtures("local_tokenizer")
-def test_generated_load_compares_with_saved_pre_output_budget_report(monkeypatch, tmp_path):
+def test_generated_load_ignores_unused_builtin_fixtures(monkeypatch, tmp_path):
     current = run_virtual(monkeypatch, generate_load_report(monkeypatch))
     saved = tmp_path / "report.json"
     saved.write_text(current.model_dump_json())
-    current = RunReport.model_validate_json(saved.read_text())
-    baseline = RunReport.model_validate_json(gzip.decompress(BASE_REPORT.read_bytes()))
-    assert baseline.manifest["test_fixture_provenance"]["commit"] == BASE_COMMIT
-    assert len(baseline.requests) == 40
-    assert {row.requested_max_tokens for row in baseline.requests} == {8}
-    assert all(row.scenario.startswith("load_") for row in baseline.requests)
-    assert current.manifest["fixture_pack"]["builtin_sha256"] != baseline.manifest["fixture_pack"]["builtin_sha256"]
-    assert _same_load_workload(current.manifest, baseline.manifest)
+    baseline = RunReport.model_validate_json(saved.read_text())
+    baseline.manifest["fixture_pack"]["builtin_sha256"] = "different-builtins"
     assert _settings_reasons(current, baseline) == []
     assert _settings_reasons(baseline, current) == []
-    compared = compare_baseline(current, baseline)
-    assert compared.baseline["targets"][0]["reasons"] == []
-    assert compared.baseline["targets"][0]["load_test"]["points"]
+    assert compare_baseline(current, baseline).baseline["targets"][0]["load_test"]["points"]
 
-    # The unused built-in digest exception requires exact Load source/settings
-    # attestation and no companion check that might consume those fixtures.
-    for change in ("profile", "unknown_source", "missing_identity", "mixed_builtin"):
+    for change in ("profile", "unknown_fingerprint", "missing_identity", "mixed_builtin"):
         changed = baseline.model_copy(deep=True)
         if change == "profile":
             changed.manifest["config"]["load_test"]["profile"]["short"]["output_tokens"] += 1
-        elif change == "unknown_source":
+            identity, _ = runner.build_workload_identity(RunConfig.model_validate(changed.manifest["config"]))
+            changed.manifest["fixture_pack"]["workload_fixture_sha256"] = fixture_hash(identity)
+        elif change == "unknown_fingerprint":
             changed.manifest["fixture_pack"]["workload_fixture_sha256"] = "unknown"
         elif change == "missing_identity":
             del changed.manifest["fixture_pack"]["workload_fixture_sha256"]
@@ -114,52 +90,9 @@ def test_generated_load_compares_with_saved_pre_output_budget_report(monkeypatch
         assert "Fixture pack identity differs." in _settings_reasons(changed, current), change
 
 
-def test_output_budgets_generator_constant_is_the_current_workloads_source_hash():
-    import hashlib
-
-    from giraffe import workloads
-    from giraffe.reporting import _OUTPUT_BUDGETS_GENERATOR_SOURCE
-
-    assert _OUTPUT_BUDGETS_GENERATOR_SOURCE == hashlib.sha256(Path(workloads.__file__).read_bytes()).hexdigest()
-    # The predecessor generator (BASE_COMMIT) hashed differently; see the generation script below.
-    assert _OUTPUT_BUDGETS_GENERATOR_SOURCE != "2c5cfa60063bd236302582d25e7fe37e7807b829f487168cd09407d37bd60e6e"
-
-
-@pytest.mark.usefixtures("local_tokenizer")
-def test_load_run_from_another_generator_source_is_not_comparable(monkeypatch):
-    current = run_virtual(monkeypatch, generate_load_report(monkeypatch))
-    baseline = RunReport.model_validate_json(gzip.decompress(BASE_REPORT.read_bytes()))
-    assert _same_load_workload(current.manifest, baseline.manifest)
-    current.manifest["fixture_pack"]["workload_fixture_sha256"] = "0" * 64  # an unattested generator hash
-    assert not _same_load_workload(current.manifest, baseline.manifest)
-    assert "Fixture pack identity differs." in _settings_reasons(current, baseline)
-
-
 @pytest.mark.usefixtures("local_tokenizer")
 def test_load_restart_still_requires_matching_readiness_fixture(monkeypatch):
     current = run_virtual(monkeypatch, generate_load_report(monkeypatch, restart=True))
     baseline = current.model_copy(deep=True)
-    saved_base = RunReport.model_validate_json(gzip.decompress(BASE_REPORT.read_bytes()))
-    baseline.manifest["fixture_pack"]["builtin_sha256"] = saved_base.manifest["fixture_pack"]["builtin_sha256"]
-    assert _same_load_workload(current.manifest, baseline.manifest)
+    baseline.manifest["fixture_pack"]["builtin_sha256"] = "different-readiness-fixture"
     assert "Fixture pack identity differs." in _settings_reasons(current, baseline)
-    assert "Fixture pack identity differs." in _settings_reasons(baseline, current)
-
-
-if __name__ == "__main__":
-    import sys
-    import tempfile
-
-    from giraffe import workloads
-    from tests.conftest import local_tokenizer
-
-    # Fail rather than label a report from another generator as the base.
-    assert workloads.FIXTURE_SOURCE_SHA256 == "2c5cfa60063bd236302582d25e7fe37e7807b829f487168cd09407d37bd60e6e"
-    with tempfile.TemporaryDirectory() as temporary, pytest.MonkeyPatch.context() as patch:
-        local_tokenizer.__wrapped__(patch, Path(temporary))
-        baseline = asyncio.run(generate_load_report(patch))
-    baseline.manifest["test_fixture_provenance"] = {
-        "commit": BASE_COMMIT, "transport": "httpx.MockTransport",
-        "tokenizer": "tests.conftest.local_tokenizer"}
-    encoded = (json.dumps(baseline.model_dump(mode="json", exclude_defaults=True), indent=2) + "\n").encode()
-    Path(sys.argv[1]).write_bytes(gzip.compress(encoded, mtime=0))
