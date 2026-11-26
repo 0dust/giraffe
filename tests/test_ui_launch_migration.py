@@ -102,7 +102,9 @@ def test_cli_preview_prints_removal_as_warning(tmp_path, capsys, command):
     capsys.readouterr()
     assert main([command, '--config', str(source), '--output-format', 'json']) == 0
     captured = capsys.readouterr()
-    assert json.loads(captured.out)['migration_notes'] == expected
+    result = json.loads(captured.out)
+    assert result['migration_notes'] == expected
+    assert result['migration_limit_notes'] == expected[:1]
     stderr = captured.err
     assert 'Warning: ' + REMOVED_LOAD in stderr
     assert 'Migration: ' + REMOVED_LOAD not in stderr

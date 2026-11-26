@@ -805,7 +805,7 @@ def _main(argv: list[str] | None = None) -> int:
                 raise ValueError(plan["errors"][0]["msg"])
             warnings = plan["warnings"]
             if json_output:
-                emit("success", 0, config=config.model_dump(mode="json"), migration_notes=config._migration_notes, migration_warnings=config._migration_warnings, warnings=warnings)
+                emit("success", 0, config=config.model_dump(mode="json"), migration_notes=config._migration_notes, migration_limit_notes=migration_limit_notes(config._migration_notes), migration_warnings=config._migration_warnings, warnings=warnings)
             else:
                 print("Configuration is valid. No traffic was sent.")
                 print("Targets: " + ", ".join(target.name for target in config.targets))
@@ -835,7 +835,7 @@ def _main(argv: list[str] | None = None) -> int:
             plan["warnings"].extend(item["msg"] for item in guard["warnings"])
             if args.output_format == "json":
                 print(json.dumps({"config": config.model_dump(mode="json"),
-                                  "migration_notes": config._migration_notes, "migration_warnings": config._migration_warnings, "request_pack_preview": preview, "request_plan": plan}, allow_nan=False))
+                                  "migration_notes": config._migration_notes, "migration_limit_notes": migration_limit_notes(config._migration_notes), "migration_warnings": config._migration_warnings, "request_pack_preview": preview, "request_plan": plan}, allow_nan=False))
             else:
                 print("Configuration preview. No traffic was sent.")
                 print("Targets: " + ", ".join(target.name for target in config.targets))

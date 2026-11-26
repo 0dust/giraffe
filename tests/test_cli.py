@@ -453,7 +453,7 @@ def test_preview_stdin_allows_blank_model_without_side_effects(monkeypatch, caps
                     resource_issues=[dict(issue, blocking=True) for issue in guard["errors"]]
                     + [dict(issue, blocking=False) for issue in guard["warnings"]])
     assert json.loads(capsys.readouterr().out) == {
-        "config": draft.model_dump(mode="json"), "migration_notes": [], "migration_warnings": [], "request_pack_preview": pack_preview(draft),
+        "config": draft.model_dump(mode="json"), "migration_notes": [], "migration_limit_notes": [], "migration_warnings": [], "request_pack_preview": pack_preview(draft),
         "request_plan": expected}
     assert not list(tmp_path.iterdir())
 
