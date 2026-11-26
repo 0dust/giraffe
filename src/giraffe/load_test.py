@@ -362,7 +362,8 @@ def scheduled_count(settings, point):
     return n
 
 
-def load_time_plan(settings):
+def load_time_plan(settings, *, predicted_extensions=None):
+    predicted_extensions = predicted_extensions or {}
     own = dict(settings_sets(settings))
     points = test_points(settings)
     expected = sum(scheduled_count(own[p["source"]], p) or 0 for p in points)
@@ -376,6 +377,7 @@ def load_time_plan(settings):
     windows = sum(p["windows"] for p in points)
     sending = sum(p["windows"] * own[p["source"]].schedule.duration_seconds for p in points)
     allowances = sum(p["windows"] * own[p["source"]].request_timeout_seconds for p in points)
+    extensions = sum(predicted_extensions.get(p["id"], 0) for p in points)
     rows = {}
     for kind in LOAD_TITLES:
         selected = [p for p in points if p["type"] == kind]
@@ -386,6 +388,9 @@ def load_time_plan(settings):
                 "windows": sum(p["windows"] for p in selected),
                 "configured_load_seconds": sum(
                     p["windows"] * own[p["source"]].schedule.duration_seconds for p in selected
+                ),
+                "sending_extension_seconds": sum(
+                    predicted_extensions.get(p["id"], 0) for p in selected
                 ),
                 "finish_allowance_seconds": sum(
                     p["windows"] * own[p["source"]].request_timeout_seconds for p in selected
@@ -423,7 +428,15 @@ def load_time_plan(settings):
         "windows": windows,
         "configured_load_seconds": sending,
         "finish_allowance_seconds": allowances,
-        "time_with_allowances_seconds": sending + allowances,
+        "upper_allowance_label": (
+            "Upper allowance before any window extension"
+            if any(p["pattern"] == "concurrent" and p["type"] not in {"mixed", "interference"}
+                   and own[p["source"]].pass_criteria.min_valid_responses > p["level"]
+                   and not predicted_extensions.get(p["id"], 0) for p in points)
+            else "Upper allowance including request deadlines"
+        ),
+        "sending_extension_seconds": extensions,
+        "time_with_allowances_seconds": sending + extensions + allowances,
         "expected_scheduled_requests": expected,
         "known_scheduled_requests": sum(known(p) for p in points),
         "unknown_requests": unknown,

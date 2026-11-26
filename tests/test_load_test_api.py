@@ -165,7 +165,7 @@ async def test_preview_warns_when_a_concurrent_condition_is_likely_to_miss_its_s
                                    "field": "load_test.schedule.duration_seconds", "value": required}]
 
 
-async def shortfall_preview(tmp_path, payload, samples):
+async def shortfall_preview(tmp_path, payload, samples, *, full_plan=False):
     config = RunConfig.model_validate(payload)
     measurements = []
     for shape, concurrency, p50, p90 in samples:
@@ -193,9 +193,9 @@ async def shortfall_preview(tmp_path, payload, samples):
     assert response.status_code == 200, response.text
     plan = response.json()['request_plan']
     warnings = [row for row in plan['load_warnings']
-                if row.get('kind') in {'load_sample_shortfall', 'load_timeout_shortfall'}]
+                if row.get('kind') in {'load_sample_shortfall', 'load_timeout_shortfall', 'load_timeout_risk'}]
     assert all(row['msg'] in plan['warnings'] for row in warnings)
-    return warnings
+    return plan if full_plan else warnings
 
 
 @pytest.mark.parametrize('p50,p90', [(4000, 6400), (6400, None), (6400, 0), (6400, -1)])
@@ -213,22 +213,91 @@ async def test_shortfall_uses_p90_with_p50_fallback(tmp_path, p50, p90):
     }]
 
 
+async def test_load_upper_allowance_adds_only_predicted_extension(tmp_path):
+    payload = values()
+    load = payload['load_test']
+    load['schedule']['duration_seconds'] = 20
+    load['request_timeout_seconds'] = 7
+    load['pass_criteria']['min_valid_responses'] = 5
+    plan = await shortfall_preview(tmp_path, payload, [('short_short', 1, 6400, 6400)], full_plan=True)
+    assert plan['load_test']['time_with_allowances_seconds'] == 33
+    assert plan['load_test']['sending_extension_seconds'] == 6
+    assert plan['load_test']['upper_allowance_label'] == 'Upper allowance including request deadlines'
+    assert plan['check_time_summaries'][0]['total_seconds'] == 33
+
+
+async def test_load_upper_allowance_labels_unpredicted_points_even_with_other_predictions(tmp_path):
+    payload = values()
+    load = payload['load_test']
+    load['schedule']['duration_seconds'] = 20
+    load['request_timeout_seconds'] = 7
+    load['pass_criteria']['min_valid_responses'] = 5
+    load['patterns']['concurrent']['levels'] = [1, 2]
+    plan = await shortfall_preview(tmp_path, payload, [('short_short', 1, 6400, 6400)], full_plan=True)
+    assert plan['load_test']['time_with_allowances_seconds'] == 60
+    assert plan['load_test']['upper_allowance_label'] == 'Upper allowance before any window extension'
+
+
 @pytest.mark.parametrize('timeout', [5, 6.4])
-async def test_shortfall_warns_about_timeout_instead_of_duration(tmp_path, timeout):
+@pytest.mark.parametrize('p50', [4000, 6400])
+async def test_timeout_warning_distinguishes_typical_latency_from_tail(tmp_path, timeout, p50):
     payload = values()
     payload['load_test']['schedule']['duration_seconds'] = 30
+    payload['load_test']['pass_criteria']['min_valid_responses'] = 5
     payload['load_test']['request_timeout_seconds'] = timeout
-    warning, = await shortfall_preview(tmp_path, payload, [('short_short', 1, 4000, 6400)])
-    assert warning['kind'] == 'load_timeout_shortfall'
+    warning, = await shortfall_preview(tmp_path, payload, [('short_short', 1, p50, 6400)])
     assert warning['fields'] == ['load_test.request_timeout_seconds']
-    assert warning['msg'] == (
-        f'Short input → Short output, 1 at once: recent responses take about 6.4 s, longer than the '
-        f'{timeout:g} s request timeout, so they will time out and none will count. '
-        'Raise the request timeout to at least 8 s.'
-    )
+    if p50 == 4000:
+        assert warning['kind'] == 'load_timeout_risk'
+        assert warning['msg'] == (
+            'Short input → Short output, 1 at once: at least 1 in 10 recent responses took longer than the '
+            f'{timeout:g} s request timeout (90th percentile about 6.4 s), so some may time out and the test '
+            'may miss its 5 required valid responses. Raise the request timeout to at least 8 s.'
+        )
+    else:
+        assert warning['kind'] == 'load_timeout_shortfall'
+        assert warning['msg'] == (
+            'Short input → Short output, 1 at once: recent responses typically take about 6.4 s, longer than the '
+            f'{timeout:g} s request timeout, so most will time out. Raise the request timeout to at least 8 s.'
+        )
+    assert 'none will count' not in warning['msg']
     assert warning['actions'] == [{'label': 'Set timeout to 8 s', 'field': 'load_test.request_timeout_seconds', 'value': 8}]
-    assert warning['values']['estimated_requests'] == 0
-    assert warning['values']['min_valid_responses'] == 1
+    assert 'estimated_requests' not in warning['values']
+    assert all('estimated_requests' not in row for row in warning['values']['conditions'])
+    assert warning['values']['min_valid_responses'] == 5
+
+
+async def test_timeout_risk_also_warns_when_window_is_too_short(tmp_path):
+    payload = values()
+    payload['load_test']['schedule']['duration_seconds'] = 20
+    payload['load_test']['pass_criteria']['min_valid_responses'] = 5
+    payload['load_test']['request_timeout_seconds'] = 5
+    risk, shortfall = await shortfall_preview(tmp_path, payload, [('short_short', 1, 4000, 6400)])
+    assert risk['kind'] == 'load_timeout_risk'
+    assert shortfall['kind'] == 'load_sample_shortfall'
+    assert shortfall['values']['estimated_requests'] == 4
+    assert shortfall['actions'][0]['value'] == 26
+
+
+async def test_timeout_risks_group_per_timeout_field(tmp_path):
+    payload = values()
+    load = payload['load_test']
+    load['schedule']['duration_seconds'] = 30
+    load['pass_criteria']['min_valid_responses'] = 5
+    load['request_timeout_seconds'] = 5
+    load['workloads']['combinations']['selected'] = ['short_short', 'short_long']
+    warning, = await shortfall_preview(tmp_path, payload, [
+        ('short_short', 1, 4000, 6400), ('short_long', 1, 4500, 7100),
+    ])
+    assert warning['kind'] == 'load_timeout_risk'
+    assert warning['msg'] == (
+        '2 conditions had at least 1 in 10 recent responses longer than the 5 s request timeout, '
+        'so some may time out and miss the 5 required valid responses: '
+        'Short input → Short output, 1 at once (90th percentile about 6.4 s); '
+        'Short input → Long output, 1 at once (90th percentile about 7.1 s). '
+        'Raise the request timeout to at least 9 s.'
+    )
+    assert 'estimated_requests' not in warning['values']
 
 
 @pytest.mark.parametrize('targets', [1, 2])
@@ -266,13 +335,13 @@ async def test_timeout_shortfalls_group_per_timeout_field(tmp_path):
     assert warning['kind'] == 'load_timeout_shortfall'
     assert len(warning['values']['conditions']) == 2
     assert warning['msg'] == (
-        '2 conditions have recent responses longer than the 5 s request timeout, '
-        'so they will time out and none will count: '
+        '2 conditions typically take longer than the 5 s request timeout, '
+        'so most responses will time out: '
         'Short input → Short output, 1 at once (about 6.4 s); '
         'Short input → Long output, 1 at once (about 7.1 s). '
         'Raise the request timeout to at least 9 s.'
     )
-    assert warning['msg'].count('none will count') == 1
+    assert 'estimated_requests' not in warning['values']
     assert warning['actions'] == [{
         'label': 'Set timeout to 9 s', 'field': 'load_test.request_timeout_seconds', 'value': 9,
     }]

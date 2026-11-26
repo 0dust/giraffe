@@ -104,3 +104,31 @@ def test_extension_reason_renders_in_condition_dialog_and_point():
  assert(html.includes(reason));
 })()
 ''', dom=True)
+
+
+@pytest.mark.parametrize('predicted', [False, True])
+def test_upper_allowance_renders_extension_label_and_help(predicted):
+    config = RunConfig.model_validate(values())
+    config.load_test.schedule.duration_seconds = 20
+    config.load_test.request_timeout_seconds = 7
+    config.load_test.pass_criteria.min_valid_responses = 5
+    observations = None
+    if predicted:
+        from giraffe.latency import input_bucket
+        observations = {'local': [{
+            'family': 'load.combinations.concurrent', 'concurrency': 1,
+            'stream': config.stream, 'output_cap': config.load_test.profile.short.output_tokens,
+            'input_bucket': input_bucket(config.load_test.profile.short.input_tokens * 4),
+            'n': 4, 'p50_ms': 6400, 'p90_ms': 6400,
+        }]}
+    plan = request_plan(config, observations=observations)
+    label = ('Upper allowance including request deadlines' if predicted
+             else 'Upper allowance before any window extension')
+    assert plan['load_test']['time_with_allowances_seconds'] == (33 if predicted else 27)
+    browser_logic('const plan=' + json.dumps(plan) + ',label=' + json.dumps(label) + r''';
+const html=renderLoadPlan(config,plan);
+assert(html.includes(label));
+assert(html.includes(loadElapsed(plan.load_test.time_with_allowances_seconds)));
+assert(html.includes('If fewer than the required valid responses start in a window, sending continues until they have, up to one request timeout per remaining round and within Maximum duration.'));
+assert(html.includes('id="field-load_upper_allowance-info"'));
+''', config)

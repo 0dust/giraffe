@@ -163,6 +163,40 @@ def test_worked_burst_plans(constant, poisson, expected, tests):
             assert 650 < len(offers) < 870
 
 
+@pytest.mark.parametrize("level,minimum,unpredicted", [(1, 5, True), (5, 5, False), (6, 5, False), (2, 5, True)])
+def test_load_upper_allowance_without_history_keeps_configured_bound(level, minimum, unpredicted):
+    c = config()
+    c.load_test.schedule.duration_seconds = 20
+    c.load_test.request_timeout_seconds = 7
+    c.load_test.patterns.concurrent.levels = [level]
+    c.load_test.pass_criteria.min_valid_responses = minimum
+    plan = load_time_plan(c.load_test)
+    assert plan["configured_load_seconds"] == 20
+    assert plan["finish_allowance_seconds"] == 7
+    assert plan["time_with_allowances_seconds"] == 27
+    assert plan["workloads"]["combinations"]["sending_extension_seconds"] == 0
+    assert plan["upper_allowance_label"] == (
+        "Upper allowance before any window extension" if unpredicted
+        else "Upper allowance including request deadlines"
+    )
+    summary, = request_plan(c)["check_time_summaries"]
+    assert summary["total_seconds"] == 27
+
+
+@pytest.mark.parametrize("kind", ["mixed", "interference"])
+def test_load_upper_allowance_does_not_extend_mixed_or_interference(kind):
+    c = config()
+    c.load_test.schedule.duration_seconds = 20
+    c.load_test.request_timeout_seconds = 7
+    c.load_test.pass_criteria.min_valid_responses = 5
+    c.load_test.workloads.combinations.enabled = False
+    getattr(c.load_test.workloads, kind).enabled = True
+    c.load_test.patterns.concurrent.levels = [2]
+    plan = load_time_plan(c.load_test)
+    assert plan["time_with_allowances_seconds"] == plan["windows"] * 27
+    assert plan["upper_allowance_label"] == "Upper allowance including request deadlines"
+
+
 def test_true_poisson_counts_and_seed_reproducibility():
     c = burst_config(poisson=True)
     p = load_points(c.load_test)[0]
