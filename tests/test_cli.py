@@ -453,7 +453,7 @@ def test_preview_stdin_allows_blank_model_without_side_effects(monkeypatch, caps
                     resource_issues=[dict(issue, blocking=True) for issue in guard["errors"]]
                     + [dict(issue, blocking=False) for issue in guard["warnings"]])
     assert json.loads(capsys.readouterr().out) == {
-        "config": draft.model_dump(mode="json"), "migration_notes": [], "request_pack_preview": pack_preview(draft),
+        "config": draft.model_dump(mode="json"), "migration_notes": [], "migration_limit_notes": [], "migration_warnings": [], "request_pack_preview": pack_preview(draft),
         "request_plan": expected}
     assert not list(tmp_path.iterdir())
 
@@ -570,3 +570,44 @@ def test_cli_rejects_credential_query_urls_without_echoing_values(suffix, capsys
     assert main(["run", "--url", "http://server/v1" + suffix, "--model", "tiny"]) == 4
     captured = capsys.readouterr()
     assert "PRIVATE_SECRET" not in captured.out + captured.err
+
+
+def test_current_load_config_has_no_legacy_notes_in_api_or_preview(tmp_path, capsys):
+    from giraffe.cli import migrated_configuration
+    from giraffe.models import RunConfig, migrate_run_limits
+    values = {
+        "targets": [{"name": "one", "url": "http://local", "model": "m"}],
+        "checks": ["load"],
+        "load_test": {"workloads": {"combinations": {"selected": ["short_long"]}},
+                      "patterns": {"concurrent": {"levels": [1]}},
+                      "schedule": {"duration_seconds": 20}},
+    }
+    assert migrate_run_limits(values) == (values, [])
+    assert RunConfig.model_validate(values)._migration_notes == []
+    config = migrated_configuration(values)
+    assert config._migration_notes == []
+    assert config.max_requests is config.max_duration_seconds is config.concurrency is None
+    path = tmp_path / "current-load.json"
+    path.write_text(json.dumps(values))
+    capsys.readouterr()
+    assert main(["preview", "--config", str(path), "--output-format", "text"]) == 0
+    captured = capsys.readouterr()
+    assert "Migration:" not in captured.err + captured.out
+    assert "Earlier Giraffe versions" not in captured.err + captured.out
+
+
+def test_legacy_fixture_preview_prints_one_combined_limit_note(tmp_path, capsys):
+    import yaml
+    from giraffe.models import migrate_run_limits
+    values = yaml.safe_load(Path("tests/fixtures/legacy-run-limits-overlap.yaml").read_text())
+    _, notes = migrate_run_limits(values)
+    expected = ("Earlier Giraffe versions capped runs at 300 requests and 300 s of traffic by default. "
+                "This configuration sets none of these limits, so they no longer apply. "
+                "Use Edit limits to keep them.")
+    assert [note for note in notes if note.startswith("Earlier Giraffe versions")] == [expected]
+    path = tmp_path / "legacy.yaml"
+    path.write_text(yaml.safe_dump(values))
+    assert main(["preview", "--config", str(path), "--output-format", "text"]) == 0
+    captured = capsys.readouterr()
+    assert captured.err.count("Migration: Earlier Giraffe versions") == 1
+    assert f"Migration: {expected}" in captured.err

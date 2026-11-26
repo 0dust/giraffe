@@ -43,7 +43,7 @@ if _required_modules_available():
     from giraffe.configuration_errors import configuration_errors
     from giraffe.diagnostics import configure_logging, run_logging
     from giraffe.models import (CATALOGUE_NAMES, CHECK_NAMES, ConfigDraft, RunConfig, RunReport, is_legacy_config,
-                               migrate_concurrent_load, migrate_load_test, migrate_run_limits)
+                               migrate_concurrent_load, migrate_load_test, migrate_run_limits, migration_limit_notes, merge_migration_warnings)
     from giraffe.storage import DEFAULT_LIMITS, Heartbeat, format_size as _disk_size, parse_size
     from giraffe.resources import PhaseSampler, SAMPLING
 else:
@@ -409,21 +409,32 @@ def load_configuration(path: Path) -> dict:
 
 def _migrated_values(values):
     values, limit_notes = migrate_run_limits(values)
-    values, load_notes = migrate_concurrent_load(values)
-    values, combined_notes = migrate_load_test(values)
-    return values, limit_notes + load_notes + combined_notes
+    values, load_notes, warnings = migrate_concurrent_load(values)
+    values, combined_notes, combined_warnings = migrate_load_test(values)
+    return values, limit_notes + load_notes + combined_notes, merge_migration_warnings(warnings, combined_warnings)
 
 
-def _configuration_notes(config, notes):
+def _configuration_notes(config, notes, warnings, *, startup=False, verbose=False, path=None):
     config._migration_notes = list(dict.fromkeys([*notes, *config._migration_notes]))
-    for note in notes:
+    config._migration_warnings = merge_migration_warnings(warnings, config._migration_warnings)
+    for warning in config._migration_warnings:
+        print(f"Warning: {warning['msg']}", file=sys.stderr)
+    visible = migration_limit_notes(config._migration_notes)
+    details = [note for note in config._migration_notes if note not in visible]
+    for note in (visible if startup and not verbose else config._migration_notes):
         print(f"Migration: {note}", file=sys.stderr)
+    if startup and not verbose and details:
+        settings = "setting was" if len(details) == 1 else "settings were"
+        summary = f"Migration: {len(details)} other {settings} converted from an earlier Giraffe version."
+        if path is not None:
+            summary += f" Run giraffe preview --config {path} to list them."
+        print(summary, file=sys.stderr)
     return config
 
 
-def migrated_configuration(values, model=RunConfig):
-    values, notes = _migrated_values(values)
-    return _configuration_notes(model.model_validate(values), notes)
+def migrated_configuration(values, model=RunConfig, **note_options):
+    values, notes, warnings = _migrated_values(values)
+    return _configuration_notes(model.model_validate(values), notes, warnings, **note_options)
 
 
 def configuration(args: argparse.Namespace) -> RunConfig:
@@ -445,7 +456,7 @@ def configuration(args: argparse.Namespace) -> RunConfig:
         # Rebuild inherited legacy parallelism from the overridden limit while
         # preserving settings the saved input explicitly assigned to checks.
         values["concurrency"] = args.concurrency
-    values, notes = _migrated_values(values)
+    values, notes, warnings = _migrated_values(values)
     if values.get("restart_target"):
         if args.command != "cold-start":
             raise ValueError("Restart requires the explicit cold-start --restart TARGET command")
@@ -514,7 +525,8 @@ def configuration(args: argparse.Namespace) -> RunConfig:
         if getattr(args, key, None) is not None:
             values["targets"][0][key] = getattr(args, key)
     args._configuration_input = values
-    return _configuration_notes(RunConfig.model_validate(values), notes)
+    return _configuration_notes(RunConfig.model_validate(values), notes, warnings,
+                                startup=args.command == "run", verbose=getattr(args, "verbose", False), path=args.config)
 
 
 def _discover_model(args: argparse.Namespace, values: dict | None = None, target: dict | None = None) -> str:
@@ -821,7 +833,7 @@ def _main(argv: list[str] | None = None) -> int:
                 raise ValueError(plan["errors"][0]["msg"])
             warnings = plan["warnings"]
             if json_output:
-                emit("success", 0, config=config.model_dump(mode="json"), migration_notes=config._migration_notes, warnings=warnings)
+                emit("success", 0, config=config.model_dump(mode="json"), migration_notes=config._migration_notes, migration_limit_notes=migration_limit_notes(config._migration_notes), migration_warnings=config._migration_warnings, warnings=warnings)
             else:
                 print("Configuration is valid. No traffic was sent.")
                 print("Targets: " + ", ".join(target.name for target in config.targets))
@@ -851,7 +863,7 @@ def _main(argv: list[str] | None = None) -> int:
             plan["warnings"].extend(item["msg"] for item in guard["warnings"])
             if args.output_format == "json":
                 print(json.dumps({"config": config.model_dump(mode="json"),
-                                  "migration_notes": config._migration_notes, "request_pack_preview": preview, "request_plan": plan}, allow_nan=False))
+                                  "migration_notes": config._migration_notes, "migration_limit_notes": migration_limit_notes(config._migration_notes), "migration_warnings": config._migration_warnings, "request_pack_preview": preview, "request_plan": plan}, allow_nan=False))
             else:
                 print("Configuration preview. No traffic was sent.")
                 print("Targets: " + ", ".join(target.name for target in config.targets))
@@ -929,11 +941,12 @@ def _main(argv: list[str] | None = None) -> int:
         if args.command in {"ui", "web"}:
             if not 1 <= args.port <= 65535:
                 raise ValueError("Port must be between 1 and 65535")
-            defaults, migration_notes = None, []
+            defaults, migration_notes, migration_warnings = None, [], []
             if args.config:
-                resolved = migrated_configuration(load_configuration(args.config))
+                resolved = migrated_configuration(load_configuration(args.config), startup=True, path=args.config)
                 defaults = resolved.model_dump(mode="json")
                 migration_notes = resolved._migration_notes
+                migration_warnings = resolved._migration_warnings
                 defaults["restart_target"] = None
             import uvicorn
             from giraffe.web import create_app
@@ -948,7 +961,7 @@ def _main(argv: list[str] | None = None) -> int:
                         raise ValueError(f"port {args.port} is in use; choose another with --port") from None
                     raise
                 token = secrets.token_urlsafe(32)
-                app = create_app(runs_dir=args.runs_dir, defaults=defaults, migration_notes=migration_notes,
+                app = create_app(runs_dir=args.runs_dir, defaults=defaults, migration_notes=migration_notes, migration_warnings=migration_warnings,
                                  token=token, host=args.host, port=args.port, allow_restart_command=args.allow_restart_command,
                                  auto_cleanup=_auto_cleanup_policy(args), **_storage_limits(args))
                 try:

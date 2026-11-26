@@ -261,7 +261,7 @@ def test_serial_answer_verdict_preserves_concurrency_intent_on_round_trip(explic
 def test_legacy_migration_preserves_whether_parallelism_was_requested(legacy, explicit):
     from giraffe.cli import _migrated_values
 
-    values, _ = _migrated_values({'targets': [{'name': 'local', 'url': 'http://local', 'model': 'm'}], **legacy})
+    values, _, _ = _migrated_values({'targets': [{'name': 'local', 'url': 'http://local', 'model': 'm'}], **legacy})
     config = RunConfig.model_validate(values)
     assert config.default_concurrency == 4
     assert config.parallelism_requested('correctness') == explicit
