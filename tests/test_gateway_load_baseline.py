@@ -33,7 +33,7 @@ GATEWAY_GENERATORS = (
     # Output-budget changes affect prefixes; dedicated Load requests are unchanged.
     "a04c62a2e7b10ab0aef201cf5c283fe53df694d247ca5ce35caca1340a83f387",
 )
-CURRENT_LOAD_SOURCE = "98ebc719cb9bdb3519c90719e5eed1ca3c233b9a4188db96a8dfc0f111337818"
+CURRENT_LOAD_SOURCE = "a8950697b0ef37f4a8b41b0b0ad112f0dd942a9e5dc547f42aa271ce8e6c561b"
 
 
 @pytest.mark.asyncio
@@ -73,6 +73,7 @@ async def test_completed_load_requires_new_neutral_prompt_baseline(monkeypatch, 
     assert _settings_reasons(baseline, current) == ["Fixture pack identity differs."]
     compared = compare_baseline(current, baseline)
     assert compared.baseline["targets"][0]["reasons"] == ["Fixture pack identity differs."]
+    assert compared.baseline["targets"][0]["status"] == "inconclusive"
 
     for change in ("interim_traffic", "pre_final_admission", "unknown_traffic", "unknown_generator", "settings", "missing_settings"):
         changed = baseline.model_copy(deep=True)

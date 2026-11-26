@@ -225,8 +225,9 @@ async def test_collector_clears_inference_headers_and_runtime_cookies(monkeypatc
     result = await deployment.snapshot(target, config, time.monotonic() + 1, asyncio.Event(),
                                        run_start=time.monotonic() - 1)
     assert seen[0].headers["authorization"] == "Bearer inference-private"
-    assert "authorization" not in seen[1].headers
-    assert "cookie" not in seen[1].headers
+    collector = next(request for request in seen if request.url.path == "/export")
+    assert "authorization" not in collector.headers
+    assert "cookie" not in collector.headers
     assert "private" not in json.dumps(result)
 
 

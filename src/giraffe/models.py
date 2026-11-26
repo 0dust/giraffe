@@ -2464,6 +2464,7 @@ class RunConfig(Model):
     concurrent_load: ConcurrentLoad = Field(default_factory=ConcurrentLoad)
     load_test: LoadTest = Field(default_factory=LoadTest)
     _preparation_residency: dict = PrivateAttr(default_factory=dict)
+    _preflight_context_windows: dict = PrivateAttr(default_factory=dict)
     _migration_notes: list[str] = PrivateAttr(default_factory=list)
     _concurrency_warnings: list[dict[str, Any]] = PrivateAttr(default_factory=list)
     sessions: Sessions | None = None
