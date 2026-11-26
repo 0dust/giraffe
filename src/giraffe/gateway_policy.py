@@ -8,6 +8,7 @@ from fractions import Fraction
 from math import ceil, floor, inf
 import time
 
+from . import states
 from .identities import gateway_identities_only, identity_headers, litellm_key_fingerprint
 from .models import CheckResult, RequestSpec
 
@@ -68,7 +69,7 @@ async def _execute(run, target, client):
         return
     observation["identities_distinct"] = True
     if (not gateway_identities_only(run.config.checks) and run.remaining(target.name) == 0
-            and run.stop_reason(target.name) in (None, "maximum request budget reached")):
+            and run.stop_reason(target.name) in (None, states.STOP_REQUEST_BUDGET)):
         # A completed shared workload can legitimately use the entire quota.
         # An unsent optional probe does not interrupt that workload.
         run.mark_request_limit(gateway_probe=True)
@@ -122,7 +123,7 @@ async def _execute(run, target, client):
         observation["end_ms"] = min((finished-run.start)*1000, observation["end_ms"])
         if not observation["complete"]:
             reason = observation["stop_reason"] or run.stop_reason(target.name)
-            if reason in (None, "maximum request budget reached") and run.remaining(target.name) == 0:
+            if reason in (None, states.STOP_REQUEST_BUDGET) and run.remaining(target.name) == 0:
                 observation["budget_limited"] = True
                 reason = reason or "The target request limit interrupted the configured gateway policy probes."
             observation["stop_reason"] = reason

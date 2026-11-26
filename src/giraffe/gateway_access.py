@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 
+from giraffe import states
 from giraffe.client import REASONING_BUDGET_ERROR, _ProtocolError, _text, _token_count
 from giraffe.identities import LITELLM_NATIVE_KEY_HEADERS, gateway_identities_only, identity_headers, litellm_key_fingerprint
 from giraffe.models import CheckResult, RequestSpec
@@ -217,9 +218,9 @@ def _record_cutoff(run, target, rows, *, inference_finished=False):
     # A deadline expiring after inference cannot explain a probe that did not run.
     stopped = ((run.endpoint_health[target]["abort_reason"] or run.reason)
                if inference_finished else run.stop_reason(target))
-    if stopped == "maximum run duration reached":
+    if stopped == states.STOP_MAX_DURATION:
         reason = "run_deadline"
-    elif stopped and stopped != "maximum request budget reached":
+    elif stopped and stopped != states.STOP_REQUEST_BUDGET:
         reason = "run_stopped"
     elif stopped or run.remaining(target) == 0:
         reason = "request_budget_exhausted"

@@ -8,11 +8,20 @@ from giraffe.models import RunConfig, required_concurrency
 from giraffe.scale_down import ScaleDownController
 
 
+def advance_scale_down(control, phase):
+    if phase in {"finalizing", "finished"}:
+        control.set_phase(phase)
+        return
+    phases = ("baseline", "waiting_for_output", "armed", "observing", "post_removal")
+    for next_phase in phases[phases.index(control.phase) + 1:phases.index(phase) + 1]:
+        control.set_phase(next_phase)
+
+
 def test_controller_acceptance_is_bound_idempotent_and_copied():
     control = ScaleDownController('run', 'service', run_start=time.monotonic(), stop=asyncio.Event())
     marker = dict(event_id='operator', nonce=control.status()['nonce'], target='service', source='test')
     assert not control.accept_marker(marker)['accepted']
-    control.set_phase('armed')
+    advance_scale_down(control, 'armed')
     assert not control.accept_marker({**marker, 'nonce': 'old'})['accepted']
     accepted = control.accept_marker(marker)
     assert accepted['accepted'] and accepted['accepted_ms'] >= accepted['received_ms']
@@ -29,7 +38,7 @@ def test_controller_acceptance_is_bound_idempotent_and_copied():
 def test_controller_stop_rejects_without_consuming_marker():
     stop = asyncio.Event()
     control = ScaleDownController('run', 'service', run_start=time.monotonic(), stop=stop)
-    control.set_phase('armed')
+    advance_scale_down(control, 'armed')
     stop.set()
     assert not control.accept_marker(dict(event_id='e', nonce=control.nonce, target='service', source='test'))['accepted']
     assert control.status()['acknowledgment'] is None
