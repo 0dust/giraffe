@@ -241,7 +241,7 @@ def test_load_migration_preserves_current_timeout_while_noting_only_legacy_overr
               "test_options": {"concurrency": {"request_timeout_seconds": 90, "samples": 9}}}
     if legacy:
         values["buckets"] = {"levels": [1, 2]}
-    migrated, notes = migrate_concurrent_load(values)
+    migrated, notes, warnings = migrate_concurrent_load(values)
     assert migrated["test_options"]["concurrency"] == {"request_timeout_seconds": 90}
     assert values["test_options"]["concurrency"] == {"request_timeout_seconds": 90, "samples": 9}
     assert any("test_options.concurrency.samples=9 dropped" in note for note in notes)

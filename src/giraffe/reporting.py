@@ -115,7 +115,7 @@ def _uses_shared_request_options(config: dict, check: str) -> bool:
 def _comparison_config(value: dict) -> dict:
     """Normalize saved config I/O without changing the recorded workload identity."""
     config, _ = migrate_run_limits(deepcopy(value))
-    config, _ = migrate_concurrent_load(config)
+    config, _, _ = migrate_concurrent_load(config)
     checks = config.get("checks")
     options = config.get("request_options")
     if (isinstance(checks, list) and "gateway_access" in checks
@@ -310,7 +310,7 @@ def _run_limits_workload_identity(manifest: dict, *, revision: str, include_load
     legacy = revision == "legacy"
     try:
         config, _ = migrate_run_limits(deepcopy(raw))
-        config, _ = migrate_concurrent_load(config)
+        config, _, _ = migrate_concurrent_load(config)
         resolved = RunConfig.model_validate({**config, "max_requests": None, "max_duration_seconds": None})
     except ValidationError:
         return None
@@ -4623,6 +4623,8 @@ def _render(report: RunReport) -> str:
              f"<title>Giraffe — {_e(report.run_id)}</title>", '<style>' + STYLE + _COMPARISON_SUMMARY_STYLE + '.load-acceptance-export{max-width:100%;overflow-x:auto}.load-acceptance-export table{min-width:760px}.load-acceptance-export th:nth-child(2),.load-acceptance-export th:nth-child(3),.load-acceptance-export td:nth-child(2),.load-acceptance-export td:nth-child(3){white-space:nowrap;min-width:140px}.load-acceptance-export small{display:block;white-space:normal}' + '</style><main>',  f"<h1>{_e(verdict)}</h1>",
              f'<p class="muted">Run {_e(report.run_id)} · suite {_e(report.suite_version)}<br>'
              f'{_e(report.started_at)} → {_e(report.finished_at)}</p>']
+    for warning in report.manifest.get("config_migration_warnings", []):
+        parts.append(f'<p><strong>Warning:</strong> {_e(warning["msg"])}</p>')
     for summary in disconnected.values():
         parts.append(f'<p class="card"><strong>{_e(summary)}</strong></p>')
     if report.abort_reason:

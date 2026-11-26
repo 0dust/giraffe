@@ -14,12 +14,8 @@ pytestmark = pytest.mark.usefixtures("local_tokenizer")
 
 
 def load_saved(value):
-    value, limit_notes = migrate_run_limits(value)
-    value, load_notes = migrate_concurrent_load(value)
-    value, combined_notes = migrate_load_test(value)
-    config = RunConfig.model_validate(value)
-    config._migration_notes = list(dict.fromkeys([*limit_notes, *load_notes, *combined_notes, *config._migration_notes]))
-    return config
+    from giraffe.cli import migrated_configuration
+    return migrated_configuration(value)
 
 
 @pytest.mark.parametrize('source,old_value,fragment', [
@@ -36,10 +32,10 @@ def test_migration_notes_actual_values_and_no_input_mutation(source, old_value, 
     values = {'targets': [TARGET], 'checks': ['concurrency'], 'concurrent_workloads': {source: old_value}}
     before = json.dumps(values)
     limited, limit_notes = migrate_run_limits(values)
-    migrated, notes = migrate_concurrent_load(limited)
+    migrated, notes, warnings = migrate_concurrent_load(limited)
     assert json.dumps(values) == before
     config = load_saved(values)
-    _, combined_notes = migrate_load_test(migrated)
+    _, combined_notes, warnings = migrate_load_test(migrated)
     assert config._migration_notes == list(dict.fromkeys([*limit_notes, *notes, *combined_notes]))
     assert fragment in '\n'.join(notes)
     assert config.load_test.workloads.mixed.enabled is False
@@ -58,10 +54,12 @@ def test_interference_migration_never_produces_invalid_allocation(scenario, stre
         'concurrent_workloads': {'scenarios': [scenario], 'levels': levels}})
     assert c.load_test.workloads.interference.enabled is enabled
     assert ('load' in c.checks) is enabled
-    text = ' '.join(c._migration_notes)
-    assert '2 concurrent requests' in text
-    if not enabled:
-        assert 'levels >= 2' in text
+    text = ' '.join([*c._migration_notes, *(w['msg'] for w in c._migration_warnings)])
+    if enabled:
+        assert '2 concurrent requests' in text
+    else:
+        assert 'concurrency levels of at least 2' in text
+        assert any(w['removed_check'] == 'load' for w in c._migration_warnings)
     if scenario == 'mixed_interference':
         assert 'long-output heavy partners and before-output ordering have no equivalent' in text
 
@@ -96,17 +94,17 @@ def test_disabled_block_stays_disabled_and_absent_checks_preserve_legacy_default
 
 
 @pytest.mark.parametrize('changes,checks,note', [
-    ({'max_duration_seconds': 1}, [], 'Concurrent load turned off: max_duration_seconds=1 cannot fit its minimum sending windows.'),
+    ({'max_duration_seconds': 1}, [], "Load test won't run: the imported Maximum duration (1 s) can't fit its sending windows. Raise Maximum duration, then select Load test again."),
     ({'max_output_tokens': 8}, ['concurrency'], 'output_tokens.long=96 copied to profile.long.output_tokens=8; clipped to max_output_tokens=8.'),
     ({'concurrency': 1}, ['concurrency'], 'levels=[1, 2] moved to schedule.levels=[1] (bounded by Simultaneous limit).'),
-    ({'targets': [{**TARGET, 'deployment': {'serving': {'context_limit': 100}}}]}, [], 'Combinations exceeding known server context window 100 were turned off.'),
-    ({'targets': [TARGET, {**TARGET, 'name': 'other'}], 'overlap_models': True, 'concurrency': 1}, [], 'Concurrent load turned off: 2 overlapping targets need at least 2 request slots; concurrency=1.'),
+    ({'targets': [{**TARGET, 'deployment': {'serving': {'context_limit': 100}}}]}, [], "Some Load test combinations won't run: they exceed the server's 100-token context window."),
+    ({'targets': [TARGET, {**TARGET, 'name': 'other'}], 'overlap_models': True, 'concurrency': 1}, [], "Load test won't run: 2 endpoints run at the same time and need at least 2 simultaneous requests, but the imported Simultaneous limit is 1. Raise Simultaneous limit, then select Load test again."),
 ])
 def test_migration_bounds_settings_or_turns_off_unrunnable_load(changes, checks, note):
     c = load_saved({'targets': [TARGET], 'checks': ['buckets', 'concurrency'], 'concurrent_workloads': {}, **changes})
-    assert c.checks == ['load' if check == 'concurrency' else check for check in checks] and note in c._migration_notes
+    assert c.checks == ['load' if check == 'concurrency' else check for check in checks] and note in [*c._migration_notes, *(w['msg'] for w in c._migration_warnings)]
     if not checks:
-        assert 'Concurrent load unselected because no migrated load type can run with these settings.' in c._migration_notes
+        assert any(w['removed_check'] == 'load' for w in c._migration_warnings)
     else:
         assert c.load_test.patterns.concurrent.levels == ([1] if changes.get('concurrency') == 1 else [1, 2])
         assert c.load_test.profile.long.output_tokens == (8 if changes.get('max_output_tokens') == 8 else 96)
@@ -192,8 +190,8 @@ def test_unrunnable_legacy_default_keeps_automatic_check_selection(arrivals):
                              'correctness', 'cancellation', 'recovery', 'json', 'load']
     assert config.load_test.workloads.combinations.selected == ['short_short']
     assert config.load_test.patterns.constant.enabled
-    assert any('streaming_fairness ran at 2 concurrent requests; interference left off' in note for note in config._migration_notes)
-    assert any('Concurrent load unselected because no migrated load type can run' in note for note in config._migration_notes)
+    assert any('streaming_fairness' in w['msg'] for w in config._migration_warnings)
+    assert all(w['removed_check'] is None for w in config._migration_warnings)
 
 
 @pytest.mark.parametrize('models', [False, True])
@@ -276,7 +274,7 @@ def test_valid_legacy_values_above_global_limits_preserve_old_bounding(field):
     values = dict(targets=[TARGET], checks=['concurrency'], concurrency=2, max_output_tokens=128,
         **{field: {'levels': [3], 'output_tokens': {'short': 16, 'medium': 48, 'long': 256}}})
     migrated, _ = migrate_run_limits(values)
-    migrated, notes = migrate_concurrent_load(migrated)
+    migrated, notes, warnings = migrate_concurrent_load(migrated)
     assert migrated['concurrent_load']['schedule']['levels'] == [2]
     assert migrated['concurrent_load']['profile']['long']['output_tokens'] == 128
     assert 'levels=[3] moved to schedule.levels=[2] (bounded by Simultaneous limit).' in notes
@@ -317,3 +315,55 @@ def test_migration_validation_does_not_restore_legacy_public_schema():
     schema = RunConfig.model_json_schema()
     assert not any('Legacy' in name or name in {'Buckets', 'ConcurrentWorkloads', 'TokenStressCase'} for name in schema['$defs'])
     assert not {'buckets', 'concurrent_workloads'} & schema['properties'].keys()
+
+
+@pytest.mark.parametrize('checks', [['access'], ['access', 'serving'], ['access', 'serving', 'correctness']])
+def test_removed_check_warning_names_all_remaining_checks(checks):
+    from giraffe.models import CHECK_NAMES
+    config = load_saved({'targets': [TARGET], 'checks': [*checks, 'buckets'],
+                         'concurrent_workloads': {}, 'max_duration_seconds': .5})
+    names = [CHECK_NAMES[c] for c in checks]
+    remaining = names[0] if len(names) == 1 else ', '.join(names[:-1]) + ' and ' + names[-1]
+    assert config.checks == checks
+    assert config._migration_warnings == [{'msg': "Load test won't run: the imported Maximum duration (0.5 s) can't fit its sending windows. Raise Maximum duration, then select Load test again. Only " + remaining + ' will run.', 'removed_check': 'load'}]
+
+
+def test_context_window_warning_copy_and_partial_workload_metadata():
+    target = {**TARGET, 'deployment': {'serving': {'context_limit': 1000}}}
+    config = load_saved({'targets': [target], 'checks': ['access', 'concurrency'],
+        'concurrent_workloads': {'levels': [2]}})
+    messages = [w['msg'] for w in config._migration_warnings]
+    assert "Some Load test combinations won't run: they exceed the server's 1,000-token context window." in messages
+    assert "Load test's long-request comparison won't run: its request sizes exceed the server's 1,000-token context window." in messages
+    assert "Load test large_input stress won't run: its request sizes exceed the server's 1,000-token context window." in messages
+    assert config.checks == ['access', 'load']
+    assert all(w['removed_check'] is None for w in config._migration_warnings)
+    assert not any('turned off' in note for note in config._migration_notes)
+
+
+def test_disabled_single_shape_mixed_only_load_is_a_check_removal_warning():
+    from giraffe.models import ConcurrentLoad
+    load = ConcurrentLoad().model_dump()
+    for name in ('combinations', 'interference', 'stress'):
+        load[name]['enabled'] = False
+    load['mixed'].update(enabled=True, shares={'short_short': 100})
+    config = load_saved({'targets': [TARGET], 'checks': ['access', 'concurrency'], 'concurrent_load': load})
+    assert config.checks == ['access']
+    assert config._migration_warnings == [{'msg': 'Legacy one-shape mixed workload disabled; mixed traffic requires at least two request shapes. Only Endpoint response will run.', 'removed_check': 'load'}]
+
+
+def test_selected_legacy_check_with_all_workloads_disabled_warns_on_removal():
+    from giraffe.models import ConcurrentLoad
+    load = ConcurrentLoad().model_dump()
+    for name in ('combinations', 'mixed', 'interference', 'stress'):
+        load[name]['enabled'] = False
+    config = load_saved({'targets': [TARGET], 'checks': ['access', 'concurrency'], 'concurrent_load': load})
+    assert config.checks == ['access']
+    assert config._migration_warnings == [{'msg': "Load test won't run: no imported load workload is enabled. Only Endpoint response will run.", 'removed_check': 'load'}]
+
+
+def test_python_implicit_arrivals_keeps_historical_default_selection():
+    config = RunConfig(targets=[TARGET], arrivals={'requests': 2})
+    assert config.checks == ['access', 'serving', 'first_output', 'generation', 'load',
+                             'context', 'correctness', 'cancellation', 'recovery']
+    assert config._migration_warnings == []

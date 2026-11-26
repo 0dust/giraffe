@@ -61,7 +61,7 @@ from giraffe.deployment import safe_config
 from giraffe.fixtures import load_custom_fixtures
 from giraffe.latency import load_observations
 from giraffe.models import (ConfigDraft, CleanupCriteria, Model, RequestRecord, RunConfig, RunReport, ScaleDownMarker,
-                            migrate_concurrent_load, migrate_load_test, migrate_run_limits)
+                            migrate_concurrent_load, migrate_load_test, migrate_run_limits, MigrationWarning, merge_migration_warnings)
 from giraffe.planning import request_plan
 from giraffe.open_files import open_file_guard
 from giraffe.preflight import APIKeyInput, ConnectionTest, ModelDiscovery, PreflightError, TokenizerSelection, attach_api_key
@@ -519,9 +519,10 @@ def _config_input(value, handler):
     if isinstance(value, RunConfig):
         return handler(value)
     value, notes = migrate_run_limits(value)
-    value, load_notes = migrate_concurrent_load(value)
-    value, combined_notes = migrate_load_test(value)
+    value, load_notes, warnings = migrate_concurrent_load(value)
+    value, combined_notes, combined_warnings = migrate_load_test(value)
     config = handler(value)
+    config._migration_warnings = merge_migration_warnings(warnings, combined_warnings, config._migration_warnings)
     config._migration_notes = list(dict.fromkeys([*notes, *load_notes, *combined_notes, *config._migration_notes]))
     return config
 
@@ -692,6 +693,7 @@ class SessionCredentials(Model):
 class StartRun(SessionCredentials):
     config: RunConfigInput
     migration_notes: list[str] = Field(default_factory=list, max_length=MAX_MIGRATION_NOTES)
+    migration_warnings: list[MigrationWarning] = Field(default_factory=list, max_length=MAX_MIGRATION_NOTES)
     baseline_id: str | None = None
     mode: Literal["normal", "cold-start"] = "normal"
     restart_target: str | None = None
@@ -913,8 +915,8 @@ def _bootstrap_config(defaults: dict | None) -> dict:
     else:
         # Launcher-provided settings are validated there; preserve a blank model for first use.
         defaults, _ = migrate_run_limits(defaults)
-        defaults, _ = migrate_concurrent_load(defaults)
-        defaults, _ = migrate_load_test(defaults)
+        defaults, _, _ = migrate_concurrent_load(defaults)
+        defaults, _, _ = migrate_load_test(defaults)
         config.update(defaults)
         if "concurrent_load" not in defaults:
             config.pop("concurrent_load", None)
@@ -924,6 +926,7 @@ def _bootstrap_config(defaults: dict | None) -> dict:
 
 def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                migration_notes: list[str] | None = None,
+               migration_warnings: list[MigrationWarning] | None = None,
                token: str | None = None,
                allow_restart_command: bool = False,
                host: str = "127.0.0.1",
@@ -1828,11 +1831,12 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
         configuration = _bootstrap_config(defaults)
         resolved = ConfigDraft.model_validate(configuration)
         migrated_defaults, limit_notes = migrate_run_limits(defaults)
-        migrated_defaults, load_notes = migrate_concurrent_load(migrated_defaults)
-        _, combined_notes = migrate_load_test(migrated_defaults)
+        migrated_defaults, load_notes, load_warnings = migrate_concurrent_load(migrated_defaults)
+        _, combined_notes, combined_warnings = migrate_load_test(migrated_defaults)
         return {**capabilities(resolved, restart_allowed=allow_restart_command), "config": resolved.model_dump(mode="json"),
                 "baseline_configs": await run_in_threadpool(setup_baseline_configs),
                 "migration_notes": list(dict.fromkeys([*(migration_notes or []), *limit_notes, *load_notes, *combined_notes, *resolved._migration_notes])),
+                "migration_warnings": merge_migration_warnings(migration_warnings or [], load_warnings, combined_warnings, resolved._migration_warnings),
                 "active_run_id": active.get("id"), "disk_active_id": await run_in_threadpool(disk_active_id), "request_plan": await run_in_threadpool(preview_plan, resolved)}
 
     @app.get("/api/capabilities")
@@ -1875,19 +1879,19 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
     @app.post("/api/config/draft")
     def validate_draft(config: ConfigDraftInput):
         """Normalize a draft for editing or export without requiring run readiness."""
-        return {"config": config.model_dump(mode="json"), "migration_notes": config._migration_notes, "request_plan": preview_plan(config)}
+        return {"config": config.model_dump(mode="json"), "migration_notes": config._migration_notes, "migration_warnings": config._migration_warnings, "request_plan": preview_plan(config)}
 
     @app.post("/api/config/plan")
     @app.post("/api/config/validate")
     def validate_config(config: RunConfigInput):
         """Normalize edits using the same contract as a run without sending traffic."""
-        return {"config": config.model_dump(mode="json"), "migration_notes": config._migration_notes, "request_plan": preview_plan(config, validate=True)}
+        return {"config": config.model_dump(mode="json"), "migration_notes": config._migration_notes, "migration_warnings": config._migration_warnings, "request_plan": preview_plan(config, validate=True)}
 
     @app.post("/api/config/preview")
     def preview_config(config: ConfigDraftInput):
         """Describe effective requests and coverage without target calls or file imports."""
         preview = pack_preview(config)
-        return {"config": config.model_dump(mode="json"), "migration_notes": config._migration_notes, "request_pack_preview": preview,
+        return {"config": config.model_dump(mode="json"), "migration_notes": config._migration_notes, "migration_warnings": config._migration_warnings, "request_pack_preview": preview,
                 "request_plan": preview_plan(config, pack_details=preview, validate=True)}
 
     @app.post("/api/datasets/preview")
@@ -1975,6 +1979,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
         if execute:
             require_restart_allowed(config, mode=body.mode, restart_target=body.restart_target)
         config._migration_notes = list(dict.fromkeys([*config._migration_notes, *body.migration_notes]))
+        config._migration_warnings = merge_migration_warnings(config._migration_warnings, body.migration_warnings)
         body.attach_api_keys(config)
         if body.mode == "normal":
             if config.restart_target or body.restart_target:
@@ -2063,7 +2068,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
             while len(feeds) > 4:
                 feeds.popitem(last=False)
             active["task"] = asyncio.create_task(execute(active, config, baseline))
-            return {"id": identifier, "state": "running", "terminal": False, "migration_notes": config._migration_notes,
+            return {"id": identifier, "state": "running", "terminal": False, "migration_notes": config._migration_notes, "migration_warnings": config._migration_warnings,
                     "live_conditions": waiting}
 
     @app.get("/api/runs/{identifier}")

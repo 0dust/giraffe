@@ -459,11 +459,15 @@ async def test_suite_wires_new_check_and_manifest_notes(monkeypatch):
     monkeypatch.setattr(runner, 'LLMClient', ContextClient)
     c = short_windows(configuration())
     c._migration_notes = ['saved migration note']
+    c._migration_warnings = [{'msg': 'Some imported work was removed', 'removed_check': None}]
     report = await run_suite(c)
     check = next(x for x in report.checks if x.id == 'load')
     assert check.status == 'pass'
     assert 'scenarios' not in check.metrics
     assert report.manifest['config_migration_notes'] == ['saved migration note']
+    assert report.manifest['config_migration_warnings'] == c._migration_warnings
+    from giraffe.reporting import _render
+    assert '<strong>Warning:</strong> Some imported work was removed' in _render(report)
     assert check.metrics['migration_notes'] == ['saved migration note']
     assert not {'fairness', 'buckets', 'mixed', 'token_stress'} & set(report.manifest['config']['checks'])
 
