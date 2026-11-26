@@ -589,3 +589,12 @@ def test_scale_down_preview_exposes_finite_selected_target_bounds_and_global_cei
     assert row['effective_request_upper_bound'] == 3
     assert row['effective_duration_upper_bound'] == 5
     assert preview['required_concurrency']['by_check']['scale_down'] == 4
+
+
+def test_streamed_probe_setup_has_consistent_support_label():
+    result = plan(config(checks=["serving"], stream=True, restart_target="local",
+                         targets=[{"name": "local", "url": "http://localhost:1", "model": "m",
+                                   "restart_command": ["restart-service"]}]))
+    row = next(row for row in result["time_timeline"] if row["id"] == "performance_evidence_probe")
+    assert row["title"] == "Streamed token and usage support"
+    assert not any(row["id"] == "performance_evidence_probe" for row in plan(config(stream=False))["time_timeline"])

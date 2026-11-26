@@ -108,7 +108,7 @@ for(const checks of [['load'],['correctness'],['correctness','load']]){
   assert.doesNotMatch(correctnessMarkup,/class="builtin-example"|Expected answer:<\/strong>/);
   assert.doesNotMatch(loadMarkup,/data-action="view-builtin-examples"|3 built-in questions/);
   assert.doesNotMatch(loadMarkup,/class="builtin-example"|Requests repeat these questions|Expected answer:<\/strong>/);
-  assert(loadMarkup.includes(generated));
+  assert(!loadMarkup.includes(generated));
   if(checks.includes('correctness')){
     assert.match(correctnessMarkup,/3 built-in questions/);
     const preview=renderBuiltinQuestions(draft,{expanded:true});

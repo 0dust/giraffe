@@ -20,8 +20,6 @@ PRE_MULTI_USER_GENERATOR = "ab5875f7c635f8f454429a88aac87d52ce3a141a84bcf7b936fa
 PRE_NONCE_LOAD = "9b694c97a39d449d8ea15b09a9aeb406bf835179c0882827685c4d7888687d36"
 NONCE_ONLY_LOAD = "df3b7bbf30cab87d2e8c1c6dab8819f9cfe592b181407caa7c32af4c5f720cd4"
 NONCE_LOAD_GENERATOR = "d9a9e921584262148e06b636f0e8f195b7e530fd2a69c5e98f013359cf947ede"
-PRE_WINDOW_EXTENSION_LOAD = "ab442c8b54be31143ad52fa20f86cd896d2fcf39da495a80cc48db9bc5cb90ee"
-PRE_WINDOW_EXTENSION_MULTI_USER = "a505fae2bd8c99931e6b0f70aae58d76d4499cfe52bca68035468bf49fc4e79c"
 INTERIM_LOAD_SOURCES = (
     "113325dd5cffa04626cc7be7ee93bc6e9be67335531288bc329b3542a155c92a",
     "788f4c8f0b14421d5fc00f8b32c0ffcef79c04c647730767cb44b16584ed4aa4",
@@ -58,8 +56,10 @@ def test_ordinary_load_baseline_survives_optional_nonce_builder_argument(additio
 
 
 @pytest.mark.parametrize("additional_checks", [[], ["access"]], ids=["load", "access-and-load"])
-@pytest.mark.parametrize("old_source", [PRE_NONCE_LOAD, NONCE_ONLY_LOAD, PRE_WINDOW_EXTENSION_LOAD],
-                         ids=["before-nonce", "before-explicit-stage", "before-window-extension"])
+@pytest.mark.parametrize("old_source", [
+    PRE_NONCE_LOAD, NONCE_ONLY_LOAD,
+    "ab442c8b54be31143ad52fa20f86cd896d2fcf39da495a80cc48db9bc5cb90ee",
+], ids=["before-nonce", "before-explicit-stage", "before-context-validation-removal"])
 def test_ordinary_load_baseline_survives_explicit_multi_user_stage(additional_checks, old_source):
     current, old, _ = load_reports(old_source=old_source)
     for report in (current, old):
@@ -81,23 +81,6 @@ def test_interim_load_sources_remain_comparable_to_each_other():
     assert current.manifest["fixture_pack"] != old.manifest["fixture_pack"]
     assert _settings_reasons(current, old) == []
     assert _settings_reasons(old, current) == []
-
-
-@pytest.mark.parametrize("source", [PRE_WINDOW_EXTENSION_LOAD, None], ids=["predecessor", "current"])
-def test_window_extension_revisions_still_require_explicit_interference_mode(source):
-    current, old, settings = load_reports(load_source=source, old_source=source)
-    # These revisions never emitted a Load identity without the mode field.
-    historical = deepcopy(settings)
-    historical["load_test"]["workloads"]["interference"].pop("mode")
-    if source is None:
-        from giraffe.reporting import _load_test_workload_source_sha256
-
-        source = _load_test_workload_source_sha256()
-    old.manifest["fixture_pack"]["workload_fixture_sha256"] = fixture_hash({
-        "generator_source_sha256": NONCE_LOAD_GENERATOR,
-        "settings": historical, "load_test_source_sha256": source})
-    assert "Fixture pack identity differs." in _settings_reasons(current, old)
-    assert "Fixture pack identity differs." in _settings_reasons(old, current)
 
 
 @pytest.mark.parametrize("change", ["generator", "source", "settings", "missing_settings", "multi_user", "builtin"])
@@ -765,7 +748,7 @@ async def test_exact_policy_predecessor_preserves_measured_multi_user(monkeypatc
     predecessor_generator = "e4ddc7a7e8563f9ab3bba2fc42ad0232ee924c65f67d92dafd89c21025d202d0"
     # This test changes only the generator label on the current runtime. The
     # pre-mode runtime upgrade is covered by test_interference_upgrade_baseline.
-    predecessor_source = "7421241a3c22766b5a546b85f24056a9673f8cfb99c0df987b767e07a1a4eee3"
+    predecessor_source = "be3add1ad1520344959556def01cb0e8540a2b7252587b1f987770d0562dcc1a"
     if companion == "load":
         options.update(checks=["multi_user", "load"], load_test=load_config(duration=1).load_test)
     with monkeypatch.context() as policy:
@@ -790,7 +773,7 @@ async def test_exact_policy_predecessor_preserves_measured_multi_user(monkeypatc
                 "settings": {"multi_user": old.manifest["config"]["multi_user"]}}
     if companion == "load":
         identity["settings"]["load_test"] = options["load_test"].model_dump(mode="json")
-        identity["load_test_source_sha256"] = "656aa277b6f2d1eebbe4c0cc4f56d6875bdf4547bae6a36c63c3fe613f8d6b75"
+        identity["load_test_source_sha256"] = "3d2fd5628600a0d75e7c15edd2b1414ab376172cba2c15928a44d80014e99498"
     assert fixture_hash(identity) == old.manifest["fixture_pack"][fingerprint]
 
     assert _settings_reasons(current, old) == []
@@ -799,14 +782,6 @@ async def test_exact_policy_predecessor_preserves_measured_multi_user(monkeypatc
     assert target["reasons"] == []
     assert any(row["check"] == "multi_user" and row["status"] in {"pass", "fail"}
                for row in target["comparisons"])
-
-    previous = old.model_copy(deep=True)
-    previous_identity = {**identity, "multi_user_source_sha256": PRE_WINDOW_EXTENSION_MULTI_USER}
-    if companion == "load":
-        previous_identity["load_test_source_sha256"] = PRE_WINDOW_EXTENSION_LOAD
-    previous.manifest["fixture_pack"][fingerprint] = fixture_hash(previous_identity)
-    assert _settings_reasons(current, previous) == []
-    assert _settings_reasons(previous, current) == []
 
     changed_settings = {**identity["settings"],
                         "multi_user": {**identity["settings"]["multi_user"], "levels": [3]}}

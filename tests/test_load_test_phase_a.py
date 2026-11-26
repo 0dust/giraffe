@@ -841,12 +841,12 @@ def test_legacy_steady_arrivals_notes_and_known_context_do_not_size_from_client(
     v["context_limit"] = 128
     assert RunConfig.model_validate(v).load_test.profile.long.input_tokens == 2048
     v["targets"] = [{**TARGET, "deployment": {"serving": {"context_limit": 100}}}]
-    with pytest.raises(ValidationError) as exc:
-        RunConfig.model_validate(v)
-    assert (
-        "load_test.profile.short.input_tokens"
-        in configuration_errors(exc.value.errors(), v)[0]["fields"]
-    )
+    c = RunConfig.model_validate(v)
+    warning, = [w for w in request_plan(c)["load_warnings"]
+                if w.get("kind") == "context_window_exceeded"]
+    assert "load_test.profile.short.input_tokens" in warning["fields"]
+    assert "configured context window is 100 tokens" in warning["msg"]
+    assert not warning.get("blocking")
 
 
 def test_old_report_renderers_remain_readable():

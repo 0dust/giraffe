@@ -601,23 +601,6 @@ def validate_config(config):
                 "Long input during an active short stream needs streaming responses.",
                 values={prefix + "workloads.interference.enabled": True, "stream": config.stream},
             )
-        for target in config.targets:
-            context, _ = context_window(target)
-            for shape in running_shapes(own):
-                a, b = shape.split("_")
-                if (
-                    context is not None
-                    and not getattr(own, "legacy_source", None)
-                    and getattr(own.profile, a).input_tokens + getattr(own.profile, b).output_tokens
-                    > context
-                ):
-                    load_validation_error(
-                        [
-                            prefix + f"profile.{a}.input_tokens",
-                            prefix + f"profile.{b}.output_tokens",
-                        ],
-                        f"{load_shape_label(shape)} exceeds the known endpoint context window ({context} tokens).",
-                    )
     settings = dict(settings_sets(config.load_test))
     required = sum(initial_requests(p) for p in test_points(config.load_test) if not getattr(settings[p["source"]], "legacy_source", None)) * len(config.targets)
     if config.max_requests is not None and required > config.max_requests:

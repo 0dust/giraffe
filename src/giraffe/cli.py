@@ -1065,6 +1065,11 @@ def _main(argv: list[str] | None = None) -> int:
                 if json_output:
                     emit("blocked", states.EXIT_CODE_BLOCKED, target=target, message=message)
                 return states.EXIT_CODE_BLOCKED
+        if args.command == "run" and not args.skip_preflight and "load" in config.checks:
+            from giraffe.deployment import probe_context_windows
+            windows = asyncio.run(probe_context_windows(config))
+            config._preflight_context_windows = windows
+            plan = request_plan(config, observations=load_observations(runs_root, config), context_windows=windows)
         planning_warnings = plan["warnings"]
         for warning in planning_warnings:
             print(f"Warning: {warning}", file=sys.stderr)
@@ -1466,6 +1471,12 @@ def _print_result(report: RunReport, json_path: Path, html_path: Path | None,
     if unselected:
         print("Not selected: " + ", ".join(unselected))
     for name, observation in report.observations.get("targets", {}).items():
+        probe = next((row for row in report.conditions if row.get("target") == name
+                      and row.get("condition_id") == "performance_evidence_probe"), None)
+        if probe:
+            status = "passed" if probe.get("status") == "passed" else "inconclusive"
+            reason = probe.get("reason") or observation.get("token_evidence", {}).get("reason", "")
+            print(f"  {name} / streamed token and usage support: {status} — {reason}")
         telemetry = observation.get("serving_telemetry", {})
         states = sorted({s.get("status", "unknown") for s in telemetry.get("snapshots", [])})
         print(f"  {name} / serving telemetry: {', '.join(states)}; source freshness and other traffic remain qualified in JSON.")
