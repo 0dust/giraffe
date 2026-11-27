@@ -55,10 +55,10 @@ prompts and requirements. **All 100 responses at that load were correct and on
 time**; the slowest finished in 6.68 seconds. Giraffe caught the missed requirement
 and checked the result after the configuration change.
 
-[![Giraffe's recorded comparison: at four requests in flight, the baseline failed with 51 valid responses and the repeat passed with 100](https://raw.githubusercontent.com/0dust/giraffe/f05b9b7befde14e68f2e762e745c78310f4ee995/docs/assets/readme/order-extraction-comparison.png)](https://raw.githubusercontent.com/0dust/giraffe/f05b9b7befde14e68f2e762e745c78310f4ee995/docs/assets/readme/order-extraction-comparison.png)
+[![Giraffe's recorded comparison: at four requests in flight, the baseline failed with 51 valid responses and the repeat passed with 100](https://raw.githubusercontent.com/0dust/giraffe/6fdf44c864f137b1a28a9af24ef50d36269821ce/docs/assets/readme/order-extraction-comparison.png)](https://raw.githubusercontent.com/0dust/giraffe/6fdf44c864f137b1a28a9af24ef50d36269821ce/docs/assets/readme/order-extraction-comparison.png)
 
 *Recorded local demo with sample orders: Llama 3.2 1B, Ollama 0.12.10, M1 Mac.
-[Prompts, settings and evidence](https://github.com/0dust/giraffe/blob/f05b9b7befde14e68f2e762e745c78310f4ee995/docs/samples/README.md#order-extraction-under-load) · [Download both reports](https://github.com/0dust/giraffe/raw/f05b9b7befde14e68f2e762e745c78310f4ee995/docs/samples/order-extraction.zip).*
+[Prompts, settings and evidence](https://github.com/0dust/giraffe/blob/6fdf44c864f137b1a28a9af24ef50d36269821ce/docs/samples/README.md#order-extraction-under-load) · [Download both reports](https://github.com/0dust/giraffe/raw/6fdf44c864f137b1a28a9af24ef50d36269821ce/docs/samples/order-extraction.zip).*
 
 ## Quick start
 
@@ -113,11 +113,11 @@ giraffe ui
 
 Open the access link printed in the terminal (it contains a per-launch token), enter your endpoint and model, choose checks, then **Launch**. Keep the terminal open; **Ctrl+C** stops the UI. Use `--port` to choose a different port.
 
-[![Giraffe test conditions updating during a recorded local run](https://raw.githubusercontent.com/0dust/giraffe/f05b9b7befde14e68f2e762e745c78310f4ee995/docs/assets/readme/browser-ui-live.gif)](https://raw.githubusercontent.com/0dust/giraffe/f05b9b7befde14e68f2e762e745c78310f4ee995/docs/assets/readme/browser-ui-live.gif)
+[![Giraffe test conditions updating during a recorded local run](https://raw.githubusercontent.com/0dust/giraffe/6fdf44c864f137b1a28a9af24ef50d36269821ce/docs/assets/readme/browser-ui-live.gif)](https://raw.githubusercontent.com/0dust/giraffe/6fdf44c864f137b1a28a9af24ef50d36269821ce/docs/assets/readme/browser-ui-live.gif)
 
 *Watch three test conditions update during a real Qwen2.5 1.5B run, with up to four
 requests in flight. Playback is condensed.
-[Download this run](https://github.com/0dust/giraffe/raw/f05b9b7befde14e68f2e762e745c78310f4ee995/docs/samples/browser-ui-demo.zip) · [Recording details](https://github.com/0dust/giraffe/blob/f05b9b7befde14e68f2e762e745c78310f4ee995/docs/samples/README.md#browser-ui-demo).*
+[Download this run](https://github.com/0dust/giraffe/raw/6fdf44c864f137b1a28a9af24ef50d36269821ce/docs/samples/browser-ui-demo.zip) · [Recording details](https://github.com/0dust/giraffe/blob/6fdf44c864f137b1a28a9af24ef50d36269821ce/docs/samples/README.md#browser-ui-demo).*
 
 ## Inference engines
 
@@ -221,11 +221,11 @@ your own questions and expected answers to test the work your application needs.
 See the [Load test guide](https://github.com/0dust/giraffe/blob/main/docs/workloads.md#load-test)
 for traffic patterns, answer checks and configuration examples.
 
-[![Actual and intended concurrency across the 1, 2 and 4 request stages](https://raw.githubusercontent.com/0dust/giraffe/f05b9b7befde14e68f2e762e745c78310f4ee995/docs/assets/readme/fresh-load-concurrency.jpg)](https://raw.githubusercontent.com/0dust/giraffe/f05b9b7befde14e68f2e762e745c78310f4ee995/docs/assets/readme/fresh-load-concurrency.jpg)
+[![Actual and intended concurrency across the 1, 2 and 4 request stages](https://raw.githubusercontent.com/0dust/giraffe/6fdf44c864f137b1a28a9af24ef50d36269821ce/docs/assets/readme/fresh-load-concurrency.jpg)](https://raw.githubusercontent.com/0dust/giraffe/6fdf44c864f137b1a28a9af24ef50d36269821ce/docs/assets/readme/fresh-load-concurrency.jpg)
 
 *A separate November 18 run: Qwen2.5 1.5B on Ollama 0.34.1, with 1,154 correct
 responses across concurrency 1, 2, and 4. All three stages passed.
-[Download the performance run](https://github.com/0dust/giraffe/raw/f05b9b7befde14e68f2e762e745c78310f4ee995/docs/samples/token-timing.zip) · [Measurement details](https://github.com/0dust/giraffe/blob/f05b9b7befde14e68f2e762e745c78310f4ee995/docs/samples/README.md#token-timing).*
+[Download the performance run](https://github.com/0dust/giraffe/raw/6fdf44c864f137b1a28a9af24ef50d36269821ce/docs/samples/token-timing.zip) · [Measurement details](https://github.com/0dust/giraffe/blob/6fdf44c864f137b1a28a9af24ef50d36269821ce/docs/samples/README.md#token-timing).*
 
 ## Test multi-turn conversations
 
@@ -370,7 +370,7 @@ Results are **pass**, **fail**, **inconclusive**, **skipped** or **blocked**. Mi
 
 An order-lookup prompt asked for customer `C-41442`; the model's `search_orders`
 call used `C-41422`. Giraffe flagged the mismatch without executing the tool.
-[Inspect the recorded request](https://github.com/0dust/giraffe/blob/f05b9b7befde14e68f2e762e745c78310f4ee995/docs/samples/README.md#tool-call-mismatch).
+[Inspect the recorded request](https://github.com/0dust/giraffe/blob/6fdf44c864f137b1a28a9af24ef50d36269821ce/docs/samples/README.md#tool-call-mismatch).
 
 ## Documentation
 
@@ -401,5 +401,5 @@ multi-replica deployment is still pending.
 
 ## Sample reports
 
-[Download the load comparison](https://github.com/0dust/giraffe/raw/f05b9b7befde14e68f2e762e745c78310f4ee995/docs/samples/load-comparison.zip) ·
-[Reports and JSON evidence](https://github.com/0dust/giraffe/blob/f05b9b7befde14e68f2e762e745c78310f4ee995/docs/samples/README.md) · [Run configuration](https://github.com/0dust/giraffe/blob/f05b9b7befde14e68f2e762e745c78310f4ee995/docs/samples/load-config.json)
+[Download the load comparison](https://github.com/0dust/giraffe/raw/6fdf44c864f137b1a28a9af24ef50d36269821ce/docs/samples/load-comparison.zip) ·
+[Reports and JSON evidence](https://github.com/0dust/giraffe/blob/6fdf44c864f137b1a28a9af24ef50d36269821ce/docs/samples/README.md) · [Run configuration](https://github.com/0dust/giraffe/blob/6fdf44c864f137b1a28a9af24ef50d36269821ce/docs/samples/load-config.json)
