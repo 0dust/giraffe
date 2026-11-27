@@ -48,6 +48,14 @@ records concurrency one still accepted and concurrency four newly accepted.
 
 ### Original product screenshots
 
+![Recorded Giraffe comparison showing concurrency four newly accepted](../assets/readme/order-extraction-comparison.png)
+
+The README uses this tight crop of the tested-load comparison, taken at 28.0
+seconds in the original comparison recording. It shows both load levels and
+their before/after outcomes at native resolution. The four-request row changes
+from `Failed · 51 valid` to `Passed · 100 valid`; the complete timing evidence is
+in the reports and table above. The full run headers follow for reference.
+
 | Before: load test failed | After: selected checks passed |
 | --- | --- |
 | ![Original Giraffe screen showing the order-extraction load failure](../assets/readme/order-extraction-before.png) | ![Original Giraffe screen showing the same checks passing after the change](../assets/readme/order-extraction-after.png) |
@@ -114,7 +122,11 @@ The November 18 GIF shows three test conditions in a separate, brief run:
 17/17 scored answers passed at concurrency 1, 2, and 4. Its 12-second stages and
 three-response minimum demonstrate the UI; they do not establish serving
 capacity. Playback is condensed to 10.8 seconds, with the live excerpt at 2.5x
-speed and the completed report held for 3.5 seconds.
+speed and the completed report held for 3.5 seconds. The live frames are cropped
+to the Tests panel, removing the already-clipped heading above it; the final
+frame is cropped to the run summary. The GIF is 720 pixels wide. Its three cells
+represent test conditions, not individual requests. No additional conditions,
+data, or UI content were added to the recording.
 
 ## Tool-call mismatch
 

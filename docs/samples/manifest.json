@@ -135,14 +135,17 @@
   },
   "images": {
     "browser-ui-live.gif": {
-      "sha256": "ccaa99e4434f42a837613412f5168436bb75250d5a80ea55299447cb11103d0f",
-      "bytes": 610223,
+      "sha256": "9a0cac2ff2c502af8ec9ee1ee82155d1d026c101a88a4ac4708d43f4e76a7e64",
+      "bytes": 281621,
       "evidence": "browser-ui-demo.zip",
-      "capture_changes": "None; copied byte-for-byte from the reviewed preview.",
+      "capture_changes": "Re-encoded the original source frames. Live frames: crop 1120x540 at x=112,y=180 to the Tests panel; final report: crop 1120x540 at x=112,y=95 to the run summary. Resized to 720x347. No added cells, altered text, data or verdicts.",
       "run_id": "f50226a58da24bb1a4b76abd6270cd2b",
       "code_commit": "b5068162b8e78f2840541c9e368b7eca61aaed92",
       "source_report_sha256": "900e601ba40a891cb57a13c67587af5b8691a9edfa2d03c4b855734d55aa86e8",
-      "playback": "Live excerpt at 2.5x; final report held for 3.5 seconds; 10.8 seconds total. Resized to 1120 pixels wide and palette reduced; no data or verdict edits."
+      "playback": "Original frame timing retained: live excerpt at 2.5x; final report held for 3.5 seconds; 10.8 seconds total at 10 fps. GIF palette reduced.",
+      "previous_sha256": "ccaa99e4434f42a837613412f5168436bb75250d5a80ea55299447cb11103d0f",
+      "source_frames_archive": "captured-frames.zip",
+      "source_frames_sha256": "198503765ab4b9c2ba0b5cf7ad2732d468f61d9cb92643f91c78bf3be0cde0a8"
     },
     "fresh-load-results.jpg": {
       "sha256": "c635b375638f7459c52da029203bfa6abe6783e3e43e951fe123a5ef4285849b",
@@ -216,6 +219,26 @@
       "source_recording_sha256": "4a079b2c55d3c74b010ec05069310277551a77bc7f18c335da64e067005d5ab8",
       "frame_timestamp_seconds": 2,
       "capture_changes": "One frame from the original screen recording; removed the 144-pixel browser chrome above the application. Native 1200x602 crop; no scaling, overlays, UI edits, drawn elements or data changes."
+    },
+    "order-extraction-comparison.png": {
+      "sha256": "bad60beeec5e83a1e38bfb9a4f855fa09d554fab3041c96517c1507ab68e4ec9",
+      "bytes": 72357,
+      "evidence": "order-extraction.zip",
+      "baseline_run_id": "1d97cea922ec4f14928a1cc367dbf9c6",
+      "run_id": "3411391abe324c7ebdc05fd599bcde60",
+      "ui_run": "20261101T050816-a84e0e4d",
+      "code_commit": "6ea042908ac4cc0770c353fe6f1c0faf864ba5e0",
+      "source_report_sha256": "6ddd96fe92ec159f4981f3cce1ea197865faebc565510d0c62526c27784d67ea",
+      "source_recording": "manual-comparison-8s-take1.mp4",
+      "source_recording_sha256": "6f2f4fb84eb6e92f1e8b9a2fec1b8e39df9279ca6642021a24b6891e84e523c9",
+      "frame_timestamp_seconds": 28,
+      "crop": {
+        "x": 280,
+        "y": 310,
+        "width": 880,
+        "height": 320
+      },
+      "capture_changes": "One frame from the original comparison recording, cropped to the tested-load table and its heading. Native resolution; no scaling, overlays, UI edits, drawn elements or data changes."
     }
   },
   "context_request_evidence_sha256": "6ae00365f85d67228b6082ecdfdd4e94cb18ed3a9b04c257edadf9a8b909170c",

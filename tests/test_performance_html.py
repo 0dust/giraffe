@@ -37,11 +37,42 @@ def test_standalone_findings_first_order_and_complete_sections():
 
 
 def test_measurement_scope_has_one_population_explanation():
-    html = _render(synthetic_report_1000())
+    from giraffe.performance_html import render_performance
+
+    performance = build_performance(synthetic_report_1000())
+    html = render_performance(performance)
     scope = html.split('<div class="html-scope">', 1)[1].split('</div>', 1)[0]
-    assert scope.count('One comparable workload across its recorded load stages') == 1
-    assert 'Headlines use one comparable workload' not in scope
+    assert scope.lower().count('one comparable workload across its recorded load stages') == 1
+    assert scope.count(performance['targets'][0]['scope_note']) == 1
     assert '<summary>About these measurements</summary>' in scope
+
+
+def test_measurement_scope_uses_metadata_and_omits_empty_label():
+    from giraffe.performance_html import render_performance
+
+    performance = build_performance(synthetic_report_1000())
+    target = performance['targets'][0]
+    target['scope_note'] = 'Recorded scope: <selected> & separate.'
+    window = target['summaries'][target['selected_window']]['window']
+    window.pop('workload_label', None)
+    window.pop('stages_description', None)
+    scope = render_performance(performance).split('<div class="html-scope">', 1)[1].split('</div>', 1)[0]
+    assert 'Recorded scope: &lt;selected&gt; &amp; separate.' in scope
+    assert '<p class="html-note">' not in scope
+    assert 'Every request remains in the dispatch-ordered series' not in scope
+
+
+def test_measurement_scope_retains_stage_population():
+    from giraffe.performance_html import render_performance
+
+    performance = build_performance(synthetic_report_1000())
+    target = performance['targets'][0]
+    target['scope_note'] = 'Keep all request evidence.'
+    window = target['summaries'][target['selected_window']]['window']
+    window.update(kind='stage', population='Count dispatches; measure terminal events.')
+    scope = render_performance(performance).split('<div class="html-scope">', 1)[1].split('</div>', 1)[0]
+    assert 'Count dispatches; measure terminal events.' in scope
+    assert 'Keep all request evidence.' in scope
 
 
 def test_standalone_chart_decimation_preserves_extrema_and_bounds_geometry():

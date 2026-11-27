@@ -338,14 +338,17 @@ def render_performance(performance, *, prefix='performance'):
         window = summary['window']
         rows = [target['request_series'][index] for index in summary['request_row_indices']]
         pfx = prefix if len(performance['targets']) == 1 else prefix + '-' + str(len(parts))
+        scope_label = ' · '.join(filter(None, (window.get('workload_label'), window.get('stages_description'))))
+        scope_note = target.get('scope_note') or window.get('population', '')
+        population = window.get('population', '') if window.get('kind') == 'stage' else ''
         parts.append('<div class="html-scope"><strong>' + _e(target['target']) + '</strong> · '
             + _e(window['label']) + ' · ' + _fmt(window.get('duration_s')) + ' s · '
-            + _fmt(window['request_count']) + ' requests<p class="html-note">'
-            + _e(' · '.join(filter(None, (window.get('workload_label'), window.get('stages_description')))))
-            + '.</p><details><summary>About these measurements</summary><p>'
-            + _e(window.get('population', '')) + '</p>'
-            + '<p>Every request remains in the dispatch-ordered series; observed throughput does not establish capacity. '
-            + 'Missing measurements and collection instructions appear in their cards below.</p></details></div>')
+            + _fmt(window['request_count']) + ' requests'
+            + ('<p class="html-note">' + _e(scope_label.rstrip('.') + '.') + '</p>' if scope_label else '')
+            + '<details><summary>About these measurements</summary>'
+            + ('<p>' + _e(population) + '</p>' if population and population != scope_note else '')
+            + ('<p>' + _e(scope_note) + '</p>' if scope_note else '')
+            + '<p>Missing measurements and collection instructions appear in their cards below.</p></details></div>')
         windows = [item for item in target.get('windows', [])
                    if item['id'] in (target.get('default_window'), target.get('selected_window'))
                    or not any(cohort['id'] == item.get('cohort_id')
