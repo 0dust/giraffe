@@ -855,7 +855,7 @@ nodes['#new-run-form']=form;
 nodes['[data-action="use-request-budget"]']={{disabled:false}};
 const document={{querySelector:q=>nodes[q],querySelectorAll:()=>[],addEventListener:(kind,fn)=>listeners[kind]=fn,
   createElement:()=>({{click(){{this.clicked=true;}}}})}};
-const context={{positiveBoundErrors,structuredClone,document,window:{{addEventListener(){{}}}},assert,nodes,form,listeners,
+const context={{positiveBoundErrors,structuredClone,document,window:{{addEventListener(){{}}}},location:{{hash:'#new'}},assert,nodes,form,listeners,
   Blob,URL:{{createObjectURL(blob){{downloads.push(blob);return 'blob:config';}},revokeObjectURL(){{}}}},
   navigator:{{clipboard:{{async writeText(){{throw new Error('denied');}}}}}},setTimeout(){{}},clearTimeout(){{}},downloads}};
 const source=fs.readFileSync({json.dumps(str(static / 'app.js'))},'utf8')

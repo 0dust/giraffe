@@ -28,7 +28,7 @@ function updateAPIKeySummary() {
   const key=apiKeyFor(form.elements.url.value),ref=form.elements.api_key_env?.value.trim();
   $('.row-value',summary).textContent=key?'Set for this tab':ref||'Not set';
 }
-const state = {bootstrap:null, runs:[], storage:null, storageUnavailable:false, cleanup:null, cleanupResult:null, baselines:[], detail:null, mosaicFollow:true, config:null, active:null, diskActive:null, routeVersion:0, poll:null, tab:'checks', selectedCheck:null, checkNavigatorOpen:false, filter:'all', historySearch:'', comparisonFilter:null, comparisonCheck:'all', submitting:false, openTest:null, configView:'form', jsonDraft:null, jsonBase:null, configRevision:0, configBusy:false, showAvailableTests:false, formMode:'normal', formRestartTarget:null, requestPreview:null, previewSequence:0, planTimer:null, setupPreset:null, catalogueFilter:'all', catalogueCategory:'all', catalogueSearch:'', setupStep:1, focusSetupOnEntry:false, returnToReview:false, modelDiscovery:null, modelDiscoverySequence:0, autoModel:null, datasetSelection:[], datasetImportSequence:0, judgeEditorOpen:null, datasetImport:null, datasetEditor:null, datasetTry:null, migrationNotes:[], migrationLimitNotes:[], migrationWarnings:[], dismissedMigrationNotes:[], loadPanels:{}, limitValues:{}, jsonValidation:null};
+const state = {bootstrap:null, runs:[], storage:null, storageUnavailable:false, cleanup:null, cleanupResult:null, baselines:[], detail:null, mosaicFollow:true, config:null, active:null, diskActive:null, routeVersion:0, setupNavigationSequence:0, poll:null, tab:'checks', selectedCheck:null, checkNavigatorOpen:false, filter:'all', historySearch:'', comparisonFilter:null, comparisonCheck:'all', submitting:false, openTest:null, configView:'form', jsonDraft:null, jsonBase:null, configRevision:0, configBusy:false, showAvailableTests:false, formMode:'normal', formRestartTarget:null, requestPreview:null, previewSequence:0, planTimer:null, setupPreset:null, catalogueFilter:'all', catalogueCategory:'all', catalogueSearch:'', setupStep:1, focusSetupOnEntry:false, returnToReview:false, modelDiscovery:null, modelDiscoverySequence:0, autoModel:null, datasetSelection:[], datasetImportSequence:0, judgeEditorOpen:null, datasetImport:null, datasetEditor:null, datasetTry:null, migrationNotes:[], migrationLimitNotes:[], migrationWarnings:[], dismissedMigrationNotes:[], loadPanels:{}, limitValues:{}, jsonValidation:null};
 state.setupWorkspace=null;
 const statusLabels = {not_applicable:'Not applicable',measured:'Measured',warmup:'Warmup',pass:'Passed',fail:'Failed',failed:'Failed',timeout:'Timed out',inconclusive:'Inconclusive',skipped:'Not run',idle:'Unused',blocked:'Blocked',running:'Running',queued:'Queued',reserved:'Reserved',stopping:'Stopping',error:'Runner error',completed:'Finished',stopped:'Stopped',cancelled:'Cancelled',interrupted:'Interrupted'};
 const statusIcons = {pass:'✓',fail:'×',failed:'×',timeout:'◷',inconclusive:'?',skipped:'–',idle:'○',blocked:'!',running:'·',queued:'○',reserved:'○',stopping:'·',error:'×',completed:'✓',stopped:'⊘',cancelled:'⊘',interrupted:'!'};
@@ -3142,9 +3142,14 @@ function validateSetupChecks() {
     if(config.request_pack.cases.some(item=>item.scorer==='judge')&&!judgesReady(config)){focusSetting('judging');throw new Error('Set up the AI evaluator before reviewing questions that need an AI answer check.');}
   }
 }
+function supersedeSetupIntents(){state.setupNavigationSequence++;}
+function beginSetupIntent(){
+  supersedeSetupIntents();
+  const seq=state.setupNavigationSequence,route=state.routeVersion,hash=location.hash,revision=state.configRevision;
+  return {current:()=>seq===state.setupNavigationSequence&&route===state.routeVersion&&hash===location.hash&&revision===state.configRevision};
+}
 function navigateSetup(step) {
   if(state.setupWorkspace||state.submitting||step<1||step>3)return;
-  const intent=state.setupNavigationSequence=(state.setupNavigationSequence||0)+1;
   const error=$('#form-error');if(error)error.hidden=true;
   try{
     assertAppliedConfig();
@@ -3156,13 +3161,14 @@ function navigateSetup(step) {
         if(index===2){
           revealSetupStep(2);
           if($('#request-plan')&&!currentRequestPlan()&&!currentSettingErrors().length){
-            captureFormDraft();const revision=state.configRevision,route=state.routeVersion;
-            refreshRequestPreview(undefined,{draft:true}).then(()=>{if(intent===state.setupNavigationSequence&&revision===state.configRevision&&route===state.routeVersion)navigateSetup(step);}).catch(problem=>{if(intent===state.setupNavigationSequence&&revision===state.configRevision&&route===state.routeVersion){focusFirstSettingError(problem);if(error){error.textContent=problem.message;error.hidden=false;}}});return;
+            captureFormDraft();const intent=beginSetupIntent();
+            refreshRequestPreview(undefined,{draft:true}).then(()=>{if(intent.current())navigateSetup(step);}).catch(problem=>{if(intent.current()){focusFirstSettingError(problem);if(error){error.textContent=problem.message;error.hidden=false;}}});return;
           }
           validateSetupChecks();
         }
       }
     }
+    supersedeSetupIntents();
     captureFormDraft();
     revealSetupStep(step,{focus:true});updateBounds();
   }catch(problem){focusFirstSettingError(problem);if(error){error.textContent=problem.message;error.hidden=false;}else configError(problem);}
@@ -3441,7 +3447,7 @@ function watchPlanViewport() {
   if(dock&&typeof ResizeObserver!=='undefined'){state.planViewportObserver=new ResizeObserver(resize);state.planViewportObserver.observe(dock);}
 }
 function openSetupWorkspace(view,{returnTo='setup',focusSelector=null}={}) {
-  state.setupNavigationSequence=(state.setupNavigationSequence||0)+1;
+  supersedeSetupIntents();
   if(!state.setupWorkspace){
     datasetEditingAllowed();
     captureFormDraft();
@@ -3468,7 +3474,7 @@ function focusSetupWorkspace(selector='#setup-workspace-title') {
 }
 function closeSetupWorkspace() {
   const context=state.setupWorkspace;if(!context)return;
-  state.setupNavigationSequence=(state.setupNavigationSequence||0)+1;
+  supersedeSetupIntents();
   cleanupQuestionWorkspace();state.setupWorkspace=null;
   const workspace=$('#setup-workspace'),setup=$('#run-setup-content')||$('#new-run-form');
   if(workspace){workspace.hidden=true;workspace.innerHTML='';}
@@ -4854,16 +4860,15 @@ async function stopRun(){
 // "New run" starts setup at step 1, even when the form is already open on a later step.
 async function startNewRun(){
   if(state.setupWorkspace){closeSetupWorkspace();return;}
-  const intent=state.setupNavigationSequence=(state.setupNavigationSequence||0)+1;
-  const version=state.routeVersion,revision=state.configRevision;
+  const intent=beginSetupIntent();
   if($('#new-run-form'))captureFormDraft();
   try{
     const config=omitInactiveGatewayAccess(state.config || state.bootstrap.config,state.gatewayAccessDraft ||= {});
     const result=await api('/api/config/draft',{method:'POST',body:JSON.stringify(config)});
-    if(intent!==state.setupNavigationSequence||version!==state.routeVersion||revision!==state.configRevision)return;
+    if(!intent.current())return;
     state.config=result.config;replaceMigrationNotes(result.migration_notes,result.migration_warnings,result.migration_limit_notes);
-  }catch(error){if(intent===state.setupNavigationSequence)toast(error.message);return;}
-  state.setupStep=1;state.returnToReview=false;state.openTest=null;configChanged();
+  }catch(error){if(intent.current())toast(error.message);return;}
+  state.setupStep=1;state.focusSetupOnEntry=false;state.returnToReview=false;state.openTest=null;configChanged();
   if(location.hash!=='#new'){location.hash='#new';return;}
   renderNew();enterRoute();window.scrollTo?.({top:0,left:0,behavior:'instant'});
 }
@@ -4873,11 +4878,13 @@ function normalizeRateThreshold(config){
   return result;
 }
 async function rerun({step=1,baseline}={}){
-  const version=state.routeVersion;let source=state.detail.report?.manifest?.config || state.detail.config;
+  const detail=state.detail;let source=detail?.report?.manifest?.config || detail?.config;
   if(!source){toast('No configuration was saved for this run.');return;}
+  const intent=beginSetupIntent();
   let notes=[],limitNotes=[],warnings=[];
-  try{const result=await api('/api/config/draft',{method:'POST',body:JSON.stringify(source)});if(version!==state.routeVersion)return;source=result.config;notes=result.migration_notes || [];limitNotes=result.migration_limit_notes || [];warnings=result.migration_warnings?.length?result.migration_warnings:(state.detail.report?.manifest?.config_migration_warnings || []);}
+  try{const result=await api('/api/config/draft',{method:'POST',body:JSON.stringify(source)});if(!intent.current())return;source=result.config;notes=result.migration_notes || [];limitNotes=result.migration_limit_notes || [];warnings=result.migration_warnings?.length?result.migration_warnings:(detail.report?.manifest?.config_migration_warnings || []);}
   catch(error){
+    if(!intent.current())return;
     const unsupported=(error.errors || []).filter(item=>item.type==='extra_forbidden');
     if(unsupported.length){const fields=[...new Set(unsupported.map(item=>item.field))].join(', ');toast(`This run was saved by an earlier Giraffe version with settings this version no longer supports: ${fields}. Start a new run from Setup instead.`);}
     else toast(error.message);
@@ -4886,7 +4893,7 @@ async function rerun({step=1,baseline}={}){
   source=normalizeRateThreshold(source);
   replaceMigrationNotes(notes,warnings,limitNotes);state.config=clone(source);state.gatewayAccessDraft={};state.autoModel=null;state.setupStep=step===2&&source.targets?.length&&source.targets.every(t=>t.model?.trim())?2:1;state.focusSetupOnEntry=state.setupStep===2;
   if(step===2){state.returnToReview=false;state.catalogueFilter='all';state.catalogueCategory='all';state.catalogueSearch='';}
-  invalidateModelDiscovery();state.datasetSelection=[];state.config.restart_target=null;state.formMode='normal';state.formRestartTarget=null;state.jsonDraft=null;state.jsonBase=null;state.configView='form';configChanged();state.prefillBaseline=baseline ?? (state.detail.baseline_id || '');location.hash='#new';
+  invalidateModelDiscovery();state.datasetSelection=[];state.config.restart_target=null;state.formMode='normal';state.formRestartTarget=null;state.jsonDraft=null;state.jsonBase=null;state.configView='form';configChanged();state.prefillBaseline=baseline ?? (detail.baseline_id || '');location.hash='#new';
 }
 function portableConfig(payload) {return {...payload.config,restart_target:payload.mode==='cold-start'?payload.restart_target:null};}
 function hasJsonChanges() {return state.jsonDraft!==null&&state.jsonDraft!==state.jsonBase;}
@@ -4952,7 +4959,7 @@ function discardConfig() {
   configChanged();state.jsonDraft=state.jsonBase;$('#config-editor').value=state.jsonDraft;configError();syncConfigView();
   scheduleRequestPlan();
 }
-async function applyConfig(text=state.jsonDraft,{importing=false}={}) {
+async function applyConfig(text=state.jsonDraft,{importing=false,intent}={}) {
   if(state.configBusy)return;
   const version=state.routeVersion,revision=state.configRevision;
   state.configBusy=true;configError();
@@ -4961,8 +4968,9 @@ async function applyConfig(text=state.jsonDraft,{importing=false}={}) {
     const parsed=JSON.parse(text);
     const localErrors=positiveBoundErrors(parsed,state.bootstrap.limits,state.bootstrap.cap_explanations);
     if(localErrors.length)throw Object.assign(new Error(localErrors[0].msg),{errors:localErrors});
+    intent ||= beginSetupIntent();
     const result=await api('/api/config/draft',{method:'POST',body:JSON.stringify(parsed)});
-    if(version!==state.routeVersion||revision!==state.configRevision)return;
+    if(!intent.current())return;
     captureFormDraft();
     replaceMigrationNotes(result.migration_notes,result.migration_warnings,result.migration_limit_notes);
     state.config=result.config;state.gatewayAccessDraft={};state.autoModel=null;invalidateModelDiscovery();state.datasetSelection=[];
@@ -4971,14 +4979,14 @@ async function applyConfig(text=state.jsonDraft,{importing=false}={}) {
     state.config.restart_target=null;
     state.jsonDraft=null;state.jsonBase=null;configChanged();
     renderNew();toast(importing?'Configuration imported.':'Configuration applied.');
-  }catch(error){if(version===state.routeVersion&&revision===state.configRevision){configError(error);if(!importing&&text===state.jsonDraft){state.jsonValidation={draft:text,revision,route:version,errors:error.errors?.length?error.errors:[{fields:['config'],msg:error.message}]};renderRequestPreview();}}}
+  }catch(error){if(!intent||intent.current()){configError(error);if(!importing&&text===state.jsonDraft){state.jsonValidation={draft:text,revision,route:version,errors:error.errors?.length?error.errors:[{fields:['config'],msg:error.message}]};renderRequestPreview();}}}
   finally{state.configBusy=false;}
 }
 async function importConfig(file) {
-  if(!file)return;
-  const version=state.routeVersion,revision=state.configRevision;
-  try{assertAppliedConfig();const text=await file.text();if(version!==state.routeVersion||revision!==state.configRevision)return;await applyConfig(text,{importing:true});}
-  catch(error){if(version===state.routeVersion)configError(error);}
+  if(!file||state.configBusy)return;
+  let intent;
+  try{assertAppliedConfig();intent=beginSetupIntent();const text=await file.text();if(!intent.current()||state.configBusy)return;await applyConfig(text,{importing:true,intent});}
+  catch(error){if(!intent||intent.current())configError(error);}
 }
 async function validatedSnapshot({draft=false}={}) {
   assertAppliedConfig();
