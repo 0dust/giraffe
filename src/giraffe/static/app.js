@@ -794,8 +794,75 @@ async function refreshStorage() {
   try{state.storage=await api('/api/storage');state.storageUnavailable=false;}
   catch{state.storage=null;state.storageUnavailable=true;}
 }
+// Reads and writes share a clock: arrival order alone cannot establish freshness.
+const runWrites=new Map(),runListReads=new Set(),runDetailReads=new WeakMap();
+let runWriteClock=0;
+function runWriteEntry(id){
+  if(!runWrites.has(id))runWrites.set(id,{sequence:0,pending:new Set(),readers:0,reads:new Set(),confirmed:0,comparison:0,keep:null,latestKeep:0,detail:null,detailStart:0,detailKept:false});
+  return runWrites.get(id);
+}
+function retireRunWrites(id,entry){
+  if(![...entry.reads].some(read=>read.start<entry.detailStart))entry.detail=null;
+  if(runWrites.get(id)===entry&&!entry.pending.size&&!entry.readers&&![...runListReads].some(start=>start<entry.confirmed))runWrites.delete(id);
+}
+function beginRunWrite(id,kind){
+  const entry=runWriteEntry(id),write={entry,kind,sequence:++entry.sequence};
+  entry.pending.add(write);
+  if(kind==='keep')entry.latestKeep=write.sequence;
+  return write;
+}
+function finishRunWrite(id,write){write.entry.pending.delete(write);retireRunWrites(id,write.entry);}
+function confirmRunWrite(id,write,value){
+  const entry=write.entry;
+  if(write.kind==='keep'&&entry.latestKeep!==write.sequence)return false;
+  entry.confirmed=++runWriteClock;
+  if(write.kind==='keep'){
+    entry.keep={at:entry.confirmed,value};
+    const row=state.runs.find(run=>run.id===id);if(row)row.kept=value;
+    if(state.detail?.id===id)state.detail.kept=value;
+  }else entry.comparison=entry.confirmed;
+  return true;
+}
+function keepPending(id){return [...(runWrites.get(id)?.pending||[])].some(write=>write.kind==='keep');}
+// Only older readers need a private, immutable snapshot of a newer payload.
+async function fetchRunDetail(id,{handoff=false}={}){
+  const entry=runWriteEntry(id),start=++runWriteClock,read={id,entry,start,handoff:false};
+  entry.readers++;entry.reads.add(read);
+  try{
+    let detail=await api(runPath(id));
+    // A pre-comparison read cannot be final. Reuse the newer refetch, or fetch now.
+    if(entry.comparison>start&&entry.detailStart<entry.comparison)detail=await fetchRunDetail(id);
+    if(entry.detailStart>start)detail=JSON.parse(entry.detail);
+    else {
+      entry.detailStart=start;entry.detailKept=detail.kept;
+      entry.detail=[...entry.reads].some(reader=>reader.start<start)?JSON.stringify(detail):null;
+    }
+    if(entry.keep&&entry.keep.at>entry.detailStart)detail.kept=entry.keep.value;
+    read.start=entry.detailStart;read.handoff=handoff;runDetailReads.set(detail,read);
+    if(handoff)entry.readers++;
+    return detail;
+  }finally{if(!read.handoff)entry.reads.delete(read);entry.readers--;retireRunWrites(id,entry);}
+}
+// Report consumers hold their reader through the await handoff, then reconcile before assignment.
+function reconcileRunDetail(detail){
+  const read=runDetailReads.get(detail);if(!read)return detail;
+  runDetailReads.delete(detail);
+  const {id,entry,start,handoff}=read;
+  try{
+    if(entry.detailStart>start)detail=JSON.parse(entry.detail);
+    if(entry.keep&&entry.keep.at>entry.detailStart)detail.kept=entry.keep.value;
+    return detail;
+  }finally{if(handoff){entry.reads.delete(read);entry.readers--;retireRunWrites(id,entry);}}
+}
 async function refreshRuns() {
-  const [runs]=await Promise.allSettled([api('/api/runs'),refreshStorage()]);
+  const start=++runWriteClock;runListReads.add(start);
+  let runs;
+  try{[runs]=await Promise.allSettled([api('/api/runs'),refreshStorage()]);
+    if(runs.status==='fulfilled')for(const row of runs.value.runs||[]){
+      const entry=runWrites.get(row.id),keep=entry?.keep;
+      if(keep&&keep.at>start)row.kept=entry.detailStart>keep.at?entry.detailKept:keep.value;
+    }
+  }finally{runListReads.delete(start);for(const [id,entry] of runWrites)retireRunWrites(id,entry);}
   if(runs.status==='rejected')throw runs.reason;
   const data=runs.value;state.runs=data.runs || [];state.diskActive=data.disk_active_id || null;setActive(data.active_run_id);$('#run-count').textContent=state.runs.length || '';renderRailRuns();return data;
 }
@@ -907,7 +974,7 @@ async function route() {
       const id=destination.id;updateNav('runs','Run detail');
       state.detail=null;
       $('#main').innerHTML='<div class="loading">Loading run…</div>';
-      const detail=await api(runPath(id));if(version!==state.routeVersion)return;
+      const detail=reconcileRunDetail(await fetchRunDetail(id,{handoff:true}));if(version!==state.routeVersion)return;
       state.detail=detail;state.failingRequestsOnly=false;state.mosaicPage=0;state.mosaicFollow=true;state.mosaicAutoFocus=null;state.selectedCheck=null;state.checkNavigatorOpen=false;state.tab='checks';state.comparisonFilter=null;state.comparisonCheck='all';reportView.id=null;renderDetail();enterRoute();if(destination?.section)revealReportSection(destination.section);
       if(reportView.tab==='performance'&&typeof fetch==='function')loadPerformance({force:true});
       if(destination?.requestId)await openRequest(destination.requestId);
@@ -942,7 +1009,7 @@ async function pollRunStatus(version,{schedule=true}={}) {
     const delta=await runEvents(id,state.statusRun.seq);
     if(version!==state.routeVersion||state.active!==id)return;
     if(delta.reset||delta.idle)delay=1800;
-    if(delta.reset)state.statusRun=await api(runPath(id));else mergeRunEvents(state.statusRun,delta);
+    if(delta.reset)state.statusRun=reconcileRunDetail(await fetchRunDetail(id,{handoff:true}));else mergeRunEvents(state.statusRun,delta);
     if(version!==state.routeVersion||state.active!==id)return;
     const saved=state.runs.find(run=>run.id===id);if(saved)saved.state=state.statusRun.state;
     if(!activeState(state.statusRun)){setActive(null);await refreshRuns();}
@@ -965,10 +1032,10 @@ async function pollDetail(version) {
     const delta=await runEvents(id,state.detail.seq);if(version!==state.routeVersion || state.detail?.id!==id || sequence<lastDetailSequence||reportRouteKey()!==key)return;
     if(!activeState(state.detail)&&activeState({state:delta.state}))return;
     const wasStopping=state.detail.state==='stopping';
-    let detail=delta.reset?await api(runPath(id)):mergeRunEvents(state.detail,delta);
+    let detail=delta.reset?reconcileRunDetail(await fetchRunDetail(id,{handoff:true})):mergeRunEvents(state.detail,delta);
     if(version!==state.routeVersion || state.detail?.id!==id || sequence<lastDetailSequence||reportRouteKey()!==key)return;
     const completed=!activeState(detail);
-    if(completed&&!delta.reset){detail=await api(runPath(id));if(version!==state.routeVersion||state.detail?.id!==id||sequence<lastDetailSequence||reportRouteKey()!==key)return;}
+    if(completed&&!delta.reset){detail=reconcileRunDetail(await fetchRunDetail(id,{handoff:true}));if(version!==state.routeVersion||state.detail?.id!==id||sequence<lastDetailSequence||reportRouteKey()!==key)return;}
     if(wasStopping&&activeState(detail))detail.state='stopping';
     if(['running','queued'].includes(detail.state)&&(epoch!==detailEpoch||state.stopPending?.id===id)){
       schedulePoll(pollDetail,version,500);return;
@@ -1003,7 +1070,7 @@ function storageLine() {
   if(policy.max_total_bytes!=null)rules.push(`oldest first to ${diskSize(policy.max_total_bytes)}`);
   return `<div class="storage-line"><p>${s?`Saved runs on disk: ${diskSize(s.runs_bytes)}${s.limits?.max_total_storage?` of ${diskSize(s.limits.max_total_storage)} limit`:' · no total limit'} · Baselines ${diskSize(s.baselines_bytes)}${s.baselines_shared_bytes?` (${diskSize(s.baselines_shared_bytes)} shared with source run)`:''} · Automatic cleanup: ${rules.length?escape(rules.join(' or ')):'off'}${s.last_auto_cleanup?.deleted?.length?` · Automatically deleted: ${s.last_auto_cleanup.deleted.map(escape).join(', ')}`:''}${s.last_auto_cleanup?.error?` · Automatic cleanup failed: ${escape(s.last_auto_cleanup.error)}`:''} · Free disk ${diskSize(s.free_bytes)}`:state.storageUnavailable?'Storage information unavailable':'Saved runs on disk: loading…'}</p><button type="button" class="button small" data-action="storage-dialog">Clean up…</button></div>`;
 }
-function keepButton() {return `<button type="button" class="button small" data-action="keep-run"${state.keepPending?.id===state.detail.id?' disabled aria-busy="true"':''} aria-pressed="${Boolean(state.detail.kept)}">${state.detail.kept?'Kept — protected from cleanup':'Keep run'}</button>`;}
+function keepButton() {return `<button type="button" class="button small" data-action="keep-run"${keepPending(state.detail.id)?' disabled aria-busy="true"':''} aria-pressed="${Boolean(state.detail.kept)}">${state.detail.kept?'Kept — protected from cleanup':'Keep run'}</button>`;}
 function openStorageDialog() {
   state.cleanup={revision:0,preview:null,busy:false};
   const dialog=$('#storage-dialog');
@@ -1049,13 +1116,12 @@ async function confirmCleanup() {
   finally{current.busy=false;if(state.cleanup===current)$('#cleanup-preview-button').disabled=false;}
 }
 async function toggleKept() {
-  const detail=state.detail,id=detail.id;if(state.keepPending?.id===id)return;
-  const t=reportToken(),p=state.keepPending={id};
-  if(state.keptOverride?.id===id)state.keptOverride=null;
+  const detail=state.detail,id=detail.id;if(keepPending(id))return;
+  const t=reportToken(),write=beginRunWrite(id,'keep');
   $('[data-action="keep-run"]').disabled=true;
-  try{const result=await api(`${runPath(id)}/keep`,{method:'POST',body:JSON.stringify({keep:!detail.kept})});if(reportStillShown(t))state.detail.kept=result.kept;else state.keptOverride={id,kept:result.kept,version:state.routeVersion};}
-  catch(error){if(sameReportVisit(t))toast(error.message);}
-  finally{if(state.keepPending===p)state.keepPending=null;if(reportStillShown(t))renderDetail();}
+  try{const result=await api(`${runPath(id)}/keep`,{method:'POST',body:JSON.stringify({keep:!detail.kept})});confirmRunWrite(id,write,result.kept);}
+  catch(error){if(sameReportVisit(t)&&write.entry.latestKeep===write.sequence)toast(error.message);}
+  finally{finishRunWrite(id,write);if(reportStillShown(t))renderDetail();}
 }
 function cleanupResultNotice() {
   const result=state.cleanupResult;if(!result)return '';
@@ -4209,8 +4275,6 @@ function renderDetail() {
   cancelStopConfirmationTimer();
   state.reportRouteActive=true;
   const d=state.detail;
-  if(state.keptOverride&&state.keptOverride.version!==state.routeVersion)state.keptOverride=null;
-  if(state.keptOverride?.id===d.id){d.kept=state.keptOverride.kept;state.keptOverride=null;}
   syncReportView();
   if(state.liveError&&(state.liveError.id!==d.id||d.state==='stopping'||!activeState(d)))state.liveError=null;
   if(state.stopPending&&(state.stopPending.id!==d.id||d.state==='stopping'||!activeState(d)))state.stopPending=null;
@@ -4880,11 +4944,13 @@ async function compareSavedRun(event) {
   if(state.detail?.id!==id||pendingComparisons.has(id))return;
   const button=form.querySelector('[type="submit"]'),error=form.querySelector('#comparison-error');
   pendingComparisons.add(id);
+  const write=beginRunWrite(id,'compare');
   button.disabled=true;error.hidden=true;
   try {
     const result=await api(`${runPath(id)}/compare`,{method:'POST',body:JSON.stringify({baseline_id:new FormData(form).get('baseline_id')})});
-    if(!reportStillShown(t))return;
-    const detail=await api(runPath(id));
+    confirmRunWrite(id,write);
+    if(!reportStillShown(t)&&!write.entry.readers)return;
+    const detail=reconcileRunDetail(await fetchRunDetail(id,{handoff:true}));
     if(!reportStillShown(t))return;
     state.detail=detail;state.comparisonFilter=null;state.comparisonCheck='all';state.tab='baseline';
     reportView.performance=null;reportView.pending=false;reportView.lastFetch=0;reportView.sequence++;
@@ -4899,7 +4965,7 @@ async function compareSavedRun(event) {
     }
     if(sameReportVisit(t))toast(result.warning||'Comparison saved. No new requests were sent.');
   }catch(failure){if(sameReportVisit(t)){error.textContent=failure.message;error.hidden=false;}}
-  finally{pendingComparisons.delete(id);button.disabled=false;}
+  finally{pendingComparisons.delete(id);finishRunWrite(id,write);button.disabled=false;}
 }
 async function saveBaseline(event){
   event.preventDefault();

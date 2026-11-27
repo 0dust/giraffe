@@ -11,7 +11,9 @@ import pytest
 from giraffe.capabilities import capabilities
 
 
-def run_render_checks(assertions: str, *, dom: bool = False, timeout_seconds: int = 60) -> None:
+def run_render_checks(
+    assertions: str, *, dom: bool = False, timeout_seconds: int = 60, strict: bool = False
+) -> None:
     node = shutil.which("node")
     if not node:
         pytest.skip("Node is needed to execute browser result rendering")
@@ -30,7 +32,7 @@ const context={assert,structuredClone,...formConfig,bootstrap,nodes,listeners,wa
 if(USE_DOM){context.document=browserDOM(listeners);context.location={hash:'#runs/live'};context.setTimeout=()=>{};context.clearTimeout=()=>{};context.window.innerWidth=1280;context.window.innerHeight=800;context.window.matchMedia=()=>({matches:false});nodes['#main']=context.document.querySelector('#main');}
 const source=fs.readFileSync(APP_PATH,'utf8')
   .replace(/^import .*?;\n/,'').replace(/\ninit\(\);\s*$/,'');
-vm.runInNewContext(source+`
+vm.runInNewContext((STRICT_MODE ? "'use strict';" : '')+source+`
 state.bootstrap=bootstrap;
 function check(id,status,extra={}) {
   return {id,target:'local',title:id+' check',status,required:true,
@@ -47,7 +49,7 @@ function detail(value,extra={}) {
   state.tab='checks';state.selectedCheck=null;renderDetail();return nodes['#main'].innerHTML;
 }
 `+ASSERTIONS,context);
-""".replace("DOM_PATH", json.dumps((Path(__file__).parent / "ui_dom.mjs").as_uri())).replace("USE_DOM", "true" if dom else "false").replace("APP_PATH", json.dumps(str(app))).replace(
+""".replace("DOM_PATH", json.dumps((Path(__file__).parent / "ui_dom.mjs").as_uri())).replace("USE_DOM", "true" if dom else "false").replace("STRICT_MODE", "true" if strict else "false").replace("APP_PATH", json.dumps(str(app))).replace(
         "ASSERTIONS", json.dumps(assertions)
     ).replace("BOOTSTRAP", json.dumps(capabilities())).replace("FORM_PATH", json.dumps(app.with_name("form-config.mjs").as_uri()))
     result = subprocess.run(
@@ -221,7 +223,7 @@ def test_saved_comparison_failure_releases_pending_and_respects_navigation(phase
 
 
 @pytest.mark.parametrize("phase", ["post", "detail"])
-def test_saved_comparison_ignores_success_after_navigation(phase):
+def test_saved_comparison_only_finishes_started_read_after_navigation(phase):
     run_render_checks(r"""
 (async()=>{
   const phase=PHASE;
@@ -239,7 +241,9 @@ def test_saved_comparison_ignores_success_after_navigation(phase):
   const saving=compareSavedRun({preventDefault(){},target:dialog.querySelector('form')});
   await Promise.resolve();await Promise.resolve();
   state.routeVersion++;state.detail={...initial,id:'another-run'};
-  resolve({...initial,baseline_id:'reference'});await saving;
+  const finish=resolve;
+  if(phase==='post')api=async()=>{detailReads++;return {...initial,baseline_id:'reference'};};
+  finish({...initial,baseline_id:'reference'});await saving;
   assert.equal(state.detail.id,'another-run');
   assert.equal(detailReads,phase==='post'?0:1);
   dialog.close();state.routeVersion++;state.detail=initial;
@@ -964,6 +968,8 @@ def test_saved_comparison_reply_respects_report_and_dialog(mode, phase):
   if(path==='/api/baselines')return {baselines:[{id:'reference',name:'Reference'}]};
   if(path.endsWith('/compare')){reading=true;return PHASE==='post'?pending.promise:{};}
   if(reading&&path==='/api/runs/saved-run'&&PHASE==='detail'){reading=false;return pending.promise;}
+  // A return GET issued after the POST confirmation reads the saved server state.
+  if(path==='/api/runs/saved-run'&&PHASE==='detail')return {...initial,baseline_id:'reference'};
   return navigationReply(path);
  };
  await openComparisonDialog();const dialog=$('#comparison-dialog');

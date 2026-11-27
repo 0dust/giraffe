@@ -150,7 +150,7 @@ def test_keep_reply_respects_report_navigation_and_blocks_duplicate(mode, fails)
  await toggleKept();assert.equal(posts,1);
  await navigate(MODE);const main=$('#main'),writes=reportRenders,before=main.innerHTML;
  if(FAILS)pending.reject(Error('Keep failed'));else pending.resolve({kept:true});
- await saving;assert.equal(state.keepPending,null);
+ await saving;assert.equal(keepPending(initial.id),false);
  assert.equal(messages.length,FAILS&&['C','T'].includes(MODE)?1:0);
  if(['C','T','L'].includes(MODE)){
   assert(reportRenders>writes);
@@ -198,24 +198,24 @@ def test_keep_success_during_return_refetch_is_applied_once(post_first):
  const entering=POST_FIRST?null:route();
  if(!POST_FIRST)assert.equal(state.detail,null);
  post.resolve({kept:true});await saving;
- assert.equal(state.keptOverride.kept,true);
- assert.equal(state.keptOverride.version,state.routeVersion);
+ if(POST_FIRST)assert.equal(runWrites.has(initial.id),false);
+ else assert.equal(runWrites.get(initial.id).keep.value,true);
  let entry=entering;
  if(POST_FIRST){location.hash='#runs/saved-run';returning=true;entry=route();}
  get.resolve({...initial,kept:false});await entry;
- assert.equal(state.detail.kept,!POST_FIRST);assert.equal(state.keptOverride,null);
+ assert.equal(state.detail.kept,!POST_FIRST);
  assert.match($('[data-action="keep-run"]').textContent,POST_FIRST?/Keep run/:/Kept — protected/);
  assert.equal(messages.length,0);
- // A later explicit action clears any deferred override for this run.
- state.keptOverride={id:'saved-run',kept:true,version:state.routeVersion};api=async()=>({kept:false});
- await toggleKept();assert.equal(state.keptOverride,null);assert.equal(state.detail.kept,false);
+ // A later explicit action confirms the next value for this run.
+ api=async()=>({kept:false});
+ await toggleKept();assert.equal(runWrites.has(initial.id),false);assert.equal(state.detail.kept,false);
  renderDetail();assert.match($('[data-action="keep-run"]').textContent,/Keep run/);
 })()
 """.replace('POST_FIRST', json.dumps(post_first)), dom=True)
 
 
 
-def test_keep_override_from_abandoned_refetch_cannot_overwrite_later_visit():
+def test_keep_confirmation_from_abandoned_refetch_cannot_overwrite_later_visit():
     run_render_checks(REPORT_REPLY_SETUP + r"""
 (async()=>{
  const post=deferred(),oldGet=deferred();let reads=0;
@@ -227,14 +227,14 @@ def test_keep_override_from_abandoned_refetch_cannot_overwrite_later_visit():
  const saving=toggleKept();location.hash='#runs';await route();
  location.hash='#runs/saved-run';const abandoned=route();
  post.resolve({kept:true});await saving;
- assert.equal(state.keptOverride.version,state.routeVersion);
+ assert.equal(runWrites.get(initial.id).keep.value,true);
  const version=state.routeVersion;
  location.hash='#runs';await route();
  location.hash='#runs/saved-run';await route();
  assert(state.routeVersion>version);
- assert.equal(state.detail.kept,false);assert.equal(state.keptOverride,null);
+ assert.equal(state.detail.kept,false);
  assert.match($('[data-action="keep-run"]').textContent,/Keep run/);
  oldGet.resolve({...initial,kept:true});await abandoned;
- assert.equal(state.detail.kept,false);assert.equal(state.keptOverride,null);
+ assert.equal(state.detail.kept,false);
 })()
 """, dom=True)
