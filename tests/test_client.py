@@ -64,6 +64,36 @@ async def test_stream_options_follow_effective_stream_mode(
     assert request.options == (options if option_source == "request" else {})
 
 
+@pytest.mark.parametrize("stream", [False, True])
+async def test_ordinary_request_payload_preserves_reasoning_options(monkeypatch, stream):
+    calls = []
+
+    def respond(request):
+        calls.append(json.loads(request.content))
+        if stream:
+            chunk = {"choices": [{"delta": {"content": "42"}, "finish_reason": "stop"}]}
+            return httpx.Response(200, text=f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n",
+                                  headers={"content-type": "text/event-stream"})
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": "42"}, "finish_reason": "stop"}],
+        })
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(
+        transport=httpx.MockTransport(respond), **kw))
+    target = Target(name="local", url="http://local", model="test")
+    config = RunConfig(targets=[target], stream=stream, request_options={
+        "reasoning_effort": "low", "chat_template_kwargs": {"enable_thinking": False},
+    })
+    async with LLMClient(target, config) as client:
+        record = await client.execute(spec(stream=stream))
+
+    assert record.valid and record.output == "42"
+    assert len(calls) == 1
+    assert calls[0]["reasoning_effort"] == "low"
+    assert calls[0]["chat_template_kwargs"] == {"enable_thinking": False}
+
+
 async def test_ordinary_nonstream_json_keeps_existing_duplicate_member_handling(monkeypatch):
     body = (b'{"error":{"type":"upstream_failure"},"error":null,'
             b'"choices":[{"message":{"role":"assistant","content":"42"},"finish_reason":"stop"}]}')

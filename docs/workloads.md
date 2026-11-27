@@ -497,9 +497,28 @@ generation pace, while their saved timing and total usage remain readable.
 | `forced_tool_diagnostic` | Optional forced-selection probe when tool calling is selected | Diagnostic results appear separately. Forced success cannot establish automatic selection; forced failures do not independently fail automatic capability. |
 
 Conversation fixtures, modes, generation options, schedules and seeds contribute
-to the workload fixture hash in the manifest, together with a hash of the loaded
-workload generator source. Source changes conservatively prevent like-for-like
-baseline comparison even when settings stay the same. Live histories may change input
+to the workload fixture hash in the manifest, together with explicit versions in
+`src/giraffe/workload_versions.py`. The keys are `prefix`, `consistency`, `tools`,
+`fixed_sessions`, `session_plan`, `multi_user`, `gateway_access`, `gateway_policy`,
+`scale_down`, `load_test`, `logprob` and `tool_conversations`. Bump the relevant
+version when server-visible requests or schedules change; source formatting does
+not affect identity. Each request builder has its own key. `prefix` covers Prefix
+requests; `consistency` covers ordinary Answer consistency, while its logprob path
+uses only `logprob`. `tools` covers single-response tool requests, including forced
+diagnostics; conversation-only tool checks use only `tool_conversations`.
+`multi_user` covers population assignment, execution windows and ordered arrival
+(and burst/recovery) offers, plus generated per-user requests. Every selected
+Multi-user run includes it, including conversations that share the population
+and window planner and also use the session builders. `load_test` guards both
+final requests and dispatch arrival schedules across independent settings sources.
+Core built-in fixtures have their own `builtin_sha256`; no shared `generator` key
+is needed. Full and shared identities use the same consumer rule.
+`fixed_sessions` covers name-recall prompts in Sessions and Multi-user conversations
+with `profile: correctness`, including both fixed and live history modes.
+`session_plan` covers performance Sessions, sampled correctness Sessions, and all
+Multi-user conversations, including configurations without sampling. Standalone
+correctness Sessions without sampling bypass the planner and omit its key.
+Live histories may change input
 work across runs: comparison checks observed input lengths and request hashes and
 marks affected timing/rates inconclusive rather than claiming identical inputs.
 Optional `consistency.logprobs` collects and compares content token probabilities
@@ -1224,7 +1243,7 @@ Each user alternates the selected modes across fresh conversations. Fixed histor
 
 A failed, cancelled or truncated turn stops its conversation without a substitute answer. Truncated conversation output counts as partial output and a request error; it cannot qualify as valid delivered work. The user can then start a fresh conversation, subject to the shared budgets and stop rules. If no turn can be dispatched (for example, its first prompt exceeds the history admission ceiling), that user stops instead of repeatedly attempting the same impossible history. Every conversation has a distinct ID and request/turn links under the same user. Conversation summaries and links survive response retention. Copied live assistant replies are omitted from saved request inputs unless `retention: all`; bodies kept by `retention: failures` remain attached to their original requests. Existing Sessions counts and concurrency semantics remain unchanged.
 
-Reproduction and baseline identity include fairness criteria, comparability tolerance, conversation settings and generator sources. Changed work or window policies cannot pass a baseline comparison. Live history can vary between runs; actual shape and hash evidence remain authoritative.
+Reproduction and baseline identity include fairness criteria, comparability tolerance, conversation settings and selected workload versions. Changed work or window policies cannot pass a baseline comparison. Live history can vary between runs; actual shape and hash evidence remain authoritative.
 
 ### Matched noisy neighbors
 

@@ -10,6 +10,15 @@ from giraffe.scale_down import ScaleDownController
 from giraffe.web import _RunThread
 
 
+def advance_scale_down(control, phase):
+    if phase in {"finalizing", "finished"}:
+        control.set_phase(phase)
+        return
+    phases = ("baseline", "waiting_for_output", "armed", "observing", "post_removal")
+    for next_phase in phases[phases.index(control.phase) + 1:phases.index(phase) + 1]:
+        control.set_phase(next_phase)
+
+
 def marker(control, **updates):
     return dict(event_id="remove-one", nonce=control.nonce, target="local", source="operator", **updates)
 
@@ -21,7 +30,7 @@ async def test_marker_is_accepted_on_worker_loop():
     async def operation(stop):
         nonlocal control
         control = ScaleDownController("report-id", "local", run_start=time.monotonic(), stop=stop)
-        control.set_phase("armed")
+        advance_scale_down(control, "armed")
         original = control.accept_marker
         def accept(value):
             observed.append(threading.get_ident())
@@ -54,7 +63,7 @@ async def test_timed_out_delivery_cannot_later_accept():
     async def operation(stop):
         nonlocal control
         control = ScaleDownController("report", "local", run_start=time.monotonic(), stop=stop)
-        control.set_phase("armed")
+        advance_scale_down(control, "armed")
         worker.bind_scale_down_control(control)
         ready.set()
         await stop.wait()
@@ -92,7 +101,7 @@ async def test_worker_rejects_inapplicable_markers(phase, change, reason):
     async def operation(stop):
         nonlocal control
         control = ScaleDownController("report", "local", run_start=time.monotonic(), stop=stop)
-        control.set_phase(phase)
+        advance_scale_down(control, phase)
         worker.bind_scale_down_control(control)
         ready.set()
         await stop.wait()
@@ -115,7 +124,7 @@ async def test_stop_racing_queued_marker_rejects():
     async def operation(stop):
         nonlocal control
         control = ScaleDownController("report", "local", run_start=time.monotonic(), stop=stop)
-        control.set_phase("armed")
+        advance_scale_down(control, "armed")
         worker.bind_scale_down_control(control)
         ready.set()
         await stop.wait()
@@ -155,7 +164,7 @@ async def test_api_marker_ack_status_and_job_identity(tmp_path, monkeypatch):
             return original(value)
         control.accept_marker = accept
         on_scale_down_control(control)
-        control.set_phase("armed")
+        advance_scale_down(control, "armed")
         # Later request progress must not erase the actionable control status.
         progress(dict(event="request_started", target="local", request_slot=0, scenario="warm"))
         await stop_event.wait()
@@ -166,7 +175,7 @@ async def test_api_marker_ack_status_and_job_identity(tmp_path, monkeypatch):
     values = config(checks=["scale_down"], scale_down={"target": "local"})
     async with browser(tmp_path) as client:
         identifier = await start(client, values)
-        detail = await detail_when(client, identifier, lambda d: d.get("scale_down_control"))
+        detail = await detail_when(client, identifier, lambda d: (d.get("scale_down_control") or {}).get("phase") == "armed")
         status = detail["scale_down_control"]
         assert status["run_id"] == "different-report-id" != identifier
         events_path = f"/api/runs/{identifier}/events"

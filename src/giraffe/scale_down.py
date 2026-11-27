@@ -7,6 +7,7 @@ import time
 from bisect import bisect_right
 from dataclasses import dataclass
 
+from . import states
 from .caps import MAX_SANITIZE_ITEMS
 from .client import REASONING_BUDGET_ERROR
 from .deployment import scale_down_enabled
@@ -459,8 +460,9 @@ class ScaleDownController:
                              phase=self.phase, acknowledgment=self._ack))
 
     def set_phase(self, phase):
-        if phase not in {"baseline", "waiting_for_output", "armed", "observing", "post_removal", "finalizing", "finished"}:
+        if phase not in states.SCALE_DOWN_PHASES:
             raise ValueError("Unknown scale-down phase")
+        states.check_scale_down_transition(self.phase, phase)
         self.phase = phase
         if self.on_change:
             self.on_change(self.status())
@@ -477,7 +479,7 @@ class ScaleDownController:
         except (ValidationError, TypeError, ValueError):
             return {**ack, "reason": "Invalid scale-down marker."}
         ack.update(event_id=marker["event_id"], marker=marker)
-        if self.stop.is_set() or self.phase in {"finalizing", "finished"}:
+        if self.stop.is_set() or self.phase in states.SCALE_DOWN_CLOSING_PHASES:
             ack["reason"] = "The scenario is stopping or finished."
         elif marker["nonce"] != self.nonce or marker["target"] != self.target:
             ack["reason"] = "Marker does not identify this active scenario."
@@ -497,10 +499,10 @@ class ScaleDownController:
 def ingest_deployment(run, target, evidence):
     """Consume append-only collector histories once, without another poller."""
     observation = run.observations[target]
-    states = getattr(run, "scale_down_ingestion", None)
-    if states is None:
-        states = run.scale_down_ingestion = {}
-    state = states.setdefault(target, {"payloads": set(), "deployment_history": 0,
+    ingestion = getattr(run, "scale_down_ingestion", None)
+    if ingestion is None:
+        ingestion = run.scale_down_ingestion = {}
+    state = ingestion.setdefault(target, {"payloads": set(), "deployment_history": 0,
                                       "scale_down_deployment_history": 0})
     rows = [observation.get("deployment")]
     for name in ("deployment_history", "scale_down_deployment_history"):
@@ -675,7 +677,7 @@ async def execute(run, target, client, fixtures, *, collector_task=None):
             stage_index=0, fixtures={}, execute=send,
             reserve_offer=lambda: not sending_done and run.reserve_offer(target.name),
             try_acquire=run.try_acquire_slot, release=run.release_slot,
-            stop_reason=lambda: None if reason() == "maximum request budget reached" else reason(),
+            stop_reason=lambda: None if reason() == states.STOP_REQUEST_BUDGET else reason(),
             deadline=deadline, limits=run.config.limits,
             spec_factory=lambda index: request_spec(followup_fixture, "followup"),
             check_id="scale_down", scenario="scale_down_followup", run_start=run.start,
@@ -729,7 +731,7 @@ async def execute(run, target, client, fixtures, *, collector_task=None):
             finish = min(deadline, time.monotonic()+settings.completion_seconds)
             while any(not task.done() for task in pending) and time.monotonic() < finish:
                 stop_reason = reason()
-                if stop_reason and stop_reason != "maximum request budget reached":
+                if stop_reason and stop_reason != states.STOP_REQUEST_BUDGET:
                     break
                 await pause()
         finally:
@@ -751,7 +753,7 @@ async def execute(run, target, client, fixtures, *, collector_task=None):
                    and not any((row.get("scale_down_lifecycle") or {}).get("collected_start_ms", -math.inf)
                                >= clients_completed_ms for row in history[collected:])):
                 stop_reason = reason()
-                if stop_reason and stop_reason != "maximum request budget reached":
+                if stop_reason and stop_reason != states.STOP_REQUEST_BUDGET:
                     break
                 await pause()
             ingest_deployment(run, target.name, evidence)

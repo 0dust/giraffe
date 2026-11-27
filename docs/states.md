@@ -140,6 +140,8 @@ Where you see it: `.scale-down-status.json` `phase`.
 | `finalizing` | `finished` |
 | `finished` | None |
 
+A phase write the table does not declare is still saved, and logged as a warning; the test suite fails on it.
+
 Phases normally follow the declared order. Cleanup may skip to `finalizing`; the runner can force `finished`.
 
 ## Reading states from a program

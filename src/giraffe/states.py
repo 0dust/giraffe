@@ -1,15 +1,10 @@
-"""Single source of truth for lifecycle vocabularies whose values are a public contract; see docs/states.md.
-
-Modules whose bytes are hashed into baseline workload identity (load_test, multi_user,
-scale_down, traffic, gateway_access, gateway_policy and others) keep inline copies of
-these literals: editing them would make saved baselines not comparable.
-"""
+"""Single source of truth for lifecycle vocabularies whose values are a public contract; see docs/states.md."""
 
 import logging
 from typing import Final
 
 logger = logging.getLogger(__name__)
-# Tests turn this on so an undeclared run-state write fails instead of logging.
+# Tests turn this on so an undeclared lifecycle write fails instead of logging.
 STRICT_TRANSITIONS = False
 
 
@@ -82,6 +77,18 @@ def check_run_transition(current: str | None, new: str | None) -> None:
     if new is None or run_transition_allowed(current, new) and new in RUN_TRANSITIONS:
         return
     message = f"Undeclared run state transition: {current!r} -> {new!r}"
+    if STRICT_TRANSITIONS:
+        raise AssertionError(message)
+    logger.warning(message)
+
+
+def check_scale_down_transition(current: str, new: str) -> None:
+    """Flag a phase write that SCALE_DOWN_TRANSITIONS does not declare."""
+    if new not in SCALE_DOWN_PHASES:
+        raise ValueError("Unknown scale-down phase")
+    if current == new or new in SCALE_DOWN_TRANSITIONS[current]:
+        return
+    message = f"Undeclared scale-down transition: {current!r} -> {new!r}"
     if STRICT_TRANSITIONS:
         raise AssertionError(message)
     logger.warning(message)

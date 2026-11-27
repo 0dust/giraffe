@@ -155,6 +155,10 @@ giraffe run --config giraffe.yaml \
 
 Giraffe reads the run settings from YAML; `--output` chooses where to save the results, and `--html` adds an HTML report.
 
+**Reasoning models:** set options such as `reasoning_effort` and
+`chat_template_kwargs` under YAML `request_options`; see
+[`examples/reasoning.yaml`](https://github.com/0dust/giraffe/blob/main/examples/reasoning.yaml).
+
 **Measuring generation pace:** Giraffe needs token counts at streamed answer
 boundaries, not just a final token total. When your server streams logprobs, as
 Ollama does, Giraffe detects this and uses them automatically. Otherwise, on a

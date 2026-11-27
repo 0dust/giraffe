@@ -130,10 +130,11 @@ def test_javascript_run_state_vocabulary(name):
 
 def test_scale_down_phase_vocabulary():
     assert set(states.SCALE_DOWN_PHASES[-2:]) == states.SCALE_DOWN_CLOSING_PHASES
-    # scale_down.py is source-hashed, so its own copy of the phase set stays inline.
-    source = (ROOT / "src" / "giraffe" / "scale_down.py").read_text()
-    for phase in states.SCALE_DOWN_PHASES:
-        assert f'"{phase}"' in source, phase
+    from giraffe.scale_down import ScaleDownController
+
+    controller = ScaleDownController("run", "target", run_start=0, stop=None)
+    with pytest.raises(ValueError, match="^Unknown scale-down phase$"):
+        controller.set_phase("unknown")
 
 
 def test_documented_vocabulary():
@@ -145,22 +146,11 @@ def test_documented_vocabulary():
             assert f"`{value}`" in documentation, (name, value)
 
 
-# Baseline comparability hashes the bytes of these modules (reporting.py and
-# runner.py workload identity), so any edit to them, even a literal-for-constant
-# swap, makes saved baselines for that workload not comparable. They keep
-# their inline literals on purpose.
-SOURCE_HASHED = {"load_test.py", "concurrent_load.py", "traffic.py", "multi_user.py",
-                 "multi_user_metrics.py", "session_sampling.py", "workloads.py",
-                 "gateway_access.py", "gateway_json.py", "gateway_policy.py",
-                 "gateway_response.py", "scale_down.py", "logprobs.py",
-                 "logprob_workload.py", "tool_conversations.py"}
-
-
 def test_stop_reasons_not_scattered():
     guarded = (states.STOP_REQUEST_BUDGET, states.STOP_MAX_DURATION,
                states.STOP_ERROR_THRESHOLD, states.STOP_CANCELLED_BY_USER)
     for path in (ROOT / "src" / "giraffe").glob("*.py"):
-        if path.name == "states.py" or path.name in SOURCE_HASHED:
+        if path.name == "states.py":
             continue
         occurrences = Counter(line.strip() for line in path.read_text().splitlines()
                               if any(f'"{value}"' in line for value in guarded))
@@ -179,6 +169,30 @@ def test_undeclared_run_transition_fails_in_tests_and_warns_in_production(monkey
     with caplog.at_level("WARNING", logger="giraffe.states"):
         states.check_run_transition("error", "completed")
     assert "Undeclared run state transition: 'error' -> 'completed'" in caplog.text
+
+
+def test_undeclared_scale_down_transition_fails_in_tests_and_warns_in_production(monkeypatch, caplog):
+    from giraffe.scale_down import ScaleDownController
+
+    assert states.STRICT_TRANSITIONS is True
+    controller = ScaleDownController("run", "target", run_start=0, stop=None)
+    for current, successors in states.SCALE_DOWN_TRANSITIONS.items():
+        for new in (current, *successors):
+            controller.phase = current
+            controller.set_phase(new)
+            assert controller.phase == new
+    for current, new in [("finished", "armed"), ("baseline", "observing")]:
+        controller.phase = current
+        with pytest.raises(AssertionError, match="Undeclared scale-down transition"):
+            controller.set_phase(new)
+        assert controller.phase == current
+    monkeypatch.setattr(states, "STRICT_TRANSITIONS", False)
+    with caplog.at_level("WARNING", logger="giraffe.states"):
+        for current, new in [("finished", "armed"), ("baseline", "observing")]:
+            controller.phase = current
+            controller.set_phase(new)
+            assert controller.phase == new
+            assert f"Undeclared scale-down transition: {current!r} -> {new!r}" in caplog.text
 
 
 @pytest.mark.parametrize("state", states.RUN_STATES)
