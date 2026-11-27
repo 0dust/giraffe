@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from giraffe import concurrent_load, load_test, multi_user, session_sampling, workloads
+from giraffe import concurrent_load, load_test, multi_user, runner, session_sampling, workloads
 from giraffe.deployment import fixture_hash
 from giraffe.fixtures import builtin_fixtures
 from giraffe.logprob_workload import logprob_fixtures
@@ -18,7 +18,7 @@ from giraffe.workload_versions import WORKLOAD_VERSIONS
 
 NONCE = "0" * 32
 PINNED = {
-    "generator": (1, "ed642bed3e3a013c33edb0fbbd2238e684095a64f1487fbbf21fa5cf6e5d9873"),
+    "generator": (1, "1327c00ca81d862e3685dc3f2aa49c941a849c5cbc20ae7e578192d1766c4253"),
     "fixed_sessions": (1, "84e2056aa1e6fb8068c2848480478dfdc4e39f41e1e66512d2d37a4a02815b1d"),
     "session_sampling": (1, "54c8029050f0f728e9d5a78f03c06d786c533d5154119bfb9855489dd5d130bc"),
     "multi_user": (1, "5f1f0f51dd70726696e20ce9f033c15bd2fdabc40fb97406ca6009769d987516"),
@@ -45,7 +45,23 @@ def _requests(specs):
 
 
 def _generator():
-    return {name: _requests(specs) for name, specs in builtin_fixtures(_config()).items()}
+    requests = {name: _requests(specs) for name, specs in builtin_fixtures(_config()).items()}
+    prefix = runner._check_config(_config(checks=["prefix"]), "prefix")
+    consistency = runner._check_config(_config(
+        checks=["consistency"],
+        consistency={"prompts_per_shape": len(workloads.COPY_PASSAGES) + 1,
+                     "shapes": ["short", "long"]},
+    ), "consistency")
+    requests["prefix"] = _requests(workloads.prefix_requests(prefix, nonce=lambda: NONCE))
+    requests["consistency"] = [_requests([spec]) for _, _, spec in workloads.consistency_requests(consistency)]
+    tools = runner._check_config(_config(checks=["tools"], forced_tool_diagnostic=True), "tools")
+    requests["tools"] = _requests([
+        workloads.tool_request(tools, fixture, mode, forced=forced)
+        for forced in (False, True)
+        for fixture in workloads.resolved_tool_fixtures(tools)
+        for mode in workloads.resolved_tool_modes(tools)
+    ])
+    return requests
 
 
 def _fixed_sessions():
@@ -317,3 +333,103 @@ def test_multi_user_session_sampling_version_follows_sampling(sampling, monkeypa
     monkeypatch.setitem(WORKLOAD_VERSIONS, "session_sampling", 2)
     after, _ = build_workload_identity(config)
     assert (fixture_hash(before) != fixture_hash(after)) is (sampling is not None)
+
+
+def test_generator_guard_covers_second_copy_passage(monkeypatch):
+    before = _generator()
+    passages = list(workloads.COPY_PASSAGES)
+    passages[1] = passages[1].replace("brass key", "glass key")
+    monkeypatch.setattr(workloads, "COPY_PASSAGES", tuple(passages))
+    assert fixture_hash(_generator()) != fixture_hash(before)
+
+
+def test_generator_guard_covers_same_length_label_change(monkeypatch):
+    before = _generator()
+    monkeypatch.setattr(workloads, "LABEL_INSTRUCTION", workloads.LABEL_INSTRUCTION.replace("K7P4", "K7P5"))
+    assert fixture_hash(_generator()) != fixture_hash(before)
+
+
+class CaptureRun:
+    def __init__(self, config):
+        self.config = config
+        self.records = []
+        self.requests = []
+        self.unfinished = {config.targets[0].name: set()}
+        self.observations = {config.targets[0].name: {}}
+        self.planned = []
+        self.finished = []
+
+    def allowed(self, target):
+        return True
+
+    def plan_condition(self, target, scenario, **kwargs):
+        self.planned.append(scenario)
+
+    def start_condition(self, target, scenario, *args, **kwargs):
+        self.planned.append(scenario)
+
+    def finish_condition(self, target, scenario, *args, **kwargs):
+        self.finished.append(scenario)
+
+    async def request(self, target, client, request, *, on_start=None):
+        from giraffe.models import RequestRecord
+
+        if on_start:
+            on_start()
+        self.requests.append(request.model_copy(deep=True))
+        record = RequestRecord(id=str(len(self.requests)), target=target.name,
+                               fixture_id=request.fixture_id, scenario=request.scenario,
+                               check_ids=request.check_ids, started_at="", status="completed",
+                               valid=True, output="K7P4")
+        self.records.append(record)
+        return record
+
+
+async def test_prefix_builder_matches_sent_requests(monkeypatch):
+    config = _config(checks=["prefix"], prefix={"prefix_chars": 128, "repeats": 3, "history_turns": 3},
+                     test_options={"prefix": {"max_output_tokens": 48, "request_timeout_seconds": 7}})
+    monkeypatch.setattr(workloads.uuid, "uuid4", lambda: SimpleNamespace(hex=NONCE))
+    run = CaptureRun(config)
+    await workloads.prefixes(run, config.targets[0], None)
+    expected = workloads.prefix_requests(runner._check_config(config, "prefix"), nonce=lambda: NONCE)
+    assert len(run.requests) == 9
+    assert _requests(run.requests) == _requests(expected)
+    # Admission and reporting metadata must survive extraction too.
+    assert run.requests == expected
+    assert run.planned == run.finished == ["prefix_shared", "prefix_independent", "prefix_history"]
+    history = run.requests[-3:]
+    assert [len(request.messages) for request in history] == [1, 3, 5]
+    assert history[-1].messages[1] == {"role": "assistant", "content": "K7P4"}
+
+
+async def test_consistency_builder_matches_sent_requests():
+    config = _config(checks=["consistency"], consistency={
+        "shapes": ["short", "long"], "prompts_per_shape": len(workloads.COPY_PASSAGES) + 1,
+        "levels": [2], "repetitions": 2, "temperature": .25, "seed": 17,
+    }, test_options={"consistency": {"max_output_tokens": 80, "request_timeout_seconds": 7}})
+    run = CaptureRun(config)
+    await workloads.consistency(run, config.targets[0], None, {})
+    expected = workloads.consistency_requests(runner._check_config(config, "consistency"))
+    for level in (1, 2):
+        first_per_prompt = {}
+        for request in run.requests:
+            if request.workload["level"] == level:
+                key = (request.workload["input_bucket"], request.workload["prompt_index"])
+                first_per_prompt.setdefault(key, request)
+        assert list(first_per_prompt) == [(shape, index) for shape, index, _ in expected]
+        assert _requests(first_per_prompt.values()) == _requests([spec for _, _, spec in expected])
+    assert run.planned == run.finished
+
+
+async def test_tool_builder_matches_sent_requests():
+    config = _config(checks=["tools"], forced_tool_diagnostic=True)
+    run = CaptureRun(config)
+    await workloads.tools(run, config.targets[0], None)
+    effective = runner._check_config(config, "tools")
+    expected = [workloads.tool_request(effective, fixture, mode, forced=forced)
+                for forced in (False, True)
+                for fixture in workloads.resolved_tool_fixtures(effective)
+                for mode in workloads.resolved_tool_modes(effective)]
+    assert len(run.requests) == 4
+    assert _requests(run.requests) == _requests(expected)
+    assert run.planned == run.finished
