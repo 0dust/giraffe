@@ -27,11 +27,12 @@ from . import __version__
 from .client import LLMClient, no_response_failure
 from .conditions import condition_aggregate, condition_for, request_status, scheduled_multi_user_window
 from .deployment import fixture_hash
-from .fixtures import (FIXTURE_VERSION, builtin_fixtures, load_custom_fixtures,
+from .fixtures import (FIXTURE_VERSION, builtin_fixtures as _builtin_fixtures, load_custom_fixtures,
                        score_response, traffic_fixtures, deterministic_options, reasoning_budget, TRUNCATED_ANSWER)
 from .identities import gateway_identities_only
 from .overlap import NEEDS_STREAM, max_evidenced_overlap, scheduling_delay_windows
 from .request_pack import pack_identity, pack_preview, pack_specs
+from .timeout_warning import TimeoutWatch, format_timeout_warning
 from .stats import percentile
 from .local_tokenizer import TokenizerUnavailable
 from .resources import PhaseSampler, SAMPLING, peak_rss_bytes
@@ -252,10 +253,34 @@ def _scenario_checks(spec):
 
 def _check_config(config: RunConfig, check_id: str) -> RunConfig:
     effective = config.effective_check(check_id)
-    return config.model_copy(update={
+    resolved = config.model_copy(update={
         key: Limits.model_validate(value) if key == "limits" else value
         for key, value in effective.items() if key in RunConfig.model_fields
     })
+    options = config.test_options.get(check_id)
+    resolved._request_timeout_check = check_id if options and options.request_timeout_seconds is not None else None
+    return resolved
+
+
+def builtin_fixtures(config):
+    """Keep timeout provenance with fixtures at their effective config boundary."""
+    fixtures = _builtin_fixtures(config)
+    check = config._request_timeout_check
+    return {key: [spec.model_copy(update={"deadline_source": "check" if check else "run",
+                                         "timeout_check": check}) for spec in specs]
+            for key, specs in fixtures.items()}
+
+
+def _response_config(config, *, initial=False):
+    response = config.effective_initial() if initial else config.effective_response()
+    resolved = config.model_copy(update={key: response[key] for key in
+                                        ("samples", "max_output_tokens", "request_timeout_seconds")})
+    candidates = (["access"] if initial and "access" in config.checks else
+                  [check for check in ("serving", "first_output") if check in config.checks])
+    resolved._request_timeout_check = next((check for check in candidates
+        if (options := config.test_options.get(check)) is not None
+        and options.request_timeout_seconds is not None), None)
+    return resolved
 
 
 class _Peak:
@@ -348,6 +373,7 @@ class _Run:
         for _ in range(pool_size):
             self.slots.put_nowait(None)
         self.records: list[RequestRecord] = []
+        self.timeout_watch = TimeoutWatch()
         self.record_sink = record_sink.get()
         from giraffe.logprobs import LogprobBudget
         self.logprob_budget = LogprobBudget()
@@ -760,6 +786,57 @@ class _Run:
             if not reserved:
                 self.release_slot()
 
+    def timeout_origin(self, spec):
+        """Validate producer provenance against the request's actual deadline."""
+        # These producers overwrite copied pack/fixture deadlines in build_spec.
+        if "multi_user" in spec.check_ids:
+            return "run", None, None
+        timeout = spec.request_timeout_seconds
+        if timeout is None:
+            return "run", None, None
+        if "load" in spec.check_ids or spec.deadline_source == "load":
+            source = (spec.load_point or {}).get("source", "native")
+            setting = "load_test.request_timeout_seconds"
+            settings = self.config.load_test
+            if source.startswith("legacy_"):
+                try:
+                    index = int(source.split("_")[1])
+                    settings = settings.migrated_tests[index].settings
+                except (ValueError, IndexError):
+                    return "run", None, None
+                setting = f"load_test.migrated_tests.{index}.settings.request_timeout_seconds"
+            if settings.request_timeout_seconds == timeout:
+                return "load", None, setting
+            return "run", None, None
+        if (spec.workload.get("request_source") == "custom_fixtures"
+                and spec._fixture_request_timeout_seconds == timeout):
+            return "run", None, (f"custom_fixtures ({self.config.custom_fixtures}, fixture {spec.fixture_id})"
+                                 ".request_timeout_seconds")
+        if spec.deadline_source is not None:
+            check = spec.timeout_check
+            options = self.config.test_options.get(check)
+            if (spec.deadline_source == "check" and check in self.config.checks and options is not None
+                    and options.request_timeout_seconds is not None
+                    and self.config.effective_check(check)["request_timeout_seconds"] == timeout):
+                return "check", check, None
+            return "run", None, None
+        if spec.scenario in {"initial", "readiness", "warm"}:
+            if spec.scenario in {"initial", "readiness"} and "access" in self.config.checks:
+                candidates = ["access"]
+            else:
+                candidates = [name for name in ("serving", "first_output") if name in self.config.checks]
+        else:
+            candidates = [name for name in spec.check_ids
+                          if name not in {"access", "serving", "first_output", "generation"}]
+            if "generation" in spec.check_ids:
+                candidates.append("generation")
+        for check in candidates:
+            options = self.config.test_options.get(check)
+            if (check in self.config.checks and options is not None and options.request_timeout_seconds is not None
+                    and self.config.effective_check(check)["request_timeout_seconds"] == timeout):
+                return "check", check, None
+        return "run", None, None
+
     async def request(self, target, client, spec, event=None, on_start=None, timeout_override=None,
                       *, slot_reserved=False, budget_reserved=False, deadline_override=None,
                       admission_deadline=None, prepared_admission=False, admission_check=None,
@@ -775,6 +852,9 @@ class _Run:
         ``admission_check`` checks caller-owned eligibility before committing an attempt.
         ``on_preparation_failure`` can read a client diagnostic without recording an attempt.
         """
+        source, timeout_check, timeout_setting = self.timeout_origin(spec)
+        spec = spec.model_copy(update={"deadline_source": source, "timeout_check": timeout_check,
+                                       "timeout_setting": timeout_setting})
         check_ids = [name for name in spec.check_ids if name in self.config.checks
                      and (not _stress(spec.scenario) or name not in {"access", "serving", "first_output", "generation"})
                      and (name != "generation" or spec.scenario == "generation")
@@ -838,6 +918,10 @@ class _Run:
             start_progress_error = None
             completed_before_progress = None
             overlap = 0
+
+            def intentional_deadline_expired():
+                return (intentional_deadline_applies and not global_deadline
+                        and deadline is not None and deadline.expired())
 
             def preparation_failure(kind):
                 if task.cancelling() > cancellations:
@@ -962,7 +1046,7 @@ class _Run:
                 elif deadline.expired():
                     record.status, record.valid = ("cancelled" if global_deadline else "timeout"), False
                     record.error = states.STOP_MAX_DURATION if global_deadline else (
-                        "intentional request deadline" if timeout_override else "request deadline exceeded")
+                        "intentional request deadline" if intentional_deadline_expired() else "request deadline exceeded")
             except _DispatchRefused:
                 return None
             except (asyncio.CancelledError, TimeoutError) as exc:
@@ -1024,6 +1108,15 @@ class _Run:
             record.completed_at = completed_before_progress[0] if completed_before_progress else _now()
             record.identity = spec.identity
             record.request_timeout_seconds = spec.request_timeout_seconds or self.config.request_timeout_seconds
+            record.deadline_source = spec.deadline_source
+            record.timeout_check = spec.timeout_check
+            record.timeout_setting = spec.timeout_setting
+            record._request_slot = request_slot
+            if (spec.deadline_source == "run" and spec.timeout_setting is not None
+                    and spec.workload.get("request_source") == "custom_fixtures"
+                    and spec._fixture_request_timeout_seconds == record.request_timeout_seconds):
+                record._timeout_fixture = {"setting": spec.timeout_setting, "file": self.config.custom_fixtures,
+                    "fixture_id": spec.fixture_id, "field": "request_timeout_seconds"}
             if record.status in {"timeout", "cancelled"}:
                 try:
                     reason = self.stop_reason(target.name)
@@ -1050,9 +1143,10 @@ class _Run:
                 elif self.endpoint_health[target.name]["abort_reason"]:
                     record.termination_reason, record.termination_limit_seconds = "endpoint_unresponsive", self.config.unresponsive_for_seconds
                     record.error = self.endpoint_health[target.name]["abort_reason"]
-                elif intentional_deadline_applies and deadline is not None and deadline.expired():
+                elif intentional_deadline_expired():
                     record.termination_reason = "intentional_deadline"
                     record.termination_limit_seconds = timeout
+                    record.error = "intentional request deadline"
                 elif record.status == "timeout" and record.termination_reason in {None, "external_cancellation"}:
                     record.termination_reason = "request_timeout"
                     record.termination_limit_seconds = record.request_timeout_seconds
@@ -1078,7 +1172,7 @@ class _Run:
             intentional = (record.status == "cancelled" and record.termination_reason in {
                 "generation_chunk_limit", "intentional_cancellation", "intentional_cancellation_deadline",
             }) or (
-                timeout_override is not None and record.status == "timeout")
+                record.status == "timeout" and record.termination_reason == "intentional_deadline")
             record.intentional = intentional
             propagating_error = False
             try:
@@ -1133,6 +1227,12 @@ class _Run:
                         condition["reason"] = self.condition_reason(target.name)
                 # Live visualization gets measurements only, never retained response bodies.
                 try:
+                    warning = self.timeout_watch.observe(record, (time.monotonic() - self.start),
+                        readiness=readiness, evidence_probe=evidence_probe)
+                    if warning is not None:
+                        self.observations[target.name]["timeout_warnings"] = [
+                            item for item in self.timeout_watch.warnings if item["target"] == target.name][-16:]
+                        self.emit("timeout_warning", target.name, spec.scenario, timeout_warning=warning)
                     self.emit("request_completed", target.name, spec.scenario, status=record.status,
                               condition_id=condition_id, condition_summary=dict(condition) if condition else None,
                               input_chars=request_parameters["input_chars"], requested_max_tokens=output_cap,
@@ -1503,8 +1603,7 @@ async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attributio
                     run, target, stop_event=telemetry_stop))
             restart = run.observations[target.name]["restart"]
             if enabled & {"access", "serving", "first_output", "generation"} or restart:
-                response = config.effective_initial()
-                response_config = config.model_copy(update={key: response[key] for key in ("samples", "max_output_tokens", "request_timeout_seconds")})
+                response_config = _response_config(config, initial=True)
                 initial_specs = builtin_fixtures(response_config)["short"]
                 if restart and restart["status"] == "hook_completed":
                     ready_deadline = min(run.deadline, time.monotonic() + config.readiness_timeout_seconds)
@@ -1571,9 +1670,9 @@ async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attributio
             run.observations[target.name]["deployment"]["model_residency"]["after_preparation"] = (
                 await deployment.model_residency(target, config, deadline=run.deadline, stop=run.stop))
             if enabled & {"serving", "first_output"}:
-                response = config.effective_response()
-                response_specs = builtin_fixtures(config.model_copy(update={key: response[key] for key in ("samples", "max_output_tokens", "request_timeout_seconds")}))["short"]
-                await run.group(target, client, response_specs, "warm", count=response["samples"])
+                response_config = _response_config(config)
+                response_specs = builtin_fixtures(response_config)["short"]
+                await run.group(target, client, response_specs, "warm", count=response_config.samples)
             run.finish_checks(target.name, {"serving", "first_output"})
             if "generation" in enabled:
                 effective = _check_config(config, "generation")
@@ -1611,6 +1710,12 @@ async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attributio
                         # Explicit custom request settings belong to their fixture.
                         check_fixtures[check_id].extend(spec.model_copy(update={
                             "max_tokens": spec.max_tokens if spec.max_tokens is not None else effective.max_output_tokens,
+                            "deadline_source": ("run" if spec.request_timeout_seconds is not None
+                                                else "check" if effective._request_timeout_check else "run"),
+                            "timeout_check": (None if spec.request_timeout_seconds is not None
+                                              else effective._request_timeout_check),
+                            "timeout_setting": (f"custom_fixtures ({config.custom_fixtures}, fixture {spec.fixture_id}).request_timeout_seconds"
+                                                if spec.request_timeout_seconds is not None else None),
                             "request_timeout_seconds": (spec.request_timeout_seconds if spec.request_timeout_seconds is not None
                                                         else effective.request_timeout_seconds)})
                             for spec in fixtures[check_id] if spec.workload.get("request_source") == "custom_fixtures")
@@ -1684,7 +1789,10 @@ async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attributio
                     "allowance": allowance, "reserved_later": reserved,
                     "policy": "reserve fixed later work and probes; half quota cap only with later checks"}
                 heavy = traffic_fixtures(effective)
-                heavy_specs = heavy["long_input"] + heavy["long_output"]
+                heavy_specs = [spec.model_copy(update={
+                    "deadline_source": "check" if effective._request_timeout_check else "run",
+                    "timeout_check": effective._request_timeout_check})
+                    for spec in heavy["long_input"] + heavy["long_output"]]
                 end = min(run.deadline, time.monotonic() + effective.sustained_seconds)
                 dispatched, exhausted = 0, False
                 async def worker():
@@ -3257,6 +3365,7 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
     warnings = ["Other traffic on the target is unknown; results cover only the recorded workload.",
                 "Backend/replica identity is unverified unless explicitly reported by the server; a service URL does not establish complete replica coverage."]
     warnings.extend(model_identity_warnings(config, run.records))
+    warnings.extend(format_timeout_warning(warning) for warning in run.timeout_watch.warnings)
     if run.memory_limit_reached:
         warnings.append("Maximum memory (RAM growth during this run) was exceeded." +
             (" Unfinished checks were interrupted." if run.memory_interrupted_checks else " No check was interrupted."))

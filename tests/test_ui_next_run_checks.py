@@ -51,6 +51,7 @@ assert.equal(document.querySelectorAll('[data-action="choose-next-checks"]').len
 
 def test_click_restores_saved_configuration_and_resets_browse_state():
     browser_logic(r'''
+api=async(path,options)=>{assert.equal(path,'/api/config/draft');return {config:JSON.parse(options.body),migration_notes:[]};};
 const saved=structuredClone(config);saved.targets[0].url='http://saved.example/v1';saved.targets[0].model='saved-model';
 saved.checks=['generation','json'];saved.restart_target='local';
 state.detail={state:'completed',report:{manifest:{config:saved}},config:config,baseline_id:'saved-baseline'};
@@ -100,6 +101,7 @@ await page.run(`
 (async()=>{
  const saved=structuredClone(state.config);saved.targets[0].model='saved-model';
  state.detail={report:{manifest:{config:saved}}};
+ api=async(path,options)=>{assert.equal(path,'/api/config/draft');return {config:JSON.parse(options.body),migration_notes:[]};};
  await rerun({step:2});
  let rendered=false,focused=0,scrolled=0;
  renderNew=()=>{assert.equal(state.focusSetupOnEntry,false);rendered=true;};
@@ -117,6 +119,7 @@ await page.run(`
 
 def test_step_two_requires_a_model_on_every_target():
     browser_logic(r"""
+api=async(path,options)=>{assert.equal(path,'/api/config/draft');return {config:JSON.parse(options.body),migration_notes:[]};};
 const saved=structuredClone(config);
 saved.targets[0].model='first-model';
 saved.targets.push({...saved.targets[0],name:'second',model:''});

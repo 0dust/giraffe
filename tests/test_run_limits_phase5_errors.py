@@ -157,27 +157,45 @@ def test_direct_pydantic_traffic_error_has_structured_context_without_web_depend
 
 
 @pytest.mark.parametrize("legacy_metadata", [False, True])
-async def test_capacity_estimate_is_advisory_for_actual_requests_and_baseline_matching(monkeypatch, legacy_metadata, local_tokenizer):
+def test_capacity_estimate_is_advisory_for_actual_requests_and_baseline_matching(monkeypatch, legacy_metadata, local_tokenizer):
     from giraffe import runner
+    from giraffe.load_test import load_time_plan
     from giraffe.reporting import _settings_reasons
     from tests.test_runner import FakeClient
+    from tests.virtual_clock import run_virtual
 
     monkeypatch.setattr(runner, "LLMClient", FakeClient)
-    values = config(traffic={"rates": [40], "duration_seconds": .03})
-    original = RunConfig.model_validate(values)
-    estimated = RunConfig.model_validate({**values, "traffic": {**values["traffic"], "expected_response_seconds": 2}})
-    reference = await runner.run_suite(original)
-    current = await runner.run_suite(estimated)
-    assert [(record.fixture_id, record.scenario, record.input_chars, record.requested_max_tokens)
-            for record in current.requests] == [
-           (record.fixture_id, record.scenario, record.input_chars, record.requested_max_tokens)
-            for record in reference.requests]
-    if legacy_metadata:
-        reference.manifest["config"]["traffic"] = dict(values["traffic"])
-        reference.manifest["effective_traffic"] = dict(values["traffic"])
-    before = reference.model_dump_json()
-    assert _settings_reasons(current, reference) == []
-    assert reference.model_dump_json() == before
+
+    async def scenario():
+        values = config(traffic={"rates": [40], "duration_seconds": .03})
+        original = RunConfig.model_validate(values)
+        estimated = RunConfig.model_validate({**values, "traffic": {**values["traffic"], "expected_response_seconds": 2}})
+        reference = await runner.run_suite(original)
+        current = await runner.run_suite(estimated)
+        reference_load = next(c for c in reference.checks if c.id == "load")
+        current_load = next(c for c in current.checks if c.id == "load")
+        assert [[(o["offset_seconds"], o["origin"], o["burst_index"], o["shape"])
+                 for o in p["offers"]] for p in current_load.metrics["points"]] == [
+               [(o["offset_seconds"], o["origin"], o["burst_index"], o["shape"])
+                 for o in p["offers"]] for p in reference_load.metrics["points"]]
+        expected_offers = load_time_plan(original.load_test)["expected_scheduled_requests"]
+        for load in (reference_load, current_load):
+            offers = [o for p in load.metrics["points"] for o in p["offers"]]
+            assert len(offers) == expected_offers
+            assert {o["outcome"] for o in offers} == {"started"}
+        assert [(record.fixture_id, record.scenario, record.input_chars, record.requested_max_tokens)
+                for record in current.requests] == [
+               (record.fixture_id, record.scenario, record.input_chars, record.requested_max_tokens)
+                for record in reference.requests]
+        assert len(current.requests) == len(reference.requests) == 40
+        if legacy_metadata:
+            reference.manifest["config"]["traffic"] = dict(values["traffic"])
+            reference.manifest["effective_traffic"] = dict(values["traffic"])
+        before = reference.model_dump_json()
+        assert _settings_reasons(current, reference) == []
+        assert reference.model_dump_json() == before
+
+    run_virtual(monkeypatch, scenario())
 
 
 @pytest.mark.parametrize("rates", [[0], [-1], [10001], [50, 50], [100, 50]])
