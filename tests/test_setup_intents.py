@@ -204,3 +204,83 @@ const workspace=state.setupWorkspace,before=snapshot();
 await settle(0,SUCCESS);await pending;
 assert.equal(snapshot(),before);assert.equal(state.setupWorkspace,workspace);assert.deepEqual(toasts,[]);
 """, ACTION=action, TRANSITION=transition, SUCCESS=success)
+
+
+FOCUS_HARNESS = r'''
+let settingFocus=[],stepFocus=[];
+updateNav=()=>{};enterRoute=()=>{};
+focusSetting=(path,options)=>settingFocus.push({path,...options});
+syncSetupStep=options=>{if(options?.focus)stepFocus.push(state.setupStep);};
+nodes['#main']={innerHTML:''};
+refreshRuns=async()=>{};renderRuns=()=>{};
+'''
+
+
+def test_timeout_rerun_focuses_setting_once_on_new_entry():
+    run_script(FOCUS_HARNESS + r'''
+const pending=rerun({focusPath:'load_test.request_timeout_seconds'});
+assert.equal(pendingTimeoutSetting,null);
+await settle(0,true);await pending;
+assert.equal(location.hash,'#new');
+assert.equal(pendingTimeoutSetting,'load_test.request_timeout_seconds');
+await route();
+assert.deepEqual(settingFocus,[{path:'load_test.request_timeout_seconds',explicit:true}]);
+assert.deepEqual(stepFocus,[]);assert.equal(pendingTimeoutSetting,null);
+await route();assert.equal(settingFocus.length,1);
+''')
+
+
+@pytest.mark.parametrize('replacement', ['new', 'away'])
+@pytest.mark.parametrize('success', [False, True])
+def test_superseded_timeout_rerun_cannot_focus_later_entry(replacement, success):
+    run_script(FOCUS_HARNESS + r'''
+const pending=rerun({focusPath:'load_test.request_timeout_seconds'});
+let newer;
+if(REPLACEMENT==='new')newer=startNewRun();
+else {location.hash='#runs';await route();}
+await settle(0,SUCCESS);await pending;
+assert.equal(pendingTimeoutSetting,null);assert.deepEqual(toasts,[]);
+if(newer){await settle(1,true);await newer;}
+location.hash='#new';await route();
+assert.deepEqual(settingFocus,[]);assert.equal(pendingTimeoutSetting,null);
+''', REPLACEMENT=replacement, SUCCESS=success)
+
+
+def test_rerun_step_two_keeps_normal_entry_focus():
+    run_script(FOCUS_HARNESS + r'''
+state.focusSetupOnEntry=false;
+const pending=rerun({step:2});await settle(0,true);await pending;
+assert.equal(location.hash,'#new');assert.equal(state.setupStep,2);
+assert.equal(pendingTimeoutSetting,null);assert.equal(state.focusSetupOnEntry,true);
+await route();
+assert.deepEqual(settingFocus,[]);assert.deepEqual(stepFocus,[2]);
+assert.equal(state.focusSetupOnEntry,false);
+await route();assert.deepEqual(stepFocus,[2]);
+''')
+
+
+@pytest.mark.parametrize('replacement', [
+    'new', 'rerun', 'choose-next-checks', 'apply', 'import',
+    'workspace-open', 'workspace-close', 'navigate', 'away',
+])
+def test_stale_timeout_focus_is_cleared_by_new_setup_owner(replacement):
+    run_script(FOCUS_HARNESS + r'''
+if(REPLACEMENT==='workspace-close')openSetupWorkspace('questions');
+// Seed an unconsumed flag, including the gap before a hashchange is delivered.
+pendingTimeoutSetting='load_test.request_timeout_seconds';
+let pending;
+if(REPLACEMENT==='import'){
+  pending=importConfig({text:async()=>JSON.stringify(initialConfig)});await flush();
+}else if(REPLACEMENT==='apply'){
+  prepareJson();pending=act('apply');
+}else if(REPLACEMENT==='workspace-open')openSetupWorkspace('questions');
+else if(REPLACEMENT==='workspace-close')closeSetupWorkspace();
+else if(REPLACEMENT==='navigate'){
+  location.hash='#new';captureFormDraft=()=>{};revealSetupStep=step=>{state.setupStep=step;};
+  updateBounds=()=>{};navigateSetup(1);
+}else if(REPLACEMENT==='away'){location.hash='#runs';await route();}
+else pending=act(REPLACEMENT);
+assert.equal(pendingTimeoutSetting,null);
+if(requests.length){await settle(0,true);await pending;}
+location.hash='#new';await route();assert.deepEqual(settingFocus,[]);
+''', REPLACEMENT=replacement)

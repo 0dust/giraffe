@@ -96,6 +96,9 @@ def pack_specs(config: RunConfig) -> list[RequestSpec]:
     consumer = "load" if "load" in config.checks else "capacity" if "capacity" in config.checks else "correctness"
     effective = config.effective_check(consumer)
     cap = effective.get("max_output_tokens", config.max_output_tokens)
+    check_options = config.test_options.get(consumer)
+    timeout_check = (consumer if consumer != "load" and check_options
+                     and check_options.request_timeout_seconds is not None else None)
     specs = []
     for case in sorted(config.request_pack.cases, key=lambda case: case.fixture_id):
         options = config.request_options | case.options
@@ -109,6 +112,8 @@ def pack_specs(config: RunConfig) -> list[RequestSpec]:
             expected_provided="expected" in case.model_fields_set, rubric=case.rubric,
             max_tokens=case.max_tokens or cap, stream=config.stream, options=options,
             request_timeout_seconds=effective.get("request_timeout_seconds", config.request_timeout_seconds),
+            deadline_source="load" if consumer == "load" else "check" if timeout_check else "run",
+            timeout_check=timeout_check,
             input_chars=sum(len(message.content) for message in case.messages),
             workload={"case_id": case.fixture_id, "request_source": "request_pack"},
         ))

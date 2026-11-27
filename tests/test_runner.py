@@ -277,6 +277,48 @@ async def test_core_runs_compare_measurements_after_grading_limit_change(client)
     assert any(target["comparisons"] for target in compared.baseline["targets"])
 
 
+async def test_saved_version_three_timing_baseline_requires_rerun(client, monkeypatch, tmp_path):
+    from giraffe.models import RunReport
+    from giraffe.reporting import compare_baseline, save_baseline_report
+    from tests.test_reporting import baseline_check
+
+    original = client.execute
+    first_output_ms = 12
+
+    async def timed(self, spec, **kwargs):
+        record = await original(self, spec, **kwargs)
+        record.first_output_ms = first_output_ms
+        record.last_output_ms = record.elapsed_ms = first_output_ms + 10
+        return record
+
+    monkeypatch.setattr(client, "execute", timed)
+    settings = config(checks=["first_output"], samples=6)
+    baseline = await runner.run_suite(settings)
+    historical = baseline.model_copy(deep=True)
+    historical.manifest["timing_measurement_version"] = 3
+    # The previous timer included time spent waiting for a connection.
+    for record in historical.requests:
+        record.first_output_ms += 66
+        record.last_output_ms += 66
+        record.elapsed_ms += 66
+    source = tmp_path / "historical.json"
+    source.write_text(historical.model_dump_json())
+    saved = tmp_path / "baseline.json"
+    save_baseline_report(source, saved)
+
+    first_output_ms = 45
+    current = await runner.run_suite(settings)
+    result = compare_baseline(current, RunReport.model_validate_json(saved.read_bytes()))
+    assert baseline_check(result).status == "inconclusive"
+    assert "rerun the baseline" in baseline_check(result).summary
+    assert current.manifest["timing_measurement_version"] == 4
+
+    result = compare_baseline(current, baseline)
+    assert baseline_check(result).status == "fail"
+    assert any(row["metric"] == "first_output_ms" and row["status"] == "fail"
+               for row in result.baseline["targets"][0]["comparisons"])
+
+
 async def test_error_threshold_stop_has_actionable_remediation_without_run_caps(client, monkeypatch):
     original = client.execute
 

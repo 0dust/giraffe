@@ -2562,6 +2562,7 @@ class RunConfig(Model):
     concurrent_load: ConcurrentLoad = Field(default_factory=ConcurrentLoad)
     load_test: LoadTest = Field(default_factory=LoadTest)
     _preparation_residency: dict = PrivateAttr(default_factory=dict)
+    _request_timeout_check: str | None = PrivateAttr(default=None)
     _preflight_context_windows: dict = PrivateAttr(default_factory=dict)
     _migration_notes: list[str] = PrivateAttr(default_factory=list)
     _migration_warnings: list[MigrationWarning] = PrivateAttr(default_factory=list)
@@ -3064,6 +3065,10 @@ class RequestSpec(Model):
     context_position: str | None = None
     input_chars: int = 0
     request_timeout_seconds: float | None = Field(default=None, gt=0)
+    deadline_source: Literal["run", "check", "load"] | None = Field(default=None, exclude=True)
+    timeout_check: str | None = Field(default=None, exclude=True)
+    timeout_setting: str | None = Field(default=None, exclude=True)
+    _fixture_request_timeout_seconds: float | None = PrivateAttr(default=None)
     load_point: dict[str, Any] | None = None
     requested_input_tokens: int | None = None
     requested_output_tokens: int | None = None
@@ -3161,6 +3166,8 @@ class RequestRecord(PersistedModel):
             if getattr(self, name) is None:
                 result.pop(name, None)
         return result
+    _request_slot: int | None = PrivateAttr(default=None)
+    _timeout_fixture: dict | None = PrivateAttr(default=None)
     _timing_started_monotonic: float | None = PrivateAttr(default=None)
     _gateway_key_hash: str | None = PrivateAttr(default=None)
     _gateway_terminal_usage: bool = PrivateAttr(default=False)
@@ -3181,6 +3188,9 @@ class RequestRecord(PersistedModel):
     response_body_bytes: int = Field(default=0, ge=0)
     error: str | None = None
     request_timeout_seconds: float | None = None
+    deadline_source: Literal["run", "check", "load"] = "run"
+    timeout_check: str | None = None
+    timeout_setting: str | None = None
     termination_reason: str | None = None
     termination_limit_seconds: float | None = None
     server_request_id: str | None = None
