@@ -818,6 +818,7 @@ def load_custom_fixtures(path: str, *, legacy_max_output_tokens: int | None = No
                                  "Use a request pack and configured AI judges for judge scoring; tool scoring is built-in only.")
             values = {"scenario": "custom", "check_ids": ["correctness"], **entry}
             spec = RequestSpec.model_validate(values)
+            spec._fixture_request_timeout_seconds = spec.request_timeout_seconds
             if not spec.fixture_id.strip() or spec.fixture_id in ids:
                 raise ValueError("fixture_id must be non-empty and unique")
             if not spec.scenario.strip():
