@@ -16,6 +16,8 @@ WHOLE_FIELD_WARNING = (
     "The whole serving.launch_arguments field was declared intended; additional changes "
     "within that field are not checked separately."
 )
+LAUNCH_SIZE_LIMIT = "[launch evidence exceeds size limit]"
+LAUNCH_SIZE_WARNING = "Launch evidence reached the size limit; equivalence is unverified."
 BOOLEAN_FLAGS = {"--enable-prefix-caching", "--no-enable-prefix-caching", "--enforce-eager"}
 SPECULATIVE_METHODS = {"eagle", "eagle3", "ngram", "mtp", "draft_model"}
 
@@ -76,13 +78,29 @@ def _redacted(value):
             or isinstance(value, list) and any(_redacted(item) for item in value))
 
 
+def launch_evidence_at_limit(value):
+    # Older reports sliced strings, individual tokens and argv at these caps.
+    # Evidence exactly at a cap may therefore already contain a partial value.
+    if isinstance(value, str):
+        return len(value) >= MAX_SANITIZE_STRING_CHARS
+    return isinstance(value, list) and (
+        value == [LAUNCH_SIZE_LIMIT]
+        or len(value) >= MAX_LAUNCH_ARGUMENTS
+        or any(isinstance(arg, str) and len(arg) >= MAX_SANITIZE_STRING_CHARS for arg in value)
+    )
+
+
 def _parse(value, allowed_flags):
     warnings, settings, order = [], {}, []
+    if launch_evidence_at_limit(value):
+        return None, [], [LAUNCH_SIZE_WARNING]
     try:
         args = shlex.split(value) if isinstance(value, str) else value
     except ValueError:
         args = None
-    if (not isinstance(args, list) or len(args) > MAX_LAUNCH_ARGUMENTS
+    if launch_evidence_at_limit(args):
+        return None, [], [LAUNCH_SIZE_WARNING]
+    if (not isinstance(args, list)
             or not all(isinstance(arg, str) for arg in args)
             or args[:2] != ["vllm", "serve"] or len(args) < 3 or args[2].startswith("--")):
         return None, [], ["Individual launch comparison requires a bounded vllm serve command with a model operand."]
@@ -125,6 +143,12 @@ def _parse(value, allowed_flags):
                     value = int(value)
                     if value <= 0:
                         raise ValueError("unsupported integer")
+                elif flag == "--gpu-memory-utilization":
+                    if not isinstance(value, str):
+                        raise ValueError("missing GPU memory utilization")
+                    value = float(value)
+                    if not 0 <= value <= 1:
+                        raise ValueError("unsupported GPU memory utilization")
             except (ValueError, TypeError, RecursionError):
                 value = "[redacted]"
                 warnings.append(f"Unsupported or redacted value for {flag}; equivalence is unverified.")
@@ -186,6 +210,9 @@ def compare_launch_settings(current, baseline, intended, allowed_flags):
         for source in before.keys() & after.keys()
     } if not declared and not whole_field else {}
     if not declared and not any(value is not None for value in legacy_redacted_args.values()):
+        if any(launch_evidence_at_limit(row.get("value")) for row in (*before.values(), *after.values())):
+            result["status"] = "unverified"
+            result["warnings"].append(LAUNCH_SIZE_WARNING)
         return result, set(), False
     result["status"] = "checked"
     covered, parsed, extra = set(), {}, False
@@ -200,7 +227,10 @@ def compare_launch_settings(current, baseline, intended, allowed_flags):
             comparable = False
             result["warnings"].append("Launch evidence provenance, scope or status changed; equivalence is unverified.")
         if left is None or right is None:
-            comparable &= not declared and old.get("value") == new.get("value")
+            comparable &= (
+                not declared and old.get("value") == new.get("value")
+                and LAUNCH_SIZE_WARNING not in warnings and LAUNCH_SIZE_WARNING not in more
+            )
             continue
         if [flag for flag in left_order if flag in right] != [flag for flag in right_order if flag in left]:
             result["warnings"].append("Launch argument order changed; precedence is unverified.")
@@ -228,14 +258,16 @@ def compare_launch_settings(current, baseline, intended, allowed_flags):
             continue
         equivalent = comparable
         for source in old_meta.keys() | new_meta.keys():
-            old, new = old_meta.get(source, {}), new_meta.get(source, {})
-            if old and new:
+            old, new = old_meta.get(source), new_meta.get(source)
+            if old is not None and new is not None:
                 equivalent &= _same_context(old, new)
             for row, command, launch in zip(
                     (old, new), parsed.get(source, (None, None)),
                     (before.get(source, {}), after.get(source, {})), strict=True):
-                if row:
-                    equivalent &= _same_context(row, launch, allow_metadata_file_provenance=True)
+                if row is None:
+                    continue
+                equivalent &= "value" in row and _same_context(
+                    row, launch, allow_metadata_file_provenance=True)
                 value = row.get("value")
                 try:
                     if flag == "--speculative-config":

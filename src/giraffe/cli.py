@@ -1004,10 +1004,26 @@ def _main(argv: list[str] | None = None) -> int:
         if args.command in {"export", "inspect"}:
             from giraffe.reporting import reproduction_export, _retained
             report = _retained(load_report(args.report))
-            value = reproduction_export(report) if args.command == "export" else {
-                "run_id": report.run_id, "observations": report.observations, "baseline": report.baseline,
-                "performance": report.performance, "conditions": report.conditions,
-                "workload_selection": report.manifest.get("workload_selection", {})}
+            if args.command == "export":
+                value = reproduction_export(report)
+            else:
+                from giraffe.launch_settings import comparison_warnings
+
+                # Apply the display fallback to the retained copy of the comparison.
+                targets = (report.baseline or {}).get("targets")
+                if isinstance(targets, list):
+                    for target in targets:
+                        diff = target.get("configuration_diff") if isinstance(target, dict) else None
+                        if not isinstance(diff, dict) or "launch_comparison" in diff:
+                            continue
+                        warnings = comparison_warnings(diff)
+                        if warnings:
+                            diff["launch_comparison"] = {
+                                "status": "whole_field", "settings": [], "warnings": warnings}
+                value = {
+                    "run_id": report.run_id, "observations": report.observations, "baseline": report.baseline,
+                    "performance": report.performance, "conditions": report.conditions,
+                    "workload_selection": report.manifest.get("workload_selection", {})}
             print(json.dumps(value, indent=2, allow_nan=False))
             return 0
         if args.command == "baseline":

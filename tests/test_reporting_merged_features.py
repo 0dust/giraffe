@@ -1,10 +1,11 @@
 """Merged deployment and telemetry features remain visible without embedded JSON."""
 
+import json
 from html import unescape
 
 import pytest
 
-from giraffe.cli import load_report
+from giraffe.cli import load_report, main
 from giraffe.reporting import compare_baseline, reproduction_export, write_report
 from tests.test_reporting import make_report
 
@@ -44,12 +45,13 @@ def test_baseline_visibly_explains_grouped_and_confounded_deployment_changes(con
     assert '<script' not in html and 'data:application/json' not in html
 
 
-def launch_setting_comparison(mode):
+def launch_setting_comparison(mode, *, intended=None):
     from tests.test_deployment import SPECULATION_ARGS, SPECULATION_SETTING, launch_snapshot
 
     current, baseline = make_report(), make_report("baseline")
     prefix = ["vllm", "serve", "model", "--max-num-seqs"]
-    intended = FIELDS if mode in {"whole", "legacy"} else SPECULATION_SETTING
+    if intended is None:
+        intended = FIELDS if mode in {"whole", "legacy"} else SPECULATION_SETTING
     speculation = ["--speculative-config=[redacted]"] if mode == "unverified" else SPECULATION_ARGS
     snapshots = (
         launch_snapshot(prefix + ["32" if mode in {"batching", "whole", "legacy"} else "16"] + speculation,
@@ -103,6 +105,45 @@ def test_launch_setting_results_survive_json_html_and_cli(mode, tmp_path, capsys
         else:
             assert "--speculative-config" in output and "intended" in output
     assert diff["confounded"] is (mode in {"batching", "unverified"})
+
+
+@pytest.mark.parametrize(("intended", "confounded"), [(FIELDS[-1], True), (FIELDS, False)])
+def test_inspect_and_report_warn_about_legacy_whole_launch_field(intended, confounded, tmp_path, capsys):
+    value = launch_setting_comparison("legacy", intended=intended)
+    diff = value.baseline["targets"][0]["configuration_diff"]
+    assert diff["confounded"] is confounded
+    json_path, _ = write_report(value, tmp_path)
+    original = json_path.read_bytes()
+    warning = ("The whole serving.launch_arguments field was declared intended; additional changes "
+               "within that field are not checked separately.")
+
+    assert main(["report", str(json_path), "--html"]) == 0
+    html = unescape((tmp_path / "report.html").read_text())
+    assert html.count(warning) == 1
+    assert ("Confounded: multiple unrelated changes." in html) is confounded
+    capsys.readouterr()
+
+    assert main(["inspect", str(json_path)]) == 0
+    inspected = json.loads(capsys.readouterr().out)
+    inspected_diff = inspected["baseline"]["targets"][0]["configuration_diff"]
+    assert inspected_diff.pop("launch_comparison") == {
+        "status": "whole_field", "settings": [], "warnings": [warning],
+    }
+    assert inspected_diff == diff
+    assert json_path.read_bytes() == original
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_inspect_preserves_existing_launch_comparison_shape(legacy, tmp_path, capsys):
+    value = launch_setting_comparison("batching" if legacy else "whole")
+    diff = value.baseline["targets"][0]["configuration_diff"]
+    if legacy:
+        diff.pop("launch_comparison")
+    json_path, _ = write_report(value, tmp_path)
+
+    assert main(["inspect", str(json_path)]) == 0
+    inspected = json.loads(capsys.readouterr().out)
+    assert inspected["baseline"]["targets"][0]["configuration_diff"] == diff
 
 
 def gpu_series_limited_report():

@@ -16,7 +16,9 @@ from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
-from .launch_settings import LAUNCH_FIELD, compare_launch_settings, safe_speculation
+from .launch_settings import (
+    LAUNCH_FIELD, LAUNCH_SIZE_LIMIT, compare_launch_settings, launch_evidence_at_limit, safe_speculation,
+)
 
 from .caps import (
     MAX_DEPLOYMENT_BODY_BYTES, MAX_DEPLOYMENT_SCOPE_CHARS, MAX_LAUNCH_ARGUMENTS,
@@ -145,10 +147,23 @@ LAUNCH_FLAGS = {
 }
 
 
-def safe_launch(command):
-    args = shlex.split(command) if isinstance(command, str) else list(command)
-    if len(args) > MAX_LAUNCH_ARGUMENTS:
+def safe_launch(command, *, structured=False):
+    if isinstance(command, str) and launch_evidence_at_limit(command):
+        return [LAUNCH_SIZE_LIMIT]
+    if structured and not isinstance(command, (str, list)):
+        return [REDACTED]
+    try:
+        args = shlex.split(command) if isinstance(command, str) else list(command)
+    except ValueError:
+        if structured:
+            return [REDACTED]
+        raise
+    if not structured and len(args) > MAX_LAUNCH_ARGUMENTS:
         raise ValueError("launch command exceeds 256 arguments")
+    if launch_evidence_at_limit(args):
+        return [LAUNCH_SIZE_LIMIT]
+    if structured and not all(isinstance(arg, str) for arg in args):
+        return [REDACTED]
     result, index = [], 0
     while index < len(args):
         arg = str(args[index])
@@ -169,10 +184,23 @@ def safe_launch(command):
                 index += 1
         elif index < 3 and arg in {"vllm", "serve", "ollama", "run"}:
             result.append(arg)
+        elif structured and index == 2 and args[:2] in (["vllm", "serve"], ["ollama", "run"]):
+            result.append(sanitize(arg))
         else:
             result.append(REDACTED)
         index += 1
+    if structured and isinstance(command, str):
+        result = command if result == args else shlex.join(result)
+    if launch_evidence_at_limit(result):
+        return [LAUNCH_SIZE_LIMIT]
     return result
+
+
+def sanitize_serving(values):
+    """Apply the launch evidence policy before generic sanitization can slice its input."""
+    if values.get("launch_arguments") is not None:
+        values = {**values, "launch_arguments": safe_launch(values["launch_arguments"], structured=True)}
+    return sanitize(values)
 
 
 def safe_metadata(data):
@@ -182,7 +210,8 @@ def safe_metadata(data):
     for category, fields in CATEGORIES.items():
         source = data.get(category, {})
         if isinstance(source, dict):
-            result[category] = sanitize({k: v for k, v in source.items() if k in fields})
+            selected = {k: v for k, v in source.items() if k in fields}
+            result[category] = sanitize_serving(selected) if category == "serving" else sanitize(selected)
     aliases = {
         "model": ("model", "requested"),
         "revision": ("model", "revision"),
