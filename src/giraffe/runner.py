@@ -3320,7 +3320,7 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
                 "invocation": {"source": "python_api", "argv": None},
                 "config_migration_notes": list(config._migration_notes),
                 "config_migration_warnings": list(config._migration_warnings),
-                "timing_measurement_version": 3,
+                "timing_measurement_version": 4,
                 **({"gateway_access_source_sha256": workload_identity["gateway_access_source_sha256"]}
                    if "gateway_access_source_sha256" in workload_identity else {}),
                 **({"gateway_policy_source_sha256": workload_identity["gateway_policy_source_sha256"]}

@@ -86,6 +86,8 @@ def test_generated_load_compares_with_saved_pre_output_budget_report(monkeypatch
     saved.write_text(current.model_dump_json())
     current = RunReport.model_validate_json(saved.read_text())
     baseline = RunReport.model_validate_json(gzip.decompress(BASE_REPORT.read_bytes()))
+    # Hold the timing method constant to isolate output-budget compatibility.
+    current.manifest["timing_measurement_version"] = baseline.manifest["timing_measurement_version"]
     assert baseline.manifest["test_fixture_provenance"]["commit"] == BASE_COMMIT
     assert len(baseline.requests) == 40
     assert {row.requested_max_tokens for row in baseline.requests} == {8}

@@ -129,6 +129,8 @@ def baseline(kind):
 def test_pre_interference_mode_report_remains_comparable(monkeypatch, kind):
     current = run_virtual(monkeypatch, generate_upgrade_report(monkeypatch, kind))
     old = baseline(kind)
+    # Hold the timing method constant to isolate workload compatibility.
+    current.manifest["timing_measurement_version"] = old.manifest["timing_measurement_version"]
     before = current.model_dump_json(), old.model_dump_json()
     assert _settings_reasons(current, old) == []
     assert _settings_reasons(old, current) == []
@@ -201,6 +203,7 @@ def test_historical_source_cannot_attest_reverse_mode_in_migrated_settings():
 def test_prefix_companion_report_remains_comparable_across_load_source_upgrade(monkeypatch, kind):
     current = run_virtual(monkeypatch, generate_upgrade_report(monkeypatch, kind))
     old = baseline(kind)
+    current.manifest["timing_measurement_version"] = old.manifest["timing_measurement_version"]
     before = current.model_dump_json(), old.model_dump_json()
     assert _settings_reasons(current, current) == _settings_reasons(old, old) == []
     assert _settings_reasons(current, old) == []
@@ -254,6 +257,7 @@ def test_prefix_source_upgrade_keeps_changed_work_incomparable(monkeypatch, kind
 def test_prefix_source_upgrade_keeps_changed_actual_request_budgets_incomparable(monkeypatch, kind):
     current = run_virtual(monkeypatch, generate_upgrade_report(monkeypatch, kind, prefix_budget=256))
     old = baseline(kind)
+    current.manifest["timing_measurement_version"] = old.manifest["timing_measurement_version"]
     assert {row.requested_max_tokens for row in current.requests if "prefix" in row.check_ids} == {256}
     assert {row.requested_max_tokens for row in old.requests if "prefix" in row.check_ids} == {128}
     assert _settings_reasons(current, old)
