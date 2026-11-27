@@ -7,24 +7,25 @@ from types import SimpleNamespace
 
 import pytest
 
-from giraffe import concurrent_load, load_test, multi_user, runner, session_sampling, workloads
+from giraffe import concurrent_load, load_test, logprob_workload, multi_user, runner, workloads
 from giraffe.deployment import fixture_hash
 from giraffe.fixtures import builtin_fixtures
-from giraffe.logprob_workload import logprob_fixtures
-from giraffe.models import LoadTest, LoadTestSettings, MultiUser, RunConfig, ScaleDownConfig, Sessions
+from giraffe.models import SHAPES, LoadTest, LoadTestSettings, MultiUser, RunConfig, ScaleDownConfig
 from giraffe.scale_down import resolve_fixtures
 from giraffe.workload_versions import WORKLOAD_VERSIONS
 
 
 NONCE = "0" * 32
 PINNED = {
-    "generator": (1, "1327c00ca81d862e3685dc3f2aa49c941a849c5cbc20ae7e578192d1766c4253"),
+    "prefix": (1, "721d473c4755c1ffd6c23b4fd4606805923e034c79b5452f6108b1a6072d025a"),
+    "consistency": (1, "e370b46d376d786cb54035d025c6400a8c701f66431d352ba5f1602c98e0856f"),
+    "tools": (1, "a6cea9e42a2277e0ed896442835f247ffe991b0c0e73cf5c2bdc59cf0ff7001d"),
     "fixed_sessions": (1, "84e2056aa1e6fb8068c2848480478dfdc4e39f41e1e66512d2d37a4a02815b1d"),
-    "session_sampling": (1, "54c8029050f0f728e9d5a78f03c06d786c533d5154119bfb9855489dd5d130bc"),
-    "multi_user": (1, "5f1f0f51dd70726696e20ce9f033c15bd2fdabc40fb97406ca6009769d987516"),
+    "session_plan": (1, "9d8e586754a51e7257d31ebe033b5f90f505b00719a127e249f587f74bc56c68"),
+    "multi_user": (1, "7b65f0d2c21e1a1ab7cc11f5aff886d20edc73334b7be62907cf57ee55d083d7"),
     "scale_down": (1, "3403a497536a5c37c6a28f46c7ec3a6e09c71b20ee11bec196c93e5497041541"),
-    "load_test": (1, "4ddb40c97866d0db11ab68208d900f59146bc441f6d05e78ffa269f334a0840d"),
-    "logprob": (1, "6d8fa2a11aad42d276707e5289b68a49e09cfdaf15dd9223e9571394bf9eec18"),
+    "load_test": (1, "d56ed26cd650be79385881c699d12a56aba9a289158cba559daf52308b31b459"),
+    "logprob": (1, "20a0ab8ec361396ff16a7380f0eb7bf218d9a979c69ea3b8e7297346ec2c6f35"),
 }
 # No pure request builder exists for these workloads: their RequestSpecs are
 # constructed inside asynchronous execution, with run/response/credential state.
@@ -44,87 +45,134 @@ def _requests(specs):
     return [spec.model_dump(mode="json", include=fields) for spec in specs]
 
 
-def _generator():
-    requests = {name: _requests(specs) for name, specs in builtin_fixtures(_config()).items()}
-    prefix = runner._check_config(_config(checks=["prefix"]), "prefix")
-    consistency = runner._check_config(_config(
+def _prefix():
+    config = runner._check_config(_config(checks=["prefix"]), "prefix")
+    return _requests(list(workloads.prefix_requests(config, nonce=lambda: NONCE)))
+
+
+def _consistency():
+    config = runner._check_config(_config(
         checks=["consistency"],
         consistency={"prompts_per_shape": len(workloads.COPY_PASSAGES) + 1,
                      "shapes": ["short", "long"]},
     ), "consistency")
-    requests["prefix"] = _requests(workloads.prefix_requests(prefix, nonce=lambda: NONCE))
-    requests["consistency"] = [_requests([spec]) for _, _, spec in workloads.consistency_requests(consistency)]
-    tools = runner._check_config(_config(checks=["tools"], forced_tool_diagnostic=True), "tools")
-    requests["tools"] = _requests([
-        workloads.tool_request(tools, fixture, mode, forced=forced)
+    return [_requests([spec]) for _, _, spec in list(workloads.consistency_requests(config))]
+
+
+def _tools():
+    config = runner._check_config(_config(checks=["tools"], forced_tool_diagnostic=True), "tools")
+    return _requests([
+        workloads.tool_request(config, fixture, mode, forced=forced)
         for forced in (False, True)
-        for fixture in workloads.resolved_tool_fixtures(tools)
-        for mode in workloads.resolved_tool_modes(tools)
+        for fixture in workloads.resolved_tool_fixtures(config)
+        for mode in workloads.resolved_tool_modes(config)
     ])
-    return requests
 
 
 def _fixed_sessions():
-    config = _config(checks=["sessions"])
-    settings = config.sessions
-    requests = []
-    for mode in settings.modes:
-        for index in range(settings.sessions):
-            value = f"Session_{index:04d}_{mode}"
-            history = []
-            for turn, prompt in enumerate(settings.turns):
-                prompt = workloads.session_prompt(prompt, turn, value)
-                messages = [*history, {"role": "user", "content": prompt}]
-                request = workloads.spec(
-                    prompt, f"session_{mode}_turn{turn}", "sessions",
-                    max_tokens=settings.max_tokens,
-                    request_timeout_seconds=config.request_timeout_seconds,
-                    options=workloads.deterministic_options(config),
-                )
-                request.messages = messages
-                requests.append(request)
-                # A deterministic valid reply makes live history reproducible too.
-                history = [*messages, {"role": "assistant", "content": value}]
-    return _requests(requests)
+    config = runner._check_config(_config(checks=["sessions"]), "sessions")
+    return _requests(request for mode in config.sessions.modes
+                     for index in range(config.sessions.sessions)
+                     for request in workloads.fixed_session_requests(config, config.sessions, mode, index))
+
+
+def _load_guard_cases():
+    # Cover the primary source and the independently configured migrated source
+    # selected by both arrival_window and _minimum_request_budget.
+    settings = LoadTest(migrated_tests=[{"source": "arrivals", "settings": LoadTestSettings().model_dump()}])
+    return settings, dict(load_test.settings_sets(settings)), load_test.test_points(settings)
 
 
 def _load_test():
-    settings = LoadTest()
-    points = load_test.test_points(settings)
+    settings, sources, points = _load_guard_cases()
+    config = _config(checks=["load"])
+    calibration = {(size, variant): {"filler_chars": 400}
+                   for size in ("short", "medium", "long") for variant in ("short_answer", "long_output")}
     return {
-        "prompts": [concurrent_load.prompt(chars, variant, nonce=NONCE)
-                    for chars in (0, 400) for variant in ("short_answer", "long_output")],
-        "points": points,
-        "specs": [concurrent_load.make_spec(settings, shape, "version_guard",
-                                            next(point for point in points if point["shape"] == shape), 400,
-                                            nonce=NONCE).model_dump(mode="json")
-                  for shape in load_test.running_shapes(settings)],
+        "arrivals": [{"schedule": load_test.planned_arrivals(sources[point["source"]], point)}
+                     for point in points],
+        "requests": [_requests([load_test.build_spec(SimpleNamespace(config=config), sources[point["source"]],
+                                                    point, shape, calibration, nonce=NONCE)])
+                     for point in points for shape in load_test.point_shapes(sources[point["source"]], point)],
     }
 
 
-def _multi_user():
+def _multi_user_cases():
     settings = MultiUser()
     config = _config()
-    population = multi_user.population_plan(settings)
     load_settings = LoadTestSettings(profile=settings.profile,
                                      request_timeout_seconds=config.request_timeout_seconds)
-    first = population[0]
-    shape = first["profile"]
-    size, output = shape.split("_")
-    calibration = {(size, "short_answer" if output == "short" else "long_output"): {"filler_chars": 400}}
-    # The public builder is also used by run_window for each persistent user.
-    specs = []
-    for level in settings.levels:
-        point = {"id": f"multi_user_{level}_measurement", "type": "combinations", "workload": "combinations",
-                 "pattern": "concurrent", "level": level, "rate": None, "bursts": False, "source": "primary"}
-        specs.append(load_test.build_spec(SimpleNamespace(config=config), load_settings, point, shape,
-                                         calibration, nonce=NONCE))
-    return {"population": population, "first_user_requests": _requests(specs)}
+    calibration = {(size, "short_answer" if output == "short" else "long_output"): {"filler_chars": 400}
+                   for size, output in (shape.split("_") for shape in SHAPES)}
+    for shape in SHAPES:
+        for level in settings.levels:
+            point = {"id": f"multi_user_{level}_measurement", "type": "combinations", "workload": "combinations",
+                     "pattern": "concurrent", "level": level, "rate": None, "bursts": False, "source": "primary"}
+            yield config, load_settings, point, shape, calibration
 
 
-def _session_sampling():
-    settings = Sessions(sampling={"think_time_seconds": {"values": [0, .25], "weights": [1, 1]}})
-    return session_sampling.session_plan(settings)
+def _multi_user_plan_settings():
+    return [
+        MultiUser(),
+        MultiUser(
+            scenarios=["repeated_requests", "arrivals", "recovery", "noisy_neighbors", "cancellation"],
+            levels=[2, 5], shapes=list(SHAPES), warmup_seconds=1, duration_seconds=3,
+            think_time_seconds={"values": [0, .25], "weights": [1, 1]},
+            arrivals={"requests_per_second": 2, "activations": {"user-02": .5},
+                      "bursts": [{"user_id": "user-01", "at_seconds": 1, "requests": 3,
+                                  "spacing_seconds": .25},
+                                 {"user_id": "user-02", "at_seconds": 1, "requests": 2}]},
+            noisy_neighbors={"heavy_profiles": ["long_short", "short_long", "long_long"]},
+        ),
+        MultiUser(scenarios=["noisy_neighbors"], levels=[2],
+                  noisy_neighbors={"heavy_user_ids": ["user-02"]}),
+        MultiUser(conversations={}),
+        MultiUser(conversations={"profile": "performance", "modes": ["live"], "workloads": [
+            {"name": "chat", "turns": ["First", "Next"], "weight": 1},
+            {"name": "summary", "turns": ["Read", "Summarize"], "weight": 2},
+        ]}),
+    ]
+
+
+def _multi_user_window_plan(window):
+    # Only execution inputs: omit placeholder timing, counters and accounting.
+    fields = {"id", "scenario", "population", "phase", "planned_duration_seconds", "role",
+              "requests_per_second", "control_window_id", "sustained_window_id", "control_work_count",
+              "work_sequence_start", "trigger", "heavy_profile", "heavy_user_ids", "selected_user_id"}
+    user_fields = {"user_id", "profile", "conversation_workload", "think_time_plan", "cohort", "activation_seconds"}
+    offer_fields = {"index", "user_id", "profile", "cohort", "offset_seconds", "origin", "burst_index"}
+    return {**{key: value for key, value in window.items() if key in fields},
+            "users": [{key: value for key, value in user.items() if key in user_fields}
+                      for user in window["users"]],
+            **({"offers": [{key: value for key, value in offer.items() if key in offer_fields}
+                           for offer in window["offers"]]} if "offers" in window else {})}
+
+
+def _multi_user_plan(settings):
+    # execute() consumes these exact windows, with include_offers=True by default.
+    observation = multi_user._planned_observation(settings)
+    return {"population": observation["population"],
+            "windows": [_multi_user_window_plan(window) for window in observation["windows"]]}
+
+
+def _multi_user():
+    return {"plans": [_multi_user_plan(settings) for settings in _multi_user_plan_settings()],
+            "requests": _requests(load_test.build_spec(SimpleNamespace(config=config), settings, point, shape,
+                                                       calibration, nonce=NONCE)
+                                  for config, settings, point, shape, calibration in _multi_user_cases())}
+
+
+async def _session_plan():
+    from tests.test_workload_builder_dispatch import sampled_guard_requests
+
+    plans, requests = await sampled_guard_requests()
+    from giraffe.session_sampling import session_plan
+    from giraffe.models import Sessions
+
+    fixed = Sessions(sampling={"think_time_seconds": {"values": [0, .25], "weights": [1, 1]}})
+    return {"sampled_schedule": [plan["turns"] for plan in plans],
+            "fixed_schedule": [plan["turns"] for plan in session_plan(fixed)],
+            "requests": _requests(requests)}
 
 
 def _scale_down():
@@ -132,12 +180,28 @@ def _scale_down():
 
 
 def _logprob():
-    config = _config()
-    return {name: _requests([spec]) for name, spec in logprob_fixtures(config, builtin_fixtures(config)).items()}
+    config = runner._check_config(_config(checks=["consistency"], consistency={"logprobs": {}}), "consistency")
+    templates = logprob_workload.logprob_fixtures(config, builtin_fixtures(config))
+    return _requests(request for shape in config.consistency.shapes
+                     for level in dict.fromkeys([1, *config.consistency.levels])
+                     for phase, rounds in (("priming", config.consistency.logprobs.priming_rounds),
+                                           ("measured", config.consistency.repetitions))
+                     for repeat in range(rounds)
+                     for request in logprob_workload.logprob_requests(config, templates, shape, level, phase, repeat))
 
 
-BUILDERS = {"generator": _generator, "fixed_sessions": _fixed_sessions, "session_sampling": _session_sampling, "multi_user": _multi_user,
+BUILDERS = {"prefix": _prefix, "consistency": _consistency, "tools": _tools,
+            "fixed_sessions": _fixed_sessions, "session_plan": _session_plan, "multi_user": _multi_user,
             "scale_down": _scale_down, "load_test": _load_test, "logprob": _logprob}
+
+
+async def _digest(name):
+    import inspect
+
+    value = BUILDERS[name]()
+    if inspect.isawaitable(value):
+        value = await value
+    return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
 
 def _failure(name):
@@ -147,8 +211,8 @@ def _failure(name):
 
 
 @pytest.mark.parametrize("name", PINNED)
-def test_generated_requests_match_workload_version(name):
-    digest = hashlib.sha256(json.dumps(BUILDERS[name](), sort_keys=True).encode()).hexdigest()
+async def test_generated_requests_match_workload_version(name, local_tokenizer):
+    digest = await _digest(name)
     assert WORKLOAD_VERSIONS[name] == PINNED[name][0], _failure(name)
     assert digest == PINNED[name][1], _failure(name)
 
@@ -182,13 +246,13 @@ def test_module_comments_do_not_affect_workload_fingerprint(monkeypatch):
     (["serving"], {}, set()),
     (["load"], {}, {"load_test"}),
     (["multi_user"], {}, {"multi_user"}),
-    (["sessions"], {}, {"generator", "fixed_sessions"}),
-    (["sessions"], {"sessions": {"sampling": {}}}, {"generator", "fixed_sessions", "session_sampling"}),
-    (["consistency"], {}, {"generator"}),
-    (["consistency"], {"consistency": {"logprobs": {}}}, {"generator", "logprob"}),
+    (["sessions"], {}, {"fixed_sessions"}),
+    (["sessions"], {"sessions": {"sampling": {}}}, {"fixed_sessions", "session_plan"}),
+    (["consistency"], {}, {"consistency"}),
+    (["consistency"], {"consistency": {"logprobs": {}}}, {"logprob"}),
     (["gateway_access"], {}, {"gateway_access"}),
     (["gateway_access"], {"gateway_access": {}}, {"gateway_access"}),
-    (["tools"], {}, {"generator"}),
+    (["tools"], {}, {"tools"}),
     (["gateway_policy"], {}, {"gateway_policy"}),
     (["scale_down"], {"scale_down": {"target": "service"}}, {"scale_down"}),
 ])
@@ -224,13 +288,12 @@ def test_tool_conversation_version_requires_configured_conversations():
     )
     config = _config(checks=["tools"], tool_checks=ToolChecks(conversations=[fixture]))
     identity, _ = build_workload_identity(config)
-    assert identity["workload_versions"] == {"generator": WORKLOAD_VERSIONS["generator"],
-                                              "tool_conversations": WORKLOAD_VERSIONS["tool_conversations"]}
+    assert identity["workload_versions"] == {"tool_conversations": WORKLOAD_VERSIONS["tool_conversations"]}
     assert identity["resolved_tool_checks"]["conversations"] == [fixture.model_dump(mode="json")]
 
 
 @pytest.mark.parametrize("shared_checks", [["serving"], ["load"]])
-def test_shared_identity_removes_gateway_versions_and_recomputes_generator(shared_checks, monkeypatch):
+def test_shared_identity_removes_gateway_versions_and_filters_selected_builders(shared_checks, monkeypatch):
     from giraffe.runner import build_workload_identity
 
     base, _ = build_workload_identity(_config(checks=shared_checks))
@@ -242,7 +305,7 @@ def test_shared_identity_removes_gateway_versions_and_recomputes_generator(share
     changed, changed_shared = build_workload_identity(config)
     assert fixture_hash(changed) != fixture_hash(full)
     assert changed_shared == shared
-    monkeypatch.setitem(WORKLOAD_VERSIONS, "generator", 2)
+    monkeypatch.setitem(WORKLOAD_VERSIONS, "prefix", 2)
     generator_changed, generator_shared = build_workload_identity(config)
     assert fixture_hash(generator_changed) == fixture_hash(changed)
     assert generator_shared == changed_shared
@@ -258,13 +321,13 @@ def test_workload_version_bump_changes_selected_identity(monkeypatch):
     assert fixture_hash(before) != fixture_hash(after)
 
 
-def test_gateway_settings_preserve_shared_comparability_but_generator_version_does_not(monkeypatch):
+def test_gateway_settings_preserve_shared_comparability_but_selected_builder_version_does_not(monkeypatch):
     from giraffe.reporting import _settings_reasons
     from giraffe.runner import build_workload_identity
     from tests.test_reporting import make_report
 
     def report(profile):
-        config = _config(checks=["serving", "sessions", "gateway_access"],
+        config = _config(checks=["serving", "prefix", "gateway_access"],
                          gateway_access={"profile": profile})
         result = make_report()
         result.manifest["config"] = config.model_dump(mode="json")
@@ -278,7 +341,7 @@ def test_gateway_settings_preserve_shared_comparability_but_generator_version_do
     assert reason not in _settings_reasons(current, baseline)
     assert reason not in _settings_reasons(baseline, current)
 
-    monkeypatch.setitem(WORKLOAD_VERSIONS, "generator", 2)
+    monkeypatch.setitem(WORKLOAD_VERSIONS, "prefix", 2)
     changed = report("other-gateway")
     assert reason in _settings_reasons(changed, baseline)
     assert reason in _settings_reasons(baseline, changed)
@@ -294,12 +357,12 @@ def test_fixed_session_guard_covers_prompt_changes(monkeypatch):
 
 
 @pytest.mark.parametrize("checks", [["load"], ["load", "serving", "first_output", "generation", "context"]])
-def test_generator_bump_does_not_change_load_identity(checks, monkeypatch):
+def test_prefix_bump_does_not_change_load_identity(checks, monkeypatch):
     from giraffe.runner import build_workload_identity
 
     config = _config(checks=checks)
     before, _ = build_workload_identity(config)
-    monkeypatch.setitem(WORKLOAD_VERSIONS, "generator", 2)
+    monkeypatch.setitem(WORKLOAD_VERSIONS, "prefix", 2)
     after, _ = build_workload_identity(config)
     assert fixture_hash(before) == fixture_hash(after)
 
@@ -325,28 +388,28 @@ def test_fixed_sessions_version_follows_prompt_consumers(checks, settings, chang
 
 
 @pytest.mark.parametrize("sampling", [None, {"think_time_seconds": {"values": [0, .25]}}])
-def test_multi_user_session_sampling_version_follows_sampling(sampling, monkeypatch):
+def test_multi_user_session_plan_version_follows_all_conversations(sampling, monkeypatch):
     from giraffe.runner import build_workload_identity
 
     config = _config(checks=["multi_user"], multi_user={"conversations": {"sampling": sampling}})
     before, _ = build_workload_identity(config)
-    monkeypatch.setitem(WORKLOAD_VERSIONS, "session_sampling", 2)
+    monkeypatch.setitem(WORKLOAD_VERSIONS, "session_plan", 2)
     after, _ = build_workload_identity(config)
-    assert (fixture_hash(before) != fixture_hash(after)) is (sampling is not None)
+    assert (fixture_hash(before) != fixture_hash(after)) is True
 
 
-def test_generator_guard_covers_second_copy_passage(monkeypatch):
-    before = _generator()
+def test_consistency_guard_covers_second_copy_passage(monkeypatch):
+    before = _consistency()
     passages = list(workloads.COPY_PASSAGES)
     passages[1] = passages[1].replace("brass key", "glass key")
     monkeypatch.setattr(workloads, "COPY_PASSAGES", tuple(passages))
-    assert fixture_hash(_generator()) != fixture_hash(before)
+    assert fixture_hash(_consistency()) != fixture_hash(before)
 
 
-def test_generator_guard_covers_same_length_label_change(monkeypatch):
-    before = _generator()
+def test_prefix_guard_covers_same_length_label_change(monkeypatch):
+    before = _prefix()
     monkeypatch.setattr(workloads, "LABEL_INSTRUCTION", workloads.LABEL_INSTRUCTION.replace("K7P4", "K7P5"))
-    assert fixture_hash(_generator()) != fixture_hash(before)
+    assert fixture_hash(_prefix()) != fixture_hash(before)
 
 
 class CaptureRun:
@@ -391,7 +454,7 @@ async def test_prefix_builder_matches_sent_requests(monkeypatch):
     monkeypatch.setattr(workloads.uuid, "uuid4", lambda: SimpleNamespace(hex=NONCE))
     run = CaptureRun(config)
     await workloads.prefixes(run, config.targets[0], None)
-    expected = workloads.prefix_requests(runner._check_config(config, "prefix"), nonce=lambda: NONCE)
+    expected = list(workloads.prefix_requests(runner._check_config(config, "prefix"), nonce=lambda: NONCE))
     assert len(run.requests) == 9
     assert _requests(run.requests) == _requests(expected)
     # Admission and reporting metadata must survive extraction too.
@@ -409,7 +472,7 @@ async def test_consistency_builder_matches_sent_requests():
     }, test_options={"consistency": {"max_output_tokens": 80, "request_timeout_seconds": 7}})
     run = CaptureRun(config)
     await workloads.consistency(run, config.targets[0], None, {})
-    expected = workloads.consistency_requests(runner._check_config(config, "consistency"))
+    expected = list(workloads.consistency_requests(runner._check_config(config, "consistency")))
     for level in (1, 2):
         first_per_prompt = {}
         for request in run.requests:
@@ -433,3 +496,107 @@ async def test_tool_builder_matches_sent_requests():
     assert len(run.requests) == 4
     assert _requests(run.requests) == _requests(expected)
     assert run.planned == run.finished
+
+
+async def test_label_instruction_changes_only_prefix_guard(monkeypatch, local_tokenizer):
+    before = {name: await _digest(name) for name in BUILDERS}
+    monkeypatch.setattr(workloads, "LABEL_INSTRUCTION", "\nReturn the box label K7P4 only.")
+    after = {name: await _digest(name) for name in BUILDERS}
+    assert {name for name in BUILDERS if before[name] != after[name]} == {"prefix"}
+
+
+def test_multi_user_guard_covers_long_output_instruction(monkeypatch):
+    before = fixture_hash(_multi_user())
+    original = concurrent_load.prompt
+
+    def changed(chars, variant, **kwargs):
+        return original(chars, variant, **kwargs).replace("numbered list", "counting list") if variant == "long_output" else original(chars, variant, **kwargs)
+
+    monkeypatch.setattr(concurrent_load, "prompt", changed)
+    assert fixture_hash(_multi_user()) != before
+
+
+def test_load_guard_covers_dispatch_arrival_offsets(monkeypatch):
+    before = fixture_hash(_load_test())
+    original = load_test.planned_arrivals
+
+    def changed(settings, point):
+        offers, overflow = original(settings, point)
+        return [{**offer, "offset_seconds": offer["offset_seconds"] / 2} for offer in offers], overflow
+
+    monkeypatch.setattr(load_test, "planned_arrivals", changed)
+    assert fixture_hash(_load_test()) != before
+
+
+def test_fixed_session_guard_covers_appended_assistant_history(monkeypatch):
+    before = fixture_hash(_fixed_sessions())
+    original = workloads.session_history
+
+    def changed(*args):
+        history = original(*args)
+        history[-1]["content"] = history[-1]["content"].lower()
+        return history
+
+    monkeypatch.setattr(workloads, "session_history", changed)
+    assert fixture_hash(_fixed_sessions()) != before
+
+
+async def test_session_plan_guard_covers_prepared_filler(monkeypatch, local_tokenizer):
+    from giraffe import local_tokenizer as sizing
+
+    before = await _digest("session_plan")
+    original = sizing.prepare_messages
+
+    async def changed(run, target, scenario, build_messages, *args, **kwargs):
+        def messages(chars):
+            return [{**message, "content": message["content"].replace("neutral", "typical")}
+                    for message in build_messages(chars)]
+        return await original(run, target, scenario, messages, *args, **kwargs)
+
+    monkeypatch.setattr(sizing, "prepare_messages", changed)
+    assert await _digest("session_plan") != before
+
+
+def test_logprob_guard_covers_final_top_logprobs(monkeypatch):
+    before = fixture_hash(_logprob())
+    original = logprob_workload.logprob_requests
+
+    def changed(*args):
+        requests = original(*args)
+        for request in requests:
+            request.options["top_logprobs"] += 1
+        return requests
+
+    monkeypatch.setattr(logprob_workload, "logprob_requests", changed)
+    assert fixture_hash(_logprob()) != before
+
+
+def test_multi_user_guard_covers_population_assignment(monkeypatch):
+    from giraffe import multi_user
+
+    before = fixture_hash(_multi_user())
+    original = multi_user.population_plan
+
+    def changed(settings):
+        population = original(settings)
+        population[0]["profile"] = "short_long"
+        return population
+
+    monkeypatch.setattr(multi_user, "population_plan", changed)
+    assert fixture_hash(_multi_user()) != before
+
+
+def test_multi_user_guard_covers_offer_offsets(monkeypatch):
+    from giraffe import multi_user
+
+    before = fixture_hash(_multi_user())
+    original = multi_user._offer_plan
+
+    def changed(window, settings):
+        offers = original(window, settings)
+        for offer in offers:
+            offer["offset_seconds"] /= 2
+        return offers
+
+    monkeypatch.setattr(multi_user, "_offer_plan", changed)
+    assert fixture_hash(_multi_user()) != before

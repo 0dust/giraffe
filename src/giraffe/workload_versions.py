@@ -8,9 +8,11 @@ requests and fails when they change without a version bump.
 """
 
 WORKLOAD_VERSIONS: dict[str, int] = {
-    "generator": 1,
+    "prefix": 1,
+    "consistency": 1,
+    "tools": 1,
     "fixed_sessions": 1,
-    "session_sampling": 1,
+    "session_plan": 1,
     "multi_user": 1,
     "gateway_access": 1,
     "gateway_policy": 1,

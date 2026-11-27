@@ -62,15 +62,11 @@ def build_workload_identity(config: RunConfig) -> tuple[dict, dict]:
                               if hasattr(getattr(config, key), "model_dump") else getattr(config, key))
                          for key, checks in WORKLOAD_CHECKS.items()
                          if checks.intersection(config.checks)}
-    def uses_generator(settings):
-        # Core built-ins are attested separately by fixture_pack.builtin_sha256.
-        # Load and ordinary Multi-user requests use load_test's own builders.
-        return (any(settings.get(key) for key in ("prefix", "sessions", "consistency", "tool_calling"))
-                or bool((settings.get("multi_user") or {}).get("conversations")))
-
     versions = {}
-    if uses_generator(workload_settings):
-        versions["generator"] = WORKLOAD_VERSIONS["generator"]
+    if "prefix" in config.checks and config.prefix:
+        versions["prefix"] = WORKLOAD_VERSIONS["prefix"]
+    if "consistency" in config.checks and config.consistency and config.consistency.logprobs is None:
+        versions["consistency"] = WORKLOAD_VERSIONS["consistency"]
     workload_identity = {"workload_versions": versions, "settings": workload_settings}
     conversations = []
     if "sessions" in config.checks and config.sessions:
@@ -79,8 +75,10 @@ def build_workload_identity(config: RunConfig) -> tuple[dict, dict]:
         conversations.append(config.multi_user.conversations)
     if any(settings.profile != "performance" for settings in conversations):
         versions["fixed_sessions"] = WORKLOAD_VERSIONS["fixed_sessions"]
-    if any(settings.sampling is not None for settings in conversations):
-        versions["session_sampling"] = WORKLOAD_VERSIONS["session_sampling"]
+    if (("sessions" in config.checks and config.sessions
+         and (config.sessions.profile == "performance" or config.sessions.sampling))
+            or ("multi_user" in config.checks and config.multi_user and config.multi_user.conversations)):
+        versions["session_plan"] = WORKLOAD_VERSIONS["session_plan"]
     if "multi_user" in config.checks:
         from .multi_user import WINDOW_POLICY
 
@@ -96,6 +94,9 @@ def build_workload_identity(config: RunConfig) -> tuple[dict, dict]:
     if "tools" in config.checks:
         from .tool_checks import resolved_tool_fixtures, resolved_tool_modes
 
+        tools_config = _check_config(config, "tools")
+        if resolved_tool_fixtures(tools_config) and resolved_tool_modes(tools_config):
+            versions["tools"] = WORKLOAD_VERSIONS["tools"]
         workload_identity["resolved_tool_checks"] = {
             "fixtures": [fixture.model_dump(mode="json") for fixture in resolved_tool_fixtures(config)],
             "modes": resolved_tool_modes(config),
@@ -109,9 +110,7 @@ def build_workload_identity(config: RunConfig) -> tuple[dict, dict]:
         shared_settings = {key: value for key, value in workload_settings.items()
                            if key not in SHARED_BASELINE_EXCLUDED_WORKLOADS}
         shared_versions = {key: value for key, value in versions.items()
-                           if key not in SHARED_BASELINE_EXCLUDED_WORKLOADS and key != "generator"}
-        if uses_generator(shared_settings):
-            shared_versions["generator"] = WORKLOAD_VERSIONS["generator"]
+                           if key not in SHARED_BASELINE_EXCLUDED_WORKLOADS}
         shared_workload_hash["shared_workload_fixture_sha256"] = fixture_hash({
             **workload_identity,
             "settings": shared_settings,

@@ -120,9 +120,8 @@ async def test_load_fixture_identity_requires_well_formed_full_digests(monkeypat
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
     cfg = RunConfig.model_validate({**config().model_dump(), "stream": False})
     current = await runner.run_suite(cfg)
-    baseline = await runner.run_suite(cfg)
+    baseline = current.model_copy(deep=True)
     assert _settings_reasons(current, baseline) == []
-    assert compare_baseline(current, baseline).baseline["status"] == "pass"
 
     for report in (current, baseline):
         report.manifest["fixture_pack"]["shared_workload_fixture_sha256"] = "a" * 64

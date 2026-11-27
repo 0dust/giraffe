@@ -98,12 +98,16 @@ def fixed_session_turns(settings, index, context_limit):
 LABEL_INSTRUCTION = "\nThe box label is K7P4. Reply with the box label only."
 
 
-def label_context(chars, prefix=""):
-    return (" The box is gray." * (chars // 17 + 1))[: max(0, chars - len(prefix + LABEL_INSTRUCTION))]
+# Preserve the context budget independently of Prefix's mutable instruction.
+CONTEXT_TEMPLATE_RESERVE = len("\nThe box label is K7P4. Reply with the box label only.")
+
+
+def label_context(chars, prefix="", *, instruction_chars=CONTEXT_TEMPLATE_RESERVE):
+    return (" The box is gray." * (chars // 17 + 1))[: max(0, chars - len(prefix) - instruction_chars)]
 
 
 def label_prompt(chars, prefix=""):
-    return prefix + label_context(chars, prefix) + LABEL_INSTRUCTION
+    return prefix + label_context(chars, prefix, instruction_chars=len(LABEL_INSTRUCTION)) + LABEL_INSTRUCTION
 
 
 
@@ -121,7 +125,6 @@ def prefix_admitted(input_chars, max_tokens, context_limit):
 def prefix_requests(config, *, nonce=lambda: uuid.uuid4().hex):
     """Build the ordered controls and complete fixed history sent by Prefix."""
     settings = config.prefix
-    requests = []
     shared_nonce = nonce() + "\n"
     prefix = shared_nonce + (" The rock is gray." * (settings.prefix_chars // len(" The rock is gray.") + 1))[: settings.prefix_chars]
     for kind in ("shared", "independent"):
@@ -148,7 +151,7 @@ def prefix_requests(config, *, nonce=lambda: uuid.uuid4().hex):
                 cache_state="first unique use is not proof of empty server cache",
             )
             request.options = deterministic_options(config, request.options)
-            requests.append(request)
+            yield request
     history = []
     for turn in range(settings.history_turns):
         prompt = label_prompt(96)
@@ -159,9 +162,8 @@ def prefix_requests(config, *, nonce=lambda: uuid.uuid4().hex):
         request.messages = messages
         request.input_chars = sum(len(m["content"]) for m in messages)
         request.options = deterministic_options(config, request.options)
-        requests.append(request)
+        yield request
         history = [*messages, {"role": "assistant", "content": "K7P4"}]
-    return requests
 
 
 async def prefixes(run, target, client):
@@ -205,6 +207,62 @@ async def prefixes(run, target, client):
     finally:
         for scenario in plans:
             run.finish_condition(target.name, scenario)
+
+
+def session_turn_request(config, settings, mode, index, turn, prompt, history, *,
+                         sampled=None, preparation=None, session_id=None,
+                         task_type="exact_repeat", workload=None, scheduled_ms=0,
+                         check="sessions"):
+    """Build the final outgoing turn, including prepared input and prior history."""
+    value = f"Session_{index:04d}_{mode}"
+    sampled = sampled if sampled is not None else {
+        "think_time_seconds": settings.delay_seconds if turn else 0,
+        "input_tokens": None, "output_tokens": settings.max_tokens,
+    }
+    if not workload:
+        prompt = session_prompt(prompt, turn, value)
+    if preparation is not None:
+        prompt = preparation["messages"][0]["content"]
+    messages = [*history, {"role": "user", "content": prompt}]
+    request = spec(
+        prompt, f"session_{mode}_turn{turn}", check,
+        max_tokens=sampled["output_tokens"],
+        request_timeout_seconds=config.request_timeout_seconds,
+        session_id=session_id, task_type=task_type, turn_id=turn, mode=mode,
+        history_messages=len(history),
+        configured_delay_seconds=sampled["think_time_seconds"],
+        sampled_input_tokens=sampled["input_tokens"],
+        sampled_output_tokens=sampled["output_tokens"],
+        sampling_seed=settings.sampling.seed if settings.sampling else None,
+        scheduled_ms=scheduled_ms,
+    )
+    if preparation is not None:
+        request.workload["input_preparation"] = {
+            key: value for key, value in preparation.items()
+            if key not in {"messages", "request_ids"}
+        }
+    request.messages = messages
+    request.input_chars = sum(len(message["content"]) for message in messages)
+    if not workload:
+        request.scorer, request.expected = "exact", value
+        request.options = deterministic_options(config, request.options)
+    return request
+
+
+def session_history(request, mode, value, output):
+    """Append the same assistant history used for the following outgoing turn."""
+    answer = final_answer(output)[0] if mode == "live" else value
+    return [*request.messages, {"role": "assistant", "content": answer}]
+
+
+def fixed_session_requests(config, settings, mode, index):
+    """Yield fixed session turns with the executor's synthetic assistant history."""
+    history = []
+    value = f"Session_{index:04d}_{mode}"
+    for turn, prompt in enumerate(settings.turns):
+        request = session_turn_request(config, settings, mode, index, turn, prompt, history)
+        yield request
+        history = session_history(request, mode, value, value)
 
 
 async def execute_conversation(run, target, client, config, settings, mode, index, *,
@@ -255,48 +313,26 @@ async def execute_conversation(run, target, client, config, settings, mode, inde
             item["stop_reason"] = run.reason or "request budget reached during turn pause"
             run.unfinished[target.name].add(check)
             break
-        if not workload:
-            prompt = session_prompt(prompt, turn, value)
         preparation = None
         if sampled["input_tokens"] is not None:
-            preparation = prepared_inputs[(prompt, sampled["input_tokens"])]
+            prepared_prompt = prompt if workload else session_prompt(prompt, turn, value)
+            preparation = prepared_inputs[(prepared_prompt, sampled["input_tokens"])]
             if preparation["status"] != "calibrated" or preparation.get("reason_code") == "minimum_prompt_length":
                 item["stop_reason"] = preparation.get("reason") or "requested input length could not be prepared"
                 run.unfinished[target.name].add(check)
                 break
-            prompt = preparation["messages"][0]["content"]
-        messages = [*history, {"role": "user", "content": prompt}]
-        input_chars = sum(len(m["content"]) for m in messages)
-        if input_chars + budget + 32 > config.context_limit:
+        request = session_turn_request(
+            config, settings, mode, index, turn, prompt, history,
+            sampled=sampled, preparation=preparation, session_id=session_id,
+            task_type=item["task_type"], workload=workload,
+            scheduled_ms=(due - run.start) * 1000, check=check,
+        )
+        if request.input_chars + budget + 32 > config.context_limit:
             item["stop_reason"] = (
                 "history admission ceiling reached; required history not cropped"
             )
             run.unfinished[target.name].add(check)
             break
-        request = spec(
-            prompt,
-            f"session_{mode}_turn{turn}",
-            check,
-            max_tokens=budget,
-            request_timeout_seconds=config.request_timeout_seconds,
-            session_id=session_id,
-            task_type=item["task_type"],
-            turn_id=turn,
-            mode=mode,
-            history_messages=len(history),
-            configured_delay_seconds=delay,
-            sampled_input_tokens=sampled["input_tokens"],
-            sampled_output_tokens=budget,
-            sampling_seed=settings.sampling.seed if settings.sampling else None,
-            scheduled_ms=(due - run.start) * 1000,
-        )
-        if preparation:
-            request.workload["input_preparation"] = {key: value for key, value in preparation.items()
-                                                    if key not in {"messages", "request_ids"}}
-        request.messages, request.input_chars = messages, input_chars
-        if not workload:
-            request.scorer, request.expected = "exact", value
-            request.options = deterministic_options(config, request.options)
         record = (await send(request, finalize_pause) if send is not None else
                   await run.request(target, client, request, finalize_record=finalize_pause))
         if record is None:
@@ -327,8 +363,7 @@ async def execute_conversation(run, target, client, config, settings, mode, inde
             item["stop_reason"] = "observed context budget reached"
             run.unfinished[target.name].add(check)
             break
-        answer = final_answer(record.output)[0] if mode == "live" else value
-        history = [*messages, {"role": "assistant", "content": answer}]
+        history = session_history(request, mode, value, record.output)
     item["completed_turns"] = len(item["turns"])
     return item
 
@@ -424,7 +459,6 @@ def consistency_output_cap(config):
 def consistency_requests(config):
     """Build each Answer consistency base request before per-level repetition."""
     settings = config.consistency
-    requests = []
     for shape in settings.shapes:
         for prompt_index in range(settings.prompts_per_shape):
             answer = COPY_PASSAGES[prompt_index % len(COPY_PASSAGES)]
@@ -439,8 +473,7 @@ def consistency_requests(config):
                         max_tokens=consistency_output_cap(config),
                         request_timeout_seconds=config.request_timeout_seconds,
                         options=consistency_options(config))
-            requests.append((shape, prompt_index, base))
-    return requests
+            yield shape, prompt_index, base
 
 
 async def consistency(run, target, client, fixtures):

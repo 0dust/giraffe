@@ -237,7 +237,7 @@ async def test_sampled_live_history_lengths_pauses_planning_and_report_roundtrip
     from giraffe.deployment import fixture_hash
 
     assert report.manifest["fixture_pack"]["workload_fixture_sha256"] == fixture_hash({
-        "workload_versions": {name: WORKLOAD_VERSIONS[name] for name in ("generator", "session_sampling")},
+        "workload_versions": {name: WORKLOAD_VERSIONS[name] for name in ("session_plan",)},
         "settings": {"sessions": value.sessions.model_dump(mode="json")},
     })
     write_report(report, tmp_path, html=True)

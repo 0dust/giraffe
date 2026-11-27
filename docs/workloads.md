@@ -433,18 +433,27 @@ generation pace, while their saved timing and total usage remain readable.
 
 Conversation fixtures, modes, generation options, schedules and seeds contribute
 to the workload fixture hash in the manifest, together with explicit versions in
-`src/giraffe/workload_versions.py`. The keys are `generator`, `fixed_sessions`,
-`session_sampling`, `multi_user`, `gateway_access`, `gateway_policy`, `scale_down`,
-`load_test`, `logprob` and `tool_conversations`. Bump the relevant version when
-server-visible requests or schedules change; source formatting does not affect identity.
-`generator` covers selected Prefix, Sessions, Consistency and Tools workloads,
-and Multi-user conversations that use `workloads.py` request builders. Core
-built-in fixtures have their own `builtin_sha256`; selecting core checks or Load
-alone does not add `generator`. Full and shared identities use this same rule.
+`src/giraffe/workload_versions.py`. The keys are `prefix`, `consistency`, `tools`,
+`fixed_sessions`, `session_plan`, `multi_user`, `gateway_access`, `gateway_policy`,
+`scale_down`, `load_test`, `logprob` and `tool_conversations`. Bump the relevant
+version when server-visible requests or schedules change; source formatting does
+not affect identity. Each request builder has its own key. `prefix` covers Prefix
+requests; `consistency` covers ordinary Answer consistency, while its logprob path
+uses only `logprob`. `tools` covers single-response tool requests, including forced
+diagnostics; conversation-only tool checks use only `tool_conversations`.
+`multi_user` covers population assignment, execution windows and ordered arrival
+(and burst/recovery) offers, plus generated per-user requests. Every selected
+Multi-user run includes it, including conversations that share the population
+and window planner and also use the session builders. `load_test` guards both
+final requests and dispatch arrival schedules across independent settings sources.
+Core built-in fixtures have their own `builtin_sha256`; no shared `generator` key
+is needed. Full and shared identities use the same consumer rule.
 `fixed_sessions` covers name-recall prompts in Sessions and Multi-user conversations
 with `profile: correctness`, including both fixed and live history modes.
-`session_sampling` covers configured `sessions.sampling` and
-`multi_user.conversations.sampling`. Live histories may change input
+`session_plan` covers performance Sessions, sampled correctness Sessions, and all
+Multi-user conversations, including configurations without sampling. Standalone
+correctness Sessions without sampling bypass the planner and omit its key.
+Live histories may change input
 work across runs: comparison checks observed input lengths and request hashes and
 marks affected timing/rates inconclusive rather than claiming identical inputs.
 Optional `consistency.logprobs` collects and compares content token probabilities
