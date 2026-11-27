@@ -9,7 +9,7 @@ from tests.test_run_limits_phase4_planning import config, observations
 from tests.test_ux_catalogue import browser_logic
 
 
-def test_short_estimate_names_connection_risk_without_contradicting_headline():
+def test_partial_measured_traffic_omits_eta_but_keeps_connection_risk():
     configured = config(checks=["access", "correctness"], max_duration_seconds=5)
     plan = request_plan(configured, observations=observations(configured, p50=10, p90=10))
     assert 0 < plan["estimated_high_seconds"] < 1
@@ -17,14 +17,14 @@ def test_short_estimate_names_connection_risk_without_contradicting_headline():
     assert plan["unknown_time_components"] == []
     risk, = plan["time_warnings"]
     assert risk["msg"] == (
-        "Endpoint access for service may wait up to 30 s if the server is slow to respond; "
+        "Endpoint response for service may wait up to 30 s if the server is slow to respond; "
         "this allowance shares the time limit and is excluded from the estimated duration.")
     assert risk["fields"] == ["max_duration_seconds", "test_options.access.request_timeout_seconds"]
     assert [item["id"] for item in risk["components"]] == ["initial"]
     browser_logic("const plan=" + json.dumps(plan) + r""";
 const markup=renderPlanTime(plan);
-assert.match(markup,/Confidence: medium/);
-assert.match(markup,/Endpoint access for service may wait up to 30 s/);
+assert.equal(plan.has_complete_time_estimate,false);assert.doesNotMatch(markup,/Estimated duration:|Confidence:/);
+assert.match(markup,/Endpoint response for service may wait up to 30 s/);
 assert.doesNotMatch(markup,/estimated traffic duration may exceed|Unknown requests/);
 assert.match(markup,/data-setting-path="test_options.access.request_timeout_seconds"/);
 """)
@@ -63,7 +63,7 @@ def test_headline_over_budget_is_explicit_without_fictitious_unknown_requests():
 ])
 def test_duration_range_never_repeats_identical_formatted_endpoints(low, high, expected):
     browser_logic(f"""
-const plan={{estimated_seconds:{(low + high) / 2},estimated_low_seconds:{low},estimated_high_seconds:{high}}};
+const plan={{has_complete_time_estimate:true,estimated_seconds:{(low + high) / 2},estimated_low_seconds:{low},estimated_high_seconds:{high}}};
 const markup=renderPlanTime(plan);
 assert(markup.includes('Estimated duration: {expected} · test traffic only'),markup);
 assert.equal((markup.match(/Estimated duration:/g)||[]).length,1);

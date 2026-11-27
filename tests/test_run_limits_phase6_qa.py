@@ -34,7 +34,7 @@ def test_budget_copy_uses_catalogue_names_and_grouped_numbers_without_changing_r
     plan = request_plan(configured)
     assert plan["planned_total"] == 100007  # 100k arrivals + connection + answers; local sizing sends no requests.
     assert [(row["id"], row["title"]) for row in plan["rows"]] == [
-        ("initial", "Endpoint access"), ("access", "Endpoint access"),
+        ("initial", "Endpoint response"), ("access", "Endpoint response"),
         ("correctness", "Answer correctness"),
         ("load_combinations", "Input → output combinations"), ("load_calibration", "Local prompt preparation")]
     notice = next(item for item in plan["request_warnings"] if item["kind"] == "incomplete_coverage")
@@ -65,7 +65,7 @@ assert.equal(elements.max_requests.disabled,false);assert.equal(elements.max_req
 
 def test_restored_catalogue_retains_reference_names():
     names = {
-        "access": "Endpoint response", "serving": "Invalid responses",
+        "access": "Endpoint response", "serving": "Response validity",
         "correctness": "Answer correctness", "json": "JSON correctness",
         "context": "Context recall", "tools": "Tool-call correctness",
         "first_output": "First answer", "generation": "Generation",

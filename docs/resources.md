@@ -16,6 +16,9 @@ The per-run limit measures the compact, deduplicated JSON, including its storage
 
 `--retention all`, `failures`, and `none` control whether response text is kept: all responses, only failure evidence, or no responses. Failure evidence includes requests cited by inconclusive checks. Request metadata (timings, status, scores) is always saved. Retention does not cap disk usage; storage limits do.
 
+To export replies from a replay, see
+[Replay saved prompts against vLLM](workloads.md#replay-saved-prompts-against-vllm).
+
 Runs with an `evidence.jsonl` journal and no `report.json` are protected from manual
 and automatic cleanup, including crashed runs and export failures with only a summary.
 Cleanup becomes available after a report is saved.

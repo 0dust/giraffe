@@ -48,10 +48,12 @@ async def test_explicit_model_sends_one_bounded_request_and_preserves_auth(monke
         url="http://server" + suffix, model="  manual-model  ", api_key_env=" CONNECTION_KEY ",
         headers_env={"X-Gateway": "CONNECTION_HEADER"}, request_options={"temperature": 0},
     ))
-    assert set(result) == {"status", "model", "latency_ms", "message"}
+    assert set(result) == {"status", "model", "latency_ms", "message", "context_window", "context_window_reason"}
+    assert result["context_window"] is None
     assert result["status"] == "connected" and result["model"] == "manual-model"
     assert result["latency_ms"] >= 0
-    assert len(requests) == 1 and requests[0].method == "POST"
+    assert len(requests) == 2 and requests[0].method == "POST"
+    assert requests[1].method == "GET" and requests[1].url.path.endswith("/models")
     base = "/gateway/v1" if suffix.startswith("/gateway") else "/v1"
     assert str(requests[0].url) == "http://server" + base + "/chat/completions"
     assert requests[0].headers["Authorization"] == "Bearer private-key"
@@ -228,9 +230,9 @@ async def test_same_ca_proxy_and_environment_transport_apply_to_discovery_and_pr
     result = await check_connection(ConnectionTest(url="https://server", ca_bundle="private-ca.pem",
                                                  proxy="http://proxy:8080"))
     assert result["status"] == "connected" and len(requests) == 2
-    assert ca_files == ["private-ca.pem", "private-ca.pem"]
+    assert ca_files == ["private-ca.pem"] * 2
     assert all(client["verify"] is trust and client["proxy"] == "http://proxy:8080"
-               and client["trust_env"] and not client["follow_redirects"] for client in clients)
+               and client.get("trust_env", True) and not client["follow_redirects"] for client in clients)
 
 
 @pytest.mark.parametrize("model", [None, "model"])
@@ -298,6 +300,77 @@ async def test_api_validates_sensitive_inputs_and_creates_no_run_artifacts(tmp_p
         assert response.status_code == 200 and response.json()["status"] == "connected"
         assert (await client.get("/api/runs")).json()["runs"] == []
     assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("body,effort", [
+    ({"error": {
+        "message": 'invalid reasoning value: "bogus" (must be ...)',
+        "type": "invalid_request_error", "param": None, "code": None,
+    }}, "bogus"),
+    pytest.param({"error": {"param": None, "message":
+                           "max_tokens must be at least 64 when reasoning_effort is high."}},
+                 "high", id="null-param-with-prose"),
+])
+async def test_api_connection_rejection_mentions_request_options(tmp_path, monkeypatch, body, effort):
+    requests, _ = endpoint(monkeypatch, lambda request: httpx.Response(400, json=body))
+    async with browser(tmp_path) as client:
+        response = await client.post("/api/targets/test-connection", json={
+            "url": "http://server", "model": "tiny", "request_options": {"reasoning_effort": effort},
+        })
+    assert response.status_code == 422
+    assert response.json()["detail"] == (
+        "The server returned HTTP 400. Check the model name, the OpenAI-compatible endpoint "
+        "and request_options (reasoning_effort).")
+    assert "invalid reasoning value" not in response.text and "bogus" not in response.text
+    assert "rejected request_options" not in response.text
+    assert len(requests) == 1
+    payload = json.loads(requests[0].content)
+    assert payload["max_tokens"] == 32 and payload["reasoning_effort"] == effort
+
+
+async def test_api_connection_rejection_prefers_param_over_prose(tmp_path, monkeypatch):
+    requests, _ = endpoint(monkeypatch, lambda request: httpx.Response(400, json={"error": {
+        "param": "reasoning_effort",
+        "message": "Invalid value for reasoning_effort. The supplied chat_template_kwargs was accepted.",
+    }}))
+    async with browser(tmp_path) as client:
+        response = await client.post("/api/targets/test-connection", json={
+            "url": "http://server", "model": "tiny", "request_options": {
+                "reasoning_effort": "bogus", "chat_template_kwargs": {"enable_thinking": False},
+            },
+        })
+    assert response.status_code == 422
+    assert response.json()["detail"] == (
+        "The server returned HTTP 400 and rejected request_options.reasoning_effort. "
+        "Check that field's value or remove it from the configuration.")
+    assert "chat_template_kwargs" not in response.text and "bogus" not in response.text
+    assert len(requests) == 1
+
+
+@pytest.mark.parametrize("status,body", [
+    pytest.param(400, {"error": {"param": "max_tokens", "message":
+                               "max_tokens must be at least 64 when reasoning_effort is high."}},
+                 id="param-with-prose"),
+    pytest.param(400, {"error": {"param": "max_tokens", "message":
+                               "max_tokens must be at least 64."}}, id="param-without-prose"),
+    pytest.param(422, {"detail": [{"loc": ["body", "max_tokens"], "msg": "x"}],
+                       "message": "max_tokens must be at least 64 when reasoning_effort is high."},
+                 id="loc-with-prose"),
+])
+async def test_api_connection_other_structured_field_keeps_generic_warning(tmp_path, monkeypatch, status, body):
+    requests, _ = endpoint(monkeypatch, lambda request: httpx.Response(status, json=body))
+    async with browser(tmp_path) as client:
+        response = await client.post("/api/targets/test-connection", json={
+            "url": "http://server", "model": "tiny", "request_options": {"reasoning_effort": "high"},
+        })
+    assert response.status_code == 422
+    message = response.json()["detail"]
+    assert message == (f"The server returned HTTP {status}. "
+                       "Check the model name and OpenAI-compatible endpoint.")
+    assert "reasoning_effort" not in message and "rejected request_options" not in message
+    assert len(requests) == 1
+    payload = json.loads(requests[0].content)
+    assert payload["max_tokens"] == 32 and payload["reasoning_effort"] == "high"
 
 
 async def test_active_run_blocks_extra_connection_traffic(tmp_path, monkeypatch, local_tokenizer):

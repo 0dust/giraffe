@@ -120,13 +120,53 @@ The four `load_test.workloads` options are:
 - `mixed`: seeded request-frequency choices from at least two selected shapes,
   with equal shares or positive custom shares totaling 100%. Reports retain the
   requested and observed mix.
-- `interference`: replenished short streams compared across a full baseline window
-  and a full long-input probe window (2D per eligible concurrency level). Probes
-  wait for streaming to start or for five chunks, according to `trigger`.
+- `interference`: short-answer performance compared across a full short-only baseline
+  window and a full interference window (2D per eligible concurrency level).
+  The default `mode: long_input_during_short` introduces long inputs after short
+  answers start streaming. `mode: short_during_long` sends short requests after
+  long answers start streaming. `trigger` selects `streaming_started` or
+  `after_five_chunks` for the active answers in either mode.
 - `stress`: selected `long_short`, `short_long` or `long_long` cases. Long-output
   coverage requires `ceil(profile.long.output_tokens × min_output_percent / 100)`
   tokens in every valid response: 80% of the default 512-token cap is 410.
   Coverage alone never passes; early endings leave coverage inconclusive.
+
+To measure how an active long answer affects a new short request, use this
+interference-only configuration alongside your endpoint settings:
+
+```yaml
+checks: [load]
+stream: true
+concurrency: 2
+load_test:
+  workloads:
+    combinations:
+      enabled: false
+    interference:
+      enabled: true
+      mode: short_during_long
+      trigger: streaming_started
+      max_slowdown: 1.5
+  patterns:
+    concurrent:
+      levels: [2]
+    constant:
+      enabled: false
+```
+
+This mode uses short inputs requesting long outputs, then sends short-input,
+short-output probes while those answers are still active. The report compares
+the short requests' first-answer and completion times with the same short work
+running alone. If the server queues a short request until the long answer ends,
+that wait remains part of its measured delay. Only dispatch must occur during
+the long stream; the two answers do not need to stream simultaneously. Long-answer
+coverage requires endpoint-reported output tokens above `profile.short.output_tokens`;
+the Long output setting remains a cap. Missing streaming progress, early completion
+or insufficient measured long-output coverage can leave the comparison inconclusive.
+
+For saved questions, budgets at or below `profile.short.output_tokens` select
+short baseline/probe work; larger budgets select the long background. If either
+role has no eligible saved question, the comparison remains inconclusive.
 
 The shared `profile` defaults to input token targets 128/512/2048 and output caps
 64/256/512 for Short/Medium/Long. New profiles require strictly increasing sizes.
@@ -157,6 +197,18 @@ already sent drain under `load_test.request_timeout_seconds` (default 300 second
 and any run deadline. Drained requests remain in the evidence. A truncated sending
 window or incomplete delivery is inconclusive unless observed endpoint failures
 already establish failure. Stopping or reaching a run limit preserves partial results.
+
+During a run, Giraffe warns when at least three ordinary requests and at least 20%
+of finished ordinary requests for one target and timeout setting hit their request
+timeout. It counts requests that started answering, produced reasoning only, or
+received no output; readiness requests, evidence probes and intentional timeout
+tests are excluded. Nothing changes automatically. To allow more time, stop and
+rerun with a higher `request_timeout_seconds` (`--request-timeout`) for an inherited
+run timeout, `test_options.<check>.request_timeout_seconds` for a per-check override,
+or `load_test.request_timeout_seconds` for Load test (the warning names the nested
+settings path for migrated load tests). Equal deadlines can share a warning, which
+names all settings involved. An explicit custom-fixture timeout is changed in the
+named fixture file's `request_timeout_seconds` field; the run timeout does not override it.
 
 `pass_criteria` applies first-answer, completion, optional stream-pause and generation
 speed limits to individual responses, not p95. Defaults are 2,000 ms first answer,
@@ -199,6 +251,59 @@ configuration with embedded cases, expected answers and deterministic scorers.
 Edit its target URL and model, then run it with
 `giraffe run --config examples/request-pack.json --html`. Its `request_pack`
 object can also be extracted as a standalone dataset for `--request-pack`.
+
+### Replay saved prompts against vLLM
+
+Edit the endpoint and model in `examples/vllm.yaml` first, then save your prompts
+as `prompts.json`:
+
+```json
+{
+  "version": 1,
+  "cases": [
+    {
+      "fixture_id": "summarize-update",
+      "messages": [
+        {"role": "user", "content": "Summarize this update in one sentence: The search index rebuild finished overnight, and median query latency fell from 120 ms to 80 ms."}
+      ],
+      "scorer": "none",
+      "max_tokens": 64,
+      "options": {"temperature": 0}
+    },
+    {
+      "fixture_id": "explain-cache",
+      "messages": [
+        {"role": "user", "content": "Explain when a small web service should invalidate its cached product prices."}
+      ],
+      "scorer": "none",
+      "options": {"temperature": 0}
+    }
+  ]
+}
+```
+
+Per-case `max_tokens` overrides `--max-output-tokens`, so the first prompt allows
+64 output tokens and the second uses 256. `--output` must name a new or empty
+directory because Giraffe never overwrites a run;
+`--retention all` keeps successful replies that other retention settings may drop.
+
+```sh
+giraffe run --config examples/vllm.yaml --request-pack prompts.json --checks correctness --max-output-tokens 256 --retention all --output runs/replay
+```
+
+With `scorer: none`, correctness is `inconclusive` and exit code 2 is expected;
+replies and token counts are still saved. Filter on `pack_control` to export one
+reply per saved prompt with `id` matching its `fixture_id` in `prompts.json`,
+since the loaded pass repeats prompts:
+
+```sh
+jq -c '.requests[] | select(.scenario == "pack_control") | {id: .workload.case_id, reply: .output, completion_tokens, finish_reason, status, valid, error}' runs/replay/report.json
+```
+
+Use a reply only when `status` is `completed` and `valid` is `true`; otherwise
+`error` explains the failure (for example `HTTP 503` or a stream that ended early),
+and `reply`, `completion_tokens` and `finish_reason` may be empty or partial.
+A `finish_reason` of `"length"` means the reply hit its token limit.
 
 Judge scoring requires an explicit evaluator endpoint in `judging.judges` and a
 `judge` case with an expected answer and rubric. Evaluator calls have separate
@@ -677,7 +782,12 @@ Arbitrary environment dumps and unknown top-level configuration fields are exclu
 
 Discovery is optional and read-only: `discovery: ollama` reads `/api/version` and
 `/api/show`, with optional `/api/tags` and `/api/ps` for matching model digests and
-active context length; `discovery: vllm` reads `/version`. Served model identifiers also come
+active context length; `discovery: vllm` reads `/version`, and optionally `/v1/models`
+for the served model's `max_model_len` (context window). Before a run (CLI
+`giraffe run` preflight, UI Connect), Giraffe reads the context window from
+`/v1/models` (vLLM, SGLang) or the configured discovery route and uses it to plan
+the Load test; LMDeploy and TensorRT-LLM do not report one, so set it in
+`deployment.serving.context_limit`. Served model identifiers also come
 from inference responses. A separately configured `collector_url` can return an
 allowlisted JSON export with `scope` and `collected_at`. A collector never inherits
 inference credentials. Use an accessible read-only export, not a privileged agent

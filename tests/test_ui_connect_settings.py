@@ -115,9 +115,9 @@ assertValues();
 validateRunForm=()=>true;validateSetupChecks=()=>{};revealSetupStep=step=>state.setupStep=step;
 for(const step of [2,3,1]){navigateSetup(step);assert.equal(state.setupStep,step);renderNew();assertValues();}
 const saved=readForm(false).config;
+api=async(path,options)=>{assert.equal(path,'/api/config/draft');return {config:JSON.parse(options.body),migration_notes:[]};};
 state.detail={report:{manifest:{config:saved}},baseline_id:null};await rerun();renderNew();assertValues();
 state.config=structuredClone(bootstrap.config);state.jsonDraft=state.jsonBase='synced';renderNew();
-api=async(path,options)=>{assert.equal(path,'/api/config/draft');return {config:JSON.parse(options.body),migration_notes:[]};};
 toast=()=>{};
 await importConfig({text:async()=>JSON.stringify(saved)});assertValues();
 for(const name of Object.keys(edits)){
@@ -193,6 +193,8 @@ def test_moved_settings_have_one_editable_control_on_their_own_step():
         else:
             assert any(parent['tag'] == 'details' and parent.get('id') == 'execution-settings' for parent in control['parents']), name
     timeout, = tree.named('request_timeout_seconds')
+    timeout_label, = [node for node in tree.nodes if node['tag'] == 'label' and node.get('for') == timeout['id']]
+    assert timeout_label['text'] == 'Default request timeout (seconds)'
     memory, = tree.named('max_memory_mb')
     grid = next(parent for parent in timeout['parents'] if parent.get('class') == 'fields')
     assert grid in memory['parents']

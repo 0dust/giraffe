@@ -11,7 +11,7 @@ TARGET = {"name": "one", "url": "http://local", "model": "m"}
 
 def saved(**values):
     value, notes = migrate_run_limits({"targets": [TARGET], **values})
-    value, load_notes = migrate_concurrent_load(value)
+    value, load_notes, warnings = migrate_concurrent_load(value)
     return RunConfig.model_validate(value), notes + load_notes
 
 

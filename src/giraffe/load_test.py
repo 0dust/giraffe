@@ -56,6 +56,23 @@ LOAD_TITLES = {
 SCHEDULER_LAG_MS = 100  # Same delivery-evidence policy as traffic.py, not an acceptance criterion.
 
 
+class _LongOutputProgress(OutputProgress):
+    requires_confirmed_answer = True
+    finished = False
+
+    def on_answer_reset(self):
+        self.first, self.chunks = False, 0
+        self.changed.set()
+
+    def on_stream_finished(self):
+        self.finished = True
+        self.changed.set()
+
+
+def interference_shapes(settings):
+    return ["short_short", "short_long" if settings.workloads.interference.mode == "short_during_long" else "long_short"]
+
+
 def settings_sets(settings):
     return [
         ("primary", settings),
@@ -74,7 +91,7 @@ def running_shapes(settings):
                 *(w.combinations.selected if w.combinations.enabled else []),
                 *(w.mixed.selected if w.mixed.enabled else []),
                 *(w.stress.cases if w.stress.enabled else []),
-                *(["short_short", "long_short"] if w.interference.enabled else []),
+                *(interference_shapes(settings) if w.interference.enabled else []),
             ]
         )
     )
@@ -149,6 +166,16 @@ def _shape_sources(settings, size, sources, records=()):
     return matching or sources
 
 
+def _saved_shape_sources(run, settings, point, shape, sources):
+    if point["type"] == "interference" and settings.workloads.interference.mode == "short_during_long":
+        short = shape.endswith("_short")
+        cap = settings.profile.short.output_tokens
+        sources = [source for source in sources if (
+            (source.max_tokens if source.max_tokens is not None else run.config.max_output_tokens) <= cap
+        ) == short]
+    return _shape_sources(settings, shape.split("_")[0], sources, run.records)
+
+
 def stress_output_floor(settings):
     return math.ceil(settings.profile.long.output_tokens * settings.workloads.stress.min_output_percent / 100)
 
@@ -215,7 +242,7 @@ def point_shapes(settings, point):
     return (
         list(settings.workloads.mixed.selected)
         if point["type"] == "mixed"
-        else ["short_short", "long_short"]
+        else interference_shapes(settings)
         if point["type"] == "interference"
         else [point["shape"]]
     )
@@ -311,6 +338,7 @@ def test_points(settings):
                     "workload": "interference",
                     "shape": None,
                     "pattern": "interference",
+                    "interference_mode": w.interference.mode,
                     "level": n,
                     "rate": None,
                     "bursts": None,
@@ -334,7 +362,8 @@ def scheduled_count(settings, point):
     return n
 
 
-def load_time_plan(settings):
+def load_time_plan(settings, *, predicted_extensions=None):
+    predicted_extensions = predicted_extensions or {}
     own = dict(settings_sets(settings))
     points = test_points(settings)
     expected = sum(scheduled_count(own[p["source"]], p) or 0 for p in points)
@@ -348,6 +377,7 @@ def load_time_plan(settings):
     windows = sum(p["windows"] for p in points)
     sending = sum(p["windows"] * own[p["source"]].schedule.duration_seconds for p in points)
     allowances = sum(p["windows"] * own[p["source"]].request_timeout_seconds for p in points)
+    extensions = sum(predicted_extensions.get(p["id"], 0) for p in points)
     rows = {}
     for kind in LOAD_TITLES:
         selected = [p for p in points if p["type"] == kind]
@@ -358,6 +388,9 @@ def load_time_plan(settings):
                 "windows": sum(p["windows"] for p in selected),
                 "configured_load_seconds": sum(
                     p["windows"] * own[p["source"]].schedule.duration_seconds for p in selected
+                ),
+                "sending_extension_seconds": sum(
+                    predicted_extensions.get(p["id"], 0) for p in selected
                 ),
                 "finish_allowance_seconds": sum(
                     p["windows"] * own[p["source"]].request_timeout_seconds for p in selected
@@ -395,7 +428,15 @@ def load_time_plan(settings):
         "windows": windows,
         "configured_load_seconds": sending,
         "finish_allowance_seconds": allowances,
-        "time_with_allowances_seconds": sending + allowances,
+        "upper_allowance_label": (
+            "Upper allowance before any window extension"
+            if any(p["pattern"] == "concurrent" and p["type"] not in {"mixed", "interference"}
+                   and own[p["source"]].pass_criteria.min_valid_responses > p["level"]
+                   and not predicted_extensions.get(p["id"], 0) for p in points)
+            else "Upper allowance including request deadlines"
+        ),
+        "sending_extension_seconds": extensions,
+        "time_with_allowances_seconds": sending + extensions + allowances,
         "expected_scheduled_requests": expected,
         "known_scheduled_requests": sum(known(p) for p in points),
         "unknown_requests": unknown,
@@ -433,6 +474,8 @@ def load_time_plan(settings):
 
 def point_label(point):
     shape = load_shape_label(point["shape"]) if point["shape"] else LOAD_TITLES[point["type"]]
+    if point.get("interference_mode") == "short_during_long":
+        shape = "Short request during an active long answer"
     traffic = (
         "Maintain concurrent requests"
         if point["pattern"] == "concurrent"
@@ -483,11 +526,14 @@ def required_slots(config):
     )
 
 
+def initial_requests(point):
+    if point["type"] == "interference":
+        return point["level"] + 1 if point.get("interference_mode") == "short_during_long" else point["level"] * 2 - 1
+    return point["level"] or 0
+
+
 def minimum_reservation(settings):
-    return sum(
-        (p["level"] * 2 - 1 if p["type"] == "interference" else p["level"] or 0)
-        for p in test_points(settings)
-    )
+    return sum(initial_requests(point) for point in test_points(settings))
 
 
 def validate_config(config):
@@ -568,25 +614,8 @@ def validate_config(config):
                 "Long input during an active short stream needs streaming responses.",
                 values={prefix + "workloads.interference.enabled": True, "stream": config.stream},
             )
-        for target in config.targets:
-            context, _ = context_window(target)
-            for shape in running_shapes(own):
-                a, b = shape.split("_")
-                if (
-                    context is not None
-                    and not getattr(own, "legacy_source", None)
-                    and getattr(own.profile, a).input_tokens + getattr(own.profile, b).output_tokens
-                    > context
-                ):
-                    load_validation_error(
-                        [
-                            prefix + f"profile.{a}.input_tokens",
-                            prefix + f"profile.{b}.output_tokens",
-                        ],
-                        f"{load_shape_label(shape)} exceeds the known endpoint context window ({context} tokens).",
-                    )
     settings = dict(settings_sets(config.load_test))
-    required = sum((p["level"] * 2 - 1 if p["type"] == "interference" else p["level"] or 0) for p in test_points(config.load_test) if not getattr(settings[p["source"]], "legacy_source", None)) * len(config.targets)
+    required = sum(initial_requests(p) for p in test_points(config.load_test) if not getattr(settings[p["source"]], "legacy_source", None)) * len(config.targets)
     if config.max_requests is not None and required > config.max_requests:
         load_validation_error(
             ["max_requests", "load_test.patterns.concurrent.levels"],
@@ -646,6 +675,8 @@ def build_spec(
         "role": role,
         "phase": phase,
     }
+    if point.get("interference_mode"):
+        details["interference_mode"] = point["interference_mode"]
     scenario = point["id"] + ("." + phase if phase else "")
     # Never swap a saved question for a synthetic label prompt. Shape targets
     # remain requested targets; the report exposes actual lengths and shortfall.
@@ -653,9 +684,17 @@ def build_spec(
                getattr(run, "pack_specs", []) or getattr(run, "load_custom_specs", []))
     if sources:
         if frozen_sources is None:
-            sources = _shape_sources(settings, size, sources, run.records)
-        index = point.get("_source_index", 0)
-        point["_source_index"] = index + 1
+            sources = _saved_shape_sources(run, settings, point, shape, sources)
+            if not sources:
+                return None
+        if (frozen_sources is None and point["type"] == "interference"
+                and settings.workloads.interference.mode == "short_during_long"):
+            indices = point.setdefault("_source_indices", {})
+            index = indices.get(shape, 0)
+            indices[shape] = index + 1
+        else:
+            index = point.get("_source_index", 0)
+            point["_source_index"] = index + 1
         if getattr(run, "pack_specs", []):
             cases = {case.fixture_id: case for case in run.config.request_pack.cases}
             rng = random.Random(settings.patterns.poisson.seed + index)
@@ -696,9 +735,18 @@ def build_spec(
 
 
 async def concurrent_window(run, target, client, settings, point, calibration, *, phase=None):
-    """Refill each slot independently; a minimum sample count never ends a window."""
+    """Refill each slot independently; a minimum sample count never ends a window.
+
+    Plain concurrent points extend sending until the required number of requests
+    have started, subject to the existing run and point limits.
+    """
     begin = time.monotonic()
     end = begin + settings.schedule.duration_seconds
+    sending_cutoff = end
+    minimum = settings.pass_criteria.min_valid_responses
+    extendable = phase is None and point["type"] != "mixed"
+    dispatched = 0
+    extended = False
     records, active = [], {}
     changed = asyncio.Event()
     rng = random.Random(settings.patterns.poisson.seed)
@@ -706,6 +754,8 @@ async def concurrent_window(run, target, client, settings, point, calibration, *
     failure = None
     cutoff = None
     triggered = 0
+    reverse = bool(phase and settings.workloads.interference.mode == "short_during_long")
+    workers = 1 if reverse and phase == "baseline" else point["level"] - 1 if phase else point["level"]
     scenario = point["id"] + ("." + phase if phase else "")
     run.start_condition(target.name, scenario, planned=None, planned_kind="duration")
     intent = ScheduleObservation(
@@ -713,15 +763,25 @@ async def concurrent_window(run, target, client, settings, point, calibration, *
         start=begin, origin=run.start, stage_id=scenario, check_id="load",
         kind="concurrency", label=point_label(point) + (f" · {phase}" if phase else ""),
         pattern=point["pattern"],
-        concurrency=point["level"] - (1 if phase == "control" else 0),
+        concurrency=workers + (phase == "probe") if reverse else point["level"] - (phase == "control"),
     )
 
     def ended():
-        nonlocal reason, cutoff
+        nonlocal reason, cutoff, sending_cutoff, extended
         if failure is not None:
             return True
-        if time.monotonic() >= end:
-            return True
+        now = time.monotonic()
+        if now >= sending_cutoff:
+            if extendable and not extended and dispatched < minimum and now >= end:
+                extension_cap = end + math.ceil((minimum - dispatched) / workers) * settings.request_timeout_seconds
+                sending_cutoff = min(run.deadline, extension_cap)
+                extended = sending_cutoff > end
+            else:
+                if extended and dispatched < minimum:
+                    reason = ("extension limit reached" if sending_cutoff < run.deadline
+                              else run.condition_reason(target.name))
+                    cutoff = sending_cutoff
+                return True
         if not run.allowed(target.name):
             reason = run.condition_reason(target.name)
         elif point.get("request_allowance") is not None and run.budget_counts[target.name] - point["budget_start"] >= point["request_allowance"]:
@@ -731,38 +791,64 @@ async def concurrent_window(run, target, client, settings, point, calibration, *
         cutoff = time.monotonic() if cutoff is None else cutoff
         return True
 
-    async def send(shape, role, progress=None):
-        if ended():
-            return None
-        async with run.slot(False, min(end, run.deadline)) as admitted:
-            if not admitted or ended():
-                return None
-            if role == "probe" and (
-                len(active) != point["level"] - 1
-                or not all(
-                    p.first
-                    if settings.workloads.interference.trigger == "streaming_started"
-                    else p.chunks >= 5
-                    for p in active.values()
-                )
-            ):
-                return None
-            spec = build_spec(run, settings, point, shape, calibration, role=role, phase=phase)
-            try:
-                record = await run.request(target, client, spec, event=progress, slot_reserved=True)
-            except asyncio.CancelledError as exc:
-                record = getattr(exc, "giraffe_record", None)
+    def trigger_ready():
+        return len(active) == point["level"] - 1 and all(
+            not getattr(p, "finished", False) and (
+                p.first if settings.workloads.interference.trigger == "streaming_started" else p.chunks >= 5
+            ) for p in active.values()
+        )
+
+    def request_started():
+        nonlocal dispatched, sending_cutoff
+        dispatched += 1
+        if extended and dispatched >= minimum:
+            sending_cutoff = min(time.monotonic(), run.deadline)
+            changed.set()
+
+    async def send(shape, role, progress=None, index=None):
+        while not ended():
+            async with run.slot(False, min(sending_cutoff, run.deadline)) as admitted:
+                if not admitted:
+                    continue  # A slot wait may have used the original cutoff.
+                if ended():
+                    return None
+                probe_request = role == "probe" or reverse and phase == "probe" and role == "short_stream"
+                if probe_request and not trigger_ready():
+                    return None
+                spec = build_spec(run, settings, point, shape, calibration, role=role, phase=phase)
+                if spec is None:
+                    return None
+                guarded = dict(on_start=request_started)
+                if reverse:
+                    def eligible():
+                        return not ended() and (not probe_request or trigger_ready())
+
+                    def phase_started():
+                        request_started()
+                        if index is not None and phase == "probe":
+                            active[index] = progress
+                            changed.set()
+
+                    guarded = dict(admission_deadline=min(sending_cutoff, run.deadline), prepared_admission=True,
+                                   admission_check=eligible, on_start=phase_started)
+                try:
+                    record = await run.request(target, client, spec, event=progress, slot_reserved=True, **guarded)
+                except asyncio.CancelledError as exc:
+                    record = getattr(exc, "giraffe_record", None)
+                    if record is not None:
+                        records.append(record)
+                    raise
                 if record is not None:
                     records.append(record)
-                raise
-            if record is not None:
-                records.append(record)
-            return record
+                return record
+        return None
 
     async def worker(index):
         while not ended():
-            progress = OutputProgress(changed) if phase else None
-            if phase:
+            progress = (_LongOutputProgress(changed) if reverse else OutputProgress(changed)) if phase else None
+            if reverse:
+                shape = "short_long" if phase == "probe" else "short_short"
+            elif phase:
                 active[index] = progress
                 shape = "short_short"
             elif point["type"] == "mixed":
@@ -771,7 +857,8 @@ async def concurrent_window(run, target, client, settings, point, calibration, *
             else:
                 shape = point["shape"]
             try:
-                record = await send(shape, "short_stream" if phase else "request", progress)
+                role = "long_stream" if reverse and phase == "probe" else "short_stream" if phase else "request"
+                record = await send(shape, role, progress, index)
             finally:
                 active.pop(index, None)
                 changed.set()
@@ -781,29 +868,27 @@ async def concurrent_window(run, target, client, settings, point, calibration, *
 
     async def probe():
         nonlocal triggered
+        if reverse:
+            sources = getattr(run, "pack_specs", []) or getattr(run, "load_custom_specs", [])
+            if sources and not _saved_shape_sources(run, settings, point, "short_short", sources):
+                return
         while not ended():
             changed.clear()
-            streams = list(active.values())
-            if len(streams) == point["level"] - 1 and all(
-                p.first
-                if settings.workloads.interference.trigger == "streaming_started"
-                else p.chunks >= 5
-                for p in streams
-            ):
-                sent = await send("long_short", "probe")
+            if trigger_ready():
+                sent = await send("short_short" if reverse else "long_short", "short_stream" if reverse else "probe")
                 triggered += sent is not None
                 await asyncio.sleep(0)
-                continue  # At most one long request alongside the N-1 shorts.
+                continue  # One probe slot alongside the N-1 background streams.
             try:
                 await asyncio.wait_for(
-                    changed.wait(), max(0.0001, min(end, run.deadline) - time.monotonic())
+                    changed.wait(), max(0.0001, min(sending_cutoff, run.deadline) - time.monotonic())
                 )
             except TimeoutError:
                 return
 
     tasks = [
         asyncio.create_task(worker(i))
-        for i in range(point["level"] - 1 if phase else point["level"])
+        for i in range(workers)
     ]
     if phase == "probe":
         tasks.append(asyncio.create_task(probe()))
@@ -822,17 +907,17 @@ async def concurrent_window(run, target, client, settings, point, calibration, *
     sending_end = None
     try:
         # Do not await workers directly: requests may outlive the sending window.
-        while time.monotonic() < end and not ended():
+        while not ended():
             changed.clear()
             try:
                 await asyncio.wait_for(
-                    changed.wait(), min(0.02, max(0.0001, end - time.monotonic()))
+                    changed.wait(), min(0.02, max(0.0001, sending_cutoff - time.monotonic()))
                 )
             except TimeoutError:
                 pass
         if failure is not None:
             raise failure
-        sending_end = min(end, cutoff if cutoff is not None else time.monotonic())
+        sending_end = min(sending_cutoff, cutoff if cutoff is not None else time.monotonic())
         intent.begin_drain(sending_end)
         finish_end = run.deadline
         while any(not t.done() for t in tasks) and time.monotonic() < finish_end:
@@ -845,7 +930,7 @@ async def concurrent_window(run, target, client, settings, point, calibration, *
             await asyncio.wait(tasks, timeout=min(0.02, max(0, finish_end - time.monotonic())),
                                return_when=asyncio.FIRST_EXCEPTION)
     except asyncio.CancelledError as exc:
-        sending_end = min(end, time.monotonic())
+        sending_end = min(sending_cutoff, time.monotonic())
         reason = run.stop_reason(target.name) or "execution cancelled"
         cancelled = exc
     except Exception as exc:
@@ -853,7 +938,7 @@ async def concurrent_window(run, target, client, settings, point, calibration, *
             failure = exc
     finally:
         if sending_end is None:
-            sending_end = min(end, time.monotonic())
+            sending_end = min(sending_cutoff, time.monotonic())
         intent.begin_drain(sending_end)
         for task in tasks:
             if not task.done():
@@ -889,6 +974,17 @@ async def concurrent_window(run, target, client, settings, point, calibration, *
             if record.termination_reason not in AUTHORITATIVE_TERMINATION_REASONS:
                 record.error = reason or "overall run deadline reached"
             record.load_point["cancellation_reason"] = record.error
+    if extended and sending_end > end:
+        point["window_extension"] = {
+            "configured_seconds": settings.schedule.duration_seconds,
+            "sending_seconds": sending_end - begin,
+            "reason": "min_valid_responses",
+        }
+        note = (f"Sending continued {sending_end - end:.1f} s past the "
+                f"{settings.schedule.duration_seconds:g} s window so {minimum} requests could start.")
+        if dispatched < minimum and reason:
+            note += f" It stopped early: {reason}."
+        point["window_extension_note"] = note
     window = {
         "phase": phase,
         "sending_start_ms": (begin - run.start) * 1000,
@@ -896,7 +992,7 @@ async def concurrent_window(run, target, client, settings, point, calibration, *
         "delivered_window_seconds": max(0, sending_end - begin),
         "observation_seconds": now - begin,
         "drain_seconds": max(0, now - sending_end),
-        "cut_short": sending_end + 1e-6 < end,
+        "cut_short": sending_end + 1e-6 < end or (extended and dispatched < minimum),
         "window_reason": reason,
         "triggered": triggered,
         "request_ids": [r.id for r in records],
@@ -998,39 +1094,89 @@ async def arrival_window(run, target, client, settings, point, calibration):
     return [r for _, r in evidence.records]
 
 
-def interference_measurements(records, windows, delay_windows=()):
+def _short_work_comparison(baseline, probes, short_output_cap):
+    """A changed question mix or generation length cannot establish interference."""
+    if any(row.output_tokens is None or row.output_tokens > short_output_cap
+           for rows in (baseline, probes) for row in rows):
+        return "Matched short work is not comparable: short answers need reported output at or below the Short output cap."
+    cohorts = []
+    for rows in (baseline, probes):
+        grouped = {}
+        for row in rows:
+            identity = (row.fixture_id, row.requested_max_tokens, row.requested_input_tokens,
+                        row.stream, row.workload.get("case_id"))
+            grouped.setdefault(identity, []).append(row)
+        cohorts.append(grouped)
+    if not baseline or not probes or set(cohorts[0]) != set(cohorts[1]):
+        return "Matched short work is not comparable: questions or requested budgets differ."
+    for identity in cohorts[0]:
+        groups = [cohort[identity] for cohort in cohorts]
+        if abs(len(groups[0]) / len(baseline) - len(groups[1]) / len(probes)) > .1:
+            return "Matched short work is not comparable: question shares differ by more than 10%."
+        fields = ["input_tokens", "output_tokens"]
+        if any(row.completion_tokens is not None for group in groups for row in group):
+            fields.append("completion_tokens")
+        if any(row.cached_prompt_tokens is not None for group in groups for row in group):
+            fields.append("cached_prompt_tokens")
+        for field in fields:
+            values = [[getattr(row, field) for row in group] for group in groups]
+            if any(value is None for cohort in values for value in cohort):
+                return "Matched short work is not comparable: actual token lengths are missing."
+            for quantile in (.5, .95):
+                a, b = (percentile(cohort, quantile) for cohort in values)
+                if max(a, b) > min(a, b) * 1.1:
+                    return "Matched short work is not comparable: actual token lengths differ by more than 10%."
+    return None
+
+
+def interference_measurements(records, windows, delay_windows=(), *, mode="long_input_during_short", short_output_cap=0):
     """Match only short streams overlapping the actual long-request prefill.
 
     Baseline uses the same relative interval in its independent full window.
     This reuses #48's answer-window matching, rather than diluting with all shorts.
     """
     delays = _delays(delay_windows)
+    reverse = mode == "short_during_long"
     baseline = next((w for w in windows if w["phase"] == "baseline"), {})
     probe_window = next((w for w in windows if w["phase"] == "probe"), {})
-    probes = [r for r in records if r.load_point.get("role") == "probe"]
+    probes = [r for r in records if r.load_point.get("role") == ("long_stream" if reverse else "probe")]
     shorts = [
         r
         for r in records
         if r.load_point.get("role") == "short_stream"
         and r.valid
         and r.status == "completed"
-        and r.answer_chunks >= 2
+        and (reverse or r.answer_chunks >= 2)
     ]
     matched = {"baseline": [], "probe": []}
     intervals = []
     for probe in probes:
-        if probe.timing_start_ms is None or probe.first_output_ms is None:
-            continue
-        a, b = probe.timing_start_ms, probe.timing_start_ms + probe.first_output_ms
+        if reverse:
+            window = answer_window(probe)
+            if (not window or probe.stream is not True or probe.answer_chunks < 2
+                    or not probe.valid or probe.status != "completed"
+                    or probe.output_tokens is None or probe.output_tokens <= short_output_cap):
+                continue
+            a, b = window
+        else:
+            if probe.timing_start_ms is None or probe.first_output_ms is None:
+                continue
+            a, b = probe.timing_start_ms, probe.timing_start_ms + probe.first_output_ms
         offset = baseline.get("sending_start_ms", 0) - probe_window.get("sending_start_ms", 0)
         intervals.append({"probe_ms": [a, b], "baseline_ms": [a + offset, b + offset]})
         for phase, shift in (("probe", 0), ("baseline", offset)):
             for r in shorts:
                 window = answer_window(r)
+                if reverse:
+                    # Dispatch during an active long answer is the exposure. A
+                    # serialized server may produce no short output until later.
+                    exposed = (r.dispatch_ms is not None and a + shift - 1e-6 <= r.dispatch_ms < b + shift
+                               and not any(start <= r.dispatch_ms < end for start, end in delays.windows))
+                else:
+                    exposed = window and _overlap(window, (a + shift, b + shift), delays)
                 if (
                     r.load_point.get("phase") == phase
-                    and window
-                    and _overlap(window, (a + shift, b + shift), delays)
+                    and exposed
                 ):
                     if r not in matched[phase]:
                         matched[phase].append(r)
@@ -1040,6 +1186,7 @@ def interference_measurements(records, windows, delay_windows=()):
             "matched_count": len(rows),
             "request_ids": [r.id for r in rows],
             "completion_median_ms": median([r.elapsed_ms for r in rows]) if rows else None,
+            "first_answer_median_ms": median([r.first_output_ms for r in rows if r.first_output_ms is not None]),
             "longest_stream_pause_ms": max(
                 (r.max_stream_gap_ms for r in rows if r.max_stream_gap_ms is not None), default=None
             ),
@@ -1049,6 +1196,7 @@ def interference_measurements(records, windows, delay_windows=()):
     valid_shorts = [r for r in records if r.load_point.get("role") == "short_stream" and r.valid and r.status == "completed"]
     buffered = sum(r.answer_chunks < 2 for r in valid_shorts)
     result.update(
+        mode=mode,
         buffered_stream=bool(valid_shorts) and buffered > len(valid_shorts) / 2,
         buffered_short_streams=buffered,
         valid_short_streams=len(valid_shorts),
@@ -1059,6 +1207,23 @@ def interference_measurements(records, windows, delay_windows=()):
         triggered=probe_window.get("triggered", 0),
         comparison_metric="short-answer completion time",
     )
+    first = result["baseline"]["first_answer_median_ms"]
+    later = result["probe"]["first_answer_median_ms"]
+    result["first_answer_slowdown"] = later / first if first and later is not None else None
+    if reverse:
+        result["comparison_metric"] = "short-answer completion and first-answer time after dispatch during a long answer"
+        work_reason = _short_work_comparison(matched["baseline"], matched["probe"], short_output_cap)
+        result["work_comparison"] = {"qualified": work_reason is None, "reason": work_reason,
+                                     "tolerance_percent": 10}
+        result["long_output_coverage"] = {
+            "required_more_than_tokens": short_output_cap,
+            "actual_output_tokens": _distribution([r.output_tokens for r in probes if r.output_tokens is not None]),
+            "unknown_output_count": sum(r.output_tokens is None for r in probes),
+            "background_request_count": len(probes),
+            "qualified_request_ids": [r.id for r in probes if r.stream is True and r.valid and r.status == "completed"
+                                      and r.answer_chunks >= 2 and answer_window(r) is not None
+                                      and r.output_tokens is not None and r.output_tokens > short_output_cap],
+        }
     return result
 
 
@@ -1192,6 +1357,7 @@ def measurements(run, target, settings, point, records, shape):
         error_percent=(len(failed) + len(timed_out)) / denominator * 100 if denominator else 0,
         scored=len(scored),
         correct=sum(r.score is True for r in scored),
+        refused=sum(r.score is False and r.refused for r in scored),
         unscored=len(valid) - len(scored),
         correct_percent=sum(r.score is True for r in scored) / len(scored) * 100
         if scored
@@ -1235,7 +1401,7 @@ def measurements(run, target, settings, point, records, shape):
         request_ids=[r.id for r in rows],
     )
     if getattr(run, "pack_specs", []):
-        eligible = _shape_sources(settings, a, run.pack_specs, run.records)
+        eligible = _saved_shape_sources(run, settings, point, shape, run.pack_specs)
         group["case_coverage"] = {
             spec.workload["case_id"]: sum(
                 r.workload.get("case_id") == spec.workload["case_id"] and r.score is not None
@@ -1459,8 +1625,11 @@ def assess_point(run, target, settings, point, records):
     status = aggregate([g["status"] for g in point["groups"]])
     reason = next((g["reason"] for g in point["groups"] if g["status"] == status), "No evidence.")
     if point["type"] == "interference":
+        reverse = settings.workloads.interference.mode == "short_during_long"
         evidence = interference_measurements(
-            records, point.get("measurement_windows", []), scheduling_delay_windows(run)
+            records, point.get("measurement_windows", []), scheduling_delay_windows(run),
+            mode=settings.workloads.interference.mode,
+            short_output_cap=settings.profile.short.output_tokens,
         )
         point["interference"] = evidence
         matched_ids = set(evidence["baseline"]["request_ids"] + evidence["probe"]["request_ids"])
@@ -1468,7 +1637,7 @@ def assess_point(run, target, settings, point, records):
             run,
             [r for r in records if r.id in matched_ids],
             target.name,
-            ("latency_ms", "max_stream_gap_ms"),
+            ("first_output_ms", "latency_ms", "max_stream_gap_ms") if reverse else ("latency_ms", "max_stream_gap_ms"),
         )
         n = settings.pass_criteria.min_valid_responses
         exercised = evidence["triggered"] and all(
@@ -1476,43 +1645,56 @@ def assess_point(run, target, settings, point, records):
         )
         window_load = []
         for window in point.get("measurement_windows", []):
+            serial_control = reverse and window["phase"] == "baseline"
+            role = "long_stream" if reverse and window["phase"] == "probe" else "short_stream"
             shorts = [
                 r
                 for r in records
                 if r.load_point.get("phase") == window["phase"]
-                and r.load_point.get("role") == "short_stream"
+                and r.load_point.get("role") == role
+                and (not serial_control or r.valid and r.status == "completed"
+                     and r.dispatch_ms is not None and r.completed_ms is not None)
             ]
-            average, _ = inflight(shorts, window["sending_start_ms"], window["sending_end_ms"])
+            average, client_peak = inflight(shorts, window["sending_start_ms"], window["sending_end_ms"])
             observed = peak_evidenced_concurrency(shorts, scheduling_delay_windows(run))
             window_load.append(
                 {
                     "phase": window["phase"],
                     "mean_inflight": average,
+                    "client_peak_inflight": client_peak,
                     "evidenced_concurrency": observed,
+                    "required_concurrency": 1 if reverse and window["phase"] == "baseline" else point["level"] - 1,
                 }
             )
-        evidence["short_stream_load"] = window_load
+        evidence["background_load" if reverse else "short_stream_load"] = window_load
         evidence["input_qualification"] = {
             phase: input_qualification(settings, "short", [
                 r for r in records if r.load_point.get("phase") == phase
                 and r.load_point.get("role") == "short_stream"
             ], floors=point.get("input_class_floors", {}).get("short_answer")) for phase in ("baseline", "probe")
         }
-        evidence["input_qualification"]["long_probe"] = input_qualification(settings, "long", [
-            r for r in records if r.load_point.get("role") == "probe"
-        ], floors=point.get("input_class_floors", {}).get("short_answer"))
+        heavy = "long_stream" if reverse else "probe"
+        heavy_key = "long_stream" if reverse else "long_probe"
+        evidence["input_qualification"][heavy_key] = input_qualification(settings, "short" if reverse else "long", [
+            r for r in records if r.load_point.get("role") == heavy
+        ], floors=point.get("input_class_floors", {}).get("long_output" if reverse else "short_answer"))
         exercised = (
             exercised
             and len(window_load) == 2
             and all(
-                v["mean_inflight"] >= 0.9 * (point["level"] - 1)
-                and v["evidenced_concurrency"] >= point["level"] - 1
+                v["mean_inflight"] >= 0.9 * v["required_concurrency"]
+                and (v["client_peak_inflight"] == 1 if reverse and v["phase"] == "baseline"
+                     else v["evidenced_concurrency"] >= v["required_concurrency"])
                 for v in window_load
             )
         )
         if status not in {"fail", "blocked"}:
-            if not evidence["input_qualification"]["long_probe"]["qualified"]:
-                status, reason = "inconclusive", "long-input probe not exercised: " + evidence["input_qualification"]["long_probe"]["reason"]
+            if not evidence["input_qualification"][heavy_key]["qualified"]:
+                status, reason = "inconclusive", ("Long-answer input not exercised: " if reverse else "long-input probe not exercised: ") + evidence["input_qualification"][heavy_key]["reason"]
+            elif reverse and (len(evidence["long_output_coverage"]["qualified_request_ids"]) < n
+                              or len(evidence["long_output_coverage"]["qualified_request_ids"])
+                              != evidence["long_output_coverage"]["background_request_count"]):
+                status, reason = "inconclusive", "Long answers need streamed output and reported output longer than the Short output cap."
             elif not all(evidence["input_qualification"][phase]["qualified"] for phase in ("baseline", "probe")):
                 status, reason = "inconclusive", "Short input not exercised in both short-stream comparison windows."
             elif not exercised or evidence["slowdown"] is None:
@@ -1520,6 +1702,8 @@ def assess_point(run, target, settings, point, records):
                     "inconclusive",
                     "Trigger or matched overlap was not exercised sufficiently in both full comparison windows.",
                 )
+            elif reverse and not evidence["work_comparison"]["qualified"]:
+                status, reason = "inconclusive", evidence["work_comparison"]["reason"]
             elif evidence["slowdown"] > settings.workloads.interference.max_slowdown:
                 if evidence["timing_quality"]["affected_request_ids"]:
                     status, reason = (
@@ -1532,6 +1716,8 @@ def assess_point(run, target, settings, point, records):
                         "Short-answer completion slowdown exceeded the workload limit.",
                     )
     code = next((g["reason_code"] for g in point["groups"] if g["status"] == status), "comparison")
+    if point.get("window_extension_note"):
+        reason += " " + point["window_extension_note"]
     point.update(status=status, reason=reason, reason_code=code)
     bursts = {o["burst_index"]: [] for o in point.get("offers", []) if o.get("origin") == "burst"}
     for r in records:
@@ -1577,10 +1763,12 @@ def publish_point(run, target, point):
     # Live cards use aggregate delivery evidence; the complete offered schedule
     # remains in the report rather than being repeated in every progress event.
     payload = {key: value for key, value in point.items() if key != "offers"}
+    reason = (point["reason"] if point.get("window_extension") else point.get("window_reason"))
+    reason = reason or ("dropped: all request slots busy" if point.get("local_drops") else None) or point["reason"]
     for phase in ("baseline", "probe") if point["type"] == "interference" else (None,):
         scenario = point["id"] + ("." + phase if phase else "")
         run.finish_condition(
-            target.name, scenario, reason=point.get("window_reason") or ("dropped: all request slots busy" if point.get("local_drops") else None) or point["reason"], load_point_result=payload
+            target.name, scenario, reason=reason, load_point_result=payload
         )
 
 
@@ -1678,7 +1866,7 @@ async def execute(run, target, client):
                 }
             if cancellation is None and not point.get("calibration_failure") and not point.get("input_not_calibrated"):
                 remaining = run.remaining(target.name)
-                reserved = reserved_checks + sum((p["level"] * 2 - 1 if p["type"] == "interference" else p["level"] or 0) for p in points[index + 1:])
+                reserved = reserved_checks + sum(initial_requests(p) for p in points[index + 1:])
                 point.update(request_allowance=max(0, remaining - reserved) if remaining is not None else None, reserved_later_requests=reserved, budget_start=run.budget_counts[target.name])
                 try:
                     if point["type"] == "interference":
@@ -1806,6 +1994,18 @@ def _result_summary(run, target, points, status, settings, *, include_remedy=Tru
             "run stopped before sufficient evidence was collected",
             "Resolve the stop cause recorded in the affected conditions and rerun the selected workload.",
         ))
+    if code == "correctness":
+        groups = [group for point in deciding for group in point.get("groups", [])
+                  if group.get("reason_code") == "correctness"]
+        refused = sum(group.get("refused", 0) for group in groups)
+        if refused:
+            wrong = sum(group["scored"] - group["correct"] for group in groups)
+            cause += f" (model refusals accounted for {refused} of {wrong} wrong answers)"
+            remedy = (
+                "Rerun with response retention enabled to inspect the model's refusal messages."
+                if run.config.retention == "none"
+                else "Review the recorded responses in the affected conditions for the model's refusal messages."
+            )
     if code == "budget_limited" and run.reason != "cancelled by user":
         minimum, unknown = _minimum_request_budget(run)
         if unknown == "schedule_overflow":
@@ -1895,6 +2095,9 @@ def result(run, target):
     observation["highest_accepted"] = list(accepted.values())
     status = aggregate([p["status"] for p in observation["points"]])
     summary = _result_summary(run, target, observation["points"], status, settings)
+    for point in observation["points"]:
+        if point.get("window_extension_note"):
+            summary += " " + point["window_extension_note"]
     deciding = [p for p in observation["points"] if p["status"] == status]
     observation["reason_code"] = Counter(p.get("reason_code") for p in deciding).most_common(1)[0][0] if deciding else None
     return CheckResult(

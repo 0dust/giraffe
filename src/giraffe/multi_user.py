@@ -11,6 +11,7 @@ from collections import Counter
 from copy import deepcopy
 from fractions import Fraction
 
+from giraffe import concurrent_load
 from giraffe.concurrent_load import OutputProgress, calibrate
 from giraffe.load_test import _shape_sources, build_spec
 from giraffe.models import (
@@ -57,7 +58,7 @@ def _matched_work_sha256(spec, *, nonce=None):
     if nonce and messages:
         first = messages[0]
         content = first.get("content")
-        prefix = f"Request {nonce}."
+        prefix = concurrent_load.nonce_prefix(nonce)
         # Remove only the generated cache-busting prefix from the identity.
         if isinstance(content, str) and content.startswith(prefix):
             messages = [{**first, "content": content[len(prefix):]}, *messages[1:]]

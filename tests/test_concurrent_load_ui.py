@@ -11,11 +11,14 @@ pytestmark = pytest.mark.usefixtures("local_tokenizer")
 def test_drawer_structure_and_labels():
     browser_logic(r'''
 const html=renderTestCard(bootstrap.checks.find(c=>c.id==='load'),config);let previous=-1;
-for(const title of ['Data profile','Workloads','Traffic patterns','Request timing &amp; delivery','Pass criteria']){
+for(const title of ['Request timing &amp; delivery','Data profile','Workloads','Traffic patterns','Pass criteria']){
  const index=html.indexOf((title==='Pass criteria'?'<summary>':'<h3>')+title);assert(index>previous,title);previous=index;
 }
-for(const label of ['Input tokens · target','Output tokens · cap','Choose one or more','This check only','Bursts use this same mix. Shares describe request counts, not tokens or time.',...Object.values(loadTitles),...Object.values(loadCriteriaLabels)])assert(html.includes(label),label);
+assert(html.indexOf('name="load_request_timeout_seconds"')<html.indexOf('<h3>Data profile'));
+for(const label of ['Input tokens · target','Output tokens · cap','Choose one or more','Bursts use this same mix. Shares describe request counts, not tokens or time.',...Object.values(loadTitles),...Object.values(loadCriteriaLabels)])assert(html.includes(label),label);
 for(const type of Object.keys(loadTitles)){assert(html.includes('name="load_workloads_'+type+'_enabled"'));assert(html.includes('data-load-collapse="'+type+'"'));assert(html.includes('aria-controls="load-panel-'+type+'"'));}
+assert.doesNotMatch(html,/<span class="eyebrow">This check only<\/span>/);
+assert.match(html,/Load test only\./);
 assert.equal((html.match(/name="load_workloads_combinations_selected_/g)||[]).length,9);
 assert.equal((html.match(/name="load_workloads_mixed_selected_/g)||[]).length,9);
 assert.equal((html.match(/name="load_workloads_stress_cases_/g)||[]).length,3);
@@ -86,9 +89,15 @@ def test_plan_breakdown_and_duration_rows_use_server_numbers():
     plan=request_plan(config)
     browser_logic('const plan='+json.dumps(plan)+r''';
 config.checks=['load'];const html=renderRunBlueprint(config,plan);
-assert.match(html,/Load test plan/);assert.match(html,/Scheduled load tests/);assert.match(html,/12<\/dd>/);assert.match(html,/3m 0s/);assert.match(html,/63m 0s/);assert.match(html,/Unknown \+ 135/);
-assert.match(html,/Expected scheduled requests/);assert.match(html,/Execution order/);
-assert.equal((html.match(/Estimated duration:/g)||[]).length,1);assert.match(html,/test traffic only/);
+assert.equal((html.match(/data-plan-row="load"/g)||[]).length,1);
+assert.match(html,/aria-label="Load test details"/);assert.doesNotMatch(html,/Load test plan/);
+assert.match(html,/Scheduled load tests/);assert.match(html,/12<\/dd>/);assert.match(html,/3m 0s/);assert.match(html,/63m 0s/);
+assert.match(html,/Scheduled requests per endpoint/);assert.match(html,/135 scheduled requests per endpoint \+ completion-driven requests/);assert.doesNotMatch(html,/Unknown \+ 135/);
+assert.match(html,/Execution order/);
+for(const row of plan.rows){assert(html.includes('data-plan-phase="'+row.id+'"'));assert(html.includes(escape(row.summary||'')));}
+for(const phase of plan.load_test.execution_order)assert(html.includes(escape(phase)));
+assert.equal(plan.has_complete_time_estimate,false);
+assert.doesNotMatch(html,/Estimated duration:|Confidence:|test traffic only/);
 assert.doesNotMatch(renderLoadPlan(config),/12<\/dd>|3m 0s/); // No independent planner fallback.
 ''')
 

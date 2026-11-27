@@ -261,7 +261,7 @@ def test_serial_answer_verdict_preserves_concurrency_intent_on_round_trip(explic
 def test_legacy_migration_preserves_whether_parallelism_was_requested(legacy, explicit):
     from giraffe.cli import _migrated_values
 
-    values, _ = _migrated_values({'targets': [{'name': 'local', 'url': 'http://local', 'model': 'm'}], **legacy})
+    values, _, _ = _migrated_values({'targets': [{'name': 'local', 'url': 'http://local', 'model': 'm'}], **legacy})
     config = RunConfig.model_validate(values)
     assert config.default_concurrency == 4
     assert config.parallelism_requested('correctness') == explicit
@@ -305,3 +305,37 @@ def test_scale_down_selection_requires_a_bound_target_and_config():
     # Merely retaining scenario settings does not select the external exercise.
     cfg = RunConfig(targets=[target], scale_down=dict(target='service'))
     assert 'scale_down' not in cfg.checks
+
+
+@pytest.mark.parametrize("version", ["2024-02-01", "2025-04-01-preview"])
+def test_inference_endpoints_accept_api_version_queries_and_round_trip(version):
+    from giraffe.models import JudgeEndpoint
+
+    url = f"https://server/openai/deployments/model?api-version={version}"
+    target = Target(name="local", url=url, model="example")
+    config = RunConfig(targets=[target], judging={"judges": [
+        JudgeEndpoint(name="judge", url=url, model="judge-model")]})
+    restored = RunConfig.model_validate_json(config.model_dump_json())
+    assert restored.targets[0].url == url
+    assert restored.judging.judges[0].url == url
+
+
+@pytest.mark.parametrize("suffix", [
+    "?api-key=PRIVATE_SECRET", "?key=PRIVATE_SECRET", "?token=PRIVATE_SECRET",
+    "?sig=PRIVATE_SECRET", "?%61pi-key=PRIVATE_SECRET", "?tenant=PRIVATE_SECRET",
+    "?api-version=PRIVATE_SECRET", "?api-version=2024-02-01&key=PRIVATE_SECRET",
+    "?api-version=2024-02-01&api-version=2025-04-01-preview", "#PRIVATE_SECRET",
+])
+def test_inference_endpoints_reject_unapproved_queries_and_fragments(suffix):
+    from giraffe.models import JudgeEndpoint
+
+    for endpoint in (Target, JudgeEndpoint):
+        with pytest.raises(ValidationError):
+            endpoint(name="local", url="https://server/v1" + suffix, model="example")
+
+
+@pytest.mark.parametrize("field", ["metrics_url", "host_metrics_url"])
+def test_api_version_support_does_not_relax_metrics_url_validation(field):
+    with pytest.raises(ValidationError):
+        Target(name="local", url="https://server/v1", model="example",
+               **{field: "https://server/metrics?api-version=2024-02-01"})

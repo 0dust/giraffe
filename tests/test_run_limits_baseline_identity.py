@@ -56,14 +56,20 @@ def test_ordinary_load_baseline_survives_optional_nonce_builder_argument(additio
 
 
 @pytest.mark.parametrize("additional_checks", [[], ["access"]], ids=["load", "access-and-load"])
-@pytest.mark.parametrize("old_source", [PRE_NONCE_LOAD, NONCE_ONLY_LOAD], ids=["before-nonce", "before-explicit-stage"])
-def test_ordinary_load_baseline_survives_explicit_multi_user_stage(additional_checks, old_source):
+@pytest.mark.parametrize("old_source", [
+    PRE_NONCE_LOAD, NONCE_ONLY_LOAD,
+    "ab442c8b54be31143ad52fa20f86cd896d2fcf39da495a80cc48db9bc5cb90ee",
+    "3d2fd5628600a0d75e7c15edd2b1414ab376172cba2c15928a44d80014e99498",
+    "656aa277b6f2d1eebbe4c0cc4f56d6875bdf4547bae6a36c63c3fe613f8d6b75",
+], ids=["before-nonce", "before-explicit-stage", "before-context-validation-removal",
+        "main-before-plan-messages", "branch-before-plan-messages"])
+def test_ordinary_load_baseline_requires_new_neutral_prompt_source(additional_checks, old_source):
     current, old, _ = load_reports(old_source=old_source)
     for report in (current, old):
         report.manifest["config"]["checks"].extend(additional_checks)
     assert current.manifest["fixture_pack"] != old.manifest["fixture_pack"]
-    assert _settings_reasons(current, old) == []
-    assert _settings_reasons(old, current) == []
+    assert _settings_reasons(current, old) == ["Fixture pack identity differs."]
+    assert _settings_reasons(old, current) == ["Fixture pack identity differs."]
 
 
 @pytest.mark.parametrize("old_source", INTERIM_LOAD_SOURCES)
@@ -102,6 +108,21 @@ def test_load_source_compatibility_does_not_hide_unattested_work(change):
             report.manifest["config"]["checks"].append("serving")
         old.manifest["fixture_pack"]["builtin_sha256"] = "changed"
     old.manifest["fixture_pack"]["workload_fixture_sha256"] = fixture_hash(identity)
+    assert "Fixture pack identity differs." in _settings_reasons(current, old)
+
+
+def test_historical_load_sources_never_attest_short_during_long_mode():
+    from giraffe.reporting import _same_load_workload
+
+    current, old, settings = load_reports(load_source=NONCE_ONLY_LOAD)
+    settings["load_test"]["workloads"]["interference"]["mode"] = "short_during_long"
+    for report, source in ((current, NONCE_ONLY_LOAD), (old, PRE_NONCE_LOAD)):
+        report.manifest["config"]["load_test"]["workloads"]["interference"]["mode"] = "short_during_long"
+        report.manifest["fixture_pack"]["workload_fixture_sha256"] = fixture_hash({
+            "generator_source_sha256": NONCE_LOAD_GENERATOR,
+            "settings": settings, "load_test_source_sha256": source})
+
+    assert not _same_load_workload(current.manifest, old.manifest)
     assert "Fixture pack identity differs." in _settings_reasons(current, old)
 
 
@@ -363,15 +384,15 @@ def test_output_budget_revision_never_attests_changed_prefixes_in_mixed_runs(che
                                         include_load="load" in checks, shared=shared) is None
 
 
-def test_output_budget_revision_preserves_exact_unchanged_load_source():
+def test_output_budget_revision_cannot_bridge_neutral_prompt_source():
     current, old, settings = load_reports()
     from giraffe.reporting import _load_test_workload_source_sha256
 
     current.manifest["fixture_pack"]["workload_fixture_sha256"] = fixture_hash({
         "generator_source_sha256": workloads.FIXTURE_SOURCE_SHA256,
         "settings": settings, "load_test_source_sha256": _load_test_workload_source_sha256()})
-    assert _settings_reasons(current, old) == []
-    assert _settings_reasons(old, current) == []
+    assert _settings_reasons(current, old) == ["Fixture pack identity differs."]
+    assert _settings_reasons(old, current) == ["Fixture pack identity differs."]
 
 
 @pytest.mark.parametrize("which", ["current", "baseline"])
@@ -728,7 +749,9 @@ async def test_exact_policy_predecessor_preserves_measured_multi_user(monkeypatc
                    multi_user={"levels": [2], "duration_seconds": .4,
                                "think_time_seconds": {"values": [.01]}})
     predecessor_generator = "e4ddc7a7e8563f9ab3bba2fc42ad0232ee924c65f67d92dafd89c21025d202d0"
-    predecessor_source = "914d6728904a6790358feb7631fb690173a637a5deb73cbdb19947ea8104120e"
+    # This test changes only the generator label on the current runtime. The
+    # pre-mode runtime upgrade is covered by test_interference_upgrade_baseline.
+    predecessor_source = "1f7c1ad09cd892dfe3d8a1929075f245341cbc4ee2c4e6a54de74553454854f4"
     if companion == "load":
         options.update(checks=["multi_user", "load"], load_test=load_config(duration=1).load_test)
     with monkeypatch.context() as policy:
@@ -753,7 +776,7 @@ async def test_exact_policy_predecessor_preserves_measured_multi_user(monkeypatc
                 "settings": {"multi_user": old.manifest["config"]["multi_user"]}}
     if companion == "load":
         identity["settings"]["load_test"] = options["load_test"].model_dump(mode="json")
-        identity["load_test_source_sha256"] = "fa40b2a909d2b067529ab02bd686c61adb8a175063e481d802ad33d308ef49fa"
+        identity["load_test_source_sha256"] = "55a11a95edaf1f01336ec1879340df0e27adcfd8cc69d05a8ea726a011d3f07b"
     assert fixture_hash(identity) == old.manifest["fixture_pack"][fingerprint]
 
     assert _settings_reasons(current, old) == []

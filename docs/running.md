@@ -13,6 +13,22 @@ This example assumes Ollama already serves a model. Change the URL for your depl
 giraffe run --url http://127.0.0.1:11434/v1 --html
 ```
 
+Inference and judge URLs accept an `api-version` query in `YYYY-MM-DD` or
+`YYYY-MM-DD-preview` form, as required by the
+[versioned Azure OpenAI API](https://learn.microsoft.com/en-us/azure/foundry/openai/reference#rest-api-versioning).
+Use an API base or a complete `/chat/completions` URL; Giraffe preserves the
+version when building completion and model-list requests. For example:
+
+```sh
+giraffe run --url "https://RESOURCE.openai.azure.com/openai/deployments/DEPLOYMENT?api-version=2024-02-01" --model DEPLOYMENT
+```
+
+Other query parameters, embedded credentials and fragments remain rejected.
+Keep authentication in `api_key_env` (Bearer authentication) or `headers_env`
+(custom headers), referring to environment variables. For Azure's `api-key`
+header, set `headers_env: {api-key: AZURE_OPENAI_API_KEY}` on the target in your
+configuration and define that environment variable before running Giraffe.
+
 The model is auto-detected when only one is served. If several are served, add
 `--model MODEL_ID`; if discovery is unsupported, supply the model explicitly.
 The shared CLI and UI default checks are `access, serving, correctness, first_output`:
@@ -163,6 +179,7 @@ and evaluator endpoints use their own credentials. Open local endpoints need no 
 
 By default, `giraffe run` sends a bounded preflight completion request per target
 before printing its request, simultaneous, duration, timeout and output settings.
+`--skip-preflight` skips the connection check and context-window probe.
 Those settings appear before suite traffic. **Ctrl+C** stops new requests and
 saves partial results after the suite starts. A blocking preflight failure does
 not produce a run report. Ordinary runs do not restart the service; cold-start

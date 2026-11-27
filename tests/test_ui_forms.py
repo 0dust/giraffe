@@ -60,9 +60,9 @@ renderRequestPlan();
 assert.match(nodes['#request-plan'].innerHTML,/164 requests/);
 assert.match(nodes['#request-plan'].innerHTML,/12 evaluator calls/);
 assert.match(nodes['#request-plan'].innerHTML,/data-action="use-request-budget"/);
-assert.match(nodes['#request-plan'].innerHTML,/<details class="request-planning">/);
+assert.match(nodes['#request-plan'].innerHTML,/<details class="(?:[^"]* +)?request-planning(?: +[^"]*)?">/);
 assert.match(nodes['#request-plan'].innerHTML,/96 characters sent/);assert.match(nodes['#request-plan'].innerHTML,/64 configured, plus instructions/);
-assert.match(nodes['#request-plan'].innerHTML,/Connection check/);assert.doesNotMatch(nodes['#request-plan'].innerHTML,/Shared accounting/);
+assert.match(nodes['#request-plan'].innerHTML,/Initial request/);assert.match(nodes['#request-plan'].innerHTML,/data-plan-phase="initial"/);assert.match(nodes['#request-plan'].innerHTML,/1 request per endpoint/);assert.match(nodes['#request-plan'].innerHTML,/One generated request checks the connection/);assert.doesNotMatch(nodes['#request-plan'].innerHTML,/Shared accounting/);
 configChanged();assert.match(nodes['#request-plan'].innerHTML,/stale/i);
 assert.doesNotMatch(nodes['#request-plan'].innerHTML,/data-action="use-request-budget"|164 requests/);
 let current=structuredClone(config),resolve;
@@ -84,7 +84,7 @@ assert.equal(state.requestPreview.status,'current');
 assert.doesNotMatch(nodes['#request-plan'].innerHTML,/Retry request plan|temporary planning failure/);
 nodes['#cli-fallback']={{hidden:false}};
 const syncView=syncConfigView;syncConfigView=()=>{{}};
-listeners.input({{target:{{id:'config-editor',value:'dirty',matches(){{return false;}},closest(){{return {{}};}}}}}});
+listeners.input({{target:{{id:'config-editor',value:'dirty',matches(){{return false;}},closest(q){{return q==='#new-run-form'?{{}}:null;}}}}}});
 syncConfigView=syncView;
 assert.match(nodes['#request-plan'].innerHTML,/Apply or discard JSON changes/);
 assert.doesNotMatch(nodes['#request-plan'].innerHTML,/164 requests|data-action="use-request-budget"/);
@@ -237,9 +237,20 @@ assert.equal(state.config.targets[0].model,'latest-model');
 assert.equal(state.config.checks.join(','),bootstrap.defaults.checks.join(','));
 assert.equal(JSON.stringify(state.config.request_pack),savedPack);
 assert.equal(state.config.max_requests,config.max_requests);
+// A failed comparison cannot prefill a subsequent fresh New run.
+location.hash='#runs/saved';state.detail={{id:'saved',config}};
+state.baselines=[{{id:'failed-baseline',run_id:'saved',name:'Saved baseline'}}];state.prefillBaseline='';
+let comparisonToast;toast=text=>{{comparisonToast=text;}};
+api=async()=>{{throw Object.assign(new Error('Extra inputs are not permitted'),{{status:422,errors:[{{type:'extra_forbidden',field:'targets.0.bogus_setting'}}]}});}};
+await listeners.click({{target:{{closest:q=>q==='[data-action]'?{{dataset:{{action:'compare-run'}}}}:null}}}});
+assert.equal(state.prefillBaseline,'');assert.equal(location.hash,'#runs/saved');assert.match(comparisonToast,/bogus_setting/);
+api=async(path,options)=>{{assert.equal(path,'/api/config/draft');return {{config:JSON.parse(options.body),migration_notes:[]}};}};
+delete nodes['#new-run-form'];await startNewRun();nodes['#new-run-form']=form;
+assert.equal(location.hash,'#new');renderNew();assert.equal(form.elements.baseline_id.value,'');
 // Reruns and imported advanced selections infer Custom without rewriting them.
 const custom={{...structuredClone(config),checks:['access','correctness','recovery'],concurrency:16}};
-state.detail={{report:{{manifest:{{config:custom}}}},baseline_id:'saved-baseline'}};rerun();
+api=async(path,options)=>{{assert.equal(path,'/api/config/draft');return {{config:JSON.parse(options.body),migration_notes:[]}};}};
+state.detail={{report:{{manifest:{{config:custom}}}},baseline_id:'saved-baseline'}};await rerun();
 const rerunBefore=JSON.stringify(state.config);renderNew();
 assert.equal(state.setupPreset,'custom');assert.equal(JSON.stringify(state.config),rerunBefore);
 assert.equal(state.config.concurrency,16);assert.equal(state.prefillBaseline,'saved-baseline');
@@ -329,7 +340,12 @@ vm.runInNewContext('state.bootstrap=bootstrap;state.bootstrap.config=config;',co
 for(const check of context.bootstrap.checks) {{
   context.check=check;
   const markup=vm.runInNewContext('renderTestCard(check,config)',context);
-  assert.match(markup,/class="check-info-details"/);assert(markup.includes('<dt>Sends</dt>'));
+  if(['serving','correctness'].includes(check.id)) {{
+    assert.doesNotMatch(markup,/class="check-info-details"/);assert(!markup.includes('<dt>Sends</dt>'));
+    assert(markup.includes(`popovertarget="field-check_${{check.id}}-help"`));
+  }} else {{
+    assert.match(markup,/class="check-info-details"/);assert(markup.includes('<dt>Sends</dt>'));
+  }}
   for(const name of check.option_fields) {{
     assert(markup.includes(`name="test_${{check.id}}_${{name}}"`));
     assert(markup.includes(`popovertarget="field-test_${{check.id}}_${{name}}-help"`));
@@ -839,7 +855,7 @@ nodes['#new-run-form']=form;
 nodes['[data-action="use-request-budget"]']={{disabled:false}};
 const document={{querySelector:q=>nodes[q],querySelectorAll:()=>[],addEventListener:(kind,fn)=>listeners[kind]=fn,
   createElement:()=>({{click(){{this.clicked=true;}}}})}};
-const context={{positiveBoundErrors,structuredClone,document,window:{{addEventListener(){{}}}},assert,nodes,form,listeners,
+const context={{positiveBoundErrors,structuredClone,document,window:{{addEventListener(){{}}}},location:{{hash:'#new'}},assert,nodes,form,listeners,
   Blob,URL:{{createObjectURL(blob){{downloads.push(blob);return 'blob:config';}},revokeObjectURL(){{}}}},
   navigator:{{clipboard:{{async writeText(){{throw new Error('denied');}}}}}},setTimeout(){{}},clearTimeout(){{}},downloads}};
 const source=fs.readFileSync({json.dumps(str(static / 'app.js'))},'utf8')
@@ -993,6 +1009,7 @@ await assert.rejects(api('/api/runs/missing'),error=>error.message==='Not Found'
 changeRequestSource('request_pack');assert.equal(nodes['#request-pack-file'].clicked,undefined);
 assert.equal(state.config.request_source,'request_pack');assert.equal(state.config.request_pack,null);
 assert.equal(calls,0);
+current=structuredClone(state.config); // Mounted form state follows the source radio without renderNew.
 current={...current,request_pack:pack};state.config=current;
 let resolve;api=()=>new Promise(done=>resolve=done);
 // Request previews may resolve out of order: only current revision is accepted.
@@ -1105,6 +1122,34 @@ assert.match(cell.textContent,/insufficient evidence/);
 
 def test_ai_judge_configuration_evidence_and_evaluation_phase():
     from giraffe.capabilities import capabilities
+    from tests.test_ui_question_navigation import navigation_browser
+
+    navigation_browser(r'''
+state.config.request_pack.cases[0].scorer='judge';
+state.config.judging={...state.config.judging,judges:[{name:'saved',url:'http://judge.local/v1',model:'saved-model',api_key_env:'EVALUATOR_KEY',headers_env:{'X-Team':'TEAM_HEADER'}}]};
+renderNew();const stored=JSON.stringify(state.config.judging);
+await click('configure-evaluator');
+const applied=state.jsonDraft;state.jsonDraft='unapplied';await click('add-judge');
+assert.equal(state.setupWorkspace.evaluatorDraft.judges.length,1);
+assert.match(document.querySelector('#evaluator-error').textContent,/Apply or discard/);state.jsonDraft=applied;
+await click('add-judge');
+assert.equal(state.setupWorkspace.evaluatorDraft.judges.length,2);
+assert.equal(document.querySelector('#evaluator-form').elements.judge_count.value,'2');
+assert.equal(JSON.stringify(state.config.judging),stored);
+await click('cancel-evaluator');assert.equal(JSON.stringify(state.config.judging),stored);
+await click('configure-evaluator');await click('add-judge');
+let form=document.querySelector('#evaluator-form');
+type(form.elements.judge_1_url,'http://second.local/v1');type(form.elements.judge_1_model,'second-model');
+await click('save-evaluator');assert.equal(state.setupWorkspace,null);
+assert.equal(state.config.judging.judges.length,2);
+assert.equal(state.config.judging.judges[1].model,'second-model');
+assert.equal(state.config.judging.judges[0].headers_env['X-Team'],'TEAM_HEADER');
+const saved=JSON.stringify(state.config.judging);await click('configure-evaluator');
+const remove=document.querySelector('[data-judge-index="0"]');await listeners.click({target:remove,preventDefault(){}});
+assert.equal(state.setupWorkspace.evaluatorDraft.judges.length,1);assert.equal(state.config.judging.judges.length,2);
+await click('cancel-evaluator');assert.equal(JSON.stringify(state.config.judging),saved);
+assert.equal(requests.length,0);
+''')
 
     node = shutil.which("node")
     if not node:
@@ -1136,16 +1181,10 @@ context.bootstrap=BOOTSTRAP;
 vm.runInNewContext(source+`
 state.bootstrap=bootstrap;
 state.config=draft;state.jsonDraft=state.jsonBase='synced';
-let captured=0,rendered=0;
-captureFormDraft=()=>{captured++;};renderNew=()=>{rendered++;};
 let markup=renderJudging(draft);assert.match(markup,/AI evaluator/);assert.match(markup,/judge_0_model/);assert.match(markup,/Evaluation limits/);assert.match(markup,/configured evaluators/);
 assert.equal(renderJudging({...draft,request_source:'builtin'}),'');
 assert.equal(renderJudging({...draft,request_pack:{cases:[{scorer:'exact'}]}}),'');
-changeJudge('add');assert.equal(state.config.judging.judges.length,2);assert.equal(captured,1);assert.equal(rendered,1);
-assert.equal(state.config.judging.judges[1].model,'');assert.equal(state.requestPreview,null);
-changeJudge('remove',0);assert.equal(state.config.judging.judges.length,1);assert.equal(state.config.judging.judges[0].name,'judge-1');
-state.jsonDraft='unapplied';changeJudge('add');assert.equal(state.config.judging.judges.length,1);assert.match(nodes['#config-error'].textContent,/Apply or discard/);
-state.jsonDraft=state.jsonBase;
+// Transactional Add/Remove/Save/Cancel runs against actual mounted forms above.
 state.config=structuredClone(config);
 state.requestPreview={status:'current',revision:state.configRevision,route:state.routeVersion,config:state.config,data:{active:true,consumers:['correctness'],cases:[],stages:[],warnings:['AI judging runs after target traffic. Messages, golden answers and generated answers are sent to every configured judge.','Other warning'],judging:{active:true,ready:false,readiness_errors:['Missing <model>'],planned_call_upper_bound:12,judge_count:1}}};
 renderRequestPreview();markup=nodes['#request-pack-preview'].innerHTML;assert.match(markup,/Missing &lt;model&gt;/);assert(!markup.includes("Missing <model>"));assert.doesNotMatch(markup,/judge calls/);assert.doesNotMatch(markup,/AI judging runs after target traffic/);assert.match(markup,/Other warning/);assert.equal(state.requestPreview.data.warnings.length,2);
@@ -1178,7 +1217,7 @@ def test_dataset_editor_preserves_canonical_cases_and_stages_imports():
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
-import {datasetCaseFromValues,changeDatasetScorer} from FORM_PATH;
+import {datasetCaseFromValues,changeDatasetScorer,limitValue} from FORM_PATH;
 const original={fixture_id:'conversation',messages:[{role:'system',content:'Return JSON'},{role:'user',content:'Nothing'}],scorer:'json',schema:{type:'null'},expected:null,weight:2,max_tokens:null,options:{temperature:0,response_format:{type:'json_object'}}};
 const values=new FormData();
 values.set('example_id','conversation');values.set('message_count','2');
@@ -1200,7 +1239,7 @@ nodes['#dataset-dialog']={innerHTML:'',open:false,showModal(){this.open=true;},c
 nodes['#new-run-form']={elements:{request_source:{value:'builtin'}}};
 nodes['#dataset-import-form']={elements:{input_field:{value:'question'},expected_field:{value:'answer'},import_scorer:{value:'judge'}}};
 nodes['#dataset-try-form']={elements:{try_target:{value:'secondary'},save_try_output:{checked:true}}};
-const context={assert,structuredClone,nodes,listeners,datasetCaseFromValues,changeDatasetScorer,document:{querySelector:q=>nodes[q],querySelectorAll:()=>[],addEventListener:(kind,fn)=>listeners[kind]=fn},window:{addEventListener(){}},location:{hash:'#new'}};
+const context={assert,structuredClone,nodes,listeners,datasetCaseFromValues,changeDatasetScorer,limitValue,document:{querySelector:q=>nodes[q],querySelectorAll:()=>[],addEventListener:(kind,fn)=>listeners[kind]=fn},window:{addEventListener(){}},location:{hash:'#new'}};
 const source=fs.readFileSync(APP_PATH,'utf8').replace(/^import .*?;\n/,'').replace(/\ninit\(\);\s*$/,'');
 await vm.runInNewContext(source+`
 (async()=>{
@@ -1209,32 +1248,33 @@ const initial={request_source:'builtin',request_pack:null,targets:[{name:'local'
 state.config=structuredClone(initial);state.jsonDraft=state.jsonBase='synced';
 readForm=()=>({config:structuredClone(state.config),mode:'normal'});captureFormDraft=()=>{};
 renderNew=()=>{state.jsonDraft=state.jsonBase='synced';};toast=()=>{};setActive=id=>{state.active=id;};
+openSetupWorkspace=view=>{state.setupWorkspace||={};state.setupWorkspace.view=view;};renderSetupWorkspace=(title,body)=>{nodes['#question-workspace-body']={innerHTML:body};};focusSetupWorkspace=()=>{};refreshQuestionSetupSummary=()=>{};evaluatorReadiness=()=>({needed:true,ready:false,label:'Configuration needed'});
 const pack={version:1,cases:[{fixture_id:'one',messages:[{role:'user',content:'<question>'}],scorer:'judge',expected:'<answer>',weight:1}]};
 changeRequestSource('request_pack');assert.equal(state.config.request_source,'request_pack');assert.equal(state.config.request_pack,null);assert(!nodes['#request-pack-file'].clicked);
-let markup=renderRequestSource(state.config);assert.match(markup,/My questions/);assert.match(markup,/Add your first question/);assert(!markup.includes('dataset-bulk-scorer'));
+let markup=renderRequestSource(state.config);assert.match(markup,/My questions/);assert.match(markup,/data-action="manage-questions"/);assert.doesNotMatch(markup,/Add your first question|Enter a question and its expected answer, or use the sample questions to get started/);assert(!markup.includes('dataset-bulk-scorer'));
 const calls=[];api=async(path,options)=>{calls.push({path,body:JSON.parse(options.body)});if(path==='/api/datasets/preview')return {columns:[],preview_rows:pack.cases,request_pack:pack,errors:[],needs_mapping:false};if(path==='/api/config/draft')return {config:JSON.parse(options.body)};throw Error('Unexpected endpoint');};
 await importRequestPack({name:'examples.json',size:20,text:async()=>JSON.stringify(pack)});
-assert.equal(state.config.request_pack,null);assert.equal(calls.length,1);assert.equal(calls[0].path,'/api/datasets/preview');assert(nodes['#dataset-dialog'].open);
-markup=nodes['#dataset-dialog'].innerHTML;assert.match(markup,/Use dataset/);assert(markup.includes('<th>Input</th>'));assert.match(markup,/&lt;question&gt;/);assert(!markup.includes('<pre>'));
-await useImportedDataset({preventDefault(){}});assert.equal(state.config.request_pack.cases[0].fixture_id,'one');assert.equal(state.config.targets[0].model,'');assert.equal(calls[1].path,'/api/config/draft');assert(!nodes['#dataset-dialog'].open);
+assert.equal(state.config.request_pack,null);assert.equal(calls.length,1);assert.equal(calls[0].path,'/api/datasets/preview');assert.equal(state.setupWorkspace.view,'question-import');
+markup=nodes['#question-workspace-body'].innerHTML;assert.match(markup,/Replace current questions with this question/);assert(markup.includes('<th>Input</th>'));assert.match(markup,/&lt;question&gt;/);assert(!markup.includes('<pre>'));
+await useImportedDataset({preventDefault(){}});assert.equal(state.config.request_pack.cases[0].fixture_id,'one');assert.equal(state.config.targets[0].model,'');assert.equal(calls.length,1,'Applying a validated import does not parse an inflated copy again');assert.equal(state.setupWorkspace.view,'questions');
 const accepted=JSON.stringify(state.config);
 // Sample loading uses the same staged preview: cancelling preserves custom questions.
 const importApi=api;const sampleCalls=[];
 api=async(path,options)=>{sampleCalls.push(path);const body=JSON.parse(options.body);if(path==='/api/config/draft')return {config:body};const sample=JSON.parse(body.text);return {columns:[],preview_rows:sample.cases,request_pack:sample,errors:[],needs_mapping:false};};
-await sampleDataset();assert.equal(JSON.stringify(state.config),accepted);assert(nodes['#dataset-dialog'].open);
+await sampleDataset();assert.equal(JSON.stringify(state.config),accepted);assert.equal(state.setupWorkspace.view,'question-import');
 assert.deepEqual(sampleCalls,['/api/datasets/preview']);assert.equal(state.datasetImport.preview.request_pack.cases[0].fixture_id,'refund-window');
-closeDatasetDialog();assert.equal(JSON.stringify(state.config),accepted);
+openQuestionManager();assert.equal(JSON.stringify(state.config),accepted);
 await sampleDataset();await useImportedDataset({preventDefault(){}});
-assert.equal(sampleCalls.at(-1),'/api/config/draft');assert.equal(state.config.request_pack.cases[0].fixture_id,'refund-window');assert(!nodes['#dataset-dialog'].open);
+assert.equal(sampleCalls.at(-1),'/api/datasets/preview');assert.equal(state.config.request_pack.cases[0].fixture_id,'refund-window');assert.equal(state.setupWorkspace.view,'questions');
 state.config=JSON.parse(accepted);api=importApi;
 const invalidPreview=renderDatasetImportTable({columns:['question','answer'],preview_rows:[{question:'q',answer:'a'},null,42]});
 assert.match(invalidPreview,/Invalid row: null/);assert.match(invalidPreview,/Invalid row: 42/);
 // A slower old file read cannot replace a newer staged import.
 let finishRead;const slowRead=importRequestPack({name:'old.json',size:20,text:()=>new Promise(done=>finishRead=done)});
 await importRequestPack({name:'new.json',size:20,text:async()=>JSON.stringify(pack)});
-finishRead(JSON.stringify(pack));await slowRead;assert.equal(state.datasetImport.name,'new.json');assert.equal(JSON.stringify(state.config),accepted);closeDatasetDialog();
+finishRead(JSON.stringify(pack));await slowRead;assert.equal(state.datasetImport.name,'new.json');assert.equal(JSON.stringify(state.config),accepted);openQuestionManager();
 // Flat import requires a confirmed mapping preview and explicit commit.
-api=async(path,options)=>{const body=JSON.parse(options.body);calls.push({path,body});if(path==='/api/config/draft')return {config:body};return body.input_field?{columns:['question','answer'],preview_rows:[{question:'<question>',answer:'<answer>'}],request_pack:pack,errors:[],needs_mapping:false}:{columns:['question','answer'],preview_rows:[{question:'<question>',answer:'<answer>'}],suggested_mapping:{input_field:'question',expected_field:'answer'},request_pack:null,errors:[],needs_mapping:true};};
+api=async(path,options)=>{const body=JSON.parse(options.body);calls.push({path,body});if(path==='/api/config/draft')return {config:body};return (body.input_field||body.format==='json'&&JSON.parse(body.text).version===1)?{columns:['question','answer'],preview_rows:[{question:'<question>',answer:'<answer>'}],request_pack:pack,errors:[],needs_mapping:false}:{columns:['question','answer'],preview_rows:[{question:'<question>',answer:'<answer>'}],suggested_mapping:{input_field:'question',expected_field:'answer'},request_pack:null,errors:[],needs_mapping:true};};
 await importRequestPack({name:'examples.csv',size:20,text:async()=>'question,answer'});
 assert.equal(JSON.stringify(state.config),accepted);assert.equal(state.datasetImport.preview.request_pack,null);
 const before=calls.length;await useImportedDataset({preventDefault(){}});assert.equal(calls.length,before);
@@ -1242,22 +1282,22 @@ await previewDatasetMapping();assert.equal(calls.at(-1).body.input_field,'questi
 // Changing a mapping invalidates the preview; late earlier responses cannot restore it.
 let resolve;api=()=>new Promise(done=>resolve=done);const older=previewDatasetMapping();const oldResolve=resolve;
 listeners.change({target:{matches:()=>false,closest:selector=>selector==='#dataset-import-form',name:'input_field'}});
-assert(state.datasetImport.mappingDirty);assert.match(nodes['#dataset-dialog'].innerHTML,/Columns changed/);
+assert(state.datasetImport.mappingDirty);assert.match(nodes['#question-workspace-body'].innerHTML,/Columns changed/);
 const newer=previewDatasetMapping();resolve({columns:['question','answer'],preview_rows:[],request_pack:pack,errors:[]});await newer;
 oldResolve({columns:[],preview_rows:[],request_pack:null,errors:[{field:'old',message:'stale'}]});await older;
 assert.equal(state.datasetImport.preview.request_pack.cases[0].fixture_id,'one');assert(!state.datasetImport.mappingDirty);assert.equal(JSON.stringify(state.config),accepted);
-// Cancelling while the explicit commit validates cannot apply it afterward.
-const applying=useImportedDataset({preventDefault(){}});const commitResolve=resolve;
-assert(state.configBusy);closeDatasetDialog();commitResolve({config:{...state.config,request_pack:{version:1,cases:[]}}});await applying;
-assert.equal(JSON.stringify(state.config),accepted);assert.equal(state.configBusy,false);
+// A validated preview applies atomically without a second raw-file parse.
+api=()=>assert.fail('Validated import must not be parsed a second time');
+await useImportedDataset({preventDefault(){}});assert.equal(state.setupWorkspace.view,'questions');
+state.config=JSON.parse(accepted);api=()=>new Promise(done=>resolve=done);
 state.datasetImport={name:'again.json',text:'{}',format:'json',revision:state.configRevision,route:state.routeVersion,sequence:0,mapping:{},preview:null};
 // Leaving/cancelling an import while parsing keeps the active dataset unchanged.
-const pending=previewDatasetMapping();const pendingResolve=resolve;closeDatasetDialog();pendingResolve({request_pack:pack});await pending;assert.equal(state.datasetImport,null);assert.equal(JSON.stringify(state.config),accepted);
+const pending=previewDatasetMapping();const pendingResolve=resolve;openQuestionManager();pendingResolve({request_pack:pack});await pending;assert.equal(state.datasetImport,null);assert.equal(JSON.stringify(state.config),accepted);
 // Edits to main configuration while import validation is in flight win.
-const importing=importRequestPack({name:'late.json',size:20,text:async()=>JSON.stringify(pack)});await Promise.resolve();const staleResolve=resolve;configChanged();staleResolve({request_pack:pack,preview_rows:pack.cases});await importing;assert.equal(state.datasetImport.preview,null);assert.equal(JSON.stringify(state.config),accepted);closeDatasetDialog();
+const importing=importRequestPack({name:'late.json',size:20,text:async()=>JSON.stringify(pack)});await Promise.resolve();const staleResolve=resolve;configChanged();staleResolve({request_pack:pack,preview_rows:pack.cases});await importing;assert.equal(state.datasetImport.preview,null);assert.equal(JSON.stringify(state.config),accepted);openQuestionManager();
 // Dirty JSON and oversized files are rejected before reading.
 state.jsonDraft='unapplied';await importRequestPack({size:20,text:async()=>{throw Error('must not read');}});assert.match(nodes['#config-error'].textContent,/Apply or discard/);state.jsonDraft=state.jsonBase;
-await importRequestPack({size:1048577,text:async()=>{throw Error('must not read');}});assert.match(nodes['#config-error'].textContent,/1 MiB/);
+await importRequestPack({size:1048577,text:async()=>{throw Error('must not read');}});assert.match(state.datasetImport.error,/1 MiB/);
 // Trial only submits one named example/target to its own bounded endpoint.
 openTryExample(0);markup=nodes['#dataset-dialog'].innerHTML;assert.match(markup,/Sends this question once/);assert.match(markup,/No traffic stages or restart/);assert.match(markup,/Save this trial/);assert.match(markup,/name="save_try_output" type="checkbox" checked/);assert.match(markup,/does not change what your main run saves/);
 const trial=[];api=async(path,options)=>{trial.push({path,body:JSON.parse(options.body)});return {id:'trial',state:'queued'};};
@@ -1352,8 +1392,8 @@ import fs from 'node:fs';
 import vm from 'node:vm';
 const nodes={
   '#form-error':{hidden:true},'#start-run':{},
-  '[data-action="add-example"]':{focus(){this.focused=true;}},
-  '.judge-configuration':{open:false},
+  '[data-action="manage-questions"]':{focus(){this.focused=true;}},
+  '[data-action="configure-evaluator"]':{focus(){this.focused=true;}},
 };
 const context={assert,nodes,structuredClone,
   document:{querySelector:q=>nodes[q],querySelectorAll:()=>[],addEventListener(){}},
@@ -1370,12 +1410,13 @@ syncTestControls=()=>{};updateBounds=()=>{};renderRequestPreview=()=>{};
 let calls=0;api=async()=>{calls++;throw Error('should not send');};
 validateRunForm=()=>true;readForm=()=>({config:structuredClone(state.config)});
 await startRun({preventDefault(){},target:{}});
-assert.equal(calls,0);assert(nodes['[data-action="add-example"]'].focused);
+assert.equal(calls,0);assert(nodes['[data-action="manage-questions"]'].focused);
 assert.match(nodes['#form-error'].textContent,/Add a question/);
 state.config.request_pack={cases:[{fixture_id:'one',scorer:'judge'}]};
 let additions=0;changeJudge=action=>{assert.equal(action,'add');additions++;};
 await startRun({preventDefault(){},target:{}});
-assert.equal(calls,0);assert.equal(additions,1);assert(nodes['.judge-configuration'].open);
+assert.equal(calls,0);assert.equal(additions,0);assert(nodes['[data-action="configure-evaluator"]'].focused);
+assert.equal(state.setupWorkspace,null);
 assert.match(nodes['#form-error'].textContent,/Set up the AI evaluator/);
 assert(!judgesReady(state.config));
 state.config.judging={judges:[{name:'evaluator',url:'http://localhost/v1',model:'m'}]};
@@ -1388,7 +1429,7 @@ assert(!markup.includes('class="judge-configuration" open'));
 state.datasetSelection=['one'];markup=renderAnswerChecks(state.config);
 assert(markup.includes('dataset-bulk-scorer'));
 state.config.request_pack.cases[0].scorer='exact';markup=renderAnswerChecks(state.config);
-assert(!markup.includes('judge_count'));assert(!markup.includes('Configure evaluator'));
+assert(!markup.includes('judge_count'));assert(markup.includes('Not needed'));assert(markup.includes('Configure evaluator'));
 })()
 `,context);
 """.replace("APP_PATH", json.dumps(str(app)))
