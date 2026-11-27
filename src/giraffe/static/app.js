@@ -937,15 +937,15 @@ async function pollNew(version) {
 }
 let detailEpoch=0,detailSequence=0,lastDetailSequence=0;
 async function pollDetail(version) {
-  const id=state.detail.id,epoch=detailEpoch,sequence=++detailSequence;
+  const key=reportRouteKey(),id=state.detail.id,epoch=detailEpoch,sequence=++detailSequence;
   try {
-    const delta=await runEvents(id,state.detail.seq);if(version!==state.routeVersion || state.detail?.id!==id || sequence<lastDetailSequence)return;
+    const delta=await runEvents(id,state.detail.seq);if(version!==state.routeVersion || state.detail?.id!==id || sequence<lastDetailSequence||reportRouteKey()!==key)return;
     if(!activeState(state.detail)&&activeState({state:delta.state}))return;
     const wasStopping=state.detail.state==='stopping';
     let detail=delta.reset?await api(runPath(id)):mergeRunEvents(state.detail,delta);
-    if(version!==state.routeVersion || state.detail?.id!==id || sequence<lastDetailSequence)return;
+    if(version!==state.routeVersion || state.detail?.id!==id || sequence<lastDetailSequence||reportRouteKey()!==key)return;
     const completed=!activeState(detail);
-    if(completed&&!delta.reset){detail=await api(runPath(id));if(version!==state.routeVersion||state.detail?.id!==id||sequence<lastDetailSequence)return;}
+    if(completed&&!delta.reset){detail=await api(runPath(id));if(version!==state.routeVersion||state.detail?.id!==id||sequence<lastDetailSequence||reportRouteKey()!==key)return;}
     if(wasStopping&&activeState(detail))detail.state='stopping';
     if(['running','queued'].includes(detail.state)&&(epoch!==detailEpoch||state.stopPending?.id===id)){
       schedulePoll(pollDetail,version,500);return;
@@ -961,7 +961,7 @@ async function pollDetail(version) {
     else if(summaryFocus){const disclosure=$('.all-requests');disclosure?.querySelector('summary')?.focus({preventScroll:true});}
     else if(action==='stop')$('[data-action="stop"]')?.focus({preventScroll:true});
     if(activeState(detail))schedulePoll(pollDetail,version,delta.reset||delta.idle?1800:300);else {if(state.active===id)setActive(null);await refreshRuns();if(version===state.routeVersion&&state.active)schedulePoll(pollRunStatus,version,3000);}
-  } catch(error) {if(error.name==='AbortError'||version!==state.routeVersion||state.detail?.id!==id||sequence<lastDetailSequence)return;if(epoch!==detailEpoch){schedulePoll(pollDetail,version,500);return;}connectionError(error.message+' Reconnecting; the suite may still be running.');schedulePoll(pollDetail,version,3000);}
+  } catch(error) {if(error.name==='AbortError'||version!==state.routeVersion||state.detail?.id!==id||sequence<lastDetailSequence||reportRouteKey()!==key)return;if(epoch!==detailEpoch){schedulePoll(pollDetail,version,500);return;}connectionError(error.message+' Reconnecting; the suite may still be running.');schedulePoll(pollDetail,version,3000);}
 }
 function suiteList() { return `<ol class="suite-list">${(state.bootstrap.checks || []).map((c,i)=>`<li><span class="index">${String(i+1).padStart(2,'0')}</span><span>${escape(c.title)}</span>${c.optional?'<small>OPT</small>':''}</li>`).join('')}</ol>`; }
 function runOutcome(run) {
@@ -980,7 +980,7 @@ function storageLine() {
   if(policy.max_total_bytes!=null)rules.push(`oldest first to ${diskSize(policy.max_total_bytes)}`);
   return `<div class="storage-line"><p>${s?`Saved runs on disk: ${diskSize(s.runs_bytes)}${s.limits?.max_total_storage?` of ${diskSize(s.limits.max_total_storage)} limit`:' · no total limit'} · Baselines ${diskSize(s.baselines_bytes)}${s.baselines_shared_bytes?` (${diskSize(s.baselines_shared_bytes)} shared with source run)`:''} · Automatic cleanup: ${rules.length?escape(rules.join(' or ')):'off'}${s.last_auto_cleanup?.deleted?.length?` · Automatically deleted: ${s.last_auto_cleanup.deleted.map(escape).join(', ')}`:''}${s.last_auto_cleanup?.error?` · Automatic cleanup failed: ${escape(s.last_auto_cleanup.error)}`:''} · Free disk ${diskSize(s.free_bytes)}`:state.storageUnavailable?'Storage information unavailable':'Saved runs on disk: loading…'}</p><button type="button" class="button small" data-action="storage-dialog">Clean up…</button></div>`;
 }
-function keepButton() {return `<button type="button" class="button small" data-action="keep-run" aria-pressed="${Boolean(state.detail.kept)}">${state.detail.kept?'Kept — protected from cleanup':'Keep run'}</button>`;}
+function keepButton() {return `<button type="button" class="button small" data-action="keep-run"${state.keepPending?.id===state.detail.id?' disabled aria-busy="true"':''} aria-pressed="${Boolean(state.detail.kept)}">${state.detail.kept?'Kept — protected from cleanup':'Keep run'}</button>`;}
 function openStorageDialog() {
   state.cleanup={revision:0,preview:null,busy:false};
   const dialog=$('#storage-dialog');
@@ -1014,21 +1014,25 @@ async function previewCleanup(event) {
   finally{if(state.cleanup===current)$('#cleanup-preview-button').disabled=false;}
 }
 async function confirmCleanup() {
-  const current=state.cleanup,preview=current?.preview,routeVersion=state.routeVersion;if(!preview||current.busy)return;
+  const current=state.cleanup,preview=current?.preview,routeVersion=state.routeVersion,key=reportRouteKey();if(!preview||current.busy)return;
   current.busy=true;$('#cleanup-confirm').disabled=true;$('#cleanup-preview-button').disabled=true;$('#cleanup-error').hidden=true;
   try {
     const result=await api('/api/storage/cleanup',{method:'POST',body:JSON.stringify({...preview.criteria,ids:preview.ids})});
     if(state.cleanup!==current)return;
-    current.preview=null;state.cleanupResult=result;$('#storage-dialog').close();renderRuns();
-    try{await refreshRuns();if(state.cleanup===current&&state.routeVersion===routeVersion)renderRuns();}
-    catch(error){toast('Cleanup finished, but run history could not be refreshed: '+error.message);}
+    current.preview=null;state.cleanupResult=result;$('#storage-dialog').close();if(state.routeVersion===routeVersion&&reportRouteKey()===key)renderRuns();
+    try{await refreshRuns();if(state.cleanup===current&&state.routeVersion===routeVersion&&reportRouteKey()===key)renderRuns();}
+    catch(error){if(state.routeVersion===routeVersion&&reportRouteKey()===key)toast('Cleanup finished, but run history could not be refreshed: '+error.message);}
   }catch(error){if(state.cleanup===current){current.preview=null;$('#cleanup-error').textContent=error.message+' Preview again before deleting.';$('#cleanup-error').hidden=false;}}
   finally{current.busy=false;if(state.cleanup===current)$('#cleanup-preview-button').disabled=false;}
 }
 async function toggleKept() {
-  const detail=state.detail,button=$('[data-action="keep-run"]');button.disabled=true;
-  try{const result=await api(`${runPath(detail.id)}/keep`,{method:'POST',body:JSON.stringify({keep:!detail.kept})});if(state.detail!==detail)return;detail.kept=result.kept;renderDetail();}
-  catch(error){toast(error.message);button.disabled=false;}
+  const detail=state.detail,id=detail.id;if(state.keepPending?.id===id)return;
+  const t=reportToken(),p=state.keepPending={id};
+  if(state.keptOverride?.id===id)state.keptOverride=null;
+  $('[data-action="keep-run"]').disabled=true;
+  try{const result=await api(`${runPath(id)}/keep`,{method:'POST',body:JSON.stringify({keep:!detail.kept})});if(reportStillShown(t))state.detail.kept=result.kept;else state.keptOverride={id,kept:result.kept,version:state.routeVersion};}
+  catch(error){if(sameReportVisit(t))toast(error.message);}
+  finally{if(state.keepPending===p)state.keepPending=null;if(reportStillShown(t))renderDetail();}
 }
 function cleanupResultNotice() {
   const result=state.cleanupResult;if(!result)return '';
@@ -3680,14 +3684,14 @@ function plannedRequests(detail=state.detail) {
   return detail?.progress?.planned_total ?? (conditions.length&&conditions.every(item=>Number.isFinite(item.planned))?conditions.reduce((sum,item)=>sum+item.planned,0):null);
 }
 async function loadDetailPlan() {
-  const detail=state.detail;
+  const detail=state.detail,t=reportToken();
   if(!activeState(detail)||plannedRequests(detail)!=null||typeof fetch!=='function'||!detail.config)return;
   if(detailPlan.id!==detail.id)detailPlan={id:detail.id,plan:null,pending:false,done:false};
   const current=detailPlan,version=state.routeVersion;if(current.pending||current.done)return;
   current.pending=true;
   try{const value=await api('/api/config/plan',{method:'POST',body:JSON.stringify(detail.config)});if(state.detail?.id===detail.id&&version===state.routeVersion)current.plan=value.request_plan || null;}
   catch{ /* The request count stays absent when planning is unavailable. */ }
-  finally{current.pending=false;current.done=true;if(current.plan&&state.detail?.id===detail.id&&version===state.routeVersion&&activeState(state.detail))renderDetail();}
+  finally{current.pending=false;current.done=true;if(current.plan&&state.detail?.id===detail.id&&version===state.routeVersion&&activeState(state.detail)&&reportStillShown(t))renderDetail();}
 }
 function finishedRequests(report,detail=state.detail) {
   const counts=[detail?.progress?.completed,detail?.summary?.request_count,report?.request_count];
@@ -3734,6 +3738,10 @@ function reportRoute(hash=typeof location==='undefined'?'':location.hash) {
   if(section&&!(tab==='results'&&section==='baseline')&&!sections.some(([id])=>id===section))return null;
   try{return {id:decodeURIComponent(match[1]),tab,section};}catch{return null;}
 }
+function reportRouteKey(hash=typeof location==='undefined'?'':location.hash){const r=reportRoute(hash);return r?`run:${r.id}`:`hash:${hash}`;}
+function reportToken(){return {id:state.detail?.id??null,version:state.routeVersion,key:reportRouteKey()};}
+function reportStillShown(t){return Boolean(t.id)&&state.reportRouteActive&&state.detail?.id===t.id&&reportRouteKey()===t.key;}
+function sameReportVisit(t){return t.version===state.routeVersion&&reportStillShown(t);}
 function syncReportView() {
   const d=state.detail;if(!d)return;
   if(reportView.id!==d.id){
@@ -3758,6 +3766,7 @@ function announceRunComplete(detail) {
 }
 function replaceReportAnchor() {
   if(typeof location==='undefined')return;
+  if(reportRoute()?.id!==reportView.id)return;
   const hash=`${linkRun(reportView.id)}/${reportView.tab}`;
   // Replacing an automatic default must not add a browser-history entry or count as a user choice.
   if(typeof history!=='undefined'&&history.replaceState)history.replaceState(null,'',hash);
@@ -4117,7 +4126,7 @@ async function loadPerformance({force=false}={}) {
   if(!state.detail)return;
   if(reportView.pending){if(force)reportView.again=true;return;}
   const now=Date.now();if(!force&&(reportView.performance||reportView.lastFetch))return;
-  const id=state.detail.id,version=state.routeVersion,sequence=++reportView.sequence,target=reportView.target,window=reportView.window;
+  const t=reportToken(),id=state.detail.id,version=state.routeVersion,sequence=++reportView.sequence,target=reportView.target,window=reportView.window;
   reportView.pending=true;reportView.lastFetch=now;
   const params=Object.entries({target,window}).filter(([,value])=>value!=null).map(([key,value])=>`${key}=${encodeURIComponent(value)}`).join('&');
   try{
@@ -4126,7 +4135,7 @@ async function loadPerformance({force=false}={}) {
     if(target!==reportView.target||window!==reportView.window){reportView.again=true;return;}
     reportView.performance=value;reportView.error='';
   }catch(error){if(state.detail?.id===id&&version===state.routeVersion&&reportView.sequence===sequence)reportView.error=error.message;}
-  finally{if(state.detail?.id===id&&version===state.routeVersion&&reportView.sequence===sequence){reportView.pending=false;if(reportView.again){reportView.again=false;loadPerformance({force:true});}else if(state.reportRouteActive){renderDetail();finishPendingReportReveal();}}}
+  finally{if(state.detail?.id===id&&version===state.routeVersion&&reportView.sequence===sequence){reportView.pending=false;if(reportView.again){reportView.again=false;loadPerformance({force:true});}else if(reportStillShown(t)){renderDetail();finishPendingReportReveal();}}}
 }
 
 function resultActions(report,{completePass=false,savedBaseline=null}={}) {
@@ -4177,6 +4186,8 @@ function renderDetail() {
   cancelStopConfirmationTimer();
   state.reportRouteActive=true;
   const d=state.detail;
+  if(state.keptOverride&&state.keptOverride.version!==state.routeVersion)state.keptOverride=null;
+  if(state.keptOverride?.id===d.id){d.kept=state.keptOverride.kept;state.keptOverride=null;}
   syncReportView();
   if(state.liveError&&(state.liveError.id!==d.id||d.state==='stopping'||!activeState(d)))state.liveError=null;
   if(state.stopPending&&(state.stopPending.id!==d.id||d.state==='stopping'||!activeState(d)))state.stopPending=null;
@@ -4288,7 +4299,7 @@ function inlineAnswerRequests(check,report) {
   return findingRequests(check,report).filter(r=>r.score===false||r.evaluation||r.evaluation_error||['correctness','json','context','tools'].includes(check.id)).slice(0,3);
 }
 async function loadFindingEvidence() {
-  const detail=state.detail,report=detail?.report;
+  const t=reportToken(),detail=state.detail,report=detail?.report;
   if(!report?.requests_compact||reportView.tab!=='results'||typeof fetch!=='function')return;
   if(findingEvidence.id!==detail.id)findingEvidence={id:detail.id,records:new Map(),pending:new Set(),errors:new Map()};
   const evidence=findingEvidence,version=state.routeVersion,records=[...new Map(report.checks.flatMap(check=>inlineAnswerRequests(check,report)).map(r=>[r.id,r])).values()];
@@ -4300,7 +4311,7 @@ async function loadFindingEvidence() {
     catch(error){if(findingEvidence===evidence)evidence.errors.set(record.id,error.message);}
     finally{evidence.pending.delete(record.id);}
   }));
-  if(state.detail?.id===detail.id&&state.routeVersion===version&&findingEvidence===evidence)renderDetail();
+  if(state.detail?.id===detail.id&&state.routeVersion===version&&findingEvidence===evidence&&reportStillShown(t))renderDetail();
 }
 function requestWithEvidence(record) {return findingEvidence.id===state.detail?.id?findingEvidence.records.get(record.id)||record:record;}
 function requestQuestion(record,report) {
@@ -4771,44 +4782,80 @@ function openBaselineDialog(){
   const report=state.detail.report,dialog=$('#baseline-dialog');dialog.className='baseline-form';dialog.innerHTML=`<form id="baseline-form"><div class="dialog-head"><div><div class="eyebrow">Explicit reference run</div><h2 id="baseline-title">Save baseline</h2></div><button type="button" class="button ghost" data-action="close-dialog" aria-label="Close save baseline">✕</button></div><div class="dialog-body"><p class="hint">Save this exact report for future comparisons. Its recorded outcome is ${escape(statusLabels[report.overall] || report.overall)}.</p><div class="fields">${field('baseline_name','Baseline name','',{required:true,full:true,placeholder:'e.g. before-runtime-upgrade'})}</div><p class="hint" style="margin-top:12px">Existing baselines are preserved unless you explicitly replace one.</p><div id="baseline-error" class="error-message" role="alert" hidden></div><label class="replace-row" id="replace-row" hidden><input name="replace" type="checkbox">Replace the existing baseline with this name</label></div><div class="dialog-footer"><button type="button" class="button" data-action="close-dialog">Cancel</button><button type="submit" class="button primary" id="save-baseline">Save baseline</button></div></form>`;dialog.showModal();}
 // Closing a chooser does not cancel a comparison already being saved.
 const pendingComparisons=new Set();
+let baselinesSequence=0,comparisonDialogSequence=0;
+async function refreshBaselines(){
+  const s=++baselinesSequence,before=new Set(state.baselines),r=await api('/api/baselines'),list=r.baselines||[];
+  if(s===baselinesSequence){
+    const merged=new Map(list.map(item=>[item.id,item]));
+    for(const item of state.baselines)if(!before.has(item))merged.set(item.id,item);
+    state.baselines=[...merged.values()];
+  }
+  return list;
+}
+function mergeBaseline(summary){if(!summary?.id)return;const index=state.baselines.findIndex(item=>item.id===summary.id);if(index<0)state.baselines.push(summary);else state.baselines[index]=summary;}
 async function openComparisonDialog() {
-  const id=state.detail?.id,version=state.routeVersion;
+  const t=reportToken(),id=t.id;
   if(!id||state.detail.state!=='completed')return;
   if(pendingComparisons.has(id)){toast('A comparison is still being saved for this run.');return;}
+  const s=++comparisonDialogSequence;
   try {
-    const result=await api('/api/baselines');
-    if(version!==state.routeVersion||state.detail?.id!==id||pendingComparisons.has(id))return;
-    state.baselines=result.baselines||[];
+    await refreshBaselines();
+    if(s!==comparisonDialogSequence||!sameReportVisit(t)||pendingComparisons.has(id))return;
     const choices=state.baselines.filter(item=>item.run_id!==id);
     const dialog=$('#comparison-dialog');
     dialog.className='baseline-form';
     dialog.innerHTML=`<form id="comparison-form" data-run-id="${escape(id)}"><div class="dialog-head"><h2 id="comparison-title">Compare with saved baseline</h2><button type="button" class="button ghost" data-action="close-dialog" aria-label="Close comparison">✕</button></div><div class="dialog-body"><p>Compare the recorded results. No new requests will be sent to your endpoint.</p>${choices.length?`<label for="saved-baseline-choice">Saved baseline</label><select id="saved-baseline-choice" name="baseline_id" required>${choices.map(item=>`<option value="${escape(item.id)}"${item.id===state.detail.baseline_id?' selected':''}>${escape(item.name)} · ${escape(date(item.saved_at))}</option>`).join('')}</select>`:'<p>No other saved baselines yet. Open a different completed run and choose “Save as reference baseline”, then return here.</p>'}<div id="comparison-error" class="error-message" role="alert" hidden></div></div><div class="dialog-footer"><button type="button" class="button" data-action="close-dialog">Cancel</button><button type="submit" class="button primary"${choices.length?'':' disabled'}>Compare saved results</button></div></form>`;
     dialog.showModal();
-  }catch(error){if(version===state.routeVersion&&state.detail?.id===id)toast(error.message);}
+  }catch(error){if(s===comparisonDialogSequence&&sameReportVisit(t))toast(error.message);}
 }
 async function compareSavedRun(event) {
   event.preventDefault();
-  const form=event.target,id=form.dataset.runId,version=state.routeVersion;
+  const form=event.target,id=form.dataset.runId,t=reportToken(),dialog=$('#comparison-dialog');
+  const own=()=>sameReportVisit(t)&&form.isConnected&&dialog?.open;
   if(state.detail?.id!==id||pendingComparisons.has(id))return;
-  const button=form.querySelector('[type="submit"]'),error=$('#comparison-error');
+  const button=form.querySelector('[type="submit"]'),error=form.querySelector('#comparison-error');
   pendingComparisons.add(id);
   button.disabled=true;error.hidden=true;
   try {
     const result=await api(`${runPath(id)}/compare`,{method:'POST',body:JSON.stringify({baseline_id:new FormData(form).get('baseline_id')})});
-    if(version!==state.routeVersion||state.detail?.id!==id)return;
+    if(!reportStillShown(t))return;
     const detail=await api(runPath(id));
-    if(version!==state.routeVersion||state.detail?.id!==id)return;
+    if(!reportStillShown(t))return;
     state.detail=detail;state.comparisonFilter=null;state.comparisonCheck='all';state.tab='baseline';
     reportView.performance=null;reportView.pending=false;reportView.lastFetch=0;reportView.sequence++;
-    $('#comparison-dialog').close();
-    chooseReportTab('results');renderDetail();
-    const section=$('#report-baseline-reference');
-    if(section){section.open=true;section.scrollIntoView?.({block:'start'});$('summary',section)?.focus({preventScroll:true});}
-    toast(result.warning||'Comparison saved. No new requests were sent.');
-  }catch(failure){if(version===state.routeVersion&&state.detail?.id===id){error.textContent=failure.message;error.hidden=false;}}
+    if(own()){
+      dialog.close();
+      chooseReportTab('results');renderDetail();
+      const section=$('#report-baseline-reference');
+      if(section){section.open=true;section.scrollIntoView?.({block:'start'});$('summary',section)?.focus({preventScroll:true});}
+    }else{
+      if(reportView.tab==='performance')loadPerformance({force:true});
+      renderDetail();
+    }
+    if(sameReportVisit(t))toast(result.warning||'Comparison saved. No new requests were sent.');
+  }catch(failure){if(sameReportVisit(t)){error.textContent=failure.message;error.hidden=false;}}
   finally{pendingComparisons.delete(id);button.disabled=false;}
 }
-async function saveBaseline(event){event.preventDefault();const form=event.target,data=new FormData(form),button=$('#save-baseline'),error=$('#baseline-error');button.disabled=true;error.hidden=true;try{await api('/api/baselines',{method:'POST',body:JSON.stringify({run_id:state.detail.id,name:String(data.get('baseline_name')).trim(),replace:data.has('replace')})});const result=await api('/api/baselines');state.baselines=result.baselines || [];$('#baseline-dialog').close();renderDetail();toast(`Saved as baseline “${String(data.get('baseline_name')).trim()}”. Open another completed run and choose Compare with baseline, or select it before a new run.`);}catch(e){error.textContent=e.message;error.hidden=false;if(e.status===409)$('#replace-row').hidden=false;}finally{button.disabled=false;}}
+async function saveBaseline(event){
+  event.preventDefault();
+  const t=reportToken(),form=event.target,dialog=$('#baseline-dialog'),data=new FormData(form),name=String(data.get('baseline_name')).trim();
+  const button=form.querySelector('#save-baseline'),error=form.querySelector('#baseline-error'),replaceRow=form.querySelector('#replace-row');
+  const own=()=>sameReportVisit(t)&&form.isConnected&&dialog?.open;
+  button.disabled=true;error.hidden=true;
+  let result;
+  try{result=await api('/api/baselines',{method:'POST',body:JSON.stringify({run_id:t.id,name,replace:data.has('replace')})});}
+  catch(e){
+    if(own()){error.textContent=e.message;error.hidden=false;if(e.status===409)replaceRow.hidden=false;}
+    else if(sameReportVisit(t))toast(`Baseline “${name}” was not saved: ${e.message}`);
+    button.disabled=false;return;
+  }
+  mergeBaseline(result);
+  try{await refreshBaselines();}catch{}
+  if(own())dialog.close();
+  if(reportStillShown(t))renderDetail();
+  if(sameReportVisit(t))toast(`Saved as baseline “${name}”. Open another completed run and choose Compare with baseline, or select it before a new run.`);
+  button.disabled=false;
+}
 let stopConfirmationTimer=null,stopConfirmationEpoch=0;
 function cancelStopConfirmationTimer({reset=false}={}) {
   if(stopConfirmationTimer!=null&&typeof clearTimeout==='function')clearTimeout(stopConfirmationTimer);
@@ -4832,17 +4879,17 @@ async function confirmStop(){
 
 async function stopRun(){
   if(!activeState(state.detail)||state.detail.stoppable===false||state.detail.state==='stopping'||state.stopPending?.id===state.detail.id)return;
-  const button=$('[data-action="stop"]'),id=state.detail.id,version=state.routeVersion,epoch=++detailEpoch;
+  const t=reportToken(),button=$('[data-action="stop"]'),id=state.detail.id,version=state.routeVersion,epoch=++detailEpoch;
   state.liveError=null;state.stopPending={id};button.disabled=true;button.textContent='Stopping…';
   try{
     const result=await api(`${runPath(id)}/cancel`,{method:'POST',body:'{}'});
-    if(version!==state.routeVersion||state.detail?.id!==id||epoch!==detailEpoch)return;
+    if(!sameReportVisit(t)||epoch!==detailEpoch)return;
     state.stopPending=null;
     if(!activeState(state.detail))return;
     if(state.detail.state!=='stopping')state.detail.state=result.state || 'stopping';
     renderDetail();schedulePoll(pollDetail,version,500);
   }catch(error){
-    if(version!==state.routeVersion||state.detail?.id!==id||epoch!==detailEpoch)return;
+    if(!sameReportVisit(t)||epoch!==detailEpoch)return;
     state.stopPending=null;
     if(state.detail.state==='stopping'||!activeState(state.detail))return;
     state.liveError={id,message:error.message,sequence:detailSequence};

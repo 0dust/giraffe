@@ -1,6 +1,10 @@
 """Storage controls remain explicit and usable without a browser server."""
 
-from tests.test_ux_results import run_render_checks
+import json
+
+import pytest
+
+from tests.test_ux_results import REPORT_REPLY_SETUP, run_render_checks
 
 
 def test_history_exposes_disk_totals_run_sizes_and_kept_marker():
@@ -100,21 +104,22 @@ assert.match(nodes['#cleanup-preview'].innerHTML,/Preview again/);
 """)
 
 
-def test_cleanup_result_survives_history_refresh_failure():
+@pytest.mark.parametrize('navigate', [False, True])
+def test_cleanup_result_survives_history_refresh_failure(navigate):
     run_render_checks(r"""
 (async()=>{
 nodes['#storage-dialog']={open:true,close(){this.open=false;}};
 for(const id of ['cleanup-error','cleanup-preview-button','cleanup-confirm'])nodes['#'+id]={};
 state.cleanup={preview:{criteria:{older_than_days:0},ids:['kept']}};
 let message;toast=value=>message=value;
-api=async path=>{if(path==='/api/storage/cleanup')return {deleted:[],bytes_freed:0,skipped:[{id:'kept',reason:'run is active'}]};throw Error('History unavailable');};
+api=async path=>{if(path==='/api/storage/cleanup')return {deleted:[],bytes_freed:0,skipped:[{id:'kept',reason:'run is active'}]};if(NAVIGATE)globalThis.location={hash:'#runs/x'};throw Error('History unavailable');};
 await confirmCleanup();
 assert(!nodes['#storage-dialog'].open);
 assert.match(nodes['#main'].innerHTML,/role="status">Deleted 0 runs, freed 0 B on disk\. Skipped 1: kept — run is active/);
-assert.match(message,/Cleanup finished, but run history could not be refreshed/);
+if(NAVIGATE)assert.equal(message,undefined);else assert.match(message,/Cleanup finished, but run history could not be refreshed/);
 assert.equal(state.cleanup.preview,null);
 })()
-""")
+""".replace('NAVIGATE', json.dumps(navigate)))
 
 
 def test_keep_toggle_posts_boolean_and_refreshes_detail_markup():
@@ -130,6 +135,32 @@ for(const expected of [true,false]){
 }
 })()
 """)
+
+
+@pytest.mark.parametrize('mode', ['C', 'T', 'P', 'R', 'O', 'L'])
+@pytest.mark.parametrize('fails', [False, True])
+def test_keep_reply_respects_report_navigation_and_blocks_duplicate(mode, fails):
+    run_render_checks(REPORT_REPLY_SETUP + r"""
+(async()=>{
+ const pending=deferred();let posts=0;
+ api=async(path,options)=>{if(options){posts++;return pending.promise;}return navigationReply(path);};
+ const saving=toggleKept();renderDetail();
+ assert($('[data-action="keep-run"]').hasAttribute('disabled'));
+ assert.equal($('[data-action="keep-run"]').getAttribute('aria-busy'),'true');
+ await toggleKept();assert.equal(posts,1);
+ await navigate(MODE);const main=$('#main'),writes=reportRenders,before=main.innerHTML;
+ if(FAILS)pending.reject(Error('Keep failed'));else pending.resolve({kept:true});
+ await saving;assert.equal(state.keepPending,null);
+ assert.equal(messages.length,FAILS&&['C','T'].includes(MODE)?1:0);
+ if(['C','T','L'].includes(MODE)){
+  assert(reportRenders>writes);
+  assert.equal(Boolean(state.detail.kept),!FAILS);
+  assert(!$('[data-action="keep-run"]').hasAttribute('disabled'));
+ }else assert.equal(main.innerHTML,before);
+ if(MODE==='R')assert.equal(state.reportRouteActive,false);
+ if(MODE==='O')assert.equal(state.detail.id,'other');
+})()
+""".replace('MODE', json.dumps(mode)).replace('FAILS', json.dumps(fails)), dom=True)
 
 
 def test_summary_only_error_and_storage_omissions_remain_visible():
@@ -154,3 +185,56 @@ assert.match(html,/2 KiB shared with source run/);
 assert.match(html,/Automatic cleanup: keep newest 5 runs/);
 assert.match(html,/Automatically deleted: old-a, old-b/);
 """)
+
+
+@pytest.mark.parametrize('post_first', [False, True])
+def test_keep_success_during_return_refetch_is_applied_once(post_first):
+    run_render_checks(REPORT_REPLY_SETUP + r"""
+(async()=>{
+ const post=deferred(),get=deferred();let returning=false;
+ api=async(path,options)=>options?post.promise:returning&&path==='/api/runs/saved-run'?get.promise:navigationReply(path);
+ const saving=toggleKept();location.hash='#runs';await route();
+ if(!POST_FIRST){location.hash='#runs/saved-run';returning=true;}
+ const entering=POST_FIRST?null:route();
+ if(!POST_FIRST)assert.equal(state.detail,null);
+ post.resolve({kept:true});await saving;
+ assert.equal(state.keptOverride.kept,true);
+ assert.equal(state.keptOverride.version,state.routeVersion);
+ let entry=entering;
+ if(POST_FIRST){location.hash='#runs/saved-run';returning=true;entry=route();}
+ get.resolve({...initial,kept:false});await entry;
+ assert.equal(state.detail.kept,!POST_FIRST);assert.equal(state.keptOverride,null);
+ assert.match($('[data-action="keep-run"]').textContent,POST_FIRST?/Keep run/:/Kept — protected/);
+ assert.equal(messages.length,0);
+ // A later explicit action clears any deferred override for this run.
+ state.keptOverride={id:'saved-run',kept:true,version:state.routeVersion};api=async()=>({kept:false});
+ await toggleKept();assert.equal(state.keptOverride,null);assert.equal(state.detail.kept,false);
+ renderDetail();assert.match($('[data-action="keep-run"]').textContent,/Keep run/);
+})()
+""".replace('POST_FIRST', json.dumps(post_first)), dom=True)
+
+
+
+def test_keep_override_from_abandoned_refetch_cannot_overwrite_later_visit():
+    run_render_checks(REPORT_REPLY_SETUP + r"""
+(async()=>{
+ const post=deferred(),oldGet=deferred();let reads=0;
+ api=async(path,options)=>{
+  if(options)return post.promise;
+  if(path==='/api/runs/saved-run')return ++reads===1?oldGet.promise:{...initial,kept:false};
+  return navigationReply(path);
+ };
+ const saving=toggleKept();location.hash='#runs';await route();
+ location.hash='#runs/saved-run';const abandoned=route();
+ post.resolve({kept:true});await saving;
+ assert.equal(state.keptOverride.version,state.routeVersion);
+ const version=state.routeVersion;
+ location.hash='#runs';await route();
+ location.hash='#runs/saved-run';await route();
+ assert(state.routeVersion>version);
+ assert.equal(state.detail.kept,false);assert.equal(state.keptOverride,null);
+ assert.match($('[data-action="keep-run"]').textContent,/Keep run/);
+ oldGet.resolve({...initial,kept:true});await abandoned;
+ assert.equal(state.detail.kept,false);assert.equal(state.keptOverride,null);
+})()
+""", dom=True)
