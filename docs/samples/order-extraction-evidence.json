@@ -1,0 +1,85 @@
+{
+  "scenario": "Extract order_id, status and integer quantity from sample orders into JSON.",
+  "scope": "Recorded local application demo with six authored sample orders and an illustrative eight-second requirement; not customer production traffic.",
+  "recorded_on": "2026-11-01",
+  "giraffe_commit": "6ea042908ac4cc0770c353fe6f1c0faf864ba5e0",
+  "runtime": "Ollama 0.12.10",
+  "model": "llama3.2:1b Q8_0",
+  "hardware": "Apple M1 MacBook Air, 8 GB unified memory",
+  "only_config_difference": "targets[0].identity.ollama_num_parallel: 1 -> 4",
+  "request_pack_sha256": "4364d734c693a635ae58357731d56f3d1b6edb8cc354a76bc00ddf77fd8268f2",
+  "matching_inputs": true,
+  "requirements": {
+    "max_first_answer_ms": null,
+    "max_completion_ms": 8000.0,
+    "max_error_percent": 0.0,
+    "min_correct_percent": 100.0,
+    "max_stream_pause_ms": null,
+    "min_generation_tokens_per_second": null,
+    "min_valid_responses": 10
+  },
+  "runs": [
+    {
+      "role": "before",
+      "run_id": "1d97cea922ec4f14928a1cc367dbf9c6",
+      "overall": "fail",
+      "ollama_num_parallel": 1,
+      "load_points": [
+        {
+          "client_concurrency": 1,
+          "requests": 49,
+          "correct": 49,
+          "over_8000_ms": 0,
+          "completion_p95_ms": 2371.25,
+          "completion_max_ms": 2648.73,
+          "late_request_ids": []
+        },
+        {
+          "client_concurrency": 4,
+          "requests": 51,
+          "correct": 51,
+          "over_8000_ms": 9,
+          "completion_p95_ms": 9275.26,
+          "completion_max_ms": 10214.14,
+          "late_request_ids": [
+            "75a87249538e452ea06ba5b1b8fc2133",
+            "09d0c62f23e24dddbc35ef74eed7a780",
+            "6d8fb25b702c4a9abc6edee8cb6c1ab9",
+            "288bedeb7488445abfff642e086d5d7a",
+            "8f3a4619f52446a8ad88317b4d3582c4",
+            "e91a9f7031314d23ba645ff3948761e9",
+            "84bacaa762294b8f9c1136de658183da",
+            "27ceb876a00a459f856f2e4265aaa75b",
+            "a6ad024f442b4606b12e06617503f20c"
+          ]
+        }
+      ]
+    },
+    {
+      "role": "after",
+      "run_id": "3411391abe324c7ebdc05fd599bcde60",
+      "overall": "pass",
+      "ollama_num_parallel": 4,
+      "load_points": [
+        {
+          "client_concurrency": 1,
+          "requests": 47,
+          "correct": 47,
+          "over_8000_ms": 0,
+          "completion_p95_ms": 2458.25,
+          "completion_max_ms": 2623.04,
+          "late_request_ids": []
+        },
+        {
+          "client_concurrency": 4,
+          "requests": 100,
+          "correct": 100,
+          "over_8000_ms": 0,
+          "completion_p95_ms": 5788.97,
+          "completion_max_ms": 6676.88,
+          "late_request_ids": []
+        }
+      ]
+    }
+  ]
+}

@@ -95,6 +95,42 @@
           "presentation_commit": "336552816c878e9d26e4a760789e3012104b37ae"
         }
       ]
+    },
+    "order-extraction.zip": {
+      "sha256": "67aa09016746230205a34b90e5c2a54e9cea3cd653e75dfa539b646d07efc0de",
+      "bytes": 496769,
+      "reports": [
+        {
+          "directory": "before",
+          "run_id": "1d97cea922ec4f14928a1cc367dbf9c6",
+          "started_at": "2026-11-01T05:03:31.316510+00:00",
+          "overall": "fail",
+          "source_report_sha256": "f643fcc61cf6b23c08ac39ffb21865491fb22631dacf607137034ffcda903368",
+          "distributed_report_sha256": "9bd1bda44347a6f9a930c083f10b0210696eb0531ef654c3ec2ec7f3912ef4ed",
+          "distributed_html_sha256": "c0203e7b5ce6ab104ce9bca6cab194cf33808631f9309611c96286173a5b2695",
+          "config_sha256": "5864af78cbcc693430f048a487000c4b02ec371e19c1960e9617efe5fd219ca7",
+          "changed_metadata_fields": [
+            "manifest.run_location.hostname"
+          ],
+          "html_presentation_changes": "Saved report rendered with the PR review branch; screenshots retain the original recorded product UI. No new inference or recomputed verdicts.",
+          "presentation_commit": "9c34260584b5e479e09f13c28dfcf9f610c99a8d"
+        },
+        {
+          "directory": "after",
+          "run_id": "3411391abe324c7ebdc05fd599bcde60",
+          "started_at": "2026-11-01T05:08:16.409986+00:00",
+          "overall": "pass",
+          "source_report_sha256": "6ddd96fe92ec159f4981f3cce1ea197865faebc565510d0c62526c27784d67ea",
+          "distributed_report_sha256": "ba680b9ccef63ad68f3ee563bc46010906830c5bf7c1e02f5854fd2258201719",
+          "distributed_html_sha256": "9b41c6494504be95a6e10070ca4ab68b4d828c17ddd67a2b3bc4642b13650592",
+          "config_sha256": "aa8f84cd2f5f7502dddc4845e5bfe4762cb9c2c08470118d349aa9f28243de3a",
+          "changed_metadata_fields": [
+            "manifest.run_location.hostname"
+          ],
+          "html_presentation_changes": "Saved report rendered with the PR review branch; screenshots retain the original recorded product UI. No new inference or recomputed verdicts.",
+          "presentation_commit": "9c34260584b5e479e09f13c28dfcf9f610c99a8d"
+        }
+      ]
     }
   },
   "images": {
@@ -154,11 +190,39 @@
       "case_id": "recall-medium-d0-0",
       "configuration": "ollama-ctx8k",
       "source_image_sha256": "d8ea783a195e0e9f90595d773939ca91c97898ae061846c98d655c7408270b5f"
+    },
+    "order-extraction-before.png": {
+      "sha256": "3966f2548d362f34d21713866fe5e5e141b7089411497dcdd122a9b252cbd4d6",
+      "bytes": 140527,
+      "evidence": "order-extraction.zip",
+      "run_id": "1d97cea922ec4f14928a1cc367dbf9c6",
+      "ui_run": "20261101T050331-32375a5e",
+      "code_commit": "6ea042908ac4cc0770c353fe6f1c0faf864ba5e0",
+      "source_report_sha256": "f643fcc61cf6b23c08ac39ffb21865491fb22631dacf607137034ffcda903368",
+      "source_recording": "manual-before-load-results-8s-take1.mp4",
+      "source_recording_sha256": "7a5671e7b581cccc8eec8af4e9d3d41b4e01b34cad604119e583fe1aa289f927",
+      "frame_timestamp_seconds": 2,
+      "capture_changes": "One frame from the original screen recording; removed the 144-pixel browser chrome above the application. Native 1200x602 crop; no scaling, overlays, UI edits, drawn elements or data changes."
+    },
+    "order-extraction-after.png": {
+      "sha256": "69be50e11fa18f027148740348c7be5cbcc84b5ae12e86ba34f97fe54e6dd720",
+      "bytes": 132157,
+      "evidence": "order-extraction.zip",
+      "run_id": "3411391abe324c7ebdc05fd599bcde60",
+      "ui_run": "20261101T050816-a84e0e4d",
+      "code_commit": "6ea042908ac4cc0770c353fe6f1c0faf864ba5e0",
+      "source_report_sha256": "6ddd96fe92ec159f4981f3cce1ea197865faebc565510d0c62526c27784d67ea",
+      "source_recording": "manual-after-load-results-8s-take1.mp4",
+      "source_recording_sha256": "4a079b2c55d3c74b010ec05069310277551a77bc7f18c335da64e067005d5ab8",
+      "frame_timestamp_seconds": 2,
+      "capture_changes": "One frame from the original screen recording; removed the 144-pixel browser chrome above the application. Native 1200x602 crop; no scaling, overlays, UI edits, drawn elements or data changes."
     }
   },
   "context_request_evidence_sha256": "6ae00365f85d67228b6082ecdfdd4e94cb18ed3a9b04c257edadf9a8b909170c",
   "evidence_files": {
     "context-recall-evidence.json": "bdd14a7995552086d653a01d1f6e561225da5474fa9c2fd446e24f99c701c2e4",
-    "tool-call-evidence.json": "46885e186289722fecfd6e7a3bd5463104a9a65727986e0c81bfe553e9a2cc49"
+    "tool-call-evidence.json": "46885e186289722fecfd6e7a3bd5463104a9a65727986e0c81bfe553e9a2cc49",
+    "order-extraction-evidence.json": "ea4b35a6058d3c2922dbf03f39c495c1678d2c4f9e92b041fd89732ddaded113",
+    "order-extraction-questions.json": "a0ad0aec28d520a0113c010d346575ced69862352e828ace1bc21363a9149e01"
   }
 }

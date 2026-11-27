@@ -4,6 +4,66 @@ Download a ZIP, extract it, and open its `report.html` in a browser. Each report
 includes the matching `report.json` and run configuration; viewing it sends no
 inference requests.
 
+## Order extraction under load
+
+[Download both full reports](order-extraction.zip?raw=true) ·
+[Six complete prompts and expected answers](order-extraction-questions.json) ·
+[Verified counts and late-request IDs](order-extraction-evidence.json)
+
+An order-extraction app needs the correct `order_id`, `status`, and integer
+`quantity` in its JSON response, within its response-time limit. This recorded
+local demo checks both requirements while maintaining one and then four requests
+in flight. Its six authored sample orders and eight-second deadline illustrate
+an application requirement; they are not customer production traffic or a
+customer service-level agreement.
+
+The November 1, 2026 runs used Llama 3.2 1B Q8_0 with Ollama 0.12.10 on an 8 GB
+M1 MacBook Air. The only recorded configuration difference was
+`OLLAMA_NUM_PARALLEL=1` versus `4`. The model digest, complete prompts, JSON
+schema, expected field values, temperature, seed, context, output cap, 90-second
+load stages, and acceptance limits match. All six cases appear at each tested
+load in both runs.
+
+| Measured result | Before: one Ollama slot | After: four Ollama slots |
+| --- | ---: | ---: |
+| At one request in flight: correct and within eight seconds | 49 / 49 | 47 / 47 |
+| At four requests in flight: correct JSON | 51 / 51 | 100 / 100 |
+| At four requests in flight: responses over eight seconds | 9 / 51 | 0 / 100 |
+| At four requests in flight: slowest completion | 10.21 s | 6.68 s |
+| At four requests in flight: p95 completion | 9.28 s | 5.79 s |
+| Four-request acceptance | Failed | Passed |
+
+Every measured response must finish within eight seconds; p95 is a descriptive
+measurement, not the acceptance rule. The duration-bounded stages complete
+different numbers of requests. Both four-request groups have qualified timing
+evidence. The after run's one-request group has a client-delay timing warning;
+its acceptance still passed. Optional statistical comparisons retain their
+warnings. These observations do not establish maximum capacity or a universal
+effect of this setting.
+
+Giraffe identified the failing requirement, retained the request evidence, and
+compared the repeat against the saved baseline. The operator changed and
+restarted Ollama; Giraffe did not tune the server. The saved tested-load comparison
+records concurrency one still accepted and concurrency four newly accepted.
+
+### Original product screenshots
+
+| Before: load test failed | After: selected checks passed |
+| --- | --- |
+| ![Original Giraffe screen showing the order-extraction load failure](../assets/readme/order-extraction-before.png) | ![Original Giraffe screen showing the same checks passing after the change](../assets/readme/order-extraction-after.png) |
+
+These are frames at 2.0 seconds in the original before/after screen recordings.
+Only the browser chrome above the application was cropped. No UI text, results,
+colors, or other product content was redrawn or altered. They show Giraffe
+`6ea042908ac4cc0770c353fe6f1c0faf864ba5e0`, the revision used for these runs.
+
+Open `before/report.html` and `after/report.html` from the ZIP. The full recorded
+JSON, resolved configurations, and request pack are included. The HTML was
+rendered from those saved reports with the PR review branch; the screenshots
+retain the original UI. Only the personal hostname and JSON whitespace were
+changed in the distributed JSON. The manifest records both original and
+distributed hashes, recording hashes, frame times, and run IDs.
+
 ## Ollama context comparison
 
 [All 45 matched recall cases](context-recall-evidence.json) ·
