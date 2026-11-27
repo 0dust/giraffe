@@ -221,8 +221,8 @@
       "capture_changes": "One frame from the original screen recording; removed the 144-pixel browser chrome above the application. Native 1200x602 crop; no scaling, overlays, UI edits, drawn elements or data changes."
     },
     "order-extraction-comparison.png": {
-      "sha256": "bad60beeec5e83a1e38bfb9a4f855fa09d554fab3041c96517c1507ab68e4ec9",
-      "bytes": 72357,
+      "sha256": "5d70bea9c845588b20edd00b8757d8f69ee0a9c175473b9d170562c6aedf2ca4",
+      "bytes": 63510,
       "evidence": "order-extraction.zip",
       "baseline_run_id": "1d97cea922ec4f14928a1cc367dbf9c6",
       "run_id": "3411391abe324c7ebdc05fd599bcde60",
@@ -231,14 +231,14 @@
       "source_report_sha256": "6ddd96fe92ec159f4981f3cce1ea197865faebc565510d0c62526c27784d67ea",
       "source_recording": "manual-comparison-8s-take1.mp4",
       "source_recording_sha256": "6f2f4fb84eb6e92f1e8b9a2fec1b8e39df9279ca6642021a24b6891e84e523c9",
-      "frame_timestamp_seconds": 28,
+      "frame_timestamp_seconds": 32,
       "crop": {
         "x": 280,
-        "y": 310,
+        "y": 244,
         "width": 880,
-        "height": 320
+        "height": 294
       },
-      "capture_changes": "One frame from the original comparison recording, cropped to the tested-load table and its heading. Native resolution; no scaling, overlays, UI edits, drawn elements or data changes."
+      "capture_changes": "One frame from the original comparison recording after the cursor moved below the table, cropped to both tested-load rows and the highest accepted concurrency. Native resolution; no scaling, overlays, UI edits, drawn elements or data changes."
     }
   },
   "context_request_evidence_sha256": "6ae00365f85d67228b6082ecdfdd4e94cb18ed3a9b04c257edadf9a8b909170c",

@@ -50,9 +50,9 @@ records concurrency one still accepted and concurrency four newly accepted.
 
 ![Recorded Giraffe comparison showing concurrency four newly accepted](../assets/readme/order-extraction-comparison.png)
 
-The README uses this tight crop of the tested-load comparison, taken at 28.0
-seconds in the original comparison recording. It shows both load levels and
-their before/after outcomes at native resolution. The four-request row changes
+The README uses this tight crop of the tested-load comparison, taken at 32.0
+seconds in the original comparison recording, after the cursor moved below the
+table. It shows both load levels and their before/after outcomes at native resolution. The four-request row changes
 from `Failed · 51 valid` to `Passed · 100 valid`; the complete timing evidence is
 in the reports and table above. The full run headers follow for reference.
 
