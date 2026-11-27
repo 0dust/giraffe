@@ -3333,7 +3333,7 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
                 "invocation": {"source": "python_api", "argv": None},
                 "config_migration_notes": list(config._migration_notes),
                 "config_migration_warnings": list(config._migration_warnings),
-                "timing_measurement_version": 3,
+                "timing_measurement_version": 4,
                 **({"gateway_access_workload_version": workload_identity["workload_versions"]["gateway_access"]}
                    if "gateway_access" in workload_identity["workload_versions"] else {}),
                 **({"gateway_policy_workload_version": workload_identity["workload_versions"]["gateway_policy"]}

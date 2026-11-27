@@ -17,7 +17,7 @@ import time
 import uuid
 from time import monotonic
 from datetime import datetime, timezone
-from typing import Any, AsyncIterator, Callable, Literal
+from typing import Any, AsyncIterator, Callable, Iterable, Literal
 from urllib.parse import urlsplit
 
 import httpx
@@ -291,6 +291,28 @@ def _rejected_evidence_field(body: bytes) -> str | None:
             if re.search(r"\b" + field + r"\b", message):
                 return field
     return None
+
+
+def _rejected_request_option(body: bytes, keys: Iterable[str]) -> tuple[str | None, bool]:
+    """Retain a configured key or an other-field flag only from structured fields."""
+    try:
+        data = json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        return None, False
+    if not isinstance(data, dict):
+        return None, False
+    error = data.get("error")
+    detail = data.get("detail")
+    keys = set(keys)
+    if isinstance(error, dict) and isinstance(error.get("param"), str) and error["param"]:
+        return (error["param"], False) if error["param"] in keys else (None, True)
+    if isinstance(detail, list) and any(
+            isinstance(item, dict) and isinstance(item.get("loc"), list) for item in detail):
+        matches = {key for key in keys if any(
+            isinstance(item, dict) and isinstance(item.get("loc"), list) and key in item["loc"]
+            for item in detail)}
+        return (next(iter(matches)) if len(matches) == 1 else None), not matches
+    return None, False
 
 
 def _answer_spans(
@@ -664,6 +686,10 @@ class LLMClient:
                 payload.update(spec.tool_expectation.choice.request_options())
             record.tool_request_options = {key: payload[key] for key in
                 ("tools", "tool_choice", "parallel_tool_calls") if key in payload}
+        request_option_keys = sorted(
+            key for key, value in self.config.request_options.items()
+            if key in payload and key not in _RESERVED_OPTIONS and value is not None
+        ) if spec.scenario == "connection" and not access_probe else []
         # Continuous usage is a server-specific, explicit opt-in. It requires
         # include_usage on compatible endpoints, unless the caller disables it.
         options = payload.get("stream_options")
@@ -711,9 +737,7 @@ class LLMClient:
             "messages": spec.messages, "options": {k: v for k, v in payload.items() if k not in {"model", "messages"}},
         }, sort_keys=True).encode()).hexdigest()
         record.history_hash = hashlib.sha256(json.dumps(spec.messages[:-1], sort_keys=True).encode()).hexdigest()
-        start = time.perf_counter()
-        record._timing_started_monotonic = monotonic()
-        record.client_preparation_ms = (start - preparation_start) * 1000
+        start = preparation_start
         tool_parts: dict[int, dict] = {}
         last_answer: float | None = None
         tool_output: float | None = None
@@ -1113,7 +1137,7 @@ class LLMClient:
         )
         timeout = min(request_timeout,
                       spec.cancel_after_ms / 1000 if spec.cancel_after_ms else float("inf"))
-        transport_started = _before_send is None
+        transport_started = False
         try:
             observe("started")
             async with asyncio.timeout(None if _before_send is not None else timeout) as request_deadline:
@@ -1143,23 +1167,22 @@ class LLMClient:
                             sending_post = False
 
                     request.extensions["trace"] = observe_send
-                if _before_send is not None:
-                    def begin_transport():
-                        nonlocal start, transport_started
+                def begin_transport():
+                    nonlocal start, transport_started
+                    if _before_send is not None:
                         _before_send()
-                        transport_started = True
-                        start = time.perf_counter()
-                        record._timing_started_monotonic = monotonic()
-                        record.started_at = datetime.now(timezone.utc).isoformat()
-                        record.client_preparation_ms = (start - preparation_start) * 1000
                         request_deadline.reschedule(asyncio.get_running_loop().time() + timeout)
+                    # The pool calls this after leasing a connection lane.
+                    start = time.perf_counter()
+                    record._timing_started_monotonic = monotonic()
+                    record.started_at = datetime.now(timezone.utc).isoformat()
+                    record.client_preparation_ms = (start - preparation_start) * 1000
+                    transport_started = True
 
-                    if isinstance(self._client, HTTPClientPool):
-                        response = await self._client.send(request, stream=True, _before_send=begin_transport)
-                    else:
-                        begin_transport()
-                        response = await self._client.send(request, stream=True)
+                if isinstance(self._client, HTTPClientPool):
+                    response = await self._client.send(request, stream=True, _before_send=begin_transport)
                 else:
+                    begin_transport()
                     response = await self._client.send(request, stream=True)
                 events = None
                 try:
@@ -1195,6 +1218,13 @@ class LLMClient:
                             record.gateway_evidence = response_evidence(response.status_code, error_body, response.headers,
                                 declared_priority=spec.workload.get("declared_priority"), expected_key_hash=expected_key_hash)
                         if spec.scenario == "connection" and response.status_code in {400, 404, 422}:
+                            if response.status_code in {400, 422} and request_option_keys:
+                                record.workload["request_option_keys"] = request_option_keys
+                                rejected_option, other_field_named = _rejected_request_option(error_body, request_option_keys)
+                                if rejected_option:
+                                    record.workload["rejected_request_option"] = rejected_option
+                                if other_field_named:
+                                    record.workload["rejected_other_field"] = True
                             # Keep only the classification, never arbitrary server error text.
                             body = error_body.decode("utf-8", errors="replace").lower()
                             try:
@@ -1385,7 +1415,10 @@ class LLMClient:
                     evidence = evidence.model_copy(update={"status": "incomplete", "reason": "Response did not complete validly."})
                 record.logprob_evidence = self.logprob_budget.retain(evidence)
             now = time.perf_counter()
-            record.elapsed_ms = (now - start) * 1000
+            if transport_started:
+                record.elapsed_ms = (now - start) * 1000
+            else:
+                record.client_preparation_ms = (now - preparation_start) * 1000
             record.output_chars = len(record.output)
             record.tool_calls = [tool_parts[index] for index in sorted(tool_parts)]
             # Answer timing excludes inline reasoning and counts network reads,

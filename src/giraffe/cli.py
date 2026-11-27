@@ -1065,7 +1065,7 @@ def _main(argv: list[str] | None = None) -> int:
                     except PreflightError as error:
                         if error.blocking:
                             return target.name, str(error).rstrip(". ") + ". Use --skip-preflight to run anyway."
-                        warning = f"preflight for {target.name}: {error}; continuing."
+                        warning = f"preflight for {target.name}: {str(error).rstrip('. ')}; continuing."
                         warnings.append(warning)
                         print(f"Warning: {warning}", file=sys.stderr)
                 return None
