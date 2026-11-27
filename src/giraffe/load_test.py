@@ -1358,6 +1358,7 @@ def measurements(run, target, settings, point, records, shape):
         error_percent=(len(failed) + len(timed_out)) / denominator * 100 if denominator else 0,
         scored=len(scored),
         correct=sum(r.score is True for r in scored),
+        refused=sum(r.score is False and r.refused for r in scored),
         unscored=len(valid) - len(scored),
         correct_percent=sum(r.score is True for r in scored) / len(scored) * 100
         if scored
@@ -1994,6 +1995,18 @@ def _result_summary(run, target, points, status, settings, *, include_remedy=Tru
             "run stopped before sufficient evidence was collected",
             "Resolve the stop cause recorded in the affected conditions and rerun the selected workload.",
         ))
+    if code == "correctness":
+        groups = [group for point in deciding for group in point.get("groups", [])
+                  if group.get("reason_code") == "correctness"]
+        refused = sum(group.get("refused", 0) for group in groups)
+        if refused:
+            wrong = sum(group["scored"] - group["correct"] for group in groups)
+            cause += f" (model refusals accounted for {refused} of {wrong} wrong answers)"
+            remedy = (
+                "Rerun with response retention enabled to inspect the model's refusal messages."
+                if run.config.retention == "none"
+                else "Review the recorded responses in the affected conditions for the model's refusal messages."
+            )
     if code == "budget_limited" and run.reason != states.STOP_CANCELLED_BY_USER:
         minimum, unknown = _minimum_request_budget(run)
         if unknown == "schedule_overflow":

@@ -616,6 +616,33 @@ async def test_duplicate_response_keys_do_not_qualify_gateway_access(monkeypatch
     assert [row["observed"] for row in rows] == (["unverified", "deny"] if ambiguous == "allowed" else ["allow", "unverified"])
 
 
+async def test_access_refusal_survives_report_round_trip(monkeypatch, tmp_path):
+    monkeypatch.setenv("ALLOW_KEY", "allow-secret")
+    monkeypatch.setenv("DENY_KEY", "deny-secret")
+
+    def handler(request):
+        if request.method != "POST":
+            return httpx.Response(404)
+        return httpx.Response(200, json={"choices": [{"message": {
+            "role": "assistant", "content": None, "refusal": "I cannot answer."},
+            "finish_reason": "stop"}]})
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
+    report = await run_suite(config(retention="all"))
+    saved, _ = write_report(report, tmp_path)
+    retained = RunReport.model_validate_json(saved.read_text())
+    check = next(check for check in retained.checks if check.id == "gateway_access")
+    assert retained.overall == check.status == "fail"
+    assert len(retained.requests) == 2
+    assert all(record.refused is True for record in retained.requests)
+    assert all(record.evaluation.scorer == "none" and record.score is None for record in retained.requests)
+    cases = check.metrics["gateway_access"]["cases"]
+    assert [case["observed"] for case in cases] == ["allow", "allow"]
+    assert [case["reason"] for case in cases] == ["assistant_refusal", "assistant_refusal"]
+    assert [case["status"] for case in cases] == ["pass", "fail"]
+
+
 @pytest.mark.parametrize("message,finish,error,observed", [
     ({"refusal": "deny-secret"}, "stop", None, "allow"),
     ({"refusal": " "}, "stop", None, "unverified"),

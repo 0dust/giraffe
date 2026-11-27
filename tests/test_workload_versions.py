@@ -22,9 +22,9 @@ PINNED = {
     "tools": (1, "a6cea9e42a2277e0ed896442835f247ffe991b0c0e73cf5c2bdc59cf0ff7001d"),
     "fixed_sessions": (1, "84e2056aa1e6fb8068c2848480478dfdc4e39f41e1e66512d2d37a4a02815b1d"),
     "session_plan": (1, "9d8e586754a51e7257d31ebe033b5f90f505b00719a127e249f587f74bc56c68"),
-    "multi_user": (1, "7b65f0d2c21e1a1ab7cc11f5aff886d20edc73334b7be62907cf57ee55d083d7"),
+    "multi_user": (1, "6346d9c3563f03fa6e5b985eda335be879b1793a2c23f9a21489a800237209bc"),
     "scale_down": (1, "3403a497536a5c37c6a28f46c7ec3a6e09c71b20ee11bec196c93e5497041541"),
-    "load_test": (1, "d56ed26cd650be79385881c699d12a56aba9a289158cba559daf52308b31b459"),
+    "load_test": (1, "766519b73e92f859505c06b814e071cbb9bac898e32679574129339c1b67d1ab"),
     "logprob": (1, "20a0ab8ec361396ff16a7380f0eb7bf218d9a979c69ea3b8e7297346ec2c6f35"),
 }
 # No pure request builder exists for these workloads: their RequestSpecs are
@@ -510,7 +510,7 @@ def test_multi_user_guard_covers_long_output_instruction(monkeypatch):
     original = concurrent_load.prompt
 
     def changed(chars, variant, **kwargs):
-        return original(chars, variant, **kwargs).replace("numbered list", "counting list") if variant == "long_output" else original(chars, variant, **kwargs)
+        return original(chars, variant, **kwargs).replace("every whole number", "every whole integer") if variant == "long_output" else original(chars, variant, **kwargs)
 
     monkeypatch.setattr(concurrent_load, "prompt", changed)
     assert fixture_hash(_multi_user()) != before

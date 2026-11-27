@@ -3237,6 +3237,7 @@ class RequestRecord(PersistedModel):
     valid: bool = False
     score: bool | None = None
     score_message: str | None = None
+    refused: bool = False
     evaluation: EvaluationEvidence | None = None
     evaluation_error: str | None = None
     logprob_evidence: LogprobEvidence | None = None
