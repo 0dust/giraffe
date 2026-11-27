@@ -74,8 +74,8 @@
       ]
     },
     "token-timing.zip": {
-      "sha256": "ea7ef311763709daf7e1d7562746e74ad052d0da789a0b350d6ea882b06f621b",
-      "bytes": 915824,
+      "sha256": "3dc247d461f80ad320c69e7aec017f6063c4cdbbbf2d616ab811e7d62e6d93ff",
+      "bytes": 954157,
       "reports": [
         {
           "directory": ".",
@@ -84,41 +84,20 @@
           "overall": "pass",
           "source_report_sha256": "668de4ea53cb186f097e99aebffc5bcf6ded07dee3f16aa9700ba3f83123a8a1",
           "distributed_report_sha256": "f4b9d7dcc69e95a174037660740083ea95a42b63524b8f137a917c73aa325bfd",
-          "distributed_html_sha256": "447312c87f88bd965c36e184361e2062c094dfc6ecb13e9eafa45a73459288c1",
+          "distributed_html_sha256": "2cdbe4a613a44219863b641dd9c7d97de4a83ee45e148f08d50e3ad74a847f0f",
           "config_sha256": "d307611356fa1d1cec2b8de857e34aa7db86bf67b13107bcacc500cab5c6de85",
           "changed_metadata_fields": [
             "manifest.run_location.hostname",
             "manifest.invocation.argv"
-          ]
+          ],
+          "previous_distributed_html_sha256": "447312c87f88bd965c36e184361e2062c094dfc6ecb13e9eafa45a73459288c1",
+          "html_presentation_changes": "Re-rendered the distributed JSON with the corrected measurement-scope copy. JSON, configuration, scores and measurements are byte-identical.",
+          "presentation_commit": "336552816c878e9d26e4a760789e3012104b37ae"
         }
       ]
     }
   },
   "images": {
-    "baseline-comparison.jpg": {
-      "sha256": "96601f52a7645fed002d3d73490afbc86db3099bbc3b5069060ebbc7a6b1c171",
-      "bytes": 32604,
-      "evidence": "Historical October 28 Qwen2.5-7B KV-cache comparison; reference run also had other failures.",
-      "capture_changes": "None; copied byte-for-byte from the reviewed preview.",
-      "capture_commit": "dd12138355a74cbbb5f6ebdd23f69a4c4dfe944e",
-      "historical_sources": [
-        {
-          "run_id": "7b9ae9ce490642309110456f65c171d1",
-          "started_at": "2026-10-28T11:06:56.418018+00:00",
-          "sha256": "691dbc5ab55f271fa05fb46fb645c782020ee764f37c4b31ad62db4a1a3adc52"
-        },
-        {
-          "run_id": "077a344c654f45ba8f8f650291498a8c",
-          "started_at": "2026-10-28T11:26:53.331635+00:00",
-          "sha256": "63489bda9bbfc4c02dea24e46bb3eeeb11a7cea23c5b049e4fee0108f5fa1af8"
-        },
-        {
-          "run_id": "09117d9053f149198fb0434954f68f13",
-          "started_at": "2026-10-28T11:32:49.164618+00:00",
-          "sha256": "b9287b622f9d57923d78be5856b68355cf6635a71fce17b06c4694f7f41b0c55"
-        }
-      ]
-    },
     "browser-ui-live.gif": {
       "sha256": "ccaa99e4434f42a837613412f5168436bb75250d5a80ea55299447cb11103d0f",
       "bytes": 610223,
@@ -154,36 +133,44 @@
       "source_run_code_commit": "b5068162b8e78f2840541c9e368b7eca61aaed92",
       "source_report_sha256": "668de4ea53cb186f097e99aebffc5bcf6ded07dee3f16aa9700ba3f83123a8a1"
     },
-    "ollama-default-recall-medium-d0-0-ui.png": {
-      "sha256": "da00d5eb4919b9db91512aa7017767a3e596c5abeff7000d5897488835fa4da9",
-      "bytes": 854079,
+    "ollama-default-recall-medium-d0-0-ui.jpg": {
+      "sha256": "cba4b71f60bad9f0c711456aad4ab3ba6eed17b8b34d3769543a5a8238a7b9a7",
+      "bytes": 114303,
       "evidence": "context-request-evidence.json",
-      "capture_changes": "None; copied byte-for-byte from the reviewed preview.",
+      "capture_changes": "JPEG quality 80; resized from 2560 to 1280 pixels wide. No content, score, or verdict edits.",
       "source_report_sha256": "248d4e7d6a01c202937b12c44ee45a000a2ce2887b2552f47a245c5de25d3d61",
       "request_id": "89102e58b1c64142ba693961203bf08a",
       "case_id": "recall-medium-d0-0",
-      "configuration": "ollama-default"
+      "configuration": "ollama-default",
+      "source_image_sha256": "da00d5eb4919b9db91512aa7017767a3e596c5abeff7000d5897488835fa4da9"
     },
-    "ollama-ctx8k-recall-medium-d0-0-ui.png": {
-      "sha256": "d8ea783a195e0e9f90595d773939ca91c97898ae061846c98d655c7408270b5f",
-      "bytes": 673837,
+    "ollama-ctx8k-recall-medium-d0-0-ui.jpg": {
+      "sha256": "f2f6a512c8000180fb33786462a4dadc2c906347630860a200b4eeb7e6d2d0e9",
+      "bytes": 104713,
       "evidence": "context-request-evidence.json",
-      "capture_changes": "None; copied byte-for-byte from the reviewed preview.",
+      "capture_changes": "JPEG quality 80; resized from 2560 to 1280 pixels wide. No content, score, or verdict edits.",
       "source_report_sha256": "73325e492165edcc79a087aad268b2824e790f10b08bc4de2ed9bbba0c1eed27",
       "request_id": "db9481c8df1d460d9df4a7bacf1eab6d",
       "case_id": "recall-medium-d0-0",
-      "configuration": "ollama-ctx8k"
+      "configuration": "ollama-ctx8k",
+      "source_image_sha256": "d8ea783a195e0e9f90595d773939ca91c97898ae061846c98d655c7408270b5f"
     },
-    "llamacpp-q8-search-orders-wrong-customer-ui.jpg": {
-      "sha256": "e0c859d23f4ad790173a6c78f3ac76b42fe7cb7932111d750e7cca6b07b82a43",
-      "bytes": 67812,
-      "evidence": "November 17 Qwen2.5 7B Q8_0 / llama.cpp / Colab T4; calls validated without execution.",
-      "capture_changes": "None; copied byte-for-byte from the reviewed preview.",
-      "source_report_sha256": "e36a5fd07a1a04b28b75cb4d8141e38bd79bb1fbc6b31f690ff6d133e37218f7",
-      "request_id": "41522d191ba14ee8b5960bc5d637a513",
-      "case_id": "tool-search_orders-00",
-      "configuration": "llamacpp-q8"
+    "context-recall-comparison.svg": {
+      "sha256": "e66fca3b556fe88e80dae4403ddb99bb0fc9f3144995a00f775981fc79f9986e",
+      "bytes": 19633,
+      "evidence": "context-recall-evidence.json",
+      "capture_changes": "New evidence graphic derived from saved request records; not an application screenshot."
+    },
+    "tool-call-mismatch.svg": {
+      "sha256": "1b44924a988ab5b9046603ec3b01c384b0727d5eb1e55496aee51156e02475fb",
+      "bytes": 2456,
+      "evidence": "tool-call-evidence.json",
+      "capture_changes": "New evidence graphic derived from saved request records; not an application screenshot."
     }
   },
-  "context_request_evidence_sha256": "6ae00365f85d67228b6082ecdfdd4e94cb18ed3a9b04c257edadf9a8b909170c"
+  "context_request_evidence_sha256": "6ae00365f85d67228b6082ecdfdd4e94cb18ed3a9b04c257edadf9a8b909170c",
+  "evidence_files": {
+    "context-recall-evidence.json": "bdd14a7995552086d653a01d1f6e561225da5474fa9c2fd446e24f99c701c2e4",
+    "tool-call-evidence.json": "46885e186289722fecfd6e7a3bd5463104a9a65727986e0c81bfe553e9a2cc49"
+  }
 }

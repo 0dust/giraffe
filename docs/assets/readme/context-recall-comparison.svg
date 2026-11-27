@@ -1,0 +1,197 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 656" role="img" aria-labelledby="title desc">
+<title id="title">19 recall failures at context 4096; one at context 8192</title>
+<desc id="desc">A comparison graphic derived from all 45 quiet-phase recall requests in each saved Giraffe run. Each matching position uses an identical prompt. Red cells failed; green cells passed. This is a data summary, not an application screenshot.</desc>
+<rect width="1280" height="656" rx="20" fill="#101113"/>
+<g font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" fill="#f4f4f2">
+<text x="48" y="51" font-size="14" letter-spacing="2" fill="#d5ac65">GIRAFFE · RECORDED RECALL RESULTS</text>
+<text x="48" y="100" font-size="35" font-weight="650">Same model. Same questions. More context.</text>
+<text x="48" y="134" font-size="18" fill="#a6aaa9">Qwen2.5 7B · Ollama 0.40.16 · 45 identical questions · quiet phase</text>
+<rect x="48" y="166" width="576" height="398" rx="14" fill="#191c1e" stroke="#34383a"/>
+<text x="72" y="207" font-size="18" fill="#b8bfbd">Context 4,096</text>
+<text x="72" y="252" font-size="32" font-weight="650">19 of 45 answers wrong</text>
+<rect x="72" y="275" width="54" height="45" rx="7" fill="#a54147"><title>pack:recall-long-d0-0: fail</title></rect>
+<text x="99" y="306" text-anchor="middle" font-size="27" fill="#fff">×</text>
+<rect x="131" y="275" width="54" height="45" rx="7" fill="#a54147"><title>pack:recall-long-d0-1: fail</title></rect>
+<text x="158" y="306" text-anchor="middle" font-size="27" fill="#fff">×</text>
+<rect x="190" y="275" width="54" height="45" rx="7" fill="#a54147"><title>pack:recall-long-d0-2: fail</title></rect>
+<text x="217" y="306" text-anchor="middle" font-size="27" fill="#fff">×</text>
+<rect x="249" y="275" width="54" height="45" rx="7" fill="#a54147"><title>pack:recall-long-d1-0: fail</title></rect>
+<text x="276" y="306" text-anchor="middle" font-size="27" fill="#fff">×</text>
+<rect x="308" y="275" width="54" height="45" rx="7" fill="#a54147"><title>pack:recall-long-d1-1: fail</title></rect>
+<text x="335" y="306" text-anchor="middle" font-size="27" fill="#fff">×</text>
+<rect x="367" y="275" width="54" height="45" rx="7" fill="#a54147"><title>pack:recall-long-d1-2: fail</title></rect>
+<text x="394" y="306" text-anchor="middle" font-size="27" fill="#fff">×</text>
+<rect x="426" y="275" width="54" height="45" rx="7" fill="#a54147"><title>pack:recall-long-d2-0: fail</title></rect>
+<text x="453" y="306" text-anchor="middle" font-size="27" fill="#fff">×</text>
+<rect x="485" y="275" width="54" height="45" rx="7" fill="#a54147"><title>pack:recall-long-d2-1: fail</title></rect>
+<text x="512" y="306" text-anchor="middle" font-size="27" fill="#fff">×</text>
+<rect x="544" y="275" width="54" height="45" rx="7" fill="#a54147"><title>pack:recall-long-d2-2: fail</title></rect>
+<text x="571" y="306" text-anchor="middle" font-size="27" fill="#fff">×</text>
+<rect x="72" y="327" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-long-d3-0: pass</title></rect>
+<text x="99" y="358" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="131" y="327" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-long-d3-1: pass</title></rect>
+<text x="158" y="358" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="190" y="327" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-long-d3-2: pass</title></rect>
+<text x="217" y="358" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="249" y="327" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-long-d4-0: pass</title></rect>
+<text x="276" y="358" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="308" y="327" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-long-d4-1: pass</title></rect>
+<text x="335" y="358" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="367" y="327" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-long-d4-2: pass</title></rect>
+<text x="394" y="358" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="426" y="327" width="54" height="45" rx="7" fill="#a54147"><title>pack:recall-medium-d0-0: fail</title></rect>
+<text x="453" y="358" text-anchor="middle" font-size="27" fill="#fff">×</text>
+<rect x="485" y="327" width="54" height="45" rx="7" fill="#a54147"><title>pack:recall-medium-d0-1: fail</title></rect>
+<text x="512" y="358" text-anchor="middle" font-size="27" fill="#fff">×</text>
+<rect x="544" y="327" width="54" height="45" rx="7" fill="#a54147"><title>pack:recall-medium-d0-2: fail</title></rect>
+<text x="571" y="358" text-anchor="middle" font-size="27" fill="#fff">×</text>
+<rect x="72" y="379" width="54" height="45" rx="7" fill="#a54147"><title>pack:recall-medium-d1-0: fail</title></rect>
+<text x="99" y="410" text-anchor="middle" font-size="27" fill="#fff">×</text>
+<rect x="131" y="379" width="54" height="45" rx="7" fill="#a54147"><title>pack:recall-medium-d1-1: fail</title></rect>
+<text x="158" y="410" text-anchor="middle" font-size="27" fill="#fff">×</text>
+<rect x="190" y="379" width="54" height="45" rx="7" fill="#a54147"><title>pack:recall-medium-d1-2: fail</title></rect>
+<text x="217" y="410" text-anchor="middle" font-size="27" fill="#fff">×</text>
+<rect x="249" y="379" width="54" height="45" rx="7" fill="#a54147"><title>pack:recall-medium-d2-0: fail</title></rect>
+<text x="276" y="410" text-anchor="middle" font-size="27" fill="#fff">×</text>
+<rect x="308" y="379" width="54" height="45" rx="7" fill="#a54147"><title>pack:recall-medium-d2-1: fail</title></rect>
+<text x="335" y="410" text-anchor="middle" font-size="27" fill="#fff">×</text>
+<rect x="367" y="379" width="54" height="45" rx="7" fill="#a54147"><title>pack:recall-medium-d2-2: fail</title></rect>
+<text x="394" y="410" text-anchor="middle" font-size="27" fill="#fff">×</text>
+<rect x="426" y="379" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-medium-d3-0: pass</title></rect>
+<text x="453" y="410" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="485" y="379" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-medium-d3-1: pass</title></rect>
+<text x="512" y="410" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="544" y="379" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-medium-d3-2: pass</title></rect>
+<text x="571" y="410" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="72" y="431" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-medium-d4-0: pass</title></rect>
+<text x="99" y="462" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="131" y="431" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-medium-d4-1: pass</title></rect>
+<text x="158" y="462" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="190" y="431" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-medium-d4-2: pass</title></rect>
+<text x="217" y="462" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="249" y="431" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-short-d0-0: pass</title></rect>
+<text x="276" y="462" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="308" y="431" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-short-d0-1: pass</title></rect>
+<text x="335" y="462" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="367" y="431" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-short-d0-2: pass</title></rect>
+<text x="394" y="462" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="426" y="431" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-short-d1-0: pass</title></rect>
+<text x="453" y="462" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="485" y="431" width="54" height="45" rx="7" fill="#a54147"><title>pack:recall-short-d1-1: fail</title></rect>
+<text x="512" y="462" text-anchor="middle" font-size="27" fill="#fff">×</text>
+<rect x="544" y="431" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-short-d1-2: pass</title></rect>
+<text x="571" y="462" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="72" y="483" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-short-d2-0: pass</title></rect>
+<text x="99" y="514" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="131" y="483" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-short-d2-1: pass</title></rect>
+<text x="158" y="514" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="190" y="483" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-short-d2-2: pass</title></rect>
+<text x="217" y="514" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="249" y="483" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-short-d3-0: pass</title></rect>
+<text x="276" y="514" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="308" y="483" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-short-d3-1: pass</title></rect>
+<text x="335" y="514" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="367" y="483" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-short-d3-2: pass</title></rect>
+<text x="394" y="514" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="426" y="483" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-short-d4-0: pass</title></rect>
+<text x="453" y="514" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="485" y="483" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-short-d4-1: pass</title></rect>
+<text x="512" y="514" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="544" y="483" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-short-d4-2: pass</title></rect>
+<text x="571" y="514" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="656" y="166" width="576" height="398" rx="14" fill="#191c1e" stroke="#34383a"/>
+<text x="680" y="207" font-size="18" fill="#b8bfbd">Context 8,192</text>
+<text x="680" y="252" font-size="32" font-weight="650">1 of 45 answers wrong</text>
+<rect x="680" y="275" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-long-d0-0: pass</title></rect>
+<text x="707" y="306" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="739" y="275" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-long-d0-1: pass</title></rect>
+<text x="766" y="306" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="798" y="275" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-long-d0-2: pass</title></rect>
+<text x="825" y="306" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="857" y="275" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-long-d1-0: pass</title></rect>
+<text x="884" y="306" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="916" y="275" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-long-d1-1: pass</title></rect>
+<text x="943" y="306" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="975" y="275" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-long-d1-2: pass</title></rect>
+<text x="1002" y="306" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="1034" y="275" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-long-d2-0: pass</title></rect>
+<text x="1061" y="306" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="1093" y="275" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-long-d2-1: pass</title></rect>
+<text x="1120" y="306" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="1152" y="275" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-long-d2-2: pass</title></rect>
+<text x="1179" y="306" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="680" y="327" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-long-d3-0: pass</title></rect>
+<text x="707" y="358" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="739" y="327" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-long-d3-1: pass</title></rect>
+<text x="766" y="358" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="798" y="327" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-long-d3-2: pass</title></rect>
+<text x="825" y="358" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="857" y="327" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-long-d4-0: pass</title></rect>
+<text x="884" y="358" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="916" y="327" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-long-d4-1: pass</title></rect>
+<text x="943" y="358" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="975" y="327" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-long-d4-2: pass</title></rect>
+<text x="1002" y="358" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="1034" y="327" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-medium-d0-0: pass</title></rect>
+<text x="1061" y="358" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="1093" y="327" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-medium-d0-1: pass</title></rect>
+<text x="1120" y="358" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="1152" y="327" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-medium-d0-2: pass</title></rect>
+<text x="1179" y="358" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="680" y="379" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-medium-d1-0: pass</title></rect>
+<text x="707" y="410" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="739" y="379" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-medium-d1-1: pass</title></rect>
+<text x="766" y="410" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="798" y="379" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-medium-d1-2: pass</title></rect>
+<text x="825" y="410" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="857" y="379" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-medium-d2-0: pass</title></rect>
+<text x="884" y="410" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="916" y="379" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-medium-d2-1: pass</title></rect>
+<text x="943" y="410" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="975" y="379" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-medium-d2-2: pass</title></rect>
+<text x="1002" y="410" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="1034" y="379" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-medium-d3-0: pass</title></rect>
+<text x="1061" y="410" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="1093" y="379" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-medium-d3-1: pass</title></rect>
+<text x="1120" y="410" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="1152" y="379" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-medium-d3-2: pass</title></rect>
+<text x="1179" y="410" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="680" y="431" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-medium-d4-0: pass</title></rect>
+<text x="707" y="462" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="739" y="431" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-medium-d4-1: pass</title></rect>
+<text x="766" y="462" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="798" y="431" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-medium-d4-2: pass</title></rect>
+<text x="825" y="462" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="857" y="431" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-short-d0-0: pass</title></rect>
+<text x="884" y="462" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="916" y="431" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-short-d0-1: pass</title></rect>
+<text x="943" y="462" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="975" y="431" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-short-d0-2: pass</title></rect>
+<text x="1002" y="462" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="1034" y="431" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-short-d1-0: pass</title></rect>
+<text x="1061" y="462" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="1093" y="431" width="54" height="45" rx="7" fill="#a54147"><title>pack:recall-short-d1-1: fail</title></rect>
+<text x="1120" y="462" text-anchor="middle" font-size="27" fill="#fff">×</text>
+<rect x="1152" y="431" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-short-d1-2: pass</title></rect>
+<text x="1179" y="462" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="680" y="483" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-short-d2-0: pass</title></rect>
+<text x="707" y="514" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="739" y="483" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-short-d2-1: pass</title></rect>
+<text x="766" y="514" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="798" y="483" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-short-d2-2: pass</title></rect>
+<text x="825" y="514" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="857" y="483" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-short-d3-0: pass</title></rect>
+<text x="884" y="514" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="916" y="483" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-short-d3-1: pass</title></rect>
+<text x="943" y="514" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="975" y="483" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-short-d3-2: pass</title></rect>
+<text x="1002" y="514" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="1034" y="483" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-short-d4-0: pass</title></rect>
+<text x="1061" y="514" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="1093" y="483" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-short-d4-1: pass</title></rect>
+<text x="1120" y="514" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<rect x="1152" y="483" width="54" height="45" rx="7" fill="#1d7060"><title>pack:recall-short-d4-2: pass</title></rect>
+<text x="1179" y="514" text-anchor="middle" font-size="27" fill="#fff">✓</text>
+<text x="48" y="604" font-size="17" fill="#b8bfbd">Each cell is one saved recall answer. Matching positions use the same prompt.</text>
+<text x="48" y="634" font-size="15" fill="#8f9895">November 17, 2026 · Colab T4 · One recorded pass per configuration · 1 failure remained</text>
+</g></svg>
