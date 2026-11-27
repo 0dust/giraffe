@@ -356,3 +356,23 @@ def test_heartbeat_close_is_bounded_when_metadata_write_stalls(tmp_path, monkeyp
         release.set()
         heartbeat._thread.join(timeout=2)
     assert not heartbeat._thread.is_alive()
+
+
+def test_recovered_timeout_warning_uses_latest_update_once(tmp_path):
+    from giraffe.timeout_warning import format_timeout_warning
+
+    payload = {"key": "local|2.0|run", "target": "local", "deadline_seconds": 2,
+        "deadline_source": "run", "setting": "request_timeout_seconds", "cli_flag": "--request-timeout",
+        "finished": 3, "timed_out": 3, "answer_started": 0, "reasoning_only": 0, "no_output": 3,
+        "checks": ["correctness"], "first_at_seconds": 2, "updated_at_seconds": 2, "update": 1}
+    latest = {**payload, "finished": 10, "timed_out": 6, "no_output": 6, "updated_at_seconds": 4, "update": 2}
+    writer = EvidenceWriter(tmp_path, {"config": {"retention": "all"}})
+    writer.record_finished(record())
+    for warning in (payload, latest, latest):
+        writer.progress({"event": "timeout_warning", "target": "local", "timeout_warning": warning})
+    writer.close()
+    recovered = recover_evidence(tmp_path, {})
+    assert len(recovered.requests) == 1
+    assert recovered.observations["targets"]["local"]["timeout_warnings"] == [latest]
+    assert recovered.warnings.count(format_timeout_warning(latest)) == 1
+    assert format_timeout_warning(payload) not in recovered.warnings

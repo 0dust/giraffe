@@ -231,13 +231,13 @@ function orderedRequests(report) {
     return (Date.parse(a.started_at)||0)-(Date.parse(b.started_at)||0);
   });
 }
-function renderMosaic(records,{budget=records.length,live=false,budgetUsed=records.length,attempted=records.length,droppedOffers=0}={}) {
-  const countOnly=live&&budget==null;
+function renderMosaic(records,{budget=records.length,live=false,budgetUsed=records.length,attempted=records.length,droppedOffers=0,filtered=false,positions=requestPositions(records)}={}) {
+  const liveBudget=live&&!filtered,countOnly=liveBudget&&budget==null;
   const total=countOnly?records.reduce((total,record)=>Math.max(total,record.slot+1),0):Math.max(records.length,budget || 0);
   if(!total)return '<section class="request-viz"><h2>Request mosaic</h2><p class="viz-empty">No requests recorded.</p></section>';
   const pages=Math.ceil(total/mosaicPageSize);
   let page=Math.max(0,Math.min(state.mosaicPage || 0,pages-1)),frontier=-1;
-  if(live){
+  if(liveBudget){
     frontier=records.reduce((slot,r)=>r.status==='running'?Math.max(slot,r.slot):slot,-1);
     if(frontier<0)frontier=records.length?records.reduce((slot,r)=>Math.max(slot,r.slot),-1):budgetUsed-1;
     state.mosaicLivePage=Math.max(0,Math.min(Math.floor(frontier/mosaicPageSize),pages-1));
@@ -250,24 +250,35 @@ function renderMosaic(records,{budget=records.length,live=false,budgetUsed=recor
   const count=Math.min(mosaicPageSize,total-offset),geometry=reticulateCells(count,pages>1?mosaicPageSize:count);
   if(countOnly&&records.length&&!records.some(record=>record.slot>=offset&&record.slot<offset+count))return `<section class="request-viz"><h2>Requests</h2><p class="hint">Earlier request evidence was evicted from the live window. ${number(state.detail?.live_request_summary?.evicted||0)} earlier requests; ${Object.entries(state.detail?.live_request_summary?.statuses||{}).map(([status,n])=>`${number(n)} ${escape(human(status))}`).join(' · ')}.</p><div class="mosaic-pages"><button type="button" class="text-button" data-action="mosaic-prev" ${page===0?'disabled':''}>←</button><span>${offset+1}–${offset+count} / ${number(total)}</span><button type="button" class="text-button" data-action="mosaic-next" ${page===pages-1?'disabled':''}>→</button></div></section>`;
   const entrance=!live&&state.mosaicAnimated!==state.detail?.id;state.mosaicAnimated=state.detail?.id;
-  const positions=requestPositions(records);
   const firstVisibleSlot=countOnly?records.reduce((slot,record)=>record.slot>=offset&&record.slot<offset+count?Math.min(slot,record.slot):slot,Infinity):offset;
-  const bySlot=new Map(records.map((r,i)=>[live?r.slot:i,r]));
+  const bySlot=new Map(records.map((r,i)=>[liveBudget?r.slot:i,r]));
   // Request slots are compact dispatch IDs; unsent offers occupy the remaining budget.
   const sent=Math.max(attempted,live?records.reduce((count,r)=>Math.max(count,r.slot+1),0):records.length),droppedEnd=Math.min(budgetUsed,sent+droppedOffers);
   const statuses=['pass','fail','timeout','cancelled','skipped','inconclusive',...(live?['running','queued',...(countOnly?[]:['reserved','idle'])]:[])];
-  return `<section class="request-viz"><div class="viz-heading"><h2>${live&&!countOnly?'Request budget':'Requests'}</h2><span class="mono hint">${countOnly?`${number(total)} started · ${number(records.length)} in live window`:`${number(records.length)} ${live?'started':'recorded'}`}${live&&droppedOffers?` · ${number(droppedOffers)} dropped before sending`:''}</span>${live&&pages>1?`<span class="mosaic-live-controls">${state.mosaicFollow!==false?'<span class="mosaic-following">Following live</span>':`<span class="hint">Live on requests ${liveOffset+1}–${Math.min(total,liveOffset+mosaicPageSize)}</span><button class="text-button mosaic-live" data-action="mosaic-live">Back to live</button>`}</span>`:''}</div><div class="mosaic-scroll"><svg class="request-mosaic${live?' is-live':''}${entrance?' is-entering':''}" viewBox="0 0 ${geometry.width} ${geometry.height}" style="--mosaic-w:${geometry.width}px;--spot-round:${geometry.round}" data-columns="${geometry.columns}" role="group" aria-label="${live?countOnly?'Live requests':'Live request budget':'Recorded requests'}. Arrow keys move between spots.">${geometry.cells.map((points,i)=>{
+  return `<section class="request-viz"><div class="viz-heading"><h2>${liveBudget&&!countOnly?'Request budget':'Requests'}</h2><span class="mono hint">${countOnly?`${number(total)} started · ${number(records.length)} in live window`:`${number(records.length)} ${live?'started':'recorded'}`}${live&&droppedOffers?` · ${number(droppedOffers)} dropped before sending`:''}</span>${liveBudget&&pages>1?`<span class="mosaic-live-controls">${state.mosaicFollow!==false?'<span class="mosaic-following">Following live</span>':`<span class="hint">Live on requests ${liveOffset+1}–${Math.min(total,liveOffset+mosaicPageSize)}</span><button class="text-button mosaic-live" data-action="mosaic-live">Back to live</button>`}</span>`:''}</div><div class="mosaic-scroll"><svg class="request-mosaic${live?' is-live':''}${entrance?' is-entering':''}" viewBox="0 0 ${geometry.width} ${geometry.height}" style="--mosaic-w:${geometry.width}px;--spot-round:${geometry.round}" data-columns="${geometry.columns}" role="group" aria-label="${live?countOnly||filtered?'Live requests':'Live request budget':'Recorded requests'}. Arrow keys move between spots.">${geometry.cells.map((points,i)=>{
     const slot=offset+i,r=bySlot.get(slot);if(countOnly&&!r)return '';
     const dropped=!r&&slot>=sent&&slot<droppedEnd,status=r?requestStatus(r):dropped?'skipped':slot<sent?'inconclusive':slot<budgetUsed?displayStatus('reserved'):'idle',current=live&&status==='running'&&slot===frontier,label=r?requestLabel(r,records,undefined,positions):dropped?`Budget slot ${slot+1}: Not run · dropped before sending`:status!=='idle'?`Budget slot ${slot+1}: ${statusLabels[status]}, request evidence unavailable`:`Budget slot ${slot+1}: not used`;
     const action=r?(live?`data-live-slot="${r.slot}"`:`data-request="${escape(r.id)}"`):'';
     return `<g class="request-spot ${status}${current?' current':''}" data-live-key="slot:${offset+i}" data-request-id="${escape(r?.id)}" data-state="${status}" style="--i:${i}" ${action} ${r?'role="button"':'role="img"'} tabindex="${offset+i===firstVisibleSlot?0:-1}" aria-label="${escape(label)}"><polygon points="${points}"/>${spotGlyph(points,status)}</g>`;
-  }).join('')}</svg></div><div class="viz-footer"><div class="mosaic-legend">${statuses.map(status=>`<span><i class="legend-dot ${status}" aria-hidden="true"></i><span aria-hidden="true">${statusIcons[status]}</span>${statusLabels[status]}${live?'':`<b>${number(records.filter(r=>requestStatus(r)===status).length)}</b>`}</span>`).join('')}${infoHelp('mosaic','Request outcomes','Green means a scored, correct answer. Red means a failed or timed-out request, invalid completion or incorrect answer. Timed-out requests use a clock glyph; cancelled and not-run requests use neutral markers. Unscored completions stay inconclusive. Check verdicts also consider probe intent, timing and aggregate criteria.')}</div>${pages>1?`<div class="mosaic-pages"><button class="text-button" data-action="mosaic-prev" ${page===0?'disabled':''} aria-label="Previous requests">←</button><span class="mono">${offset+1}–${offset+count} / ${number(total)}${live&&page!==state.mosaicLivePage?' · live on another page':''}</span><button class="text-button" data-action="mosaic-next" ${page===pages-1?'disabled':''} aria-label="Next requests">→</button></div>`:''}</div></section>`;
+  }).join('')}</svg></div><div class="viz-footer"><div class="mosaic-legend">${statuses.map(status=>`<span><i class="legend-dot ${status}" aria-hidden="true"></i><span aria-hidden="true">${statusIcons[status]}</span>${statusLabels[status]}${live?'':`<b>${number(records.filter(r=>requestStatus(r)===status).length)}</b>`}</span>`).join('')}${infoHelp('mosaic','Request outcomes','Green means a scored, correct answer. Red means a failed or timed-out request, invalid completion or incorrect answer. Timed-out requests use a clock glyph; cancelled and not-run requests use neutral markers. Unscored completions stay inconclusive. Check verdicts also consider probe intent, timing and aggregate criteria.')}</div>${pages>1?`<div class="mosaic-pages"><button class="text-button" data-action="mosaic-prev" ${page===0?'disabled':''} aria-label="Previous requests">←</button><span class="mono">${offset+1}–${offset+count} / ${number(total)}${liveBudget&&page!==state.mosaicLivePage?' · live on another page':''}</span><button class="text-button" data-action="mosaic-next" ${page===pages-1?'disabled':''} aria-label="Next requests">→</button></div>`:''}</div></section>`;
 }
 const conditionViews=new Map(),conditionLayouts=new Map();
 let conditionRun=null,conditionFocus=null,conditionHover=null,conditionDialog=null,conditionDialogSequence=0;
 const conditionStatusNames={passed:'Passed',failed:'Failed',inconclusive:'Inconclusive',running:'Running',waiting:'Waiting',skipped:'Not run',stopped:'Stopped',cancelled:'Cancelled',timed_out:'Timed out',not_started:'Not started',unscored:'Unscored'};
 const conditionStatusGlyphs={passed:'✓',failed:'✕',inconclusive:'!',running:'·',waiting:'○',skipped:'–',stopped:'■',cancelled:'■',timed_out:'◷',not_started:'○',unscored:'!'};
 const conditionStatusClass=status=>({passed:'pass',failed:'fail',waiting:'idle',stopped:'cancelled',timed_out:'timeout',not_started:'idle',unscored:'inconclusive'}[status] || status);
+function requestFilterStatus(record) {
+  if(['timeout','timed_out'].includes(record.status))return 'timed_out';
+  if(['running','cancelled','failed'].includes(record.status))return record.status;
+  if(['queued','reserved','skipped'].includes(record.status))return 'not_started';
+  if(record.score===false||record.valid===false)return 'failed';
+  return record.score===true?'passed':'unscored';
+}
+function requestFilterOptions(filter,statuses=[]) {
+  const values=[...new Set(['running','passed','failed','timed_out','not_started',...statuses,...(filter!=='all'?[filter]:[])])];
+  return `<option value="all"${filter==='all'?' selected':''}>All statuses</option>${values.map(status=>`<option value="${escape(status)}"${filter===status?' selected':''}>${escape(conditionStatusNames[status] || human(status))}</option>`).join('')}`;
+}
+
 function conditionStatus(summary,{live=false,failed=0,started=0,completed=0,passed=0,verdict}={}) {
   const aliases={pass:'passed',fail:'failed',blocked:'inconclusive',timeout:'timed_out',completed:'inconclusive',finished:'inconclusive'};
   let status=summary?.aggregate_status;
@@ -387,7 +398,7 @@ function conditionResults(report) {
 }
 function renderTests(records,{conditions=[],live=false,report=null}={}) {
   const run=state.detail?.id || report?.run_id || '';
-  if(conditionRun!==run){conditionRun=run;conditionFocus=null;conditionHover=null;conditionViews.clear();conditionDialogSequence++;conditionDialog=null;$('#test-dialog')?.close?.();state.allRequestsOpen=false;}
+  if(conditionRun!==run){conditionRun=run;conditionFocus=null;conditionHover=null;conditionViews.clear();conditionDialogSequence++;conditionDialog=null;$('#test-dialog')?.close?.();state.allRequestsOpen=false;state.requestStatusFilter='all';}
   if(!conditions.length)conditions=report?.conditions || Object.entries(report?.observations?.targets || {}).flatMap(([target,obs])=>(obs.conditions || []).map(item=>({...item,target})));
   const {results,key:resultKey}=conditionResults(report),defaultTarget=reportConfig(report || {}).targets?.[0]?.name || state.detail?.config?.targets?.[0]?.name || '',groups=new Map();
   for(const summary of conditions){
@@ -439,7 +450,7 @@ function renderConditionDialog() {
   const statuses=[...new Set(['running','passed','failed','timed_out','not_started',...Object.keys(totals).filter(status=>totals[status]>0),...(d.filter!=='all'?[d.filter]:[])])];
   const focused=document.activeElement,inside=focused&&dialog.contains?.(focused),focusId=inside?focused.id:null,focusValue=inside&&focused.tagName==='INPUT'&&!d.clamped?focused.value:null,start=focused?.selectionStart,end=focused?.selectionEnd;
   const reasons=view.summary.reasons || (view.summary.reason?[view.summary.reason]:[]),width=payload?.number_width || Math.max(4,String(view.summary.planned || view.summary.started || 0).length);
-  const html=`<div class="dialog-head"><div><span class="eyebrow">${escape((conditionStatusNames[view.status] || view.status).toUpperCase())}</span><h2 id="test-title">${escape(view.name)}</h2><p class="hint">${escape(view.checkName)} · ${escape(view.description)}${view.target?` · ${escape(view.target)}`:''}</p></div><button type="button" class="button ghost" data-condition-action="close" aria-label="Close test details">×</button></div><div class="dialog-body"><dl class="metrics-grid condition-counts">${conditionDialogCounts(view)}</dl><p class="hint condition-effective-limits">${escape(conditionLimits(view))}</p><details class="condition-plan-identity"><summary>${escape(conditionIdentity(view))} · plan identity</summary><p>${escape(view.summary.name || view.condition.label || view.name)}</p><code>${escape(view.condition.id)}</code><p class="hint">Each configured workload, traffic pattern and level is a separate condition.</p></details>${reasons.length?`<p class="hint condition-shortfall">${view.summary.not_started>0?`${number(view.summary.not_started)} not sent: `:''}${escape(reasons.join(' · '))}</p>`:''}<div class="request-tools"><h3>Requests</h3><label>Status <select id="condition-filter" aria-label="Request status"><option value="all"${d.filter==='all'?' selected':''}>All statuses</option>${statuses.map(status=>`<option value="${escape(status)}"${d.filter===status?' selected':''}>${escape(conditionStatusNames[status] || human(status))}</option>`).join('')}</select></label><label>Rows <select id="condition-page-size" aria-label="Rows per page">${[10,25,50].map(size=>`<option value="${size}"${size===d.size?' selected':''}>${size}</option>`).join('')}</select></label></div>${d.error?`<p class="notice warning" role="status">${escape(d.error)}</p>`:''}<div class="request-table-scroll"><table class="request-table" aria-label="Requests in this test"><thead><tr><th>Request</th><th>Status</th><th>Result</th></tr></thead><tbody>${rows.length?rows.map(row=>`<tr data-live-key="condition-request:${row.number}"><td>${row.request_id?`<button type="button" class="text-button request-link" data-condition-request="${escape(row.request_id)}">#${String(row.number).padStart(width,'0')}</button>`:`<span class="mono">#${String(row.number).padStart(width,'0')}</span>`}</td><td><span class="condition-request-state ${conditionStatusClass(row.status)}">${conditionStatusGlyphs[row.status] || '!'} ${escape(conditionStatusNames[row.status] || human(row.status))}</span></td><td>${escape(row.result_text)}</td></tr>`).join(''):`<tr><td colspan="3" class="empty-requests">${d.error?escape(d.error):!payload?'Loading requests…':d.filter!=='all'?'No requests match this status':'No requests recorded.'}</td></tr>`}</tbody></table></div><div class="request-pagination"><span class="hint" aria-live="polite">${payload?`${number(payload.range_start)}–${number(payload.range_end)} of ${number(total)} requests`:'Loading request page…'}</span><div class="page-controls"><button type="button" class="button ghost" data-condition-action="first" aria-label="First page"${page<=1?' disabled':''}>«</button><button type="button" class="button ghost" data-condition-action="prev" aria-label="Previous page"${page<=1?' disabled':''}>‹</button><label>Page <input id="condition-page-number" type="number" min="1" max="${pages}" value="${page}" aria-label="Page number"></label><span class="hint">of ${number(pages)}</span><button type="button" class="button ghost" data-condition-action="go">Go</button><button type="button" class="button ghost" data-condition-action="next" aria-label="Next page"${page>=pages?' disabled':''}>›</button><button type="button" class="button ghost" data-condition-action="last" aria-label="Last page"${page>=pages?' disabled':''}>»</button></div></div><p id="condition-page-error" class="hint" role="status">${escape(d.validation || '')}</p></div><div class="dialog-footer"><button type="button" class="button primary" data-condition-action="close">Back to tests</button></div>`;
+  const html=`<div class="dialog-head"><div><span class="eyebrow">${escape((conditionStatusNames[view.status] || view.status).toUpperCase())}</span><h2 id="test-title">${escape(view.name)}</h2><p class="hint">${escape(view.checkName)} · ${escape(view.description)}${view.target?` · ${escape(view.target)}`:''}</p></div><button type="button" class="button ghost" data-condition-action="close" aria-label="Close test details">×</button></div><div class="dialog-body"><dl class="metrics-grid condition-counts">${conditionDialogCounts(view)}</dl><p class="hint condition-effective-limits">${escape(conditionLimits(view))}</p><details class="condition-plan-identity"><summary>${escape(conditionIdentity(view))} · plan identity</summary><p>${escape(view.summary.name || view.condition.label || view.name)}</p><code>${escape(view.condition.id)}</code><p class="hint">Each configured workload, traffic pattern and level is a separate condition.</p></details>${reasons.length?`<p class="hint condition-shortfall">${view.summary.not_started>0?`${number(view.summary.not_started)} not sent: `:''}${escape(reasons.join(' · '))}</p>`:''}<div class="request-tools"><h3>Requests</h3><label>Status <select id="condition-filter" aria-label="Request status">${requestFilterOptions(d.filter,statuses)}</select></label><label>Rows <select id="condition-page-size" aria-label="Rows per page">${[10,25,50].map(size=>`<option value="${size}"${size===d.size?' selected':''}>${size}</option>`).join('')}</select></label></div>${d.error?`<p class="notice warning" role="status">${escape(d.error)}</p>`:''}<div class="request-table-scroll"><table class="request-table" aria-label="Requests in this test"><thead><tr><th>Request</th><th>Status</th><th>Result</th></tr></thead><tbody>${rows.length?rows.map(row=>`<tr data-live-key="condition-request:${row.number}"><td>${row.request_id?`<button type="button" class="text-button request-link" data-condition-request="${escape(row.request_id)}">#${String(row.number).padStart(width,'0')}</button>`:`<span class="mono">#${String(row.number).padStart(width,'0')}</span>`}</td><td><span class="condition-request-state ${conditionStatusClass(row.status)}">${conditionStatusGlyphs[row.status] || '!'} ${escape(conditionStatusNames[row.status] || human(row.status))}</span></td><td>${escape(row.result_text)}</td></tr>`).join(''):`<tr><td colspan="3" class="empty-requests">${d.error?escape(d.error):!payload?'Loading requests…':d.filter!=='all'?'No requests match this status':'No requests recorded.'}</td></tr>`}</tbody></table></div><div class="request-pagination"><span class="hint" aria-live="polite">${payload?`${number(payload.range_start)}–${number(payload.range_end)} of ${number(total)} requests`:'Loading request page…'}</span><div class="page-controls"><button type="button" class="button ghost" data-condition-action="first" aria-label="First page"${page<=1?' disabled':''}>«</button><button type="button" class="button ghost" data-condition-action="prev" aria-label="Previous page"${page<=1?' disabled':''}>‹</button><label>Page <input id="condition-page-number" type="number" min="1" max="${pages}" value="${page}" aria-label="Page number"></label><span class="hint">of ${number(pages)}</span><button type="button" class="button ghost" data-condition-action="go">Go</button><button type="button" class="button ghost" data-condition-action="next" aria-label="Next page"${page>=pages?' disabled':''}>›</button><button type="button" class="button ghost" data-condition-action="last" aria-label="Last page"${page>=pages?' disabled':''}>»</button></div></div><p id="condition-page-error" class="hint" role="status">${escape(d.validation || '')}</p></div><div class="dialog-footer"><button type="button" class="button primary" data-condition-action="close">Back to tests</button></div>`;
   patchHTML(dialog,html);
   // Native controls retain their values and caret while live patches update rows.
   const filter=$('#condition-filter'),size=$('#condition-page-size'),pageInput=$('#condition-page-number');if(filter)filter.value=d.filter;if(size)size.value=String(d.size);if(d.clamped&&pageInput)pageInput.value=String(d.page);
@@ -464,9 +475,9 @@ async function refreshConditionDialog({force=false}={}) {
   }catch(error){if(conditionDialog===d){d.error=`Could not load requests: ${error.message || error}`;renderConditionDialog();}}
   finally{d.pending=false;if(conditionDialog===d&&d.again){d.again=false;refreshConditionDialog({force:true});}}
 }
-function openConditionDialog(key) {
+function openConditionDialog(key,{filter='all'}={}) {
   const dialog=$('#test-dialog');if(!dialog||!conditionViews.has(key))return;
-  conditionDialogSequence++;conditionDialog={key,page:1,size:10,filter:'all',payload:null,updatedAt:0};conditionFocus=key;
+  conditionDialogSequence++;conditionDialog={key,page:1,size:10,filter,payload:null,updatedAt:0};conditionFocus=key;
   renderConditionDialog();if(!dialog.open)dialog.showModal();refreshConditionDialog({force:true});
 }
 function conditionDialogClosed({reveal=true}={}) {
@@ -511,13 +522,25 @@ function handleConditionKeydown(event) {
   return false;
 }
 function renderAllRequests(records,options={}) {
-  return `<details class="all-requests"${state.allRequestsOpen?' open':''}><summary>Individual requests · ${number(records.length)}</summary>${options.live?renderMosaic(records,options):`<div class="evidence-band${records.length<=72?' is-compact':''}">${renderMosaic(records)}${renderBeeswarm(records,{width:records.length<=72?500:960})}</div>`}</details>`;
+  const filter=state.requestStatusFilter || 'all',filtered=filter!=='all',shown=filtered?records.filter(record=>requestFilterStatus(record)===filter):records;
+  const positions=requestPositions(records),mosaicOptions={...options,positions,filtered,...(filtered?{budget:shown.length,budgetUsed:shown.length,attempted:shown.length,droppedOffers:0}:{})};
+  const controls=`<div class="request-tools"><label>Status <select id="all-requests-filter" aria-label="Request status">${requestFilterOptions(filter,records.map(requestFilterStatus))}</select></label></div>`;
+  return `<details class="all-requests"${state.allRequestsOpen?' open':''}><summary>Individual requests · ${number(records.length)}</summary>${controls}${options.live?renderMosaic(shown,mosaicOptions):`<div class="evidence-band${shown.length<=72?' is-compact':''}">${renderMosaic(shown,mosaicOptions)}${renderBeeswarm(shown,{positions,width:shown.length<=72?500:960})}</div>`}</details>`;
 }
+function syncAllRequestsFilter() {
+  const filter=$('#all-requests-filter');if(filter)filter.value=state.requestStatusFilter || 'all';
+}
+function filterAllRequests(status) {
+  state.requestStatusFilter=status;state.mosaicPage=0;state.mosaicFollow=status==='all';state.allRequestsOpen=true;
+  renderDetail();const requests=$('.all-requests');if(requests)requests.open=true;
+  $('#all-requests-filter')?.focus?.({preventScroll:true});
+}
+
 function focusMosaicStart() {
   const spot=$('.request-mosaic [tabindex="0"]');state.mosaicAutoFocus=spot?.dataset?.liveSlot;spot?.focus({preventScroll:true});
 }
-function renderBeeswarm(records,{width=960}={}) {
-  const positions=requestPositions(records),measured=records.filter(r=>Number.isFinite(r.elapsed_ms)&&r.elapsed_ms>=0),missing=records.length-measured.length;
+function renderBeeswarm(records,{width=960,positions=requestPositions(records)}={}) {
+  const measured=records.filter(r=>Number.isFinite(r.elapsed_ms)&&r.elapsed_ms>=0),missing=records.length-measured.length;
   if(!measured.length)return '<section class="latency-viz"><h2>Request latency</h2><p class="viz-empty">No latency measurements.</p></section>';
   // Use the mosaic's page so every rendered dot remains individually inspectable.
   const page=records.slice((state.mosaicPage || 0)*mosaicPageSize,((state.mosaicPage || 0)+1)*mosaicPageSize).filter(r=>Number.isFinite(r.elapsed_ms)&&r.elapsed_ms>=0);
@@ -784,7 +807,7 @@ async function runEvents(id, after=0) {
   finally{if(state.eventAbort===controller)state.eventAbort=null;}
 }
 function mergeRunEvents(detail, delta) {
-  const events=delta.events || [],keys=['state','progress','live_request_count','live_request_summary','live_preparations','phases','error','abort_reason','scale_down_control'];
+  const events=delta.events || [],keys=['state','progress','live_request_count','live_request_summary','live_preparations','timeout_warnings','phases','error','abort_reason','scale_down_control'];
   for(const event of events)for(const key of keys)if(Object.hasOwn(event,key))detail[key]=event[key];
   for(const key of keys)if(Object.hasOwn(delta,key))detail[key]=delta[key];
   detail.seq=delta.seq;
@@ -879,7 +902,7 @@ async function route() {
   clearPoll();cancelLiveFetch();const version=++state.routeVersion;const hash=location.hash;
   try {
     if(!hash){location.hash=state.active?linkRun(state.active):'#new';return;}
-    if (hash==='#new') { updateNav('new','New run');state.config ||= clone(state.bootstrap.config);const focusSetup=state.focusSetupOnEntry;state.focusSetupOnEntry=false;renderNew();enterRoute();if(focusSetup)syncSetupStep({focus:true});schedulePoll(pollNew,version,state.active?3000:10000);return; }
+    if (hash==='#new') { updateNav('new','New run');state.config ||= clone(state.bootstrap.config);const focusSetup=state.focusSetupOnEntry;state.focusSetupOnEntry=false;renderNew();enterRoute();if(pendingTimeoutSetting){const path=pendingTimeoutSetting;pendingTimeoutSetting=null;focusSetting(path,{explicit:true});}else if(focusSetup)syncSetupStep({focus:true});schedulePoll(pollNew,version,state.active?3000:10000);return; }
     if (destination) {
       const id=destination.id;updateNav('runs','Run detail');
       state.detail=null;
@@ -3854,7 +3877,7 @@ function renderPreparation(detail=state.detail) {
 }
 function renderReportToolbar() {
   const {data,target,window}=selectedPerformance();
-  return `${renderPreparation()}<div class="report-toolbar" data-live-key="report-toolbar"><div class="result-tabs" role="tablist" aria-label="Run report">${[['results','Results'],['performance','Performance']].map(([tab,label])=>`<button role="tab" id="tab-${tab}" aria-selected="${reportView.tab===tab}" tabindex="${reportView.tab===tab?0:-1}" aria-controls="report-${tab}" class="${reportView.tab===tab?'selected':''}" data-report-tab="${tab}">${label}</button>`).join('')}</div><div class="report-measurement" ${reportView.tab==='performance'?'':'hidden'}>${(data?.available_targets?.length||0)>1?`<label>Target <select id="performance-target">${data.available_targets.map(item=>`<option value="${escape(item.target)}" ${target?.target===item.target?'selected':''}>${escape(item.identity?.model||item.target)} · ${escape(item.target)}</option>`).join('')}</select></label>`:''}<label>Measurement <select id="performance-window" ${!target||reportView.pending?'disabled':''}>${performanceWindowOptions(target,window)}</select></label></div></div>`;
+  return `${renderPreparation()}${renderTimeoutWarnings(state.detail)}<div class="report-toolbar" data-live-key="report-toolbar"><div class="result-tabs" role="tablist" aria-label="Run report">${[['results','Results'],['performance','Performance']].map(([tab,label])=>`<button role="tab" id="tab-${tab}" aria-selected="${reportView.tab===tab}" tabindex="${reportView.tab===tab?0:-1}" aria-controls="report-${tab}" class="${reportView.tab===tab?'selected':''}" data-report-tab="${tab}">${label}</button>`).join('')}</div><div class="report-measurement" ${reportView.tab==='performance'?'':'hidden'}>${(data?.available_targets?.length||0)>1?`<label>Target <select id="performance-target">${data.available_targets.map(item=>`<option value="${escape(item.target)}" ${target?.target===item.target?'selected':''}>${escape(item.identity?.model||item.target)} · ${escape(item.target)}</option>`).join('')}</select></label>`:''}<label>Measurement <select id="performance-window" ${!target||reportView.pending?'disabled':''}>${performanceWindowOptions(target,window)}</select></label></div></div>`;
 }
 // Presentation uses the selected backend summary. Only scales and drawing are reduced here.
 const performanceCharts=new Map(),performancePlotViews=new Map(),performanceChartWidths=new Map();
@@ -4190,7 +4213,7 @@ function renderDetail() {
   if(!report){
     const hadTestDialog=$('#test-dialog')?.open;if(hadTestDialog)closeConditionDialog({reveal:false});
     const summary=d.summary,records=d.live_requests||[],partial=summaryReport(d);
-    patchHTML($('#main'),`<div class="page-heading"><div><div class="eyebrow">Run ${escape(d.id)}</div><h1>${userStopped(partial)?'Stopped by you':'Run could not finish'}</h1>${userStopped(partial)?renderGuidance(partial,d):`<p>${summary?'Only a summary was saved; request evidence may be unavailable.':'No report was saved. Review the error and settings before trying again.'}</p>`}</div></div>${notice(d.error || 'The runner did not produce a report.','error')}${renderReportToolbar()}${renderPerformance()}<section id="report-results" role="tabpanel" aria-labelledby="tab-results" data-live-key="report-results" ${reportView.tab==='results'?'':'hidden'}>${summary?`<section class="panel saved-summary"><h2>Saved summary</h2><p>Recorded overall: ${escape(statusLabels[summary.overall] || summary.overall)} · ${number(summary.request_count)} requests</p><section id="result-content">${renderChecks(partial)}</section></section>`:'<section class="panel check-verdict-summary"><h2>Checks & evidence</h2><p>No final check verdicts were saved.</p></section>'}${renderTests(records,{conditions:d.live_conditions||[],live:false})}${renderLiveLoadResults(d)}${renderAllRequests(records)}${renderDiagnostics(null,d)}</section><div class="actions">${keepButton()}${summary?resultActions(partial):''}<button class="button" data-action="rerun">Run again</button><a class="button" href="#runs">Back to runs</a></div>`);syncPerformanceSelection();if(hadTestDialog)$(`#tab-${reportView.tab}`)?.focus({preventScroll:true});return;
+    patchHTML($('#main'),`<div class="page-heading"><div><div class="eyebrow">Run ${escape(d.id)}</div><h1>${userStopped(partial)?'Stopped by you':'Run could not finish'}</h1>${userStopped(partial)?renderGuidance(partial,d):`<p>${summary?'Only a summary was saved; request evidence may be unavailable.':'No report was saved. Review the error and settings before trying again.'}</p>`}</div></div>${notice(d.error || 'The runner did not produce a report.','error')}${renderReportToolbar()}${renderPerformance()}<section id="report-results" role="tabpanel" aria-labelledby="tab-results" data-live-key="report-results" ${reportView.tab==='results'?'':'hidden'}>${summary?`<section class="panel saved-summary"><h2>Saved summary</h2><p>Recorded overall: ${escape(statusLabels[summary.overall] || summary.overall)} · ${number(summary.request_count)} requests</p><section id="result-content">${renderChecks(partial)}</section></section>`:'<section class="panel check-verdict-summary"><h2>Checks & evidence</h2><p>No final check verdicts were saved.</p></section>'}${renderTests(records,{conditions:d.live_conditions||[],live:false})}${renderLiveLoadResults(d)}${renderAllRequests(records)}${renderDiagnostics(null,d)}</section><div class="actions">${keepButton()}${summary?resultActions(partial):''}<button class="button" data-action="rerun">Run again</button><a class="button" href="#runs">Back to runs</a></div>`);syncAllRequestsFilter();syncPerformanceSelection();if(hadTestDialog)$(`#tab-${reportView.tab}`)?.focus({preventScroll:true});return;
   }
   const config=reportConfig(report),checks=report.checks.filter(c=>c.id!=='baseline');
   const required=checks.filter(c=>c.required);
@@ -4211,7 +4234,7 @@ function renderDetail() {
   <details class="report-reference condition-reference"><summary>Test conditions</summary>${renderTests(report.requests,{report})}</details>
   <section id="results-requests" class="report-result-section">${renderAllRequests(orderedRequests(report))}</section><section id="results-resources" class="report-result-section">${renderDiagnostics(report,d)}</section></section>
   <div class="actions" style="margin-top:24px">${keepButton()}<a class="button small" href="${runPath(d.id)}/report.html" download>Download HTML report</a><a class="button small" href="${runPath(d.id)}/report.json" download>Download JSON</a>${savedBaseline?`<button class="button small" data-action="compare-run">Compare a new run with this baseline</button><button class="button small" data-action="baseline-dialog">Save again under another name</button>`:!completePass&&d.state==='completed'?'<button class="button small" data-action="baseline-dialog">Save as reference baseline</button>':''}</div>`);
-  syncPerformanceSelection();syncComparisonFilters();refreshConditionDialog();loadFindingEvidence();
+  syncAllRequestsFilter();syncPerformanceSelection();syncComparisonFilters();refreshConditionDialog();loadFindingEvidence();
 }
 function renderDiagnostics(report,detail) {
   return `<details class="run-diagnostics"><summary>Run diagnostics</summary><p>Internal run ID: <code>${escape(report?.run_id || 'Not recorded')}</code></p>${renderResources(report,detail)}</details>`;
@@ -4640,6 +4663,47 @@ function liveStopReasons(detail) {
   state.liveStopReasonState={id:detail.id,reasons:[...reasons]};
   return [...reasons];
 }
+function timeoutSettingLabel(warning,setting) {
+  return [...new Set((setting?[setting]:(warning.settings || [warning.setting])).map(setting=>{
+    if((warning.fixture_settings || []).some(item=>item.setting===setting))return 'Fixture request timeout';
+    if(setting.startsWith('load_test.'))return 'Load request timeout';
+    if(setting.startsWith('test_options.'))return `${catalogTitle(setting.split('.')[1])} request timeout`;
+    return 'Request timeout';
+  }))].join(' and ');
+}
+function timeoutBreakdown(warning) {
+  return [['answer_started','had started answering'],['reasoning_only','produced reasoning only'],['no_output','received no output']].filter(([key])=>warning[key]>0).map(([key,label])=>`${number(warning[key])} ${label}`).join(' · ');
+}
+function timeoutWarnings(detail) {
+  return activeState(detail)?detail.timeout_warnings || []:Object.values(detail.report?.observations?.targets || {}).flatMap(target=>target?.timeout_warnings || []);
+}
+function timeoutDeadline(seconds) {
+  const value=seconds<1?seconds*1000:seconds,[mantissa,exponent]=value.toExponential(5).split('e'),power=Number(exponent);
+  const formatted=power<-4||power>=6?`${Number(mantissa)}e${power<0?'-':'+'}${String(Math.abs(power)).padStart(2,'0')}`:String(Number(value.toPrecision(6)));
+  return formatted+(seconds<1?' ms':'s');
+}
+function timeoutFixtureGroups(warning) {
+  const groups=new Map();
+  for(const item of warning.fixture_settings || []){
+    const key=JSON.stringify([item.file,item.field]);
+    if(!groups.has(key))groups.set(key,{file:item.file,field:item.field,ids:[]});
+    const group=groups.get(key);if(!group.ids.includes(item.fixture_id))group.ids.push(item.fixture_id);
+  }
+  return [...groups.values()];
+}
+function renderTimeoutWarnings(detail,{live=activeState(detail)}={}) {
+  const warnings=timeoutWarnings(detail);if(!warnings.length)return '';
+  const title=live?'Requests are timing out':'Requests timed out',config=detail.config || detail.report?.manifest?.config,canChangeTimeout=Boolean(config?.targets?.length);
+  const help=warnings.map(warning=>{const deadline=timeoutDeadline(warning.deadline_seconds),label=timeoutSettingLabel(warning),fixtures=warning.fixture_settings || [],other=(warning.settings || [warning.setting]).filter(setting=>!fixtures.some(item=>item.setting===setting)),remedy=fixtures.length?`${timeoutFixtureGroups(warning).map(item=>`edit ${item.field} on ${item.ids.length===1?'fixture':'fixtures'} ${item.ids.join(', ')} in ${item.file}`).join('; ')}${other.length?` and raise ${other.map(setting=>timeoutSettingLabel(warning,setting)).join(' and ')}, then ${live?'stop and rerun':'run again'}`:', then run again'}`:`run again with a higher ${label}`;return live?`Each request may take up to ${deadline}. Giraffe will not change this during the run. Stop run keeps the results collected so far. To give the server more time, ${remedy}. Keep it if responses slower than ${deadline} should count as failures. Intentional timeout tests are not counted here.`:`Each request could take up to ${deadline}. To give the server more time, ${remedy}. Keep it if responses slower than ${deadline} should count as failures. Intentional timeout tests are not counted here.`;}).join(' ');
+  const row=warning=>{const fixtures=warning.fixture_settings || [],settings=(warning.settings || [warning.setting]).filter(setting=>!fixtures.some(item=>item.setting===setting));return `<li>${escape(warning.target)} · ${number(warning.timed_out)} of ${number(warning.finished)} requests hit the ${escape(timeoutDeadline(warning.deadline_seconds))} ${escape(timeoutSettingLabel(warning).toLowerCase())} · ${escape(timeoutBreakdown(warning))}${timeoutFixtureGroups(warning).map(item=>` · <span>Edit <code>${escape(item.field)}</code> on ${item.ids.length===1?'fixture':'fixtures'} ${item.ids.map(id=>`<code>${escape(id)}</code>`).join(', ')} in <span title="${escape(item.file)}">${escape(item.file.split(/[\\/]/).pop())}</span></span>`).join('')} ${(canChangeTimeout?settings:[]).map(setting=>`<button type="button" class="text-button" data-action="timeout-setting" data-timeout-key="${escape(warning.key)}" data-timeout-setting="${escape(setting)}">${settings.length>1?`Change ${escape(timeoutSettingLabel(warning,setting))}`:'Change timeout for next run'}</button>`).join(' ')}</li>`;};
+  const expanded=state.timeoutWarningExpansion?.id===detail.id&&state.timeoutWarningExpansion.open;
+  return `<section class="notice warning ${live?'live':'report'}-timeout-warning" role="status"${live?' aria-live="polite"':''}><strong>${title}</strong> ${infoHelp(`${live?'live':'report'}_timeout_warning`,title,help)}<ul>${warnings.slice(0,4).map(row).join('')}</ul>${warnings.length>4?`<details class="timeout-warning-more" data-timeout-more${expanded?' open':''}><summary><span class="when-closed">Show ${number(warnings.length-4)} more ${warnings.length===5?'target/setting':'targets/settings'}</span><span class="when-open">Show fewer</span></summary><ul>${warnings.slice(4).map(row).join('')}</ul></details>`:''}${(live?detail.live_requests:detail.report?.requests)?.some(record=>requestFilterStatus(record)==='timed_out')?'<div class="actions"><button type="button" class="text-button" data-action="show-timeouts">Show timed-out requests</button></div>':`<p class="hint">${live?'Timed-out requests have left the live request list. The saved report lists all of them.':'Timed-out request details were not kept in this report.'}</p>`}</section>`;
+}
+function showTimedOutRequests() {
+  chooseReportTab('results');filterAllRequests('timed_out');
+  $('.all-requests')?.scrollIntoView?.({block:'start'});
+}
+
 function renderLive() {
   cancelStopConfirmationTimer();
   state.reportRouteActive=true;
@@ -4661,8 +4725,9 @@ function renderLive() {
   ${renderReportToolbar()}${renderPerformance()}<section id="report-results" role="tabpanel" aria-labelledby="tab-results" data-live-key="report-results" ${reportView.tab==='results'?'':'hidden'}><section class="panel check-verdict-summary"><h2>Checks & evidence</h2><p>Checks are still running. Finished requests are not a passing check verdict.</p></section>
   ${d.live_request_summary?.evicted?`<p class="hint live-eviction-summary">${number(d.live_request_summary.evicted)} earlier requests outside the live window · ${Object.entries(d.live_request_summary.statuses||{}).map(([status,count])=>`${number(count)} ${escape(human(status))}`).join(' · ')}</p>`:''}${stopReasons.length?`<section class="notice warning live-stop-reason" role="status"><strong>Run stop reason</strong><ul>${stopReasons.map(reason=>`<li>${escape(reason)}</li>`).join('')}</ul></section>`:''}${renderScaleDownControl(d)}${renderTests(d.live_requests || [],{conditions:d.live_conditions || [],live:true})}${renderLiveLoadResults(d)}<div class="live-layout"><div><section class="panel live-state">${badge(d.state)}<h2>${judging?escape(testLabel({...progress,scenario:'judging'})):escape(progress.scenario?scenarioLabel(progress):human(progress.event || 'Preparing requests'))}</h2><p class="live-phase">${escape(progress.target || (c.targets || []).map(t=>t.name).join(', '))} · ${escape((c.targets || []).map(t=>t.model).join(', '))}</p>
 </section>
-  <details class="panel live-activity"><summary>Activity · last 5 events</summary><div class="event-list">${[...events].reverse().slice(0,5).map(e=>`<div class="event-row"><span class="time">${elapsed(e.elapsed_seconds)}</span><span>${escape(({request_started:'Request sent',request_completed:'Response received',run_started:'Run started',run_stopping:'Stopping run',run_completed:'Run complete',judging_started:'Answer evaluation started',judging_progress:'Evaluating answers'})[e.event] || human(e.event || 'Progress'))}${e.scenario?` · ${escape(scenarioLabel(e))}`:''}</span></div>`).join('')||'<p class="hint">Preparing the first requests…</p>'}</div></details></div>
+  <details class="panel live-activity"><summary>Activity · last 5 events</summary><div class="event-list">${[...events].reverse().slice(0,5).map(e=>`<div class="event-row"><span class="time">${elapsed(e.elapsed_seconds)}</span><span>${escape(({request_started:'Request sent',request_completed:'Response received',timeout_warning:'Requests timing out',run_started:'Run started',run_stopping:'Stopping run',run_completed:'Run complete',judging_started:'Answer evaluation started',judging_progress:'Evaluating answers'})[e.event] || human(e.event || 'Progress'))}${e.scenario?` · ${escape(scenarioLabel(e))}`:''}</span></div>`).join('')||'<p class="hint">Preparing the first requests…</p>'}</div></details></div>
   <aside class="panel run-preview">${renderPhases(d.phases || events)}<h3>${judging?'Evaluation limits':'Limits'}</h3>${judging?'<p>Separate limits apply to the configured judges.</p>':''}<dl class="bound-list">${bounds.map(([k,v])=>`<div><dt>${escape(k)}</dt><dd>${escape(v)}</dd></div>`).join('')}</dl><hr><p class="hint">${judging?'Incomplete panels, evaluation failures and ties leave answers unscored.':'Finished requests include responses, failures, timeouts and cancellations. Scheduled requests can also use budget without reaching the server.'}</p></aside></div><div id="live-error" class="error-message" role="alert" ${liveError?'':'hidden'}>${escape(liveError)}</div>${renderAllRequests(d.live_requests || [],{budget:c.max_requests,live:true,budgetUsed:progress.budget_used ?? started,attempted:started,droppedOffers:progress.dropped_offers || 0})}${renderDiagnostics(d.report,d)}</section>`,{landing:true});
+  syncAllRequestsFilter();
   const dialog=$('#request-dialog'),status=dialog?.open?$('.live-request-status',dialog):null,record=status&&(d.live_requests || []).find(r=>String(r.slot)===status.dataset.statusSlot);
   if(record){if(status.getAttribute('data-request-id')!==String(record.id || '')){cancelLandings(status);status.setAttribute('data-request-id',record.id || '');}patchHTML(status,badge(requestStatus(record)),{landing:true});const identity=$('.request-identity',dialog);if(identity)patchHTML(identity,identity.getAttribute('data-condition-request-context')?conditionEvidenceIdentityText(JSON.parse(identity.getAttribute('data-condition-request-context'))):requestIdentityContent(record,d.live_requests));}
   syncPerformanceSelection();refreshSpotTip();refreshConditionDialog();loadDetailPlan();scheduleStopConfirmationReset();
@@ -4872,7 +4937,8 @@ function normalizeRateThreshold(config){
   if(defaultValue!==undefined){result.limits ||= {};if(result.limits.regression_rate_points==null)result.limits.regression_rate_points=defaultValue;}
   return result;
 }
-async function rerun({step=1}={}){
+let pendingTimeoutSetting=null;
+async function rerun({step=1,focusPath=null}={}){
   const version=state.routeVersion;let source=state.detail.report?.manifest?.config || state.detail.config;
   if(!source){toast('No configuration was saved for this run.');return;}
   let notes=[],limitNotes=[],warnings=state.detail.report?.manifest?.config_migration_warnings || [];
@@ -4883,7 +4949,7 @@ async function rerun({step=1}={}){
   source=normalizeRateThreshold(source);
   replaceMigrationNotes(notes,warnings,limitNotes);state.config=clone(source);state.gatewayAccessDraft={};state.autoModel=null;state.setupStep=step===2&&source.targets?.length&&source.targets.every(t=>t.model?.trim())?2:1;state.focusSetupOnEntry=state.setupStep===2;
   if(step===2){state.returnToReview=false;state.catalogueFilter='all';state.catalogueCategory='all';state.catalogueSearch='';}
-  invalidateModelDiscovery();state.datasetSelection=[];state.config.restart_target=null;state.formMode='normal';state.formRestartTarget=null;state.jsonDraft=null;state.jsonBase=null;state.configView='form';configChanged();state.prefillBaseline=state.detail.baseline_id || '';location.hash='#new';
+  invalidateModelDiscovery();state.datasetSelection=[];state.config.restart_target=null;state.formMode='normal';state.formRestartTarget=null;state.jsonDraft=null;state.jsonBase=null;state.configView='form';configChanged();state.prefillBaseline=state.detail.baseline_id || '';pendingTimeoutSetting=focusPath;location.hash='#new';
 }
 function portableConfig(payload) {return {...payload.config,restart_target:payload.mode==='cold-start'?payload.restart_target:null};}
 function hasJsonChanges() {return state.jsonDraft!==null&&state.jsonDraft!==state.jsonBase;}
@@ -5222,6 +5288,8 @@ document.addEventListener('click',async(event)=>{
   if(action==='compare-run'){const saved=(state.baselines || []).find(item=>item.run_id===state.detail?.id);await rerun();if(saved)state.prefillBaseline=saved.id;return;}
   if(action==='choose-baseline'){const options=$('#execution-settings');if(options){options.open=true;const select=$('#field-baseline_id');select?.focus();select?.scrollIntoView?.({block:'center'});}return;}
   if(action==='retry')route();if(action==='clear-filter'){state.filter='all';state.historySearch='';renderRuns();}
+  if(action==='show-timeouts'){showTimedOutRequests();return;}
+  if(action==='timeout-setting'){const {timeoutKey:key,timeoutSetting:setting}=event.target.closest('[data-action]').dataset,warning=timeoutWarnings(state.detail).find(warning=>warning.key===key);if(warning&&(warning.settings || [warning.setting]).includes(setting)&&!(warning.fixture_settings || []).some(item=>item.setting===setting))await rerun({focusPath:setting});return;}
   if(action==='stop')await confirmStop();if(action==='show-failing')showFailingRequests();if(action==='show-inconclusive'){chooseReportTab('results',{anchor:false});const findings=$('#failing-requests');findings?.scrollIntoView?.({block:'start'});findings?.focus({preventScroll:true});}if(action==='show-comparison'){chooseReportTab('results',{anchor:false});revealReportSection('baseline');location.hash=`${linkRun(state.detail.id)}/results/baseline`;}if(action==='rerun')await rerun();if(action==='choose-next-checks')await rerun({step:2});if(action==='baseline-dialog')openBaselineDialog();
   if(action==='close-dialog'){if(event.target.closest('dialog')?.id==='request-dialog')closeRequestEvidence();else event.target.closest('dialog').close();}if(action==='apply-config')await applyConfig();
   if(action==='discard-config')discardConfig();
@@ -5307,6 +5375,7 @@ document.addEventListener('change',event=>{
     location.hash=`${linkRun(state.detail.id)}/results/${event.target.value}`;
     scrollReportSection(event.target.value,'results');return;
   }
+  if(event.target.id==='all-requests-filter'){filterAllRequests(event.target.value);return;}
   if(handleConditionChange(event))return;
   if(handlePerformanceChange(event))return;
   if(event.target.id==='performance-target'||event.target.id==='performance-window'){
@@ -5380,6 +5449,7 @@ document.addEventListener('keydown',event=>{
   }
   const configTab=event.target.closest('[data-config-tab]');if(configTab&&['ArrowLeft','ArrowRight','Home','End'].includes(event.key)){event.preventDefault();switchConfigView(event.key==='Home'?'form':event.key==='End'?'json':state.configView==='form'?'json':'form');return;}});
 document.addEventListener('toggle',event=>{
+  if(event.target.matches('[data-timeout-more]'))state.timeoutWarningExpansion={id:state.detail?.id,open:event.target.open};
   if(event.target.matches('.all-requests'))cancelLandings(event.target);
   if(event.target.matches('.all-requests'))state.allRequestsOpen=event.target.open;
   if(event.target.matches('.judge-configuration'))state.judgeEditorOpen=event.target.open;
