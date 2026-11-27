@@ -42,6 +42,24 @@ production capacity.
 
 [Quick start](#quick-start) · [Inference engines](#inference-engines) · [Conversations](#test-multi-turn-conversations) · [Baselines](#save-a-baseline-and-compare) · [Tests](#tests) · [Docs](#documentation) · [Discord](https://discord.gg/GBefPbWebr)
 
+## A correct answer can still arrive too late
+
+An order-to-JSON workflow passed with one request at a time. With four requests
+in flight, every answer was still correct, but **9 of 51 responses missed the
+eight-second deadline**.
+
+We changed Ollama's parallelism from one to four and repeated the same six
+prompts and requirements. **All 100 responses at that load were correct and on
+time**; the slowest finished in 6.68 seconds. Giraffe caught the missed requirement
+and checked the result after the configuration change.
+
+| Before: one Ollama slot | After: four Ollama slots |
+| --- | --- |
+| [![Giraffe's recorded order-extraction run: load test failed](https://raw.githubusercontent.com/0dust/giraffe/b35048ae55ce448197070eda12ce9fb47d8a371a/docs/assets/readme/order-extraction-before.png)](https://raw.githubusercontent.com/0dust/giraffe/b35048ae55ce448197070eda12ce9fb47d8a371a/docs/assets/readme/order-extraction-before.png) | [![Giraffe's recorded repeat: selected acceptance checks passed](https://raw.githubusercontent.com/0dust/giraffe/b35048ae55ce448197070eda12ce9fb47d8a371a/docs/assets/readme/order-extraction-after.png)](https://raw.githubusercontent.com/0dust/giraffe/b35048ae55ce448197070eda12ce9fb47d8a371a/docs/assets/readme/order-extraction-after.png) |
+
+*Recorded local demo with sample orders: Llama 3.2 1B, Ollama 0.12.10, M1 Mac.
+[Prompts, settings and evidence](https://github.com/0dust/giraffe/blob/b35048ae55ce448197070eda12ce9fb47d8a371a/docs/samples/README.md#order-extraction-under-load) · [Download both reports](https://github.com/0dust/giraffe/raw/b35048ae55ce448197070eda12ce9fb47d8a371a/docs/samples/order-extraction.zip).*
+
 ## Quick start
 
 Start your inference server separately and have a model ready to use.
