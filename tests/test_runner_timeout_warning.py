@@ -426,6 +426,8 @@ async def test_scale_down_window_only_intentional_when_binding(tmp_path, monkeyp
         await run.request(cfg.targets[0], FakeClient(cfg.targets[0], cfg),
             fixture.model_copy(update={"scenario": "scale_down_baseline", "check_ids": ["scale_down"]}), **kwargs)
     assert [record.intentional for record in run.records] == [intentional] * 3
+    assert [record.error for record in run.records] == [
+        "intentional request deadline" if intentional else "request deadline exceeded"] * 3
     assert [record._request_slot for record in run.records] == [0, 1, 2]
     assert all("_request_slot" not in record.model_dump() for record in run.records)
     assert bool(run.timeout_watch.warnings) is not intentional

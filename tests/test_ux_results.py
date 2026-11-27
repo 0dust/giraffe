@@ -1059,7 +1059,7 @@ assert.equal(document.querySelectorAll('[data-action="timeout-setting"]').length
 """, dom=True)
 
 
-@pytest.mark.parametrize("seconds,label", [(.025, "25 ms"), (2.5, "2.5s")])
+@pytest.mark.parametrize("seconds,label", [(.025, "25 ms"), (1.04, "1.04s"), (2.5, "2.5s"), (60.5, "60.5s")])
 def test_timeout_notice_precision_fixture_remedy_and_more_groups(seconds, label):
     run_render_checks(r"""
 {
@@ -1146,3 +1146,28 @@ more.open=true;listeners.toggle({target:more});renderLive();
 assert.equal(document.querySelector('.timeout-warning-more').open,true);
 }
 """.replace('EXTRA', str(extra)), dom=True)
+
+
+@pytest.mark.parametrize("live", [True, False])
+def test_mixed_timeout_help_names_fixture_and_run_setting(live):
+    run_render_checks(r"""
+{
+const setting='fixture:slow',fixture={setting,file:'/path/cases.json',field:'request_timeout_seconds',fixture_id:'slow'};
+const warning={key:'mixed',target:'local',deadline_seconds:.04,setting,settings:[setting,'request_timeout_seconds'],fixture_settings:[fixture],finished:26,timed_out:26,no_output:26};
+state.detail=LIVE?{id:'live',state:'running',config:{targets:[{name:'local',model:'m'}]},events:[],progress:{},timeout_warnings:[warning]}:{id:'saved',state:'completed',report:report([check('serving','fail')],{observations:{targets:{local:{timeout_warnings:[warning]}}}})};
+renderDetail();
+const notice=document.querySelector(LIVE?'.live-timeout-warning':'.report-timeout-warning');
+const help=notice.querySelector('.field-help').textContent;
+assert(help.includes('edit request_timeout_seconds on fixture slow in /path/cases.json and raise Request timeout, then '+(LIVE?'stop and rerun':'run again')));
+if(!LIVE)assert(!help.includes('stop and rerun'));
+assert.equal(notice.querySelector('[data-action="timeout-setting"]').dataset.timeoutSetting,'request_timeout_seconds');
+}
+""".replace('LIVE', 'true' if live else 'false'), dom=True)
+
+
+def test_timeout_deadline_precision_matches_python_general_format():
+    run_render_checks(r"""
+{
+for(const [value,expected] of [[.025,'25 ms'],[1.04,'1.04s'],[2.5,'2.5s'],[60.5,'60.5s'],[1.039999999999,'1.04s'],[1234567,'1.23457e+06s'],[.0000000001,'1e-07 ms']])assert.equal(timeoutDeadline(value),expected);
+}
+""")

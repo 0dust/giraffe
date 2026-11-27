@@ -201,7 +201,7 @@ def test_active_warning_refreshes_after_twenty_successes():
     assert original["finished"] == 3 and original["update"] == 1
 
 
-@pytest.mark.parametrize("seconds,label", [(.025, "25 ms"), (2.5, "2.5s")])
+@pytest.mark.parametrize("seconds,label", [(.025, "25 ms"), (1.04, "1.04s"), (2.5, "2.5s"), (60.5, "60.5s")])
 def test_warning_formats_precise_deadline(seconds, label):
     assert f"the {label} request timeout" in format_timeout_warning(
         activate(TimeoutWatch(), request_timeout_seconds=seconds))
@@ -233,3 +233,12 @@ def test_formatter_keeps_different_fixture_files_and_fields_separate():
     payload.update(setting="0", settings=["0", "1", "2"], fixture_settings=fixtures)
     message = format_timeout_warning(payload)
     assert "edit request_timeout_seconds on fixture one in a.json; edit other_timeout on fixture two in a.json; edit request_timeout_seconds on fixture three in b.json" in message
+
+
+def test_formatter_mixed_fixture_and_run_names_both_remedies():
+    fixture = {"setting": "fixture:slow", "file": "/path/cases.json",
+               "field": "request_timeout_seconds", "fixture_id": "slow"}
+    payload = activate(TimeoutWatch())
+    payload.update(setting=fixture["setting"], settings=[fixture["setting"], "request_timeout_seconds"],
+                   fixture_settings=[fixture])
+    assert "edit request_timeout_seconds on fixture slow in /path/cases.json and raise request_timeout_seconds, then stop and rerun" in format_timeout_warning(payload)

@@ -853,6 +853,10 @@ class _Run:
             completed_before_progress = None
             overlap = 0
 
+            def intentional_deadline_expired():
+                return (intentional_deadline_applies and not global_deadline
+                        and deadline is not None and deadline.expired())
+
             def preparation_failure(kind):
                 if task.cancelling() > cancellations:
                     raise asyncio.CancelledError
@@ -976,7 +980,7 @@ class _Run:
                 elif deadline.expired():
                     record.status, record.valid = ("cancelled" if global_deadline else "timeout"), False
                     record.error = states.STOP_MAX_DURATION if global_deadline else (
-                        "intentional request deadline" if timeout_override else "request deadline exceeded")
+                        "intentional request deadline" if intentional_deadline_expired() else "request deadline exceeded")
             except _DispatchRefused:
                 return None
             except (asyncio.CancelledError, TimeoutError) as exc:
@@ -1073,9 +1077,10 @@ class _Run:
                 elif self.endpoint_health[target.name]["abort_reason"]:
                     record.termination_reason, record.termination_limit_seconds = "endpoint_unresponsive", self.config.unresponsive_for_seconds
                     record.error = self.endpoint_health[target.name]["abort_reason"]
-                elif intentional_deadline_applies and deadline is not None and deadline.expired():
+                elif intentional_deadline_expired():
                     record.termination_reason = "intentional_deadline"
                     record.termination_limit_seconds = timeout
+                    record.error = "intentional request deadline"
                 elif record.status == "timeout" and record.termination_reason in {None, "external_cancellation"}:
                     record.termination_reason = "request_timeout"
                     record.termination_limit_seconds = record.request_timeout_seconds

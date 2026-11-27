@@ -290,3 +290,49 @@ async def test_cli_journal_preserves_out_of_order_runner_slots(tmp_path):
         detail = (await client.get('/api/runs/cli')).json()
         assert [(row["id"], row["slot"]) for row in detail["live_requests"]] == [("request-0", 0), ("request-1", 1)]
         assert detail["live_request_count"] == 2
+
+
+async def test_cli_journal_late_timeout_counts_once_after_eviction(tmp_path):
+    directory = tmp_path / "cli"
+    write_metadata(directory, {"id": "cli", "state": "running", "heartbeat_at": _now(),
+        "owner_pid": os.getpid(), "owner_host": socket.gethostname(), "config": config()})
+    journal = directory / "evidence.jsonl"
+
+    def line(slot):
+        return json.dumps({"type": "record", "request_slot": slot, "record": {
+            "id": f"request-{slot}", "target": "local", "scenario": "warm",
+            "status": "timeout" if slot == 0 else "completed", "valid": slot != 0}}) + "\n"
+
+    journal.write_text(''.join(line(slot) for slot in range(1, 4098)) + line(0))
+    expected = {"evicted": 2, "through_slot": 1, "statuses": {"completed": 1, "timeout": 1}}
+    async with browser(tmp_path) as client:
+        for _ in range(2):
+            detail = (await client.get('/api/runs/cli')).json()
+            assert detail["live_request_count"] == 4098
+            assert len(detail["live_requests"]) == 4096
+            assert detail["live_request_summary"] == expected
+
+
+def test_web_runner_evicted_running_completion_and_duplicates_count_once():
+    from giraffe.web import _track_live_request, MAX_LIVE_REQUESTS
+
+    job = {"requests": OrderedDict(), "live_request_count": 0, "evicted_running": set(),
+           "live_request_summary": {"evicted": 0, "through_slot": None, "statuses": {}}}
+
+    def complete(slot, status="completed"):
+        _track_live_request(job, {"event": "request_completed", "request_slot": slot,
+            "request": {"id": str(slot), "status": status}}, None)
+
+    _track_live_request(job, {"event": "request_started", "request_slot": 0}, None)
+    for slot in range(1, MAX_LIVE_REQUESTS + 2):
+        _track_live_request(job, {"event": "request_started", "request_slot": slot}, None)
+        complete(slot)
+    assert job["live_request_summary"]["evicted"] == 2
+    assert job["live_request_summary"]["statuses"] == {"running": 1, "completed": 1}
+    complete(0, "timeout")
+    for slot in (0, 1, MAX_LIVE_REQUESTS + 1):
+        complete(slot, "timeout" if slot == 0 else "completed")
+    assert job["live_request_summary"] == {
+        "evicted": 2, "through_slot": 1, "statuses": {"running": 0, "completed": 1, "timeout": 1}}
+    assert job["evicted_running"] == set()
+    assert len(job["requests"]) == MAX_LIVE_REQUESTS

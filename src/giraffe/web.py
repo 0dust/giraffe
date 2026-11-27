@@ -569,6 +569,10 @@ def _track_live_request(job: dict, event: dict, max_requests: int | None) -> Non
             summary["statuses"]["running"] -= 1
             status = request["status"]
             summary["statuses"][status] = summary["statuses"].get(status, 0) + 1
+        elif kind == "request_completed" and event.get("uncounted_evicted_completion"):
+            summary["evicted"] += 1
+            status = request["status"]
+            summary["statuses"][status] = summary["statuses"].get(status, 0) + 1
         return
     out_of_order = slot not in requests and bool(requests) and slot < next(reversed(requests))
     requests[slot] = request
@@ -1037,7 +1041,12 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                                 slot = value.get("request_slot")
                                 if not isinstance(slot, int) or isinstance(slot, bool) or slot < 0:
                                     slot = cached["live_request_count"]
+                                through = cached["live_request_summary"]["through_slot"]
+                                late = through is not None and slot <= through
+                                # The runner writes one terminal record per slot; the
+                                # append cursor consumes it once, including late outcomes.
                                 _track_live_request(cached, {"event": "request_completed",
+                                    "uncounted_evicted_completion": late,
                                     "request_slot": slot, "request": request,
                                     "intentional": record.get("intentional", False),
                                     **{key: record.get(key) for key in (
