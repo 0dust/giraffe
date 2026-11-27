@@ -108,7 +108,7 @@ function checkMapping(){
  const input=html.match(/<input\b[^>]*name="tokenizer_custom"[^>]*>/)[0];
  assert(input.includes('value="'+(mode==='custom'?choice:'')+'"'));
 }
-api=async(path,options)=>({config:JSON.parse(options.body)});
+api=async(path,options)=>({config:JSON.parse(options.body),migration_notes:[]});
 await importConfig({text:async()=>JSON.stringify(original)});assert.equal(state.config.targets[0].tokenizer,original.targets[0].tokenizer);checkMapping();
 state.detail={config:original};await rerun();assert.equal(state.config.targets[0].tokenizer,original.targets[0].tokenizer);checkMapping();
 sessionStorage.setItem('giraffe-draft-v1',JSON.stringify({bootstrap:state.bootstrap.config,config:original}));
