@@ -11,6 +11,15 @@ import pytest
 from giraffe.scale_down import ScaleDownController
 
 
+def advance_scale_down(control, phase):
+    if phase in {"finalizing", "finished"}:
+        control.set_phase(phase)
+        return
+    phases = ("baseline", "waiting_for_output", "armed", "observing", "post_removal")
+    for next_phase in phases[phases.index(control.phase) + 1:phases.index(phase) + 1]:
+        control.set_phase(next_phase)
+
+
 def active_directory(path):
     (path / ".web.json").write_text(json.dumps(dict(state="running", owner_pid=os.getpid(),
         owner_host=socket.gethostname(), heartbeat_at=datetime.now(timezone.utc).isoformat())))
@@ -27,7 +36,7 @@ async def test_file_submission_ack_and_rejected_slot_reuse(tmp_path):
         rejected = await asyncio.to_thread(submit_marker, tmp_path, event_id="too-early", wait_seconds=2)
         assert rejected["outcome"] == "rejected"
         assert "not armed" in rejected["acknowledgment"]["reason"]
-        control.set_phase("armed")
+        advance_scale_down(control, "armed")
         accepted = await asyncio.to_thread(submit_marker, tmp_path, event_id="remove", wait_seconds=2)
         assert accepted["outcome"] == "accepted"
         assert await asyncio.to_thread(submit_marker, tmp_path, event_id="remove", wait_seconds=0) == accepted
@@ -55,7 +64,7 @@ async def test_malformed_file_rejected_then_corrected(tmp_path, bad_input):
     active_directory(tmp_path)
     (tmp_path / ".scale-down-event.json").write_bytes(bad_input)
     control = ScaleDownController("report", "local", run_start=time.monotonic(), stop=asyncio.Event())
-    control.set_phase("armed")
+    advance_scale_down(control, "armed")
     adapter = ScaleDownFileControl(tmp_path)
     adapter.bind(control)
     try:
@@ -75,7 +84,7 @@ async def test_symlink_marker_cannot_read_or_modify_target(tmp_path):
     target.write_text("secret")
     (tmp_path / ".scale-down-event.json").symlink_to(target)
     control = ScaleDownController("report", "local", run_start=time.monotonic(), stop=asyncio.Event())
-    control.set_phase("armed")
+    advance_scale_down(control, "armed")
     adapter = ScaleDownFileControl(tmp_path)
     adapter.bind(control)
     try:
@@ -96,7 +105,7 @@ async def test_standalone_marking_command_accepts_and_inspects_same_event(tmp_pa
     from giraffe.scale_down_control import ScaleDownFileControl
     active_directory(tmp_path)
     control = ScaleDownController("report", "local", run_start=time.monotonic(), stop=asyncio.Event())
-    control.set_phase("armed")
+    advance_scale_down(control, "armed")
     adapter = ScaleDownFileControl(tmp_path)
     adapter.bind(control)
     try:
@@ -168,7 +177,7 @@ async def test_quiet_run_keeps_journal_and_terminal_status(tmp_path, monkeypatch
             on_change=lambda status: progress(dict(event="scale_down_updated", target="local",
                 scale_down_control=status, scale_down={}, scale_down_snapshots=[])))
         on_scale_down_control(control)
-        control.set_phase("armed")
+        advance_scale_down(control, "armed")
         result = make_report(config, cancelled=cancelled)
         record_sink.get()(result.requests[0])
         control.set_phase("finished")
@@ -206,7 +215,7 @@ def test_configured_cli_run_preserves_journal_with_report(tmp_path, monkeypatch,
             on_change=lambda status: progress(dict(event="scale_down_updated", target="local",
                 scale_down_control=status, scale_down={}, scale_down_snapshots=[])))
         on_scale_down_control(control)
-        control.set_phase("armed")
+        advance_scale_down(control, "armed")
         report = make_report(config, cancelled=cancelled)
         record_sink.get()(report.requests[0])
         control.set_phase("finished")
@@ -237,7 +246,7 @@ async def test_same_event_can_be_retried_after_arming(tmp_path):
         await adapter.ready.wait()
         first = await asyncio.to_thread(submit_marker, tmp_path, event_id="retry", wait_seconds=2)
         assert first["outcome"] == "rejected"
-        control.set_phase("armed")
+        advance_scale_down(control, "armed")
         second = await asyncio.to_thread(submit_marker, tmp_path, event_id="retry", wait_seconds=2)
         assert second["outcome"] == "accepted"
         assert second["acknowledgment"]["marker"] == first["acknowledgment"]["marker"]
@@ -275,14 +284,14 @@ async def test_api_marker_preserves_same_operator_timestamp(tmp_path, monkeypatc
             on_change=lambda status: progress(dict(event="scale_down_updated", target="local",
                 scale_down_control=status, scale_down={}, scale_down_snapshots=[])))
         on_scale_down_control(control)
-        control.set_phase("armed")
+        advance_scale_down(control, "armed")
         await stop_event.wait()
         control.set_phase("finished")
         return report(configuration)
     monkeypatch.setattr("giraffe.web.run_suite", measured)
     async with browser(tmp_path) as client:
         identifier = await start(client, config(checks=["scale_down"], scale_down={"target": "local"}))
-        detail = await detail_when(client, identifier, lambda value: value.get("scale_down_control"))
+        detail = await detail_when(client, identifier, lambda value: (value.get("scale_down_control") or {}).get("phase") == "armed")
         marker = dict(event_id="timestamp", nonce=detail["scale_down_control"]["nonce"],
             target="local", source="operator", operator_at=operator_at)
         path = f"/api/runs/{identifier}/scale-down/event"

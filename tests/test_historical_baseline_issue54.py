@@ -8,7 +8,7 @@ from pydantic import ValidationError
 from giraffe.cli import main
 from giraffe.models import RunConfig, RunReport
 from giraffe.reporting import (
-    _run_limits_workload_identity, _settings_reasons, compare_baseline, write_report,
+    _settings_reasons, compare_baseline, write_report,
 )
 from tests.test_reporting import baseline_check, make_report
 from tests.test_web import browser, finished
@@ -74,14 +74,6 @@ def test_supported_historical_configuration_remains_comparable(version):
     assert (current.model_dump_json(), baseline.model_dump_json()) == before
 
 
-@pytest.mark.parametrize("change", ["unsupported_version", "malformed_checks"])
-def test_invalid_saved_configuration_cannot_attest_a_workload_identity(change):
-    baseline = historical_report(1 if change == "unsupported_version" else 2)
-    if change == "malformed_checks":
-        baseline.manifest["config"]["checks"] = [{}]
-    before = baseline.model_dump_json()
-    assert _run_limits_workload_identity(baseline.manifest, revision="phase3") is None
-    assert baseline.model_dump_json() == before
 
 
 @pytest.mark.parametrize("version", [1, 3])

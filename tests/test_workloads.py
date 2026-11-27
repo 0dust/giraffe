@@ -221,13 +221,13 @@ async def test_independent_prefix_controls_use_fresh_nonces_and_matched_prose():
         assert shared[:256] != independent[:256]
 
 
-async def test_loaded_workload_source_identity_is_part_of_baseline_fixture_hash(monkeypatch):
-    from giraffe import workloads
+async def test_workload_version_is_part_of_baseline_fixture_hash(monkeypatch):
+    from giraffe.workload_versions import WORKLOAD_VERSIONS
     from giraffe.reporting import compare_baseline
     with FakeEndpoint() as endpoint:
         settings = config(endpoint, prefix={"repeats": 2, "history_turns": 2})
         baseline = await run_suite(settings)
-        monkeypatch.setattr(workloads, "FIXTURE_SOURCE_SHA256", "different-generator-content")
+        monkeypatch.setitem(WORKLOAD_VERSIONS, "prefix", 2)
         current = await run_suite(settings)
     assert (baseline.manifest["fixture_pack"]["workload_fixture_sha256"]
             != current.manifest["fixture_pack"]["workload_fixture_sha256"])

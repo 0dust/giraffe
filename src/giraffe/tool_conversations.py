@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import uuid
-from pathlib import Path
 
 from jsonschema import ValidationError
 
@@ -11,7 +9,6 @@ from giraffe.fixtures import _normalized, _parsed_tool_arguments, final_answer, 
 from giraffe.models import ExpectedToolCall, RequestSpec, ToolChoiceRule, ToolExpectation
 from giraffe.tool_schema import tool_call_fingerprint
 
-SOURCE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 MARKER = "{{observation_id}}"
 
 

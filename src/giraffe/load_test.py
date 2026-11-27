@@ -13,6 +13,7 @@ from decimal import Decimal
 import math
 import random
 import time
+from giraffe import states
 from giraffe.stats import median, percentile
 
 from giraffe.concurrent_load import (
@@ -924,7 +925,7 @@ async def concurrent_window(run, target, client, settings, point, calibration, *
             if failure is not None:
                 raise failure
             stop = run.stop_reason(target.name)
-            if stop and stop != "maximum request budget reached":
+            if stop and stop != states.STOP_REQUEST_BUDGET:
                 reason = stop
                 break
             await asyncio.wait(tasks, timeout=min(0.02, max(0, finish_end - time.monotonic())),
@@ -966,7 +967,7 @@ async def concurrent_window(run, target, client, settings, point, calibration, *
                    and record.scenario == scenario]
     now = time.monotonic()
     if any(r.status == "cancelled" for r in records) and reason in {
-        None, "time limit reached", "maximum run duration reached"
+        None, "time limit reached", states.STOP_MAX_DURATION
     }:
         reason = "overall run deadline reached"
     for record in records:
@@ -1045,7 +1046,7 @@ async def arrival_window(run, target, client, settings, point, calibration):
 
     def stop():
         why = run.stop_reason(target.name)
-        return None if why == "maximum request budget reached" else why
+        return None if why == states.STOP_REQUEST_BUDGET else why
 
     run.start_condition(target.name, point["id"], planned=len(offers))
     evidence = await run_stage(
@@ -1936,7 +1937,7 @@ def _result_reason(points, status):
 
 
 def _result_remediation(run, points, status):
-    if status == "pass" or run.reason == "cancelled by user":
+    if status == "pass" or run.reason == states.STOP_CANCELLED_BY_USER:
         return None
     code = _result_reason(points, status)
     if code == "budget_limited":
@@ -1986,7 +1987,7 @@ def _result_summary(run, target, points, status, settings, *, include_remedy=Tru
         "correctness": ("answer correctness below the requirement", "Correct the answers or scoring configuration recorded in the affected conditions."),
         "timing": ("response timing limit exceeded", "Reduce the offered load or adjust load_test.pass_criteria to the required service target."),
     }
-    if (run.reason == "cancelled by user" and status == "inconclusive"
+    if (run.reason == states.STOP_CANCELLED_BY_USER and status == "inconclusive"
             and code in {"run_stopped", "cancelled", "unfinished", "budget_limited", "time_limited"}):
         cause, remedy = "stopped by you", None
     else:
@@ -2006,7 +2007,7 @@ def _result_summary(run, target, points, status, settings, *, include_remedy=Tru
                 if run.config.retention == "none"
                 else "Review the recorded responses in the affected conditions for the model's refusal messages."
             )
-    if code == "budget_limited" and run.reason != "cancelled by user":
+    if code == "budget_limited" and run.reason != states.STOP_CANCELLED_BY_USER:
         minimum, unknown = _minimum_request_budget(run)
         if unknown == "schedule_overflow":
             remedy = ("Reduce load_test.patterns.rates or load_test.schedule.duration_seconds "
@@ -2018,13 +2019,13 @@ def _result_summary(run, target, points, status, settings, *, include_remedy=Tru
                            if unknown == "duration_based" else "The selected workloads have no fixed request count")
             remedy = (explanation + ", so bound this run with --max-duration (max_duration_seconds) and "
                       "--no-max-requests (max_requests: null), or select fewer rates.")
-    elif code == "time_limited" and run.reason != "cancelled by user":
+    elif code == "time_limited" and run.reason != states.STOP_CANCELLED_BY_USER:
         from .runner import _deadline_guidance
         remedy = _deadline_guidance(run.config)
     measure_only = any(own.pass_criteria.max_first_answer_ms is None and own.pass_criteria.max_completion_ms is None
                        for own in settings.values())
     unscored = any(group.get("unscored", 0) for p in points for group in p.get("groups", []))
-    if status == "inconclusive" and run.reason != "cancelled by user" and (measure_only or unscored):
+    if status == "inconclusive" and run.reason != states.STOP_CANCELLED_BY_USER and (measure_only or unscored):
         additions = []
         if measure_only:
             additions.append("set load_test.pass_criteria.max_first_answer_ms or load_test.pass_criteria.max_completion_ms in --config")
