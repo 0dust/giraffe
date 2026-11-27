@@ -510,7 +510,9 @@ def test_multi_user_guard_covers_long_output_instruction(monkeypatch):
     original = concurrent_load.prompt
 
     def changed(chars, variant, **kwargs):
-        return original(chars, variant, **kwargs).replace("every whole number", "every whole integer") if variant == "long_output" else original(chars, variant, **kwargs)
+        text = original(chars, variant, **kwargs)
+        # Append a marker so the test does not depend on the prompt's wording.
+        return f"{text}\nTest-only long-output marker." if variant == "long_output" else text
 
     monkeypatch.setattr(concurrent_load, "prompt", changed)
     assert fixture_hash(_multi_user()) != before
