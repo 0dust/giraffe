@@ -25,9 +25,8 @@ configuration, not an estimate of general model accuracy. Other checks in both
 complete runs failed. The later loaded phase repeated these prompts and is not
 an independent replication; it is excluded from the headline counts.
 
-The README's cell graphic is a summary of these saved records, not an application
-screenshot. Matching cell positions use the same question, including the failure
-that remained at context 8192.
+These records are retained as a synthetic test example. They are not a
+production-workload comparison and are not used as the README's hero.
 
 ### Inspect one answer
 
@@ -65,9 +64,8 @@ The prompt requests cancelled orders for customer `C-41442`. The model returns a
 valid `search_orders` call with `C-41422`. The response protocol passed; the
 expected-argument check failed. There was no assistant-text requirement.
 
-The README's evidence graphic highlights the recorded mismatch. It is a summary
-of one streamed request from the November 17 Qwen2.5 7B Q8_0 / llama.cpp / Colab T4
-experiment, not an application screenshot or a general conclusion about Q8.
+This is one streamed request from the November 17 Qwen2.5 7B Q8_0 / llama.cpp /
+Colab T4 experiment, not a general conclusion about Q8.
 Giraffe checked the tool call without executing it.
 
 ## Token timing
@@ -113,8 +111,7 @@ capture revisions, and image origins. Personal hostnames and absolute local CLI
 paths are replaced in the report copies. Requests, scores, verdicts, and timing
 measurements are unchanged.
 
-The context screenshots are JPEG conversions at 1280 pixels wide. The context
-and tool-call graphics summarize saved request evidence and are labeled as such;
-they are not screenshots. The original GIF and performance screenshots retain
-their recorded content. The token-timing ZIP has only a presentation update to
+The context screenshots are JPEG conversions at 1280 pixels wide. The original
+GIF and performance screenshots retain their recorded content.
+The token-timing ZIP has only a presentation update to
 `report.html`; the manifest records its previous and current HTML hashes.

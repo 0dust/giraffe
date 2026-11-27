@@ -154,18 +154,6 @@
       "case_id": "recall-medium-d0-0",
       "configuration": "ollama-ctx8k",
       "source_image_sha256": "d8ea783a195e0e9f90595d773939ca91c97898ae061846c98d655c7408270b5f"
-    },
-    "context-recall-comparison.svg": {
-      "sha256": "e66fca3b556fe88e80dae4403ddb99bb0fc9f3144995a00f775981fc79f9986e",
-      "bytes": 19633,
-      "evidence": "context-recall-evidence.json",
-      "capture_changes": "New evidence graphic derived from saved request records; not an application screenshot."
-    },
-    "tool-call-mismatch.svg": {
-      "sha256": "1b44924a988ab5b9046603ec3b01c384b0727d5eb1e55496aee51156e02475fb",
-      "bytes": 2456,
-      "evidence": "tool-call-evidence.json",
-      "capture_changes": "New evidence graphic derived from saved request records; not an application screenshot."
     }
   },
   "context_request_evidence_sha256": "6ae00365f85d67228b6082ecdfdd4e94cb18ed3a9b04c257edadf9a8b909170c",
