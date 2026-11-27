@@ -18,16 +18,16 @@
 
 ---
 
-Giraffe is a test suite for engineers running self-hosted LLMs. Point it at an
-existing **OpenAI-compatible chat API**, such as Ollama or vLLM, to check answers
-against expected results, measure response times, and test behavior under load.
+Giraffe has built-in tests to check whether your LLM deployment continues to
+operate reliably and meet your requirements under changing conditions.
+
+Point it at an existing **OpenAI-compatible chat API**, such as Ollama or vLLM.
+Check answers against what your app expects, including JSON fields and tool
+arguments. Measure time to the first answer token when requests arrive together,
+and repeat the same checks after a server update or model switch.
+
 Run it from the command line or a local web UI, inspect failed requests, and
-compare results before and after a deployment change.
-
-<a href="https://github.com/0dust/giraffe/blob/bc518043b56e95a87dc43360167174aa2e0fbbd3/docs/samples/README.md#ollama-context-comparison"><img alt="Recorded Giraffe recall results: 19 of 45 answers wrong at context 4096, one wrong at context 8192" src="https://raw.githubusercontent.com/0dust/giraffe/bc518043b56e95a87dc43360167174aa2e0fbbd3/docs/assets/readme/context-recall-comparison.svg" width="1280"></a>
-
-**19 recall failures at 4,096 context. One at 8,192.** Giraffe checked the same
-45 questions in these two Ollama runs. [Inspect the evidence](https://github.com/0dust/giraffe/blob/bc518043b56e95a87dc43360167174aa2e0fbbd3/docs/samples/README.md#ollama-context-comparison).
+compare results.
 
 Use it to answer questions like:
 
@@ -95,17 +95,16 @@ giraffe ui
 
 Open the access link printed in the terminal (it contains a per-launch token), enter your endpoint and model, choose checks, then **Launch**. Keep the terminal open; **Ctrl+C** stops the UI. Use `--port` to choose a different port.
 
-[![Giraffe test conditions updating during a recorded local run](https://raw.githubusercontent.com/0dust/giraffe/bc518043b56e95a87dc43360167174aa2e0fbbd3/docs/assets/readme/browser-ui-live.gif)](https://raw.githubusercontent.com/0dust/giraffe/bc518043b56e95a87dc43360167174aa2e0fbbd3/docs/assets/readme/browser-ui-live.gif)
+[![Giraffe test conditions updating during a recorded local run](https://raw.githubusercontent.com/0dust/giraffe/a41a5dd0935f2cc4d9df02819bad442cfafa570c/docs/assets/readme/browser-ui-live.gif)](https://raw.githubusercontent.com/0dust/giraffe/a41a5dd0935f2cc4d9df02819bad442cfafa570c/docs/assets/readme/browser-ui-live.gif)
 
 *Watch test conditions update during a real Qwen2.5 1.5B run. Playback is condensed.
-[Download this run](https://github.com/0dust/giraffe/raw/bc518043b56e95a87dc43360167174aa2e0fbbd3/docs/samples/browser-ui-demo.zip) · [Recording details](https://github.com/0dust/giraffe/blob/bc518043b56e95a87dc43360167174aa2e0fbbd3/docs/samples/README.md#browser-ui-demo).*
+[Download this run](https://github.com/0dust/giraffe/raw/a41a5dd0935f2cc4d9df02819bad442cfafa570c/docs/samples/browser-ui-demo.zip) · [Recording details](https://github.com/0dust/giraffe/blob/a41a5dd0935f2cc4d9df02819bad442cfafa570c/docs/samples/README.md#browser-ui-demo).*
 
 ### Inspect a wrong tool-call argument
 
-<a href="https://raw.githubusercontent.com/0dust/giraffe/bc518043b56e95a87dc43360167174aa2e0fbbd3/docs/assets/readme/tool-call-mismatch.svg"><img alt="Saved request evidence: expected customer C-41442, returned C-41422, failed argument highlighted in red" src="https://raw.githubusercontent.com/0dust/giraffe/bc518043b56e95a87dc43360167174aa2e0fbbd3/docs/assets/readme/tool-call-mismatch.svg" width="1280"></a>
-
-*The call is valid, but the customer is wrong. Giraffe flags the argument mismatch
-without executing the tool. [Request evidence](https://github.com/0dust/giraffe/blob/bc518043b56e95a87dc43360167174aa2e0fbbd3/docs/samples/README.md#tool-call-mismatch).*
+An order-lookup prompt asked for customer `C-41442`; the model's `search_orders`
+call used `C-41422`. Giraffe flagged the mismatch without executing the tool.
+[Inspect the recorded request](https://github.com/0dust/giraffe/blob/a41a5dd0935f2cc4d9df02819bad442cfafa570c/docs/samples/README.md#tool-call-mismatch).
 
 ## Inference engines
 
@@ -209,11 +208,11 @@ your own questions and expected answers to test the work your application needs.
 See the [Load test guide](https://github.com/0dust/giraffe/blob/main/docs/workloads.md#load-test)
 for traffic patterns, answer checks and configuration examples.
 
-[![Actual and intended concurrency across the 1, 2 and 4 request stages](https://raw.githubusercontent.com/0dust/giraffe/bc518043b56e95a87dc43360167174aa2e0fbbd3/docs/assets/readme/fresh-load-concurrency.jpg)](https://raw.githubusercontent.com/0dust/giraffe/bc518043b56e95a87dc43360167174aa2e0fbbd3/docs/assets/readme/fresh-load-concurrency.jpg)
+[![Actual and intended concurrency across the 1, 2 and 4 request stages](https://raw.githubusercontent.com/0dust/giraffe/a41a5dd0935f2cc4d9df02819bad442cfafa570c/docs/assets/readme/fresh-load-concurrency.jpg)](https://raw.githubusercontent.com/0dust/giraffe/a41a5dd0935f2cc4d9df02819bad442cfafa570c/docs/assets/readme/fresh-load-concurrency.jpg)
 
 *A separate November 18 run: Qwen2.5 1.5B on Ollama 0.34.1, with 1,154 correct
 responses across concurrency 1, 2, and 4. All three stages passed.
-[Download the performance run](https://github.com/0dust/giraffe/raw/bc518043b56e95a87dc43360167174aa2e0fbbd3/docs/samples/token-timing.zip) · [Measurement details](https://github.com/0dust/giraffe/blob/bc518043b56e95a87dc43360167174aa2e0fbbd3/docs/samples/README.md#token-timing).*
+[Download the performance run](https://github.com/0dust/giraffe/raw/a41a5dd0935f2cc4d9df02819bad442cfafa570c/docs/samples/token-timing.zip) · [Measurement details](https://github.com/0dust/giraffe/blob/a41a5dd0935f2cc4d9df02819bad442cfafa570c/docs/samples/README.md#token-timing).*
 
 ## Test multi-turn conversations
 
@@ -253,8 +252,6 @@ giraffe run --config giraffe.yaml \
 The new report shows acceptance results and changes against the saved baseline. Keep the workload comparable; incompatible measurements stay inconclusive.
 
 In the UI, open a completed run and choose **Save baseline** (fully passing runs) or **Save as reference baseline** (other completed runs). Name and save it, then choose **Compare a new run with this baseline** at the bottom of the report, or **Compare a new run** when shown at the top. [Baseline guide →](https://github.com/0dust/giraffe/blob/main/docs/running.md#compare-with-a-baseline)
-
-[See the same recall request before and after an Ollama context change →](https://github.com/0dust/giraffe/blob/bc518043b56e95a87dc43360167174aa2e0fbbd3/docs/samples/README.md#ollama-context-comparison)
 
 ## Tests
 
@@ -385,5 +382,5 @@ multi-replica deployment is still pending.
 
 ## Sample reports
 
-[Download the load comparison](https://github.com/0dust/giraffe/raw/bc518043b56e95a87dc43360167174aa2e0fbbd3/docs/samples/load-comparison.zip) ·
-[Reports and JSON evidence](https://github.com/0dust/giraffe/blob/bc518043b56e95a87dc43360167174aa2e0fbbd3/docs/samples/README.md) · [Run configuration](https://github.com/0dust/giraffe/blob/bc518043b56e95a87dc43360167174aa2e0fbbd3/docs/samples/load-config.json)
+[Download the load comparison](https://github.com/0dust/giraffe/raw/a41a5dd0935f2cc4d9df02819bad442cfafa570c/docs/samples/load-comparison.zip) ·
+[Reports and JSON evidence](https://github.com/0dust/giraffe/blob/a41a5dd0935f2cc4d9df02819bad442cfafa570c/docs/samples/README.md) · [Run configuration](https://github.com/0dust/giraffe/blob/a41a5dd0935f2cc4d9df02819bad442cfafa570c/docs/samples/load-config.json)
