@@ -820,6 +820,7 @@ function confirmRunWrite(id,write,value){
     entry.keep={at:entry.confirmed,value};
     const row=state.runs.find(run=>run.id===id);if(row)row.kept=value;
     if(state.detail?.id===id)state.detail.kept=value;
+    if(row&&typeof location!=='undefined'&&location.hash==='#runs'&&!state.reportRouteActive)renderRunsIfChanged();
   }else entry.comparison=entry.confirmed;
   return true;
 }
@@ -996,9 +997,9 @@ async function route() {
 }
 async function pollRuns(version) {
   try {
-    const previous=JSON.stringify([state.runs,state.storage,state.storageUnavailable]),active=state.active;
+    const active=state.active;
     if(state.active)await Promise.all([pollRunStatus(version,{schedule:false}),refreshStorage()]);else await refreshRuns();if(version!==state.routeVersion)return;
-    if(!active)connectionError();if(previous!==JSON.stringify([state.runs,state.storage,state.storageUnavailable])||active!==state.active)renderRuns();
+    if(!active)connectionError();renderRunsIfChanged();
   }catch(error){if(version===state.routeVersion)connectionError(error.message+' Your saved runs have not changed.');}
   if(version===state.routeVersion)schedulePoll(pollRuns,version,3000);
 }
@@ -1129,6 +1130,9 @@ function cleanupResultNotice() {
   const message=`Deleted ${count} ${count===1?'run':'runs'}, freed ${diskSize(result.bytes_freed)} on disk.${skipped.length?` Skipped ${skipped.length}: ${skipped.map(run=>`${run.id} — ${run.reason}`).join('; ')}.`:''}`;
   return `<div class="notice ${skipped.length?'warning':'info'}" role="status">${escape(message)}</div>`;
 }
+let runsRenderedSignature=null;
+function runsSignature(){return JSON.stringify([state.runs,state.storage,state.storageUnavailable,state.active,state.filter,state.historySearch,state.cleanupResult]);}
+function renderRunsIfChanged(){if(runsRenderedSignature!==runsSignature())renderRuns();}
 function renderRuns() {
   cancelStopConfirmationTimer({reset:true});
   const focused=document.activeElement,focusId=['run-search','run-filter'].includes(focused?.id)?focused.id:null;
@@ -1136,6 +1140,7 @@ function renderRuns() {
 
   if(!state.runs.length&&!state.active){
     $('#main').innerHTML=`<section class="first-run"><h1>Run history</h1><p>No runs yet.</p>${storageLine()}${cleanupResultNotice()}<a class="button primary" href="#new">${icon('plus')} New run</a></section>`;
+    runsRenderedSignature=runsSignature();
     return;
   }
   const runs=filteredRuns();
@@ -1150,6 +1155,7 @@ function renderRuns() {
   `<div class="empty-state"><h2>No matching runs</h2><button class="button" data-action="clear-filter">Clear filters</button></div>`}</section></div>`;
   $('#run-filter').value=state.filter;
   if(focusId){const control=$('#'+focusId);control?.focus({preventScroll:true});if(selection&&selection[0]!=null)control?.setSelectionRange?.(...selection);}
+  runsRenderedSignature=runsSignature();
 }
 const numericFields=['context_limit','concurrency','max_requests','max_memory_mb','max_duration_seconds','request_timeout_seconds','max_output_tokens'].map(name=>[name]);
 const limitFields=[['first_output_ms','First output maximum','ms'],['latency_ms','Response time maximum','ms'],['stream_gap_ms','Stream pause maximum','ms'],['min_output_tokens_per_second','Minimum generation rate','tokens / second after first output; needs streamed token counts (logprobs or cumulative usage)'],['fairness_max_ratio','Mixed-load slowdown','ratio, greater than 1']];
@@ -4911,26 +4917,32 @@ function openBaselineDialog(){
   const report=state.detail.report,dialog=$('#baseline-dialog');dialog.className='baseline-form';dialog.innerHTML=`<form id="baseline-form"><div class="dialog-head"><div><div class="eyebrow">Explicit reference run</div><h2 id="baseline-title">Save baseline</h2></div><button type="button" class="button ghost" data-action="close-dialog" aria-label="Close save baseline">✕</button></div><div class="dialog-body"><p class="hint">Save this exact report for future comparisons. Its recorded outcome is ${escape(statusLabels[report.overall] || report.overall)}.</p><div class="fields">${field('baseline_name','Baseline name','',{required:true,full:true,placeholder:'e.g. before-runtime-upgrade'})}</div><p class="hint" style="margin-top:12px">Existing baselines are preserved unless you explicitly replace one.</p><div id="baseline-error" class="error-message" role="alert" hidden></div><label class="replace-row" id="replace-row" hidden><input name="replace" type="checkbox">Replace the existing baseline with this name</label></div><div class="dialog-footer"><button type="button" class="button" data-action="close-dialog">Cancel</button><button type="submit" class="button primary" id="save-baseline">Save baseline</button></div></form>`;dialog.showModal();}
 // Closing a chooser does not cancel a comparison already being saved.
 const pendingComparisons=new Set();
-let baselinesSequence=0,comparisonDialogSequence=0;
-async function refreshBaselines(){
-  const s=++baselinesSequence,before=new Set(state.baselines),r=await api('/api/baselines'),list=r.baselines||[];
-  if(s===baselinesSequence){
-    const merged=new Map(list.map(item=>[item.id,item]));
-    for(const item of state.baselines)if(!before.has(item))merged.set(item.id,item);
-    state.baselines=[...merged.values()];
+let baselinesSequence=0,baselinesCacheSequence=0,baselineConfirmationClock=0,comparisonDialogSequence=0;
+const baselineConfirmations=new Map();
+function beginBaselineRead(){return {sequence:++baselinesSequence,confirmed:baselineConfirmationClock};}
+function reconcileBaselines(list,read){
+  // A newer completed list is authoritative, including entries it removed.
+  const merged=new Map((baselinesCacheSequence>read.sequence?state.baselines:list).map(item=>[item.id,item]));
+  for(const item of state.baselines)if(baselineConfirmations.get(item.id)>read.confirmed)merged.set(item.id,item);
+  return [...merged.values()];
+}
+async function refreshBaselines(read=beginBaselineRead()){
+  const r=await api('/api/baselines'),list=reconcileBaselines(r.baselines||[],read);
+  if(read.sequence===baselinesSequence){
+    state.baselines=list;baselinesCacheSequence=read.sequence;
   }
   return list;
 }
-function mergeBaseline(summary){if(!summary?.id)return;const index=state.baselines.findIndex(item=>item.id===summary.id);if(index<0)state.baselines.push(summary);else state.baselines[index]=summary;}
+function mergeBaseline(summary){if(!summary?.id)return;baselineConfirmations.set(summary.id,++baselineConfirmationClock);const index=state.baselines.findIndex(item=>item.id===summary.id);if(index<0)state.baselines.push(summary);else state.baselines[index]=summary;}
 async function openComparisonDialog() {
   const t=reportToken(),id=t.id;
   if(!id||state.detail.state!=='completed')return;
   if(pendingComparisons.has(id)){toast('A comparison is still being saved for this run.');return;}
   const s=++comparisonDialogSequence;
   try {
-    await refreshBaselines();
+    const read=beginBaselineRead(),list=await refreshBaselines(read);
     if(s!==comparisonDialogSequence||!sameReportVisit(t)||pendingComparisons.has(id))return;
-    const choices=state.baselines.filter(item=>item.run_id!==id);
+    const choices=reconcileBaselines(list,read).filter(item=>item.run_id!==id);
     const dialog=$('#comparison-dialog');
     dialog.className='baseline-form';
     dialog.innerHTML=`<form id="comparison-form" data-run-id="${escape(id)}"><div class="dialog-head"><h2 id="comparison-title">Compare with saved baseline</h2><button type="button" class="button ghost" data-action="close-dialog" aria-label="Close comparison">✕</button></div><div class="dialog-body"><p>Compare the recorded results. No new requests will be sent to your endpoint.</p>${choices.length?`<label for="saved-baseline-choice">Saved baseline</label><select id="saved-baseline-choice" name="baseline_id" required>${choices.map(item=>`<option value="${escape(item.id)}"${item.id===state.detail.baseline_id?' selected':''}>${escape(item.name)} · ${escape(date(item.saved_at))}</option>`).join('')}</select>`:'<p>No other saved baselines yet. Open a different completed run and choose “Save as reference baseline”, then return here.</p>'}<div id="comparison-error" class="error-message" role="alert" hidden></div></div><div class="dialog-footer"><button type="button" class="button" data-action="close-dialog">Cancel</button><button type="submit" class="button primary"${choices.length?'':' disabled'}>Compare saved results</button></div></form>`;

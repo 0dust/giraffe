@@ -7,6 +7,157 @@ import pytest
 from tests.test_ux_results import REPORT_REPLY_SETUP, run_render_checks
 
 
+@pytest.mark.parametrize('kept', [False, True])
+def test_late_keep_reply_repaints_visible_history_and_idle_poll_preserves_focus(kept):
+    run_render_checks(REPORT_REPLY_SETUP + r"""
+(async()=>{
+ window.matchMedia=()=>({matches:true});
+ const counter=document.createElement('span');counter.setAttribute('id','run-count');document.body.insertBefore(counter,null);
+ const post=deferred();let serverKept=KEPT;
+ state.detail.kept=serverKept;
+ const row=()=>({...initial,kept:serverKept,targets:[{model:'test-model'}]});
+ api=(path,options)=>options?post.promise:path==='/api/runs'?{runs:[row()]}:navigationReply(path);
+ const saving=toggleKept();await navigate('R');
+ assert.equal(Boolean($('.kept-marker')),KEPT);
+ assert($('#run-search'),$('#main').textContent);
+ const search=$('#run-search');search.value='test';state.historySearch='test';
+ search.selectionStart=1;search.selectionEnd=3;
+ Object.getPrototypeOf(search).setSelectionRange=function(start,end){this.selectionStart=start;this.selectionEnd=end;};
+ search.focus({preventScroll:true});
+ let scrolls=0;window.scrollTo=()=>scrolls++;
+ serverKept=!KEPT;post.resolve({kept:serverKept});await saving;
+ assert.equal(Boolean($('.kept-marker')),!KEPT,'reply must update visible badge immediately');
+ assert.equal(document.activeElement,$('#run-search'));assert.equal(document.activeElement.getAttribute('value'),'test');
+ assert.equal(document.activeElement.selectionStart,1);assert.equal(document.activeElement.selectionEnd,3);
+ assert.equal(scrolls,0);
+ const focused=document.activeElement,writes=$('#main').writes;
+ await pollRuns(state.routeVersion);
+ assert.equal($('#main').writes,writes,'identical idle poll must not repaint');
+ assert.strictEqual(document.activeElement,focused);
+})()
+""".replace('KEPT', json.dumps(kept)), dom=True)
+
+
+@pytest.mark.parametrize('change', ['keep', 'status', 'empty'])
+def test_history_poll_compares_with_last_paint_after_out_of_band_cache_change(change):
+    run_render_checks(REPORT_REPLY_SETUP + r"""
+(async()=>{
+ window.matchMedia=()=>({matches:true});
+ const counter=document.createElement('span');counter.setAttribute('id','run-count');document.body.insertBefore(counter,null);
+ state.runs=[{...initial,kept:false}];state.storage={};location.hash='#runs';renderRuns();
+ const writes=$('#main').writes;
+ if(CHANGE==='keep')state.runs[0].kept=true;
+ else if(CHANGE==='status')state.runs[0].state='error';
+ else state.runs=[];
+ api=path=>path==='/api/runs'?{runs:structuredClone(state.runs)}:navigationReply(path);
+ await pollRuns(state.routeVersion);
+ assert($('#main').writes>writes,'cache already matches server but differs from last paint');
+ if(CHANGE==='keep')assert($('.kept-marker'));
+ else if(CHANGE==='status')assert($('.history-row.error'));
+ else assert.match($('#main').textContent,/No runs yet/);
+ const painted=$('#main').writes;await pollRuns(state.routeVersion);
+ assert.equal($('#main').writes,painted,'including the empty view, idle polls must not repaint');
+})()
+""".replace('CHANGE', json.dumps(change)), dom=True)
+
+
+@pytest.mark.parametrize('newer_first', [False, True])
+def test_chooser_uses_own_list_and_concurrent_save_with_newer_refresh_pending(newer_first):
+    run_render_checks(REPORT_REPLY_SETUP + r"""
+(async()=>{
+ window.matchMedia=()=>({matches:true});
+ const post=deferred(),chooser=deferred(),newer=deferred();let lists=0;
+ const existing={id:'existing',run_id:'pre-existing-run',name:'Existing',saved_at:'2026-10-15T09:00:00Z'};
+ const saved={id:'saved',run_id:initial.id,name:'Saved on A',saved_at:'2026-10-15T10:00:00Z'};
+ const self={id:'self',run_id:'other',name:'B itself'};
+ api=(path,options)=>path==='/api/baselines'?(options?post.promise:++lists===1?chooser.promise:newer.promise):navigationReply(path);
+ openBaselineDialog();const form=$('#baseline-dialog').querySelector('form');form.values={baseline_name:'Saved on A'};
+ const saving=saveBaseline({preventDefault(){},target:form});
+ await navigate('O');const opening=openComparisonDialog();assert.equal(lists,1);
+ post.resolve(saved);
+ for(let i=0;i<12&&lists<2;i++)await Promise.resolve();assert.equal(lists,2);
+ if(NEWER_FIRST){newer.resolve({baselines:[existing,saved,self]});await saving;}
+ chooser.resolve({baselines:[existing,self]});await opening;
+ const options=()=>$('#comparison-dialog').querySelectorAll('option');
+ assert.deepEqual(Array.from(options(),item=>item.getAttribute('value')).sort(),['existing','saved']);
+ if(!NEWER_FIRST){
+  assert.deepEqual(state.baselines.map(item=>item.id),['saved'],'older chooser must not overwrite cache');
+  newer.resolve({baselines:[existing,saved,self]});await saving;
+ }
+ assert.deepEqual(state.baselines.map(item=>item.id).sort(),['existing','saved','self']);
+ assert.deepEqual(Array.from(options(),item=>item.getAttribute('value')).sort(),['existing','saved']);
+ assert.equal(messages.length,0);
+})()
+""".replace('NEWER_FIRST', json.dumps(newer_first)), dom=True)
+
+
+@pytest.mark.parametrize('newer_first', [False, True])
+def test_baseline_replacement_during_chooser_load_uses_newest_name_and_time(newer_first):
+    run_render_checks(REPORT_REPLY_SETUP + r"""
+(async()=>{
+ window.matchMedia=()=>({matches:true});
+ const post=deferred(),chooser=deferred(),newer=deferred();let lists=0;
+ const old={id:'reference',run_id:'old-run',name:'Old cached name',saved_at:'2025-01-01T00:00:00Z'};
+ const saved={...old,run_id:initial.id,name:'Replaced reference',saved_at:'2026-11-28T12:00:00Z'};
+ const existing={id:'existing',run_id:'pre-existing-run',name:'Another eligible reference'};
+ state.baselines=[old];
+ api=(path,options)=>{
+  if(path!=='/api/baselines')return navigationReply(path);
+  if(options){assert.equal(JSON.parse(options.body).replace,true);return post.promise;}
+  return ++lists===1?chooser.promise:newer.promise;
+ };
+ openBaselineDialog();const form=$('#baseline-dialog').querySelector('form');form.values={baseline_name:saved.name,replace:true};
+ const saving=saveBaseline({preventDefault(){},target:form});await navigate('O');
+ const opening=openComparisonDialog();post.resolve(saved);
+ for(let i=0;i<12&&lists<2;i++)await Promise.resolve();assert.equal(lists,2);
+ if(NEWER_FIRST){newer.resolve({baselines:[saved,existing]});await saving;}
+ chooser.resolve({baselines:[old,existing]});await opening;
+ const options=$('#comparison-dialog').querySelectorAll('option');assert.equal(options.length,2);
+ const replacement=Array.from(options).find(item=>item.getAttribute('value')===saved.id);
+ assert.equal(replacement.textContent,`${saved.name} · ${date(saved.saved_at)}`);
+ assert.equal(state.baselines[0].name,saved.name);
+ if(!NEWER_FIRST){newer.resolve({baselines:[saved,existing]});await saving;}
+ assert.equal(state.baselines[0].saved_at,saved.saved_at);
+})()
+""".replace('NEWER_FIRST', json.dumps(newer_first)), dom=True)
+
+
+def test_older_chooser_does_not_resurrect_baseline_missing_from_newer_completed_list():
+    run_render_checks(REPORT_REPLY_SETUP + r"""
+(async()=>{
+ window.matchMedia=()=>({matches:true});
+ const old=deferred(),fresh=deferred();let reads=0;
+ const deleted={id:'deleted',run_id:'other',name:'Removed reference'};
+ api=()=>++reads===1?old.promise:fresh.promise;
+ const opening=openComparisonDialog();
+ mergeBaseline(deleted);
+ const refreshing=refreshBaselines();fresh.resolve({baselines:[]});await refreshing;
+ old.resolve({baselines:[deleted]});await opening;
+ assert.equal($('#comparison-dialog').querySelectorAll('option').length,0);
+ assert.equal(state.baselines.length,0);
+})()
+""", dom=True)
+
+
+@pytest.mark.parametrize('removed', [False, True])
+def test_chooser_reconciles_newer_completed_list_during_await_handoff(removed):
+    run_render_checks(REPORT_REPLY_SETUP + r"""
+(async()=>{
+ const old=deferred(),fresh=deferred();let reads=0;
+ const before={id:'reference',run_id:'other',name:'Old name',saved_at:'2025-01-01T00:00:00Z'};
+ const after={...before,name:'Newest name',saved_at:'2026-11-28T12:00:00Z'};
+ api=()=>++reads===1?old.promise:fresh.promise;
+ const opening=openComparisonDialog(),refreshing=refreshBaselines();
+ // The old refresh finishes first; the newer cache lands before the chooser resumes.
+ old.resolve({baselines:[before]});fresh.resolve({baselines:REMOVED?[]:[after]});
+ await opening;await refreshing;
+ const options=$('#comparison-dialog').querySelectorAll('option');assert.equal(options.length,REMOVED?0:1);
+ if(!REMOVED)assert.equal(options[0].textContent,`${after.name} · ${date(after.saved_at)}`);
+ assert.equal(state.baselines.length,REMOVED?0:1);
+})()
+""".replace('REMOVED', json.dumps(removed)), dom=True)
+
+
 @pytest.mark.parametrize('first', ['A', 'B'])
 def test_keep_pending_belongs_to_each_run(first):
     run_render_checks(REPORT_REPLY_SETUP + r"""
