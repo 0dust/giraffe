@@ -186,7 +186,7 @@ def test_waiting_for_shared_slots_ends_with_point_window(monkeypatch):
         run = _Run(c, None, None)
         admitted = 0
         @asynccontextmanager
-        async def shared_slot(reserved, deadline=None, *, gateway_probe=False):
+        async def shared_slot(reserved, deadline=None, cooldown_target=None, *, gateway_probe=False):
             nonlocal admitted
             assert not gateway_probe
             if reserved:
@@ -448,7 +448,7 @@ def test_shared_slots_never_free_extension_ends_at_finite_cap(monkeypatch):
         clock = asyncio.get_running_loop().time
 
         @asynccontextmanager
-        async def unavailable_slot(reserved, deadline=None, *, gateway_probe=False):
+        async def unavailable_slot(reserved, deadline=None, cooldown_target=None, *, gateway_probe=False):
             assert not reserved
             deadlines.append(deadline)
             try:

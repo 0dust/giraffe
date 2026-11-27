@@ -326,7 +326,10 @@ stream-gap sanity default. The first-output sanity bound applies only to the
 First-output and generation checks use ordinary serial requests; loaded timing
 belongs to the corresponding load check. Serving excludes sustained recovery traffic.
 Other stress traffic exempts timeouts and intentional cancellations, but non-timeout
-HTTP and protocol failures still enter serving checks and `stop_after_errors`.
+HTTP and protocol failures still enter serving checks and `stop_after_errors`. HTTP 429 responses
+are tracked separately. Giraffe pauses ordinary dispatch to that target for `Retry-After` (one second
+if missing or invalid). It skips scheduled offers during the pause and does not replay rejected requests.
+Consecutive 429s reaching `stop_after_errors` stop the run with a rate-limit reason.
 Recognized context-length rejections are excluded from serving errors; the context
 check applies the size-evidence rule described above. ConnectTimeout and ConnectError
 are transport failures for access; a response timeout remains a

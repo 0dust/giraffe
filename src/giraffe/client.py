@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import codecs
 import json
 import hashlib
@@ -17,7 +18,8 @@ import time
 import uuid
 from time import monotonic
 from datetime import datetime, timezone
-from typing import Any, AsyncIterator, Callable, Iterable, Literal
+from email.utils import parsedate_to_datetime
+from typing import Any, AsyncIterator, Awaitable, Callable, Iterable, Literal
 from urllib.parse import urlsplit
 
 import httpx
@@ -409,7 +411,26 @@ class _StreamGeneration:
         return count, answers, token_at, answer_reset
 
 
+def _retry_after_seconds(value: str | None) -> float | None:
+    if value is None:
+        return None
+    value = value.strip()
+    # HTTP specifies whole seconds. Some gateways also send fractional seconds.
+    if re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", value):
+        seconds = float(value)
+        return seconds if math.isfinite(seconds) else None
+    try:
+        date = parsedate_to_datetime(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    # RFC 850 and asctime date formats are accepted for legacy servers.
+    if date.tzinfo is None:
+        date = date.replace(tzinfo=timezone.utc)
+    return max(0.0, (date - datetime.now(timezone.utc)).total_seconds())
+
+
 class LLMClient:
+    _supports_rate_limit_control = True
     reports_response_activity = True
     _supports_dispatch_guard = True
 
@@ -613,15 +634,20 @@ class LLMClient:
         self, spec: RequestSpec, *, first_output_event: asyncio.Event | None = None,
         lifecycle_observer: Callable[[RequestLifecycleEvent], None] | None = None,
         _before_send: Callable[[], None] | None = None,
+        _wait_to_send: Callable[[], Awaitable[None]] | None = None,
+        _on_http_status: Callable[[int, float | None], None] | None = None,
     ) -> RequestRecord:
         from .identities import identity_scope
         with identity_scope(spec.identity is not None):
             return await self._execute(spec, first_output_event=first_output_event,
-                                       lifecycle_observer=lifecycle_observer, _before_send=_before_send)
+                                       lifecycle_observer=lifecycle_observer, _before_send=_before_send,
+                                       _wait_to_send=_wait_to_send, _on_http_status=_on_http_status)
 
     async def _execute(
         self, spec: RequestSpec, *, first_output_event: asyncio.Event | None = None,
         _before_send: Callable[[], None] | None = None,
+        _wait_to_send: Callable[[], Awaitable[None]] | None = None,
+        _on_http_status: Callable[[int, float | None], None] | None = None,
         lifecycle_observer: Callable[[RequestLifecycleEvent], None] | None = None,
     ) -> RequestRecord:
         if self._client is None:
@@ -1174,8 +1200,10 @@ class LLMClient:
                             sending_post = False
 
                     request.extensions["trace"] = observe_send
-                def begin_transport():
+                async def begin_transport():
                     nonlocal start, transport_started
+                    if _wait_to_send is not None:
+                        await _wait_to_send()
                     if _before_send is not None:
                         _before_send()
                         request_deadline.reschedule(asyncio.get_running_loop().time() + timeout)
@@ -1189,11 +1217,15 @@ class LLMClient:
                 if isinstance(self._client, HTTPClientPool):
                     response = await self._client.send(request, stream=True, _before_send=begin_transport)
                 else:
-                    begin_transport()
+                    await begin_transport()
                     response = await self._client.send(request, stream=True)
                 events = None
                 try:
                     record.http_status = response.status_code
+                    if response.status_code == 429:
+                        record.retry_after_seconds = _retry_after_seconds(response.headers.get("Retry-After"))
+                    if _on_http_status is not None:
+                        _on_http_status(response.status_code, record.retry_after_seconds)
                     if access_probe:
                         record._gateway_access_routing_issue = routing_issue(response.headers, payload["model"])
                     if spec.identity is not None:

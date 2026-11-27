@@ -808,7 +808,7 @@ async def concurrent_window(run, target, client, settings, point, calibration, *
 
     async def send(shape, role, progress=None, index=None):
         while not ended():
-            async with run.slot(False, min(sending_cutoff, run.deadline)) as admitted:
+            async with run.slot(False, min(sending_cutoff, run.deadline), target.name) as admitted:
                 if not admitted:
                     continue  # A slot wait may have used the original cutoff.
                 if ended():
@@ -819,19 +819,20 @@ async def concurrent_window(run, target, client, settings, point, calibration, *
                 spec = build_spec(run, settings, point, shape, calibration, role=role, phase=phase)
                 if spec is None:
                     return None
-                guarded = dict(on_start=request_started)
-                if reverse:
-                    def eligible():
-                        return not ended() and (not probe_request or trigger_ready())
+                admission_deadline = min(sending_cutoff, run.deadline)
+                def eligible():
+                    return not ended() and (not probe_request or trigger_ready())
 
+                guarded = dict(admission_deadline=admission_deadline, prepared_admission=True,
+                               admission_check=eligible, on_start=request_started)
+                if reverse:
                     def phase_started():
                         request_started()
                         if index is not None and phase == "probe":
                             active[index] = progress
                             changed.set()
 
-                    guarded = dict(admission_deadline=min(sending_cutoff, run.deadline), prepared_admission=True,
-                                   admission_check=eligible, on_start=phase_started)
+                    guarded.update(on_start=phase_started)
                 try:
                     record = await run.request(target, client, spec, event=progress, slot_reserved=True, **guarded)
                 except asyncio.CancelledError as exc:
@@ -841,6 +842,8 @@ async def concurrent_window(run, target, client, settings, point, calibration, *
                     raise
                 if record is not None:
                     records.append(record)
+                elif time.monotonic() >= admission_deadline and not ended() and sending_cutoff > admission_deadline:
+                    continue  # The minimum-sample extension opened a new sending interval.
                 return record
         return None
 

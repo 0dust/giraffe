@@ -45,6 +45,7 @@ from .models import (
 
 
 logger = logging.getLogger(__name__)
+_RATE_LIMIT_FALLBACK_SECONDS = 1.0
 # A context-local sink lets web runs persist evidence without changing request()
 # or sharing a writer between concurrent CLI invocations.
 record_sink = ContextVar("giraffe_record_sink", default=lambda record: None)
@@ -141,15 +142,15 @@ def model_identity_warnings(config: RunConfig, records: list[RequestRecord]) -> 
     return warnings
 
 
-def _stats(records: list[RequestRecord]) -> dict:
-    """attempted = completed + failed + timed_out + cancelled + reasoning_budget_exhausted.
-
-    Reasoning-budget records are neither errors nor answers; they are excluded from error_rate.
-    """
-    good = [r for r in records if r.status == "completed" and r.valid]
+def _stats(records: list[RequestRecord], *, separate_rate_limits: bool = False) -> dict:
+    """Exclude cancellation, reasoning exhaustion, and optionally 429 from the error rate."""
+    classified = records
+    if separate_rate_limits:
+        classified = [r for r in records if r.http_status != 429]
+    good = [r for r in classified if r.status == "completed" and r.valid]
     latencies = [r.elapsed_ms for r in good]
     output = [r.first_output_ms for r in good if r.first_output_ms is not None]
-    evaluated = [r for r in records if r.status != "cancelled" and not _reasoning_budget(r)]
+    evaluated = [r for r in classified if r.status != "cancelled" and not _reasoning_budget(r)]
     errors = sum(r.status in {"failed", "timeout"} or (r.status == "completed" and not r.valid) for r in evaluated)
     rates = [r.output_tokens / (r.elapsed_ms / 1000) for r in good
              if r.output_tokens is not None and r.elapsed_ms > 0]
@@ -157,10 +158,10 @@ def _stats(records: list[RequestRecord]) -> dict:
     result = {
         "attempted": len(records), "completed": len(good),
         "failed": sum((r.status == "failed" or (r.status == "completed" and not r.valid))
-                      and not _reasoning_budget(r) for r in records),
-        "reasoning_budget_exhausted": sum(map(_reasoning_budget, records)),
-        "timed_out": sum(r.status == "timeout" for r in records),
-        "cancelled": sum(r.status == "cancelled" for r in records),
+                      and not _reasoning_budget(r) for r in classified),
+        "reasoning_budget_exhausted": sum(map(_reasoning_budget, classified)),
+        "timed_out": sum(r.status == "timeout" for r in classified),
+        "cancelled": sum(r.status == "cancelled" for r in classified),
         "error_rate": errors / len(evaluated) if evaluated else None,
         "p50_ms": percentile(latencies, .5), "p95_ms": percentile(latencies, .95),
         "first_output_p50_ms": percentile(output, .5),
@@ -184,6 +185,9 @@ def _stats(records: list[RequestRecord]) -> dict:
         "finish_reasons": dict(Counter(r.finish_reason or "unknown" for r in records)),
         "measurement_window_ms": max((r.completed_ms or 0 for r in records), default=0)-min((r.dispatch_ms or 0 for r in records), default=0),
     }
+
+    if separate_rate_limits:
+        result["rate_limited"] = len(records) - len(classified)
 
     window = result["measurement_window_ms"]/1000
     result["completed_requests_per_second"] = result["completed"]/window if window>0 else None
@@ -382,6 +386,10 @@ class _Run:
         self.dropped_offers = 0
         self.budget_counts = Counter()
         self.errors = 0
+        self.rate_limit_until: dict[str, float] = {}
+        self.consecutive_rate_limits: Counter[str] = Counter()
+        self.rate_limit_threshold_reached = False
+        self.dispatch_stopped = asyncio.Event()
         self.reason: str | None = None
         self.limits_reached = set()
         self.request_limit_scopes: set[str] = set()
@@ -667,6 +675,8 @@ class _Run:
             self.reason = self.reason or "; ".join(health["abort_reason"] for health in self.endpoint_health.values())
         if self.errors >= self.config.stop_after_errors:
             self.reason = self.reason or states.STOP_ERROR_THRESHOLD
+        if self.rate_limit_threshold_reached:
+            self.reason = self.reason or states.STOP_RATE_LIMIT
         self.reason = self.reason or previous
         if (self.reason == states.STOP_CANCELLED_BY_USER and previous != self.reason and self._gateway_only_phase
                 and all(check in SHARED_BASELINE_EXCLUDED_WORKLOADS for _, check in self.pending_checks)
@@ -675,6 +685,7 @@ class _Run:
             # A user stop also skips judging, which the inference deadline allows.
             self.user_stop_scope = "gateway"
         if self.reason and self.reason != states.STOP_REQUEST_BUDGET and not self.stop_notified:
+            self.dispatch_stopped.set()
             self.stop_notified = True
             self.emit("run_stopping", abort_reason=self.reason)
         return (self.endpoint_health[target]["abort_reason"] if target else None) or self.reason
@@ -712,6 +723,36 @@ class _Run:
             return
         health.update(last_response_seconds=time.monotonic() - self.start,
                       consecutive_failures=0, failure_request_ids=[])
+
+    def observe_http_status(self, target: str, status: int, retry_after: float | None) -> None:
+        if status != 429:
+            self.consecutive_rate_limits.pop(target, None)
+            return
+
+        self.endpoint_response(target)
+        delay = _RATE_LIMIT_FALLBACK_SECONDS if retry_after is None else retry_after
+        self.rate_limit_until[target] = max(self.rate_limit_until.get(target, 0.0),
+                                            time.monotonic() + delay)
+        self.consecutive_rate_limits[target] += 1
+        if self.consecutive_rate_limits[target] >= self.config.stop_after_errors:
+            self.rate_limit_threshold_reached = True
+            self.stop_reason()
+
+    async def wait_for_rate_limit(self, target: str, deadline: float, *, scheduled: bool = False) -> bool:
+        while (until := self.rate_limit_until.get(target, 0.0)) > time.monotonic():
+            # Scheduled offers must never be replayed together after cooldown.
+            if scheduled or self.stop_reason(target) not in {None, states.STOP_REQUEST_BUDGET}:
+                return False
+            now = time.monotonic()
+            wake_at = min(until, deadline)
+            if now >= wake_at:
+                return False
+            try:
+                async with asyncio.timeout(wake_at - now):
+                    await self.dispatch_stopped.wait()
+            except TimeoutError:
+                pass
+        return True
 
     def endpoint_failure(self, target, record_id=None):
         health = self.endpoint_health[target]
@@ -766,25 +807,33 @@ class _Run:
         self.slots.put_nowait(None)
 
     @asynccontextmanager
-    async def slot(self, reserved: bool, deadline: float | None = None, *, gateway_probe: bool = False):
-        if not reserved:
+    async def slot(self, reserved: bool, deadline: float | None = None, cooldown_target: str | None = None,
+                   *, gateway_probe: bool = False):
+        if reserved:
+            yield True
+            return
+        while True:
+            if cooldown_target is not None and not await self.wait_for_rate_limit(
+                    cooldown_target, deadline if deadline is not None else math.inf):
+                yield False
+                return
             if self.slots.empty() and self.ceiling_constrains_pool:
                 self.limits_reached.add("concurrency")
                 self.concurrency_limit_scopes.add("gateway" if gateway_probe else "shared")
-            if deadline is None:
-                await self.slots.get()
-            else:
-                try:
-                    async with asyncio.timeout_at(deadline):
-                        await self.slots.get()
-                except TimeoutError:
-                    yield False
-                    return
+            try:
+                async with asyncio.timeout_at(deadline):
+                    await self.slots.get()
+            except TimeoutError:
+                yield False
+                return
+            if cooldown_target is None or self.rate_limit_until.get(cooldown_target, 0.0) <= time.monotonic():
+                break
+            # A 429 can arrive before an occupied slot becomes available.
+            self.release_slot()
         try:
             yield True
         finally:
-            if not reserved:
-                self.release_slot()
+            self.release_slot()
 
     def timeout_origin(self, spec):
         """Validate producer provenance against the request's actual deadline."""
@@ -868,18 +917,28 @@ class _Run:
         slot_deadline = min(self.deadline, deadline_override if deadline_override is not None else self.deadline)
         if admission_deadline is not None:
             slot_deadline = min(slot_deadline, admission_deadline)
-        async with self.slot(slot_reserved, slot_deadline, gateway_probe=gateway_probe) as admitted:
+        # Identity probes measure gateway policy using their own credentials.
+        rate_limit_control = spec.identity is None
+        observes_headers = getattr(client, "_supports_rate_limit_control", False) is True
+        guard_admission = admission_deadline is not None and (budget_reserved or prepared_admission)
+        guard_transport = ((rate_limit_control and observes_headers) or
+                           (guard_admission and getattr(client, "_supports_dispatch_guard", False) is True))
+        defer_attempt = admission_deadline is not None or guard_transport
+        cooldown_target = target.name if rate_limit_control and not budget_reserved else None
+        async with self.slot(slot_reserved, slot_deadline, cooldown_target, gateway_probe=gateway_probe) as admitted:
+            if admitted and rate_limit_control and slot_reserved:
+                admitted = await self.wait_for_rate_limit(target.name, slot_deadline, scheduled=budget_reserved)
             # An offered arrival owns its budget even if a later arrival exhausts
             # the ceiling. Only a real stop condition can prevent its dispatch.
             reason = self.stop_reason(target.name)
             stopped = not admitted or time.monotonic() >= slot_deadline or (
                 reason is not None and reason != states.STOP_REQUEST_BUDGET)
-            if stopped or (admission_deadline is None and not budget_reserved and not budget_exempt
+            if stopped or (not defer_attempt and not budget_reserved and not budget_exempt
                            and not self.reserve_offer(target.name, gateway_probe=gateway_probe)):
-                if admission_deadline is None or time.monotonic() >= self.deadline or reason:
+                if (admission_deadline is None and not budget_reserved) or time.monotonic() >= self.deadline or reason not in {None, states.STOP_REQUEST_BUDGET}:
                     self.mark_unfinished(target.name, _scenario_checks(spec))
                 return None
-            if admission_deadline is None:
+            if not defer_attempt:
                 self.attempted += 1
             output_cap = spec.max_tokens if spec.max_tokens is not None else self.config.max_output_tokens
             request_parameters = {**(request_parameters or {}),
@@ -904,8 +963,14 @@ class _Run:
                     raise _DispatchRefused
                 return now
 
-            guard_admission = admission_deadline is not None and (budget_reserved or prepared_admission)
-            guard_transport = guard_admission and getattr(client, "_supports_dispatch_guard", False) is True
+            async def wait_to_send():
+                # A 429 can arrive while this request is queued for a connection.
+                if not await self.wait_for_rate_limit(target.name, slot_deadline, scheduled=budget_reserved):
+                    raise _DispatchRefused
+
+            def observe_http_status(status, retry_after):
+                self.observe_http_status(target.name, status, retry_after)
+
             key = (target.name, spec.scenario)
             global_deadline = False
             deadline = None
@@ -971,7 +1036,7 @@ class _Run:
 
             def begin_attempt():
                 nonlocal started, started_at, request_slot, token, pending_start
-                if admission_deadline is not None:
+                if defer_attempt:
                     started = admission_clock()
                     if (not budget_reserved and not budget_exempt
                             and not self.reserve_offer(target.name, gateway_probe=gateway_probe)):
@@ -990,7 +1055,7 @@ class _Run:
                     self.endpoint_attempt(target.name)
                 self.active[key] += 1
                 self.peak[key] = max(self.peak[key], self.active[key])
-                if admission_deadline is None:
+                if not defer_attempt:
                     started = time.monotonic()
                 started_at = _now()
                 token = self.inflight.start(target.name)
@@ -1016,12 +1081,14 @@ class _Run:
                     begin_attempt()
                     deadline = asyncio.timeout(request_budget())
                 async with deadline:
+                    execute_options = {"first_output_event": event}
+                    if lifecycle_observer is not None:
+                        execute_options["lifecycle_observer"] = lifecycle_observer
                     if guard_transport:
-                        record = await client.execute(spec, first_output_event=event, _before_send=begin_attempt,
-                            **({"lifecycle_observer": lifecycle_observer} if lifecycle_observer is not None else {}))
-                    else:
-                        record = await client.execute(spec, first_output_event=event,
-                            **({"lifecycle_observer": lifecycle_observer} if lifecycle_observer is not None else {}))
+                        execute_options["_before_send"] = begin_attempt
+                    if rate_limit_control and observes_headers:
+                        execute_options.update(_wait_to_send=wait_to_send, _on_http_status=observe_http_status)
+                    record = await client.execute(spec, **execute_options)
                 if token is None:
                     if record.status == "cancelled":
                         if task.cancelling() > cancellations:
@@ -1140,6 +1207,9 @@ class _Run:
                 elif reason == states.STOP_ERROR_THRESHOLD:
                     record.termination_reason, record.termination_limit_seconds = "error_threshold", None
                     record.error = f"stopped after {self.config.stop_after_errors} request errors"
+                elif reason == states.STOP_RATE_LIMIT:
+                    record.termination_reason, record.termination_limit_seconds = "rate_limit_threshold", None
+                    record.error = states.STOP_RATE_LIMIT
                 elif self.endpoint_health[target.name]["abort_reason"]:
                     record.termination_reason, record.termination_limit_seconds = "endpoint_unresponsive", self.config.unresponsive_for_seconds
                     record.error = self.endpoint_health[target.name]["abort_reason"]
@@ -1192,7 +1262,8 @@ class _Run:
                 if (not evidence_probe and not getattr(client, "reports_response_activity", False)
                         and (record.response_body_bytes or record.chunks or record.output or record.reasoning)):
                     self.endpoint_response(target.name)
-                if (token is not None and not readiness and not evidence_probe and no_response_failure(record, include_timeouts=not _stress(spec.scenario))
+                if (token is not None and not readiness and not evidence_probe and record.http_status != 429
+                        and no_response_failure(record, include_timeouts=not _stress(spec.scenario))
                         and not intentional and timeout_override is None
                         and deadline_override is None and spec.cancel_after_ms is None
                         and spec.cancel_after_chunks is None and not self.stop.is_set()
@@ -1209,8 +1280,11 @@ class _Run:
                             record.error = self.endpoint_health[target.name]["abort_reason"]
                         self.mark_unfinished(target.name, _scenario_checks(spec))
                 budget_only = bool(set(spec.check_ids) & {"prefix", "sessions", "tools"}) and reasoning_budget(record)
+                if rate_limit_control and not observes_headers and record.http_status is not None:
+                    observe_http_status(record.http_status, record.retry_after_seconds)
                 if _serving_failure(record, spec.scenario) and not readiness and not intentional and not budget_only:
-                    self.errors += 1
+                    if record.http_status != 429:
+                        self.errors += 1
                     record.check_ids = list(dict.fromkeys([*record.check_ids, *[
                         name for name in ("access", "serving", "first_output") if name in self.config.checks]]))
                 if budget_exempt:
@@ -1240,7 +1314,7 @@ class _Run:
                               **({"user": {key: spec.workload[key] for key in ("user_id", "population", "profile", "window_id", "phase", "request_sequence", "session_id", "turn_id", "conversation_sequence", "role", "matched_work_sequence", "trigger", "heavy_profile", "cancellation_role", "cohort", "origin", "work_sequence", "activation_seconds") if key in spec.workload}} if "multi_user" in spec.check_ids else {}),
                               request_slot=request_slot, request=record.model_dump(mode="json", include={
                                   "id", "target", "fixture_id", "scenario", "condition_id", "intentional", "status", "valid", "score",
-                                  "elapsed_ms", "first_output_ms", "check_ids", "http_status",
+                                  "elapsed_ms", "first_output_ms", "check_ids", "http_status", "retry_after_seconds",
                                   "request_timeout_seconds", "termination_reason", "termination_limit_seconds",
                                   "started_at", "dispatch_ms", "completed_ms", "timing_start_ms",
                                   *({"request_body_sent_ms"} if record.request_body_sent_ms is not None else ()),
@@ -1653,7 +1727,7 @@ async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attributio
                     if spec is None:
                         break
                     spec = spec.model_copy(update={"request_timeout_seconds": min(spec.request_timeout_seconds, max(.001, probe_end - time.monotonic()))})
-                    record = await run.request(target, client, spec)
+                    record = await run.request(target, client, spec, deadline_override=probe_end)
                     if record is None:
                         break
                     probe_count += 1
@@ -1806,7 +1880,7 @@ async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attributio
                         index = dispatched
                         dispatched += 1
                         spec = _spec(heavy_specs[index % len(heavy_specs)], "sustained", ["recovery"])
-                        await run.request(target, client, spec)
+                        await run.request(target, client, spec, admission_deadline=end, prepared_admission=True)
                 run.start_condition(target.name, "sustained", planned=allowance, planned_kind="upper_bound")
                 run.emit("scenario_started", target.name, "sustained")
                 outcomes = await asyncio.gather(*(worker() for _ in range(effective.concurrency)),
@@ -1821,8 +1895,8 @@ async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attributio
                         raise outcome
                 run.emit("scenario_finished", target.name, "sustained")
                 run.finish_condition(target.name, "sustained", reason="sending window ended" if allowance is None or dispatched < allowance else None)
-                run.observations[target.name]["sustained_batches"] = dispatched
                 sustained = [r for r in run.records if r.target == target.name and r.scenario == "sustained"]
+                run.observations[target.name]["sustained_batches"] = len(sustained)
                 window_ms = max((r.completed_ms for r in sustained), default=0) - min(
                     (r.dispatch_ms for r in sustained), default=0)
                 weighted = sum(r.completed_ms-r.dispatch_ms for r in sustained) / window_ms if window_ms else 0
@@ -2146,7 +2220,8 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
             records = [r for r in records if r.scenario in {"warm", "generation"}]
         if check_id == "generation":
             records = [r for r in records if r.scenario == "generation"]
-        metrics, status, summary = _stats(records), "pass", "Observed requests met configured checks."
+        metrics = _stats(records, separate_rate_limits=check_id == "serving")
+        status, summary = "pass", "Observed requests met configured checks."
         timing_records = records
         if check_id == "recovery":
             timing_records = [r for r in records if r.scenario in {"recovery_baseline", "recovery"}]
@@ -2196,6 +2271,11 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
         elif check_id == "serving":
             if metrics["error_rate"] is not None and metrics["error_rate"] > limits.max_error_rate:
                 status, summary = "fail", "Invalid completions, errors or timeouts exceeded the configured allowance."
+                if metrics["rate_limited"]:
+                    summary += f" {metrics['rate_limited']} requests were also rate limited (HTTP 429)."
+            elif metrics["rate_limited"]:
+                status, summary = "inconclusive", f"{metrics['rate_limited']} requests were rate limited (HTTP 429)."
+                metrics["reason_code"] = "rate_limited"
             elif metrics["reasoning_budget_exhausted"]:
                 status, summary = "inconclusive", "Reasoning exhausted the output budget before an answer."
             else:
@@ -2957,6 +3037,8 @@ def _verdict_summary(check, config, records, budget):
     elif check.status == "inconclusive" and (reason == "client_delayed" or (
             reason is None and "scheduling delay" in text and metrics.get("timing_quality", {}).get("status") == "client_delayed")):
         remedy = "rerun from an idle load-generator machine and reduce competing client work so streaming timing can be measured"
+    elif reason == "rate_limited":
+        remedy = "verify the endpoint or gateway request quota and rerun within that allowance"
     elif check.status == "inconclusive" and metrics.get("reasoning_budget_exhausted"):
         remedy = _output_budget_guidance(config, records, check.id)
     elif check.status == "inconclusive" and any(r.score is None and r.score_message == TRUNCATED_ANSWER for r in records):

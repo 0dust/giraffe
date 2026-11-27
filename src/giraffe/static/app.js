@@ -635,7 +635,7 @@ function requestIdentity(record,records=state.detail?.live_requests || state.det
 }
 function requestTiming(record) {return record.elapsed_ms==null?(inProgress(requestStatus(record))?'Timing pending':'No timing recorded'):ms(record.elapsed_ms);}
 function renderRequestTermination(record) {
-  const labels={request_timeout:'Request timeout reached',user_stop:'Stopped by user',run_duration_limit:'Run traffic duration limit reached',memory_limit:'Memory guardrail reached',error_threshold:'Error threshold reached',intentional_deadline:'Intentional deadline probe'};
+  const labels={request_timeout:'Request timeout reached',user_stop:'Stopped by user',run_duration_limit:'Run traffic duration limit reached',memory_limit:'Memory guardrail reached',error_threshold:'Error threshold reached',rate_limit_threshold:'HTTP 429 rate limit threshold',intentional_deadline:'Intentional deadline probe'};
   const reason=record.termination_reason,limit=record.termination_limit_seconds,timeout=record.request_timeout_seconds;
   if(reason==null&&limit==null&&timeout==null)return '';
   return `<section class="request-termination"><h3>Request limits &amp; stop reason</h3><dl class="metrics-grid">${metric('Configured request timeout',timeout==null?'Not recorded':elapsed(timeout))}${reason?metric('Stop reason',labels[reason] || human(reason)):''}${limit!=null?metric('Effective deadline',elapsed(limit),'May be shortened by the remaining run duration or an intentional probe'):''}</dl>${record.error?`<p class="hint">${escape(record.error)}</p>`:''}</section>`;

@@ -40,8 +40,9 @@ STOP_RUN_CANCELLED: Final = "run cancelled"
 STOP_MAX_DURATION: Final = "maximum run duration reached"
 STOP_REQUEST_BUDGET: Final = "maximum request budget reached"
 STOP_ERROR_THRESHOLD: Final = "error threshold reached"
+STOP_RATE_LIMIT: Final = "rate limit threshold reached"
 STOP_REASONS: Final = (STOP_CANCELLED_BY_USER, STOP_RUN_CANCELLED, STOP_MAX_DURATION,
-                       STOP_REQUEST_BUDGET, STOP_ERROR_THRESHOLD)
+                       STOP_REQUEST_BUDGET, STOP_ERROR_THRESHOLD, STOP_RATE_LIMIT)
 
 # Condition lifecycle: observations.targets.*.conditions[].status before aggregation.
 CONDITION_LIFECYCLE: Final = ("waiting", "running", "finished")
