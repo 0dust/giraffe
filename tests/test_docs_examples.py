@@ -87,11 +87,14 @@ def test_docs_use_current_flags_and_describe_output_controls():
     assert '--structured-output' in README and '--verbose' in README
 
 
-def test_running_guide_exit_codes_match_cli_help(capsys):
+@pytest.mark.parametrize('command', ['run', 'cold-start'])
+def test_running_guide_exit_codes_match_cli_help(command, capsys):
     with pytest.raises(SystemExit) as result:
-        main(['run', '--help'])
+        main([command, '--help'])
     assert result.value.code == 0
     help_text = capsys.readouterr().out
+    assert 'request_options' in help_text
+    assert 'https://github.com/0dust/giraffe/blob/main/examples/reasoning.yaml' in help_text
     rows = re.findall(r'^\| `([0-4])` \| ([^|]+) \|$', RUNNING, re.MULTILINE)
     assert len(rows) == 5
     for code, meaning in rows:
@@ -149,6 +152,31 @@ def test_sglang_example_uses_default_port_and_metrics_profile():
     assert target.url == 'http://127.0.0.1:30000/v1'
     assert target.metrics_profile == 'sglang'
     assert 'examples/sglang.yaml' in README
+
+
+def test_reasoning_example_preserves_request_options():
+    values = yaml.safe_load((ROOT / 'examples' / 'reasoning.yaml').read_text())
+    config = RunConfig.model_validate(values)
+    assert config.request_options == {'reasoning_effort': 'low'}
+    assert config.max_output_tokens == 2048
+
+    values.update(yaml.safe_load(
+        'request_options: {chat_template_kwargs: {enable_thinking: false}}'))
+    config = RunConfig.model_validate(values)
+    assert config.request_options == {'chat_template_kwargs': {'enable_thinking': False}}
+
+
+def test_reasoning_example_is_linked_from_readme_and_running_guide():
+    assert 'examples/reasoning.yaml' in README
+    assert 'https://github.com/0dust/giraffe/blob/main/examples/reasoning.yaml' in RUNNING
+    example = (ROOT / 'examples' / 'reasoning.yaml').read_text()
+    for document in (example, RUNNING):
+        text = ' '.join(document.replace('`', '').replace('#', '').split())
+        assert 'GPT-OSS takes low, medium or high' in text
+        assert 'none falls back to low and still reasons' in text
+        assert 'request_options are defaults for ordinary requests' in text
+        assert 'case can override a matching key' in text
+        assert 'Gateway access probes use their own options.' in text
 
 
 def test_scale_down_example_resolves_existing_fixtures_and_keeps_followup_capacity():
