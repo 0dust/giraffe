@@ -342,8 +342,10 @@ def render_performance(performance, *, prefix='performance'):
             + _e(window['label']) + ' · ' + _fmt(window.get('duration_s')) + ' s · '
             + _fmt(window['request_count']) + ' requests<p class="html-note">'
             + _e(' · '.join(filter(None, (window.get('workload_label'), window.get('stages_description')))))
-            + ' ' + _e(window.get('population', '')) + ' ' + _e(target.get('scope_note', '')) + '</p>'
-            + '<p class="html-note">Absent evidence stays unavailable. Collect eligible observations for this scope. Specific exclusions and collection instructions appear below.</p></div>')
+            + '.</p><details><summary>About these measurements</summary><p>'
+            + _e(window.get('population', '')) + '</p>'
+            + '<p>Every request remains in the dispatch-ordered series; observed throughput does not establish capacity. '
+            + 'Missing measurements and collection instructions appear in their cards below.</p></details></div>')
         if len(target.get('windows', [])) > 1:
             parts.append('<details><summary>Measurement windows · static report</summary>'
                 '<p>This document shows the default measurement for this target. Other windows are selectable in the app; populations are never pooled.</p>'

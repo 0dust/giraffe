@@ -564,10 +564,13 @@ const r={id:'tool',fixture_id:'mixed',target:'local',scenario:'tool_auto_complet
 state.detail={report:{manifest:{config:{retention:'all'}},requests:[r]}};
 nodes['#request-dialog']={innerHTML:'',showModal(){this.shown=true;}};
 openRequest('tool');let html=nodes['#request-dialog'].innerHTML;
+assert.match(html,/request-comparison" data-outcome="fail"/);
 assert(nodes['#request-dialog'].shown);assert.match(html,/Response protocol/);assert.match(html,/Assistant text/);assert.match(html,/Tool calls/);
 assert.match(html,/Missing &lt;sentence&gt;/);assert.match(html,/Expected assistant text/);assert.match(html,/&lt;expected&gt;/);
 assert.match(html,/Actual tool calls/);assert.match(html,/&lt;Delhi&gt;/);assert.match(html,/event list was truncated/);
 assert.match(html,/&lt;content&gt;/);assert.doesNotMatch(html,/<actual>|<expected>|<Delhi>|<prompt>|<content>|<definition>/);
+r.score=true;openRequest('tool');assert.match(nodes['#request-dialog'].innerHTML,/data-outcome="pass"/);
+r.score=null;openRequest('tool');assert.match(nodes['#request-dialog'].innerHTML,/data-outcome="inconclusive"/);
 r.tool_calls=[];r.evaluation.tool_expectation.expected_content=null;r.tool_evaluation.content={status:'not_checked',message:'No requirement'};
 openRequest('tool');html=nodes['#request-dialog'].innerHTML;assert.match(html,/Not checked/);assert.match(html,/Tool-only responses are allowed/);assert.match(html,/No tool-call body retained or recorded/);
 assert.equal(renderToolEvaluation({}), '');assert.equal(renderActualToolCalls({}), '');assert.equal(renderResponseEvents({}), '');

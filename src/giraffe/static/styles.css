@@ -678,8 +678,8 @@ dialog::backdrop { background: rgba(5,5,6,.6); backdrop-filter: blur(6px); -webk
 .dialog-head h2 { font-size: 18px; overflow-wrap: anywhere; }
 .dialog-head .mono, .dialog-head p.mono { color: var(--text-3); font-size: 12px; margin-top: 4px; }
 .dialog-head .button.ghost:focus-visible { outline: 1px solid var(--line-strong); outline-offset: 1px; }
-#request-dialog:has(.statline .status.fail) .request-comparison > section:last-child .body-output { border-color: color-mix(in oklab, var(--fail) 45%, transparent); background: color-mix(in oklab, var(--fail) 6%, var(--bg-elev)); }
-#request-dialog:has(.statline .status.pass) .request-comparison > section:last-child .body-output { border-color: color-mix(in oklab, var(--pass) 40%, transparent); background: color-mix(in oklab, var(--pass) 5%, var(--bg-elev)); }
+#request-dialog .request-comparison[data-outcome="fail"] > section:last-child .body-output { border-color: color-mix(in oklab, var(--fail) 45%, transparent); background: color-mix(in oklab, var(--fail) 6%, var(--bg-elev)); }
+#request-dialog .request-comparison[data-outcome="pass"] > section:last-child .body-output { border-color: color-mix(in oklab, var(--pass) 40%, transparent); background: color-mix(in oklab, var(--pass) 5%, var(--bg-elev)); }
 .dialog-head .button.ghost { width: 32px; height: 32px; min-height: 0; padding: 0; }
 .dialog-body { padding: 20px 24px 24px; display: grid; gap: 16px; }
 .dialog-body h3 { font-size: 13px; margin-top: 4px; display: flex; align-items: center; gap: 8px; }

@@ -36,6 +36,14 @@ def test_standalone_findings_first_order_and_complete_sections():
     assert report.model_dump_json() == before
 
 
+def test_measurement_scope_has_one_population_explanation():
+    html = _render(synthetic_report_1000())
+    scope = html.split('<div class="html-scope">', 1)[1].split('</div>', 1)[0]
+    assert scope.count('One comparable workload across its recorded load stages') == 1
+    assert 'Headlines use one comparable workload' not in scope
+    assert '<summary>About these measurements</summary>' in scope
+
+
 def test_standalone_chart_decimation_preserves_extrema_and_bounds_geometry():
     from giraffe.performance_html import decimate
 
