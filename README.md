@@ -24,6 +24,11 @@ against expected results, measure response times, and test behavior under load.
 Run it from the command line or a local web UI, inspect failed requests, and
 compare results before and after a deployment change.
 
+<a href="https://github.com/0dust/giraffe/blob/bc518043b56e95a87dc43360167174aa2e0fbbd3/docs/samples/README.md#ollama-context-comparison"><img alt="Recorded Giraffe recall results: 19 of 45 answers wrong at context 4096, one wrong at context 8192" src="https://raw.githubusercontent.com/0dust/giraffe/bc518043b56e95a87dc43360167174aa2e0fbbd3/docs/assets/readme/context-recall-comparison.svg" width="1280"></a>
+
+**19 recall failures at 4,096 context. One at 8,192.** Giraffe checked the same
+45 questions in these two Ollama runs. [Inspect the evidence](https://github.com/0dust/giraffe/blob/bc518043b56e95a87dc43360167174aa2e0fbbd3/docs/samples/README.md#ollama-context-comparison).
+
 Use it to answer questions like:
 
 - Do answers that pass individually still pass when requests run concurrently?
@@ -36,13 +41,6 @@ those tests and settings; it does not establish general model quality or certify
 production capacity.
 
 [Quick start](#quick-start) · [Inference engines](#inference-engines) · [Conversations](#test-multi-turn-conversations) · [Baselines](#save-a-baseline-and-compare) · [Tests](#tests) · [Docs](#documentation) · [Discord](https://discord.gg/GBefPbWebr)
-
-[![Giraffe baseline report showing a known-answer regression, with both sample counts visible](https://raw.githubusercontent.com/0dust/giraffe/f0940c693a5a19a050f24e49321442284cde86f6/docs/assets/readme/baseline-comparison.jpg)](https://raw.githubusercontent.com/0dust/giraffe/f0940c693a5a19a050f24e49321442284cde86f6/docs/assets/readme/baseline-comparison.jpg)
-
-*A recorded Qwen2.5-7B comparison: known-answer results changed from 6/6 to 0/6
-after a KV-cache setting change. This is one check; the reference run had other failures.*
-
-[Sample reports](https://github.com/0dust/giraffe/blob/f0940c693a5a19a050f24e49321442284cde86f6/docs/samples/README.md)
 
 ## Quick start
 
@@ -97,11 +95,17 @@ giraffe ui
 
 Open the access link printed in the terminal (it contains a per-launch token), enter your endpoint and model, choose checks, then **Launch**. Keep the terminal open; **Ctrl+C** stops the UI. Use `--port` to choose a different port.
 
-[![Live Giraffe test cells pulsing as a real run progresses, followed by the completed report](https://raw.githubusercontent.com/0dust/giraffe/f0940c693a5a19a050f24e49321442284cde86f6/docs/assets/readme/browser-ui-live.gif)](https://raw.githubusercontent.com/0dust/giraffe/f0940c693a5a19a050f24e49321442284cde86f6/docs/assets/readme/browser-ui-live.gif)
+[![Giraffe test conditions updating during a recorded local run](https://raw.githubusercontent.com/0dust/giraffe/bc518043b56e95a87dc43360167174aa2e0fbbd3/docs/assets/readme/browser-ui-live.gif)](https://raw.githubusercontent.com/0dust/giraffe/bc518043b56e95a87dc43360167174aa2e0fbbd3/docs/assets/readme/browser-ui-live.gif)
 
-*Watch test cells update during a real Qwen2.5 1.5B run, then inspect the completed
-report. Playback is condensed. This short UI demonstration is separate from the
-longer load experiment below. [Download this run's report](https://github.com/0dust/giraffe/raw/f0940c693a5a19a050f24e49321442284cde86f6/docs/samples/browser-ui-demo.zip).*
+*Watch test conditions update during a real Qwen2.5 1.5B run. Playback is condensed.
+[Download this run](https://github.com/0dust/giraffe/raw/bc518043b56e95a87dc43360167174aa2e0fbbd3/docs/samples/browser-ui-demo.zip) · [Recording details](https://github.com/0dust/giraffe/blob/bc518043b56e95a87dc43360167174aa2e0fbbd3/docs/samples/README.md#browser-ui-demo).*
+
+### Inspect a wrong tool-call argument
+
+<a href="https://raw.githubusercontent.com/0dust/giraffe/bc518043b56e95a87dc43360167174aa2e0fbbd3/docs/assets/readme/tool-call-mismatch.svg"><img alt="Saved request evidence: expected customer C-41442, returned C-41422, failed argument highlighted in red" src="https://raw.githubusercontent.com/0dust/giraffe/bc518043b56e95a87dc43360167174aa2e0fbbd3/docs/assets/readme/tool-call-mismatch.svg" width="1280"></a>
+
+*The call is valid, but the customer is wrong. Giraffe flags the argument mismatch
+without executing the tool. [Request evidence](https://github.com/0dust/giraffe/blob/bc518043b56e95a87dc43360167174aa2e0fbbd3/docs/samples/README.md#tool-call-mismatch).*
 
 ## Inference engines
 
@@ -205,21 +209,11 @@ your own questions and expected answers to test the work your application needs.
 See the [Load test guide](https://github.com/0dust/giraffe/blob/main/docs/workloads.md#load-test)
 for traffic patterns, answer checks and configuration examples.
 
-[![Giraffe Results table showing concurrency 1, 2, and 4 together, with a passing concurrency-1 control in both sweeps](https://raw.githubusercontent.com/0dust/giraffe/f0940c693a5a19a050f24e49321442284cde86f6/docs/assets/readme/fresh-load-results.jpg)](https://raw.githubusercontent.com/0dust/giraffe/f0940c693a5a19a050f24e49321442284cde86f6/docs/assets/readme/fresh-load-results.jpg)
+[![Actual and intended concurrency across the 1, 2 and 4 request stages](https://raw.githubusercontent.com/0dust/giraffe/bc518043b56e95a87dc43360167174aa2e0fbbd3/docs/assets/readme/fresh-load-concurrency.jpg)](https://raw.githubusercontent.com/0dust/giraffe/bc518043b56e95a87dc43360167174aa2e0fbbd3/docs/assets/readme/fresh-load-concurrency.jpg)
 
-*Concurrency 1 passes in both sweeps: 131 and 94 valid responses, against a minimum
-of 60. The rows for concurrency 2 and 4 retain the inconclusive timing outcomes.*
-
-“Baseline” is the first sweep; “Current” is an identical repeat. These used
-Qwen2.5 1.5B on a shared 8 GB M1 Mac, repeating one JSON extraction task for three
-minutes per level. All 840 scored answers were correct. Client scheduling delays
-qualified the higher-load timing; both complete runs remain inconclusive.
-[Download the comparison](https://github.com/0dust/giraffe/raw/f0940c693a5a19a050f24e49321442284cde86f6/docs/samples/load-comparison.zip) · [First sweep](https://github.com/0dust/giraffe/blob/f0940c693a5a19a050f24e49321442284cde86f6/docs/samples/README.md#load-comparison) ·
-[Repeat](https://github.com/0dust/giraffe/blob/f0940c693a5a19a050f24e49321442284cde86f6/docs/samples/README.md#load-comparison).
-
-[![Performance KPIs including client TTFT, response latency and throughput](https://raw.githubusercontent.com/0dust/giraffe/f0940c693a5a19a050f24e49321442284cde86f6/docs/assets/readme/fresh-load-kpis.jpg)](https://raw.githubusercontent.com/0dust/giraffe/f0940c693a5a19a050f24e49321442284cde86f6/docs/assets/readme/fresh-load-kpis.jpg)
-
-[![Actual and intended concurrency across the 1, 2 and 4 request stages](https://raw.githubusercontent.com/0dust/giraffe/f0940c693a5a19a050f24e49321442284cde86f6/docs/assets/readme/fresh-load-concurrency.jpg)](https://raw.githubusercontent.com/0dust/giraffe/f0940c693a5a19a050f24e49321442284cde86f6/docs/assets/readme/fresh-load-concurrency.jpg)
+*A separate November 18 run: Qwen2.5 1.5B on Ollama 0.34.1, with 1,154 correct
+responses across concurrency 1, 2, and 4. All three stages passed.
+[Download the performance run](https://github.com/0dust/giraffe/raw/bc518043b56e95a87dc43360167174aa2e0fbbd3/docs/samples/token-timing.zip) · [Measurement details](https://github.com/0dust/giraffe/blob/bc518043b56e95a87dc43360167174aa2e0fbbd3/docs/samples/README.md#token-timing).*
 
 ## Test multi-turn conversations
 
@@ -260,22 +254,7 @@ The new report shows acceptance results and changes against the saved baseline. 
 
 In the UI, open a completed run and choose **Save baseline** (fully passing runs) or **Save as reference baseline** (other completed runs). Name and save it, then choose **Compare a new run with this baseline** at the bottom of the report, or **Compare a new run** when shown at the top. [Baseline guide →](https://github.com/0dust/giraffe/blob/main/docs/running.md#compare-with-a-baseline)
 
-### Example: inspect the same request before and after a change
-
-**Before — context limit 4096.** The expected badge code is `ZM-5744`; the recorded
-answer is `NR-9239`.
-
-[![Giraffe failed-answer evidence: expected badge code ZM-5744, actual answer NR-9239 at context 4096](https://raw.githubusercontent.com/0dust/giraffe/f0940c693a5a19a050f24e49321442284cde86f6/docs/assets/readme/ollama-default-recall-medium-d0-0-ui.png)](https://raw.githubusercontent.com/0dust/giraffe/f0940c693a5a19a050f24e49321442284cde86f6/docs/assets/readme/ollama-default-recall-medium-d0-0-ui.png)
-
-**After — context limit 8192.** The same quiet-phase case returns the expected
-`ZM-5744`.
-
-[![Giraffe passing-answer evidence: expected and actual badge code ZM-5744 at context 8192](https://raw.githubusercontent.com/0dust/giraffe/f0940c693a5a19a050f24e49321442284cde86f6/docs/assets/readme/ollama-ctx8k-recall-medium-d0-0-ui.png)](https://raw.githubusercontent.com/0dust/giraffe/f0940c693a5a19a050f24e49321442284cde86f6/docs/assets/readme/ollama-ctx8k-recall-medium-d0-0-ui.png)
-
-*Individual request evidence from one Qwen2.5 7B Instruct experiment on a Colab T4,
-using Ollama. The panels show an excerpt of the long input; the
-[complete matched request](https://github.com/0dust/giraffe/blob/f0940c693a5a19a050f24e49321442284cde86f6/docs/samples/context-request-evidence.json) is retained.
-This example does not establish general model accuracy or repeatability.*
+[See the same recall request before and after an Ollama context change →](https://github.com/0dust/giraffe/blob/bc518043b56e95a87dc43360167174aa2e0fbbd3/docs/samples/README.md#ollama-context-comparison)
 
 ## Tests
 
@@ -303,15 +282,6 @@ The four defaults are `access, serving, correctness, first_output`; select addit
 | Gateway access policy · `gateway_access` | Declared allow/deny cases using existing test identity references |
 | Answer consistency · `consistency` | Answer agreement across repeated requests |
 | Tool calling · `tools` | Tool-call structure, names and expected arguments |
-
-### Example: inspect a tool-call argument mismatch
-
-[![Giraffe tool-call evidence showing requested customer C-41442 and returned customer C-41422](https://raw.githubusercontent.com/0dust/giraffe/f0940c693a5a19a050f24e49321442284cde86f6/docs/assets/readme/llamacpp-q8-search-orders-wrong-customer-ui.jpg)](https://raw.githubusercontent.com/0dust/giraffe/f0940c693a5a19a050f24e49321442284cde86f6/docs/assets/readme/llamacpp-q8-search-orders-wrong-customer-ui.jpg)
-
-*The prompt requests cancelled orders for `C-41442`; the recorded `search_orders`
-call uses `C-41422`. The protocol check passed and the expected-argument check
-failed. Giraffe checked the call without executing it. This is one streamed case
-from the Qwen2.5 7B Q8_0 experiment, not a general conclusion about Q8.*
 
 The catalog includes verdict checks and two server observations: **GPU metrics** and
 **Prefix cache**. Both remain in the selected checks and baseline configuration.
@@ -415,5 +385,5 @@ multi-replica deployment is still pending.
 
 ## Sample reports
 
-[Download the load comparison](https://github.com/0dust/giraffe/raw/f0940c693a5a19a050f24e49321442284cde86f6/docs/samples/load-comparison.zip) ·
-[Reports and JSON evidence](https://github.com/0dust/giraffe/blob/f0940c693a5a19a050f24e49321442284cde86f6/docs/samples/README.md) · [Run configuration](https://github.com/0dust/giraffe/blob/f0940c693a5a19a050f24e49321442284cde86f6/docs/samples/load-config.json)
+[Download the load comparison](https://github.com/0dust/giraffe/raw/bc518043b56e95a87dc43360167174aa2e0fbbd3/docs/samples/load-comparison.zip) ·
+[Reports and JSON evidence](https://github.com/0dust/giraffe/blob/bc518043b56e95a87dc43360167174aa2e0fbbd3/docs/samples/README.md) · [Run configuration](https://github.com/0dust/giraffe/blob/bc518043b56e95a87dc43360167174aa2e0fbbd3/docs/samples/load-config.json)
