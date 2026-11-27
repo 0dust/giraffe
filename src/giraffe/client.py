@@ -1009,8 +1009,15 @@ class LLMClient:
                 answer, reasoning, record._gateway_access_refusal, record._gateway_access_metered_reasoning = (
                     assistant_reply(content, choice.get("finish_reason"), usage, record)
                 )
+                if record._gateway_access_refusal:
+                    record.refused = True
             else:
                 answer = _text(content.get("content"))
+                refusal = content.get("refusal")
+                if isinstance(refusal, str) and refusal.strip():
+                    record.refused = True
+                    if not answer.strip():
+                        answer = _text(refusal)
             if logprob_collector is not None:
                 logprob_collector.add(choice.get("logprobs"))
             if spec.workload.get("logprobs") and not streaming:

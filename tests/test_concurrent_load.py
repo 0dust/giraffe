@@ -2,6 +2,7 @@ import asyncio
 import copy
 import json
 import math
+import re
 import time
 import uuid
 
@@ -9,10 +10,12 @@ import httpx
 import pytest
 from pydantic import ValidationError
 
+from giraffe.concurrent_load import prompt
+from giraffe.local_tokenizer import _builtin_encoding
 from giraffe.load_test import (
     execute, interference_measurements, load_time_plan, minimum_reservation, result, assess_point, score_group,
 )
-from giraffe.models import CHECK_LIMIT_FIELDS, CHECK_OPTION_FIELDS, LoadTest, RequestRecord, RunConfig, SHAPES
+from giraffe.models import CHECK_LIMIT_FIELDS, CHECK_OPTION_FIELDS, LoadSize, LoadTest, RequestRecord, RunConfig, SHAPES
 from giraffe.planning import request_plan
 from giraffe.runner import _Run, run_suite
 from giraffe.web import _configuration_errors, create_app
@@ -22,6 +25,18 @@ pytestmark = pytest.mark.usefixtures("local_tokenizer")
 
 
 TARGET = {"name": "local", "url": "http://localhost:1/v1", "model": "test"}
+
+
+def test_long_output_prompt_covers_maximum_output_cap(local_tokenizer):
+    instruction = prompt(0, "long_output")
+    count = int(re.search(r"whole number from 1 to (\d+)", instruction).group(1))
+    max_output_cap = next(bound.le for bound in LoadSize.model_fields["output_tokens"].metadata
+                          if hasattr(bound, "le"))
+    threshold = math.ceil(LoadTest().workloads.stress.min_output_percent / 100 * max_output_cap)
+    # N numbers require at least N tokens under any tokenizer, giving a tokenizer-independent lower bound.
+    assert count >= threshold
+    complete_answer = "K7P4," + ",".join(str(number) for number in range(1, count + 1))
+    assert len(_builtin_encoding().encode(complete_answer)) >= threshold
 
 
 def configuration(**values):
@@ -677,3 +692,30 @@ async def test_endpoint_failure_does_not_mislabel_unreached_levels_as_calibratio
 
 
 # Fake inference clients in this module use the matching local tokenizer.
+
+
+@pytest.mark.parametrize("variant", ["short_answer", "long_output"])
+def test_load_nonce_prefix(variant):
+    import re
+    from giraffe.concurrent_load import nonce_prefix, prompt
+
+    text = prompt(100, variant, nonce="abc")
+    assert text.startswith(nonce_prefix("abc"))
+    assert not re.search(r"Request [0-9a-f]{32}", text)
+    from tests.fake_endpoint import FakeEndpoint
+
+    answer = FakeEndpoint._answer(text)
+    assert answer == "K7P4"
+    if variant == "long_output":
+        assert len(FakeEndpoint._continue_numbered_list(text, answer, 32).split()) > 32
+
+
+def test_multi_user_matched_work_ignores_load_nonce():
+    from giraffe.concurrent_load import make_spec
+    from giraffe.multi_user import _matched_work_sha256
+
+    settings = configuration().load_test
+    point = {"type": "combinations", "level": 1}
+    first = make_spec(settings, "short_short", "multi_user", point, 100, nonce="abc")
+    second = make_spec(settings, "short_short", "multi_user", point, 100, nonce="different")
+    assert _matched_work_sha256(first, nonce="abc") == _matched_work_sha256(second, nonce="different")

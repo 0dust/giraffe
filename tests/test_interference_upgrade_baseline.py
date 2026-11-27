@@ -126,23 +126,17 @@ def baseline(kind):
 
 @pytest.mark.usefixtures("local_tokenizer")
 @pytest.mark.parametrize("kind", ["multi-user", "migrated-load"])
-def test_pre_interference_mode_report_remains_comparable(monkeypatch, kind):
+def test_pre_interference_mode_report_requires_new_prompt_baseline(monkeypatch, kind):
     current = run_virtual(monkeypatch, generate_upgrade_report(monkeypatch, kind))
     old = baseline(kind)
     # Hold the timing method constant to isolate workload compatibility.
     current.manifest["timing_measurement_version"] = old.manifest["timing_measurement_version"]
     before = current.model_dump_json(), old.model_dump_json()
-    assert _settings_reasons(current, old) == []
-    assert _settings_reasons(old, current) == []
+    assert _settings_reasons(current, old) == ["Fixture pack identity differs."]
+    assert _settings_reasons(old, current) == ["Fixture pack identity differs."]
     compared = compare_baseline(current, old).baseline["targets"][0]
-    assert compared["reasons"] == []
-    if kind == "multi-user":
-        assert any(row["check"] == "multi_user" and row["status"] in {"pass", "fail"}
-                   for row in compared["comparisons"])
-    else:
-        assert compared["load_test"]["status"] == "pass"
-        assert len(compared["load_test"]["points"]) == 2
-        assert all(point["status"] == "pass" for point in compared["load_test"]["points"])
+    assert compared["reasons"] == ["Fixture pack identity differs."]
+    assert compared["status"] == "inconclusive"
     assert (current.model_dump_json(), old.model_dump_json()) == before
 
 
@@ -200,17 +194,17 @@ def test_historical_source_cannot_attest_reverse_mode_in_migrated_settings():
 
 @pytest.mark.usefixtures("local_tokenizer")
 @pytest.mark.parametrize("kind", ["load-prefix", "multi-user-prefix"])
-def test_prefix_companion_report_remains_comparable_across_load_source_upgrade(monkeypatch, kind):
+def test_prefix_companion_report_requires_new_prompt_baseline(monkeypatch, kind):
     current = run_virtual(monkeypatch, generate_upgrade_report(monkeypatch, kind))
     old = baseline(kind)
     current.manifest["timing_measurement_version"] = old.manifest["timing_measurement_version"]
     before = current.model_dump_json(), old.model_dump_json()
     assert _settings_reasons(current, current) == _settings_reasons(old, old) == []
-    assert _settings_reasons(current, old) == []
-    assert _settings_reasons(old, current) == []
+    assert _settings_reasons(current, old) == ["Fixture pack identity differs."]
+    assert _settings_reasons(old, current) == ["Fixture pack identity differs."]
     compared = compare_baseline(current, old).baseline["targets"][0]
-    assert compared["reasons"] == []
-    assert compared["status"] == "pass"
+    assert compared["reasons"] == ["Fixture pack identity differs."]
+    assert compared["status"] == "inconclusive"
     assert (current.model_dump_json(), old.model_dump_json()) == before
 
 

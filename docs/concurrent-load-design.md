@@ -191,8 +191,8 @@ Its result is then labelled e.g. "pass · budget-limited window 3.2 s of 10 s". 
 ### 3.6 Token targets, calibration and context window
 
 **Prompt construction.**
-- Input prompts are built to **token targets**, reusing the label prompt idea: "The box label is K7P4" plus neutral filler, after the nonce. The model is told to write the label first.
-- Long outputs are encouraged by asking the model to continue a numbered list well beyond the cap.
+- Input prompts are built to **token targets**: a nonce line, neutral filler, then "The box label is K7P4" and a question asking the model to start its reply with the label.
+- The long-output variant then asks for the numbers 1 to 100000 in order, separated by commas.
 
 **Calibration.**
 - Calibration happens once per (input size, output-instruction variant: short-answer vs long-output instruction), using the token-stress method: `max_tokens=1` requests read `usage.prompt_tokens`, and the filler is rescaled until it is within `input_token_tolerance`, up to `calibration_attempts`.
@@ -396,6 +396,7 @@ Reason codes currently emitted: `context_exceeded`, `calibration_failed`,
 
 Each measured `RequestRecord` has dedicated `load_point`,
 `requested_input_tokens`, and `requested_output_tokens` fields.
+Each request also persists a boolean `refused` signal.
 `load_point` contains `point_id`, `type`, `workload`, `level`, `shape`,
 `sub_window` (0–3 for interference, otherwise null), and `role`
 (`request`, `short_stream`, `probe`). Calibration uses

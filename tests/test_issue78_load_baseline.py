@@ -80,7 +80,7 @@ async def generate_load_report(monkeypatch, *, restart=False):
 
 
 @pytest.mark.usefixtures("local_tokenizer")
-def test_generated_load_compares_with_saved_pre_output_budget_report(monkeypatch, tmp_path):
+def test_generated_load_rejects_saved_pre_output_budget_prompt_baseline(monkeypatch, tmp_path):
     current = run_virtual(monkeypatch, generate_load_report(monkeypatch))
     saved = tmp_path / "report.json"
     saved.write_text(current.model_dump_json())
@@ -93,12 +93,12 @@ def test_generated_load_compares_with_saved_pre_output_budget_report(monkeypatch
     assert {row.requested_max_tokens for row in baseline.requests} == {8}
     assert all(row.scenario.startswith("load_") for row in baseline.requests)
     assert current.manifest["fixture_pack"]["builtin_sha256"] != baseline.manifest["fixture_pack"]["builtin_sha256"]
-    assert _same_load_workload(current.manifest, baseline.manifest)
-    assert _settings_reasons(current, baseline) == []
-    assert _settings_reasons(baseline, current) == []
+    assert not _same_load_workload(current.manifest, baseline.manifest)
+    assert _settings_reasons(current, baseline) == ["Fixture pack identity differs."]
+    assert _settings_reasons(baseline, current) == ["Fixture pack identity differs."]
     compared = compare_baseline(current, baseline)
-    assert compared.baseline["targets"][0]["reasons"] == []
-    assert compared.baseline["targets"][0]["load_test"]["points"]
+    assert compared.baseline["targets"][0]["reasons"] == ["Fixture pack identity differs."]
+    assert compared.baseline["targets"][0]["status"] == "inconclusive"
 
     # The unused built-in digest exception requires exact Load source/settings
     # attestation and no companion check that might consume those fixtures.
@@ -131,7 +131,7 @@ def test_output_budgets_generator_constant_is_the_current_workloads_source_hash(
 def test_load_run_from_another_generator_source_is_not_comparable(monkeypatch):
     current = run_virtual(monkeypatch, generate_load_report(monkeypatch))
     baseline = RunReport.model_validate_json(gzip.decompress(BASE_REPORT.read_bytes()))
-    assert _same_load_workload(current.manifest, baseline.manifest)
+    assert not _same_load_workload(current.manifest, baseline.manifest)
     current.manifest["fixture_pack"]["workload_fixture_sha256"] = "0" * 64  # an unattested generator hash
     assert not _same_load_workload(current.manifest, baseline.manifest)
     assert "Fixture pack identity differs." in _settings_reasons(current, baseline)
@@ -143,7 +143,7 @@ def test_load_restart_still_requires_matching_readiness_fixture(monkeypatch):
     baseline = current.model_copy(deep=True)
     saved_base = RunReport.model_validate_json(gzip.decompress(BASE_REPORT.read_bytes()))
     baseline.manifest["fixture_pack"]["builtin_sha256"] = saved_base.manifest["fixture_pack"]["builtin_sha256"]
-    assert _same_load_workload(current.manifest, baseline.manifest)
+    assert not _same_load_workload(current.manifest, baseline.manifest)
     assert "Fixture pack identity differs." in _settings_reasons(current, baseline)
     assert "Fixture pack identity differs." in _settings_reasons(baseline, current)
 

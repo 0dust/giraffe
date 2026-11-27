@@ -33,11 +33,11 @@ GATEWAY_GENERATORS = (
     # Output-budget changes affect prefixes; dedicated Load requests are unchanged.
     "a04c62a2e7b10ab0aef201cf5c283fe53df694d247ca5ce35caca1340a83f387",
 )
-CURRENT_LOAD_SOURCE = "d26d065e633fe1b2693cb67504c238ebb6d26f24abb26fda26f35bc7f028b007"
+CURRENT_LOAD_SOURCE = "55a11a95edaf1f01336ec1879340df0e27adcfd8cc69d05a8ea726a011d3f07b"
 
 
 @pytest.mark.asyncio
-async def test_completed_load_survives_only_known_gateway_dispatch_changes(monkeypatch, local_tokenizer):
+async def test_completed_load_requires_new_neutral_prompt_baseline(monkeypatch, local_tokenizer):
     cfg = config().model_copy(update={"stream": False})
     payloads = []
 
@@ -69,10 +69,11 @@ async def test_completed_load_survives_only_known_gateway_dispatch_changes(monke
     baseline.run_id = "core-load"
     identity["generator_source_sha256"] = CORE_GENERATOR
     baseline.manifest["fixture_pack"]["workload_fixture_sha256"] = fixture_hash(identity)
-    assert _settings_reasons(current, baseline) == []
-    assert _settings_reasons(baseline, current) == []
+    assert _settings_reasons(current, baseline) == ["Fixture pack identity differs."]
+    assert _settings_reasons(baseline, current) == ["Fixture pack identity differs."]
     compared = compare_baseline(current, baseline)
-    assert compared.baseline["targets"][0]["load_test"]["points"]
+    assert compared.baseline["targets"][0]["reasons"] == ["Fixture pack identity differs."]
+    assert compared.baseline["targets"][0]["status"] == "inconclusive"
 
     for change in ("interim_traffic", "pre_final_admission", "unknown_traffic", "unknown_generator", "settings", "missing_settings"):
         changed = baseline.model_copy(deep=True)
@@ -143,7 +144,7 @@ async def test_policy_does_not_spend_load_reserve_for_sessions_and_tools(monkeyp
     ["serving", "sessions"],
     ["sessions", "gateway_attribution"],
 ])
-async def test_saved_fixed_sessions_baseline_survives_gateway_dispatch(monkeypatch, local_tokenizer, tmp_path, checks):
+async def test_saved_fixed_sessions_baseline_requires_matching_load_source(monkeypatch, local_tokenizer, tmp_path, checks):
     cfg = RunConfig.model_validate({**config().model_dump(), "checks": checks, "stream": True,
         "sessions": {"sessions": 2, "modes": ["fixed"], "concurrency": 2}, "limits": {"min_samples": 2}})
     usage = {"prompt_tokens": 128, "completion_tokens": 4}
@@ -192,10 +193,15 @@ async def test_saved_fixed_sessions_baseline_survives_gateway_dispatch(monkeypat
     saved, _ = write_report(baseline, tmp_path)
     baseline = RunReport.model_validate_json(saved.read_bytes())
     for report, previous in ((current, baseline), (baseline, current)):
-        assert _settings_reasons(report, previous) == []
+        expected = ["Fixture pack identity differs."] if "load" in checks else []
+        assert _settings_reasons(report, previous) == expected
         result = compare_baseline(report, previous).baseline["targets"][0]
-        assert result["status"] == "pass"
-        assert {row["check"] for row in result["comparisons"]} >= set(checks) - {"gateway_attribution"}
+        if "load" in checks:
+            assert result["reasons"] == expected
+            assert result["status"] == "inconclusive"
+        else:
+            assert result["status"] == "pass"
+            assert {row["check"] for row in result["comparisons"]} >= set(checks) - {"gateway_attribution"}
 
     for change in (
         {"load_test_source_sha256": "113325dd5cffa04626cc7be7ee93bc6e9be67335531288bc329b3542a155c92a"},

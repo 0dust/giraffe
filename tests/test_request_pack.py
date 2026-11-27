@@ -396,3 +396,49 @@ async def test_final_load_judge_upper_bound_covers_weighted_random_cases(monkeyp
     actual_judged = sum(record.fixture_id == 'pack:judged' for record in report.requests)
     assert preview['planned_call_upper_bound'] >= actual_judged
     assert preview['quota_call_upper_bound'] >= actual_judged
+
+
+async def test_load_request_pack_structured_refusal_is_saved_and_counted_wrong(
+    monkeypatch, tmp_path, local_tokenizer,
+):
+    import httpx
+
+    from giraffe.models import RunReport
+    from giraffe.reporting import write_report
+    from giraffe.runner import run_suite
+
+    refusal = "I can't provide the label K7P4."
+
+    def respond(request):
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": None, "refusal": refusal},
+                         "finish_reason": "stop"}],
+        })
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: original(
+        transport=httpx.MockTransport(respond), **kwargs))
+    configured = RunConfig(
+        targets=[Target(name="local", url="http://local/v1", model="test")],
+        checks=["load"], request_source="request_pack", stream=False, max_memory_mb=0,
+        request_pack={"version": 1, "cases": [case(scorer="contains", expected="K7P4")]},
+        load_test={
+            "workloads": {"combinations": {"selected": ["short_short"]}},
+            "patterns": {"concurrent": {"enabled": False},
+                         "constant": {"enabled": True}, "rates": [1]},
+            "schedule": {"duration_seconds": 1},
+            "pass_criteria": {"min_valid_responses": 1},
+        },
+    )
+    report = await run_suite(configured)
+    path, _ = write_report(report, tmp_path)
+    saved = RunReport.model_validate_json(path.read_text())
+
+    response, = [record for record in saved.requests if "load" in record.check_ids]
+    assert response.output == refusal
+    assert response.refused is True
+    assert response.score is False
+    load = next(check for check in saved.checks if check.id == "load")
+    group, = load.metrics["points"][0]["groups"]
+    assert group["correct"] == 0
+    assert group["refused"] == 1
