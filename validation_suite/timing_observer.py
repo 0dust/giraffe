@@ -236,13 +236,20 @@ class Observer:
         # responses. That assignment is not a fresh clock observation; omit
         # those two hooks rather than fabricate a bracket around the old time.
         execute_source = Path(self.execute.co_filename).read_text().splitlines()
-        fresh_nonstream_clock = any(
-            execute_source[line - 1].strip() == "observed_at = time.perf_counter()"
+        execute_lines = {
+            execute_source[line - 1].strip()
             for _, _, line in self.execute.co_lines() if line is not None
-        )
+        }
+        self.request_clock = self.execute
+        if not any(line.startswith("start = time.perf_counter()") for line in execute_lines):
+            self.request_clock = _nested(self.execute, "begin_transport")
+            # Reject identities before the dispatch callback can admit them.
+            guard_line = _line_number(self.execute, "start = preparation_start")
+            self.sites[(self.execute, guard_line)] = "identity_guard"
+        self.client_codes = {self.execute, self.request_clock, self.sse, self.receive}
         for code, text, name in [
-            (self.execute, "start = time.perf_counter()", "request_clock_before"),
-            (self.execute, "record._timing_started_monotonic", "request_clock_after"),
+            (self.request_clock, "start = time.perf_counter()", "request_clock_before"),
+            (self.request_clock, "record._timing_started_monotonic", "request_clock_after"),
             (self.execute, "async for event_type, event, observed_at", "response_bind"),
             (self.execute, "observed_at = time.perf_counter()", "nonstream_before"),
             (self.execute, "receive(_object(body)", "nonstream_after"),
@@ -254,7 +261,8 @@ class Observer:
             (self.receive, "record.reasoning +=", "reasoning_ready"),
             (self.recv, "if not data:", "socket_bytes"),
         ]:
-            if name in {"nonstream_before", "nonstream_after"} and not fresh_nonstream_clock:
+            if (name in {"nonstream_before", "nonstream_after"}
+                    and "observed_at = time.perf_counter()" not in execute_lines):
                 continue
             self.sites[(code, _line_number(code, text))] = name
         self.state_bound = state_bound
@@ -300,7 +308,7 @@ class Observer:
         # CPython 3.12 does not permit a local PY_UNWIND event. This filtered
         # lifecycle hook observes no values outside the exact selected codes.
         monitor.set_events(self.tool_id, events.PY_UNWIND)
-        for code in (self.execute, self.sse, self.receive):
+        for code in self.client_codes:
             monitor.set_local_events(self.tool_id, code, events.LINE | events.PY_RETURN)
         monitor.set_local_events(self.tool_id, self.recv, events.LINE | events.CALL | events.C_RETURN |
                                  events.C_RAISE | events.PY_RETURN)
@@ -309,7 +317,7 @@ class Observer:
         if self.tool_id is None:
             return
         sys.monitoring.set_events(self.tool_id, 0)
-        for code in (self.execute, self.sse, self.receive, self.recv):
+        for code in self.client_codes | {self.recv}:
             sys.monitoring.set_local_events(self.tool_id, code, 0)
         for event in (sys.monitoring.events.LINE, sys.monitoring.events.CALL,
                       sys.monitoring.events.C_RETURN, sys.monitoring.events.C_RAISE,
@@ -323,7 +331,7 @@ class Observer:
             mapping.clear()
 
     def _exit(self, code: CodeType, offset: int, value: Any) -> None:
-        if code not in (self.execute, self.sse, self.receive, self.recv):
+        if code not in self.client_codes and code is not self.recv:
             return
         entered = time.monotonic_ns()
         try:
@@ -337,6 +345,7 @@ class Observer:
                     self.responses.pop(response, None)
                     self.response_sockets.pop(response, None)
                     self.body_sequences.pop(response, None)
+            if code in (self.execute, self.sse, self.request_clock):
                 for key in [key for key in self.pending if key[0] is frame]:
                     self.pending.pop(key, None)
             elif code is self.recv:
@@ -353,9 +362,13 @@ class Observer:
             return sys.monitoring.DISABLE
         # Reject unsupported direct API use before any request can be sent.
         # This deliberate refusal must escape the callback-error handlers.
-        if site == "request_clock_before" and getattr(self._frame(code).f_locals.get("spec"), "identity", None) is not None:
-            self.log.stats["unsupported_identity_requests"] += 1
-            raise RuntimeError("Timing observation does not support test identities.")
+        if site == "identity_guard" or (site == "request_clock_before" and code is self.execute):
+            if getattr(self._frame(code).f_locals.get("spec"), "identity", None) is not None:
+                self.log.stats["unsupported_identity_requests"] += 1
+                raise RuntimeError("Timing observation does not support test identities.")
+            if site == "identity_guard":
+                self.log.callback_work(entered)
+                return None
         if site.endswith("_before"):
             key = None
             try:
