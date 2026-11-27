@@ -412,6 +412,7 @@ class _StreamGeneration:
 class LLMClient:
     reports_response_activity = True
     _supports_dispatch_guard = True
+    _supports_sent_observer = True
 
     def __init__(self, target: Target, config: RunConfig, *, max_connections: int | None = None,
                  _tls_context: ssl.SSLContext | None = None):
@@ -428,6 +429,7 @@ class LLMClient:
         self._tls_context = _tls_context
         self._stream_drains: set[asyncio.Task[None]] = set()
         self.on_response = None
+        self.on_sent: Callable[[], None] | None = None
         self._evidence_fields = {"logprobs", "stream_options"}
         self._evidence_probe_attempts = 0
         self._evidence_probe_finished = False
@@ -1185,6 +1187,9 @@ class LLMClient:
                     record.started_at = datetime.now(timezone.utc).isoformat()
                     record.client_preparation_ms = (start - preparation_start) * 1000
                     transport_started = True
+                    record.sent = True
+                    if self.on_sent is not None:
+                        self.on_sent()
 
                 if isinstance(self._client, HTTPClientPool):
                     response = await self._client.send(request, stream=True, _before_send=begin_transport)

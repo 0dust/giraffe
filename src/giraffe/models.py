@@ -2531,7 +2531,7 @@ class RunConfig(Model):
     concurrency: int | None = Field(default=None, ge=1, le=MAX_SIMULTANEOUS_REQUESTS,
                              description="Maximum simultaneous target requests across the run, chosen by the user; not detected hardware capacity.")
     max_requests: int | None = Field(default=None, ge=1,
-                              description="Total target request budget shared across all tests and targets; independent of concurrency and separate from AI judge calls.")
+                              description="Maximum inference requests charged across all targets; the connection preflight and readiness probe after a cold-start restart are not charged and are reported as exempt, while scheduled requests can use budget without being sent to the endpoint and AI judge calls use separate limits.")
     max_duration_seconds: float | None = Field(default=None, gt=0)
     max_memory_mb: int = Field(default=4096, ge=0,
         description="Maximum memory (RAM growth during this run) in MiB, sampled about once per second; 0 disables. Exceeding it stops unfinished work with partial evidence.")
@@ -3167,6 +3167,9 @@ class RequestRecord(PersistedModel):
                 result.pop(name, None)
         return result
     _request_slot: int | None = PrivateAttr(default=None)
+    _budget_exempt: bool = PrivateAttr(default=False)
+    _budget_exemption: str | None = PrivateAttr(default=None)
+    _budget_request_slot: int | None = PrivateAttr(default=None)
     _timeout_fixture: dict | None = PrivateAttr(default=None)
     _timing_started_monotonic: float | None = PrivateAttr(default=None)
     _gateway_key_hash: str | None = PrivateAttr(default=None)
@@ -3185,6 +3188,7 @@ class RequestRecord(PersistedModel):
     started_at: str
     status: Literal["completed", "failed", "timeout", "cancelled"]
     http_status: int | None = None
+    sent: bool = Field(default=False, description="Whether inference was sent to the endpoint (including attempts that failed to connect).")
     response_body_bytes: int = Field(default=0, ge=0)
     error: str | None = None
     request_timeout_seconds: float | None = None
@@ -3436,6 +3440,34 @@ class CheckResult(PersistedModel):
         return value
 
 
+class TargetRequestCounts(TypedDict):
+    sent: Annotated[int, Field(ge=0, description="Inference requests sent to the endpoint (including attempts that failed to connect), after local preparation succeeded.")]
+    budget_counted: Annotated[int, Field(ge=0, description="Requests charged to max_requests net of refunds, including reserved offers that were never sent to the endpoint.")]
+    budget_counted_unsent: Annotated[int, Field(ge=0, description="Charged offers not sent to the endpoint, including pending reservations and dropped offers without a refund.")]
+    budget_exempt: Annotated[int, Field(ge=0, description="Sent inference requests exempt from max_requests.")]
+    saved_observations: Annotated[int, Field(ge=0, description="Measurement records present in report.json requests after retention, excluding setup probes; evidence_dropped_count separately counts journal drops.")]
+    budget_exempt_by_reason: Annotated[dict[Literal["preflight", "restart_readiness"], int], Field(description="Sent exempt inference requests grouped by connection preflight or restart readiness reason.")]
+
+
+class RequestCounts(TargetRequestCounts):
+    available: Annotated[Literal[True], Field(description="Whether a consistent accounting snapshot is available for this run.")]
+    complete: Annotated[bool, Field(description="Whether accounting covers a normally finalized run; recovered counts may be incomplete.")]
+    targets: Annotated[dict[str, TargetRequestCounts], Field(description="The same request counts for each target, keyed by target name.")]
+
+
+class UnavailableRequestCounts(TypedDict):
+    complete: Annotated[Literal[False], Field(description="Recovered accounting is incomplete.")]
+    available: Annotated[Literal[False], Field(description="No consistent accounting snapshot was saved before interruption.")]
+    saved_observations: Annotated[int, Field(ge=0, description="Measurement records present in the recovered report.json requests, excluding setup probes.")]
+
+
+def request_counts_schema() -> dict[str, Any]:
+    schema = TypeAdapter(RequestCounts).json_schema()
+    schema["description"] = "Inference traffic accounting in total and for each target."
+    schema["properties"]["targets"]["additionalProperties"] = schema.pop("$defs")["TargetRequestCounts"]
+    return {"anyOf": [schema, TypeAdapter(UnavailableRequestCounts).json_schema()]}
+
+
 class RunReport(PersistedModel):
     @cached_property
     def _stored_derived(self) -> bool:
@@ -3458,7 +3490,8 @@ class RunReport(PersistedModel):
     performance: dict[str, Any] = Field(default_factory=dict)
     requests: list[RequestRecord] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
-    observations: dict[str, Any] = Field(default_factory=dict)
+    observations: dict[str, Any] = Field(default_factory=dict, json_schema_extra={
+        "properties": {"request_counts": request_counts_schema()}})
     baseline: dict[str, Any] | None = None
     abort_reason: str | None = None
     limits_reached: list[str] = Field(default_factory=list)

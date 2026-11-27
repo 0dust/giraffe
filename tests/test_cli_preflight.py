@@ -274,7 +274,10 @@ def test_run_help_has_all_flags_examples_and_exit_codes(capsys):
     assert "(default: 300)" not in output
     help_text = " ".join(output.split())  # Argparse wraps the longer field labels.
     assert help_text.count("(default: Not set)") == 3
-    for label in ["Simultaneous limit across the suite", "Maximum requests across all targets",
+    assert ("Maximum inference requests charged across all targets. Not charged: the connection preflight "
+            "and the readiness probe after a cold-start restart; the report lists them as exempt "
+            "(default: Not set)") in help_text
+    for label in ["Simultaneous limit across the suite",
                   "Maximum duration in seconds"]:
         assert label + " (default: Not set)" in help_text
     assert "--checks CHECKS" in output and "first_output" in output
@@ -403,7 +406,7 @@ def test_run_surfaces_optional_overall_summary(summary, output_format, tmp_path,
             assert "summary" not in result
     else:
         lines = output.splitlines()
-        assert lines[0].startswith("BLOCKED  0 checks passed · 0 requests · report: ")
+        assert lines[0].startswith("BLOCKED  0 checks passed · report: ")
         assert lines[1] == "Stopped: stopped"
         if summary:
             assert lines[2] == summary
@@ -441,7 +444,11 @@ def test_request_pack_replay_keeps_exact_traffic_after_unrecorded_probe(source, 
                  "stream": False, "n": 1} for case in pack["cases"]]
     assert [json.loads(request.content) for request in requests[1:]] == expected * 2
     assert saved["manifest"]["config"] == config.model_dump(mode="json")
-    assert envelope["request_count"] == 12
+    assert envelope["request_counts"] == saved["observations"]["request_counts"]
+    assert envelope["request_counts"]["sent"] == 13
+    assert envelope["request_counts"]["budget_counted"] == 12
+    assert envelope["request_counts"]["saved_observations"] == 12
+    assert "request_count" not in envelope
     assert {record["fixture_id"] for record in saved["requests"]} == {
         f"pack:question-{index}" for index in range(6)}
     assert {record["scenario"] for record in saved["requests"]} == {"pack_control", "pack_loaded"}
@@ -549,7 +556,7 @@ def test_cli_prints_the_retained_check_summary(policy, retained, tmp_path, monke
     saved = json.loads((directory / "report.json").read_text())
     assert saved["checks"][0]["summary"] in captured.out
     lines = captured.out.splitlines()
-    assert lines[0].startswith("FAIL  0 checks passed · 0 requests · report: ")
+    assert lines[0].startswith("FAIL  0 checks passed · report: ")
     assert "RAM" not in captured.out
     for secret in ["EXPECTED_SECRET", "RECEIVED_SECRET"]:
         assert (secret in captured.out) == retained
@@ -577,7 +584,7 @@ def test_invalid_endpoint_port_blocks_before_traffic(tmp_path, monkeypatch, caps
 def test_probe_exception_policy_before_a_request_record(error, blocking, tmp_path, monkeypatch, capsys):
     from giraffe.models import RunReport
 
-    async def execute(self, spec):
+    async def execute(self, spec, **kwargs):
         raise error("private probe error")
 
     async def run(config, **kwargs):

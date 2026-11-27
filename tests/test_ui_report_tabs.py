@@ -378,7 +378,7 @@ def test_missing_terminal_report_settles_an_open_live_condition_dialog():
  state.detail={id:'save-failure',state:'running',config:{targets:[]},live_conditions:[aggregate]};renderDetail();
  api=async()=>({aggregate,rows:[],totals:{running:1},page:1,pages:1,total:0});
  openConditionDialog($('.condition-spot').dataset.conditionKey);await Promise.resolve();await Promise.resolve();
- state.detail={...state.detail,state:'error',error:'Disk unavailable',report:null,summary:{overall:'inconclusive',request_count:2,checks:[]}};renderDetail();
+ state.detail={...state.detail,state:'error',error:'Disk unavailable',report:null,summary:{overall:'inconclusive',request_counts:{sent:2,budget_counted:2},checks:[]}};renderDetail();
  assert(!$('#test-dialog').open);assert.equal(conditionDialog,null);assert.equal(reportView.tab,'results');
  assert.equal(document.activeElement,$('#tab-results'));assert.match($('#main').textContent,/Disk unavailable|Only a summary was saved/);
  assert(!$('.condition-spot').classList.contains('running'));

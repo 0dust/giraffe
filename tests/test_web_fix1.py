@@ -29,7 +29,7 @@ async def test_journal_close_failure_keeps_finished_report(tmp_path, monkeypatch
     async with browser(tmp_path) as client:
         identifier = await start(client)
         detail = await finished(client, identifier)
-        assert detail["state"] == "completed" and detail["report"]["request_count"] == 1
+        assert detail["state"] == "completed" and detail["report"]["request_counts"]["sent"] == 1
         assert (tmp_path / identifier / "report.json").is_file()
         assert any("Live evidence journal failed" in warning for warning in detail["report"]["warnings"])
         assert "exporting final report" in (tmp_path / identifier / "giraffe.log").read_text()
@@ -149,7 +149,7 @@ async def test_listing_does_not_populate_full_report_cache(tmp_path, monkeypatch
     async with browser(tmp_path) as client:
         response = await client.get("/api/runs")
         assert response.status_code == 200
-        assert response.json()["runs"][0]["request_count"] == 1
+        assert response.json()["runs"][0]["request_counts"]["sent"] == 1
     assert web._report_cache.bytes == 0
 
 

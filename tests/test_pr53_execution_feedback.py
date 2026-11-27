@@ -46,7 +46,7 @@ async def test_early_intentional_cancellation_is_not_the_later_overall_deadline(
 
 def test_paged_request_reason_preserves_limit_without_endpoint_error_body():
     index = ConditionRequestIndex()
-    index.update({"event": "request_completed", "request_slot": 0, "request": {
+    index.update({"event": "request_completed", "request_slot": 0, "budget_request_slot": 0, "request": {
         "id": "timeout", "target": "local", "scenario": "correctness_c1", "status": "timeout",
         "error": "private endpoint body", "request_timeout_seconds": 120,
         "termination_reason": "request_timeout", "termination_limit_seconds": 120}})

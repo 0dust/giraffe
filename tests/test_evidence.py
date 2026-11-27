@@ -379,3 +379,193 @@ def test_recovered_timeout_warning_uses_latest_update_once(tmp_path):
     assert recovered.observations["targets"]["local"]["timeout_warnings"] == [latest]
     assert recovered.warnings.count(format_timeout_warning(latest)) == 1
     assert format_timeout_warning(payload) not in recovered.warnings
+
+
+def test_recovery_uses_one_snapshot_including_inflight_requests(tmp_path):
+    from giraffe.runner import _Run
+    from giraffe.models import RunConfig, Target
+
+    config = RunConfig(targets=[Target(name=name, model="m", url=f"http://{name}/v1")
+                               for name in ("local", "other")], checks=["access"])
+    run = _Run(config, None, None)
+    writer = EvidenceWriter(tmp_path, {"config": {"retention": "all"}})
+    writer.request_counts_start({"local": 1})
+    run.note_sent("local", "preflight")
+    run.note_sent("local", "restart_readiness")
+    readiness = record(1).model_copy(update={"scenario": "readiness", "sent": True})
+    readiness._budget_exempt = True
+    readiness._budget_exemption = "restart_readiness"
+    writer.record_finished(readiness)
+    for target in ("local", "other"):
+        assert run.reserve_offer(target)
+        run.note_sent(target)  # Neither request has finished when the process dies.
+    assert run.reserve_offer("other")  # Charged, not yet sent.
+    writer.request_counts_snapshot(run.request_counts())
+    writer.close()
+    journal = [json.loads(line) for line in (tmp_path / "evidence.jsonl").read_text().splitlines()]
+    assert journal[1] == {"type": "request_counts_start", "preflight": {"local": 1}}
+    assert len([row for row in journal if row["type"] == "record"]) == 1
+    report = recover_evidence(tmp_path, {})
+    counts = report.observations["request_counts"]
+    assert counts["available"] is True and counts["complete"] is False
+    assert counts["sent"] == 4 and counts["budget_counted"] == 3
+    assert counts["budget_exempt"] == 2 and counts["budget_counted_unsent"] == 1
+    assert counts["saved_observations"] == 0
+    assert counts["budget_exempt_by_reason"] == {"preflight": 1, "restart_readiness": 1}
+    for row in [counts, *counts["targets"].values()]:
+        assert row["sent"] == row["budget_counted"] - row["budget_counted_unsent"] + row["budget_exempt"]
+    for key in ("sent", "budget_counted", "budget_counted_unsent", "budget_exempt", "saved_observations"):
+        assert counts[key] == sum(value[key] for value in counts["targets"].values())
+
+
+def test_recovery_without_snapshot_does_not_invent_traffic_counts(tmp_path):
+    writer = EvidenceWriter(tmp_path)
+    writer.request_counts_start({"local": 1})
+    writer.record_finished(record().model_copy(update={"sent": True}))
+    writer.progress({"event": "check_finished", "budget_used": 3,
+                     "request_counts": {"sent": 2}})
+    writer.close()
+    counts = recover_evidence(tmp_path, {}).observations["request_counts"]
+    assert counts == {"complete": False, "available": False, "saved_observations": 1}
+    journal = [json.loads(line) for line in (tmp_path / "evidence.jsonl").read_text().splitlines()]
+    assert all("request_counts" not in row.get("progress", {}) for row in journal)
+
+
+def test_request_count_snapshots_coalesce_outside_the_bounded_queue(tmp_path, monkeypatch):
+    release = threading.Event()
+    original = EvidenceWriter._write
+
+    def held_write(self):
+        release.wait(5)
+        original(self)
+
+    monkeypatch.setattr(EvidenceWriter, "_write", held_write)
+    writer = EvidenceWriter(tmp_path, queue_size=1000, fsync_records=1000, fsync_seconds=60)
+    try:
+        for index in range(100):
+            writer.record_finished(record(index))
+            for update in range(20):
+                writer.request_counts_snapshot({"sent": index + 1, "update": update})
+            # Ordinary live events must not consume the evidence queue.
+            writer.progress({"event": "request_completed", "budget_used": index + 1,
+                             "request_counts": {"sent": index + 1}})
+    finally:
+        release.set()
+        writer.close()
+    journal = [json.loads(line) for line in (tmp_path / "evidence.jsonl").read_text().splitlines()]
+    snapshots = [row for row in journal if row["type"] == "request_counts"]
+    records = [row for row in journal if row["type"] == "record"]
+    assert len(records) == 100 and 0 < len(snapshots) < len(records) / 10
+    assert snapshots[-1]["sent"] == 100 and snapshots[-1]["update"] == 19
+    assert writer.dropped_count == 0
+
+
+def test_recovery_adds_only_preflight_not_in_the_snapshot(tmp_path):
+    from giraffe.runner import _Run
+    from giraffe.models import RunConfig, Target
+
+    run = _Run(RunConfig(targets=[Target(name="local", model="m", url="http://local/v1")],
+                         checks=["access"]), None, None)
+    writer = EvidenceWriter(tmp_path)
+    writer.request_counts_start({"local": 1})
+    writer.request_counts_snapshot(run.request_counts())
+    writer.close()
+    counts = recover_evidence(tmp_path, {}).observations["request_counts"]
+    assert counts["sent"] == counts["budget_exempt"] == 1
+    assert counts["targets"]["local"]["budget_exempt_by_reason"] == {"preflight": 1}
+
+
+def test_request_counts_flush_without_completed_records(tmp_path, monkeypatch):
+    durable = threading.Event()
+    real_fsync = os.fsync
+
+    def sync(descriptor):
+        real_fsync(descriptor)
+        path = tmp_path / "evidence.jsonl"
+        if path.exists() and '"type":"request_counts"' in path.read_text().replace(" ", ""):
+            durable.set()
+
+    monkeypatch.setattr(os, "fsync", sync)
+    writer = EvidenceWriter(tmp_path, fsync_seconds=0.01)
+    try:
+        writer.request_counts_snapshot({"sent": 1})
+        assert durable.wait(2), "in-flight traffic snapshot was not flushed"
+        assert writer.dropped_count == 0
+    finally:
+        writer.close()
+
+
+def test_each_record_batch_ends_with_fresh_counts_and_recovers_before_close(tmp_path, monkeypatch):
+    from collections import Counter
+    from giraffe.models import RunConfig, Target
+    from giraffe.runner import _Run
+
+    writes = []
+    real_fdopen = os.fdopen
+    real_fsync = os.fsync
+    initial_durable, records_durable = threading.Event(), threading.Event()
+
+    class CapturedStream:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return self.stream.__exit__(*args)
+
+        def __getattr__(self, name):
+            return getattr(self.stream, name)
+
+        def write(self, text):
+            writes.append(text)
+            return self.stream.write(text)
+
+    def sync(descriptor):
+        real_fsync(descriptor)
+        rows = [json.loads(line) for line in (tmp_path / "evidence.jsonl").read_text().splitlines()]
+        if any(row["type"] == "request_counts" for row in rows):
+            initial_durable.set()
+        if sum(row["type"] == "record" for row in rows) == 3:
+            records_durable.set()
+
+    monkeypatch.setattr(os, "fdopen", lambda *args, **kwargs: CapturedStream(real_fdopen(*args, **kwargs)))
+    monkeypatch.setattr(os, "fsync", sync)
+    config = RunConfig(targets=[Target(name=name, model="m", url=f"http://{name}/v1")
+                               for name in ("local", "other")], checks=["access"])
+    run = _Run(config, None, None)
+    writer = EvidenceWriter(tmp_path, fsync_records=1, fsync_seconds=0.01)
+    run.request_counts_sink = writer.request_counts_snapshot
+    try:
+        run.note_sent("local", "preflight")
+        assert initial_durable.wait(2), "old snapshot was not flushed before record traffic"
+        for index, target in enumerate(("local", "other", "local")):
+            assert run.reserve_offer(target)
+            run.note_sent(target)
+            writer.record_finished(record(index).model_copy(update={"target": target, "sent": True}))
+        assert records_durable.wait(2)
+        # Read the durable journal before normal close/final report, as after a kill.
+        recovered = recover_evidence(tmp_path, {})
+        counts = recovered.observations["request_counts"]
+        assert counts["complete"] is False and counts["available"] is True
+        assert counts["saved_observations"] == 3
+        assert counts["saved_observations"] <= counts["sent"] - counts["budget_exempt"]
+        assert writer.dropped_count == 0
+    finally:
+        writer.close()
+    sent = Counter()
+    batches = 0
+    for text in writes:
+        rows = [json.loads(line) for line in text.splitlines()]
+        records = [row for row in rows if row["type"] == "record"]
+        if not records:
+            continue
+        batches += 1
+        for row in records:
+            sent[row["record"]["target"]] += row["sent"]
+        assert rows[-1]["type"] == "request_counts"
+        assert sum(row["type"] == "request_counts" for row in rows) == 1
+        for target, total in sent.items():
+            assert rows[-1]["targets"][target]["sent"] >= total
+    assert batches == 3

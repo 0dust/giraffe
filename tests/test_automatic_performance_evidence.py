@@ -422,7 +422,7 @@ async def test_optional_probes_preserve_exact_planned_workload_budget(monkeypatc
     config = RunConfig(targets=[target], checks=["first_output"], samples=6, max_requests=7)
     assert request_plan(config)["required_request_limit"] == 7
     report = await run_suite(config)
-    assert len(report.requests) == report.observations["request_budget_used"] == 7
+    assert len(report.requests) == report.observations["request_counts"]["budget_counted"] == 7
     assert [r.scenario for r in report.requests] == ["initial", *(["warm"] * 6)]
     assert all(r.valid for r in report.requests)
     assert len([r for r in calls if r.method == "POST"]) == 7

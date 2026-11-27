@@ -129,7 +129,7 @@ def test_never_does_not_remap_errors(failure, expected, tmp_path, monkeypatch, c
     else:
         arguments += ['--model', 'tiny']
     if failure == 'preflight':
-        async def blocked(*a):
+        async def blocked(*a, **kwargs):
             raise PreflightError('endpoint unavailable', blocking=True)
         monkeypatch.setattr('giraffe.preflight.check_target', blocked)
     else:
@@ -386,7 +386,7 @@ def test_blocked_runs_write_ci_outputs_without_changing_exit(blocker, tmp_path, 
     async def prepare(*a):
         if blocker == 'tokenizer':
             raise TokenizerUnavailable(reason)
-    async def preflight(*a):
+    async def preflight(*a, **kwargs):
         raise PreflightError(reason, blocking=True)
     monkeypatch.setattr('giraffe.local_tokenizer.ensure_tokenizers', prepare)
     monkeypatch.setattr('giraffe.preflight.check_target', preflight)
@@ -444,7 +444,14 @@ def interrupted_cli_run(tmp_path, monkeypatch):
     from tests.test_evidence import record
 
     writer = EvidenceWriter(tmp_path, {'config': {'retention': 'all'}}, run_id='interrupted')
-    writer.record_finished(record())
+    writer.request_counts_start({'local': 1})
+    target_counts = {"sent": 2, "budget_counted": 1, "budget_counted_unsent": 0,
+                     "budget_exempt": 1, "saved_observations": 1,
+                     "budget_exempt_by_reason": {"preflight": 1}}
+    writer.request_counts_snapshot({**target_counts, "available": True, "complete": True,
+                                    "targets": {"local": target_counts}})
+    item = record().model_copy(update={'sent': True})
+    writer.record_finished(item)
     writer.close()
     with (tmp_path / 'evidence.jsonl').open('a') as stream:
         stream.write('{"type":"record",')
@@ -468,11 +475,16 @@ def test_report_saves_recovered_cli_journal_without_rewriting_evidence(interrupt
     junit, summary = directory / 'ci.xml', directory / 'ci.md'
     assert main(['report', str(directory), '--html', '--junit', str(junit),
                  '--summary-md', str(summary)]) == 0
-    assert '1 requests recorded' in (directory / 'report.html').read_text()
+    assert 'Requests: 2 sent · 1 counted toward the limit · 1 exempt · 1 saved observation' in (directory / 'report.html').read_text()
+    assert '(recovered; may be incomplete)' in (directory / 'report.html').read_text()
     assert 'sensitive answer' in (directory / 'report.html').read_text()
     assert ET.parse(junit).findall('.//skipped')
     assert 'INCONCLUSIVE' in summary.read_text()
-    assert 'Recovered 1 recorded requests' in capsys.readouterr().err
+    output = capsys.readouterr()
+    assert 'Recovered 1 recorded requests' in output.err
+    assert 'INCONCLUSIVE' in output.out
+    assert 'Requests: 2 sent · 1 counted toward the limit · 1 exempt · 1 saved observation' in output.out
+    assert 'Exempt: 1 connection preflight' in output.out
     recovered = RunReport.model_validate_json((directory / 'report.json').read_text())
     assert recovered.overall == 'inconclusive' and len(recovered.requests) == 1
     assert recovered.requests[0].output == 'sensitive answer'

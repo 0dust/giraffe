@@ -28,11 +28,11 @@ for(const [plan,expected] of [
  [{request_count_label:'1',count_kind:'exact',planned_total:1},'1 request planned'],
  [{request_count_label:'20',count_kind:'exact',planned_total:20},'20 requests planned'],
  [{request_count_label:'≈20',count_kind:'estimate'},'≈20 requests'],
- [{request_count_label:'Unknown + 20',count_kind:'bounded'},'20 known requests + adaptive checks'],
+ [{request_count_label:'Unknown + 20',count_kind:'bounded'},'20 known planned requests + adaptive checks'],
  [{request_count_label:'Unknown + ≈20',count_kind:'bounded'},'≈20 expected requests + adaptive checks'],
  [{count_kind:'exact',planned_total:1},'1 request planned'],
  [{count_kind:'estimate',planned_total:20},'About 20 requests'],
- [{count_kind:'bounded',known_total:20},'20 known requests + adaptive checks'],
+ [{count_kind:'bounded',known_total:20},'20 known planned requests + adaptive checks'],
 ])assert.equal(setupPlanCount(plan),expected);
 ''')
 

@@ -654,7 +654,7 @@ async def test_load_local_drops_consume_budget_and_admitted_requests_drain(clien
                                                request_source="request_pack", request_pack={"version": 1, "cases": [
         {"fixture_id": "one", "messages": [{"role": "user", "content": "A"}], "scorer": "exact", "expected": "A"}]}))
     group = load_group(report)
-    assert report.observations["request_budget_used"] == 3
+    assert report.observations["request_counts"]["budget_counted"] == 3
     assert group["scheduled"] == 10 and group["dispatched"] == group["valid"] == 1
     assert group["local_drops"] == 2 and group["not_offered"] == 7
     assert group["status"] == "inconclusive"
@@ -1649,7 +1649,7 @@ async def test_legacy_capacity_and_arrivals_migrate_to_separate_load_points():
     assert len({point["source"] for point in points}) == 2
     assert {point["rate"] for point in points} == {20, 100}
     assert report.manifest["config"]["checks"] == ["load"]
-    assert report.observations["request_budget_used"] == len(report.requests)
+    assert report.observations["request_counts"]["budget_counted"] == len(report.requests)
 
 
 async def test_saved_inactive_drafts_do_not_change_load_fixture_identity():
@@ -1871,7 +1871,7 @@ async def test_judging_waits_for_every_target_telemetry_and_monitor(client, monk
     report = await runner.run_suite(judged_pack_config(targets=targets, concurrency=8, overlap_models=True),
                                     progress=events.append)
     assert snapshots == [(r.id, r.dispatch_ms, r.completed_ms, r.elapsed_ms) for r in report.requests]
-    assert len(report.requests) == report.observations["request_budget_used"] == 10
+    assert len(report.requests) == report.observations["request_counts"]["budget_counted"] == 10
     assert report.observations["judging"]["duration_seconds"] == .12
     assert report.observations["generator_max_lag_ms"] < 100
     for target in ("one", "two"):

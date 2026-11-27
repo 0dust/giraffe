@@ -336,3 +336,42 @@ renderDetail();assert.equal(pending.animationCalls.length,1);assert(disclosure.o
 state.mosaicFollow=false;state.mosaicPage=0;renderDetail();
 assert.match($('.all-requests').textContent,/Earlier request evidence was evicted from the live window/);assert.equal($('.request-mosaic'),null);
 """, dom=True)
+
+
+def test_live_budget_heading_and_mosaic_keep_exempt_requests_out_of_slots():
+    run_render_checks(r"""
+state.detail={id:'exempt',state:'running',config:{targets:[],max_requests:2},
+ request_plan:{planned_total:2},progress:{attempted:3,completed:3,sent:3,budget_used:2,budget_exempt:1},
+ live_requests:[{slot:0,id:'first',status:'completed',valid:true,score:true},{slot:1,id:'last',status:'running'}]};
+renderDetail();
+assert.match($('.live-progress').textContent,/2 of ~2 planned requests/);
+assert.match($('.live-progress').textContent,/limit 2 · 1 exempt/);
+assert.equal($$('.request-mosaic .request-spot').length,2);
+assert.equal($('.request-mosaic [data-live-slot="1"]').dataset.state,'running');
+assert.equal($('.request-mosaic .request-spot.inconclusive'),null);
+const summary=renderRequestCounts({observations:{request_counts:{sent:3,budget_counted:2,budget_exempt:1,saved_observations:1,available:true,complete:true}}});
+assert.match(summary,/Requests: 3 sent · 2 counted toward the limit · 1 exempt · 1 saved observation/);
+assert.match(summary,/class="field-info"/);
+assert.match(summary,/connection preflight/);
+assert.equal(renderRequestCounts({observations:{}}),'');
+assert.equal(renderRequestCounts({observations:{request_counts:{available:false,complete:false,saved_observations:1}}}),'<p class="hint">Requests: counts unavailable for this recovered run · 1 saved observation</p>');
+assert.match(renderRequestCounts({observations:{request_counts:{available:false,complete:false,saved_observations:2}}}),/2 saved observations/);
+const recovered=renderRequestCounts({observations:{request_counts:{sent:3,budget_counted:4,budget_counted_unsent:2,budget_exempt:1,saved_observations:1,available:true,complete:false}}});
+assert.match(recovered,/1 saved observation · 2 counted but not sent \(recovered; may be incomplete\)/);
+assert.match(recovered,/including attempts that failed to connect/);
+assert.doesNotMatch(summary,/counted but not sent|recovered;/);
+""", dom=True)
+
+
+def test_unavailable_recovered_counts_do_not_claim_stale_budget_progress():
+    run_render_checks(r"""
+const counts={available:false,complete:false,saved_observations:2};
+const recovered={abort_reason:'cancelled by user',observations:{request_counts:counts},checks:[]};
+const staleDetail={progress:{budget_used:99},request_plan:{planned_total:100}};
+assert.equal(countedRequests(recovered,staleDetail),null);
+assert.equal(countedRequests({}, {...staleDetail,summary:{request_counts:counts}}),null);
+const guidance=renderGuidance(recovered,staleDetail);
+assert.doesNotMatch(guidance,/requests counted|99|0 of/);
+assert.equal(guidance,'<p class="result-guidance">Partial results below.</p>');
+assert.match(renderRequestCounts(recovered),/Requests: counts unavailable for this recovered run · 2 saved observations/);
+""", dom=True)

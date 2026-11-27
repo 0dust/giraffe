@@ -196,6 +196,9 @@ def report(configuration, *, cancelled=False):
     return RunReport(run_id="suite-run-id", started_at="2026-10-04T10:00:00+00:00",
                      finished_at="2026-10-04T10:00:01+00:00",
                      overall="inconclusive" if cancelled else "pass",
+                     observations={"request_counts": {"sent": 1, "budget_counted": 1,
+                         "budget_counted_unsent": 0, "budget_exempt": 0, "saved_observations": 1,
+                         "budget_exempt_by_reason": {}, "complete": True, "targets": {}}},
                      manifest={"config": configuration.model_dump(mode="json")},
                      abort_reason="cancelled by user" if cancelled else None,
                      checks=[CheckResult(id="serving", target="local", title="Serving success",
@@ -204,7 +207,7 @@ def report(configuration, *, cancelled=False):
                      requests=[RequestRecord(id="request-one", target="local", fixture_id="short",
                                              scenario="warm", check_ids=["serving"],
                                              started_at="2026-10-04T10:00:00+00:00",
-                                             status="completed", valid=True, score=True,
+                                             status="completed", valid=True, score=True, sent=True,
                                              output="private successful answer", output_chars=25)])
 
 
@@ -704,7 +707,7 @@ async def test_job_lifecycle_reads_retained_artifacts(tmp_path, fake_runner):
         assert listing["active_run_id"] is None
         assert listing["runs"][0]["id"] == identifier
         assert listing["runs"][0]["overall"] == "pass"
-        assert listing["runs"][0]["request_count"] == 1
+        assert listing["runs"][0]["request_counts"]["sent"] == 1
         assert listing["runs"][0]["check_counts"]["pass"] == 1
         saved = await client.get(f"/api/runs/{identifier}/report.json")
         assert saved.status_code == 200
@@ -712,7 +715,7 @@ async def test_job_lifecycle_reads_retained_artifacts(tmp_path, fake_runner):
         assert saved.json()["requests"][0] == evidence.json()
         assert {k: v for k, v in saved.json().items() if k != "requests"} == {
             k: v for k, v in detail["report"].items()
-            if k not in {"requests", "request_count", "requests_compact", "comparison_summary"}}
+            if k not in {"requests", "request_counts", "requests_compact", "comparison_summary"}}
         assert detail["report"]["comparison_summary"]["comparison_status"] == "absent"
         assert "comparison_summary" not in saved.json()
         html = await client.get(f"/api/runs/{identifier}/report.html")
@@ -983,10 +986,10 @@ async def test_live_requests_and_phases_survive_activity_feed_truncation(tmp_pat
         progress({"event": "scenario_started", "target": "local", "scenario": "warm",
                   "elapsed_seconds": 0})
         for slot in range(120):
-            progress({"event": "request_started", "request_slot": slot, "target": "local",
+            progress({"event": "request_started", "request_slot": slot, "budget_request_slot": slot, "target": "local",
                       "scenario": "warm", "fixture_id": f"fixture-{slot}"})
         for slot in reversed(range(120)):
-            progress({"event": "request_completed", "request_slot": slot,
+            progress({"event": "request_completed", "request_slot": slot, "budget_request_slot": slot,
                       "request": {"id": f"request-{slot}", "status": "completed", "score": None}})
         progress({"event": "scenario_finished", "target": "local", "scenario": "warm",
                   "elapsed_seconds": 12})
@@ -1227,3 +1230,56 @@ async def test_legacy_ui_config_keeps_concurrency_intent(tmp_path, monkeypatch, 
         result = next(check for check in detail['report']['checks'] if check['id'] == 'correctness')
         assert result['status'] == ('inconclusive' if explicit else 'pass')
         assert result['metrics']['evidenced_overlap'] < 2
+
+
+def test_live_budget_slots_exclude_exempt_requests():
+    from collections import OrderedDict
+    from giraffe.web import _track_live_request
+
+    job = {"requests": OrderedDict(), "live_request_count": 0,
+           "live_request_summary": {"through_slot": None, "evicted": 0, "statuses": {}},
+           "evicted_running": set()}
+    _track_live_request(job, {"event": "request_started", "request_slot": 0, "budget_request_slot": 0,
+                             "request_budget_exempt": True, "scenario": "readiness"}, 2)
+    for slot in (1, 2):
+        _track_live_request(job, {"event": "request_started", "request_slot": slot, "budget_request_slot": slot - 1,
+                                 "request_budget_exempt": False, "budget_exempt": 1}, 2)
+    _track_live_request(job, {"event": "request_completed", "request_slot": 0, "budget_request_slot": 0,
+                             "request_budget_exempt": True,
+                             "request": {"id": "probe", "status": "completed"}}, 2)
+    for slot in (2, 1):
+        _track_live_request(job, {"event": "request_completed", "request_slot": slot, "budget_request_slot": slot - 1,
+                                 "request_budget_exempt": False, "budget_exempt": 1,
+                                 "request": {"id": str(slot), "status": "completed"}}, 2)
+    assert list(job["requests"]) == [0, 1]
+    assert [request["id"] for request in job["requests"].values()] == ["1", "2"]
+    assert job["live_request_count"] == 2
+
+
+def test_live_budget_slots_survive_out_of_order_exempt_journal_completion():
+    from collections import OrderedDict
+    from giraffe.web import _track_live_request
+
+    job = {"requests": OrderedDict(), "live_request_count": 0,
+           "live_request_summary": {"through_slot": None, "evicted": 0, "statuses": {}},
+           "evicted_running": set()}
+    for raw_slot, budget_slot, exempt in [(2, 1, False), (1, 0, False), (0, None, True)]:
+        _track_live_request(job, {"event": "request_completed", "request_slot": raw_slot,
+                                 "budget_request_slot": budget_slot,
+                                 "request_budget_exempt": exempt, "budget_exempt": 1,
+                                 "request": {"id": str(raw_slot), "status": "completed"}}, 2)
+    assert list(job["requests"]) == [0, 1]
+    assert [request["id"] for request in job["requests"].values()] == ["1", "2"]
+    assert job["live_request_count"] == 2
+
+
+def test_live_mosaic_requires_explicit_budget_slot():
+    from collections import OrderedDict
+    from giraffe.web import _track_live_request
+
+    job = {"requests": OrderedDict(), "live_request_count": 0,
+           "live_request_summary": {"through_slot": None, "evicted": 0, "statuses": {}},
+           "evicted_running": set()}
+    _track_live_request(job, {"event": "request_started", "request_slot": 0}, 1)
+    assert not job["requests"]
+    assert job["live_request_count"] == 0

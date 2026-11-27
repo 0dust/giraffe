@@ -339,3 +339,25 @@ def test_api_version_support_does_not_relax_metrics_url_validation(field):
     with pytest.raises(ValidationError):
         Target(name="local", url="https://server/v1", model="example",
                **{field: "https://server/metrics?api-version=2024-02-01"})
+
+
+def test_request_count_schema_is_discoverable():
+    from giraffe.capabilities import capabilities
+    from giraffe import states
+
+    description = capabilities()
+    schema = description["report_schema"]["properties"]["observations"]["properties"]["request_counts"]
+    schema, unavailable = schema["anyOf"]
+    assert set(unavailable["properties"]) == {"available", "complete", "saved_observations"}
+    assert unavailable["properties"]["available"]["const"] is False
+    fields = {"available", "sent", "budget_counted", "budget_exempt", "saved_observations",
+              "budget_exempt_by_reason", "targets", "budget_counted_unsent", "complete"}
+    assert set(schema["properties"]) == fields
+    assert all(schema["properties"][key]["description"] for key in fields)
+    target = schema["properties"]["targets"]["additionalProperties"]
+    assert set(target["properties"]) == fields - {"targets", "complete", "available"}
+    assert all(target["properties"][key]["description"] for key in fields - {"targets", "complete", "available"})
+    reasons = target["properties"]["budget_exempt_by_reason"]["propertyNames"]["enum"]
+    assert reasons == list(states.REQUEST_BUDGET_EXEMPTIONS)
+    assert description["states"]["request_budget_exemptions"] == reasons
+    assert "known planned requests" in description["plan_fields"]["known_total"]

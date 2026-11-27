@@ -45,7 +45,9 @@ def write_config(output: Path, *, engine: str, url: str | None = None, force: bo
     comments = ("# url: OpenAI-compatible API base for your running server.\n"
                 "# model: exact served model ID; replace the placeholder before running.\n"
                 "# checks: select the checks to run (giraffe describe lists all checks).\n"
-                "# max_requests: total request budget; null leaves it unset.\n"
+                "# max_requests: inference requests charged across all targets; null leaves it unset.\n"
+                "# Connection preflight and readiness after a cold-start restart are exempt in the report.\n"
+                "# Scheduled requests can use budget without being sent to the endpoint.\n"
                 "# default_concurrency: parallel requests per check; 1 runs serially.\n")
     with output.open("w" if force else "x") as file:
         file.write(comments + yaml.safe_dump(values, sort_keys=False))

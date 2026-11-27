@@ -504,8 +504,7 @@ async def run_arrival_window(run, target, client, settings, load_settings, calib
         offer = offers[spec.workload["offer_index"]]
         user = users[offer["user_id"]]
         if user.get("stop_reason") == "request could not be prepared":
-            run.budget_used -= 1
-            run.budget_counts[target.name] -= 1
+            run.refund_offer(target.name)
             return None
         spec.workload["ready_ms"] = spec.workload["scheduled_ms"]
 

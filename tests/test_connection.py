@@ -49,6 +49,7 @@ async def test_explicit_model_sends_one_bounded_request_and_preserves_auth(monke
         headers_env={"X-Gateway": "CONNECTION_HEADER"}, request_options={"temperature": 0},
     ))
     assert set(result) == {"status", "model", "latency_ms", "message", "context_window", "context_window_reason"}
+    assert "inference_requests_sent" not in result
     assert result["context_window"] is None
     assert result["status"] == "connected" and result["model"] == "manual-model"
     assert result["latency_ms"] >= 0

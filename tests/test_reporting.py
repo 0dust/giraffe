@@ -1980,3 +1980,52 @@ def test_html_export_zero_baseline_delta_keeps_interpretation_warning(tmp_path):
     assert '>Interpretation limited</strong>' in table
     assert 'Client scheduling delay limits timing attribution.' in table
     assert '>Better</strong>' not in table and '>Worse</strong>' not in table
+
+
+@pytest.mark.parametrize("count", [1, 2])
+def test_written_request_counts_are_explicit_and_match_cli_summaries(tmp_path, capsys, count):
+    from giraffe.cli import _print_result, main
+    from giraffe.reporting import _retained
+
+    report = make_report(count=count)
+    target = {"sent": count, "budget_counted": count, "budget_counted_unsent": 0,
+              "budget_exempt": 0, "saved_observations": 99, "budget_exempt_by_reason": {}}
+    report.observations["request_counts"] = {
+        **target, "targets": {"local": dict(target)}, "complete": True, "available": True,
+    }
+    retained = _retained(report)
+    retained.observations["request_counts"]["targets"]["local"]["saved_observations"] = 77
+    assert report.observations["request_counts"]["targets"]["local"]["saved_observations"] == 99
+    json_path, html_path = write_report(report, tmp_path, html=True)
+    saved = json.loads(json_path.read_text())
+    assert report.observations["request_counts"] == saved["observations"]["request_counts"]
+    assert report.observations["request_counts"]["saved_observations"] == count
+    assert report.observations["request_counts"]["targets"]["local"]["saved_observations"] == count
+    _print_result(report, json_path, html_path, tmp_path, {}, quiet=True)
+    live = capsys.readouterr().out
+    main(["report", str(tmp_path)])
+    replay = capsys.readouterr().out
+    expected = f"Requests: {count} sent · {count} counted toward the limit · 0 exempt · {count} saved observation"
+    if count != 1:
+        expected += "s"
+    assert expected in live and expected in replay and expected in html_path.read_text()
+    assert f"{count} {'request' if count == 1 else 'requests'} sent" in live
+
+
+def test_unavailable_recovered_counts_render_without_inventing_totals(tmp_path, capsys):
+    from giraffe.cli import _print_result
+    from giraffe.reporting import _request_counts_html, refresh_saved_observations, request_count_lines
+
+    report = make_report(count=1)
+    report.observations["request_counts"] = {"available": False, "complete": False, "saved_observations": 0}
+    refresh_saved_observations(report)
+    assert report.observations["request_counts"] == {
+        "available": False, "complete": False, "saved_observations": 1,
+    }
+    line = "Requests: counts unavailable for this recovered run · 1 saved observation"
+    assert request_count_lines(report) == [line]
+    assert line in _request_counts_html(report)
+    _print_result(report, tmp_path / "report.json", None, tmp_path, {}, quiet=True)
+    output = capsys.readouterr().out
+    assert line in output
+    assert "requests sent" not in output

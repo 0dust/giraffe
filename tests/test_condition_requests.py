@@ -138,14 +138,14 @@ def test_live_index_keeps_evicted_requests_and_updates_running_filters(monkeypat
            "live_request_count": 0, "evicted_running": set()}
     summary = lifecycle(planned=1000, status="running", started=1000, running=1000, completed=0, failed=0, reason=None)
     for slot in range(1000):
-        _track_live_progress(job, {"event": "request_started", "request_slot": slot,
+        _track_live_progress(job, {"event": "request_started", "request_slot": slot, "budget_request_slot": slot,
                                   "target": "local", "scenario": "bucket_c32_short_short",
                                   "condition_summary": summary}, None)
     index = job["condition_requests"]
     assert len(job["requests"]) == 2
     assert len(index.page("bucket_c32_short_short", page=100)["rows"]) == 10
     assert index.page("bucket_c32_short_short", page=100)["rows"][-1]["number"] == 1000
-    _track_live_progress(job, {"event": "request_completed", "request_slot": 0, "request": record(0)}, None)
+    _track_live_progress(job, {"event": "request_completed", "request_slot": 0, "budget_request_slot": 0, "request": record(0)}, None)
     assert index.page("bucket_c32_short_short", status="passed")["rows"][0]["request_id"] == "request-0"
     assert index.page("bucket_c32_short_short", status="running")["total"] == 999
     assert job["conditions"]["local", "bucket_c32_short_short"]["aggregate_status"] == "running"
@@ -170,7 +170,7 @@ async def test_live_api_uses_full_condition_index(tmp_path, monkeypatch):
     ready = threading.Event()
     async def waiting(config, *, progress, stop_event):
         for slot in range(32):
-            progress({"event": "request_started", "request_slot": slot, "target": "local",
+            progress({"event": "request_started", "request_slot": slot, "budget_request_slot": slot, "target": "local",
                       "scenario": "bucket_c32_short_short", "condition_summary": lifecycle(planned=32, started=32, running=32, completed=0, status="running")})
         ready.set()
         await stop_event.wait()

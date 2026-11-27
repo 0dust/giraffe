@@ -12,7 +12,7 @@ from giraffe.local_tokenizer import SETUP_TIMEOUT_SECONDS
 from giraffe.fixtures import SUITE_VERSION, builtin_fixtures
 from giraffe.models import (
     CHECK_LIMIT_FIELDS, CHECK_NAMES, CHECK_OPTION_FIELDS, DEFAULT_CHECKS, CheckOptions, CleanupCriteria, Limits,
-    RunConfig, TrafficConfig, Arrival, Prefix, Sessions, MultiUser, Consistency, ConcurrentLoad, LoadTest, JudgingConfig, JUDGE_PROMPT_VERSION, JUDGE_VOTING_RULE,
+    RunConfig, RunReport, TrafficConfig, Arrival, Prefix, Sessions, MultiUser, Consistency, ConcurrentLoad, LoadTest, JudgingConfig, JUDGE_PROMPT_VERSION, JUDGE_VOTING_RULE,
     DEFAULT_CONSISTENCY_OUTPUT_TOKENS, SHAPES, RequestPack, session_workload_presets,
 )
 from giraffe.caps import (MAX_PLANNED_ARRIVALS, MAX_REQUEST_PACK_BYTES, MAX_REQUEST_PACK_CASES,
@@ -182,6 +182,8 @@ def capabilities(config: RunConfig | None = None, *, restart_allowed: bool = Fal
         "kind": "capabilities", "schema_version": "1", "suite_version": SUITE_VERSION, "version": __version__,
         "validation_note": "The schema describes configuration. Validate checks semantic constraints; neither command contacts endpoints or verifies runtime availability.",
         "defaults": defaults, "config_schema": schema, "limits": limits,
+        "report_schema": RunReport.model_json_schema(),
+        "plan_fields": {"known_total": "The number of known planned requests charged across all targets, excluding exempt probes, the optional performance-evidence reserve and adaptive traffic."},
         "condition_labels": condition_labels(), "states": states.describe(),
         "tokenizer_setup_timeout_seconds": SETUP_TIMEOUT_SECONDS,
         "cap_explanations": caps.cap_explanations(limits),

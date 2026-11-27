@@ -99,6 +99,17 @@ def write_junit(report: RunReport, path: Path) -> None:
         for name, value in (("model", target.get("model") or ""),
                             ("url", _url(target.get("url") or "")), ("run_id", report.run_id)):
             ET.SubElement(properties, "property", name=name, value=_text(value))
+        if request_counts := report.observations.get("request_counts"):
+            available = request_counts.get("available") is not False
+            ET.SubElement(properties, "property", name="requests.available",
+                          value=str(available).lower())
+            ET.SubElement(properties, "property", name="requests.complete",
+                          value=str(request_counts.get("complete") is True).lower())
+            if available:
+                target_counts = request_counts["targets"].get(target_name, {})
+                for name in ("sent", "budget_counted", "budget_exempt", "saved_observations"):
+                    ET.SubElement(properties, "property", name=f"requests.{name}",
+                                  value=_text(target_counts.get(name, 0)))
         for check, status, reason in selected:
             case = ET.SubElement(suite, "testcase", name=_text(check.id), classname=_text(check.target))
             if status in {"fail", "blocked"}:
@@ -147,8 +158,12 @@ def _baseline_delta(report: RunReport) -> str:
 
 def write_summary_md(report: RunReport, path: Path, report_path: Path | None) -> None:
     """Write a concise summary suitable for GitHub step summaries and comments."""
-    lines = [f"## Giraffe: **{_md(report.overall.upper())}**", "", f"Run: {_md(report.run_id)}", "",
-             "| Target | Check | Verdict | Reason |", "| --- | --- | --- | --- |"]
+    from .reporting import request_count_lines
+
+    lines = [f"## Giraffe: **{_md(report.overall.upper())}**", "", f"Run: {_md(report.run_id)}", ""]
+    for line in request_count_lines(report):
+        lines.extend([_md(line), ""])
+    lines.extend(["| Target | Check | Verdict | Reason |", "| --- | --- | --- | --- |"])
     for check, status, reason in _rows(report):
         lines.append(f"| {_md(check.target, table_cell=True)} | {_md(check.id, table_cell=True)} | "
                      f"{_md(status, table_cell=True)} | {_md(reason, table_cell=True)} |")

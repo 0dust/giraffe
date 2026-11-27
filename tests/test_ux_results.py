@@ -395,7 +395,7 @@ renderLive();let html=nodes['#main'].innerHTML;
 assert.match(html,/<h1>Running<\/h1>/);
 assert.match(html,/9 requests finished · 5s · limit 100/);
 assert.doesNotMatch(html,/Requests started ·|Active requests<\/dt>/);
-assert.match(html,/Scheduled requests can also use budget without reaching the server/);
+assert.match(html,/Scheduled requests can also use budget without being sent to the endpoint/);
 assert.doesNotMatch(html,/Request budget used/);
 state.detail.state='stopping';renderLive();html=nodes['#main'].innerHTML;
 assert.match(html,/data-action="stop"[^>]* disabled/);

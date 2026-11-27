@@ -905,7 +905,7 @@ async def test_access_only_counts_requests_admitted_to_transport(monkeypatch, li
     assert allowed["observed"] == "allow" and denied["observed"] == "unverified"
     assert denied["reason"] == case_reason and denied["request_id"] is None
     assert check.evidence_ids == [allowed["request_id"]] == [record.id for record in report.requests]
-    assert report.observations["request_budget_used"] == events[-1]["attempted"] == 1
+    assert report.observations["request_counts"]["budget_counted"] == events[-1]["attempted"] == 1
     assert [event["fixture_id"] for event in events if event["event"] == "request_started"] == ["gateway-access-valid"]
 
 
@@ -962,7 +962,7 @@ async def test_access_quota_cutoff_preserves_completed_serving_comparison(monkey
     current = await run_suite(cfg)
     assert baseline.overall == "pass" and current.overall == "inconclusive"
     assert calls == [None] * 6 + ["Bearer allow-secret"] * (cap - 3)
-    assert current.observations["request_budget_used"] == cap
+    assert current.observations["request_counts"]["budget_counted"] == cap
     assert current.abort_reason is None and "max_requests" in current.limits_reached
     checks = {check.id: check for check in current.checks}
     assert checks["serving"].status == "pass"
@@ -1020,7 +1020,7 @@ async def test_rotated_credential_does_not_observe_another_access_identity(monke
     assert denied["observed"] == "unverified" and denied["reason"] == reason and denied["request_id"] is None
     assert sent == ["Bearer allow-secret"]
     assert check.evidence_ids == [allowed["request_id"]] == [record.id for record in report.requests]
-    assert report.observations["request_budget_used"] == events[-1]["attempted"] == 1
+    assert report.observations["request_counts"]["budget_counted"] == events[-1]["attempted"] == 1
     assert [event["fixture_id"] for event in events if event["event"] == "request_started"] == ["gateway-access-valid"]
     serialized = report.model_dump_json() + json.dumps(events)
     assert "allow-secret" not in serialized and "deny-secret" not in serialized

@@ -33,7 +33,7 @@ def test_report_helper_ignores_decoy_package_on_cwd_and_pythonpath(tmp_path, mon
     try:
         status, body = helper.read(tmp_path, "saved", "detail")
         assert status == 200
-        assert json.loads(body)["report"]["request_count"] == 1
+        assert json.loads(body)["report"]["request_counts"]["sent"] == 1
     finally:
         helper.close()
 
@@ -53,7 +53,7 @@ from giraffe.web import _ReportProcess
 helper = _ReportProcess()
 try:
     status, body = helper.read(Path(sys.argv[1]), "saved", "detail")
-    assert status == 200 and json.loads(body)["report"]["request_count"] == 1
+    assert status == 200 and json.loads(body)["report"]["request_counts"]["sent"] == 1
 finally:
     helper.close()
 '''
@@ -122,7 +122,7 @@ async def test_report_api_uses_pinned_helper_and_preserves_identity_error(tmp_pa
         if mismatch:
             assert 'Report reader identity mismatch' in response.json()['detail']
         else:
-            assert response.json()['report']['request_count'] == 1
+            assert response.json()['report']['request_counts']['sent'] == 1
 
 
 @pytest.mark.parametrize('pythonpath', [None, ''])
@@ -151,7 +151,7 @@ def test_report_helper_does_not_import_dependencies_from_cwd(tmp_path, monkeypat
     assert not marker.exists(), 'helper executed a dependency planted in its working directory'
     assert result is not None
     status, body = result
-    assert status == 200 and json.loads(body)['report']['request_count'] == 1
+    assert status == 200 and json.loads(body)['report']['request_counts']['sent'] == 1
 
 
 def test_report_helper_keeps_site_packages_after_stdlib(tmp_path, monkeypatch):

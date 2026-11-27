@@ -166,7 +166,7 @@ async def test_api_marker_ack_status_and_job_identity(tmp_path, monkeypatch):
         on_scale_down_control(control)
         advance_scale_down(control, "armed")
         # Later request progress must not erase the actionable control status.
-        progress(dict(event="request_started", target="local", request_slot=0, scenario="warm"))
+        progress(dict(event="request_started", target="local", request_slot=0, budget_request_slot=0, scenario="warm"))
         await stop_event.wait()
         control.set_phase("finished")
         return report(configuration)

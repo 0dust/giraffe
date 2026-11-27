@@ -185,10 +185,10 @@ async def test_live_api_keeps_shape_fields_separate_from_workload(tmp_path, monk
 
     async def waiting(config, *, progress, stop_event):
         shape = {"input_chars": 128, "requested_max_tokens": 24, "requested_input_tokens": 32}
-        progress({"event": "request_started", "request_slot": 0, "target": "local",
+        progress({"event": "request_started", "request_slot": 0, "budget_request_slot": 0, "target": "local",
                   "scenario": "warm", "fixture_id": "short", **shape})
         assert await asyncio.to_thread(release.wait, 3)
-        progress({"event": "request_completed", "request_slot": 0, **shape,
+        progress({"event": "request_completed", "request_slot": 0, "budget_request_slot": 0, **shape,
                   "request": {"id": "one", "status": "completed"}})
         await stop_event.wait()
         return report(config, cancelled=True)

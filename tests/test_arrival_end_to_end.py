@@ -352,7 +352,7 @@ async def test_reference_judging_waits_for_all_http_answers_and_preserves_payloa
     correctness = next(check for check in report.checks if check.id == "correctness")
     assert correctness.metrics["request_pack"]["control_status"] == "pass"
     assert correctness.status == "fail"
-    assert report.abort_reason is None and report.observations["request_budget_used"] == 4
+    assert report.abort_reason is None and report.observations["request_counts"]["budget_counted"] == 4
     assert all(record.valid and record.judgement for record in report.requests)
 
 
@@ -426,5 +426,5 @@ def test_reference_judging_has_separate_budget_and_does_not_extend_arrival_measu
     assert next(c for c in report.checks if c.id == "correctness").metrics["request_pack"]["control_status"] == "pass"
     assert next(check for check in report.checks if check.id == "correctness").status == "fail"
     assert report.abort_reason is None
-    assert report.observations["request_budget_used"] == 4
+    assert report.observations["request_counts"]["budget_counted"] == 4
     assert all(record.valid and record.judgement for record in report.requests)

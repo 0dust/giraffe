@@ -13,8 +13,8 @@ async def test_live_events_after_sequence_and_completion(tmp_path, monkeypatch):
     ready = threading.Event()
 
     async def waiting(configuration, *, progress, stop_event):
-        progress({"event": "request_started", "target": "local", "scenario": "warm", "request_slot": 0})
-        progress({"event": "request_completed", "target": "local", "scenario": "warm", "request_slot": 0,
+        progress({"event": "request_started", "target": "local", "scenario": "warm", "request_slot": 0, "budget_request_slot": 0})
+        progress({"event": "request_completed", "target": "local", "scenario": "warm", "request_slot": 0, "budget_request_slot": 0,
                   "request": {"id": "request-one", "status": "completed", "valid": True, "elapsed_ms": 2}})
         ready.set()
         await stop_event.wait()
@@ -168,7 +168,7 @@ async def test_startup_recovers_records_from_unfinalized_runner(tmp_path):
     async with browser(tmp_path) as client:
         detail = (await client.get("/api/runs/crashed")).json()
         assert detail["state"] == "interrupted"
-        assert detail["report"]["request_count"] == 4
+        assert detail["report"]["request_counts"] == {"available": False, "complete": False, "saved_observations": 4}
         reason = "Giraffe stopped before this run finished; 4 requests recorded."
         assert all(check["status"] == "inconclusive" and check["summary"] == reason
                    for check in detail["report"]["checks"])
@@ -176,7 +176,8 @@ async def test_startup_recovers_records_from_unfinalized_runner(tmp_path):
         assert not (directory / "evidence.jsonl").exists()
     async with browser(tmp_path) as client:
         reopened = (await client.get("/api/runs/crashed")).json()
-        assert reopened["state"] == "interrupted" and reopened["report"]["request_count"] == 4
+        assert reopened["state"] == "interrupted"
+        assert reopened["report"]["request_counts"] == detail["report"]["request_counts"]
 
 
 async def test_report_cache_tracks_file_identity_and_parses_on_worker(tmp_path, monkeypatch):
@@ -292,7 +293,8 @@ async def test_recovery_retries_interrupted_or_initially_fresh_owner(tmp_path, m
             if detail["state"] == "interrupted" and detail.get("report"):
                 break
             await asyncio.sleep(.005)
-        assert detail["state"] == "interrupted" and detail["report"]["request_count"] == 1
+        assert detail["state"] == "interrupted"
+        assert detail["report"]["request_counts"] == {"available": False, "complete": False, "saved_observations": 1}
 
 
 async def test_recovery_failure_keeps_server_available_and_evidence_for_retry(tmp_path, monkeypatch):
@@ -345,3 +347,41 @@ async def test_concurrent_baseline_saves_keep_name_unique(tmp_path, monkeypatch)
         assert sorted(response.status_code for response in responses) == [201, 409]
         baselines = (await client.get("/api/baselines")).json()["baselines"]
         assert len(baselines) == 1 and baselines[0]["name"] == "one name"
+
+
+async def test_live_delta_uses_counted_slots_and_excludes_exempt_requests(tmp_path, monkeypatch):
+    from tests.test_condition_requests import lifecycle
+
+    ready = threading.Event()
+
+    async def waiting(configuration, *, progress, stop_event):
+        for raw_slot, budget_slot, exempt in [(0, None, True), (1, 0, False), (2, 1, False)]:
+            progress({"event": "request_started", "target": "local", "request_slot": raw_slot,
+                      "budget_request_slot": budget_slot, "request_budget_exempt": exempt})
+        for raw_slot, budget_slot, exempt in [(1, 0, False), (2, 1, False), (0, None, True)]:
+            progress({"event": "request_completed", "target": "local", "request_slot": raw_slot,
+                      "budget_request_slot": budget_slot, "request_budget_exempt": exempt,
+                      "request": {"id": f"request-{raw_slot}", "status": "completed", "valid": True},
+                      **({"check": {"id": "access", "target": "local", "status": "pass"},
+                          "condition_summary": lifecycle()} if exempt else {})})
+        ready.set()
+        await stop_event.wait()
+        return report(configuration, cancelled=True)
+
+    monkeypatch.setattr("giraffe.web.run_suite", waiting)
+    async with browser(tmp_path) as client:
+        identifier = await start(client)
+        assert await asyncio.to_thread(ready.wait, 2)
+        path = f"/api/runs/{identifier}"
+        detail = (await client.get(path)).json()
+        delta = (await client.get(path + "/events?after=0")).json()
+        assert not delta["reset"]
+        expected = [("request-1", 0), ("request-2", 1)]
+        assert [(row["id"], row["slot"]) for row in detail["live_requests"]] == expected
+        assert [(row["id"], row["slot"]) for row in delta["records"]] == expected
+        assert delta["live_request_count"] == 2
+        assert any(check.get("id") == "access" and check["status"] == "pass" for check in delta["checks"])
+        assert any(check.get("condition", {}).get("id") == "bucket_c32_short_short"
+                   for check in delta["checks"])
+        await client.post(path + "/cancel", json={})
+        await finished(client, identifier)

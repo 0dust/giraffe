@@ -75,7 +75,7 @@ console.log(JSON.stringify({markup,cap:bootstrap.cap_explanations.concurrency.he
     assert html['cap'] in help_text(tree, 'concurrency')
     assert not any(node['tag'] == 'p' and node.get('class') == 'hint' for node in tree.nodes)
     assert_moved(tree, 'max_duration_seconds', 'When this time limit is reached, Giraffe stops sending new requests and cancels all requests still in progress. Tests can finish earlier. Completed results are kept; AI evaluation and report saving happen afterward. Server-side work may continue if the server does not honor cancellation.')
-    assert_moved(tree, 'max_requests', 'Shared by all selected checks and split into per-endpoint quotas. Scheduled requests may use budget without reaching the server. AI evaluator calls have separate limits.')
+    assert_moved(tree, 'max_requests', 'Shared by all selected checks and split into per-endpoint quotas. Scheduled requests may use budget without being sent to the endpoint. AI evaluator calls have separate limits.')
 
 
 def test_tools_and_consistency_text_is_preserved_in_popovers():

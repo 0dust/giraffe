@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from copy import deepcopy
 import contextvars
 from datetime import datetime, timezone
@@ -75,6 +75,9 @@ class EvidenceWriter:
         self._error = None
         self._closed = False
         self._stop = threading.Event()
+        self._counts_lock = threading.Lock()
+        self._pending_request_counts = None
+        self._counts_dirty = False
         self.close_seconds = max(0.001, close_seconds)
         self.dropped_count = 0
         context = contextvars.copy_context()
@@ -102,6 +105,22 @@ class EvidenceWriter:
         except queue.Full:
             self.dropped_count += 1
 
+    def request_counts_start(self, preflight: dict[str, int]) -> None:
+        self._enqueue(("request_counts_start", {"preflight": dict(preflight)}))
+
+    def request_counts_snapshot(self, counts: dict) -> None:
+        """Coalesce immutable counter snapshots outside the bounded evidence queue."""
+        with self._counts_lock:
+            if not self._closed and self._error is None:
+                self._pending_request_counts = counts
+                self._counts_dirty = True
+
+    def _request_counts_line(self, *, force: bool = False) -> str:
+        with self._counts_lock:
+            counts = self._pending_request_counts if force or self._counts_dirty else None
+            self._counts_dirty = False
+        return _json_line({"type": "request_counts", **counts}) if counts is not None else ""
+
     def progress(self, event: dict) -> None:
         if (event.get("event", "").startswith(("check_", "condition_"))
                                  or event.get("check") or event.get("condition_summary")
@@ -111,7 +130,7 @@ class EvidenceWriter:
                 return
             # Request bodies have their own record line; do not traverse or duplicate
             # them when persisting a condition transition alongside a completion.
-            value = {key: child for key, child in event.items() if key != "request"}
+            value = {key: child for key, child in event.items() if key not in {"request", "request_counts"}}
             for key in ("condition", "condition_summary", "scale_down",
                         "scale_down_snapshots", "scale_down_control", "timeout_warning"):
                 if key in value:
@@ -148,18 +167,26 @@ class EvidenceWriter:
                         item = self._queue.get(timeout=timeout)
                     except queue.Empty:
                         item = None
+                    batch = [] if item is None else [item]
+                    while batch and len(batch) < min(self.fsync_records, FSYNC_RECORDS):
+                        try:
+                            batch.append(self._queue.get_nowait())
+                        except queue.Empty:
+                            break
+                    lines = []
                     if self.dropped_count != last_dropped:
                         last_dropped = self.dropped_count
-                        stream.write(_json_line({"type": "dropped", "count": last_dropped}))
+                        lines.append(_json_line({"type": "dropped", "count": last_dropped}))
                         pending += 1
-                    if item is None and self._stop.is_set() and self._queue.empty():
-                        stream.flush()
-                        os.fsync(stream.fileno())
-                        break
-                    if item is not None:
-                        kind, value = item
+                    closing = not batch and self._stop.is_set() and self._queue.empty()
+                    has_records = any(kind == "record" for kind, _ in batch)
+                    for kind, value in batch:
                         non_finite = _has_non_finite(value) if kind != "record" else False
                         slot = value._request_slot if kind == "record" else None
+                        exempt = value._budget_exempt if kind == "record" else False
+                        budget_slot = value._budget_request_slot if kind == "record" else None
+                        exemption = value._budget_exemption if kind == "record" else None
+                        sent = value.sent if kind == "record" else False
                         if kind == "record":
                             non_finite = _has_non_finite(value.model_dump(mode="python"))
                             value = self._retained(value).requests[0].model_dump(mode="json")
@@ -178,14 +205,27 @@ class EvidenceWriter:
                             for key in ("summary", "reason"):
                                 if isinstance(value.get(key), str):
                                     value[key] = _without_answer_excerpts(value[key])
-                        stream.write(_json_line({"type": kind, kind: value, **({"request_slot": slot} if slot is not None else {})}, non_finite=non_finite))
+                        lines.append(_json_line({"type": kind, **(value if kind == "request_counts_start" else {kind: value}), **({"request_slot": slot} if slot is not None else {}),
+                                                **({"budget_exempt": exempt, "budget_exemption": exemption, "sent": sent, "budget_request_slot": budget_slot} if kind == "record" else {})}, non_finite=non_finite))
                         pending += 1
-                    if pending and (pending >= self.fsync_records
-                                    or time.monotonic() - last_sync >= self.fsync_seconds):
+                    with self._counts_lock:
+                        counts_pending = self._counts_dirty
+                    sync = (pending or counts_pending) and (pending >= self.fsync_records
+                            or time.monotonic() - last_sync >= self.fsync_seconds)
+                    # Keep records and their newest accounting in a single write,
+                    # even before the next fsync. Retain the latest snapshot so
+                    # later batches of already-counted records can repeat it.
+                    if has_records or sync or closing:
+                        lines.append(self._request_counts_line(force=has_records))
+                    if lines:
+                        stream.write("".join(lines))
+                    if sync or closing:
                         stream.flush()
                         os.fsync(stream.fileno())
                         pending = 0
                         last_sync = time.monotonic()
+                    if closing:
+                        break
         except Exception as error:
             self._error = error
             while True:
@@ -225,6 +265,7 @@ def recover_evidence(directory: Path | str, meta: dict, *, pause=None) -> RunRep
     scale_down = {}
     timeout_warnings = {}
     dropped = meta.get("evidence_dropped_count", 0)
+    preflight, snapshot = {}, None
     with stream:
         for line in stream:
             if pause is not None and pause.is_set():
@@ -233,10 +274,17 @@ def recover_evidence(directory: Path | str, meta: dict, *, pause=None) -> RunRep
                 value = json.loads(line)
                 if value.get("type") == "header":
                     header = value
+                elif value.get("type") == "request_counts_start":
+                    preflight = value["preflight"]
+                elif value.get("type") == "request_counts":
+                    snapshot = {key: child for key, child in value.items() if key != "type"}
                 elif value.get("type") == "dropped":
                     dropped = max(dropped, int(value["count"]))
                 elif value.get("type") == "record":
                     record = RequestRecord.model_validate(value["record"])
+                    record.sent = value.get("sent", record.sent)
+                    record._budget_exempt = value.get("budget_exempt", False)
+                    record._budget_exemption = value.get("budget_exemption")
                     # The journal precedes judging; never infer a judge outcome.
                     if record.judgement is not None or (record.evaluation and record.evaluation.scorer == "judge"):
                         record.score, record.score_message, record.judgement = None, None, None
@@ -300,6 +348,7 @@ def recover_evidence(directory: Path | str, meta: dict, *, pause=None) -> RunRep
         targets.setdefault(target, {})["timeout_warnings"] = list(warnings.values())
         warning_messages.extend(format_timeout_warning(warning) for warning in warnings.values())
     from .models import overall_status
+    request_counts = _recovered_request_counts(records.values(), preflight, snapshot)
     return RunReport(run_id=header.get("run_id", meta.get("run_id", directory.name)),
         started_at=header.get("started_at", meta.get("started_at", datetime.now(timezone.utc).isoformat())),
         finished_at=datetime.now(timezone.utc).isoformat(), overall=overall_status(list(checks.values()), reason), manifest=manifest,
@@ -307,8 +356,38 @@ def recover_evidence(directory: Path | str, meta: dict, *, pause=None) -> RunRep
         abort_reason=reason, warnings=["Judge scores are missing for recovered request evidence."] +
             ([f"{dropped} evidence records not written to evidence.jsonl"] if dropped else []) +
             list(dict.fromkeys(warning_messages)),
-        observations={"interrupted": True, "judge_scores_missing": True, "evidence_dropped_count": dropped,
+        observations={"request_counts": request_counts, "interrupted": True, "judge_scores_missing": True, "evidence_dropped_count": dropped,
                       "targets": targets})
+
+
+def _recovered_request_counts(records, preflight, snapshot):
+    """Use one internally consistent snapshot, never infer missing traffic."""
+    saved = Counter(record.target for record in records
+                    if record.scenario not in states.SETUP_PROBE_SCENARIOS)
+    if snapshot is None:
+        return {"complete": False, "available": False, "saved_observations": sum(saved.values())}
+    result = deepcopy(snapshot)
+    result.update(complete=False, available=True, saved_observations=sum(saved.values()))
+    targets = result["targets"]
+
+    def empty():
+        return {"sent": 0, "budget_counted": 0, "budget_counted_unsent": 0,
+                "budget_exempt": 0, "saved_observations": 0, "budget_exempt_by_reason": {}}
+
+    for target in saved:
+        targets.setdefault(target, empty())
+    for target, count in preflight.items():
+        value = targets.setdefault(target, empty())
+        missing = max(0, count - value["budget_exempt_by_reason"].get("preflight", 0))
+        if missing:
+            for row in (value, result):
+                row["sent"] += missing
+                row["budget_exempt"] += missing
+                reasons = row["budget_exempt_by_reason"]
+                reasons["preflight"] = reasons.get("preflight", 0) + missing
+    for target, value in targets.items():
+        value["saved_observations"] = saved[target]
+    return result
 
 
 def _recover_scale_down_event(targets: dict, event: dict) -> None:

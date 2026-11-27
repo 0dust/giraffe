@@ -96,7 +96,7 @@ def test_failure_summary_removes_partial_pass_report_and_reports_error(tmp_path)
     assert "disk full" in message and "2 requests was lost" in message
     assert "a summary was saved" in message
     assert summary["state"] == "error" and summary["overall"] == "pass"
-    assert summary["error"] == message and summary["request_count"] == 2
+    assert summary["error"] == message and summary["request_counts"] == report.observations.get("request_counts")
     assert summary["checks"][0]["summary"] == "One wrong answer"
     assert not (tmp_path / "report.json").exists()
     assert not (tmp_path / "report.html").exists()

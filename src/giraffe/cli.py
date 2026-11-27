@@ -261,7 +261,7 @@ Run "giraffe describe" for every state, stop reason and exit code as JSON.""")
         run.add_argument("--simultaneous-limit", "--max-concurrency", type=int, help="Simultaneous limit across the suite (default: Not set)")
         run.add_argument("--default-concurrency", type=int, help="Default parallelism for checks (default: 4)")
         run.add_argument("--no-simultaneous-limit", action="store_true", help="Leave simultaneous target requests without a suite ceiling")
-        run.add_argument("--max-requests", type=int, help="Maximum requests across all targets (default: Not set)")
+        run.add_argument("--max-requests", type=int, help="Maximum inference requests charged across all targets. Not charged: the connection preflight and the readiness probe after a cold-start restart; the report lists them as exempt (default: Not set)")
         run.add_argument("--no-max-requests", action="store_true", help="Leave the suite request budget Not set")
         run.add_argument("--no-max-duration", action="store_true", help="Leave the suite traffic duration Not set")
         run.add_argument("--max-memory", type=int, dest="max_memory_mb",
@@ -335,7 +335,8 @@ Run "giraffe describe" for every state, stop reason and exit code as JSON.""")
                     if action in group._group_actions:
                         group._group_actions.remove(action)
                 advanced._group_actions.append(action)
-    report = commands.add_parser("report", help="Render a saved report or recover an interrupted run without model requests")
+    report = commands.add_parser("report", help="Print a saved or recovered run summary; optionally export HTML or CI artifacts",
+                                 description="Print the verdict, request counts and check results for a saved or recovered run without sending model requests. Optionally export HTML or CI artifacts.")
     report.add_argument("run_dir", type=Path, metavar="RUN_DIR")
     report.add_argument("--html", action="store_true", help="Write a standalone HTML report")
     report.add_argument("--junit", type=Path, metavar="PATH")
@@ -573,7 +574,7 @@ def _stage_name(scenario: str, config=None) -> str | None:
 
 
 async def _run(config: RunConfig, *, json_progress: bool = False, verbose: bool = False, quiet: bool = False,
-               directory: Path | None = None) -> RunReport:
+               directory: Path | None = None, preflight_counts: dict[str, int] | None = None) -> RunReport:
     from giraffe.runner import run_suite
 
     stop = asyncio.Event()
@@ -600,7 +601,7 @@ async def _run(config: RunConfig, *, json_progress: bool = False, verbose: bool 
     timeout_warning_counts: dict[str, int] = {}
     timeout_warning_lines: dict[str, str] = {}
     latest_timeout_warnings: dict[str, dict] = {}
-    writer = adapter = sink_token = report = None
+    writer = adapter = sink_token = counts_token = report = None
 
     def progress(event: dict) -> None:
         nonlocal last, last_update
@@ -633,7 +634,9 @@ async def _run(config: RunConfig, *, json_progress: bool = False, verbose: bool 
         if title:
             parts = [f"  {current[0]}: {title}"]
             if config.max_requests is not None:
-                parts.append(f"{event.get('completed', 0)} of {config.max_requests} requests")
+                parts.append(f"{event.get('budget_used', 0)} of {config.max_requests} counted requests")
+            if event.get("budget_exempt", 0):
+                parts.append(f"{event['budget_exempt']} exempt")
             parts.append(f"{event.get('elapsed_seconds', 0):g}s")
             _progress_print(" · ".join(parts))
             last = current
@@ -641,13 +644,17 @@ async def _run(config: RunConfig, *, json_progress: bool = False, verbose: bool 
 
     try:
         options = {}
+        if preflight_counts:
+            options["preflight_counts"] = preflight_counts
         if directory is not None:
             from giraffe.deployment import safe_config
             from giraffe.evidence import EvidenceWriter
-            from giraffe.runner import record_sink
+            from giraffe.runner import record_sink, request_counts_sink
 
             writer = EvidenceWriter(directory, manifest={"config": safe_config(config.model_dump(mode="json"))})
+            writer.request_counts_start(preflight_counts or {})
             sink_token = record_sink.set(writer.record_finished)
+            counts_token = request_counts_sink.set(writer.request_counts_snapshot)
             if "scale_down" in config.checks:
                 from giraffe.scale_down_control import ScaleDownFileControl
                 adapter = ScaleDownFileControl(directory)
@@ -656,6 +663,8 @@ async def _run(config: RunConfig, *, json_progress: bool = False, verbose: bool 
             report = await run_suite(config, progress=progress, stop_event=stop, **options)
         except asyncio.CancelledError as error:
             report = getattr(error, "giraffe_report", None)
+            if report is not None and (counts := report.observations.get("request_counts")) is not None:
+                counts["complete"] = False
             raise
     finally:
         try:
@@ -668,8 +677,9 @@ async def _run(config: RunConfig, *, json_progress: bool = False, verbose: bool 
                     report.warnings.append("Scale-down control status file could not be saved; inspect report evidence.")
             finally:
                 if writer is not None:
-                    from giraffe.runner import record_sink
+                    from giraffe.runner import record_sink, request_counts_sink
                     record_sink.reset(sink_token)
+                    request_counts_sink.reset(counts_token)
                     try:
                         await asyncio.to_thread(writer.close)
                     except Exception:
@@ -677,7 +687,10 @@ async def _run(config: RunConfig, *, json_progress: bool = False, verbose: bool 
                         if report is not None:
                             report.warnings.append("Live evidence journal could not finish; final report uses completed run state.")
                     if report is not None:
+                        from giraffe.reporting import refresh_saved_observations
+
                         report.observations["evidence_dropped_count"] = writer.dropped_count
+                        refresh_saved_observations(report)
                         if writer.dropped_count:
                             report.warnings.append(f"{writer.dropped_count} evidence records not written to evidence.jsonl")
         finally:
@@ -985,17 +998,20 @@ def _main(argv: list[str] | None = None) -> int:
                     print("\nGiraffe UI stopped.")
             return 0
         if args.command == "report":
-            if not (args.html or args.junit or args.summary_md):
-                raise ValueError("Choose --html, --junit PATH or --summary-md PATH")
             if args.output and not args.html:
                 raise ValueError("--output requires --html")
             report = _report_for_render(args.run_dir)
+            html_path = None
             if args.html:
                 from giraffe.reporting import _atomic_write, _render
                 output = args.output or (args.run_dir if args.run_dir.is_dir() else args.run_dir.parent) / "report.html"
                 _atomic_write(output, _render(report))
                 print(f"HTML: {output.resolve()}")
+                html_path = output
             _ci_outputs(report, args, args.run_dir)
+            directory = args.run_dir if args.run_dir.is_dir() else args.run_dir.parent
+            json_path = args.run_dir if args.run_dir.is_file() else directory / "report.json"
+            _print_result(report, json_path, html_path, directory, {})
             return 0
         if args.command in {"export", "inspect"}:
             from giraffe.reporting import reproduction_export, _retained
@@ -1083,14 +1099,17 @@ def _main(argv: list[str] | None = None) -> int:
         gateway_only = gateway_identities_only(config.checks)
         preflight_targets = [target for target in config.targets
                              if not gateway_only or config.restart_target == target.name]
+        preflight_counts: dict[str, int] = {}
         if args.command == "run" and not args.skip_preflight and preflight_targets:
             from giraffe.deployment import preparation_residency
             config._preparation_residency = asyncio.run(preparation_residency(config))
             async def preflight():
                 for target in preflight_targets:
                     try:
-                        await check_target(target, config)
+                        result = await check_target(target, config)
+                        preflight_counts[target.name] = result["inference_requests_sent"]
                     except PreflightError as error:
+                        preflight_counts[target.name] = error.inference_requests_sent
                         if error.blocking:
                             return target.name, str(error).rstrip(". ") + ". Use --skip-preflight to run anyway."
                         warning = f"preflight for {target.name}: {str(error).rstrip('. ')}; continuing."
@@ -1164,6 +1183,8 @@ def _main(argv: list[str] | None = None) -> int:
             cancellation = None
             try:
                 control = {"directory": directory}
+                if preflight_counts:
+                    control["preflight_counts"] = preflight_counts
                 report = await (_run(config, quiet=True, **control) if getattr(args, "quiet", False) else
                                 _run(config, json_progress=True, **control) if json_output else
                                 _run(config, verbose=True, **control) if getattr(args, "verbose", False) else _run(config, **control))
@@ -1243,7 +1264,7 @@ def _main(argv: list[str] | None = None) -> int:
                         except OSError:
                             pass
                         if json_output:
-                            emit("error", states.EXIT_CODE_USAGE, run_id=report.run_id, message=message, request_count=len(report.requests), resources=resources)
+                            emit("error", states.EXIT_CODE_USAGE, run_id=report.run_id, message=message, request_counts=report.observations.get("request_counts"), resources=resources)
                         else:
                             print(f"giraffe: {message}", file=sys.stderr)
                             if getattr(args, "verbose", False) and not getattr(args, "quiet", False):
@@ -1302,7 +1323,7 @@ def _main(argv: list[str] | None = None) -> int:
                 print(f"Note: {report.overall} verdict accepted by --fail-on {policy}.", file=sys.stderr)
             summary = report.observations.get("summary")
             if json_output:
-                emit("interrupted" if interrupted["requested"] else report.overall, exit_code, warnings=warnings, run_id=report.run_id, request_count=len(report.requests),
+                emit("interrupted" if interrupted["requested"] else report.overall, exit_code, warnings=warnings, run_id=report.run_id, request_counts=report.observations.get("request_counts"),
                      performance=report.performance,
                      abort_reason=report.abort_reason, resources=resources, auto_cleanup=cleanup_result,
                      **({"summary": summary} if summary else {}),
@@ -1373,13 +1394,26 @@ def _ci_outputs(report: RunReport, args: argparse.Namespace, report_path: Path |
         write_summary_md(report, args.summary_md, report_path)
 
 
+def _print_request_counts(report: RunReport) -> None:
+    from giraffe.reporting import request_count_lines
+
+    for line in request_count_lines(report):
+        print(line)
+
+
 def _print_result(report: RunReport, json_path: Path, html_path: Path | None,
                   directory: Path, resources: dict, *, verbose: bool = False, quiet: bool = False) -> None:
     from giraffe.performance import cli_summary
 
     passed = sum(check.status == "pass" for check in report.checks)
     report_path = html_path or json_path
-    print(f"{report.overall.upper()}  {passed} checks passed · {len(report.requests)} requests · report: {report_path}")
+    counts = report.observations.get("request_counts")
+    requests = ""
+    if counts is not None and counts.get("available") is not False:
+        noun = "request" if counts["sent"] == 1 else "requests"
+        requests = f" · {counts['sent']} {noun} sent"
+    print(f"{report.overall.upper()}  {passed} checks passed{requests} · report: {report_path}")
+    _print_request_counts(report)
     if quiet:
         return
     for check in report.checks:

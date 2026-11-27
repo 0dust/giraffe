@@ -25,7 +25,7 @@ def test_partial_measured_traffic_omits_eta_but_keeps_connection_risk():
 const markup=renderPlanTime(plan);
 assert.equal(plan.has_complete_time_estimate,false);assert.doesNotMatch(markup,/Estimated duration:|Confidence:/);
 assert.match(markup,/Endpoint response for service may wait up to 30 s/);
-assert.doesNotMatch(markup,/estimated traffic duration may exceed|Unknown requests/);
+assert.doesNotMatch(markup,/estimated traffic duration may exceed/);
 assert.match(markup,/data-setting-path="test_options.access.request_timeout_seconds"/);
 """)
 

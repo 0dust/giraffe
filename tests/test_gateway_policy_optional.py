@@ -142,7 +142,7 @@ async def test_shared_token_evidence_has_precedence_over_policy_probes(monkeypat
         ordinary.append("performance_evidence_probe")
     ordinary.extend(["generation", "generation"])
     identity_count = max(0, cap - len(ordinary)) if policy == "available" else 0
-    assert report.observations["request_budget_used"] == len(sent) == len(ordinary) + identity_count
+    assert report.observations["request_counts"]["budget_counted"] == len(sent) == len(ordinary) + identity_count
     assert sent[:len(ordinary)] == ["Bearer shared-secret"] * len(ordinary)
     assert all(auth in {"Bearer limited-secret", "Bearer peer-secret"} for auth in sent[len(ordinary):])
     assert [record.scenario for record in report.requests] == ordinary + ["gateway_policy"] * identity_count
@@ -225,7 +225,7 @@ async def test_recovery_reserves_only_usable_policy_work(monkeypatch, policy):
     report = await run_suite(config)
     recovery = next(check for check in report.checks if check.id == "recovery")
     budget = recovery.metrics["sustained_budget"]
-    assert report.observations["request_budget_used"] == len(sent) == 10
+    assert report.observations["request_counts"]["budget_counted"] == len(sent) == 10
     if policy == "available":
         assert budget["allowance"] == 0 and budget["reserved_later"] == 9
         assert sent[:4] == ["Bearer shared-secret"] * 4
@@ -333,7 +333,7 @@ async def test_unavailable_policy_credentials_do_not_consume_requests(monkeypatc
     assert [user["dispatched"] for user in policy["users"]] == [0, 0]
     assert not sent
     assert not report.requests
-    assert report.observations["request_budget_used"] == 0
+    assert report.observations["request_counts"]["budget_counted"] == 0
     assert report.abort_reason is None
 
 
@@ -429,7 +429,7 @@ async def test_optional_policy_preserves_shared_traffic_at_run_limits(monkeypatc
             assert report.abort_reason is None
             assert report.limits_reached == ["max_requests"]
             assert report.observations["request_limit_scopes"] == ["gateway"]
-            assert report.observations["request_budget_used"] == len(sent) == 7
+            assert report.observations["request_counts"]["budget_counted"] == len(sent) == 7
             summary = policy.metrics["gateway_policy"]
             assert sum(user["dispatched"] for user in summary["users"]) == 1
             assert summary["qualification"] == "unverified"
@@ -585,7 +585,7 @@ async def test_policy_budget_stop_reason_belongs_to_the_target(monkeypatch, cap,
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handle), **kw))
     report = await run_suite(config, progress=progress)
     assert [offered["proxy"], offered["second"]] == counts
-    assert report.observations["request_budget_used"] == cap
+    assert report.observations["request_counts"]["budget_counted"] == cap
     assert report.observations["request_limit_scopes"] == ["gateway"]
     assert report.limits_reached == ["max_requests"] and report.abort_reason is None
     assert all(check.status == "pass" for check in report.checks if check.id == "serving")
@@ -609,7 +609,7 @@ async def test_isolated_policy_completed_at_exact_cap_keeps_verdict(monkeypatch)
 
     check, report, sent = await exercise(monkeypatch, full=True, max_requests=13)
     summary = check.metrics["gateway_policy"]
-    assert len(sent) == report.observations["request_budget_used"] == 13
+    assert len(sent) == report.observations["request_counts"]["budget_counted"] == 13
     assert check.status == "pass" and summary["qualification"] == "observed"
     assert summary["complete"] and summary["stop_reason"] is None
     assert report.abort_reason is None

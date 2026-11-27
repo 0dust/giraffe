@@ -216,3 +216,45 @@ def test_markdown_summary_escapes_leading_controls(tmp_path, reason, escaped):
     path = tmp_path / 'summary.md'
     write_summary_md(source, path, None)
     assert f'| local | access | pass | {escaped} |' in path.read_text()
+
+
+@pytest.mark.parametrize("complete", [True, False])
+def test_request_accounting_in_ci_artifacts(tmp_path, complete):
+    from giraffe.reporting import request_count_lines
+
+    source = report()
+    target = {"sent": 2, "budget_counted": 2, "budget_counted_unsent": 1, "budget_exempt": 1,
+              "saved_observations": 1, "budget_exempt_by_reason": {"preflight": 1}}
+    source.observations["request_counts"] = {**target, "complete": complete, "available": True, "targets": {"local": target}}
+    junit = tmp_path / "junit.xml"
+    write_junit(source, junit)
+    props = {item.get("name"): item.get("value")
+             for item in ET.parse(junit).getroot().findall("testsuite/properties/property")}
+    assert {key: value for key, value in props.items() if key.startswith("requests.")} == {
+        "requests.sent": "2", "requests.budget_counted": "2", "requests.budget_exempt": "1",
+        "requests.saved_observations": "1", "requests.complete": str(complete).lower(),
+        "requests.available": "true",
+    }
+    summary = tmp_path / "summary.md"
+    write_summary_md(source, summary, None)
+    for line in request_count_lines(source):
+        assert line in summary.read_text()
+    assert ("(recovered; may be incomplete)" in summary.read_text()) is not complete
+
+
+@pytest.mark.parametrize("saved", [1, 2])
+def test_unavailable_recovered_request_counts_in_ci(tmp_path, saved):
+    source = report()
+    source.observations["request_counts"] = {
+        "available": False, "complete": False, "saved_observations": saved,
+    }
+    junit = tmp_path / "junit.xml"
+    write_junit(source, junit)
+    props = {item.get("name"): item.get("value")
+             for item in ET.parse(junit).getroot().findall("testsuite/properties/property")
+             if item.get("name").startswith("requests.")}
+    assert props == {"requests.available": "false", "requests.complete": "false"}
+    summary = tmp_path / "summary.md"
+    write_summary_md(source, summary, None)
+    noun = "saved observation" if saved == 1 else "saved observations"
+    assert f"Requests: counts unavailable for this recovered run · {saved} {noun}" in summary.read_text()

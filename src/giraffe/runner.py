@@ -48,6 +48,16 @@ logger = logging.getLogger(__name__)
 # A context-local sink lets web runs persist evidence without changing request()
 # or sharing a writer between concurrent CLI invocations.
 record_sink = ContextVar("giraffe_record_sink", default=lambda record: None)
+request_counts_sink = ContextVar("giraffe_request_counts_sink", default=None)
+_transport_sent_callback = ContextVar("giraffe_transport_sent_callback", default=None)
+
+
+def _observe_transport_sent():
+    # A shared client can dispatch concurrent requests; the callback belongs to
+    # the request task's context, rather than mutable client request state.
+    callback = _transport_sent_callback.get()
+    if callback is not None:
+        callback()
 
 
 class _DispatchRefused(Exception):
@@ -375,12 +385,19 @@ class _Run:
         self.records: list[RequestRecord] = []
         self.timeout_watch = TimeoutWatch()
         self.record_sink = record_sink.get()
+        self.request_counts_sink = request_counts_sink.get()
         from giraffe.logprobs import LogprobBudget
         self.logprob_budget = LogprobBudget()
         self.attempted = 0
+        self.counted_attempted = 0
         self.budget_used = 0
         self.dropped_offers = 0
         self.budget_counts = Counter()
+        self.budget_unsent_counts = Counter()
+        self.saved_counts = Counter()
+        self.sent_counts = Counter()
+        self.charged_sent_counts = Counter()
+        self.exempt_counts = defaultdict(Counter)
         self.errors = 0
         self.reason: str | None = None
         self.limits_reached = set()
@@ -433,6 +450,12 @@ class _Run:
                     "timeout_seconds": config.metrics_timeout_seconds,
                     "max_samples": config.metrics_max_samples,
                     "max_series": config.metrics_max_series, "collection_gaps_seconds": []})
+
+        self._publish_request_counts()
+
+    def _publish_request_counts(self):
+        if self.request_counts_sink is not None:
+            self.request_counts_sink(self.request_counts(saved_counts=self.saved_counts))
 
     def runtime_gateway_request_counts(self, target):
         from .gateway_access import eligible_probe_count
@@ -539,6 +562,41 @@ class _Run:
             row["condition_verdict"] = row.get("condition_verdict") or "pending"
         self.emit_condition("condition_finished", scenario, row)
 
+    def note_sent(self, target: str, exempt_reason: str | None = None) -> None:
+        """Count target inference only once local preparation reaches transport."""
+        if exempt_reason is not None and exempt_reason not in states.REQUEST_BUDGET_EXEMPTIONS:
+            raise ValueError(f"Unknown request budget exemption: {exempt_reason}")
+        self.sent_counts[target] += 1
+        if exempt_reason is None:
+            self.charged_sent_counts[target] += 1
+            self.budget_unsent_counts[target] -= 1
+        else:
+            self.exempt_counts[target][exempt_reason] += 1
+        self._publish_request_counts()
+
+    def request_counts(self, *, saved_counts=None) -> dict:
+        """Snapshot charged offers, actual dispatches, and retained measurements."""
+        saved = (Counter(record.target for record in self.records
+                         if record.scenario not in states.SETUP_PROBE_SCENARIOS)
+                 if saved_counts is None else saved_counts)
+        targets = {}
+        reasons = Counter()
+        for target in self.config.targets:
+            exempt = self.exempt_counts[target.name]
+            reasons.update(exempt)
+            targets[target.name] = {
+                "sent": self.sent_counts[target.name],
+                "budget_counted": self.budget_counts[target.name],
+                "budget_counted_unsent": self.budget_unsent_counts[target.name],
+                "budget_exempt": sum(exempt.values()),
+                "saved_observations": saved[target.name],
+                "budget_exempt_by_reason": dict(exempt),
+            }
+        return {"sent": sum(self.sent_counts.values()), "budget_counted": self.budget_used,
+                "budget_counted_unsent": sum(self.budget_unsent_counts.values()), "complete": True, "available": True,
+                "budget_exempt": sum(reasons.values()), "saved_observations": sum(saved.values()),
+                "budget_exempt_by_reason": dict(reasons), "targets": targets}
+
     def record_finished(self, record: RequestRecord) -> None:
         """Persist completed, pre-judging evidence through the installed sink."""
         self.record_sink(record)
@@ -553,6 +611,9 @@ class _Run:
             self.progress({"event": event, "target": target, "scenario": scenario,
                            "completed": len(self.records), "attempted": self.attempted,
                            "budget_used": self.budget_used,
+                           "request_counts": self.request_counts(saved_counts=self.saved_counts),
+                           "sent": sum(self.sent_counts.values()),
+                           "budget_exempt": sum(sum(counts.values()) for counts in self.exempt_counts.values()),
                            "dropped_offers": self.dropped_offers,
                            "max_requests": self.config.max_requests,
                            "elapsed_seconds": round(time.monotonic() - self.start, 3), **extra})
@@ -746,7 +807,17 @@ class _Run:
             return False
         self.budget_used += 1
         self.budget_counts[target] += 1
+        # A charged offer is unsent until its transport hand-off or refund.
+        self.budget_unsent_counts[target] += 1
+        self._publish_request_counts()
         return True
+
+    def refund_offer(self, target: str) -> None:
+        """Refund a charged reservation that never reached the transport."""
+        self.budget_used -= 1
+        self.budget_counts[target] -= 1
+        self.budget_unsent_counts[target] -= 1
+        self._publish_request_counts()
 
     def drop_offer(self, target: str, scenario: str):
         self.dropped_offers += 1
@@ -840,7 +911,7 @@ class _Run:
     async def request(self, target, client, spec, event=None, on_start=None, timeout_override=None,
                       *, slot_reserved=False, budget_reserved=False, deadline_override=None,
                       admission_deadline=None, prepared_admission=False, admission_check=None,
-                      on_preparation_failure=None, budget_exempt=False, evaluate_record=None,
+                      on_preparation_failure=None, budget_exemption: str | None = None, evaluate_record=None,
                       finalize_record=None, request_parameters=None, lifecycle_observer=None):
         """Complete a request and persist its terminal evidence once.
 
@@ -852,6 +923,9 @@ class _Run:
         ``admission_check`` checks caller-owned eligibility before committing an attempt.
         ``on_preparation_failure`` can read a client diagnostic without recording an attempt.
         """
+        if budget_exemption is not None and budget_exemption not in states.REQUEST_BUDGET_EXEMPTIONS:
+            raise ValueError(f"Unknown request budget exemption: {budget_exemption}")
+        budget_exempt = budget_exemption is not None
         source, timeout_check, timeout_setting = self.timeout_origin(spec)
         spec = spec.model_copy(update={"deadline_source": source, "timeout_check": timeout_check,
                                        "timeout_setting": timeout_setting})
@@ -910,6 +984,8 @@ class _Run:
             global_deadline = False
             deadline = None
             intentional_deadline_applies = False
+            sent = False
+            budget_request_slot = None
             request_slot = started = started_at = token = timeout = None
             failure = None
             task = asyncio.current_task()
@@ -931,8 +1007,7 @@ class _Run:
                         self.mark_unfinished(target.name, _scenario_checks(spec))
                     return None
                 if budget_reserved and not budget_exempt:
-                    self.budget_used -= 1
-                    self.budget_counts[target.name] -= 1
+                    self.refund_offer(target.name)
                 return RequestRecord(
                     id=uuid.uuid4().hex, target=target.name, fixture_id=spec.fixture_id,
                     scenario=spec.scenario, check_ids=spec.check_ids, started_at=_now(),
@@ -942,7 +1017,8 @@ class _Run:
 
             def emit_start():
                 self.emit("request_started", target.name, spec.scenario,
-                          request_slot=request_slot, fixture_id=spec.fixture_id,
+                          request_slot=request_slot, budget_request_slot=budget_request_slot,
+                          request_budget_exempt=budget_exempt, fixture_id=spec.fixture_id,
                           **({"user": {key: spec.workload[key] for key in ("user_id", "population", "profile", "window_id", "phase", "request_sequence", "session_id", "turn_id", "conversation_sequence", "role", "matched_work_sequence", "trigger", "heavy_profile", "cancellation_role", "cohort", "origin", "work_sequence", "activation_seconds") if key in spec.workload}} if "multi_user" in spec.check_ids else {}),
                           input_chars=request_parameters["input_chars"], requested_max_tokens=output_cap,
                           requested_input_tokens=spec.requested_input_tokens,
@@ -970,7 +1046,7 @@ class _Run:
                 return timeout
 
             def begin_attempt():
-                nonlocal started, started_at, request_slot, token, pending_start
+                nonlocal started, started_at, request_slot, budget_request_slot, token, pending_start
                 if admission_deadline is not None:
                     started = admission_clock()
                     if (not budget_reserved and not budget_exempt
@@ -985,6 +1061,9 @@ class _Run:
                     if condition["planned"] is not None:
                         condition["not_sent"] = max(0, condition["planned"] - condition["sent"])
                 request_slot = self.attempted - 1
+                if not budget_exempt:
+                    budget_request_slot = self.counted_attempted
+                    self.counted_attempted += 1
                 self.counts[target.name] += 1
                 if not readiness and not evidence_probe:
                     self.endpoint_attempt(target.name)
@@ -1006,6 +1085,15 @@ class _Run:
                 if guard_transport:
                     deadline.reschedule(min(self.deadline, task.get_loop().time() + request_budget()))
 
+            def note_transport_sent():
+                nonlocal sent
+                self.note_sent(target.name, budget_exemption)
+                sent = True
+
+            sent_observer = getattr(client, "_supports_sent_observer", False) is True
+            if sent_observer and client.on_sent is not _observe_transport_sent:
+                client.on_sent = _observe_transport_sent
+            sent_observer_token = _transport_sent_callback.set(note_transport_sent)
             try:
                 if guard_transport:
                     # Keep the run bound during preparation. The transport hook
@@ -1016,8 +1104,16 @@ class _Run:
                     begin_attempt()
                     deadline = asyncio.timeout(request_budget())
                 async with deadline:
+                    # Alternate clients without the transport observer expose execute
+                    # itself as their hand-off. The built-in client counts after preparation.
+                    if not sent_observer and not guard_transport:
+                        note_transport_sent()
                     if guard_transport:
-                        record = await client.execute(spec, first_output_event=event, _before_send=begin_attempt,
+                        def guarded_start():
+                            begin_attempt()
+                            if not sent_observer:
+                                note_transport_sent()
+                        record = await client.execute(spec, first_output_event=event, _before_send=guarded_start,
                             **({"lifecycle_observer": lifecycle_observer} if lifecycle_observer is not None else {}))
                     else:
                         record = await client.execute(spec, first_output_event=event,
@@ -1085,6 +1181,7 @@ class _Run:
                         input_chars=spec.input_chars, requested_max_tokens=output_cap,
                     )
             finally:
+                _transport_sent_callback.reset(sent_observer_token)
                 if token is not None:
                     self.active[key] -= 1
                     overlap = self.inflight.finish(target.name, token)
@@ -1112,6 +1209,10 @@ class _Run:
             record.timeout_check = spec.timeout_check
             record.timeout_setting = spec.timeout_setting
             record._request_slot = request_slot
+            record.sent = sent
+            record._budget_exempt = budget_exempt
+            record._budget_exemption = budget_exemption
+            record._budget_request_slot = budget_request_slot if sent else None
             if (spec.deadline_source == "run" and spec.timeout_setting is not None
                     and spec.workload.get("request_source") == "custom_fixtures"
                     and spec._fixture_request_timeout_seconds == record.request_timeout_seconds):
@@ -1184,6 +1285,9 @@ class _Run:
                     failure = failure or exc
                 finally:
                     self.records.append(record)
+                    if record.scenario not in states.SETUP_PROBE_SCENARIOS:
+                        self.saved_counts[record.target] += 1
+                        self._publish_request_counts()
                 if isinstance(failure, asyncio.CancelledError):
                     # Scoring returns a copy; callers need this retained record.
                     failure.giraffe_record = record
@@ -1234,6 +1338,7 @@ class _Run:
                             item for item in self.timeout_watch.warnings if item["target"] == target.name][-16:]
                         self.emit("timeout_warning", target.name, spec.scenario, timeout_warning=warning)
                     self.emit("request_completed", target.name, spec.scenario, status=record.status,
+                              request_budget_exempt=budget_exempt, budget_request_slot=record._budget_request_slot,
                               condition_id=condition_id, condition_summary=dict(condition) if condition else None,
                               input_chars=request_parameters["input_chars"], requested_max_tokens=output_cap,
                               requested_input_tokens=spec.requested_input_tokens,
@@ -1621,7 +1726,7 @@ async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attributio
                         if ready:
                             probe = _spec(initial_specs[0], "readiness").model_copy(update={"check_ids": []})
                             record = await run.request(target, client, probe, deadline_override=ready_deadline,
-                                                       budget_exempt=True)
+                                                       budget_exemption="restart_readiness")
                             if record and record.valid:
                                 record.check_ids = [name for name in ("access", "serving", "first_output")
                                                     if name in enabled]
@@ -2773,7 +2878,7 @@ def _budget_guidance(config, check_id=None):
                               - plan["adaptive_estimates"].get("concurrency", 0)) * len(config.targets))
     amount = f"to at least {max(planned, config.max_requests + 1)}"
     return (f"Raise max_requests (or --max-requests) {amount}, "
-            f"or select fewer checks. The plan needs at least {plan['known_total']} fixed requests; adaptive traffic may need more.")
+            f"or select fewer checks. The plan has {plan['known_total']} known planned requests; adaptive traffic may need more.")
 
 
 def _output_budget_guidance(config, records, check_id):
@@ -3059,7 +3164,8 @@ def _verdict_summary(check, config, records, budget):
 
 async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | None = None,
                     stop_event: asyncio.Event | None = None,
-                    on_scale_down_control: Callable | None = None) -> RunReport:
+                    on_scale_down_control: Callable | None = None,
+                    preflight_counts: dict[str, int] | None = None) -> RunReport:
     from .local_tokenizer import ensure_tokenizers
     from .deployment import preparation_residency
     residency = config._preparation_residency
@@ -3070,7 +3176,8 @@ async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | Non
     with PhaseSampler("traffic") as sampler:
         try:
             return await _run_suite(config, progress=progress, stop_event=stop_event,
-                                    sampler=sampler, residency=residency, on_scale_down_control=on_scale_down_control)
+                                    sampler=sampler, residency=residency, on_scale_down_control=on_scale_down_control,
+                                    preflight_counts=preflight_counts)
         except Exception:
             logger.exception("Unexpected suite failure")
             raise
@@ -3109,7 +3216,7 @@ async def _stop_judging(evaluation, run):
             "duration_seconds": None, "stop_reason": "cancelled"}
 
 
-async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, residency, on_scale_down_control=None) -> RunReport:
+async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, residency, on_scale_down_control=None, preflight_counts=None) -> RunReport:
     """Run the built-in suite with one shared load budget and preserve partial evidence."""
     outer_cancellation = None
     suite_task = asyncio.current_task()
@@ -3141,6 +3248,9 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
                              "per-check request setting overrides are unsupported.")
     started_at, run_id = _now(), uuid.uuid4().hex
     run = _Run(config, progress, stop_event)
+    for target, count in (preflight_counts or {}).items():
+        for _ in range(count):
+            run.note_sent(target, "preflight")
     run.run_id = run_id
     sampler.run = run
     if "scale_down" in config.checks:
@@ -3407,7 +3517,7 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
                     "targets": run.observations, "generator_max_lag_ms": round(run.max_lag_ms, 3),
                     "target_abort_reasons": target_abort_reasons,
                     "client_timing_health": run.timing_health.snapshot(),
-                    "request_budget_used": run.budget_used,
+                    "request_counts": {**run.request_counts(), "complete": outer_cancellation is None},
                     "request_limit_scopes": sorted(run.request_limit_scopes),
                     "concurrency_limit_scopes": sorted(run.concurrency_limit_scopes),
                     **({"duration_limit_scope": run.duration_limit_scope} if run.duration_limit_scope else {}),

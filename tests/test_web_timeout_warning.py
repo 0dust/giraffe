@@ -129,11 +129,14 @@ async def test_cli_journal_requests_are_bounded_measurements_in_detail_and_event
 
     def append(index):
         writer = EvidenceWriter(directory)
-        writer.record_finished(RequestRecord(id=str(index), target="local", fixture_id="slow",
+        record = RequestRecord(id=str(index), target="local", fixture_id="slow",
             scenario="warm", condition_id="serving.warm", check_ids=["serving"], started_at=_now(),
             status="timeout", request_timeout_seconds=2, termination_reason="request_deadline",
             elapsed_ms=2000, first_output_ms=10, answer_chars=7, output="private answer",
-            reasoning="private reasoning"))
+            reasoning="private reasoning")
+        record._request_slot = index
+        record._budget_request_slot = index
+        writer.record_finished(record)
         writer.progress({"event": "timeout_warning", "timeout_warning": warning()})
         writer.close()
 
@@ -171,7 +174,7 @@ async def test_cli_journal_event_cursor_sends_only_new_rows_and_resets(tmp_path,
     def append(start, count):
         with journal.open("a") as stream:
             for index in range(start, start + count):
-                stream.write(json.dumps({"type": "record", "record": {
+                stream.write(json.dumps({"type": "record", "request_slot": index, "budget_request_slot": index, "budget_exempt": False, "record": {
                     "id": str(index), "target": "local", "scenario": "warm",
                     "condition_id": "serving.warm", "status": "timeout" if index < 3 else "completed",
                     "valid": index >= 3, "elapsed_ms": 2000, "first_output_ms": 10}}) + "\n")
@@ -277,18 +280,20 @@ async def test_cli_journal_preserves_out_of_order_runner_slots(tmp_path):
     write_metadata(directory, {"id": "cli", "state": "running", "heartbeat_at": _now(),
         "owner_pid": os.getpid(), "owner_host": socket.gethostname(), "config": config()})
     writer = EvidenceWriter(directory)
-    for slot in (1, 0):
+    for slot, budget_slot, exempt in ((2, 1, False), (1, 0, False), (0, None, True)):
         record = RequestRecord(id=f"request-{slot}", target="local", fixture_id="slow", scenario="warm",
             check_ids=["serving"], started_at=_now(), status="timeout")
         record._request_slot = slot
+        record._budget_request_slot = budget_slot
+        record._budget_exempt = exempt
         writer.record_finished(record)
     writer.close()
     lines = [json.loads(line) for line in (directory / "evidence.jsonl").read_text().splitlines()]
-    assert [line["request_slot"] for line in lines if line["type"] == "record"] == [1, 0]
+    assert [line["request_slot"] for line in lines if line["type"] == "record"] == [2, 1, 0]
     assert all("request_slot" not in line["record"] for line in lines if line["type"] == "record")
     async with browser(tmp_path) as client:
         detail = (await client.get('/api/runs/cli')).json()
-        assert [(row["id"], row["slot"]) for row in detail["live_requests"]] == [("request-0", 0), ("request-1", 1)]
+        assert [(row["id"], row["slot"]) for row in detail["live_requests"]] == [("request-1", 0), ("request-2", 1)]
         assert detail["live_request_count"] == 2
 
 
@@ -299,7 +304,7 @@ async def test_cli_journal_late_timeout_counts_once_after_eviction(tmp_path):
     journal = directory / "evidence.jsonl"
 
     def line(slot):
-        return json.dumps({"type": "record", "request_slot": slot, "record": {
+        return json.dumps({"type": "record", "request_slot": slot, "budget_request_slot": slot, "record": {
             "id": f"request-{slot}", "target": "local", "scenario": "warm",
             "status": "timeout" if slot == 0 else "completed", "valid": slot != 0}}) + "\n"
 
@@ -320,12 +325,12 @@ def test_web_runner_evicted_running_completion_and_duplicates_count_once():
            "live_request_summary": {"evicted": 0, "through_slot": None, "statuses": {}}}
 
     def complete(slot, status="completed"):
-        _track_live_request(job, {"event": "request_completed", "request_slot": slot,
+        _track_live_request(job, {"event": "request_completed", "request_slot": slot, "budget_request_slot": slot,
             "request": {"id": str(slot), "status": status}}, None)
 
-    _track_live_request(job, {"event": "request_started", "request_slot": 0}, None)
+    _track_live_request(job, {"event": "request_started", "request_slot": 0, "budget_request_slot": 0}, None)
     for slot in range(1, MAX_LIVE_REQUESTS + 2):
-        _track_live_request(job, {"event": "request_started", "request_slot": slot}, None)
+        _track_live_request(job, {"event": "request_started", "request_slot": slot, "budget_request_slot": slot}, None)
         complete(slot)
     assert job["live_request_summary"]["evicted"] == 2
     assert job["live_request_summary"]["statuses"] == {"running": 1, "completed": 1}
@@ -336,3 +341,130 @@ def test_web_runner_evicted_running_completion_and_duplicates_count_once():
         "evicted": 2, "through_slot": 1, "statuses": {"running": 0, "completed": 1, "timeout": 1}}
     assert job["evicted_running"] == set()
     assert len(job["requests"]) == MAX_LIVE_REQUESTS
+
+
+async def test_cli_journal_restart_probe_and_preparation_failure_do_not_take_mosaic_slots(tmp_path):
+    from giraffe.models import RequestRecord
+    from giraffe.evidence import recover_evidence
+
+    directory = tmp_path / "cli"
+    write_metadata(directory, {"id": "cli", "state": "running", "heartbeat_at": _now(),
+        "owner_pid": os.getpid(), "owner_host": socket.gethostname(), "config": config()})
+    writer = EvidenceWriter(directory, manifest={"config": config()}, started_at=_now())
+    writer.request_counts_start({})
+    for raw_slot, budget_slot, scenario, sent, exemption in (
+            (0, None, "readiness", True, "restart_readiness"),
+            (1, None, "initial", False, None),
+            (2, 0, "initial", True, None),
+            (3, 1, "warm", True, None)):
+        record = RequestRecord(id=f"request-{raw_slot}", target="local", fixture_id="short",
+            scenario=scenario, check_ids=["serving"], started_at=_now(),
+            status="completed" if sent else "failed", sent=sent)
+        record._request_slot = raw_slot
+        record._budget_request_slot = budget_slot
+        record._budget_exempt = bool(exemption)
+        record._budget_exemption = exemption
+        writer.record_finished(record)
+    target_counts = {"sent": 3, "budget_counted": 2, "budget_counted_unsent": 0,
+        "budget_exempt": 1, "saved_observations": 0,
+        "budget_exempt_by_reason": {"restart_readiness": 1}}
+    writer.request_counts_snapshot({**target_counts, "available": True, "complete": True,
+        "targets": {"local": target_counts}})
+    writer.close()
+    async with browser(tmp_path) as client:
+        detail = (await client.get('/api/runs/cli')).json()
+        assert [(row["id"], row["slot"]) for row in detail["live_requests"]] == [("request-2", 0), ("request-3", 1)]
+        assert detail["live_request_count"] == 2
+        replay = (await client.get('/api/runs/cli/events')).json()
+        assert [row["slot"] for row in replay["records"]] == [0, 1]
+    recovered = recover_evidence(directory, {"config": config(), "started_at": _now()})
+    assert recovered is not None
+    failure = next(record for record in recovered.requests if record.id == "request-1")
+    assert failure.sent is False
+    from giraffe.reporting import write_report
+    write_report(recovered, directory)
+    saved = json.loads((directory / "report.json").read_text())
+    assert next(record for record in saved["requests"] if record["id"] == "request-1")["sent"] is False
+    counts = recovered.observations["request_counts"]
+    assert counts["sent"] == 3 and counts["budget_exempt"] == 1
+    assert counts["budget_exempt_by_reason"] == {"restart_readiness": 1}
+
+
+async def test_cli_journal_replays_real_restart_readiness_dispatch_slots(tmp_path, monkeypatch):
+    import httpx
+    from giraffe.client import LLMClient
+    from giraffe.runner import _Run, record_sink, request_counts_sink
+    from tests.test_request_counts import configuration, request_spec
+
+    configuration = configuration()
+    directory = tmp_path / "cli"
+    write_metadata(directory, {"id": "cli", "state": "running", "heartbeat_at": _now(),
+        "owner_pid": os.getpid(), "owner_host": socket.gethostname(),
+        "config": configuration.model_dump(mode="json")})
+    original = httpx.AsyncClient
+
+    def client(**kwargs):
+        kwargs.setdefault("transport", httpx.MockTransport(lambda request: httpx.Response(200,
+            json={"choices": [{"message": {"content": "42"}, "finish_reason": "stop"}]})))
+        return original(**kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", client)
+    writer = EvidenceWriter(directory, manifest={"config": configuration.model_dump(mode="json")})
+    writer.request_counts_start({})
+    token = record_sink.set(writer.record_finished)
+    counts_token = request_counts_sink.set(writer.request_counts_snapshot)
+    try:
+        run = _Run(configuration, writer.progress, None)
+        target = configuration.targets[0]
+        async with LLMClient(target, configuration) as transport:
+            await run.request(target, transport, request_spec("readiness"),
+                              budget_exemption="restart_readiness")
+            await run.request(target, transport, request_spec("initial"))
+            await run.request(target, transport, request_spec("warm"))
+    finally:
+        record_sink.reset(token)
+        request_counts_sink.reset(counts_token)
+        writer.close()
+    async with browser(tmp_path) as session:
+        detail = (await session.get('/api/runs/cli')).json()
+        assert [record["slot"] for record in detail["live_requests"]] == list(range(run.budget_used))
+        assert [record["scenario"] for record in detail["live_requests"]] == ["initial", "warm"]
+        assert detail["live_request_count"] == 2
+
+
+async def test_cli_journal_progress_counters_reach_detail_events_and_live_heading(tmp_path, monkeypatch):
+    from tests.test_ux_results import run_render_checks
+
+    monkeypatch.setattr("giraffe.web._EVENT_WAIT_SECONDS", 0)
+    directory = tmp_path / "cli"
+    write_metadata(directory, {"id": "cli", "state": "running", "heartbeat_at": _now(),
+        "owner_pid": os.getpid(), "owner_host": socket.gethostname(), "config": config(),
+        "progress": {"budget_used": 0, "sent": 0, "budget_exempt": 0, "completed": 0}})
+    target = {"sent": 2, "budget_counted": 1, "budget_counted_unsent": 0, "budget_exempt": 1,
+              "saved_observations": 1, "budget_exempt_by_reason": {"restart_readiness": 1}}
+    counts = {**target, "available": True, "complete": True, "targets": {"local": target}}
+    writer = EvidenceWriter(directory)
+    writer.request_counts_snapshot(counts)
+    writer.progress({"event": "request_completed", "budget_used": 1, "sent": 2,
+        "budget_exempt": 1, "completed": 2, "attempted": 2, "request_counts": counts,
+        "request": {"output": "private answer"}, "condition": {"id": "stale"},
+        "condition_summary": {"private": "condition payload"}})
+    writer.close()
+    async with browser(tmp_path) as client:
+        detail = (await client.get('/api/runs/cli')).json()
+        for progress in (detail["progress"], (await client.get('/api/runs/cli/events')).json()["progress"]):
+            assert progress == {"budget_used": 1, "sent": 2, "budget_exempt": 1,
+                                "completed": 2, "attempted": 2, "request_counts": counts}
+        assert detail["live_requests"] == []
+        cursor = detail["seq"]
+        idle = (await client.get(f'/api/runs/cli/events?after={cursor}')).json()
+        assert idle["idle"] and idle["records"] == [] and idle["progress"] == detail["progress"]
+        writer = EvidenceWriter(directory)
+        writer.progress({"event": "timeout_warning", "timeout_warning": warning()})
+        writer.close()
+        delta = (await client.get(f'/api/runs/cli/events?after={cursor}')).json()
+        assert delta["progress"] == detail["progress"] and delta["timeout_warnings"] == [warning()]
+    detail["request_plan"] = {"planned_total": 2}
+    run_render_checks("state.detail=" + json.dumps(detail) + ";renderLive();"
+        "assert.match($('.live-progress').textContent,/1 of ~2 planned requests/);"
+        "assert.match($('.live-progress').textContent,/1 exempt/);", dom=True)

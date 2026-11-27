@@ -186,7 +186,7 @@ Its result is then labelled e.g. "pass · budget-limited window 3.2 s of 10 s". 
 
 **Not run.** Points never reached are recorded as **not run**, with the reason. Cut-short/not-run cause codes are `budget_limited` for request budgets/allowances, `time_limited` for the run deadline and `run_stopped` for user stops or other run/target stops. Request-limited inconclusive points suggest the request limit; deadline-limited points suggest Total time limit (`max_duration_seconds`); stopped points do not suggest raising limits. Supported passing points never receive "To conclude, raise …" guidance. Existing failure evidence always takes precedence over these cause codes.
 
-**Planning.** The plan warns when Σ(level × D ÷ assumed 1 s/request) exceeds the expected allowance. The warning sits beside `max_requests` with an Edit action. Use the same per-target quota and `later_reservation(config)` as execution, including sessions/consistency/tools even though their plan rows follow the load rows; subtract preceding known requests and the calibration upper bound.
+**Planning.** The plan warns when Σ(level × D ÷ assumed 1 s/request) exceeds the expected allowance. The warning sits beside `max_requests` with an Edit action. Use the same per-target quota and `later_reservation(config)` as execution, including sessions/consistency/tools even though their plan rows follow the load rows; subtract preceding known planned requests and the calibration upper bound.
 
 ### 3.6 Token targets, calibration and context window
 

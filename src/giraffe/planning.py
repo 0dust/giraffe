@@ -54,7 +54,7 @@ def token_evidence_request_reserve(rows, *, target=None):
 
 
 def recovery_later_reserves(config, *, runtime_counts_by_target=None):
-    """Reserve later fixed requests and flag work that shares sustained-load quota."""
+    """Reserve later known planned requests and flag work that shares sustained-load quota."""
     later = [name for name in config.checks
              if (name not in CORE_CHECKS or name == "load") and name != "gateway_attribution"]
     if not later:
@@ -1701,6 +1701,8 @@ def request_plan(config: RunConfig | ConfigDraft, *,
         counted[target] = sum(count if count is not None else row.get("expected_scheduled_requests", 0)
                               for row, count in zip(rows, counts))
     known = min(known_counts.values())
+    # Known planned charged requests exclude exempt probes, the optional
+    # performance-evidence reserve, and adaptive traffic.
     known_total = sum(known_counts.values())
     planned = next(iter(planned_counts.values())) if len(set(planned_counts.values())) == 1 else None
     planned_total = sum(planned_counts.values()) if planned_counts else None

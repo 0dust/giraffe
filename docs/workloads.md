@@ -78,6 +78,45 @@ does not increase that budget. AI evaluator calls use separate limits.
 Use `--simultaneous-limit` and `--default-concurrency` to set the two CLI controls
 independently.
 
+### Which requests count
+
+`max_requests` limits inference requests charged across all targets. Reports expose
+`observations.request_counts` with totals and the same counts under `targets`:
+
+- `sent`: inference requests sent to the endpoint (including attempts that failed
+  to connect), after local preparation succeeds; includes charged and exempt traffic.
+- `budget_counted`: requests charged toward the limit, net of refunds; scheduled
+  offers can use budget without being sent to the endpoint.
+- `budget_counted_unsent`: charged offers not sent to the endpoint, including
+  pending reservations and dropped offers without a refund; the report adds
+  “counted but not sent” when this count is nonzero.
+- `budget_exempt`: sent inference requests outside the limit, grouped in
+  `budget_exempt_by_reason` as `preflight` (the connection preflight) or
+  `restart_readiness` (the readiness probe after a cold-start restart).
+- `saved_observations`: measurement records present in the written report.json
+  `requests` list, excluding the `readiness` and `performance_evidence_probe` setup
+  probes. `evidence_dropped_count` covers journal drops; a record dropped from
+  evidence.jsonl still counts here if retained in report.json.
+- `complete`: true for a normally finalized run; false for a recovered run whose
+  counts may be incomplete.
+- `available`: true when request counters are available; false for a recovered
+  journal without a request-count snapshot.
+
+GET-only model discovery and health polls are not inference requests. Judge
+(AI evaluation) traffic and the web UI’s separate **Test connection** action are
+not part of a run’s counts, even when they use the same endpoint. The optional
+performance-evidence probe is charged, but is not a saved observation.
+
+Available counts reconcile as `sent = budget_counted - budget_counted_unsent +
+budget_exempt`. Recovery uses one consistent snapshot, including in-flight requests,
+and labels the counts “recovered; may be incomplete”. If no snapshot was journaled,
+the report says “counts unavailable for this recovered run” and shows only the saved
+observation count.
+
+The planner's `known_total` is the number of known planned requests: charged
+requests it can count in advance across all targets. It excludes exempt probes,
+the optional performance-evidence reserve and adaptive traffic.
+
 ## Load test
 
 Select `checks: [load]` and configure `load_test`. Workload selection and traffic
@@ -347,7 +386,7 @@ its next request as soon as its previous one completes, within the shared ceilin
 This parallelism comes from `test_options.recovery.concurrency` or
 `default_concurrency`, bounded by the run's Simultaneous limit. Here, `concurrency`
 in the completion formula means that effective worker count.
-Sustained traffic reserves planned fixed requests of later checks plus post-load
+Sustained traffic reserves known planned requests of later checks plus post-load
 probes. A half-remaining-quota cap applies only when later checks are selected.
 The phase completes when its duration elapses with observed configured concurrency,
 or its allowance is consumed after at least `max(min_samples, concurrency * 2)`

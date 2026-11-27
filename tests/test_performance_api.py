@@ -22,7 +22,7 @@ async def test_default_payload_and_selected_window_are_bounded(tmp_path):
         assert response.status_code == 200
         assert len(response.content) < 1_500_000
         data = response.json()['report']
-        assert data['requests_compact'] and data['request_count'] == 1000
+        assert data['requests_compact'] and data['request_counts'] is None
         assert len(data['requests']) == 1000
         target = data['performance']['targets'][0]
         assert len(target['summaries']) == 1
@@ -102,7 +102,7 @@ async def test_live_performance_is_on_demand_debounced_and_discloses_bounded_cov
         def emit(slot):
             row = fixture.requests[slot].model_copy(update={'target': 'local'})
             progress({'event':'request_completed', 'target':'local', 'scenario':row.scenario,
-                      'request_slot':slot, 'request':row.model_dump(mode='json'),
+                      'request_slot':slot, 'budget_request_slot': slot, 'request':row.model_dump(mode='json'),
                       'performance':{'must_not_leak':True}})
         emit(0)
         dispatched.set()
