@@ -76,6 +76,7 @@ def test_init_valid_without_warnings_and_no_overwrite(engine, tmp_path, capsys):
     assert original.count('#') >= 5
     assert ('# request_options: optional extra request fields, e.g. reasoning_effort or '
             'chat_template_kwargs for reasoning models.\n') in original
+    assert 'https://github.com/0dust/giraffe/blob/main/examples/reasoning.yaml' in original
     config = yaml.safe_load(original)
     assert 'request_options' not in config
     assert config['config_version'] == 2 and config['targets'][0]['metrics_profile'] != 'unknown'

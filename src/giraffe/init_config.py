@@ -47,6 +47,7 @@ def write_config(output: Path, *, engine: str, url: str | None = None, force: bo
                 "# checks: select the checks to run (giraffe describe lists all checks).\n"
                 "# max_requests: total request budget; null leaves it unset.\n"
                 "# default_concurrency: parallel requests per check; 1 runs serially.\n"
-                "# request_options: optional extra request fields, e.g. reasoning_effort or chat_template_kwargs for reasoning models.\n")
+                "# request_options: optional extra request fields, e.g. reasoning_effort or chat_template_kwargs for reasoning models.\n"
+                "#   example: https://github.com/0dust/giraffe/blob/main/examples/reasoning.yaml\n")
     with output.open("w" if force else "x") as file:
         file.write(comments + yaml.safe_dump(values, sort_keys=False))

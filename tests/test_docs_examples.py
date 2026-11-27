@@ -94,6 +94,7 @@ def test_running_guide_exit_codes_match_cli_help(command, capsys):
     assert result.value.code == 0
     help_text = capsys.readouterr().out
     assert 'request_options' in help_text
+    assert 'https://github.com/0dust/giraffe/blob/main/examples/reasoning.yaml' in help_text
     rows = re.findall(r'^\| `([0-4])` \| ([^|]+) \|$', RUNNING, re.MULTILINE)
     assert len(rows) == 5
     for code, meaning in rows:
@@ -167,7 +168,15 @@ def test_reasoning_example_preserves_request_options():
 
 def test_reasoning_example_is_linked_from_readme_and_running_guide():
     assert 'examples/reasoning.yaml' in README
-    assert 'examples/reasoning.yaml' in RUNNING
+    assert 'https://github.com/0dust/giraffe/blob/main/examples/reasoning.yaml' in RUNNING
+    example = (ROOT / 'examples' / 'reasoning.yaml').read_text()
+    for document in (example, RUNNING):
+        text = ' '.join(document.replace('`', '').replace('#', '').split())
+        assert 'GPT-OSS takes low, medium or high' in text
+        assert 'none falls back to low and still reasons' in text
+        assert 'request_options are defaults for ordinary requests' in text
+        assert 'case can override a matching key' in text
+        assert 'Gateway access probes use their own options.' in text
 
 
 def test_scale_down_example_resolves_existing_fixtures_and_keeps_followup_capacity():

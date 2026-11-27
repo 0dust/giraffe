@@ -57,8 +57,9 @@ and still needs room alongside the prompt in the model's context window.
 
 ### Reasoning models
 
-Giraffe sends every field under YAML `request_options` unchanged with each
-request. Use it for the reasoning settings your server documents, such as
+YAML `request_options` are defaults for ordinary requests: a fixture or request-pack
+case can override a matching key. Gateway access probes use their own options.
+Use them for the reasoning settings your server documents, such as
 `reasoning_effort` or `chat_template_kwargs`:
 
 ```yaml
@@ -68,11 +69,13 @@ request_options:
   # chat_template_kwargs: {enable_thinking: false}
 ```
 
-Servers differ: Ollama, for example, accepts `reasoning_effort: none` to turn
-reasoning off and ignores `chat_template_kwargs`. A server may ignore a field it
-does not support, so check the reasoning output in the request evidence. A server
-that rejects a field returns an HTTP error, which the serving check reports. See
-[`examples/reasoning.yaml`](../examples/reasoning.yaml).
+Models and servers differ: GPT-OSS takes `low`, `medium` or `high`; on Ollama,
+`none` falls back to `low` and still reasons. For models with on/off thinking, such
+as Qwen3, Ollama's `none` turns reasoning off. Ollama ignores `chat_template_kwargs`.
+A server may ignore a field it does not support, so check the reasoning output in
+the request evidence. When a server rejects a field, the preflight warning can point
+to `request_options` and the serving check reports the HTTP error. See
+[`examples/reasoning.yaml`](https://github.com/0dust/giraffe/blob/main/examples/reasoning.yaml).
 
 The optional context check verifies recall at 80% of the full declared window.
 Its output allowance must leave at least that much input space; reserving more

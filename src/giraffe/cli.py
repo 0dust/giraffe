@@ -243,7 +243,8 @@ def parser() -> argparse.ArgumentParser:
   giraffe run --config giraffe.yaml --baseline runs/previous
 
 Reasoning models: set reasoning_effort or chat_template_kwargs under YAML
-request_options (see examples/reasoning.yaml in the Giraffe repository).
+request_options. Example:
+https://github.com/0dust/giraffe/blob/main/examples/reasoning.yaml
 
 Exit codes:
   0  pass
