@@ -64,6 +64,36 @@ async def test_stream_options_follow_effective_stream_mode(
     assert request.options == (options if option_source == "request" else {})
 
 
+@pytest.mark.parametrize("stream", [False, True])
+async def test_ordinary_request_payload_preserves_reasoning_options(monkeypatch, stream):
+    calls = []
+
+    def respond(request):
+        calls.append(json.loads(request.content))
+        if stream:
+            chunk = {"choices": [{"delta": {"content": "42"}, "finish_reason": "stop"}]}
+            return httpx.Response(200, text=f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n",
+                                  headers={"content-type": "text/event-stream"})
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": "42"}, "finish_reason": "stop"}],
+        })
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(
+        transport=httpx.MockTransport(respond), **kw))
+    target = Target(name="local", url="http://local", model="test")
+    config = RunConfig(targets=[target], stream=stream, request_options={
+        "reasoning_effort": "low", "chat_template_kwargs": {"enable_thinking": False},
+    })
+    async with LLMClient(target, config) as client:
+        record = await client.execute(spec(stream=stream))
+
+    assert record.valid and record.output == "42"
+    assert len(calls) == 1
+    assert calls[0]["reasoning_effort"] == "low"
+    assert calls[0]["chat_template_kwargs"] == {"enable_thinking": False}
+
+
 async def test_ordinary_nonstream_json_keeps_existing_duplicate_member_handling(monkeypatch):
     body = (b'{"error":{"type":"upstream_failure"},"error":null,'
             b'"choices":[{"message":{"role":"assistant","content":"42"},"finish_reason":"stop"}]}')
@@ -347,6 +377,34 @@ async def test_stream_metadata_and_terminal_sentinel_compatibility(monkeypatch, 
         result = await client.execute(spec())
     assert result.valid and result.output == "42" and result.finish_reason == "stop"
     assert response.closed
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("check_ids", [["load"], ["correctness"]])
+async def test_load_retains_structured_refusal_as_a_scored_response(monkeypatch, stream, check_ids):
+    from giraffe.fixtures import score_response
+
+    refusal = "Declined by the model."
+    if stream:
+        chunks = [
+            b'data: {"choices":[{"delta":{"refusal":"Declined "},"finish_reason":null}]}\n\n',
+            b'data: {"choices":[{"delta":{"refusal":"by the model."},"finish_reason":"stop"}]}\n\n',
+            b"data: [DONE]\n\n",
+        ]
+        client, _, _ = setup_client(monkeypatch, chunks)
+    else:
+        client, _, _ = setup_client(monkeypatch, stream=False, body={
+            "choices": [{"message": {"content": None, "refusal": refusal}, "finish_reason": "stop"}],
+        })
+    request = spec(scorer="label", expected="K7P4").model_copy(update={"check_ids": check_ids})
+    async with client:
+        response = score_response(request, await client.execute(request))
+
+    assert response.valid and response.status == "completed"
+    assert response.output == refusal
+    assert response.refused is True
+    assert response.score is False
+    assert response.score_message == "Model refused the request."
 
 
 @pytest.mark.parametrize("stream", [False, True])
@@ -1237,3 +1295,56 @@ async def test_completed_body_with_cancelled_close_is_not_valid(monkeypatch):
     assert record.output == "42" and record.stream_terminated and transport.closed
     assert record.status == "cancelled"
     assert record.valid is False
+
+
+@pytest.mark.parametrize("base,path", [
+    ("http://server", "/v1"),
+    ("http://server/", "/v1"),
+    ("http://server/v1/", "/v1"),
+    ("http://server/v1/chat/completions", "/v1"),
+    ("http://server/v1/chat/completions/", "/v1"),
+    ("http://server/openai/deployments/a%2Fb", "/openai/deployments/a%2Fb"),
+])
+def test_completion_url_keeps_api_version_after_the_complete_path(base, path):
+    from giraffe.client import completion_url
+
+    query = "?api-version=2024-02-01"
+    assert completion_url(base + query) == "http://server" + path + "/chat/completions" + query
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("health_fallback", [False, True])
+async def test_inference_and_readiness_preserve_api_version(monkeypatch, stream, health_fallback):
+    import time
+
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        if request.method == "GET":
+            return httpx.Response(404 if health_fallback and request.url.path.endswith("/models") else 200)
+        if stream:
+            return httpx.Response(200, text=(
+                'data: {"choices":[{"delta":{"content":"42"},"finish_reason":"stop"}]}\n\n'
+                'data: [DONE]\n\n'), headers={"content-type": "text/event-stream"})
+        return httpx.Response(200, json={"choices": [
+            {"message": {"content": "42"}, "finish_reason": "stop"}]})
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: original(
+        transport=httpx.MockTransport(respond), **kwargs))
+    monkeypatch.setenv("AZURE_TEST_KEY", "private-header-key")
+    target = Target(name="local", model="test",
+        url="http://server/openai/deployments/example?api-version=2024-02-01",
+        headers_env={"api-key": "AZURE_TEST_KEY"})
+    async with LLMClient(target, RunConfig(targets=[target], stream=stream)) as client:
+        assert await client.ready(time.monotonic() + 5)
+        record = await client.execute(spec(stream=stream))
+    assert record.valid and record.output == "42"
+    paths = ["/openai/deployments/example/models"]
+    if health_fallback:
+        paths.append("/health")
+    paths.append("/openai/deployments/example/chat/completions")
+    assert [request.url.path for request in requests] == paths
+    assert all(request.url.query == b"api-version=2024-02-01" for request in requests)
+    assert all(request.headers["api-key"] == "private-header-key" for request in requests)

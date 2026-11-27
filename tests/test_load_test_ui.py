@@ -76,7 +76,7 @@ async def test_worked_plan_examples_use_preview_numbers(tmp_path,constant,poisso
     assert plan['load_test']['expected_scheduled_requests']==expected
     assert plan['load_test']['scheduled_tests']==tests
     browser_logic('const plan='+json.dumps(plan)+',label='+json.dumps(label)+r''';
-const html=renderLoadPlan(config,plan);assert(html.includes(label));assert(html.includes(loadElapsed(plan.load_test.configured_load_seconds)));assert(html.includes(loadElapsed(plan.load_test.time_with_allowances_seconds)));
+const html=renderLoadPlan(config,plan);assert(html.includes(label.replace(/^≈ /,'About ')));assert(html.includes(loadElapsed(plan.load_test.configured_load_seconds)));assert(html.includes(loadElapsed(plan.load_test.time_with_allowances_seconds)));
 for(const text of plan.load_test.execution_summary)assert(html.includes(escape(text)));
 state.requestPreview={status:'current',revision:state.configRevision,route:state.routeVersion,plan,config};nodes['#load-burst-preview']={};syncLoadDisplay(config);
 const text=nodes['#load-burst-preview'].textContent;assert.match(text,/5 bursts per test: at 10, 20, 30, 40, 50 seconds. 160/);
@@ -89,9 +89,9 @@ def test_cached_backend_plan_validates_limit_changes_without_recounting():
     browser_logic('const backend='+json.dumps(request_plan(config))+r''';
 state.requestPreview={plan:backend,config:structuredClone(config)};
 const draft=structuredClone(config);draft.max_requests=1;draft.max_duration_seconds=1;
-const issues=runLimitIssues(draft);assert(issues.some(issue=>issue.msg.includes('initial concurrent groups')));assert(issues.some(issue=>issue.msg.includes('Expected scheduled requests')));assert(issues.some(issue=>issue.fields.includes('max_duration_seconds')));
-backend.load_test.expected_scheduled_requests=0;backend.load_test.minimum_initial_requests_per_target=0;backend.load_test.time_with_allowances_seconds=0;
-assert.equal(runLimitIssues(draft).length,0); // All three numbers are server owned.
+const issues=runLimitIssues(draft);assert(issues.some(issue=>issue.msg.includes('initial concurrent groups')));assert(issues.some(issue=>issue.msg.includes('Expected scheduled requests')));assert(!issues.some(issue=>issue.fields.includes('max_duration_seconds')));
+backend.load_test.expected_scheduled_requests=0;backend.load_test.minimum_initial_requests_per_target=0;
+assert.equal(runLimitIssues(draft).length,0); // Request-budget counts are server owned; timing waits for the current preview.
 ''',config)
 
 

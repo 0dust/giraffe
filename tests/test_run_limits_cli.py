@@ -28,7 +28,8 @@ def test_a24_legacy_concurrency_sets_ceiling_and_parallelism_with_note(capsys):
     config = configuration(parser().parse_args(BASE + ["--concurrency", "40"]))
     assert config.concurrency == config.default_concurrency == 40
     assert config.effective_check("correctness")["concurrency"] == 40
-    assert "--concurrency 40 sets both" in capsys.readouterr().err
+    assert capsys.readouterr().err == "Migration: 1 other setting was converted from an earlier Giraffe version.\n"
+    assert "--concurrency 40 sets both" in config._migration_notes[0]
     assert config._migration_notes
 
 
@@ -45,7 +46,8 @@ def test_default_concurrency_can_override_legacy_flag_independently(capsys):
     ]))
     assert config.concurrency == 64 and config.default_concurrency == 8
     assert config.effective_check("correctness")["concurrency"] == 8
-    assert "--concurrency" in capsys.readouterr().err
+    assert capsys.readouterr().err == "Migration: 1 other setting was converted from an earlier Giraffe version.\n"
+    assert "--concurrency" in config._migration_notes[0]
 
 
 @pytest.mark.parametrize("flag,field", [
@@ -68,14 +70,17 @@ def test_a4_disabled_limit_wins_after_saved_values_and_flag_overrides(tmp_path, 
     assert config.model_dump(mode="json")[field] is None
 
 
-def test_a19_omitted_legacy_limits_are_not_set_with_one_note_each(capsys):
-    config = migrated_configuration({"targets": [TARGET], "checks": ["correctness"]})
+def test_a19_omitted_legacy_limits_are_not_set_with_one_combined_note(capsys):
+    values = {"targets": [TARGET], "checks": ["correctness"]}
+    config = migrated_configuration(values)
     assert config.concurrency is config.max_requests is config.max_duration_seconds is None
     assert config.default_concurrency == 4
-    assert len(config._migration_notes) == 3
+    expected = ("Earlier Giraffe versions capped runs at 300 requests, 300 s of traffic and "
+                "4 requests at once by default. This configuration sets none of these limits, "
+                "so they no longer apply. Use Edit limits to keep them.")
+    assert config._migration_notes == [expected]
     stderr = capsys.readouterr().err
-    assert stderr.count("Migration:") == 3
-    assert "300 requests" in stderr and "300" in stderr and "4" in stderr
+    assert stderr == f"Migration: {expected}\n"
 
 
 def test_a19_explicit_null_is_not_set_without_notes(capsys):
@@ -195,3 +200,29 @@ def test_validation_suite_keeps_legacy_compatible_configs_valid(identifier):
     assert config.checks == list(dict.fromkeys("load" if check in {"capacity", "arrivals", "concurrency"} else check for check in values["checks"]))
     assert config._migration_notes
     assert RunConfig.model_validate(config.model_dump()).model_dump() == config.model_dump()
+
+
+@pytest.mark.parametrize("block", ["load_test", "multi_user"])
+@pytest.mark.parametrize("checks", [None, ["correctness", "load"]])
+def test_current_format_concurrency_override_matches_versioned_config(tmp_path, capsys, block, checks):
+    values = {"targets": [TARGET], block: {}, "concurrency": 8,
+              "test_options": {"correctness": {"concurrency": 2}}}
+    if checks is not None:
+        values["checks"] = checks
+    path = tmp_path / "current.json"
+    args = ["run", "--config", str(path), "--concurrency", "40"]
+    path.write_text(json.dumps(values))
+    current = configuration(parser().parse_args(args))
+    current_stderr = capsys.readouterr().err
+    path.write_text(json.dumps({**values, "config_version": 2}))
+    versioned = configuration(parser().parse_args(args))
+    versioned_stderr = capsys.readouterr().err
+    assert current.model_dump() == versioned.model_dump()
+    assert current._migration_notes == versioned._migration_notes
+    assert current_stderr == versioned_stderr
+    assert current._migration_notes == [
+        "--concurrency 40 sets both the simultaneous-request limit and default_concurrency; "
+        "use --simultaneous-limit to set only the ceiling."]
+    assert current.concurrency == current.default_concurrency == 40
+    assert current.effective_check("correctness")["concurrency"] == 2
+    assert ("load" in current.checks) == (checks is not None)

@@ -61,6 +61,17 @@ def test_distributions_timing_origins_dispatch_order_and_no_decimation():
     assert series[0]["values"]["completion_tail_ms"] == 775
 
 
+@pytest.mark.parametrize(("first_token_ms", "state", "sample_count", "reason"), [
+    (0, "measured", 1, None),
+    (None, "not_measured", 0, "Versioned streamed generated-content receipt timing was not collected."),
+])
+def test_client_ttft_explains_missing_samples_only(first_token_ms, state, sample_count, reason):
+    result = summary(report([record(timing_schema=1, first_token_ms=first_token_ms)]))
+    for section in ("metrics", "distributions"):
+        row = result[section]["client_ttft"]
+        assert (row["state"], row["sample_count"], row["reason"]) == (state, sample_count, reason)
+
+
 def test_concurrency_clips_carry_in_and_uses_completion_before_dispatch_ties():
     records = [record("carry", -100, 500), record("next", 500, 1500), record("zero",500,500), record("partial",750,3000)]
     result = concurrency_series(records, 0, 1000)
@@ -513,3 +524,49 @@ def test_historical_capacity_goodput_requires_scored_answers_and_saved_latency_l
     assert metric['value'] == expected
     assert metric['state'] == ('measured' if expected is not None else 'insufficient_evidence')
     assert value.checks[0].metrics['traffic_stages'][1]['goodput_rps'] == 0
+
+
+@pytest.mark.parametrize("probe_only", [False, True])
+def test_probe_measurement_scope_and_default_window(probe_only):
+    probe = record("probe").model_copy(update={"scenario": "performance_evidence_probe", "check_ids": []})
+    failed = [record(scenario).model_copy(update={"scenario": scenario, "check_ids": [],
+              "status": "failed", "http_status": 500, "valid": False}) for scenario in ("initial", "warm")]
+    target = report([probe] if probe_only else [*failed, probe]).performance["targets"][0]
+    if probe_only:
+        assert target["default_window"] == "full:performance_evidence_probe"
+    else:
+        assert target["default_window"] == "full:initial"
+    scopes = {row["id"]: row["measurement_scope"] for row in target["cohorts"]}
+    assert scopes["performance_evidence_probe"] is False
+    if not probe_only:
+        assert scopes["initial"] is scopes["warm"] is True
+
+
+@pytest.mark.parametrize("eligibility", ["excluded", "legacy", "eligible", "default", "selected"])
+def test_html_measurement_catalog_uses_scope_and_preserves_selection(eligibility):
+    from giraffe.performance_html import render_performance
+
+    records = [record(scenario).model_copy(update={"scenario": scenario, "check_ids": []})
+               for scenario in ("initial", "warm", "performance_evidence_probe")]
+    value = report(records)
+    performance = build_performance(value, window="full:performance_evidence_probe" if eligibility == "selected" else None)
+    target = performance["targets"][0]
+    probe = next(row for row in target["cohorts"] if row["id"] == "performance_evidence_probe")
+    probe["measurement_scope"] = eligibility == "eligible"
+    if eligibility == "legacy":
+        probe.pop("measurement_scope")
+    if eligibility in {"default", "selected"}:
+        target[eligibility + "_window"] = "full:performance_evidence_probe"
+    for window in target["windows"]:
+        window["selection_label"] = "Catalog entry " + window["cohort_id"]
+    html = render_performance(performance)
+    assert ("Catalog entry performance_evidence_probe" in html) == (eligibility != "excluded")
+    assert "Catalog entry initial" in html and "Catalog entry warm" in html
+
+
+def test_mixed_probe_cohort_is_in_measurement_scope():
+    records = [record(scenario).model_copy(update={"scenario": scenario, "check_ids": [], "condition_id": "shared"})
+               for scenario in ("initial", "performance_evidence_probe")]
+    target = report(records).performance["targets"][0]
+    assert len(target["cohorts"]) == 1
+    assert target["cohorts"][0]["measurement_scope"] is True

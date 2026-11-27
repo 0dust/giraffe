@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from copy import deepcopy
 import contextvars
 from datetime import datetime, timezone
@@ -20,6 +21,7 @@ from . import states
 from .caps import MAX_SANITIZE_ITEMS
 from .models import MAX_SCALE_DOWN_SNAPSHOTS, CHECK_NAMES, CheckResult, RequestRecord, RunReport
 from .storage import fsync_directory
+from .timeout_warning import format_timeout_warning
 
 logger = logging.getLogger(__name__)
 FSYNC_RECORDS = 50
@@ -103,7 +105,7 @@ class EvidenceWriter:
     def progress(self, event: dict) -> None:
         if (event.get("event", "").startswith(("check_", "condition_"))
                                  or event.get("check") or event.get("condition_summary")
-                                 or event.get("event") == "scale_down_updated"):
+                                 or event.get("event") in {"scale_down_updated", "timeout_warning"}):
             if self._closed or self._error is not None:
                 self.dropped_count += 1
                 return
@@ -111,7 +113,7 @@ class EvidenceWriter:
             # them when persisting a condition transition alongside a completion.
             value = {key: child for key, child in event.items() if key != "request"}
             for key in ("condition", "condition_summary", "scale_down",
-                        "scale_down_snapshots", "scale_down_control"):
+                        "scale_down_snapshots", "scale_down_control", "timeout_warning"):
                 if key in value:
                     value[key] = deepcopy(value[key])
             self._enqueue(("progress", value))
@@ -157,6 +159,7 @@ class EvidenceWriter:
                     if item is not None:
                         kind, value = item
                         non_finite = _has_non_finite(value) if kind != "record" else False
+                        slot = value._request_slot if kind == "record" else None
                         if kind == "record":
                             non_finite = _has_non_finite(value.model_dump(mode="python"))
                             value = self._retained(value).requests[0].model_dump(mode="json")
@@ -175,7 +178,7 @@ class EvidenceWriter:
                             for key in ("summary", "reason"):
                                 if isinstance(value.get(key), str):
                                     value[key] = _without_answer_excerpts(value[key])
-                        stream.write(_json_line({"type": kind, kind: value}, non_finite=non_finite))
+                        stream.write(_json_line({"type": kind, kind: value, **({"request_slot": slot} if slot is not None else {})}, non_finite=non_finite))
                         pending += 1
                     if pending and (pending >= self.fsync_records
                                     or time.monotonic() - last_sync >= self.fsync_seconds):
@@ -220,6 +223,7 @@ def recover_evidence(directory: Path | str, meta: dict, *, pause=None) -> RunRep
         return None
     header, records, checks, conditions = {}, {}, {}, {}
     scale_down = {}
+    timeout_warnings = {}
     dropped = meta.get("evidence_dropped_count", 0)
     with stream:
         for line in stream:
@@ -239,6 +243,15 @@ def recover_evidence(directory: Path | str, meta: dict, *, pause=None) -> RunRep
                     records[record.id] = record
                 elif value.get("type") == "progress":
                     event = value["progress"]
+                    if event.get("event") == "timeout_warning":
+                        warning = event["timeout_warning"]
+                        # Validate the fields the shared formatter needs before retaining.
+                        format_timeout_warning(warning)
+                        warnings = timeout_warnings.setdefault(warning["target"], OrderedDict())
+                        warnings[warning["key"]] = warning
+                        warnings.move_to_end(warning["key"])
+                        while len(warnings) > 16:
+                            warnings.popitem(last=False)
                     if event.get("event") == "scale_down_updated":
                         _recover_scale_down_event(scale_down, event)
                     if isinstance(event.get("check"), dict):
@@ -282,13 +295,18 @@ def recover_evidence(directory: Path | str, meta: dict, *, pause=None) -> RunRep
         targets.setdefault(target, {})["scale_down"] = evidence
         if check is not None:
             checks[(target, "scale_down")] = check
+    warning_messages = []
+    for target, warnings in timeout_warnings.items():
+        targets.setdefault(target, {})["timeout_warnings"] = list(warnings.values())
+        warning_messages.extend(format_timeout_warning(warning) for warning in warnings.values())
     from .models import overall_status
     return RunReport(run_id=header.get("run_id", meta.get("run_id", directory.name)),
         started_at=header.get("started_at", meta.get("started_at", datetime.now(timezone.utc).isoformat())),
         finished_at=datetime.now(timezone.utc).isoformat(), overall=overall_status(list(checks.values()), reason), manifest=manifest,
         requests=list(records.values()), checks=list(checks.values()),
         abort_reason=reason, warnings=["Judge scores are missing for recovered request evidence."] +
-            ([f"{dropped} evidence records not written to evidence.jsonl"] if dropped else []),
+            ([f"{dropped} evidence records not written to evidence.jsonl"] if dropped else []) +
+            list(dict.fromkeys(warning_messages)),
         observations={"interrupted": True, "judge_scores_missing": True, "evidence_dropped_count": dropped,
                       "targets": targets})
 

@@ -63,6 +63,39 @@ def test_bounds_are_stable_when_request_settings_change():
     assert capabilities(configured)["limits"] == capabilities()["limits"]
 
 
+def test_builtin_question_discovery_contains_every_executed_case_and_keeps_single_example():
+    from giraffe.fixtures import builtin_fixtures
+
+    configured = RunConfig(targets=[{"name": "local", "url": "http://localhost/v1", "model": "test"}], samples=1)
+    before = configured.model_dump_json()
+    discovery = capabilities(configured)
+    questions = discovery["builtin_questions"]
+    specs = builtin_fixtures(configured)["correctness"]
+    assert questions == [{"fixture_id": spec.fixture_id, "question": spec.messages[0]["content"], "expected": spec.expected}
+                         for spec in specs]
+    assert [question["expected"] for question in questions] == ["T8R2", "25", "B"]
+    assert len(questions) == 3
+    assert discovery["builtin_question_example"] == {key: questions[0][key] for key in ("question", "expected")}
+    assert configured.model_dump_json() == before
+
+
+def test_builtin_discovery_does_not_claim_to_preview_additional_local_fixtures(tmp_path):
+    import json
+    from giraffe.fixtures import builtin_fixtures, load_custom_fixtures
+    from giraffe.planning import request_plan
+
+    path = tmp_path / "additional.json"
+    path.write_text(json.dumps([{"fixture_id": f"custom-{index}", "messages": [{"role": "user", "content": "Return A"}],
+                                 "scorer": "exact", "expected": "A"} for index in range(7)]))
+    configured = RunConfig(targets=[{"name": "local", "url": "http://localhost/v1", "model": "test"}],
+                           checks=["correctness"], samples=6, custom_fixtures=str(path))
+    assert len(capabilities(configured)["builtin_questions"]) == 3
+    assert len(builtin_fixtures(configured)["correctness"] + load_custom_fixtures(str(path))) == 10
+    row, = [row for row in request_plan(configured)["rows"] if row["id"] == "correctness"]
+    assert row["requests_per_target"] is None and row["kind"] == "bounded"
+    assert "case count is unknown" in row["summary"]
+
+
 def test_inherited_consistency_output_rule_is_not_a_hard_cap():
     discovery = capabilities()
     check = next(check for check in discovery["checks"] if check["id"] == "consistency")

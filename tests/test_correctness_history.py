@@ -354,11 +354,16 @@ state.jsonDraft='unapplied';configChanged();cleared();current();visible();
 state.requestPreview.plan={...plan,arrival_history:[],correctness_history:[{status:'unknown'}]};renderRequestPreview();cleared();
 current();visible();assert.equal(JSON.stringify(state.config),original);
 const dialog=document.createElement('dialog');dialog.setAttribute('id','dataset-dialog');document.body.insertBefore(dialog,null);
+const form=$('#new-run-form'),endpoint=form.elements.url;
+endpoint.value='http://latest-endpoint/v1';form.elements.name.value='latest-local';form.elements.model.value='latest-model';form.elements.request_timeout_seconds.value='77';
 const beforeTry=JSON.stringify(readForm().config);
 (async()=>{
 await listeners.click({target:$('#setup-history .notice button')});
 assert(dialog.open);assert.equal($('#dataset-try-form').elements.try_target.value,'second');
 assert.equal(state.datasetTry.fixture_id,'question');assert.equal(JSON.stringify(state.config),beforeTry);
+assert.equal(state.config.targets[0].name,'latest-local');assert.equal(state.config.targets[0].url,'http://latest-endpoint/v1');assert.equal(state.config.request_timeout_seconds,77);
+assert($('#dataset-try-form').querySelector('option[value="latest-local"]'));assert.equal($('#dataset-try-form').querySelector('option[value="local"]'),null);
+assert($('#dataset-try-form').textContent.includes('latest-model'));assert.equal($('#new-run-form').elements.url,endpoint);
 })()
 ''', dom=True, timeout_seconds=60)
 

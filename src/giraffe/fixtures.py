@@ -692,6 +692,22 @@ def answer_difference(expected, received) -> str:
     return f" Expected: {excerpt(expected)}; received: {excerpt(received)}."
 
 
+_REFUSAL_OPENING = re.compile(
+    r"\s*(?:(?:sorry|i['’]m sorry),?\s+(?:but\s+)?)?"
+    r"(?:(?:i|we)\s+(?:can['’]t|cannot|can not|won['’]t|will not|am unable to|are unable to)"
+    r"|(?:i['’]m|we['’]re) unable to|(?:i['’]m|i am|we['’]re) not able to)\s+"
+    r"(?:assist|comply|complete|fulfill?|generate|help|provide|respond|write)\b",
+    re.IGNORECASE,
+)
+
+
+REFUSAL_SCORE_MESSAGE = "Model refused the request."
+
+
+def is_refusal(record: RequestRecord, answer: str) -> bool:
+    return record.refused or bool(_REFUSAL_OPENING.match(answer))
+
+
 def score_response(spec: RequestSpec, record: RequestRecord) -> RequestRecord:
     """Score only a valid, completed answer; return a new record.
 
@@ -724,7 +740,12 @@ def score_response(spec: RequestSpec, record: RequestRecord) -> RequestRecord:
         })
     if unclosed or (stripped and not answer.strip() and spec.scorer != "tool"):
         return record.model_copy(update={"score": None, "score_message": REASONING_WITHOUT_ANSWER})
+    # Judge rubrics decide whether a refusal is acceptable.
+    if record.refused and spec.scorer != "judge":
+        return record.model_copy(update={"score": False, "score_message": REFUSAL_SCORE_MESSAGE, "refused": True})
     if spec.scorer == "label":
+        if is_refusal(record, answer):
+            return record.model_copy(update={"score": False, "score_message": REFUSAL_SCORE_MESSAGE, "refused": True})
         actual = re.sub(r"^(?:(?:box\s+)?label)\s*:\s*", "", _normalized(answer), flags=re.I)
         expected = str(spec.expected)
         score = bool(re.match(r"^" + re.escape(expected) + r"(?![A-Za-z0-9])", actual))
@@ -818,6 +839,7 @@ def load_custom_fixtures(path: str, *, legacy_max_output_tokens: int | None = No
                                  "Use a request pack and configured AI judges for judge scoring; tool scoring is built-in only.")
             values = {"scenario": "custom", "check_ids": ["correctness"], **entry}
             spec = RequestSpec.model_validate(values)
+            spec._fixture_request_timeout_seconds = spec.request_timeout_seconds
             if not spec.fixture_id.strip() or spec.fixture_id in ids:
                 raise ValueError("fixture_id must be non-empty and unique")
             if not spec.scenario.strip():

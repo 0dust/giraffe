@@ -29,15 +29,15 @@ const plan=PLAN;
 nodes['#request-plan']={};nodes['#start-run']={};nodes['#run-bar-summary']={textContent:'unchanged'};
 state.jsonDraft=state.jsonBase='synced';state.setupStep=3;
 state.requestPreview={status:'current',revision:state.configRevision,route:state.routeVersion,config,plan};
-renderRequestPlan();const markup=nodes['#request-plan'].innerHTML,visible=markup.split('<details class="request-planning">')[0];
+renderRequestPlan();const markup=nodes['#request-plan'].innerHTML,visible=markup.split('<details class="request-planning workload-breakdown">')[0];
 assert.match(visible,/<h3>Traffic<\/h3>/);assert(visible.includes(setupPlanCount(plan)));
 assert.match(visible,/<dt>Maximum requests<\/dt>/);assert.match(visible,/<dt>Maximum duration<\/dt>/);
 assert(visible.includes(`<dd>${config.max_requests==null?'Not set':number(config.max_requests)}</dd>`));assert(visible.includes(`<dd>${config.max_duration_seconds==null?'Not set':elapsed(config.max_duration_seconds)}</dd>`));
 assert.doesNotMatch(visible,/evaluator calls|Endpoint request budgets|Pass criteria|requests per endpoint/);
-assert.match(markup,/<details class="request-planning"><summary>Request breakdown<\/summary>/);
+assert.match(markup,/<details class="request-planning workload-breakdown"><summary>Request breakdown<\/summary>/);
 assert.equal(nodes['#run-bar-summary'].textContent,'unchanged'); // No second traffic count in the footer.
 assert.equal(nodes['#start-run'].disabled,false);
-if(plan.count_kind==='bounded'){assert.match(visible,/Unknown requests/);assert.match(visible,/Sending \/ maintained-load time/);assert.doesNotMatch(visible,/0 requests/);assert.match(markup,/Duration-based/);}
+if(plan.count_kind==='bounded'){assert.match(visible,/Requests depend on response time/);assert.match(markup,/Sending \/ maintained-load time/);assert.doesNotMatch(visible,/0 requests/);assert.match(markup,/completion-driven requests/i);}
 if(plan.count_kind==='estimate')assert.match(visible,/≈ /);
 state.configRevision++;renderRequestPlan();assert.equal(nodes['#start-run'].disabled,true);
 assert.match(nodes['#request-plan'].innerHTML,/stale/);assert.doesNotMatch(nodes['#request-plan'].innerHTML,/plan-total|Request breakdown/);
@@ -50,7 +50,7 @@ def test_budget_warning_and_fix_actions_remain_outside_breakdown():
     browser_logic(r"""
 const plan=PLAN;nodes['#request-plan']={};state.jsonDraft=state.jsonBase='synced';
 state.requestPreview={status:'current',revision:state.configRevision,route:state.routeVersion,config,plan};
-renderRequestPlan();const markup=nodes['#request-plan'].innerHTML,visible=markup.split('<details class="request-planning">')[0];
+renderRequestPlan();const markup=nodes['#request-plan'].innerHTML,visible=markup.split('<details class="request-planning workload-breakdown">')[0];
 assert.match(visible,/incomplete coverage/);assert.match(visible,/data-action="use-request-budget"/);
 assert(visible.includes('data-budget="'+plan.required_request_limit+'"'));assert.match(visible,/data-action="edit-setting"/);
 assert.match(visible,/Answer correctness/);
@@ -92,7 +92,7 @@ def test_evaluator_destinations_and_scope_stay_visible_and_thresholds_stay_separ
     browser_logic(r"""
 const plan=PLAN;nodes['#request-plan']={};state.jsonDraft=state.jsonBase='synced';
 state.requestPreview={status:'current',revision:state.configRevision,route:state.routeVersion,config,plan};
-renderRequestPlan();const markup=nodes['#request-plan'].innerHTML,visible=markup.split('<details class="request-planning">')[0];
+renderRequestPlan();const markup=nodes['#request-plan'].innerHTML,visible=markup.split('<details class="request-planning workload-breakdown">')[0];
 assert(visible.includes('Up to '+number(plan.evaluator.call_upper_bound)+' evaluator calls'));
 assert.match(visible,/Questions, expected answers and model answers/);assert.match(visible,/separate limits/);
 assert.match(visible,/judge-model/);assert.match(visible,/https:\/\/judge.example\/v1/);
@@ -115,7 +115,7 @@ const plan={count_kind:'exact',planned_total:3,planned_per_target:3,request_limi
   {id:'access',title:'Shared accounting',requests_per_target:0,kind:'exact'}],warnings:[]};
 state.requestPreview={status:'current',revision:state.configRevision,route:state.routeVersion,config,plan};
 renderRequestPlan();const markup=nodes['#request-plan'].innerHTML;
-assert(markup.includes(catalogTitle('correctness')));assert.match(markup,/Connection check/);
+assert(markup.includes(catalogTitle('correctness')));assert.match(markup,/Initial request/);
 assert.doesNotMatch(markup,/Old backend title|Shared accounting/);
 """)
 

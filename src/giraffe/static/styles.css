@@ -103,6 +103,24 @@ hr { border: 0; border-top: 1px solid var(--line); margin: 22px 0; }
 dl { margin: 0; } dt { color: var(--text-2); } dd { margin: 0; }
 ul, ol { margin: 0; }
 [hidden] { display: none !important; }
+
+.setup-workspace { max-width: 1120px; margin: 0 auto; padding-bottom: 40px; }
+.workspace-heading { display: flex; flex-direction: column; align-items: flex-start; gap: 16px; margin-bottom: 28px; }
+.workspace-heading h1 { margin: 0; }
+.workspace-actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 12px; margin-top: 28px; }
+.setup-workspace .dialog-body { padding: 0; max-height: none; overflow: visible; }
+.setup-workspace .dialog-footer { padding: 24px 0 0; border: 0; }
+.setup-workspace .judging-editor { max-width: 760px; }
+.question-setup-status { margin: 16px 0; display: grid; gap: 8px; }
+.question-setup-status > div { display: flex; justify-content: space-between; align-items: baseline; gap: 16px; }
+.question-setup-status dt { color: var(--text-2); }
+.question-setup-status dd { margin: 0; text-align: right; }
+.question-filters { margin: 24px 0; }
+@media (max-width: 600px) {
+  .question-setup-status > div { flex-wrap: wrap; gap: 4px 12px; }
+  .question-setup-status dd { text-align: left; }
+  .workspace-actions > .button { flex: 1; }
+}
 ::selection { background: var(--accent); color: var(--accent-ink); }
 button, input, select, textarea { font: inherit; color: inherit; }
 button { cursor: pointer; }
@@ -308,13 +326,13 @@ main > *:not(.hero-coat) { position: relative; z-index: 1; }
 details > summary { list-style: none; }
 details[open] > summary .when-closed, details:not([open]) > summary .when-open { display: none; }
 details > summary::-webkit-details-marker { display: none; }
-.setup-disclosure > summary, .check-advanced > summary, .configuration-tools > summary, .check-observations > summary, .comparison-support > summary, .request-timing > summary, .request-reasoning > summary, .request-planning > summary, .workload-breakdown > summary, .checks-not-run > summary, .baseline-identifier > summary, .judge-configuration > summary, .judge-limits > summary, .dataset-advanced > summary, .example-advanced > summary, .pack-preview-details > summary, details.judge-disclosure > summary, .checks-disclosure > summary, #dataset-dialog details > summary, .request-comparison details > summary, .shared-run-settings details > summary {
+.timeout-warning-more > summary, .setup-disclosure > summary, .check-advanced > summary, .configuration-tools > summary, .check-observations > summary, .comparison-support > summary, .request-timing > summary, .request-reasoning > summary, .request-planning > summary, .workload-breakdown > summary, .checks-not-run > summary, .baseline-identifier > summary, .judge-configuration > summary, .judge-limits > summary, .dataset-advanced > summary, .example-advanced > summary, .pack-preview-details > summary, details.judge-disclosure > summary, .checks-disclosure > summary, #dataset-dialog details > summary, .request-comparison details > summary, .shared-run-settings details > summary {
   display: flex; align-items: center; gap: 8px; min-height: 34px; font-size: 13px; font-weight: 500; color: var(--text-2);
 }
-:is(.setup-disclosure, .check-advanced, .configuration-tools, .check-observations, .comparison-support, .request-timing, .request-reasoning, .request-planning, .workload-breakdown, .checks-not-run, .baseline-identifier, .judge-configuration, .judge-limits, .dataset-advanced, .example-advanced, .pack-preview-details, .judge-disclosure, .checks-disclosure) > summary::before {
+:is(.timeout-warning-more, .setup-disclosure, .check-advanced, .configuration-tools, .check-observations, .comparison-support, .request-timing, .request-reasoning, .request-planning, .workload-breakdown, .checks-not-run, .baseline-identifier, .judge-configuration, .judge-limits, .dataset-advanced, .example-advanced, .pack-preview-details, .judge-disclosure, .checks-disclosure) > summary::before {
   content: ''; width: 7px; height: 7px; border-right: 1.6px solid currentColor; border-bottom: 1.6px solid currentColor; transform: rotate(-45deg); transition: transform .2s var(--ease); margin: 0 3px 0 1px; flex-shrink: 0; opacity: .7;
 }
-:is(.setup-disclosure, .check-advanced, .configuration-tools, .check-observations, .comparison-support, .request-timing, .request-reasoning, .request-planning, .workload-breakdown, .checks-not-run, .baseline-identifier, .judge-configuration, .judge-limits, .dataset-advanced, .example-advanced, .pack-preview-details, .judge-disclosure, .checks-disclosure)[open] > summary::before { transform: rotate(45deg) translate(-2px,-1px); }
+:is(.timeout-warning-more, .setup-disclosure, .check-advanced, .configuration-tools, .check-observations, .comparison-support, .request-timing, .request-reasoning, .request-planning, .workload-breakdown, .checks-not-run, .baseline-identifier, .judge-configuration, .judge-limits, .dataset-advanced, .example-advanced, .pack-preview-details, .judge-disclosure, .checks-disclosure)[open] > summary::before { transform: rotate(45deg) translate(-2px,-1px); }
 details > summary:hover { color: var(--text); }
 .details-content { padding: 6px 0 4px 20px; display: grid; gap: 12px; }
 
@@ -472,6 +490,7 @@ main:has(.new-run-layout.connecting) .setup-lede { font-size: 16px; margin-top: 
 .test-card > .test-card-heading .test-selection::after { content: ''; position: absolute; inset: -14px -18px; }
 .test-selection-line .field-info, .test-row-actions { position: relative; z-index: 1; }
 .test-description { margin: 3px 0 0 28px; font-size: 13px; color: var(--text-2); line-height: 1.45; max-width: 64ch; }
+.test-row-copy > [data-load-card-summary] { margin-left: 28px; }
 .test-row-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
 .test-setting-state { font: 600 11px var(--mono); color: var(--accent); text-transform: uppercase; letter-spacing: .08em; }
 .test-setting-state:empty { display: none; }
@@ -538,15 +557,29 @@ main:has(.new-run-layout.connecting) .setup-lede { font-size: 16px; margin-top: 
 .workload-bounds dd { font: 550 14px var(--mono); }
 .workload-help { font-size: 12px; }
 .workload-breakdown > div { display: grid; gap: 4px; margin-top: 6px; }
-.workload-breakdown details summary { font-size: 12.5px; min-height: 28px; color: var(--text-2); }
-.workload-breakdown details summary strong { font-family: var(--mono); color: var(--text); margin-right: 6px; min-width: 40px; }
+.workload-breakdown details > summary { display: flex; align-items: center; gap: 8px; padding: 5px 6px; border-radius: var(--r-sm); font-size: 12.5px; min-height: 32px; color: var(--text-2); cursor: pointer; }
+.workload-breakdown details > summary::before { content: ''; width: 6px; height: 6px; border-right: 1.6px solid currentColor; border-bottom: 1.6px solid currentColor; transform: rotate(-45deg); flex-shrink: 0; margin-right: 2px; }
+.workload-breakdown details[open] > summary::before { transform: rotate(45deg); }
+.workload-breakdown details > summary:is(:hover, :focus-visible), .workload-breakdown details[open] > summary { color: var(--text); background: var(--surface-2); }
+.workload-breakdown details summary strong { font-family: var(--mono); color: var(--accent); min-width: 2ch; overflow-wrap: anywhere; }
 .workload-breakdown details p, .workload-breakdown details small { display: block; padding: 0 0 6px 4px; color: var(--text-3); font-size: 12px; }
+.check-plan-rows > details { min-width: 0; border-bottom: 1px solid var(--line); padding-block: 4px; }
+.check-plan-summary { min-width: 0; overflow-wrap: anywhere; }
+.check-plan-name { font-weight: 600; color: var(--text); }
+.check-plan-count { color: var(--text-2); }
+.check-plan-phases { margin: 8px 0; padding-left: 22px; font-size: 12.5px; }
+.check-plan-phases li { margin-block: 8px; }
+.check-plan-phases strong, .check-time-summary strong { font-weight: 600; }
+.check-time-summary { margin-block: 12px; font-size: 12.5px; }
+.check-time-summary h4 { font-size: 12.5px; margin-bottom: 4px; }
+.check-time-summary ul { margin-block: 4px; padding-left: 22px; }
+.check-plan-rows .configured-load-plan { margin: 12px 4px; }
 .blueprint-note { font-size: 13px; color: var(--text-2); padding-left: 10px; border-left: 2px solid var(--accent-line); }
 
 /* Review (step 3) */
 #setup-review { padding: 0 32px 8px; border-radius: var(--r-xl); background: var(--surface); border: 1px solid var(--line); box-shadow: var(--highlight); }
 /* Pre-flight sheet: a full-width traffic hero, then "where requests go" beside "what and where". */
-#setup-review > .setup-body { display: grid; grid-template-columns: minmax(0, 1fr); grid-template-areas: "hero" "flight" "scope" "criteria" "options" "guide"; }
+#setup-review > .setup-body { display: grid; grid-template-columns: minmax(0, 1fr); grid-template-areas: "hero" "flight" "scope" "criteria" "options" "guide"; container-type: inline-size; }
 #setup-review .review-main, #setup-review #request-plan { display: contents; }
 .plan-hero { grid-area: hero; display: grid; grid-template-columns: minmax(0, 1fr) auto; column-gap: 48px; align-items: end; padding: 26px 0 24px; border-bottom: 1px solid var(--line); }
 .plan-hero > .review-section-heading, .plan-hero > .plan-ceiling, .plan-hero > :is(.review-load, .notice, .actions, .plan-status, .button) { grid-column: 1 / -1; }
@@ -561,6 +594,10 @@ main:has(.new-run-layout.connecting) .setup-lede { font-size: 16px; margin-top: 
 .plan-hero.is-over .plan-ceiling span { background: var(--blocked); }
 .plan-hero > .review-load, .plan-hero > .notice { margin-top: 16px; }
 .plan-hero > .actions { margin-top: 10px; }
+@container (max-width: 840px) {
+  .plan-hero { grid-template-columns: minmax(0, 1fr); }
+  .plan-hero > .review-limits { grid-column: 1; grid-row: auto; flex-wrap: wrap; row-gap: 14px; margin-top: 18px; }
+}
 .plan-status { font-size: 18px; color: var(--text-2); padding: 6px 0 2px; }
 .plan-flight { grid-area: flight; padding: 22px 0; min-width: 0; }
 .plan-flight .flight-plan { padding: 0; background: none; border: 0; border-radius: 0; gap: 14px; }
@@ -1276,6 +1313,8 @@ details.connection-row > .row-control .form-field > .field-label { display: flex
 .load-editor { min-width: 0; display: grid; gap: 22px; }
 .load-section { min-width: 0; border-top: 1px solid var(--line); padding-top: 18px; }
 .load-section > h3 { margin-bottom: 12px; font-size: 15px; }
+[data-load-context-warning] > .notice:first-child { margin-top: 10px; }
+[data-load-context-warning] > .notice:last-child { margin-bottom: 16px; }
 .load-profile { width: 100%; border-collapse: collapse; table-layout: fixed; font-size: 12px; }
 .load-profile th, .load-profile td { padding: 5px 4px; text-align: left; vertical-align: top; }
 .load-profile th:first-child { width: 58px; }
@@ -1705,6 +1744,9 @@ main > #report-results { padding-top:20px; }
 .answer-excerpt summary { display:inline-block; max-width:calc(100% - 70px); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; vertical-align:top; cursor:pointer; text-decoration:underline dotted; }
 .answer-excerpt pre { white-space:pre-wrap; overflow-wrap:anywhere; max-height:240px; overflow:auto; }
 .finding-expanded { margin-top:14px; border-top:1px solid var(--line); }
+.checks-not-selected-row { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; flex-wrap:wrap; }
+.checks-not-selected-row > .checks-not-selected { flex:1 1 320px; min-width:0; }
+.checks-not-selected-row > .button { flex:none; margin-top:2px; }
 .passed-checks > summary, .checks-not-selected > summary, .run-diagnostics > summary, .preparation-status > summary { padding:8px 0; cursor:pointer; color:var(--text-2); font-size:12px; }
 .passed-checks .finding-check { margin-top:8px; }
 .passed-checks { min-width:0; }

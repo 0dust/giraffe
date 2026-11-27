@@ -27,11 +27,12 @@ from . import __version__
 from .client import LLMClient, no_response_failure
 from .conditions import condition_aggregate, condition_for, request_status, scheduled_multi_user_window
 from .deployment import fixture_hash
-from .fixtures import (FIXTURE_VERSION, builtin_fixtures, load_custom_fixtures,
+from .fixtures import (FIXTURE_VERSION, builtin_fixtures as _builtin_fixtures, load_custom_fixtures,
                        score_response, traffic_fixtures, deterministic_options, reasoning_budget, TRUNCATED_ANSWER)
 from .identities import gateway_identities_only
 from .overlap import NEEDS_STREAM, max_evidenced_overlap, scheduling_delay_windows
 from .request_pack import pack_identity, pack_preview, pack_specs
+from .timeout_warning import TimeoutWatch, format_timeout_warning
 from .stats import percentile
 from .local_tokenizer import TokenizerUnavailable
 from .resources import PhaseSampler, SAMPLING, peak_rss_bytes
@@ -51,6 +52,72 @@ record_sink = ContextVar("giraffe_record_sink", default=lambda record: None)
 
 class _DispatchRefused(Exception):
     """The scheduled request never entered transport."""
+
+
+def build_workload_identity(config: RunConfig) -> tuple[dict, dict]:
+    """Describe selected request workloads and their shared baseline fingerprint."""
+    from .workload_versions import WORKLOAD_VERSIONS
+    from .workloads import WORKLOAD_CHECKS
+
+    workload_settings = {key: (getattr(config, key).model_dump(mode="json")
+                              if hasattr(getattr(config, key), "model_dump") else getattr(config, key))
+                         for key, checks in WORKLOAD_CHECKS.items()
+                         if checks.intersection(config.checks)}
+    versions = {}
+    if "prefix" in config.checks and config.prefix:
+        versions["prefix"] = WORKLOAD_VERSIONS["prefix"]
+    if "consistency" in config.checks and config.consistency and config.consistency.logprobs is None:
+        versions["consistency"] = WORKLOAD_VERSIONS["consistency"]
+    workload_identity = {"workload_versions": versions, "settings": workload_settings}
+    conversations = []
+    if "sessions" in config.checks and config.sessions:
+        conversations.append(config.sessions)
+    if "multi_user" in config.checks and config.multi_user and config.multi_user.conversations:
+        conversations.append(config.multi_user.conversations)
+    if any(settings.profile != "performance" for settings in conversations):
+        versions["fixed_sessions"] = WORKLOAD_VERSIONS["fixed_sessions"]
+    if (("sessions" in config.checks and config.sessions
+         and (config.sessions.profile == "performance" or config.sessions.sampling))
+            or ("multi_user" in config.checks and config.multi_user and config.multi_user.conversations)):
+        versions["session_plan"] = WORKLOAD_VERSIONS["session_plan"]
+    if "multi_user" in config.checks:
+        from .multi_user import WINDOW_POLICY
+
+        versions["multi_user"] = WORKLOAD_VERSIONS["multi_user"]
+        workload_identity["multi_user_window_policy"] = WINDOW_POLICY
+    for name in ("gateway_access", "gateway_policy", "scale_down"):
+        if name in config.checks:
+            versions[name] = WORKLOAD_VERSIONS[name]
+    if "load" in config.checks:
+        versions["load_test"] = WORKLOAD_VERSIONS["load_test"]
+    if "consistency" in config.checks and config.consistency and config.consistency.logprobs:
+        versions["logprob"] = WORKLOAD_VERSIONS["logprob"]
+    if "tools" in config.checks:
+        from .tool_checks import resolved_tool_fixtures, resolved_tool_modes
+
+        tools_config = _check_config(config, "tools")
+        if resolved_tool_fixtures(tools_config) and resolved_tool_modes(tools_config):
+            versions["tools"] = WORKLOAD_VERSIONS["tools"]
+        workload_identity["resolved_tool_checks"] = {
+            "fixtures": [fixture.model_dump(mode="json") for fixture in resolved_tool_fixtures(config)],
+            "modes": resolved_tool_modes(config),
+            **({"conversations": [fixture.model_dump(mode="json") for fixture in config.tool_checks.conversations]}
+               if config.tool_checks and config.tool_checks.conversations else {}),
+        }
+        if config.tool_checks and config.tool_checks.conversations:
+            versions["tool_conversations"] = WORKLOAD_VERSIONS["tool_conversations"]
+    shared_workload_hash = {}
+    if SHARED_BASELINE_EXCLUDED_WORKLOADS.intersection(workload_settings):
+        shared_settings = {key: value for key, value in workload_settings.items()
+                           if key not in SHARED_BASELINE_EXCLUDED_WORKLOADS}
+        shared_versions = {key: value for key, value in versions.items()
+                           if key not in SHARED_BASELINE_EXCLUDED_WORKLOADS}
+        shared_workload_hash["shared_workload_fixture_sha256"] = fixture_hash({
+            **workload_identity,
+            "settings": shared_settings,
+            "workload_versions": shared_versions,
+        })
+    return workload_identity, shared_workload_hash
 
 
 def _now() -> str:
@@ -186,10 +253,34 @@ def _scenario_checks(spec):
 
 def _check_config(config: RunConfig, check_id: str) -> RunConfig:
     effective = config.effective_check(check_id)
-    return config.model_copy(update={
+    resolved = config.model_copy(update={
         key: Limits.model_validate(value) if key == "limits" else value
         for key, value in effective.items() if key in RunConfig.model_fields
     })
+    options = config.test_options.get(check_id)
+    resolved._request_timeout_check = check_id if options and options.request_timeout_seconds is not None else None
+    return resolved
+
+
+def builtin_fixtures(config):
+    """Keep timeout provenance with fixtures at their effective config boundary."""
+    fixtures = _builtin_fixtures(config)
+    check = config._request_timeout_check
+    return {key: [spec.model_copy(update={"deadline_source": "check" if check else "run",
+                                         "timeout_check": check}) for spec in specs]
+            for key, specs in fixtures.items()}
+
+
+def _response_config(config, *, initial=False):
+    response = config.effective_initial() if initial else config.effective_response()
+    resolved = config.model_copy(update={key: response[key] for key in
+                                        ("samples", "max_output_tokens", "request_timeout_seconds")})
+    candidates = (["access"] if initial and "access" in config.checks else
+                  [check for check in ("serving", "first_output") if check in config.checks])
+    resolved._request_timeout_check = next((check for check in candidates
+        if (options := config.test_options.get(check)) is not None
+        and options.request_timeout_seconds is not None), None)
+    return resolved
 
 
 class _Peak:
@@ -282,6 +373,7 @@ class _Run:
         for _ in range(pool_size):
             self.slots.put_nowait(None)
         self.records: list[RequestRecord] = []
+        self.timeout_watch = TimeoutWatch()
         self.record_sink = record_sink.get()
         from giraffe.logprobs import LogprobBudget
         self.logprob_budget = LogprobBudget()
@@ -439,10 +531,12 @@ class _Run:
         row["status"] = "finished"
         if load_point_result is not None:
             row["load_point_result"] = dict(load_point_result)
-        if scheduled_multi_user_window(scenario) or scenario in SHARED_BASELINE_EXCLUDED_WORKLOADS:
+        if verdict is not None:
+            row["condition_verdict"] = verdict
+        elif scheduled_multi_user_window(scenario) or scenario in SHARED_BASELINE_EXCLUDED_WORKLOADS:
             # Scheduled windows and gateway probes need evidence qualification
             # after request dispatch finishes.
-            row["condition_verdict"] = verdict or row.get("condition_verdict") or "pending"
+            row["condition_verdict"] = row.get("condition_verdict") or "pending"
         self.emit_condition("condition_finished", scenario, row)
 
     def record_finished(self, record: RequestRecord) -> None:
@@ -692,6 +786,57 @@ class _Run:
             if not reserved:
                 self.release_slot()
 
+    def timeout_origin(self, spec):
+        """Validate producer provenance against the request's actual deadline."""
+        # These producers overwrite copied pack/fixture deadlines in build_spec.
+        if "multi_user" in spec.check_ids:
+            return "run", None, None
+        timeout = spec.request_timeout_seconds
+        if timeout is None:
+            return "run", None, None
+        if "load" in spec.check_ids or spec.deadline_source == "load":
+            source = (spec.load_point or {}).get("source", "native")
+            setting = "load_test.request_timeout_seconds"
+            settings = self.config.load_test
+            if source.startswith("legacy_"):
+                try:
+                    index = int(source.split("_")[1])
+                    settings = settings.migrated_tests[index].settings
+                except (ValueError, IndexError):
+                    return "run", None, None
+                setting = f"load_test.migrated_tests.{index}.settings.request_timeout_seconds"
+            if settings.request_timeout_seconds == timeout:
+                return "load", None, setting
+            return "run", None, None
+        if (spec.workload.get("request_source") == "custom_fixtures"
+                and spec._fixture_request_timeout_seconds == timeout):
+            return "run", None, (f"custom_fixtures ({self.config.custom_fixtures}, fixture {spec.fixture_id})"
+                                 ".request_timeout_seconds")
+        if spec.deadline_source is not None:
+            check = spec.timeout_check
+            options = self.config.test_options.get(check)
+            if (spec.deadline_source == "check" and check in self.config.checks and options is not None
+                    and options.request_timeout_seconds is not None
+                    and self.config.effective_check(check)["request_timeout_seconds"] == timeout):
+                return "check", check, None
+            return "run", None, None
+        if spec.scenario in {"initial", "readiness", "warm"}:
+            if spec.scenario in {"initial", "readiness"} and "access" in self.config.checks:
+                candidates = ["access"]
+            else:
+                candidates = [name for name in ("serving", "first_output") if name in self.config.checks]
+        else:
+            candidates = [name for name in spec.check_ids
+                          if name not in {"access", "serving", "first_output", "generation"}]
+            if "generation" in spec.check_ids:
+                candidates.append("generation")
+        for check in candidates:
+            options = self.config.test_options.get(check)
+            if (check in self.config.checks and options is not None and options.request_timeout_seconds is not None
+                    and self.config.effective_check(check)["request_timeout_seconds"] == timeout):
+                return "check", check, None
+        return "run", None, None
+
     async def request(self, target, client, spec, event=None, on_start=None, timeout_override=None,
                       *, slot_reserved=False, budget_reserved=False, deadline_override=None,
                       admission_deadline=None, prepared_admission=False, admission_check=None,
@@ -707,6 +852,9 @@ class _Run:
         ``admission_check`` checks caller-owned eligibility before committing an attempt.
         ``on_preparation_failure`` can read a client diagnostic without recording an attempt.
         """
+        source, timeout_check, timeout_setting = self.timeout_origin(spec)
+        spec = spec.model_copy(update={"deadline_source": source, "timeout_check": timeout_check,
+                                       "timeout_setting": timeout_setting})
         check_ids = [name for name in spec.check_ids if name in self.config.checks
                      and (not _stress(spec.scenario) or name not in {"access", "serving", "first_output", "generation"})
                      and (name != "generation" or spec.scenario == "generation")
@@ -770,6 +918,10 @@ class _Run:
             start_progress_error = None
             completed_before_progress = None
             overlap = 0
+
+            def intentional_deadline_expired():
+                return (intentional_deadline_applies and not global_deadline
+                        and deadline is not None and deadline.expired())
 
             def preparation_failure(kind):
                 if task.cancelling() > cancellations:
@@ -894,7 +1046,7 @@ class _Run:
                 elif deadline.expired():
                     record.status, record.valid = ("cancelled" if global_deadline else "timeout"), False
                     record.error = states.STOP_MAX_DURATION if global_deadline else (
-                        "intentional request deadline" if timeout_override else "request deadline exceeded")
+                        "intentional request deadline" if intentional_deadline_expired() else "request deadline exceeded")
             except _DispatchRefused:
                 return None
             except (asyncio.CancelledError, TimeoutError) as exc:
@@ -956,6 +1108,15 @@ class _Run:
             record.completed_at = completed_before_progress[0] if completed_before_progress else _now()
             record.identity = spec.identity
             record.request_timeout_seconds = spec.request_timeout_seconds or self.config.request_timeout_seconds
+            record.deadline_source = spec.deadline_source
+            record.timeout_check = spec.timeout_check
+            record.timeout_setting = spec.timeout_setting
+            record._request_slot = request_slot
+            if (spec.deadline_source == "run" and spec.timeout_setting is not None
+                    and spec.workload.get("request_source") == "custom_fixtures"
+                    and spec._fixture_request_timeout_seconds == record.request_timeout_seconds):
+                record._timeout_fixture = {"setting": spec.timeout_setting, "file": self.config.custom_fixtures,
+                    "fixture_id": spec.fixture_id, "field": "request_timeout_seconds"}
             if record.status in {"timeout", "cancelled"}:
                 try:
                     reason = self.stop_reason(target.name)
@@ -982,9 +1143,10 @@ class _Run:
                 elif self.endpoint_health[target.name]["abort_reason"]:
                     record.termination_reason, record.termination_limit_seconds = "endpoint_unresponsive", self.config.unresponsive_for_seconds
                     record.error = self.endpoint_health[target.name]["abort_reason"]
-                elif intentional_deadline_applies and deadline is not None and deadline.expired():
+                elif intentional_deadline_expired():
                     record.termination_reason = "intentional_deadline"
                     record.termination_limit_seconds = timeout
+                    record.error = "intentional request deadline"
                 elif record.status == "timeout" and record.termination_reason in {None, "external_cancellation"}:
                     record.termination_reason = "request_timeout"
                     record.termination_limit_seconds = record.request_timeout_seconds
@@ -1010,7 +1172,7 @@ class _Run:
             intentional = (record.status == "cancelled" and record.termination_reason in {
                 "generation_chunk_limit", "intentional_cancellation", "intentional_cancellation_deadline",
             }) or (
-                timeout_override is not None and record.status == "timeout")
+                record.status == "timeout" and record.termination_reason == "intentional_deadline")
             record.intentional = intentional
             propagating_error = False
             try:
@@ -1065,6 +1227,12 @@ class _Run:
                         condition["reason"] = self.condition_reason(target.name)
                 # Live visualization gets measurements only, never retained response bodies.
                 try:
+                    warning = self.timeout_watch.observe(record, (time.monotonic() - self.start),
+                        readiness=readiness, evidence_probe=evidence_probe)
+                    if warning is not None:
+                        self.observations[target.name]["timeout_warnings"] = [
+                            item for item in self.timeout_watch.warnings if item["target"] == target.name][-16:]
+                        self.emit("timeout_warning", target.name, spec.scenario, timeout_warning=warning)
                     self.emit("request_completed", target.name, spec.scenario, status=record.status,
                               condition_id=condition_id, condition_summary=dict(condition) if condition else None,
                               input_chars=request_parameters["input_chars"], requested_max_tokens=output_cap,
@@ -1435,8 +1603,7 @@ async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attributio
                     run, target, stop_event=telemetry_stop))
             restart = run.observations[target.name]["restart"]
             if enabled & {"access", "serving", "first_output", "generation"} or restart:
-                response = config.effective_initial()
-                response_config = config.model_copy(update={key: response[key] for key in ("samples", "max_output_tokens", "request_timeout_seconds")})
+                response_config = _response_config(config, initial=True)
                 initial_specs = builtin_fixtures(response_config)["short"]
                 if restart and restart["status"] == "hook_completed":
                     ready_deadline = min(run.deadline, time.monotonic() + config.readiness_timeout_seconds)
@@ -1475,7 +1642,7 @@ async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attributio
                 # A one-token inference can still have a slow first response.
                 # Share one configured timeout across compatibility retries.
                 probe_end = min(run.deadline, time.monotonic() + config.request_timeout_seconds)
-                run.preparation(target.name, "performance_evidence_probe", "Checking streamed token and usage evidence", "running")
+                run.preparation(target.name, "performance_evidence_probe", "Checking streamed token and usage support", "running")
                 client.on_response = None
                 probe_count = 0
                 planned_reserve = run.token_evidence_reserve(target)
@@ -1493,13 +1660,19 @@ async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attributio
                     run.observations[target.name]["token_evidence"] = client.observe_token_evidence_probe(record)
                 client.on_response = lambda: run.endpoint_response(target.name)
                 evidence = run.observations[target.name].setdefault("token_evidence", {"status": "unavailable", "reason": "No request budget or preparation time remained for a token-evidence compatibility probe."})
-                run.preparation(target.name, "performance_evidence_probe", "Streamed token and usage capability", "completed" if evidence.get("status") in {"available", "observed"} else "unavailable", evidence.get("reason"))
+                complete_evidence = (evidence.get("status") == "observed"
+                                     and evidence.get("logprobs") == evidence.get("usage") == "supported"
+                                     and not evidence.get("missing_usage_fields"))
+                run.preparation(target.name, "performance_evidence_probe", "Streamed token and usage support",
+                                "completed" if complete_evidence else "unavailable", evidence.get("reason"))
+                run.finish_condition(target.name, "performance_evidence_probe", reason=evidence.get("reason"),
+                                     verdict="pass" if complete_evidence else "inconclusive")
             run.observations[target.name]["deployment"]["model_residency"]["after_preparation"] = (
                 await deployment.model_residency(target, config, deadline=run.deadline, stop=run.stop))
             if enabled & {"serving", "first_output"}:
-                response = config.effective_response()
-                response_specs = builtin_fixtures(config.model_copy(update={key: response[key] for key in ("samples", "max_output_tokens", "request_timeout_seconds")}))["short"]
-                await run.group(target, client, response_specs, "warm", count=response["samples"])
+                response_config = _response_config(config)
+                response_specs = builtin_fixtures(response_config)["short"]
+                await run.group(target, client, response_specs, "warm", count=response_config.samples)
             run.finish_checks(target.name, {"serving", "first_output"})
             if "generation" in enabled:
                 effective = _check_config(config, "generation")
@@ -1537,6 +1710,12 @@ async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attributio
                         # Explicit custom request settings belong to their fixture.
                         check_fixtures[check_id].extend(spec.model_copy(update={
                             "max_tokens": spec.max_tokens if spec.max_tokens is not None else effective.max_output_tokens,
+                            "deadline_source": ("run" if spec.request_timeout_seconds is not None
+                                                else "check" if effective._request_timeout_check else "run"),
+                            "timeout_check": (None if spec.request_timeout_seconds is not None
+                                              else effective._request_timeout_check),
+                            "timeout_setting": (f"custom_fixtures ({config.custom_fixtures}, fixture {spec.fixture_id}).request_timeout_seconds"
+                                                if spec.request_timeout_seconds is not None else None),
                             "request_timeout_seconds": (spec.request_timeout_seconds if spec.request_timeout_seconds is not None
                                                         else effective.request_timeout_seconds)})
                             for spec in fixtures[check_id] if spec.workload.get("request_source") == "custom_fixtures")
@@ -1610,7 +1789,10 @@ async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attributio
                     "allowance": allowance, "reserved_later": reserved,
                     "policy": "reserve fixed later work and probes; half quota cap only with later checks"}
                 heavy = traffic_fixtures(effective)
-                heavy_specs = heavy["long_input"] + heavy["long_output"]
+                heavy_specs = [spec.model_copy(update={
+                    "deadline_source": "check" if effective._request_timeout_check else "run",
+                    "timeout_check": effective._request_timeout_check})
+                    for spec in heavy["long_input"] + heavy["long_output"]]
                 end = min(run.deadline, time.monotonic() + effective.sustained_seconds)
                 dispatched, exhausted = 0, False
                 async def worker():
@@ -2630,10 +2812,10 @@ def _output_budget_guidance(config, records, check_id):
     if capped and all(r.requested_max_tokens < value for r in capped):
         caps = ", ".join(str(value) for value in sorted({r.requested_max_tokens for r in capped}))
         return (f"the affected fixtures request {caps} tokens below the configured default; increasing {field} alone will not "
-                "change those requests. Configure the model to return the final fixture answer without extra reasoning within its requested cap, then rerun")
+                "change those requests. Configure the model to return the final fixture answer without extra reasoning within its requested cap (for example reasoning_effort or chat_template_kwargs in YAML request_options), then rerun")
     setting = field + (" (or --max-output-tokens)" if field == "max_output_tokens" else "")
     return (f"raise {setting} above {value} for requests using that output cap, "
-            "or configure the model to produce the final answer within its requested cap, then rerun")
+            "or configure the model to produce the final answer within its requested cap (for example reasoning_effort or chat_template_kwargs in YAML request_options), then rerun")
 
 
 _READ_COUNT_GUIDANCE = ("enable streamed logprobs or cumulative completion token usage alongside streamed content "
@@ -2837,7 +3019,7 @@ def _verdict_summary(check, config, records, budget):
         remedy = "enable streaming (stream: true, omit --nonstream) so the client can observe output and interrupt the request, then rerun cancellation"
     elif reason == "unseparated_reasoning_tokens":
         remedy = ("use a server that reports reasoning-token usage separately from total completion usage, "
-                  "or configure the model to answer without reasoning; streamed reasoning logprobs alone "
+                  "or configure the model to answer without reasoning (for example reasoning_effort or chat_template_kwargs in YAML request_options); streamed reasoning logprobs alone "
                   "cannot account for hidden control tokens, so they do not establish answer-token usage")
         # Separated reasoning usage is necessary, not sufficient: pace also needs
         # token counts at answer reads, and other missing timings keep their remedy.
@@ -3183,6 +3365,7 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
     warnings = ["Other traffic on the target is unknown; results cover only the recorded workload.",
                 "Backend/replica identity is unverified unless explicitly reported by the server; a service URL does not establish complete replica coverage."]
     warnings.extend(model_identity_warnings(config, run.records))
+    warnings.extend(format_timeout_warning(warning) for warning in run.timeout_watch.warnings)
     if run.memory_limit_reached:
         warnings.append("Maximum memory (RAM growth during this run) was exceeded." +
             (" Unfinished checks were interrupted." if run.memory_interrupted_checks else " No check was interrupted."))
@@ -3236,66 +3419,13 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
                         "observed_models": sorted({r.observed_model for r in run.records if r.target == t.name and r.observed_model}),
                         "observed_backend_ids": sorted({r.backend_id for r in run.records if r.target == t.name and r.backend_id}),
                         "other_replicas": "unverified"} for t in config.targets]}
-    from .reporting import (_load_test_workload_source_sha256, _multi_user_workload_identity,
-                            connection_summary)
+    from .reporting import connection_summary
     connection_failures = [message for target in config.targets if (message := connection_summary(
         [r for r in run.records if r.target == target.name], target.url))]
     if connection_failures:
         observations["summary"] = "; ".join(connection_failures)
-    from giraffe.workloads import FIXTURE_SOURCE_SHA256, WORKLOAD_CHECKS
     config_values = public_config.model_dump(mode="json")
-    workload_settings = {key: (getattr(config, key).model_dump(mode="json")
-                              if hasattr(getattr(config, key), "model_dump") else getattr(config, key))
-                         for key, checks in WORKLOAD_CHECKS.items()
-                         if checks.intersection(config.checks)}
-    workload_identity = {
-        "generator_source_sha256": FIXTURE_SOURCE_SHA256 if any(workload_settings.values()) else None,
-        "settings": workload_settings,
-    }
-    if "sessions" in config.checks and config.sessions and config.sessions.sampling:
-        from giraffe import session_sampling
-        workload_identity["session_sampling_source_sha256"] = hashlib.sha256(
-            Path(session_sampling.__file__).read_bytes()).hexdigest()
-    if "multi_user" in config.checks:
-        workload_identity.update(_multi_user_workload_identity())
-    if "gateway_access" in config.checks:
-        from giraffe import gateway_access, gateway_json
-        workload_identity["gateway_access_source_sha256"] = hashlib.sha256(b"".join(
-            Path(module.__file__).read_bytes() for module in (gateway_access, gateway_json))).hexdigest()
-    if "gateway_policy" in config.checks:
-        from giraffe import gateway_json, gateway_policy, gateway_response
-        workload_identity["gateway_policy_source_sha256"] = hashlib.sha256(b"".join(
-            Path(module.__file__).read_bytes() for module in (gateway_policy, gateway_response, gateway_json))).hexdigest()
-    if "scale_down" in config.checks:
-        from giraffe import scale_down
-        workload_identity["scale_down_source_sha256"] = hashlib.sha256(Path(scale_down.__file__).read_bytes()).hexdigest()
-    if "load" in config.checks:
-        workload_identity["load_test_source_sha256"] = _load_test_workload_source_sha256()
-    if "consistency" in config.checks and config.consistency and config.consistency.logprobs:
-        from giraffe import logprobs, logprob_workload
-        workload_identity["logprob_source_sha256"] = hashlib.sha256(
-            Path(logprobs.__file__).read_bytes() + Path(logprob_workload.__file__).read_bytes()
-        ).hexdigest()
-    if "tools" in config.checks:
-        from giraffe.tool_checks import resolved_tool_fixtures, resolved_tool_modes
-        from giraffe.tool_conversations import SOURCE_SHA256
-        workload_identity["resolved_tool_checks"] = {
-            "fixtures": [fixture.model_dump(mode="json") for fixture in resolved_tool_fixtures(config)],
-            "modes": resolved_tool_modes(config),
-            **({"conversations": [fixture.model_dump(mode="json") for fixture in config.tool_checks.conversations],
-                "conversation_source_sha256": SOURCE_SHA256}
-               if config.tool_checks and config.tool_checks.conversations else {}),
-        }
-    shared_workload_hash = {}
-    if SHARED_BASELINE_EXCLUDED_WORKLOADS.intersection(workload_settings):
-        shared_settings = {key: value for key, value in workload_settings.items()
-                           if key not in SHARED_BASELINE_EXCLUDED_WORKLOADS}
-        excluded_sources = {f"{key}_source_sha256" for key in SHARED_BASELINE_EXCLUDED_WORKLOADS}
-        shared_workload_hash["shared_workload_fixture_sha256"] = fixture_hash({
-            **{key: value for key, value in workload_identity.items() if key not in excluded_sources},
-            "settings": shared_settings,
-            "generator_source_sha256": FIXTURE_SOURCE_SHA256 if any(shared_settings.values()) else None,
-        })
+    workload_identity, shared_workload_hash = build_workload_identity(config)
     fixture_values = {key: [spec.model_dump() for spec in specs] for key, specs in fixtures.items()}
     # An unused optional field must not invalidate existing baseline fingerprints.
     for specs in fixture_values.values():
@@ -3311,11 +3441,12 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
     manifest = {"config": config_values,
                 "invocation": {"source": "python_api", "argv": None},
                 "config_migration_notes": list(config._migration_notes),
-                "timing_measurement_version": 3,
-                **({"gateway_access_source_sha256": workload_identity["gateway_access_source_sha256"]}
-                   if "gateway_access_source_sha256" in workload_identity else {}),
-                **({"gateway_policy_source_sha256": workload_identity["gateway_policy_source_sha256"]}
-                   if "gateway_policy_source_sha256" in workload_identity else {}),
+                "config_migration_warnings": list(config._migration_warnings),
+                "timing_measurement_version": 4,
+                **({"gateway_access_workload_version": workload_identity["workload_versions"]["gateway_access"]}
+                   if "gateway_access" in workload_identity["workload_versions"] else {}),
+                **({"gateway_policy_workload_version": workload_identity["workload_versions"]["gateway_policy"]}
+                   if "gateway_policy" in workload_identity["workload_versions"] else {}),
                 **({"request_pack": pack_identity(config)} if run.pack_specs else {}),
                 "workload_selection": {key: "selected" if key in public_config.checks else "not selected"
                                        for key in PUBLIC_CHECK_NAMES if key not in CORE_CHECKS},

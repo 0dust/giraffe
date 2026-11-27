@@ -14,8 +14,8 @@ from pydantic import Field, SecretStr, field_validator, model_validator
 from .caps import (
     MAX_PREFLIGHT_BODY_BYTES, MAX_PREFLIGHT_HEADER_CHARS,
 )
-from giraffe.client import NO_ANSWER_ERROR, REASONING_BUDGET_ERROR, LLMClient, _headers, completion_url
-from giraffe.models import Model, RequestSpec, RunConfig, Target
+from giraffe.client import NO_ANSWER_ERROR, REASONING_BUDGET_ERROR, LLMClient, _headers, models_url
+from giraffe.models import Deployment, Model, RequestSpec, RunConfig, Target
 
 
 logger = logging.getLogger(__name__)
@@ -71,10 +71,12 @@ class ModelDiscovery(APIKeyInput):
     headers_env: dict[str, str] = Field(default_factory=dict)
     ca_bundle: str | None = None
     proxy: str | None = None
+    deployment: Deployment = Field(default_factory=Deployment)
 
     def target(self, model: str = "discovery") -> Target:
         target = Target(name="connection", model=model, url=self.url.strip(),
-                        api_key_env=self.api_key_env, headers_env=self.headers_env)
+                        api_key_env=self.api_key_env, headers_env=self.headers_env,
+                        deployment=self.deployment)
         attach_api_key(target, self.api_key)
         return target
 
@@ -121,7 +123,7 @@ async def discover_models(body: ModelDiscovery, *, allow_manual: bool = False,
         headers = _headers(target)
     except ValueError as error:
         raise PreflightError(str(error)) from None
-    url = completion_url(target.url).removesuffix("/chat/completions") + "/models"
+    url = models_url(target.url)
     try:
         verify = ssl.create_default_context(cafile=body.ca_bundle) if body.ca_bundle else True
         client = httpx.AsyncClient(
@@ -170,6 +172,10 @@ async def discover_models(body: ModelDiscovery, *, allow_manual: bool = False,
                     "Enter the model name to test the connection."}
         raise PreflightError("The server returned an unreadable model list. "
                             "You can still enter the model name manually.") from None
+    from giraffe.deployment import _models_context_limit
+
+    context_windows = {model: value for model in models
+                       if (value := _models_context_limit(payload, model)) is not None}
     extra = {}
     if include_tokenizers:
         import re
@@ -183,15 +189,17 @@ async def discover_models(body: ModelDiscovery, *, allow_manual: bool = False,
                     and ".." not in root and not Path(root).exists()):
                 roots.setdefault(item["id"], set()).add(root)
         extra["tokenizers"] = {model: next(iter(values)) for model, values in roots.items() if len(values) == 1}
-    return {**extra, "models": models, "message": "Model list received. No inference requests were sent."
+    return {**extra, "models": models, "context_windows": context_windows, "message": "Model list received. No inference requests were sent."
             if models else "The server returned no models. Enter an installed model name manually."}
 
 
 async def check_connection(body: ConnectionTest) -> dict:
     """Resolve a model, then send at most one bounded inference without saving a run."""
     model = body.model
+    result = None
+    discovered = None
     try:
-        async with asyncio.timeout(15):
+        async with asyncio.timeout(15) as budget:
             if not model:
                 discovered = await discover_models(body, allow_manual=True)
                 models = discovered["models"]
@@ -202,17 +210,39 @@ async def check_connection(body: ConnectionTest) -> dict:
                 model = models[0]
             config = body.configuration(model, request_options=body.request_options)
             try:
-                return await check_target(config.targets[0], config)
+                result = await check_target(config.targets[0], config)
             except PreflightError as error:
                 if not error.no_answer or (body.model and not body.discovered):
                     raise
                 # Discovery succeeded, now or before a retry; an answerless test must not
                 # discard its result.
-                return {"status": "unverified", "model": model, "models": [model],
+                result = {"status": "unverified", "model": model, "models": [model],
                         "message": f'Found "{model}". The 32-token test ended before the model '
                                    "produced a visible answer. Choose checks to continue, "
                                    "or retry the connection test."}
+            from giraffe.deployment import now, probe_context_window
+            remaining = budget.when() - asyncio.get_running_loop().time()
+            result["context_window"] = None
+            result["context_window_reason"] = "unavailable"
+            if discovered is not None:
+                value = discovered.get("context_windows", {}).get(model)
+                if value is not None:
+                    result["context_window"] = {"value": value, "source": "/v1/models max_model_len", "collected_at": now()}
+                    result["context_window_reason"] = None
+                else:
+                    result["context_window_reason"] = "no_window"
+            if (result["context_window"] is None and remaining > 0
+                    and (discovered is None or config.targets[0].deployment.discovery
+                         in {"ollama", "llamacpp", "tgi", "sglang"})):
+                result["context_window_reason"] = "unavailable"
+                result["context_window"], result["context_window_reason"] = await probe_context_window(
+                    config.targets[0], config, timeout=min(6, remaining), detail=True)
+            return result
     except TimeoutError:
+        if result is not None:
+            result.setdefault("context_window", None)
+            result.setdefault("context_window_reason", "unavailable")
+            return result
         raise PreflightError("Connection test timed out after 15 seconds. "
                             "Check that the model is loaded, then try again.") from None
     except OSError:
@@ -286,8 +316,25 @@ async def check_target(target: Target, config: RunConfig) -> dict:
             message = ("Connection test timed out after 15 seconds. Check that the model is loaded, then try again."
                        if timeout else "Could not reach the model. Check the endpoint, TLS trust and proxy settings.")
         elif not 200 <= record.http_status < 300:
-            message = (f"The server returned HTTP {record.http_status}. "
-                       "Check the model name and OpenAI-compatible endpoint.")
+            rejected_option = record.workload.get("rejected_request_option")
+            option_keys = record.workload.get("request_option_keys")
+            if record.http_status in {400, 422} and rejected_option:
+                message = (f"The server returned HTTP {record.http_status} and rejected "
+                           f"request_options.{rejected_option}. Check that field's value or remove it "
+                           "from the configuration.")
+            elif record.workload.get("rejected_other_field"):
+                message = (f"The server returned HTTP {record.http_status}. "
+                           "Check the model name and OpenAI-compatible endpoint.")
+            elif record.http_status in {400, 422} and option_keys:
+                option_names = ", ".join(option_keys[:5])
+                if len(option_keys) > 5:
+                    option_names += f" and {len(option_keys) - 5} more"
+                message = (f"The server returned HTTP {record.http_status}. Check the model name, "
+                           "the OpenAI-compatible endpoint and request_options "
+                           f"({option_names}).")
+            else:
+                message = (f"The server returned HTTP {record.http_status}. "
+                           "Check the model name and OpenAI-compatible endpoint.")
         else:
             message = ("The server responded but did not return a usable answer within the "
                        "32-token test. Check the model's settings or continue with its name.")

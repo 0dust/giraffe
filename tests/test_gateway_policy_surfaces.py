@@ -181,17 +181,17 @@ async def test_matching_legacy_policy_summaries_do_not_establish_a_baseline(monk
 
 
 @pytest.mark.usefixtures("local_tokenizer")
-async def test_policy_baseline_attests_source_separately_from_shared_work(monkeypatch):
+async def test_policy_baseline_attests_workload_version_separately_from_shared_work(monkeypatch):
     check, report, _ = await exercise(monkeypatch, full=True)
     assert check.status == "pass"
 
     legacy = report.model_copy(deep=True)
-    legacy.manifest.pop("gateway_policy_source_sha256")
+    legacy.manifest.pop("gateway_policy_workload_version")
     legacy.manifest["fixture_pack"].pop("shared_workload_fixture_sha256")
-    assert compare_baseline(report, legacy).baseline["status"] == "pass"
+    assert compare_baseline(report, legacy).baseline["status"] == "inconclusive"
 
     different = report.model_copy(deep=True)
-    different.manifest["gateway_policy_source_sha256"] = "0" * 64
+    different.manifest["gateway_policy_workload_version"] = 2
     compared = compare_baseline(report, different).baseline
     assert compared["status"] == "inconclusive"
     assert all(row["status"] == "inconclusive" for row in compared["targets"][0]["comparisons"])
@@ -260,3 +260,20 @@ def test_finite_policy_plan_requires_only_its_declared_request_cap(mode):
     truncated = request_plan(config.model_copy(update={"max_requests": 12}))
     assert [warning["kind"] for warning in truncated["request_warnings"]] == ["incomplete_coverage"]
     assert truncated["request_warnings"][0]["values"]["required_request_limit"] == 13
+
+
+@pytest.mark.usefixtures("local_tokenizer")
+@pytest.mark.parametrize("version", [True, 1.0, "1", None, 1], ids=["bool", "float", "string", "missing", "int"])
+@pytest.mark.parametrize("side", ["current", "baseline"])
+async def test_policy_baseline_requires_integer_workload_versions_on_both_sides(monkeypatch, version, side):
+    check, current, _ = await exercise(monkeypatch, full=True)
+    assert check.status == "pass"
+    baseline = current.model_copy(deep=True)
+    changed = current if side == "current" else baseline
+    if version is None:
+        changed.manifest.pop("gateway_policy_workload_version")
+    else:
+        changed.manifest["gateway_policy_workload_version"] = version
+    row, = compare_baseline(current, baseline).baseline["targets"][0]["comparisons"]
+    assert row["check"] == "gateway_policy"
+    assert row["status"] == ("pass" if type(version) is int else "inconclusive")

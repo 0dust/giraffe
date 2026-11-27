@@ -27,13 +27,13 @@ from . import states
 from .caps import (MAX_HTML_PREVIEW_CHARS, MAX_HTML_JSON_PREVIEW_CHARS,
                    DEFAULT_HTML_REQUEST_DETAILS, MAX_FAILURE_SUMMARY_TITLE_CHARS,
                    MAX_FAILURE_SUMMARY_CHARS)
-from .deployment import deployment_diff, fixture_hash, safe_config, sanitize
+from .deployment import deployment_diff, safe_config, sanitize
 from .launch_settings import comparison_warnings, setting_change_text
 from .report_inputs import input_ref as _input_ref
 from .multi_user_metrics import (_error as _user_error, _length_mix_differs, _total_generated_tokens,
                                  _uncached_input_tokens, _valid as _user_valid_completion,
                                  fairness_applies, truncated_conversation_turn, user_delivery_completions, user_latency)
-from .models import (CHECK_NAMES, CORE_CHECKS, SHAPES, SHARED_BASELINE_EXCLUDED_WORKLOADS, CheckResult, GatewayAccess,
+from .models import (CHECK_NAMES, SHAPES, SHARED_BASELINE_EXCLUDED_WORKLOADS, CheckResult, GatewayAccess,
                      GatewayAttribution, GatewayEvidence, GatewayPolicy, RequestRecord, RunConfig, RunReport,
                      TestIdentity, overall_status, load_shape_label,
                      migrate_concurrent_load, migrate_run_limits, is_supported_schema, CURRENT_SCHEMA)
@@ -116,7 +116,7 @@ def _uses_shared_request_options(config: dict, check: str) -> bool:
 def _comparison_config(value: dict) -> dict:
     """Normalize saved config I/O without changing the recorded workload identity."""
     config, _ = migrate_run_limits(deepcopy(value))
-    config, _ = migrate_concurrent_load(config)
+    config, _, _ = migrate_concurrent_load(config)
     checks = config.get("checks")
     options = config.get("request_options")
     if (isinstance(checks, list) and "gateway_access" in checks
@@ -144,6 +144,21 @@ def _comparison_config(value: dict) -> dict:
         if config["traffic"].get("max_in_flight") is None:
             config["traffic"]["max_in_flight"] = default
     return config
+
+
+def _load_interference_settings(settings):
+    """Visit the primary and separately migrated Load settings only."""
+    loads = [settings]
+    migrated = settings.get("migrated_tests")
+    if isinstance(migrated, list):
+        loads.extend(item.get("settings") for item in migrated if isinstance(item, dict))
+    for load in loads:
+        if not isinstance(load, dict):
+            continue
+        workloads = load.get("workloads")
+        interference = workloads.get("interference") if isinstance(workloads, dict) else None
+        if isinstance(interference, dict):
+            yield interference
 
 
 def _comparison_manifest(manifest: dict) -> dict:
@@ -187,6 +202,12 @@ def _comparison_manifest(manifest: dict) -> dict:
                     **settings} if isinstance(settings, dict) else settings
             for check, settings in value["effective_checks"].items()
         }
+        load = value["effective_checks"].get("load")
+        if isinstance(load, dict):
+            load = deepcopy(load)
+            for interference in _load_interference_settings(load):
+                interference.setdefault("mode", "long_input_during_short")
+            value["effective_checks"]["load"] = load
     for check, field in (("first_output", "first_output_ms"), ("generation", "stream_gap_ms")):
         settings = value.get("effective_checks", {}).get(check)
         if isinstance(settings, dict) and isinstance(settings.get("limits"), dict):
@@ -196,369 +217,6 @@ def _comparison_manifest(manifest: dict) -> dict:
     if "capacity" in resolved.checks:
         value.setdefault("effective_traffic", resolved.effective_traffic().model_dump(mode="json"))
     return value
-
-
-_CONVERSATION_REVISIONS = {"persistent_users", "shared_conversations", "scale_down_shared_conversations"}
-_COMPANION_REVISIONS = _CONVERSATION_REVISIONS | {
-    "gateway_attribution", "gateway_conversations", "gateway_shared_first", "gateway_shared_targets_first",
-    "gateway_policy", "policy_conversations", "policy_shared_first", "policy_shared_targets_first",
-    "gateway_access", "gateway_access_policy", "access_conversations", "access_shared_first", "access_shared_targets_first",
-    "policy_after_shared_workloads", "policy_after_all_shared_targets", "access_after_shared_workloads",
-    "access_deferred_policy", "access_after_all_shared_targets", "scale_down_gateway_access",
-    "output_budgets",
-}
-# Access changed optional dispatch after the shared workloads in these revisions.
-_MULTI_USER_COMPANION_REVISIONS = {"policy_after_all_shared_targets", "access_after_all_shared_targets",
-                                   "scale_down_gateway_access"}
-_CONVERSATION_BRIDGE_CHECKS = {"prefix", "sessions", "consistency"}
-_CONVERSATION_LOAD_SOURCE = "9b694c97a39d449d8ea15b09a9aeb406bf835179c0882827685c4d7888687d36"
-_ACCESS_CONVERSATION_SOURCE = "9ff9179300b4012552a7bd6fd6ef0ae60c016b9023dba33ffabc9ca03783ac2d"
-_COMPANION_LOAD_SOURCE = "113325dd5cffa04626cc7be7ee93bc6e9be67335531288bc329b3542a155c92a"
-
-
-def _multi_user_workload_identity() -> dict[str, str]:
-    from . import concurrent_load, load_test, multi_user, multi_user_metrics, session_sampling, traffic
-
-    modules = (multi_user, multi_user_metrics, load_test, concurrent_load, session_sampling, traffic)
-    source = sha256(b"".join(Path(module.__file__).read_bytes() for module in modules)).hexdigest()
-    return {"multi_user_source_sha256": source, "multi_user_window_policy": multi_user.WINDOW_POLICY}
-
-
-def _load_test_workload_source_sha256() -> str:
-    from . import concurrent_load, load_test, traffic
-
-    return sha256(b"".join(Path(module.__file__).read_bytes() for module in (load_test, concurrent_load, traffic))).hexdigest()
-
-
-def _baseline_workload_fields(checks, *, shared: bool) -> set[str]:
-    return {field for field, workload_checks in WORKLOAD_CHECKS.items()
-            if workload_checks.intersection(checks) and (not shared or field not in SHARED_BASELINE_EXCLUDED_WORKLOADS)}
-
-
-# sha256 of src/giraffe/workloads.py (FIXTURE_SOURCE_SHA256) as of the "output_budgets"
-# generator revision, i.e. the source that new runs record. It is NOT the hash of the
-# predecessor revision (that is 2c5cfa60..., the origin/main source before issue #78);
-# the revision reuses the predecessor's settings identity and substitutes this hash so
-# unchanged Load-only runs stay comparable. Any later edit to workloads.py changes the
-# recorded hash: review compatibility, then update this value or add a new revision.
-# tests/test_run_limits_baseline_identity.py fails when it no longer matches the file.
-_OUTPUT_BUDGETS_GENERATOR_SOURCE = "a04c62a2e7b10ab0aef201cf5c283fe53df694d247ca5ce35caca1340a83f387"
-
-
-def _run_limits_workload_identity(manifest: dict, *, revision: str, include_load: bool = False,
-                                  shared: bool = False) -> dict | None:
-    """Reconstruct only identities whose generator revision is known exactly."""
-    if revision == "output_budgets":
-        # Only prefixes changed in this shared generator revision. Reuse the
-        # predecessor's exact source/settings constraints for unchanged work;
-        # prefix requests need a new baseline, as do changed built-in hashes.
-        identity = _run_limits_workload_identity(
-            manifest, revision="scale_down_gateway_access", include_load=include_load, shared=shared)
-        if identity is None or "prefix" in identity["settings"]:
-            return None
-        if identity["generator_source_sha256"] is not None:
-            identity["generator_source_sha256"] = _OUTPUT_BUDGETS_GENERATOR_SOURCE
-        return identity
-    raw = manifest.get("config", {})
-    legacy = revision == "legacy"
-    try:
-        config, _ = migrate_run_limits(deepcopy(raw))
-        config, _ = migrate_concurrent_load(config)
-        resolved = RunConfig.model_validate({**config, "max_requests": None, "max_duration_seconds": None})
-    except ValidationError:
-        return None
-    if revision == "scale_down_registration" and not set(resolved.checks) <= {"sessions", "consistency"}:
-        return None
-    fields = _baseline_workload_fields(resolved.checks, shared=shared)
-    has_multi_user = "multi_user" in fields
-    if has_multi_user and revision not in _MULTI_USER_COMPANION_REVISIONS:
-        return None
-    exact_conversation = revision in _CONVERSATION_REVISIONS and not include_load
-    if exact_conversation:
-        checks = set(resolved.checks)
-        if shared:
-            checks -= SHARED_BASELINE_EXCLUDED_WORKLOADS
-        if not checks <= _CONVERSATION_BRIDGE_CHECKS.union(set(CORE_CHECKS) - {"scale_down"}, {"tools"}):
-            return None
-    if revision in {"issue45", "issue95", "issue95_pauses", "issue95_pause_evidence", "scale_down_registration"} | _COMPANION_REVISIONS:
-        unchanged_fields = {"sessions", "consistency"}
-        if revision == "issue95_pause_evidence" or revision in _COMPANION_REVISIONS:
-            # Optional user/gateway dispatch changed the shared file; these
-            # specialist requests are unchanged at these exact revisions.
-            unchanged_fields.add("prefix")
-        if revision in _COMPANION_REVISIONS:
-            unchanged_fields.update(_baseline_workload_fields({"tools"}, shared=shared))
-        if has_multi_user:
-            unchanged_fields.add("multi_user")
-        if include_load or exact_conversation or has_multi_user:
-            unchanged_fields.add("load_test")
-        # Legacy concurrency has a separate source and needs its own attested revision.
-        if "concurrency" in resolved.checks or not fields <= unchanged_fields:
-            return None
-    sampled_sessions = "sessions" in resolved.checks and resolved.sessions and resolved.sessions.sampling is not None
-    if sampled_sessions and revision not in _COMPANION_REVISIONS:
-        return None  # Earlier revisions have no attested sampled-traffic equivalent.
-    settings = {}
-    for field in fields:
-        if field not in raw:
-            return None  # A fingerprint cannot attest settings missing from the saved config.
-        value = raw[field] if legacy else getattr(resolved, field)
-        settings[field] = value.model_dump(mode="json") if hasattr(value, "model_dump") else value
-        if revision == "issue45" and field == "sessions" and isinstance(settings[field], dict):
-            settings[field].pop("sampling", None)
-    # These exact source revisions preserve default generated workloads across
-    # the bounds/request-setting split. Unknown revisions retain strict matching.
-    identity = {
-        "generator_source_sha256": {
-            "legacy": "4aa7fb48fa4be4a51b3341f34d86755dcfcca5c1043d1d362205d006115eccb0",
-            "phase2": "c4edf02ed8db34d203da2328543acc3a49d98d3af41dc9471855b232c9ccf9f3",
-            "phase3": "e147840e6530a40c0ac1607ac05840a5aec5abeb2faaff31e53bd2613057eaec",
-            "review26": "00a83c3d261b368514d64e9c79a135d8b6e1b2839bf62a20a695e75e94c72eb7",
-            "caps26": "00a83c3d261b368514d64e9c79a135d8b6e1b2839bf62a20a695e75e94c72eb7",
-            "issue45": "9c47aa627a061bd90f0e181ce26b7faa912be790ae75547348c72445c4144b35",
-            "issue95": "ebc8dc0b150701e1a97f571a6ea7a37cdcf62f4d3d9db97244d8c2bd5c17b092",
-            "issue95_pauses": "37bf5c074bfdb19f367e5348b678e5a923977fe7bf013b8c781a43bb8efca19e",
-            "issue95_pause_evidence": "ab5875f7c635f8f454429a88aac87d52ce3a141a84bcf7b936fa737ffa41fe83",
-            "persistent_users": "aee9ca71bc5ffd780d1574422b761e3177471a12f951a10b04322573ca062f76",
-            "gateway_attribution": "e29f47df17e250a0fc0133ce3ead964ef97539f8066ac76c374308c9ee552c88",
-            "gateway_access": "9c18e53a9181a3bcf7c4470365ecba67a2c3e4f7f2f5c15a0d444bd8d7d6f5ac",
-            "gateway_policy": "8630615d4b6321fe111f312cff35ad9b1c4864f15f19ed5bd7be9e4649291791",
-            "gateway_access_policy": "4a2232070b9effa22e7fa01ca91f015c035d4b26c1d74794fca33c4114fb548f",
-            "shared_conversations": "d9a9e921584262148e06b636f0e8f195b7e530fd2a69c5e98f013359cf947ede",
-            "gateway_conversations": "bcdc3b8411d9039e90a35bcd5b109504e7123e95ec6baebd5e654287b4774605",
-            "policy_conversations": "7c1455ec2c7d65ec707e41ef1864d117fe72fe6f919ba18992e84f39b2449181",
-            "access_conversations": _ACCESS_CONVERSATION_SOURCE,
-            "gateway_shared_first": "7a16b503242045f808ecfdb41df6bc8c507ca68181aaf019f003dc2d4d2ffb72",
-            "policy_shared_first": "60eac0571375a103c1ebe7b23c3107b9814ceb0c002797736c55a6248a168f86",
-            "access_shared_first": "ffda4bac34b3ab331e55c050a91707b1a0bfa16322347e7109646540e5fc4891",
-            "gateway_shared_targets_first": "8037d490881621f37f1aef446474bc52a1ba276bcfcd174f39a14e37032dc9f0",
-            "policy_shared_targets_first": "d72acf540fbf8fbd8c45d3ab76d6041054209bb45913c681df171525f8ddc158",
-            "access_shared_targets_first": "16c362d1f79e5dd0b3f0601e0100ec9b19d7a512f5cee081af72594a683bf49f",
-            "access_after_shared_workloads": "2d8a82427a1c241c95e2719c8ab307513d970ba7f14c80db77201d85c35a0897",
-            "access_deferred_policy": "13a3e111a4f8985fa4dd8f763a093ade7ec118a6272e875b5f8abe0e1f104d94",
-            "access_after_all_shared_targets": "67da297a94f8a07f9ab21008c9c6ca87090a7fac3d30e4ff9a543e7491427667",
-            "policy_after_shared_workloads": "49dcdfb6b173a93720e4e9e5a9bc54ffcea7580346d2ea0210e600e0779a03e6",
-            "policy_after_all_shared_targets": "e4ddc7a7e8563f9ab3bba2fc42ad0232ee924c65f67d92dafd89c21025d202d0",
-            # Only scale-down registration differs from access_after_all_shared_targets.
-            "scale_down_gateway_access": "2c5cfa60063bd236302582d25e7fe37e7807b829f487168cd09407d37bd60e6e",
-            # Only the scale-down registry entry changed; session and text
-            # consistency request construction remains identical.
-            "scale_down_registration": "7c5a71d2036dc04a2fbbcaacfd8c55b07d1297b35c56ab79a21e04906d7fe8d0",
-            # The merged generator adds only scale-down registration to shared conversations.
-            "scale_down_shared_conversations": "48f32dc6cf3b56f8b9a275bdc0401b31ba71ea5084a09e237321039bc468613e",
-        }[revision] if any(settings.values()) else None,
-        "settings": settings,
-    }
-    if has_multi_user:
-        identity.update(_multi_user_workload_identity())
-    if (exact_conversation or has_multi_user) and "load" in resolved.checks:
-        identity["load_test_source_sha256"] = (
-            _load_test_workload_source_sha256() if has_multi_user else
-            "df3b7bbf30cab87d2e8c1c6dab8819f9cfe592b181407caa7c32af4c5f720cd4"
-            if revision == "scale_down_shared_conversations" else _CONVERSATION_LOAD_SOURCE)
-    if sampled_sessions:
-        identity["session_sampling_source_sha256"] = {
-            "persistent_users": "2fab1370faeab7ddb91a7ae9c0e49520ee9a67e305441a0663877bb12bca24c3",
-            "shared_conversations": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
-            "gateway_attribution": "2fab1370faeab7ddb91a7ae9c0e49520ee9a67e305441a0663877bb12bca24c3",
-            "gateway_conversations": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
-            "gateway_policy": "2fab1370faeab7ddb91a7ae9c0e49520ee9a67e305441a0663877bb12bca24c3",
-            "policy_conversations": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
-            "gateway_access": "2fab1370faeab7ddb91a7ae9c0e49520ee9a67e305441a0663877bb12bca24c3",
-            "gateway_access_policy": "2fab1370faeab7ddb91a7ae9c0e49520ee9a67e305441a0663877bb12bca24c3",
-            "access_conversations": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
-            "gateway_shared_first": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
-            "policy_shared_first": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
-            "access_shared_first": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
-            "gateway_shared_targets_first": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
-            "policy_shared_targets_first": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
-            "access_shared_targets_first": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
-            "access_after_shared_workloads": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
-            "access_deferred_policy": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
-            "access_after_all_shared_targets": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
-            "policy_after_shared_workloads": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
-            "policy_after_all_shared_targets": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
-            "scale_down_gateway_access": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
-            "scale_down_shared_conversations": "d8d498b51cbb006145e0448f685e431f4f5befd2a6907746987d0934f055a3f4",
-        }[revision]
-    if "concurrency" in resolved.checks:
-        identity["concurrent_load_source_sha256"] = {
-            "legacy": "33b66f3784ad9613db082fa1f00a2f3292fc910b9f842bd3fe018340a0fe7aa7",
-            "phase2": "5d4c4519c9f4b83dbec1286cd77287cfbeabbb1b9578b0d1365e9ea7480c5b88",
-            "phase3": "4124cfbd14b126c663cfa1e6f2e0a1cdc7146bfe415249e801e06049e3f79eb3",
-            "review26": "af6447cbef3456e303a590b430b3d11ea8d93a6c1a553d54f26e41086320f222",
-            # Named caps and readable remedies preserve the default requests.
-            "caps26": "5fed7f8033592e8392a51a598f6eddddf1462b74e963569527d793539f62ff88",
-        }[revision]
-    if "consistency" in resolved.checks and resolved.consistency and resolved.consistency.logprobs:
-        identity["logprob_source_sha256"] = {
-            "legacy": "1cecd981fea42d75a7abffbe8a069699b97cca73a273c2786c240b5a8c78b7b2",
-            "phase2": "1cecd981fea42d75a7abffbe8a069699b97cca73a273c2786c240b5a8c78b7b2",
-            "phase3": "7e55d5a237bcc4c03b6f7c43ee3eb49385a3aeddf842a65466ad3e24d704ef81",
-            "review26": "7e55d5a237bcc4c03b6f7c43ee3eb49385a3aeddf842a65466ad3e24d704ef81",
-            "caps26": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
-            "issue45": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
-            "issue95": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
-            "issue95_pauses": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
-            "issue95_pause_evidence": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
-            "persistent_users": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
-            "gateway_attribution": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
-            "gateway_access": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
-            "gateway_policy": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
-            "gateway_access_policy": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
-            "shared_conversations": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
-            "gateway_conversations": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
-            "policy_conversations": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
-            "access_conversations": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
-            "gateway_shared_first": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
-            "policy_shared_first": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
-            "access_shared_first": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
-            "gateway_shared_targets_first": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
-            "policy_shared_targets_first": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
-            "access_shared_targets_first": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
-            "access_after_shared_workloads": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
-            "access_deferred_policy": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
-            "access_after_all_shared_targets": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
-            "policy_after_shared_workloads": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
-            "policy_after_all_shared_targets": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
-            "scale_down_gateway_access": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
-            "scale_down_registration": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
-            "scale_down_shared_conversations": "d51d49b2716b3aa1f50c3b1e689cdc903399b9b7862bce59525194e44fea402e",
-        }[revision]
-    if "tools" in resolved.checks:
-        from .tool_checks import resolved_tool_fixtures, resolved_tool_modes
-        tool_conversation_revisions = _COMPANION_REVISIONS | {"phase3", "review26", "caps26"}
-        identity["resolved_tool_checks"] = {
-            "fixtures": [fixture.model_dump(mode="json") for fixture in resolved_tool_fixtures(resolved)],
-            "modes": resolved_tool_modes(resolved),
-            **({"conversations": [fixture.model_dump(mode="json") for fixture in resolved.tool_checks.conversations],
-                "conversation_source_sha256": ("4080132330b5ceb3d7e0b824bb26244a73967d81ae6b467441600e45c483eb48" if revision in tool_conversation_revisions else
-                                               "283d1eb18bb852ca0132a2d4a8c63e49bc7155614603e74740dd80afe8189714")}
-               if resolved.tool_checks and resolved.tool_checks.conversations else {}),
-        }
-    return identity
-
-
-def _same_run_limits_workload(current: dict, old: dict, *, fingerprint_key: str = "workload_fixture_sha256") -> bool:
-    if current.get("config", {}).get("config_version") != 2 or old.get("config", {}).get("config_version", 2) != 2:
-        return False
-    shared = fingerprint_key == "shared_workload_fixture_sha256"
-    matched_revisions = []
-    for manifest in (current, old):
-        revisions = ({"phase2", "phase3", "review26", "caps26", "issue45", "issue95", "issue95_pauses", "issue95_pause_evidence", "scale_down_registration"}
-                     | _COMPANION_REVISIONS) if "config_version" in manifest.get("config", {}) else {"legacy"}
-        fingerprint = manifest.get("fixture_pack", {}).get(fingerprint_key)
-        matched = {revision for revision in revisions
-                   if (identity := _run_limits_workload_identity(manifest, revision=revision, shared=shared)) is not None
-                   and fixture_hash(identity) == fingerprint}
-        if not matched:
-            return False
-        matched_revisions.append(matched)
-    current_config = _comparison_manifest(current)["config"]
-    old_config = _comparison_manifest(old)["config"]
-    selected = set(current_config.get("checks", [])) | set(old_config.get("checks", []))
-    if shared:
-        selected -= SHARED_BASELINE_EXCLUDED_WORKLOADS
-    if not selected <= _CONVERSATION_BRIDGE_CHECKS:
-        # Newly attested companion checks must match the exact conversation
-        # revisions on both reports. Earlier bridges keep their existing scope.
-        if not (all(matches & _COMPANION_REVISIONS for matches in matched_revisions)
-                or all(matches - _COMPANION_REVISIONS for matches in matched_revisions)):
-            return False
-    return all(current_config.get(field) == old_config.get(field)
-               for field in _baseline_workload_fields(selected, shared=shared))
-
-
-def _same_load_workload(current: dict, old: dict, *, fingerprint_key: str = "workload_fixture_sha256") -> bool:
-    """Attest unchanged Load dispatch within exact source-equivalence groups."""
-    revisions = ("shared_conversations", "scale_down_shared_conversations", "scale_down_gateway_access",
-                 "output_budgets",
-                 "gateway_conversations",
-                 "gateway_shared_first", "gateway_shared_targets_first",
-                 "policy_conversations", "policy_shared_first", "policy_shared_targets_first",
-                 "policy_after_shared_workloads", "policy_after_all_shared_targets",
-                 "access_conversations", "access_shared_first", "access_shared_targets_first",
-                 "access_after_shared_workloads", "access_deferred_policy", "access_after_all_shared_targets")
-    families = (
-        # Explicit multi-user stages preserve ordinary Load dispatch.
-        (_CONVERSATION_LOAD_SOURCE,
-         "df3b7bbf30cab87d2e8c1c6dab8819f9cfe592b181407caa7c32af4c5f720cd4",
-         "fa40b2a909d2b067529ab02bd686c61adb8a175063e481d802ad33d308ef49fa"),
-        # Interim versions also applied a post-preparation cutoff to Load.
-        ("113325dd5cffa04626cc7be7ee93bc6e9be67335531288bc329b3542a155c92a",
-         "788f4c8f0b14421d5fc00f8b32c0ffcef79c04c647730767cb44b16584ed4aa4",
-         "4caab6e7a9eb457a5ceddf272112c434a97c101a2c27c3943f8a4155fb71bdb0",
-         "3c8a5f9d0154e7f174b96005258e34c925614fbbd3546e10ffb831616b7f9bdd",
-         "9f8084f595656375f3f32b0cbcdc473a5d69c06909530c1c243ac77e72481c4b",
-         "25a9937e5ce84572a64e26de759f6c97d0fd182b2620aaa91d876a2bf6669eac"),
-    )
-    matches = []
-    shared = fingerprint_key == "shared_workload_fixture_sha256"
-    for manifest in (current, old):
-        raw = manifest.get("config", {})
-        if raw.get("config_version") != 2 or "load_test" not in raw:
-            return False
-        try:
-            resolved = RunConfig.model_validate(raw)
-        except ValidationError:
-            return False
-        fields = _baseline_workload_fields(resolved.checks, shared=shared)
-        if "load_test" not in fields or "multi_user" in fields:
-            return False  # The Multi-user bridge attests the exact Load source.
-        recorded = manifest.get("fixture_pack", {}).get(fingerprint_key)
-        attestations = set()
-        for index, sources in enumerate(families):
-            for revision in revisions:
-                identity = _run_limits_workload_identity(manifest, revision=revision, include_load=True, shared=shared)
-                if identity is None or not any(fixture_hash({**identity, "load_test_source_sha256": source}) == recorded
-                                               for source in sources):
-                    continue
-                # The generator and Load source are attested by the family.
-                # Specialist sources and settings must still match exactly.
-                del identity["generator_source_sha256"]
-                attestations.add((index, fixture_hash(identity)))
-        if not attestations:
-            return False
-        matches.append(attestations)
-    return bool(matches[0] & matches[1])
-
-
-def _with_legacy_shared_workload(manifest: dict) -> dict:
-    """Recover the shared fingerprint only from a verified historical full identity."""
-    pack = manifest["fixture_pack"]
-    config = manifest.get("config", {})
-    if "shared_workload_fixture_sha256" in pack or config.get("config_version") != 2:
-        return manifest
-    checks = config.get("checks")
-    if not isinstance(checks, list) or not all(isinstance(check, str) for check in checks):
-        return manifest
-    gateways = SHARED_BASELINE_EXCLUDED_WORKLOADS.intersection(checks)
-    if (not gateways or not gateways <= {"gateway_access", "gateway_attribution"}
-            or ("gateway_attribution" in gateways and config.get("gateway_attribution") is not None)):
-        return manifest
-    shared = _run_limits_workload_identity(manifest, revision="access_conversations",
-                                           include_load="load" in checks, shared=True)
-    if shared is None:
-        return manifest
-    if "load" in checks:
-        shared["load_test_source_sha256"] = _COMPANION_LOAD_SOURCE
-    full = {**shared, "settings": {**shared["settings"], **{check: config.get(check) for check in gateways}}}
-    if any(full["settings"].values()):
-        full["generator_source_sha256"] = _ACCESS_CONVERSATION_SOURCE
-    if "gateway_access" in gateways:
-        if "gateway_access" not in config:
-            return manifest
-        # 2099543e recorded the module only in the full hash. 08f99814 also
-        # attested the combined access and response source in the manifest.
-        source = manifest.get("gateway_access_source_sha256")
-        if source is None:
-            source = "4417c0111cd71cf6e40b0e3a730f8b6acf7bbfa6badcae05639012e3722e5939"
-        elif source != "a2589b46b16ae2c103aec0acf9cf94d9fcc10907b6c339a30820df4e9d4bbf27":
-            return manifest
-        full["gateway_access_source_sha256"] = source
-    if fixture_hash(full) != pack.get("workload_fixture_sha256"):
-        return manifest
-    return {**manifest, "fixture_pack": {**pack, "shared_workload_fixture_sha256": fixture_hash(shared)}}
 
 
 def _mixed_gateway_run(report: RunReport) -> bool:
@@ -609,6 +267,10 @@ def _limits_reached(report: RunReport) -> set[str]:
         if report.observations.get("duration_limit_scope") == "gateway":
             reached.discard("max_duration_seconds")
     return reached
+
+
+def _is_workload_digest(value: Any) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
 
 
 def _settings_reasons(report: RunReport, baseline: RunReport, *, details: dict[str, dict[str, Any]] | None = None) -> list[str]:
@@ -836,35 +498,30 @@ def _settings_reasons(report: RunReport, baseline: RunReport, *, details: dict[s
         if shared_selection_changed and pack_only:
             inactive.add("builtin_sha256")  # Both runs used only the recorded request pack for shared work.
         fingerprint_key = "workload_fixture_sha256"
-        full = current_pack.get(fingerprint_key)
-        full_match = isinstance(full, str) and bool(full) and full == old_pack.get(fingerprint_key)
-        sources = (report.manifest, baseline.manifest)
-        if shared_selection_changed or not full_match:
-            sources = tuple(_with_legacy_shared_workload(source) for source in sources)
-            current_pack, old_pack = (source["fixture_pack"] for source in sources)
         if shared_selection_changed:
             # A full digest attests shared work only when no excluded check
             # was selected in that run.
             current_pack, old_pack = (
                 pack if excluded else {**pack, shared_key: pack.get(fingerprint_key)}
                 for pack, excluded in zip((current_pack, old_pack), excluded_checks))
-            sources = tuple({**source, "fixture_pack": pack}
-                            for source, pack in zip(sources, (current_pack, old_pack)))
-        shared_digests = [pack.get(shared_key) for pack in (current_pack, old_pack)]
-        use_shared = all(isinstance(digest, str) and digest and (
-            not shared_selection_changed or re.fullmatch(r"[0-9a-f]{64}", digest)) for digest in shared_digests)
-        has_identity = use_shared or not shared_selection_changed
-        # Older reports attest the full identity only. Keep their existing
-        # compatibility when those recorded identities still match.
-        if use_shared and (shared_selection_changed or not full_match):
-            fingerprint_key = shared_key
-            current_pack, old_pack = ({**pack, "workload_fixture_sha256": pack[fingerprint_key]}
+            shared_digests = [pack.get(shared_key) for pack in (current_pack, old_pack)]
+            has_identity = all(_is_workload_digest(digest) for digest in shared_digests)
+            current_pack, old_pack = ({**pack, fingerprint_key: pack.get(shared_key)}
                                       for pack in (current_pack, old_pack))
-        same_load = has_identity and _same_load_workload(*sources, fingerprint_key=fingerprint_key)
-        if has_identity and (_same_run_limits_workload(*sources, fingerprint_key=fingerprint_key) or same_load):
-            inactive.add("workload_fixture_sha256")
-        if same_load and all(set(config.get("checks", [])) == {"load"} and not config.get("restart_target")
-                             for config in (current_config, old_config)):
+        else:
+            has_identity = all(_is_workload_digest(pack.get(fingerprint_key))
+                               for pack in (current_pack, old_pack))
+            full_match = has_identity and current_pack[fingerprint_key] == old_pack[fingerprint_key]
+            if has_identity and not full_match and all(
+                _is_workload_digest(pack.get(shared_key))
+                for pack in (current_pack, old_pack)
+            ):
+                has_identity = True
+                current_pack, old_pack = ({**pack, fingerprint_key: pack[shared_key]}
+                                          for pack in (current_pack, old_pack))
+        fingerprint_match = has_identity and current_pack.get(fingerprint_key) == old_pack.get(fingerprint_key)
+        if fingerprint_match and all(set(config.get("checks", [])) == {"load"} and not config.get("restart_target")
+                                     for config in (current_config, old_config)):
             # Generated Load owns its prompts and caps. Its attested identity
             # covers those requests; without restart readiness, built-ins were
             # never sent. Do not infer absence from retention-filtered records.
@@ -1128,6 +785,12 @@ _LOAD_POINT_FIELDS = ("source", "type", "workload", "shape", "pattern", "level",
 def _load_work_comparison(current, old, *, compare_stream_options=True):
     if not current or not old:
         return "Request samples are absent from one run.", False
+    modes = [{point.get("interference_mode") or "long_input_during_short"
+              for record in records if (point := record.load_point or {}).get("pattern") == "interference"
+              or point.get("type") == "interference" or point.get("interference_mode") is not None}
+             for records in (current, old)]
+    if modes[0] != modes[1]:
+        return "Interference modes differ.", False
     cohorts = []
     for records in (current, old):
         groups = defaultdict(list)
@@ -2637,15 +2300,10 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                         or (uses_tls and config.get("ca_bundle") != old_config.get("ca_bundle"))):
                     access_reasons.append("Gateway access transport settings differ.")
                 else:
-                    source = report.manifest.get("gateway_access_source_sha256")
-                    old_source = baseline.manifest.get("gateway_access_source_sha256")
-                    if not source or not old_source:
-                        # Earlier access reports attested the probe source in the raw workload hash.
-                        source, old_source = (
-                            pack.get("workload_fixture_sha256") if isinstance(pack, dict) else None
-                            for pack in (report.manifest.get("fixture_pack"), baseline.manifest.get("fixture_pack")))
-                    if not isinstance(source, str) or not source or source != old_source:
-                        access_reasons.append("Gateway access source identity differs or is missing. Rerun the access check and baseline.")
+                    version = report.manifest.get("gateway_access_workload_version")
+                    old_version = baseline.manifest.get("gateway_access_workload_version")
+                    if type(version) is not int or type(old_version) is not int or version != old_version:
+                        access_reasons.append("Gateway access workload version differs or is missing. Rerun the access check and baseline.")
             if access_settings is not None:
                 rows.extend(_compare_gateway_access(current_access, old_access,
                                                     [case.model_dump() for case in access_settings.cases],
@@ -2674,15 +2332,10 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
             outcomes_match = all(len(users) == len(identities)
                                  and {user.get("identity") for user in users} == identities
                                  for users in (current_users, old_users))
-            source = report.manifest.get("gateway_policy_source_sha256")
-            old_source = baseline.manifest.get("gateway_policy_source_sha256")
-            if not target_reasons and (not source or not old_source):
-                # Earlier policy reports attested their source in the full workload identity.
-                source = report.manifest["fixture_pack"].get("workload_fixture_sha256")
-                old_source = baseline.manifest["fixture_pack"].get("workload_fixture_sha256")
+            version = report.manifest.get("gateway_policy_workload_version")
+            old_version = baseline.manifest.get("gateway_policy_workload_version")
             compatible = (not target_reasons and refs_match and outcomes_match
-                          and isinstance(source, str) and bool(source)
-                          and source == old_source
+                          and type(version) is int and type(old_version) is int and version == old_version
                           and current_policy.get("version") == old_policy.get("version") == POLICY_VERSION
                           and settings == old_settings
                           and settings.model_dump(mode="json") == current_policy.get("settings") == old_policy.get("settings")
@@ -2753,7 +2406,8 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                 load_point = ({field: point_records[0].load_point.get(field) for field in (*_LOAD_POINT_FIELDS, "point_id")}
                               if check == "load" and point_records else None)
                 if load_point and load_point["pattern"] == "interference":
-                    load_point.update({field: point_records[0].load_point.get(field) for field in ("phase", "role")})
+                    load_point.update({field: point_records[0].load_point.get(field)
+                                       for field in ("phase", "role", "interference_mode")})
                 # Requested shape is checked too, rather than relying on configuration alone.
                 def shapes(records: list[RequestRecord]) -> dict[tuple, Fraction]:
                     counts = Counter((r.fixture_id, r.input_chars, r.requested_max_tokens, r.stream)
@@ -3754,7 +3408,9 @@ def _comparison_load_label(point):
     from .load_test import LOAD_TITLES
 
     shape, pattern = point.get("shape") or point.get("workload"), point.get("pattern")
-    label = load_shape_label(shape) if shape in SHAPES else LOAD_TITLES.get(point.get("type"), str(shape))
+    short_during_long = point.get("interference_mode") == "short_during_long"
+    label = ("Short request during an active long answer" if short_during_long else
+             load_shape_label(shape) if shape in SHAPES else LOAD_TITLES.get(point.get("type"), str(shape)))
     traffic = {"constant": "constant arrivals", "poisson": "Poisson arrivals", "bursts": "bursts",
                "interference": "short-answer comparison"}.get(pattern, str(pattern))
     if pattern == "concurrent":
@@ -3767,7 +3423,11 @@ def _comparison_load_label(point):
     if point.get("source") and point["source"] != "primary":
         label += " · " + point["source"].replace("_", " ").capitalize()
     if pattern == "interference":
-        phase = "Long-input probe" if point.get("role") == "probe" else {"baseline": "Short-only control", "probe": "During long-input probe"}.get(point.get("phase"))
+        if short_during_long:
+            phase = ("Long-answer background" if point.get("role") == "long_stream" else
+                     {"baseline": "Short-only control", "probe": "During a long answer"}.get(point.get("phase")))
+        else:
+            phase = "Long-input probe" if point.get("role") == "probe" else {"baseline": "Short-only control", "probe": "During long-input probe"}.get(point.get("phase"))
         if phase:
             label += " · " + phase
     return label
@@ -4525,6 +4185,8 @@ def _render(report: RunReport) -> str:
              f"<title>Giraffe — {_e(report.run_id)}</title>", '<style>' + STYLE + _COMPARISON_SUMMARY_STYLE + '.load-acceptance-export{max-width:100%;overflow-x:auto}.load-acceptance-export table{min-width:760px}.load-acceptance-export th:nth-child(2),.load-acceptance-export th:nth-child(3),.load-acceptance-export td:nth-child(2),.load-acceptance-export td:nth-child(3){white-space:nowrap;min-width:140px}.load-acceptance-export small{display:block;white-space:normal}' + '</style><main>',  f"<h1>{_e(verdict)}</h1>",
              f'<p class="muted">Run {_e(report.run_id)} · suite {_e(report.suite_version)}<br>'
              f'{_e(report.started_at)} → {_e(report.finished_at)}</p>']
+    for warning in report.manifest.get("config_migration_warnings", []):
+        parts.append(f'<p><strong>Warning:</strong> {_e(warning["msg"])}</p>')
     for summary in disconnected.values():
         parts.append(f'<p class="card"><strong>{_e(summary)}</strong></p>')
     if report.abort_reason:
@@ -4721,7 +4383,15 @@ def _render(report: RunReport) -> str:
                 parts.append(f'<p><strong>{label}:</strong> {_e(row.get("state", "unknown"))} · '
                              f'{_e(row.get("source") or "No runtime source")} · {_e(row.get("collected_at") or "Not observed")} · '
                              f'{_e(row.get("scope", "unknown"))}</p>')
-        parts.append(f'<h3>{_e(name)}</h3><details><summary>Deployment snapshot and unknowns</summary>'
+        parts.append(f'<h3>{_e(name)}</h3>')
+        probe = next((row for row in report.conditions if row.get("target") == name
+                      and row.get("condition_id") == "performance_evidence_probe"), None)
+        if probe:
+            passed = probe.get("status") == "passed"
+            reason = probe.get("reason") or observation.get("token_evidence", {}).get("reason", "")
+            parts.append(f'<p class="{"muted" if passed else "inconclusive"}">Streamed token and usage support: '
+                         f'{"Passed" if passed else "Inconclusive"} — {_e(reason)}</p>')
+        parts.append('<details><summary>Deployment snapshot and unknowns</summary>'
                      f'<pre>{_json(observation.get("deployment"))}</pre></details>'
                      f'<details><summary>Deployment observations during the run</summary>'
                      f'<pre>{_json(observation.get("deployment_history", []))}</pre></details>'
@@ -4741,8 +4411,12 @@ def _render(report: RunReport) -> str:
                      f' · {_number(record.elapsed_ms)} ms</summary>'
                      f'<p>Request {_e(record.id)} · scored: {_e(record.score)} · '
                      f'valid completion: {_e(record.valid)} · output characters: {record.output_chars}</p>')
-        if record.error or record.score_message:
-            parts.append(f'<p>{_e(record.error or "")} {_e(record.score_message or "")}</p>')
+        score_message = record.score_message
+        if (score_message == "No semantic scorer." and record.evaluation
+                and record.evaluation.scorer == "none" and record.evaluation.tool_expectation is None):
+            score_message = None
+        if record.error or score_message:
+            parts.append(f'<p>{_e(record.error or "")} {_e(score_message or "")}</p>')
         if record.evaluation:
             evidence = record.evaluation
             messages_key = sha256(json.dumps(evidence.messages, ensure_ascii=False, sort_keys=True).encode()).digest()

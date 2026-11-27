@@ -184,7 +184,7 @@ assert.match(html,/Large-input stress at 4 concurrent requests/);assert.match(ht
 async def test_null_legacy_blocks_are_absent_without_notes(key, checks, tmp_path):
     source={'targets':[TARGET], 'checks':checks, key:None,
             'max_requests':None, 'max_duration_seconds':None, 'concurrency':None}
-    migrated,notes=migrate_load_test(migrate_concurrent_load(source)[0])
+    migrated,notes, warnings=migrate_load_test(migrate_concurrent_load(source)[0])
     assert bool(notes) == ('concurrency' in checks)
     assert key not in migrated
     assert ConfigDraft.model_validate(migrated).checks == migrated["checks"]

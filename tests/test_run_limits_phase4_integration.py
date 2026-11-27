@@ -167,5 +167,5 @@ def test_cli_announces_time_coverage_and_estimate_risk_without_changing_budget(t
     captured = capsys.readouterr()
     assert "Incomplete coverage" in captured.out + captured.err
     assert "Load test" in captured.out + captured.err
-    assert "estimated traffic duration may exceed" in captured.out + captured.err
+    assert "configured test schedule already exceeds" in captured.out + captured.err
     assert json.loads(path.read_text())["max_duration_seconds"] == 5

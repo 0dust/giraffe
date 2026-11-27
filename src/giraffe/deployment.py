@@ -317,6 +317,29 @@ ENGINE_DISCOVERY_ROUTES = {
 }
 
 
+def _models_context_limit(info, model):
+    """Read only the requested model's positive integer context limit."""
+    if not isinstance(info, dict) or not isinstance(info.get("data"), list):
+        raise ValueError("invalid model list")
+    for item in info["data"]:
+        if isinstance(item, dict) and item.get("id") == model:
+            value = item.get("max_model_len")
+            if type(value) is int and value > 0:
+                return value
+    return None
+
+
+def _vllm_models_metadata(info, model):
+    """Select the served model and context window; model paths stay private."""
+    value = _models_context_limit(info, model)
+    reported = {"model": {}, "serving": {}}
+    if any(isinstance(item, dict) and item.get("id") == model for item in info["data"]):
+        reported["model"]["served"] = model
+    if value is not None:
+        reported["serving"]["context_limit"] = value
+    return reported
+
+
 def _engine_metadata(engine, info, model):
     """Select documented fields; model paths and arbitrary server settings stay private."""
     if not isinstance(info, dict):
@@ -364,6 +387,71 @@ def _engine_metadata(engine, info, model):
             if type(info.get(key)) is int and info[key] > 0
         }
     return reported
+
+
+async def probe_context_window(target, config, timeout=6, *, detail=False):
+    from giraffe.client import _headers, models_url
+
+    errors = (httpx.HTTPError, httpx.InvalidURL, ValueError, TypeError, AttributeError, OSError, TimeoutError)
+    reason = "unavailable"
+    try:
+        async with asyncio.timeout(timeout):
+            client = await asyncio.to_thread(_discovery_client, config, timeout)
+            async with client:
+                client.headers.update(_headers(target))
+                parsed = urlsplit(target.url)
+                origin = urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
+                engine = target.deployment.discovery
+                value, source = None, None
+                try:
+                    if engine in {"llamacpp", "tgi", "sglang"}:
+                        route = "/get_server_info" if engine == "sglang" else ENGINE_DISCOVERY_ROUTES[engine]
+                        info = await _read(client, origin + route)
+                        metadata = (_sglang_metadata(info) if engine == "sglang" else
+                                    _engine_metadata(engine, info, target.model))
+                        value = metadata.get("serving", {}).get("context_limit")
+                        source = engine + " " + route
+                    elif engine == "ollama":
+                        info = await _read(client, origin + "/api/ps")
+                        requested = _ollama_model_name(target.model)
+                        for item in info.get("models", []):
+                            if not isinstance(item, dict):
+                                continue
+                            name = item.get("model", item.get("name"))
+                            if not isinstance(name, str):
+                                continue
+                            try:
+                                normalized = _ollama_model_name(name)
+                            except ValueError:
+                                continue
+                            if normalized == requested:
+                                context = item.get("context_length")
+                                if type(context) is int and context > 0:
+                                    value = context
+                        source = "ollama /api/ps"
+                except errors as exc:
+                    logger.debug("Context window discovery route unavailable: %s", type(exc).__name__)
+                if type(value) is not int or value <= 0:
+                    info = await _read(client, models_url(target.url))
+                    value = _models_context_limit(info, target.model)
+                    source = "/v1/models max_model_len"
+                    reason = "no_window" if value is None else None
+                if value is not None:
+                    entry = {"value": value, "source": source, "collected_at": now()}
+                    return (entry, None) if detail else entry
+    except errors as exc:
+        reason = "unavailable"
+        logger.debug("Context window probe unavailable: %s", type(exc).__name__)
+    return (None, reason) if detail else None
+
+
+async def probe_context_windows(config) -> dict[str, dict]:
+    values = await asyncio.gather(*(probe_context_window(target, config) for target in config.targets),
+                                  return_exceptions=True)
+    for value in values:
+        if isinstance(value, BaseException):
+            logger.debug("Context window probe unavailable: %s", type(value).__name__)
+    return {target.name: value for target, value in zip(config.targets, values) if isinstance(value, dict)}
 
 
 def unknown_residency(target, reason):
@@ -494,7 +582,7 @@ def _lifecycle_snapshot(payload, target, run_start, start, end, wall_start, wall
 
 async def snapshot(target, config, deadline, stop, *, run_start=None):
     import time
-    from giraffe.client import _headers
+    from giraffe.client import _headers, models_url
 
     deployment = target.deployment
     lifecycle_enabled = scale_down_enabled(target, config)
@@ -567,7 +655,7 @@ async def snapshot(target, config, deadline, stop, *, run_start=None):
     )
     if deployment.discovery == "none" and not deployment.collector_url:
         result["discovery"].append({"status": "not_enabled"})
-        return result
+        return _finish_snapshot(result, target, config)
     parsed = urlsplit(target.url)
     origin = urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
     remaining = min(config.metrics_timeout_seconds, deadline - time.monotonic())
@@ -575,9 +663,9 @@ async def snapshot(target, config, deadline, stop, *, run_start=None):
         if lifecycle_enabled:
             result["scale_down_limitations"] = ["Run stopped before lifecycle collection."]
         result["discovery"].append({"status": "run_stopped"})
-        return result
+        return _finish_snapshot(result, target, config)
     try:
-        async with asyncio.timeout(remaining):
+        async with asyncio.timeout(remaining) as budget:
             client = await asyncio.to_thread(_discovery_client, config, remaining)
             async with client:
                 reported = {}
@@ -647,6 +735,18 @@ async def snapshot(target, config, deadline, stop, *, run_start=None):
                         result["discovery"].append(
                             {"status": "available", "source": "vllm /version"}
                         )
+                        try:
+                            remaining_models = budget.when() - asyncio.get_running_loop().time()
+                            async with asyncio.timeout(min(3, max(0, remaining_models / 2))):
+                                info = await _read(client, models_url(target.url))
+                            reported.update(_vllm_models_metadata(info, target.model))
+                            result["discovery"].append(
+                                {"status": "available", "source": "vllm /v1/models"}
+                            )
+                        except (httpx.HTTPError, httpx.InvalidURL, ValueError, TypeError, AttributeError, TimeoutError):
+                            result["discovery"].append(
+                                {"status": "unavailable", "source": "vllm /v1/models"}
+                            )
                     for category, values in reported.items():
                         for key, value in values.items():
                             if value is not None:
@@ -693,6 +793,16 @@ async def snapshot(target, config, deadline, stop, *, run_start=None):
         if lifecycle_enabled and "scale_down_lifecycle" not in result:
             result.setdefault("scale_down_limitations", [
                 "Lifecycle collection unavailable, invalid, oversized, or timed out."])
+    return _finish_snapshot(result, target, config)
+
+
+def _finish_snapshot(result, target, config):
+    entry = getattr(config, "_preflight_context_windows", {}).get(target.name)
+    if entry and "reported" not in result["fields"].get("serving.context_limit", {}):
+        source = "preflight " + entry["source"]
+        result["fields"].setdefault("serving.context_limit", {})["reported"] = _fact(
+            entry["value"], source, target.deployment.scope, entry["collected_at"])
+        result["discovery"].append({"status": "available", "source": source})
     for row in result["fields"].values():
         if (
             "configured" in row

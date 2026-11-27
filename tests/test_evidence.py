@@ -48,15 +48,18 @@ def test_recover_finished_records_before_runner_finalizes(tmp_path):
 @pytest.mark.parametrize("retention,expected", [("all", "sensitive answer"), ("none", ""), ("failures", "")])
 def test_evidence_applies_retention_and_snapshots_pre_judging_record(tmp_path, retention, expected):
     writer = EvidenceWriter(tmp_path, {"config": {"retention": retention}})
-    finished = record()
+    finished = record().model_copy(update={"refused": True})
     writer.record_finished(finished)
     finished.score = False
     finished.output = "changed by judging"
     writer.close()
     report = recover_evidence(tmp_path, {})
+    assert report.requests[0].refused is True
     assert report.requests[0].score is None
     assert report.requests[0].output == expected
     assert (tmp_path / "evidence.jsonl").stat().st_mode & 0o777 == 0o600
+    saved, _ = write_report(report, tmp_path)
+    assert RunReport.model_validate_json(saved.read_bytes()).requests[0].refused is True
 
 
 def test_evidence_fsync_is_on_writer_thread_and_happens_without_close(tmp_path, monkeypatch):
@@ -356,3 +359,23 @@ def test_heartbeat_close_is_bounded_when_metadata_write_stalls(tmp_path, monkeyp
         release.set()
         heartbeat._thread.join(timeout=2)
     assert not heartbeat._thread.is_alive()
+
+
+def test_recovered_timeout_warning_uses_latest_update_once(tmp_path):
+    from giraffe.timeout_warning import format_timeout_warning
+
+    payload = {"key": "local|2.0|run", "target": "local", "deadline_seconds": 2,
+        "deadline_source": "run", "setting": "request_timeout_seconds", "cli_flag": "--request-timeout",
+        "finished": 3, "timed_out": 3, "answer_started": 0, "reasoning_only": 0, "no_output": 3,
+        "checks": ["correctness"], "first_at_seconds": 2, "updated_at_seconds": 2, "update": 1}
+    latest = {**payload, "finished": 10, "timed_out": 6, "no_output": 6, "updated_at_seconds": 4, "update": 2}
+    writer = EvidenceWriter(tmp_path, {"config": {"retention": "all"}})
+    writer.record_finished(record())
+    for warning in (payload, latest, latest):
+        writer.progress({"event": "timeout_warning", "target": "local", "timeout_warning": warning})
+    writer.close()
+    recovered = recover_evidence(tmp_path, {})
+    assert len(recovered.requests) == 1
+    assert recovered.observations["targets"]["local"]["timeout_warnings"] == [latest]
+    assert recovered.warnings.count(format_timeout_warning(latest)) == 1
+    assert format_timeout_warning(payload) not in recovered.warnings

@@ -85,6 +85,24 @@ for(const mode of ['keyboard','pointer']){
 """, dom=True)
 
 
+def test_open_field_help_stays_anchored_when_live_updates_move_its_button():
+    run_render_checks(r"""
+state.detail={id:'help',state:'running',config:{targets:[]},scale_down_control:{target:'local',phase:'armed'}};
+renderDetail();
+const help=$('#field-scale_down_control_help-help'),trigger=$('#field-scale_down_control_help-info');
+let top=200;trigger.getBoundingClientRect=()=>({left:500,top,bottom:top+16,width:16,height:16});
+help.getBoundingClientRect=()=>({height:120});help.showPopover();
+listeners.toggle({target:help,newState:'open'});assert.equal(help.style.left,'500px');assert.equal(help.style.top,'224px');
+// The next snapshot retains the open popup but changes the layout above it.
+help.setAttribute('style','width: 360px; left: 500px; top: 224px;');
+top=300;state.detail.progress={completed:2};renderDetail();
+assert.equal($('#field-scale_down_control_help-help'),help);assert(help.matches(':popover-open'));
+assert.equal(help.style.left,'500px');assert.equal(help.style.top,'324px');
+top=700;renderDetail();assert.equal(help.style.top,'572px','Flip above the trigger near the viewport bottom');
+help.hidePopover();top=100;renderDetail();assert.equal(help.style.top,'572px','Do not position closed help');
+""", dom=True)
+
+
 def test_dialog_status_click_does_not_reopen_and_identity_updates_with_badge():
     run_render_checks(r"""
 (async()=>{

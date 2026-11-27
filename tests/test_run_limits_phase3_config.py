@@ -175,20 +175,6 @@ def test_old_effective_check_manifest_acquires_only_new_request_defaults():
     assert "samples" not in _comparison_manifest(old)["effective_checks"]["generation"]
 
 
-def test_phase2_workload_source_bridge_requires_exact_attested_generator():
-    from giraffe.deployment import fixture_hash
-    from giraffe.reporting import _run_limits_workload_identity, _same_run_limits_workload
-
-    configured = config(checks=["arrivals"], arrivals={"requests": 10})
-    current = {"config": configured.model_dump()}
-    old = {"config": configured.model_dump()}
-    for manifest, revision in ((current, "phase3"), (old, "phase2")):
-        identity = _run_limits_workload_identity(manifest, revision=revision)
-        manifest["fixture_pack"] = {"workload_fixture_sha256": fixture_hash(identity)}
-    assert _same_run_limits_workload(current, old)
-    identity["generator_source_sha256"] = "unknown-generator"
-    old["fixture_pack"]["workload_fixture_sha256"] = fixture_hash(identity)
-    assert not _same_run_limits_workload(current, old)
 
 
 def test_prefix_plan_reserves_the_configured_output_budget_within_its_context_window():
@@ -241,7 +227,7 @@ def test_load_migration_preserves_current_timeout_while_noting_only_legacy_overr
               "test_options": {"concurrency": {"request_timeout_seconds": 90, "samples": 9}}}
     if legacy:
         values["buckets"] = {"levels": [1, 2]}
-    migrated, notes = migrate_concurrent_load(values)
+    migrated, notes, warnings = migrate_concurrent_load(values)
     assert migrated["test_options"]["concurrency"] == {"request_timeout_seconds": 90}
     assert values["test_options"]["concurrency"] == {"request_timeout_seconds": 90, "samples": 9}
     assert any("test_options.concurrency.samples=9 dropped" in note for note in notes)

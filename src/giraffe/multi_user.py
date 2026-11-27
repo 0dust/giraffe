@@ -11,6 +11,8 @@ from collections import Counter
 from copy import deepcopy
 from fractions import Fraction
 
+from giraffe import concurrent_load
+from giraffe import states
 from giraffe.concurrent_load import OutputProgress, calibrate
 from giraffe.load_test import _shape_sources, build_spec
 from giraffe.models import (
@@ -57,7 +59,7 @@ def _matched_work_sha256(spec, *, nonce=None):
     if nonce and messages:
         first = messages[0]
         content = first.get("content")
-        prefix = f"Request {nonce}."
+        prefix = concurrent_load.nonce_prefix(nonce)
         # Remove only the generated cache-busting prefix from the identity.
         if isinstance(content, str) and content.startswith(prefix):
             messages = [{**first, "content": content[len(prefix):]}, *messages[1:]]
@@ -350,7 +352,7 @@ async def run_window(run, target, client, settings, load_settings, calibration, 
                 close(reason or run.stop_reason(target.name) or "target request allowance exhausted")
                 break
             if time.monotonic() >= cutoff:
-                close("maximum run duration reached" if cutoff < intended_end else None)
+                close(states.STOP_MAX_DURATION if cutoff < intended_end else None)
                 break
             done, pending = await asyncio.wait(pending, timeout=min(.025, cutoff-time.monotonic()),
                                                return_when=asyncio.FIRST_COMPLETED)
@@ -358,7 +360,7 @@ async def run_window(run, target, client, settings, load_settings, calibration, 
                 task.result()
         close(run.stop_reason(target.name))
         reason = run.stop_reason(target.name)
-        if reason and reason != "maximum request budget reached":
+        if reason and reason != states.STOP_REQUEST_BUDGET:
             for task in tasks:
                 task.cancel()
         await asyncio.gather(*tasks)
@@ -527,7 +529,7 @@ async def run_arrival_window(run, target, client, settings, load_settings, calib
 
     def stop():
         reason = run.stop_reason(target.name)
-        return None if reason == "maximum request budget reached" else reason
+        return None if reason == states.STOP_REQUEST_BUDGET else reason
 
     run.start_condition(target.name, window["id"], planned=len(offers))
     window.update(start_ms=_relative(run), end_ms=_relative(run)+window["planned_duration_seconds"]*1000,

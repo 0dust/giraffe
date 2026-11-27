@@ -10,6 +10,7 @@ from functools import cached_property
 import math
 import re
 from typing import Annotated, Any, Literal, get_args, get_origin
+from typing_extensions import TypedDict
 
 from pydantic_core import PydanticCustomError
 from pydantic import BeforeValidator, TypeAdapter, ValidationError, StrictInt, field_validator, BaseModel, ConfigDict, Field, PrivateAttr, SecretStr, StrictBool, ValidationInfo, field_serializer, model_serializer, model_validator
@@ -27,26 +28,26 @@ from .caps import (MAX_SIMULTANEOUS_REQUESTS, MAX_ARRIVAL_REQUESTS, MAX_BURST_SI
 Status = Literal["pass", "fail", "inconclusive", "skipped", "blocked"]
 # Public display names have one source; compatibility imports share this object.
 CHECK_NAMES = {
-    "access": "Endpoint access",
+    "access": "Endpoint response",
     "serving": "Response validity",
-    "first_output": "Time to first answer",
-    "generation": "Generation speed",
+    "first_output": "First answer",
+    "generation": "Generation",
     "load": "Load test",
     "scale_down": "Scale-down continuity",
-    "context": "Long-context recall",
+    "context": "Context recall",
     "correctness": "Answer correctness",
     "json": "JSON correctness",
-    "cancellation": "Cancellation & limits",
+    "cancellation": "Cancellation & timeouts",
     "recovery": "Recovery after load",
     "gpu": "GPU metrics",
-    "prefix": "Prefix cache",
-    "sessions": "Multi-turn sessions",
+    "prefix": "Prompt cache evidence",
+    "sessions": "Concurrent conversations",
     "multi_user": "Multi-user",
     "gateway_access": "Gateway access policy",
     "gateway_policy": "Gateway quotas & priorities",
     "gateway_attribution": "Gateway usage attribution",
     "consistency": "Answer consistency",
-    "tools": "Tool calling",
+    "tools": "Tool-call correctness",
 }
 CATALOGUE_NAMES = INTERNAL_CHECK_NAMES = CHECK_NAMES
 # These checks compare their own declared workload and evidence.
@@ -331,6 +332,7 @@ class MixedTraffic(Model):
 
 class StreamInterference(Model):
     enabled: bool = False
+    mode: Literal["long_input_during_short", "short_during_long"] = "long_input_during_short"
     trigger: Literal["streaming_started", "after_five_chunks"] = "streaming_started"
     max_slowdown: float = Field(default=1.5, gt=1)
 
@@ -507,24 +509,76 @@ def _validated_migration_input(value):
     return {**value, **validated}
 
 
+class MigrationWarning(TypedDict):
+    msg: str
+    removed_check: str | None
+
+
+def merge_migration_warnings(*groups: list[MigrationWarning]) -> list[MigrationWarning]:
+    result = []
+    for group in groups:
+        for warning in group:
+            if warning not in result:
+                result.append(warning)
+    return result
+
+
+def _finish_migration_warnings(value: dict, warnings: list[MigrationWarning]) -> list[MigrationWarning]:
+    names = list(dict.fromkeys(CHECK_NAMES.get("load" if check in {"concurrency", "capacity", "arrivals"} else check, check) for check in value.get("checks", [])))
+    remaining = " and ".join([", ".join(names[:-1]), names[-1]]) if len(names) > 1 else "".join(names)
+    for warning in warnings:
+        if warning["removed_check"] and remaining:
+            warning["msg"] += f" Only {remaining} will run."
+    return warnings
+
+
+def migrate_removed_restart_script(value):
+    """Drop removed script settings without turning saved data into commands."""
+    if not isinstance(value, dict):
+        return value, []
+    targets = value.get("targets")
+    if "restart_script_timeout_seconds" not in value and not (
+        isinstance(targets, list) and any(
+            isinstance(target, dict) and "restart_script" in target for target in targets
+        )
+    ):
+        return value, []
+    value = deepcopy(value)
+    value.pop("restart_script_timeout_seconds", None)
+    notes = []
+    targets = value.get("targets")
+    for index, target in enumerate(targets if isinstance(targets, list) else []):
+        if not isinstance(target, dict) or "restart_script" not in target:
+            continue
+        script = target.pop("restart_script")
+        if isinstance(script, str) and script:
+            name = target.get("name")
+            if not isinstance(name, str):
+                name = f"#{index + 1}"
+            notes.append(f"Endpoint {name}: restart_script ({script}) is no longer supported and was removed. To use cold start, set restart_command for this endpoint.")
+    if not notes:
+        notes.append("Removed restart_script settings saved by an earlier Giraffe build; this version does not use them.")
+    return value, notes
+
+
 def migrate_load_test(value):
     """Preserve legacy traffic as separate tests and explain changed semantics."""
     value = _validated_migration_input(value)
     if not isinstance(value, dict):
-        return value, []
+        return value, [], []
     value = deepcopy(value)
-    notes = []
+    notes, warnings, earlier_warnings = [], [], []
     old_checks = list(value.get("checks", []))
     older = {"fairness", "buckets", "mixed", "token_stress"}.intersection(old_checks)
     if older or value.get("concurrent_workloads") is not None or value.get("buckets") is not None:
-        value, earlier_notes = migrate_concurrent_load(value)
+        value, earlier_notes, earlier_warnings = migrate_concurrent_load(value)
         notes.extend(earlier_notes)
         old_checks = list(value.get("checks", []))
     selected = [c for c in old_checks if c in {"concurrency", "capacity", "arrivals"}]
     if "checks" not in value and value.get("arrivals"):
         selected.append("arrivals")
     if not selected:
-        return value, notes
+        return value, notes, merge_migration_warnings(earlier_warnings, _finish_migration_warnings(value, warnings))
     converted = []
     options = value.get("test_options") or {}
     def plain(v):
@@ -568,9 +622,17 @@ def migrate_load_test(value):
             w["mixed"].update(enabled=old["mixed"]["enabled"], selected=[s for s,v in shares.items() if v > 0], share_mode="custom", shares=shares)
             if w["mixed"]["enabled"] and len(w["mixed"]["selected"]) < 2:
                 w["mixed"]["enabled"] = False
-                notes.append("Legacy one-shape mixed workload disabled; mixed traffic requires at least two request shapes.")
+                warnings.append({"msg": "Legacy one-shape mixed workload disabled; mixed traffic requires at least two request shapes.", "removed_check": None})
             w["interference"].update(enabled=old["interference"]["enabled"], trigger="after_five_chunks" if old["interference"]["trigger"] == "after_chunks" else "streaming_started", max_slowdown=old["interference"]["max_slowdown"] or 1.5)
             w["stress"].update(enabled=old["stress"]["enabled"], cases=(["long_short"] if old["stress"]["large_input"] else []) + (["short_long"] if old["stress"]["large_output"] else []), min_output_percent=old["stress"]["min_output_percent"])
+            if not any(workload["enabled"] for workload in w.values()):
+                if not warnings:
+                    warnings.append({"msg": "Load test won't run: no imported load workload is enabled.", "removed_check": None})
+                old_checks = [c for c in old_checks if c != check]
+                if not any(c in {"load", "capacity", "arrivals"} for c in old_checks):
+                    for warning in warnings:
+                        warning["removed_check"] = "load"
+                continue
             patterns["concurrent"].update(enabled=True, levels=old["schedule"]["levels"])
             if not explicit_levels:
                 patterns["concurrent"].pop("levels", None)
@@ -617,20 +679,21 @@ def migrate_load_test(value):
                 if old_key in limits:
                     settings["pass_criteria"][new_key] = limits[old_key]*100
         converted.append({"source": check, "settings": settings})
-    if "load_test" not in value or "load" not in old_checks:
+    if converted and ("load_test" not in value or "load" not in old_checks):
         value["load_test"] = converted.pop(0)["settings"]
-    if isinstance(value["load_test"], BaseModel):
+    if isinstance(value.get("load_test"), BaseModel):
         value["load_test"] = value["load_test"].model_dump()
     if converted:
         value["load_test"].setdefault("migrated_tests", []).extend(converted)
         notes.append("Multiple saved checks remain separate sequential tests in load_test.migrated_tests; their rates, durations and burst schedules are not blended.")
-    value["checks"] = list(dict.fromkeys("load" if c in {"concurrency", "capacity", "arrivals"} else c for c in old_checks)) if old_checks else list(_LEGACY_DEFAULT_CHECKS)
+    value["checks"] = (list(dict.fromkeys("load" if c in {"concurrency", "capacity", "arrivals"} else c for c in old_checks))
+                       if old_checks or "checks" in value else list(_LEGACY_DEFAULT_CHECKS))
     value.pop("concurrent_load", None)
     value.pop("traffic", None)
     value.pop("arrivals", None)
     if options:
         value["test_options"] = {k:v for k,v in options.items() if k not in {"concurrency", "capacity", "arrivals"}}
-    return value, notes
+    return value, notes, merge_migration_warnings(earlier_warnings, _finish_migration_warnings(value, warnings))
 
 
 class _LegacyBuckets(Model):
@@ -697,14 +760,31 @@ class _LegacyLoadInput(Model):
     concurrent_workloads: _LegacyConcurrentWorkloads | None = None
 
 
+# Current RunConfig field names (including aliases; currently none) minus the
+# RunConfig fields at 27138490^, before migrate_run_limits was introduced.
+_V2_ONLY_CONFIG_KEYS = frozenset({
+    "config_version", "default_concurrency", "gateway_access", "gateway_attribution",
+    "gateway_policy", "legacy_custom_fixture_max_output_tokens", "load_test",
+    "multi_user", "scale_down",
+})
+
+
 def is_legacy_config(value) -> bool:
     """Only saved inputs without any v2-only setting need compatibility migration."""
-    if not isinstance(value, dict) or {"config_version", "default_concurrency"}.intersection(value):
+    if not isinstance(value, dict) or _V2_ONLY_CONFIG_KEYS.intersection(value):
         return False
     arrivals = value.get("arrivals")
     if isinstance(arrivals, BaseModel):
         return "max_in_flight" not in arrivals.model_fields_set
     return not isinstance(arrivals, dict) or "max_in_flight" not in arrivals
+
+
+class RunLimitsNote(str):
+    """The visible combined limits note; other migration strings are conversion details."""
+
+
+def migration_limit_notes(notes: list[str]) -> list[str]:
+    return [note for note in notes if isinstance(note, RunLimitsNote)]
 
 
 def migrate_run_limits(value):
@@ -725,14 +805,21 @@ def migrate_run_limits(value):
                       if value.get(field) is not None and (field != "tool_calling" or value[field]))
         value["checks"] = list(dict.fromkeys(checks))
     descriptions = {
-        "max_requests": ("300 requests", "a request limit", "Maximum requests"),
-        "max_duration_seconds": ("300 seconds", "a traffic time limit", "Maximum duration"),
-        "concurrency": ("4 requests at once", "a simultaneous-request limit", "Simultaneous limit"),
+        "max_requests": "300 requests",
+        "max_duration_seconds": "300 s of traffic",
+        "concurrency": "4 requests at once",
     }
-    for field, (old, label, control) in descriptions.items():
+    missing = []
+    for field, description in descriptions.items():
         if field not in value:
             value[field] = None
-            notes.append(f"Earlier Giraffe versions stopped after {old} by default; this configuration did not set {label}, so none applies now. Enable {control} to keep that bound.")
+            missing.append(description)
+    if missing:
+        parts = missing[0] if len(missing) == 1 else " and ".join([", ".join(missing[:-1]), missing[-1]])
+        ending = ("This configuration doesn't set that limit, so it no longer applies. Use Edit limits to keep it."
+                  if len(missing) == 1 else
+                  "This configuration sets none of these limits, so they no longer apply. Use Edit limits to keep them.")
+        notes.append(RunLimitsNote(f"Earlier Giraffe versions capped runs at {parts} by default. {ending}"))
     if value.get("concurrency") is not None:
         value.setdefault("default_concurrency", value["concurrency"])
         checks = value.get("checks", _LEGACY_DEFAULT_CHECKS)
@@ -910,8 +997,8 @@ def migrate_concurrent_load(value):
     """Convert legacy input without persisting migration metadata in config."""
     value = _validated_migration_input(value)
     if not isinstance(value, dict):
-        return value, []
-    value, notes = deepcopy(value), []
+        return value, [], []
+    value, notes, warnings = deepcopy(value), [], []
     for key in ("concurrent_workloads", "buckets"):
         if value.get(key) is None:
             value.pop(key, None)
@@ -931,7 +1018,7 @@ def migrate_concurrent_load(value):
     legacy = "concurrent_workloads" in value or "buckets" in value or any(c in legacy_checks for c in checks or [])
     options = value.get("test_options") or {}
     if not legacy and "concurrency" not in options:
-        return value, notes
+        return value, notes, warnings
     if value.get("sustained_seconds", 5) is None:
         value["sustained_seconds"] = 5
     old = value.pop("concurrent_workloads", None) or {}
@@ -962,7 +1049,7 @@ def migrate_concurrent_load(value):
                     notes.append(f"test_options.{name}.{key}={setting!r} dropped; Concurrent load uses its own schedule and p95/percent criteria.")
     value["test_options"] = options
     if not legacy:
-        return value, notes
+        return value, notes, warnings
     settings = ConcurrentLoad().model_dump()
     settings["mixed"]["enabled"] = False
     notes.append("Mixed load is new; enable it if wanted")
@@ -978,6 +1065,8 @@ def migrate_concurrent_load(value):
     ceiling = max(1, ceiling // targets) if value.get("overlap_models") else ceiling
     actual_levels = sorted(set(min(ceiling, max(1, int(n))) for n in levels))[:MAX_STAGES] or [1]
     settings["schedule"]["levels"] = actual_levels
+    if actual_levels != levels:
+        warnings.append({"msg": f"Some Load test concurrency levels won't run: imported levels {levels!r} were bounded to {actual_levels!r} by Simultaneous limit.", "removed_check": None})
     if "levels" in old:
         notes.append(f"levels={levels!r} moved to schedule.levels={actual_levels!r} (bounded by Simultaneous limit).")
     settings["combinations"].update(enabled="size_matrix" in scenarios, selected=list(SHAPES))
@@ -988,9 +1077,12 @@ def migrate_concurrent_load(value):
             continue
         enabled = min(actual_levels) >= 2 and value.get("stream", True)
         settings["interference"]["enabled"] |= enabled
-        notes.append(f"{scenario} ran at 2 concurrent requests; interference {'enabled' if enabled else 'left off; enable streaming and use only levels >= 2 to enable it'}.")
+        if enabled:
+            notes.append(f"{scenario} ran at 2 concurrent requests; interference enabled.")
+        else:
+            warnings.append({"msg": f"Load test's {scenario} comparison won't run: enable streaming and use only concurrency levels of at least 2.", "removed_check": None})
         if scenario == "mixed_interference":
-            notes.append("mixed_interference long-input heavy partners map to interference; long-output heavy partners and before-output ordering have no equivalent, so that coverage is dropped.")
+            warnings.append({"msg": "mixed_interference long-input heavy partners map to interference; long-output heavy partners and before-output ordering have no equivalent, so that coverage is dropped.", "removed_check": None})
     cases = old.get("stress_cases", [{"name": "long_input_summary", "input_tokens": 10000, "output_tokens": 50},
                                     {"name": "short_input_long_output", "max_input_tokens": 128, "output_tokens": 10000}])
     if "token_stress" in scenarios:
@@ -1036,16 +1128,16 @@ def migrate_concurrent_load(value):
         selected_shapes = settings["combinations"]["selected"]
         settings["combinations"]["selected"] = [shape for shape in selected_shapes if fits(shape)]
         if settings["combinations"]["enabled"] and len(settings["combinations"]["selected"]) != len(selected_shapes):
-            notes.append(f"Combinations exceeding known server context window {window} were turned off.")
+            warnings.append({"msg": f"Some Load test combinations won't run: they exceed the server's {window:,}-token context window.", "removed_check": None})
             settings["combinations"]["enabled"] = bool(settings["combinations"]["selected"])
         if settings["interference"]["enabled"] and not all(fits(shape) for shape in ("short_short", "long_short")):
             settings["interference"]["enabled"] = False
-            notes.append(f"Interference turned off: profile exceeds known server context window {window}.")
+            warnings.append({"msg": f"Load test's long-request comparison won't run: its request sizes exceed the server's {window:,}-token context window.", "removed_check": None})
         if settings["stress"]["enabled"]:
             for case, shape in (("large_input", "long_short"), ("large_output", "short_long")):
                 if settings["stress"][case] and not fits(shape):
                     settings["stress"][case] = False
-                    notes.append(f"Stress {case} turned off: profile exceeds known server context window {window}.")
+                    warnings.append({"msg": f"Load test {case} stress won't run: its request sizes exceed the server's {window:,}-token context window.", "removed_check": None})
             settings["stress"]["enabled"] = settings["stress"]["large_input"] or settings["stress"]["large_output"]
     from giraffe.concurrent_load import load_time_plan
     configured = sum(row["configured_load_seconds"] for row in load_time_plan(ConcurrentLoad.model_validate(settings)).values())
@@ -1078,18 +1170,25 @@ def migrate_concurrent_load(value):
         else:
             for kind in ("combinations", "mixed", "interference", "stress"):
                 settings[kind]["enabled"] = False
-            notes.append(f"Concurrent load turned off: max_duration_seconds={value.get('max_duration_seconds', 300)} cannot fit its minimum sending windows.")
+            warnings.append({"msg": f"Load test won't run: the imported Maximum duration ({value['max_duration_seconds']:g} s) can't fit its sending windows. Raise Maximum duration, then select Load test again.", "removed_check": None})
     if value.get("overlap_models") and value.get("concurrency") is not None and targets > int(number(value["concurrency"], 4)):
         for kind in ("combinations", "mixed", "interference", "stress"):
             settings[kind]["enabled"] = False
-        notes.append(f"Concurrent load turned off: {targets} overlapping targets need at least {targets} request slots; concurrency={value.get('concurrency', 4)}.")
+        warnings.append({"msg": f"Load test won't run: {targets} endpoints run at the same time and need at least {targets} simultaneous requests, but the imported Simultaneous limit is {value['concurrency']}. Raise Simultaneous limit, then select Load test again.", "removed_check": None})
     # A legacy fairness-only selection may have no runnable equivalent.
     if not any(settings[k]["enabled"] for k in ("combinations", "mixed", "interference", "stress")):
         value["checks"] = list(dict.fromkeys(c for c in selected_checks if c != "concurrency"))
-        notes.append("Concurrent load unselected because no migrated load type can run with these settings.")
+        if "concurrency" in selected_checks:
+            if not warnings:
+                warnings.append({"msg": "Load test won't run: no imported load workload can run with these settings.", "removed_check": None})
+            if not any(c in {"load", "capacity", "arrivals"} for c in value["checks"]):
+                for warning in warnings:
+                    warning["removed_check"] = "load"
     if "concurrent_load" not in value:
         value["concurrent_load"] = settings
-    return value, notes
+    if "concurrency" not in selected_checks:
+        warnings = []
+    return value, notes, _finish_migration_warnings(value, warnings)
 
 
 
@@ -1523,6 +1622,12 @@ class GatewayAttribution(Model):
         return value
 
 
+def _validate_inference_query(query: str) -> None:
+    if query and not re.fullmatch(r"api-version=[0-9]{4}-[0-9]{2}-[0-9]{2}(?:-preview)?", query):
+        raise ValueError("endpoint URL query may only contain api-version=YYYY-MM-DD or "
+                         "api-version=YYYY-MM-DD-preview; use environment-referenced headers for credentials")
+
+
 class Target(Model):
     tokenizer: str | None = Field(default=None, min_length=1,
         description="Prompt sizing tokenizer: null or auto resolves the served model name and falls back to builtin; builtin uses tiktoken o200k_base. A model ID or local directory remains an optional CLI override. Tokenizer assets download and cache locally; no inference is used for sizing.")
@@ -1573,8 +1678,9 @@ class Target(Model):
         parsed = urlsplit(self.url)
         if parsed.scheme not in {"http", "https"} or not parsed.hostname:
             raise ValueError("target url must start with http:// or https:// (for example http://localhost:11434/v1)")
-        if parsed.username or parsed.password or parsed.query or parsed.fragment:
-            raise ValueError("use an endpoint URL without credentials, query or fragment")
+        if parsed.username is not None or parsed.password is not None or parsed.fragment:
+            raise ValueError("use an endpoint URL without credentials or fragment")
+        _validate_inference_query(parsed.query)
         if self.metrics_url:
             metrics = urlsplit(self.metrics_url)
             if metrics.scheme not in {"http", "https"} or not metrics.hostname:
@@ -2190,9 +2296,10 @@ class JudgeEndpoint(Model):
         if self.url:
             parsed = urlsplit(self.url)
             if parsed.scheme not in {"http", "https"} or not parsed.hostname or any(
-                (parsed.username, parsed.password, parsed.query, parsed.fragment)
+                (parsed.username is not None, parsed.password is not None, parsed.fragment)
             ):
-                raise ValueError("judge url must be an http(s) endpoint without credentials/query/fragment")
+                raise ValueError("judge url must be an http(s) endpoint without credentials/fragment")
+            _validate_inference_query(parsed.query)
         references = [*self.headers_env.values(), *([self.api_key_env] if self.api_key_env else [])]
         if any(not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value) for value in references):
             raise ValueError("judge credentials must name environment variables")
@@ -2455,7 +2562,10 @@ class RunConfig(Model):
     concurrent_load: ConcurrentLoad = Field(default_factory=ConcurrentLoad)
     load_test: LoadTest = Field(default_factory=LoadTest)
     _preparation_residency: dict = PrivateAttr(default_factory=dict)
+    _request_timeout_check: str | None = PrivateAttr(default=None)
+    _preflight_context_windows: dict = PrivateAttr(default_factory=dict)
     _migration_notes: list[str] = PrivateAttr(default_factory=list)
+    _migration_warnings: list[MigrationWarning] = PrivateAttr(default_factory=list)
     _concurrency_warnings: list[dict[str, Any]] = PrivateAttr(default_factory=list)
     sessions: Sessions | None = None
     multi_user: MultiUser | None = None
@@ -2488,9 +2598,11 @@ class RunConfig(Model):
     @classmethod
     def migrate_load_input(cls, value, handler):
         if isinstance(value, dict):
-            value, notes = migrate_load_test(value)
+            value, restart_notes = migrate_removed_restart_script(value)
+            value, notes, warnings = migrate_load_test(value)
             result = handler(value)
-            result._migration_notes = list(dict.fromkeys([*notes, *result._migration_notes]))
+            result._migration_warnings = merge_migration_warnings(warnings, result._migration_warnings)
+            result._migration_notes = list(dict.fromkeys([*restart_notes, *notes, *result._migration_notes]))
             return result
         return handler(value)
 
@@ -2724,9 +2836,9 @@ class RunConfig(Model):
                 if value is not None and name not in supplied]
 
     def effective_response(self) -> dict[str, Any]:
-        """Endpoint response owns shared initial/warm requests.
+        """Response validity owns shared initial/warm requests.
 
-        Selected first-answer overrides apply when selected Endpoint response has
+        Selected first-answer overrides apply when selected Response validity has
         no explicit value for the same setting. Disabled drafts do not change work.
         """
         serving = self.test_options.get("serving", CheckOptions()) if "serving" in self.checks else CheckOptions()
@@ -2953,6 +3065,10 @@ class RequestSpec(Model):
     context_position: str | None = None
     input_chars: int = 0
     request_timeout_seconds: float | None = Field(default=None, gt=0)
+    deadline_source: Literal["run", "check", "load"] | None = Field(default=None, exclude=True)
+    timeout_check: str | None = Field(default=None, exclude=True)
+    timeout_setting: str | None = Field(default=None, exclude=True)
+    _fixture_request_timeout_seconds: float | None = PrivateAttr(default=None)
     load_point: dict[str, Any] | None = None
     requested_input_tokens: int | None = None
     requested_output_tokens: int | None = None
@@ -3050,6 +3166,8 @@ class RequestRecord(PersistedModel):
             if getattr(self, name) is None:
                 result.pop(name, None)
         return result
+    _request_slot: int | None = PrivateAttr(default=None)
+    _timeout_fixture: dict | None = PrivateAttr(default=None)
     _timing_started_monotonic: float | None = PrivateAttr(default=None)
     _gateway_key_hash: str | None = PrivateAttr(default=None)
     _gateway_terminal_usage: bool = PrivateAttr(default=False)
@@ -3070,6 +3188,9 @@ class RequestRecord(PersistedModel):
     response_body_bytes: int = Field(default=0, ge=0)
     error: str | None = None
     request_timeout_seconds: float | None = None
+    deadline_source: Literal["run", "check", "load"] = "run"
+    timeout_check: str | None = None
+    timeout_setting: str | None = None
     termination_reason: str | None = None
     termination_limit_seconds: float | None = None
     server_request_id: str | None = None
@@ -3116,6 +3237,7 @@ class RequestRecord(PersistedModel):
     valid: bool = False
     score: bool | None = None
     score_message: str | None = None
+    refused: bool = False
     evaluation: EvaluationEvidence | None = None
     evaluation_error: str | None = None
     logprob_evidence: LogprobEvidence | None = None

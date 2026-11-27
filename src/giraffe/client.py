@@ -17,7 +17,8 @@ import time
 import uuid
 from time import monotonic
 from datetime import datetime, timezone
-from typing import Any, AsyncIterator, Callable, Literal
+from typing import Any, AsyncIterator, Callable, Iterable, Literal
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -93,12 +94,18 @@ class _IntentionalCancellation(Exception):
 
 def completion_url(url: str) -> str:
     """Accept a server origin, API base, or complete chat-completions endpoint."""
-    url = url.rstrip("/")
-    if url.endswith("/chat/completions"):
-        return url
-    if httpx.URL(url).path in {"", "/"}:
-        url += "/v1"
-    return url + "/chat/completions"
+    parsed = urlsplit(url)
+    path = parsed.path.rstrip("/")
+    if not path.endswith("/chat/completions"):
+        path = (path or "/v1") + "/chat/completions"
+    return parsed._replace(path=path).geturl()
+
+
+def models_url(url: str) -> str:
+    """Use the inference API base and preserve its query when listing models."""
+    parsed = urlsplit(completion_url(url))
+    path = parsed.path.removesuffix("/chat/completions") + "/models"
+    return parsed._replace(path=path).geturl()
 
 
 def _headers(target: Target) -> dict[str, str]:
@@ -286,6 +293,28 @@ def _rejected_evidence_field(body: bytes) -> str | None:
     return None
 
 
+def _rejected_request_option(body: bytes, keys: Iterable[str]) -> tuple[str | None, bool]:
+    """Retain a configured key or an other-field flag only from structured fields."""
+    try:
+        data = json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        return None, False
+    if not isinstance(data, dict):
+        return None, False
+    error = data.get("error")
+    detail = data.get("detail")
+    keys = set(keys)
+    if isinstance(error, dict) and isinstance(error.get("param"), str) and error["param"]:
+        return (error["param"], False) if error["param"] in keys else (None, True)
+    if isinstance(detail, list) and any(
+            isinstance(item, dict) and isinstance(item.get("loc"), list) for item in detail):
+        matches = {key for key in keys if any(
+            isinstance(item, dict) and isinstance(item.get("loc"), list) and key in item["loc"]
+            for item in detail)}
+        return (next(iter(matches)) if len(matches) == 1 else None), not matches
+    return None, False
+
+
 def _answer_spans(
     output: str, *, stream_stack: list[str] | None = None,
 ) -> tuple[list[tuple[int, int]] | None, bool]:
@@ -440,13 +469,34 @@ class LLMClient:
             self._evidence_probe_finished = True
             completed = record.http_status == 200 and record.stream_terminated
             returned_tokens = any(event.get("token_count") is not None for event in record.output_events)
-            returned_usage = record.input_tokens is not None or record.completion_tokens is not None
+            returned_usage = record.input_tokens is not None and record.completion_tokens is not None
             for key, available in (("logprobs", returned_tokens), ("usage", returned_usage)):
                 if self.token_evidence[key] != "rejected":
                     self.token_evidence[key] = "supported" if available else "not_returned" if completed else "unverified"
-            self.token_evidence.update(status="observed" if completed else "unavailable",
-                reason=("Compatibility probe inspected streamed token boundaries and usage; request-specific coverage is checked separately."
-                        if completed else f"Compatibility probe did not complete ({record.error or record.status})."))
+            if (completed and self.token_evidence["usage"] != "rejected"
+                    and (record.input_tokens is not None) != (record.completion_tokens is not None)):
+                self.token_evidence["usage"] = "partial"
+            if completed:
+                notes = []
+                if self.token_evidence["logprobs"] == "rejected":
+                    notes.append("Endpoint rejected the logprobs options.")
+                elif not returned_tokens:
+                    notes.append("The stream did not provide token boundaries (logprobs.content).")
+                missing_usage_fields = []
+                if self.token_evidence["usage"] == "rejected":
+                    notes.append("Endpoint rejected stream_options for requesting usage counts.")
+                else:
+                    missing_usage_fields = [field for field, count in (
+                        ("usage.prompt_tokens", record.input_tokens),
+                        ("usage.completion_tokens", record.completion_tokens),
+                    ) if count is None]
+                    if missing_usage_fields:
+                        notes.append(f"The stream did not provide usable {' and '.join(missing_usage_fields)}.")
+                self.token_evidence.update(status="observed", missing_usage_fields=missing_usage_fields,
+                    reason=" ".join(notes) or "Returned streamed token boundaries and both usage counts.")
+            else:
+                self.token_evidence.update(status="unavailable",
+                    reason=f"Compatibility probe did not complete ({record.error or record.status}).")
         self.token_evidence["probe_requests"] = self._evidence_probe_attempts
         if self._evidence_probe_finished and self.token_evidence["status"] == "probing":
             self.token_evidence["status"] = "unavailable"
@@ -548,7 +598,7 @@ class LLMClient:
             return False
         try:
             async with asyncio.timeout(remaining):
-                url = completion_url(self.target.url).removesuffix("/chat/completions") + "/models"
+                url = models_url(self.target.url)
                 async with self._client.stream("GET", url, timeout=min(5, remaining)) as response:
                     status = response.status_code
                 if status == 404:
@@ -636,6 +686,10 @@ class LLMClient:
                 payload.update(spec.tool_expectation.choice.request_options())
             record.tool_request_options = {key: payload[key] for key in
                 ("tools", "tool_choice", "parallel_tool_calls") if key in payload}
+        request_option_keys = sorted(
+            key for key, value in self.config.request_options.items()
+            if key in payload and key not in _RESERVED_OPTIONS and value is not None
+        ) if spec.scenario == "connection" and not access_probe else []
         # Continuous usage is a server-specific, explicit opt-in. It requires
         # include_usage on compatible endpoints, unless the caller disables it.
         options = payload.get("stream_options")
@@ -644,7 +698,7 @@ class LLMClient:
         probing = spec.workload.get("performance_evidence_probe")
         # The shared key may route to a different backend from marked identities.
         if stream and not probing and not attribution:
-            if self.token_evidence["usage"] == "supported":
+            if self.token_evidence["usage"] in {"supported", "partial"}:
                 options = payload.setdefault("stream_options", {})
                 if isinstance(options, dict):
                     payload["stream_options"] = {"include_usage": True, **options}
@@ -683,9 +737,7 @@ class LLMClient:
             "messages": spec.messages, "options": {k: v for k, v in payload.items() if k not in {"model", "messages"}},
         }, sort_keys=True).encode()).hexdigest()
         record.history_hash = hashlib.sha256(json.dumps(spec.messages[:-1], sort_keys=True).encode()).hexdigest()
-        start = time.perf_counter()
-        record._timing_started_monotonic = monotonic()
-        record.client_preparation_ms = (start - preparation_start) * 1000
+        start = preparation_start
         tool_parts: dict[int, dict] = {}
         last_answer: float | None = None
         tool_output: float | None = None
@@ -957,8 +1009,15 @@ class LLMClient:
                 answer, reasoning, record._gateway_access_refusal, record._gateway_access_metered_reasoning = (
                     assistant_reply(content, choice.get("finish_reason"), usage, record)
                 )
+                if record._gateway_access_refusal:
+                    record.refused = True
             else:
                 answer = _text(content.get("content"))
+                refusal = content.get("refusal")
+                if isinstance(refusal, str) and refusal.strip():
+                    record.refused = True
+                    if not answer.strip():
+                        answer = _text(refusal)
             if logprob_collector is not None:
                 logprob_collector.add(choice.get("logprobs"))
             if spec.workload.get("logprobs") and not streaming:
@@ -1085,7 +1144,7 @@ class LLMClient:
         )
         timeout = min(request_timeout,
                       spec.cancel_after_ms / 1000 if spec.cancel_after_ms else float("inf"))
-        transport_started = _before_send is None
+        transport_started = False
         try:
             observe("started")
             async with asyncio.timeout(None if _before_send is not None else timeout) as request_deadline:
@@ -1115,23 +1174,22 @@ class LLMClient:
                             sending_post = False
 
                     request.extensions["trace"] = observe_send
-                if _before_send is not None:
-                    def begin_transport():
-                        nonlocal start, transport_started
+                def begin_transport():
+                    nonlocal start, transport_started
+                    if _before_send is not None:
                         _before_send()
-                        transport_started = True
-                        start = time.perf_counter()
-                        record._timing_started_monotonic = monotonic()
-                        record.started_at = datetime.now(timezone.utc).isoformat()
-                        record.client_preparation_ms = (start - preparation_start) * 1000
                         request_deadline.reschedule(asyncio.get_running_loop().time() + timeout)
+                    # The pool calls this after leasing a connection lane.
+                    start = time.perf_counter()
+                    record._timing_started_monotonic = monotonic()
+                    record.started_at = datetime.now(timezone.utc).isoformat()
+                    record.client_preparation_ms = (start - preparation_start) * 1000
+                    transport_started = True
 
-                    if isinstance(self._client, HTTPClientPool):
-                        response = await self._client.send(request, stream=True, _before_send=begin_transport)
-                    else:
-                        begin_transport()
-                        response = await self._client.send(request, stream=True)
+                if isinstance(self._client, HTTPClientPool):
+                    response = await self._client.send(request, stream=True, _before_send=begin_transport)
                 else:
+                    begin_transport()
                     response = await self._client.send(request, stream=True)
                 events = None
                 try:
@@ -1167,6 +1225,13 @@ class LLMClient:
                             record.gateway_evidence = response_evidence(response.status_code, error_body, response.headers,
                                 declared_priority=spec.workload.get("declared_priority"), expected_key_hash=expected_key_hash)
                         if spec.scenario == "connection" and response.status_code in {400, 404, 422}:
+                            if response.status_code in {400, 422} and request_option_keys:
+                                record.workload["request_option_keys"] = request_option_keys
+                                rejected_option, other_field_named = _rejected_request_option(error_body, request_option_keys)
+                                if rejected_option:
+                                    record.workload["rejected_request_option"] = rejected_option
+                                if other_field_named:
+                                    record.workload["rejected_other_field"] = True
                             # Keep only the classification, never arbitrary server error text.
                             body = error_body.decode("utf-8", errors="replace").lower()
                             try:
@@ -1357,7 +1422,10 @@ class LLMClient:
                     evidence = evidence.model_copy(update={"status": "incomplete", "reason": "Response did not complete validly."})
                 record.logprob_evidence = self.logprob_budget.retain(evidence)
             now = time.perf_counter()
-            record.elapsed_ms = (now - start) * 1000
+            if transport_started:
+                record.elapsed_ms = (now - start) * 1000
+            else:
+                record.client_preparation_ms = (now - preparation_start) * 1000
             record.output_chars = len(record.output)
             record.tool_calls = [tool_parts[index] for index in sorted(tool_parts)]
             # Answer timing excludes inline reasoning and counts network reads,

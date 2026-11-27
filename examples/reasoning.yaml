@@ -1,0 +1,25 @@
+config_version: 2
+# Reasoning models: edit the endpoint and served model ID before running.
+# Omitting checks uses the shared access, serving, correctness, first_output defaults.
+targets:
+  - name: reasoning
+    url: http://127.0.0.1:8000/v1
+    model: replace-with-served-model-id
+# Reasoning can use the whole output budget before an answer appears.
+max_output_tokens: 2048
+# request_options are defaults for ordinary requests: a fixture or request-pack
+# case can override a matching key. Gateway access probes use their own options.
+# Use the fields your server and model document. model, messages, stream, max_tokens,
+# max_completion_tokens and n are reserved; set the output cap with
+# max_output_tokens instead.
+request_options:
+  # OpenAI-style effort level, for example GPT-OSS on vLLM, SGLang or Ollama.
+  # GPT-OSS takes low, medium or high.
+  # On Ollama, GPT-OSS none falls back to low and still reasons.
+  # On Ollama, none turns reasoning off for models with on/off thinking such as Qwen3.
+  # Unsupported fields may be ignored.
+  reasoning_effort: low
+  # Chat-template switch on vLLM and SGLang, for example Qwen3. Use it instead
+  # of reasoning_effort when your model's template documents it:
+  # chat_template_kwargs:
+  #   enable_thinking: false

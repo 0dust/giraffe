@@ -115,11 +115,35 @@ def logprob_fixtures(config, fixtures):
     return result
 
 
+def logprob_requests(config, templates, shape, level, phase, repeat):
+    """Build the final request batch sent for one logprob round."""
+    from giraffe.workloads import consistency_options
+
+    settings = config.consistency
+    options = settings.logprobs
+    width = corpus_width(settings)
+    requests = []
+    for slot in range(width):
+        request = templates[shape].model_copy(deep=True)
+        request.fixture_id = f'logprob_{shape}_{slot}'
+        request.scenario = f'consistency_c{level}_{shape}'
+        request.check_ids = ['consistency']
+        request.stream = options.response_mode == 'stream'
+        request.options = consistency_options(config, request.options)
+        request.options.update(logprobs=True, top_logprobs=options.top_logprobs)
+        request.workload = {'level': level, 'input_bucket': shape, 'equality': settings.equality,
+                           'temperature': (config.request_options | request.options).get('temperature'),
+                           'seed': settings.seed, 'logprobs': True, 'top_logprobs': options.top_logprobs,
+                           'phase': phase, 'round': repeat, 'corpus_index': slot,
+                           'corpus_size': width, 'response_mode': options.response_mode,
+                           'option_support': 'requested; runtime enforcement unverified'}
+        requests.append(request)
+    return requests
+
+
 async def run_logprob_consistency(run, target, client, fixtures):
     from giraffe.fixtures import builtin_fixtures
     from giraffe.runner import _check_config
-    from giraffe.workloads import consistency_options
-
     config = _check_config(run.config, "consistency")
     settings = config.consistency
     options = settings.logprobs
@@ -133,26 +157,12 @@ async def run_logprob_consistency(run, target, client, fixtures):
     try:
         for shape in settings.shapes:
             for level in dict.fromkeys([1, *settings.levels]):
-                scenario = f'consistency_c{level}_{shape}'
                 for phase, rounds in [('priming', options.priming_rounds), ('measured', settings.repetitions)]:
                     for repeat in range(rounds):
                         if not run.allowed(target.name):
                             run.unfinished[target.name].add('consistency')
                             return
-                        specs = []
-                        for slot in range(width):
-                            spec = templates[shape].model_copy(deep=True)
-                            spec.fixture_id = f'logprob_{shape}_{slot}'
-                            spec.scenario, spec.check_ids, spec.stream = scenario, ['consistency'], options.response_mode == 'stream'
-                            spec.options = consistency_options(config, spec.options)
-                            spec.options.update(logprobs=True, top_logprobs=options.top_logprobs)
-                            spec.workload = {'level': level, 'input_bucket': shape, 'equality': settings.equality,
-                                             'temperature': (config.request_options | spec.options).get('temperature'), 'seed': settings.seed,
-                                             'logprobs': True, 'top_logprobs': options.top_logprobs,
-                                             'phase': phase, 'round': repeat, 'corpus_index': slot,
-                                             'corpus_size': width, 'response_mode': options.response_mode,
-                                             'option_support': 'requested; runtime enforcement unverified'}
-                            specs.append(spec)
+                        specs = logprob_requests(config, templates, shape, level, phase, repeat)
                         await refill(run, target, client, specs, width, level, condition_plan=False)
     finally:
         for shape in settings.shapes:

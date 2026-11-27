@@ -46,7 +46,7 @@ assert.match(renderPreparation(),/9s/);
 state.detail.state='completed';state.detail.progress={};state.detail.report={observations:{targets:{local:{preparation:{step:'Local tokenization',status:'unavailable',elapsed_seconds:2,reason:'Matching tokenizer not cached'}}}}};
 html=renderPreparation();assert.match(html,/Preparation unavailable/);assert.match(html,/Matching tokenizer not cached/);
 assert.match(html,/The affected test traffic did not run/);assert.doesNotMatch(html,/Preparing test traffic/);
-state.detail.report.observations.targets.local.preparation={scenario:'performance_evidence_probe',step:'Streamed token and usage capability',status:'unavailable',elapsed_seconds:1,reason:'Endpoint does not provide token boundaries'};
+state.detail.report.observations.targets.local.preparation={scenario:'performance_evidence_probe',step:'Streamed token and usage support',status:'unavailable',elapsed_seconds:1,reason:'Endpoint does not provide token boundaries'};
 html=renderPreparation();assert.match(html,/Unsupported measurements stay unknown/);assert.doesNotMatch(html,/test traffic did not run/);
 ''')
 
@@ -161,6 +161,26 @@ state.detail={id:'builtin',state:'completed',live_preparations:[
 const html=renderPreparation();
 assert.match(html,/Preparation complete · built-in tokenizer/);
 assert.match(html,/Reference counts, not server usage/);
+''')
+
+
+def test_identical_completed_tokenizer_notices_appear_once_per_target():
+    run_render_checks(r'''
+const reason='Using built-in tiktoken o200k_base. Reference counts, not server usage.';
+const completed={target:'local',step:'Preparing input locally',status:'completed',builtin:true,reason,elapsed_seconds:.2};
+state.detail={id:'repeated',state:'running',live_preparations:[
+ {...completed,scenario:'context_preparation'},
+ {...completed,scenario:'load_preparation_short_short_answer'},
+ {...completed,scenario:'load_preparation_long_short_answer'},
+ {...completed,scenario:'load_preparation_short_long_answer'}]};
+let html=renderPreparation();
+assert.equal(html.split(reason).length-1,1);assert.equal((html.match(/class="run-preparation"/g)||[]).length,1);
+state.detail.live_preparations.unshift({...completed,scenario:'failed',status:'unavailable',reason:'A different preparation failed'});
+html=renderPreparation();assert.match(html,/A different preparation failed/);assert.equal(html.split(reason).length-1,1);
+state.detail.live_preparations.push({...completed,target:'other',scenario:'context_preparation'});
+html=renderPreparation();assert.equal(html.split(reason).length-1,2,'Keep endpoint-specific notices');
+state.detail.live_preparations.push({...completed,scenario:'different_tokenizer',reason:'Using a different tokenizer'});
+html=renderPreparation();assert.match(html,/Using a different tokenizer/);assert.match(html,/Reference counts, not server usage/);
 ''')
 
 
