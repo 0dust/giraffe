@@ -12,6 +12,7 @@ import heapq
 import random
 from typing import Any
 
+from giraffe import states
 from giraffe.caps import MAX_TOKEN_EVIDENCE_PROBE_ATTEMPTS
 from giraffe.fixtures import builtin_fixtures
 from giraffe.gateway_access import (configured_probe_count as configured_access_probe_count,
@@ -991,10 +992,11 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
     midpoint = (low + high) / 2
     drain_fraction = combine("drain_uncertainty_seconds") / midpoint if midpoint else 0
     fixed_fraction = fixed_seconds / midpoint if midpoint else 0
-    confidence = ("low" if unknowns or uncertain_observations or not components else
-                  "high" if fixed_fraction >= .8 and drain_fraction <= .2 else "medium")
-    if confidence == "medium" and high - low > midpoint:
-        confidence = "low"
+    confidence = (states.PLAN_CONFIDENCE_LOW if unknowns or uncertain_observations or not components else
+                  states.PLAN_CONFIDENCE_HIGH if fixed_fraction >= .8 and drain_fraction <= .2
+                  else states.PLAN_CONFIDENCE_MEDIUM)
+    if confidence == states.PLAN_CONFIDENCE_MEDIUM and high - low > midpoint:
+        confidence = states.PLAN_CONFIDENCE_LOW
         uncertain_observations.append("The combined duration range is too wide for medium confidence.")
     setup_totals = [sum(item["high_seconds"] for item in timeline
                         if item["target"] == target.name and item["kind"] == "setup") for target in config.targets]
@@ -1190,6 +1192,7 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
             "actions": [{"label": label, "field": field, "value": required}],
         })
     known = bool(components) or not unknowns
+    states.check_plan_confidence(confidence)
     return {"estimated_seconds": round(midpoint, 3) if known else None,
             "has_complete_time_estimate": has_complete_time_estimate,
             "check_time_summaries": check_time_summaries, "setup_time_summaries": setup_time_summaries,
@@ -1210,7 +1213,7 @@ def _time_plan(config: RunConfig | ConfigDraft, rows: list[dict[str, Any]], obse
                 (["Confidence remains low because these components have unknown duration: " +
                   ", ".join(dict.fromkeys(item["title"] for item in unknowns)) + "."] if unknowns else []) +
                 ([f"Request deadlines after sending stops contribute {combine('drain_uncertainty_seconds'):g} seconds of uncertainty; more latency samples cannot remove that configured bound."]
-                 if confidence == "low" and drain_fraction > .2 else []),
+                 if confidence == states.PLAN_CONFIDENCE_LOW and drain_fraction > .2 else []),
             "errors": errors, "time_warnings": warnings, "load_sample_warnings": load_sample_warnings,
             "load_sending_extensions": load_sending_extensions,
             "load_upper_allowance_kind": load_upper_allowance_kind}

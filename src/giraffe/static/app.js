@@ -3241,6 +3241,10 @@ function renderPackResults(pack) {
   }).join('');
   return `<div class="traffic-summary"><h3>Request pack · quiet and loaded evidence</h3><p class="hint">Missing scored completions are insufficient evidence.</p>${pack.control_status?`<p>Quiet control ${badge(pack.control_status)}</p>`:''}</div><div class="metric-table"><table><thead><tr><th>Case</th><th>Quiet</th><th>Loaded · correct / scored, valid</th></tr></thead><tbody>${rows}</tbody></table></div>`;
 }
+// setupStep is connection (1), checks (2), or review (3); navigation, validation,
+// and new/rerun setup choose it, and these helpers sync the fixed panel identities.
+// Review edits set returnToReview until review or a fresh setup landing clears it.
+// Rerun sets focusSetupOnEntry; route entry consumes it once after rendering.
 function syncSetupIdentity() {
   const element=$('#setup-context'),form=$('#new-run-form');if(!element||!form)return;
   const model=form.elements.model.value.trim(),url=form.elements.url.value.trim();
@@ -3879,8 +3883,14 @@ function resultGuidance(report) {
   return '';
 }
 
-// Report navigation is scoped to this visit. Polls never override an explicit tab choice.
-let reportView={id:null,tab:null,explicit:false,wasLive:false,terminalSwitch:false,performance:null,target:null,window:null,error:'',pending:false,sequence:0,lastFetch:0};
+// Route entry and tab controls own the visit's explicit navigation choice; rendering
+// tracks wasLive/terminalSwitch for one completion handoff. Selection controls own
+// target/window. loadPerformance owns pending/again/error/lastFetch and its sequence;
+// resets invalidate that work together, so old requests cannot publish or reload.
+let reportView={id:null,tab:null,explicit:false,wasLive:false,terminalSwitch:false,performance:null,target:null,window:null,error:'',pending:false,again:false,sequence:0,lastFetch:0};
+function resetPerformance(){
+  reportView.performance=null;reportView.pending=false;reportView.again=false;reportView.error='';reportView.lastFetch=0;reportView.sequence++;
+}
 const reportSections=[['overview','Performance overview',null],['timing','Request timing',null],['throughput','Throughput & capacity','throughput_capacity'],['delivery','Load delivery','delivery'],['outcomes','Outcomes & quality','outcomes'],['tokens','Workload & tokens','token_accounting'],['effects','Conversations & workload effects','conversations'],['server','Server observations','server'],['baseline','Baseline comparison','baseline']];
 const comparisonSections=[['answers','Answers & correctness'],['timing','Response timing'],['delivery','Request completion'],['gateway-access-decisions','Gateway access decisions'],['gateway-attribution-outcomes','Gateway attribution outcomes'],['gateway-policy-outcomes','Gateway policy outcomes']];
 const reportResultSections=[['comparison','Baseline comparison'],['acceptance','Pass / fail','comparison'],['load-acceptance','Tested load acceptance','comparison'],...comparisonSections.map(([id,label])=>[id,label,'comparison']),['checks','Checks & evidence'],['configuration','Run configuration'],['requests','All requests'],['resources','Peak memory (RAM)']];
@@ -3902,11 +3912,11 @@ function syncReportView() {
   const d=state.detail;if(!d)return;
   if(reportView.id!==d.id){
     const route=reportRoute(),tab=route?.id===d.id?route.tab:null;
-    reportView={id:d.id,tab:tab||'results',explicit:!!tab,wasLive:activeState(d),terminalSwitch:false,performance:null,target:null,window:null,error:'',pending:false,sequence:reportView.sequence+1,lastFetch:0};
+    reportView={id:d.id,tab:tab||'results',explicit:!!tab,wasLive:activeState(d),terminalSwitch:false,performance:null,target:null,window:null,error:'',pending:false,again:false,sequence:reportView.sequence+1,lastFetch:0};
   }
   if(reportView.wasLive&&!activeState(d)&&!reportView.terminalSwitch){
     reportView.terminalSwitch=true;state.heroActionGuard={id:d.id,until:Date.now()+600};
-    reportView.performance=null;reportView.target=null;reportView.window=null;reportView.sequence++;reportView.pending=false;reportView.lastFetch=0;
+    resetPerformance();reportView.target=null;reportView.window=null;
     if(!reportView.explicit){reportView.tab='results';replaceReportAnchor();}
     announceRunComplete(d);
   }
@@ -5034,7 +5044,7 @@ async function compareSavedRun(event) {
     const detail=reconcileRunDetail(await fetchRunDetail(id,{handoff:true}));
     if(!reportStillShown(t))return;
     state.detail=detail;state.comparisonFilter=null;state.comparisonCheck='all';state.tab='baseline';
-    reportView.performance=null;reportView.pending=false;reportView.lastFetch=0;reportView.sequence++;
+    resetPerformance();
     if(own()){
       dialog.close();
       chooseReportTab('results');renderDetail();
@@ -5145,8 +5155,8 @@ async function rerun({step=1,baseline,focusPath=null}={}){
     return;
   }
   source=normalizeRateThreshold(source);
-  replaceMigrationNotes(notes,warnings,limitNotes);state.config=clone(source);state.gatewayAccessDraft={};state.autoModel=null;state.setupStep=step===2&&source.targets?.length&&source.targets.every(t=>t.model?.trim())?2:1;state.focusSetupOnEntry=state.setupStep===2;
-  if(step===2){state.returnToReview=false;state.catalogueFilter='all';state.catalogueCategory='all';state.catalogueSearch='';}
+  replaceMigrationNotes(notes,warnings,limitNotes);state.config=clone(source);state.gatewayAccessDraft={};state.autoModel=null;state.setupStep=step===2&&source.targets?.length&&source.targets.every(t=>t.model?.trim())?2:1;state.focusSetupOnEntry=state.setupStep===2;state.returnToReview=false;
+  if(step===2){state.catalogueFilter='all';state.catalogueCategory='all';state.catalogueSearch='';}
   invalidateModelDiscovery();state.datasetSelection=[];state.config.restart_target=null;state.formMode='normal';state.formRestartTarget=null;resetJsonDraft();state.configView='form';configChanged();state.prefillBaseline=baseline ?? (detail.baseline_id || '');pendingTimeoutSetting=focusPath;location.hash='#new';
 }
 function portableConfig(payload) {return {...payload.config,restart_target:payload.mode==='cold-start'?payload.restart_target:null};}

@@ -1224,7 +1224,8 @@ The message linkage follows the [OpenAI function-calling conversation contract](
 With `deployment.discovery: ollama`, Giraffe reads `/api/ps` before its CLI
 connection probe or run preparation, then again after preparation. The deployment
 snapshot and HTML report label both observations with their source, time and target
-scope. A missing model is `not_resident`; unsupported, disabled, failed or malformed
+scope, under `before_preparation` and `after_preparation`. A listed model is
+`resident`; a missing model is `not_resident`; unsupported, disabled, failed or malformed
 discovery is `unknown`. These observations do not prove a cold start or explain a
 slow first response. A separately requested UI connection test may already have
 loaded the model before the run starts. A deliberate restart may also change state

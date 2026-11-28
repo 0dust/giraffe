@@ -10,6 +10,7 @@ import time
 from contextlib import AsyncExitStack
 from typing import Callable
 
+from . import states
 from .caps import MAX_JUDGE_REASON_CHARS
 from giraffe.client import LLMClient
 from giraffe.fixtures import REASONING_WITHOUT_ANSWER, TRUNCATED_ANSWER, final_answer
@@ -38,6 +39,7 @@ the conclusion and a brief reason, not hidden reasoning or a chain of thought.
 
 
 def _error(judge: JudgeEndpoint, category: str, observed_model: str | None = None) -> JudgeVote:
+    states.check_judge_vote_error_reason(category)
     return JudgeVote(judge=judge.name, url=judge.url, model=judge.model, status="error",
                      error_category=category, observed_model=observed_model)
 
@@ -54,15 +56,16 @@ def _unique_object(pairs: list[tuple[str, object]]) -> dict:
 def _vote(judge: JudgeEndpoint, result: RequestRecord) -> JudgeVote:
     observed = result.observed_model
     if result.status == "timeout":
-        return _error(judge, "timeout", observed)
+        return _error(judge, states.JUDGE_VOTE_ERROR_TIMEOUT, observed)
     if result.status == "cancelled":
-        return _error(judge, "cancelled", observed)
+        return _error(judge, states.JUDGE_VOTE_ERROR_CANCELLED, observed)
     if not result.valid or result.status != "completed":
-        category = "http_error" if result.http_status and result.http_status >= 400 else "request_failed"
+        category = (states.JUDGE_VOTE_ERROR_HTTP_ERROR if result.http_status and result.http_status >= 400
+                    else states.JUDGE_VOTE_ERROR_REQUEST_FAILED)
         return _error(judge, category, observed)
     if result.finish_reason != "stop":
-        return _error(judge, "truncated_response" if result.finish_reason == "length"
-                      else "invalid_completion", observed)
+        return _error(judge, states.JUDGE_VOTE_ERROR_TRUNCATED_RESPONSE if result.finish_reason == "length"
+                      else states.JUDGE_VOTE_ERROR_INVALID_COMPLETION, observed)
     try:
         answer = final_answer(result.output)[0].strip()
         # Accept one complete markdown fence around the verdict object.
@@ -73,7 +76,7 @@ def _vote(judge: JudgeEndpoint, result: RequestRecord) -> JudgeVote:
                 or not data["reason"].strip() or len(data["reason"]) > MAX_JUDGE_REASON_CHARS):
             raise ValueError("invalid verdict")
     except (ValueError, TypeError, RecursionError):
-        return _error(judge, "invalid_verdict", observed)
+        return _error(judge, states.JUDGE_VOTE_ERROR_INVALID_VERDICT, observed)
     return JudgeVote(judge=judge.name, url=judge.url, model=judge.model,
                      status="completed", verdict=data["verdict"], reason=data["reason"].strip(),
                      observed_model=observed)
@@ -126,7 +129,7 @@ async def judge_records(
     if not eligible:
         return summary
     panels: list[list[JudgeVote | None]] = [[None] * len(judges) for _ in eligible]
-    aborted: str | None = "cancelled" if stop_event and stop_event.is_set() else None
+    stop_reason: str | None = states.JUDGING_STOP_CANCELLED if stop_event and stop_event.is_set() else None
 
     logged_failures = 0
 
@@ -166,22 +169,24 @@ async def judge_records(
 
             async def worker() -> None:
                 for i, j in jobs:
-                    if aborted or (stop_event and stop_event.is_set()):
+                    if stop_reason or (stop_event and stop_event.is_set()):
                         return
                     client = clients[j]
                     if client is None:
-                        vote = _error(judges[j], "client_initialization")
+                        vote = _error(judges[j], states.JUDGE_VOTE_ERROR_CLIENT_INITIALIZATION)
                     else:
                         try:
                             result = await client.execute(_request(by_id[eligible[i].fixture_id], eligible[i], config))
                             # LLMClient records cancellation rather than raising it. Never
                             # continue the worker loop after its enclosing phase was stopped.
-                            vote = _error(judges[j], aborted) if aborted else _vote(judges[j], result)
+                            vote = _error(judges[j], stop_reason) if stop_reason else _vote(judges[j], result)
+                        except states.JudgeVoteError:
+                            raise
                         except Exception:
                             log_failure("Judge request failed")
                             # Endpoint-controlled content can also fail during transport
                             # finalization. Keep that failure local to this judge vote.
-                            vote = _error(judges[j], "request_failed")
+                            vote = _error(judges[j], states.JUDGE_VOTE_ERROR_REQUEST_FAILED)
                     panels[i][j] = vote
                     summary["judge_calls_completed"] += 1
                     summary["judge_calls_errors"] += int(vote.status == "error")
@@ -191,7 +196,7 @@ async def judge_records(
                 for _ in range(min(settings.concurrency, summary["judge_calls_total"])):
                     group.create_task(worker())
 
-    phase_task = asyncio.create_task(phase()) if not aborted else None
+    phase_task = asyncio.create_task(phase()) if not stop_reason else None
     watchers = []
     cancelled = False
     try:
@@ -201,14 +206,15 @@ async def judge_records(
                 watchers.append(asyncio.create_task(stop_event.wait()))
             done, _ = await asyncio.wait([phase_task, *watchers], return_when=asyncio.FIRST_COMPLETED)
             if phase_task not in done:
-                aborted = "cancelled" if stop_event and stop_event.is_set() else "phase_deadline"
+                stop_reason = (states.JUDGING_STOP_CANCELLED if stop_event and stop_event.is_set()
+                               else states.JUDGING_STOP_PHASE_DEADLINE)
                 phase_task.cancel()
             await asyncio.gather(phase_task, return_exceptions=False)
     except asyncio.CancelledError:
         # Our deadline cancels the phase task too; only propagate cancellation of
         # this outer caller. In either case preserve all partial evidence first.
         cancelled = bool(asyncio.current_task().cancelling())
-        aborted = aborted or "cancelled"
+        stop_reason = stop_reason or states.JUDGING_STOP_CANCELLED
         if phase_task:
             phase_task.cancel()
             await asyncio.gather(phase_task, return_exceptions=True)
@@ -217,7 +223,7 @@ async def judge_records(
             watcher.cancel()
         await asyncio.gather(*watchers, return_exceptions=True)
         for record, panel in zip(eligible, panels):
-            votes = [vote if vote is not None else _error(judge, aborted or "not_evaluated")
+            votes = [vote if vote is not None else _error(judge, stop_reason or states.JUDGE_VOTE_ERROR_NOT_EVALUATED)
                      for judge, vote in zip(judges, panel)]
             complete = bool(votes) and all(vote.status == "completed" for vote in votes)
             yes = sum(vote.verdict is True for vote in votes)
@@ -236,7 +242,8 @@ async def judge_records(
         summary["judge_calls_errors"] = sum(vote.status == "error" for record in eligible
                                             for vote in record.judgement.votes)
         summary["duration_seconds"] = time.monotonic() - start
-        summary["stop_reason"] = aborted
+        states.check_judging_stop_reason(stop_reason)
+        summary["stop_reason"] = stop_reason
         if logged_failures > 1:
             logger.warning("%s additional judge failures; repeated tracebacks suppressed", logged_failures - 1)
         emit("judging_finished")

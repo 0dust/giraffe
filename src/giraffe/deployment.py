@@ -518,7 +518,8 @@ async def probe_context_windows(config) -> dict[str, dict]:
 
 
 def unknown_residency(target, reason):
-    return {"state": "unknown", "source": "ollama /api/ps" if target.deployment.discovery == "ollama" else None,
+    states.check_residency_state(states.RESIDENCY_UNKNOWN)
+    return {"state": states.RESIDENCY_UNKNOWN, "source": "ollama /api/ps" if target.deployment.discovery == "ollama" else None,
             "target": target.name, "model": sanitize(target.model),
             "scope": "configured endpoint; other replicas unverified",
             "collected_at": None, "reason": reason}
@@ -570,10 +571,11 @@ async def model_residency(target, config, *, deadline=None, stop=None):
         requested = _ollama_model_name(target.model)
         names = [_ollama_model_name(entry.get("model", entry.get("name"))) for entry in entries]
         resident = requested in names
-        result.update(state="resident" if resident else "not_resident", collected_at=now(),
+        result.update(state=states.RESIDENCY_RESIDENT if resident else states.RESIDENCY_NOT_RESIDENT, collected_at=now(),
                       reason="Requested model listed by runtime." if resident else "Requested model absent from runtime inventory.")
     except (httpx.HTTPError, ValueError, OSError, TimeoutError):
         result["reason"] = "Runtime residency inventory unavailable or invalid."
+    states.check_residency_state(result["state"])
     return result
 
 

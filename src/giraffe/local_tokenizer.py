@@ -24,6 +24,7 @@ PREPARATION_TIMEOUT_SECONDS = 10.0
 TARGET_PREPARATION_TIMEOUT_SECONDS = 20.0
 SETUP_TIMEOUT_SECONDS = 30.0
 AUTOMATIC_SETUP_TIMEOUT_SECONDS = 5.0
+AUTO = "auto"
 BUILTIN = "builtin"
 BUILTIN_ENCODING = "o200k_base"
 BUILTIN_SHA256 = "446a9538cb6c348e3516120d7c08b09f57c36495e2acfffe59a5bf8b0cfb1a2d"
@@ -166,9 +167,9 @@ async def resolve_hub_name(name):
 async def _resolve_tokenizer(config, target, verified, *, include_server_metadata=True):
     from .preflight import ModelDiscovery, PreflightError, discover_models
 
-    name, source = _remembered_alias(target) or target.model, "target_model"
+    name, source = _remembered_alias(target) or target.model, states.TOKENIZER_SOURCE_TARGET_MODEL
     if name != target.model:
-        source = "remembered_mapping"
+        source = states.TOKENIZER_SOURCE_REMEMBERED_MAPPING
     try:
         ready = verified.get(name) or await _verify_tokenizer(name, allow_download=False)
         verified[name] = ready
@@ -187,15 +188,15 @@ async def _resolve_tokenizer(config, target, verified, *, include_server_metadat
                 models = await discover_models(body, allow_manual=True, include_tokenizers=True)
             resolved = models.get("tokenizers", {}).get(target.model)
             if resolved:
-                return resolved, "server_model_root"
+                return resolved, states.TOKENIZER_SOURCE_SERVER_MODEL_ROOT
         except (PreflightError, TimeoutError):
             pass
-    if source == "remembered_mapping" or Path(name).is_dir():
+    if source == states.TOKENIZER_SOURCE_REMEMBERED_MAPPING or Path(name).is_dir():
         return name, source
     resolved = await resolve_hub_name(name)
     if resolved:
-        return resolved, "hub_resolution"
-    return BUILTIN, "builtin_fallback"
+        return resolved, states.TOKENIZER_SOURCE_HUB_RESOLUTION
+    return BUILTIN, states.TOKENIZER_SOURCE_BUILTIN_FALLBACK
 
 
 async def ensure_tokenizers(config, *, include_server_metadata=True):
@@ -212,8 +213,8 @@ async def ensure_tokenizers(config, *, include_server_metadata=True):
         identity = (target.url, target.model, target.tokenizer)
         if target._tokenizer_setup.get("identity") == identity:
             continue
-        name, source = target.tokenizer or "auto", "configured" if target.tokenizer else "automatic"
-        automatic = name == "auto"
+        name, source = target.tokenizer or AUTO, states.TOKENIZER_SOURCE_CONFIGURED
+        automatic = name == AUTO
         if automatic:
             started = time.monotonic()
             try:
@@ -223,17 +224,17 @@ async def ensure_tokenizers(config, *, include_server_metadata=True):
                     name, source = await _resolve_tokenizer(config, target, verified, **(
                         {} if include_server_metadata else {"include_server_metadata": False}))
             except (TimeoutError, TokenizerUnavailable, ImportError):
-                name, source = BUILTIN, "builtin_fallback"
+                name, source = BUILTIN, states.TOKENIZER_SOURCE_BUILTIN_FALLBACK
             finally:
                 discovery_remaining -= time.monotonic() - started
-        if name == BUILTIN and source == "configured":
-            source = "builtin"
+        if name == BUILTIN and source == states.TOKENIZER_SOURCE_CONFIGURED:
+            source = states.TOKENIZER_SOURCE_BUILTIN
         try:
             async with asyncio.timeout(SETUP_TIMEOUT_SECONDS):
                 ready = verified.get(name) or await _verify_tokenizer(name)
         except (TimeoutError, TokenizerUnavailable) as error:
             if automatic and name != BUILTIN:
-                name, source = BUILTIN, "builtin_fallback"
+                name, source = BUILTIN, states.TOKENIZER_SOURCE_BUILTIN_FALLBACK
                 async with asyncio.timeout(SETUP_TIMEOUT_SECONDS):
                     ready = verified.get(name) or await _verify_tokenizer(name)
             else:
@@ -242,18 +243,19 @@ async def ensure_tokenizers(config, *, include_server_metadata=True):
                     f'Could not load tokenizer "{name}": {reason.rstrip(".")}.',
                     code=getattr(error, "code", "tokenizer_unavailable"), target_index=index) from None
         verified[name] = ready
+        states.check_tokenizer_source(source)
         target._tokenizer_setup = {"tokenizer": name, "source": source,
             "chat_template": ready.get("chat_template", False), "identity": identity,
-            "requested": target.tokenizer or "auto"}
+            "requested": target.tokenizer or AUTO}
         if name != BUILTIN:
             _remember_alias(target, name)
 
 
-async def preview_tokenizer(model, token_id="auto"):
+async def preview_tokenizer(model, token_id=AUTO):
     """Verify only an explicit Token ID; automatic resolution happens at run start."""
-    requested = token_id.strip() or "auto"
-    if requested.lower() in {"auto", "automatic", BUILTIN}:
-        tokenizer = BUILTIN if requested.lower() == BUILTIN else "auto"
+    requested = token_id.strip() or AUTO
+    if requested.lower() in {AUTO, "automatic", BUILTIN}:
+        tokenizer = BUILTIN if requested.lower() == BUILTIN else AUTO
         return {"status": "ready", "tokenizer": tokenizer, "message": ""}
     try:
         async with asyncio.timeout(SETUP_TIMEOUT_SECONDS):
@@ -284,13 +286,17 @@ async def prepare_messages(run, target, scenario, build_messages, target_tokens,
     """
     setup = getattr(target, "_tokenizer_setup", {})
     tokenizer = setup.get("tokenizer") or getattr(target, "tokenizer", None) or BUILTIN
-    if tokenizer == "auto":
+    if tokenizer == AUTO:
         tokenizer = BUILTIN
     builtin = tokenizer == BUILTIN
-    result = dict(status="unavailable", reason=None, reason_code="tokenizer_unavailable",
+    source = setup.get("source") or (states.TOKENIZER_SOURCE_CONFIGURED
+                                    if getattr(target, "tokenizer", None) else states.TOKENIZER_SOURCE_BUILTIN)
+    states.check_tokenizer_source(source)
+    result = dict(status=states.TOKENIZER_CALIBRATION_UNAVAILABLE, reason=None,
+                  reason_code=states.TOKENIZER_CALIBRATION_REASON_TOKENIZER_UNAVAILABLE,
                   target_tokens=target_tokens, input_tokens=None, filler_chars=0,
                   request_ids=[], method="local_tokenizer", tokenizer=tokenizer,
-                  tokenizer_source=setup.get("source") or ("configured" if getattr(target, "tokenizer", None) else "builtin"),
+                  tokenizer_source=source,
                   chat_template=False, local_files_only=True)
     _progress(run, target, scenario, "running", tokenizer=tokenizer, target_tokens=target_tokens)
     failures = getattr(run, "_tokenizer_unavailable", {})
@@ -298,6 +304,7 @@ async def prepare_messages(run, target, scenario, build_messages, target_tokens,
     if tokenizer in failures:
         result["reason"] = failures[tokenizer]
         _progress(run, target, scenario, "unavailable", reason=result["reason"])
+        states.check_tokenizer_calibration(result["status"], result["reason_code"])
         return result
     process = None
     started = time.monotonic()
@@ -307,6 +314,7 @@ async def prepare_messages(run, target, scenario, build_messages, target_tokens,
     if remaining <= 0:
         result["reason"] = f"Local prompt preparation reached its {TARGET_PREPARATION_TIMEOUT_SECONDS:g}s target budget; no inference calibration was sent."
         _progress(run, target, scenario, "unavailable", reason=result["reason"])
+        states.check_tokenizer_calibration(result["status"], result["reason_code"])
         return result
     run_deadline = getattr(run, "deadline", float("inf"))
     target_deadline = started + remaining
@@ -340,7 +348,8 @@ async def prepare_messages(run, target, scenario, build_messages, target_tokens,
                 if within_range and (abs(tokens - target_tokens) <= max(1, target_tokens * tolerance)
                                      or (filler == 0 and tokens > target_tokens)):
                     floor = filler == 0 and tokens > target_tokens
-                    result.update(status="calibrated", reason_code="minimum_prompt_length" if floor else None,
+                    result.update(status=states.TOKENIZER_CALIBRATION_CALIBRATED,
+                                  reason_code=states.TOKENIZER_CALIBRATION_REASON_MINIMUM_PROMPT_LENGTH if floor else None,
                                   reason=(f"Input target {target_tokens} is below the minimum prompt length "
                                           f"({tokens} tokens with the local tokenizer)" if floor else None),
                                   messages=messages)
@@ -362,9 +371,9 @@ async def prepare_messages(run, target, scenario, build_messages, target_tokens,
                         result["sizing_gap"] = True
                     break
                 filler = candidate
-            if result["status"] != "calibrated":
+            if result["status"] != states.TOKENIZER_CALIBRATION_CALIBRATED:
                 result.update(reason="Local prompt sizing could not reach the requested token target within its bounded attempts.",
-                              reason_code="input_sizing_unavailable")
+                              reason_code=states.TOKENIZER_CALIBRATION_REASON_INPUT_SIZING_UNAVAILABLE)
     except asyncio.CancelledError:
         reason = run.stop_reason(target.name) if hasattr(run, "stop_reason") else None
         if reason == states.STOP_REQUEST_BUDGET:
@@ -393,10 +402,11 @@ async def prepare_messages(run, target, scenario, build_messages, target_tokens,
             await process.wait()
         budgets[target.name] = budgets.get(target.name, 0) + time.monotonic() - started
     result["elapsed_seconds"] = round(time.monotonic() - started, 3)
-    if builtin and result["status"] == "calibrated":
+    if builtin and result["status"] == states.TOKENIZER_CALIBRATION_CALIBRATED:
         result["reason"] = BUILTIN_NOTICE + (" " + result["reason"] if result["reason"] else "")
         result["encoding"] = BUILTIN_ENCODING
-    _progress(run, target, scenario, "completed" if result["status"] == "calibrated" else "unavailable",
+    states.check_tokenizer_calibration(result["status"], result["reason_code"])
+    _progress(run, target, scenario, "completed" if result["status"] == states.TOKENIZER_CALIBRATION_CALIBRATED else "unavailable",
               reason=result["reason"], tokenizer=tokenizer, builtin=builtin, input_tokens=result["input_tokens"])
     return result
 

@@ -1548,17 +1548,19 @@ async def _context_fixtures(run, target, client, fixtures, source=None):
                                             lambda chars: build(chars, variant).messages,
                                             desired, tolerance=.01, accepted_token_range=(minimum, max(0, available)))
             # Only a gap in the token counts can be shifted past; other failures repeat unchanged.
-            if result.get("reason_code") != "input_sizing_unavailable" or not result.get("sizing_gap"):
+            if result.get("reason_code") != states.TOKENIZER_CALIBRATION_REASON_INPUT_SIZING_UNAVAILABLE or not result.get("sizing_gap"):
                 break
         if result.get("input_tokens") is not None and result["input_tokens"] > available and result["filler_chars"] == 0:
-            result.update(status="unavailable", reason_code="context_window_exceeded", reason=(
+            result.update(status=states.TOKENIZER_CALIBRATION_UNAVAILABLE,
+                          reason_code=states.TOKENIZER_CALIBRATION_REASON_CONTEXT_WINDOW_EXCEEDED, reason=(
                 f"The minimum locally counted prompt ({result['input_tokens']} tokens) plus the configured output "
                 f"allowance ({output_budget} tokens) exceeds context_limit ({config.context_limit}). "
                 "Reduce test_options.context.max_output_tokens, or increase test_options.context.context_limit "
                 "only if the server supports that window."))
+        states.check_tokenizer_calibration(result["status"], result.get("reason_code"))
         evidence.append({key: value for key, value in result.items() if key != "messages"}
                         | ({"prompt_variant": "closing_instruction_no_other_text"} if variant else {}))
-        if result["status"] != "calibrated":
+        if result["status"] != states.TOKENIZER_CALIBRATION_CALIBRATED:
             run.observations[target.name]["context_calibration"] = {
                 "status": "unavailable", "reason": result["reason"], "method": "local_tokenizer",
                 "sizing_version": CONTEXT_SIZING_VERSION, "preparations": evidence}
@@ -1635,8 +1637,8 @@ async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attributio
         run.observations[target.name]["deployment"] = await deployment.snapshot(target, config, run.deadline, run.stop,
                     **({"run_start": run.start} if "scale_down" in config.checks else {}))
         run.observations[target.name]["deployment"]["model_residency"] = {
-            "before_preparation": run.preparation_residency.get(target.name, deployment.unknown_residency(target, "Initial observation unavailable.")),
-            "after_preparation": deployment.unknown_residency(target, "Preparation did not reach the second observation."),
+            states.RESIDENCY_BEFORE_PREPARATION: run.preparation_residency.get(target.name, deployment.unknown_residency(target, "Initial observation unavailable.")),
+            states.RESIDENCY_AFTER_PREPARATION: deployment.unknown_residency(target, "Preparation did not reach the second observation."),
         }
         if not await _restart(run, target):
             run.stop_reason(target.name)
@@ -1755,7 +1757,7 @@ async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attributio
                                     "completed" if complete_evidence else "unavailable", evidence.get("reason"))
                     run.finish_condition(target.name, "performance_evidence_probe", reason=evidence.get("reason"),
                                          verdict="pass" if complete_evidence else "inconclusive")
-            run.observations[target.name]["deployment"]["model_residency"]["after_preparation"] = (
+            run.observations[target.name]["deployment"]["model_residency"][states.RESIDENCY_AFTER_PREPARATION] = (
                 await deployment.model_residency(target, config, deadline=run.deadline, stop=run.stop))
             if enabled & {"serving", "first_output"}:
                 response_config = _response_config(config)
@@ -3216,7 +3218,7 @@ async def _stop_judging(evaluation, run):
             "inconclusive_requests": sum(r.score is None for r in records), "skipped_requests": 0,
             "ties": 0, "judge_calls_total": len(records) * len(run.config.judging.judges),
             "judge_calls_completed": len(votes), "judge_calls_errors": sum(v.status == "error" for v in votes),
-            "duration_seconds": None, "stop_reason": "cancelled"}
+            "duration_seconds": None, "stop_reason": states.JUDGING_STOP_CANCELLED}
 
 
 async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, residency, on_scale_down_control=None) -> RunReport:
