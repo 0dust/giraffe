@@ -348,7 +348,26 @@ POST `/api/runs/{id}/cancel` includes `result`:
 | `already_finished` | The run is terminal. |
 | `not_owned` | The run is in progress but this server does not own it. |
 
-Start conflicts keep their HTTP 409 status and detail text. `X-Giraffe-Error-Code` identifies `run_active`, `run_stopping` or `connection_test_running`.
+## Server admission
+
+Server activities are `run_active`, `run_starting`, `run_stopping` and `connection_test_running`.
+The first listed blocker wins. HTTP admission conflicts listed in this table carry `X-Giraffe-Error-Code`
+with the blocking activity code on their 409 responses; other 409s are outside this contract, and existing status and detail text stay the same.
+`recovery` is the background recovery pass, not an HTTP endpoint.
+
+| Operation | Ordered blockers |
+| --- | --- |
+| `start_run` | `run_active`, `run_stopping`, `connection_test_running` |
+| `test_connection` | `run_active`, `run_starting`, `connection_test_running` |
+| `tokenizer_preview` | `run_active` |
+| `compare` | `run_active` |
+| `recovery` | `run_active`, `run_starting`, `run_stopping` |
+
+Test-connection and tokenizer preview are allowed while the previous run is stopping because neither starts another measurement run.
+Tokenizer preview is allowed during a connection test: the UI resolves the tokenizer automatically while the user may be testing the connection, and both only read.
+Test-connection is allowed during storage cleanup and saved-report comparison because neither touches targets.
+
+## Scale-down command outcomes
 
 `mark-scale-down` has its own outcomes and exit codes: `accepted` exits 0, `rejected` exits 1, and `submitted_without_acknowledgment` exits 2.
 
