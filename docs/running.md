@@ -55,6 +55,28 @@ its follow-up (`limits.backend_cancel`, `limits.backend_cancel.followup`, former
 `max_output_tokens` lets a reasoning model stream before the probe is cancelled. A larger allowance does not force a longer answer
 and still needs room alongside the prompt in the model's context window.
 
+### Reasoning models
+
+YAML `request_options` are defaults for ordinary requests: a fixture or request-pack
+case can override a matching key. Gateway access probes use their own options.
+Use them for the reasoning settings your server documents, such as
+`reasoning_effort` or `chat_template_kwargs`:
+
+```yaml
+max_output_tokens: 2048
+request_options:
+  reasoning_effort: low            # or, for templates such as Qwen3 on vLLM/SGLang:
+  # chat_template_kwargs: {enable_thinking: false}
+```
+
+Models and servers differ: GPT-OSS takes `low`, `medium` or `high`; on Ollama,
+`none` falls back to `low` and still reasons. For models with on/off thinking, such
+as Qwen3, Ollama's `none` turns reasoning off. Ollama ignores `chat_template_kwargs`.
+A server may ignore a field it does not support, so check the reasoning output in
+the request evidence. When a server rejects a field, the preflight warning can point
+to `request_options` and the serving check reports the HTTP error. See
+[`examples/reasoning.yaml`](https://github.com/0dust/giraffe/blob/main/examples/reasoning.yaml).
+
 The optional context check verifies recall at 80% of the full declared window.
 Its output allowance must leave at least that much input space; reserving more
 than 20% of the window makes this coverage impossible. For example, a 2,048-token
