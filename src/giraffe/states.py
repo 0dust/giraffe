@@ -5,7 +5,7 @@ from collections.abc import Collection
 from typing import Final
 
 logger = logging.getLogger(__name__)
-# Tests turn this on so an undeclared lifecycle write fails instead of logging.
+# Tests turn this on so undeclared lifecycle states and comparison reasons fail instead of logging.
 STRICT_TRANSITIONS = False
 
 
@@ -17,6 +17,80 @@ EXIT_CODE_BLOCKED: Final = EXIT_CODES["blocked"]
 EXIT_CODE_DEFAULT: Final = 2
 EXIT_CODE_CANCELLED: Final = 130
 EXIT_CODE_USAGE: Final = 4
+
+# Baseline workload comparability is independent of regression/acceptance status.
+BASELINE_COMPARABLE: Final = "comparable"
+BASELINE_NOT_COMPARABLE: Final = "not_comparable"
+BASELINE_UNKNOWN: Final = "unknown"
+BASELINE_COMPARABILITY: Final = (BASELINE_COMPARABLE, BASELINE_NOT_COMPARABLE, BASELINE_UNKNOWN)
+BASELINE_REASON_CODES: Final = {
+    "setting_missing": BASELINE_UNKNOWN,
+    "setting_unknown": BASELINE_UNKNOWN,
+    "target_unknown": BASELINE_UNKNOWN,
+    "config_invalid": BASELINE_UNKNOWN,
+    "request_pack_unknown": BASELINE_UNKNOWN,
+    "multi_user_policy_unknown": BASELINE_UNKNOWN,
+    "fixture_pack_unknown": BASELINE_UNKNOWN,
+    "custom_fixtures_unhashed": BASELINE_UNKNOWN,
+    "gateway_access_missing": BASELINE_UNKNOWN,
+    "gateway_access_settings_unknown": BASELINE_UNKNOWN,
+    "gateway_access_workload_version_unknown": BASELINE_UNKNOWN,
+    "load_samples_missing": BASELINE_UNKNOWN,
+    "user_fairness_unknown": BASELINE_UNKNOWN,
+    "user_delivery_incomplete": BASELINE_UNKNOWN,
+    "comparison_unavailable": BASELINE_UNKNOWN,
+    "setting_differs": BASELINE_NOT_COMPARABLE,
+    "limit_constrained": BASELINE_NOT_COMPARABLE,
+    "target_differs": BASELINE_NOT_COMPARABLE,
+    "schema_differs": BASELINE_NOT_COMPARABLE,
+    "timing_method_differs": BASELINE_NOT_COMPARABLE,
+    "run_aborted": BASELINE_NOT_COMPARABLE,
+    "evaluation_failed": BASELINE_NOT_COMPARABLE,
+    "config_unsupported": BASELINE_NOT_COMPARABLE,
+    "request_source_differs": BASELINE_NOT_COMPARABLE,
+    "request_pack_differs": BASELINE_NOT_COMPARABLE,
+    "judge_incomplete": BASELINE_UNKNOWN,
+    "multi_user_policy_differs": BASELINE_NOT_COMPARABLE,
+    "cancellation_grading_differs": BASELINE_NOT_COMPARABLE,
+    "fixture_pack_differs": BASELINE_NOT_COMPARABLE,
+    "workload_format_changed": BASELINE_NOT_COMPARABLE,
+    "target_absent": BASELINE_NOT_COMPARABLE,
+    "gateway_access_settings_differs": BASELINE_NOT_COMPARABLE,
+    "gateway_access_transport_differs": BASELINE_NOT_COMPARABLE,
+    "gateway_access_workload_version_differs": BASELINE_NOT_COMPARABLE,
+    "user_delivery_differs": BASELINE_NOT_COMPARABLE,
+    "user_delivery_zero_baseline": BASELINE_UNKNOWN,
+    "user_fairness_differs": BASELINE_NOT_COMPARABLE,
+    "user_slots_differs": BASELINE_NOT_COMPARABLE,
+    "load_work_excluded": BASELINE_NOT_COMPARABLE,
+    "scale_down_unsupported": BASELINE_NOT_COMPARABLE,
+}
+
+LOAD_ACCEPTANCE_NOT_ESTABLISHED: Final = "not_established"
+LOAD_ACCEPTANCE_NOT_TESTED_IN_CURRENT: Final = "not_tested_in_current"
+LOAD_ACCEPTANCE_NOT_TESTED_IN_BASELINE: Final = "not_tested_in_baseline"
+LOAD_ACCEPTANCE_WORK_CHANGED: Final = "work_changed"
+LOAD_ACCEPTANCE_UNCHANGED_ACCEPTED: Final = "unchanged_accepted"
+LOAD_ACCEPTANCE_UNCHANGED_NOT_ACCEPTED: Final = "unchanged_not_accepted"
+LOAD_ACCEPTANCE_LOST: Final = "lost"
+LOAD_ACCEPTANCE_GAINED: Final = "gained"
+LOAD_ACCEPTANCE_ACCEPTED_BASELINE_NOT_ESTABLISHED: Final = "accepted_baseline_not_established"
+LOAD_ACCEPTANCE_NOT_ESTABLISHED_IN_CURRENT: Final = "not_established_in_current"
+LOAD_ACCEPTANCE_NOT_ESTABLISHED_IN_BASELINE: Final = "not_established_in_baseline"
+LOAD_ACCEPTANCE_CHANGES: Final = (
+    LOAD_ACCEPTANCE_NOT_ESTABLISHED,
+    LOAD_ACCEPTANCE_NOT_TESTED_IN_CURRENT,
+    LOAD_ACCEPTANCE_NOT_TESTED_IN_BASELINE,
+    LOAD_ACCEPTANCE_WORK_CHANGED,
+    LOAD_ACCEPTANCE_UNCHANGED_ACCEPTED,
+    LOAD_ACCEPTANCE_UNCHANGED_NOT_ACCEPTED,
+    LOAD_ACCEPTANCE_LOST,
+    LOAD_ACCEPTANCE_GAINED,
+    LOAD_ACCEPTANCE_ACCEPTED_BASELINE_NOT_ESTABLISHED,
+    LOAD_ACCEPTANCE_NOT_ESTABLISHED_IN_CURRENT,
+    LOAD_ACCEPTANCE_NOT_ESTABLISHED_IN_BASELINE,
+)
+
 
 # Request record: report.json requests[].status and evidence.jsonl (models.RequestRecord.status).
 REQUEST_STATUSES: Final = ("completed", "failed", "timeout", "cancelled")
@@ -303,6 +377,32 @@ def check_check_phase_transition(current: str, new: str) -> None:
     logger.warning(message)
 
 
+def check_reason_code(code: str | None, *, text: str = "") -> None:
+    """Reject missing/undeclared reason coverage in tests; warn in production."""
+    if code in BASELINE_REASON_CODES:
+        return
+    message = f"Undeclared baseline reason code: {code!r} ({text})"
+    if STRICT_TRANSITIONS:
+        raise AssertionError(message)
+    logger.warning(message)
+
+
+def worst_baseline_comparability(verdicts: Collection[str]) -> str:
+    """Combine target verdicts in severity order, including an empty comparison."""
+    if BASELINE_NOT_COMPARABLE in verdicts:
+        return BASELINE_NOT_COMPARABLE
+    if BASELINE_UNKNOWN in verdicts:
+        return BASELINE_UNKNOWN
+    return BASELINE_COMPARABLE
+
+
+def baseline_comparability(codes: Collection[str]) -> str:
+    for code in codes:
+        check_reason_code(code)
+    return worst_baseline_comparability([
+        BASELINE_REASON_CODES.get(code, BASELINE_UNKNOWN) for code in codes])
+
+
 def run_recoverable(state: str | None, journal_present: bool, report_available: bool) -> bool:
     """An interrupted journal needs recovery until a valid report owns its evidence."""
     return state == RUN_INTERRUPTED and journal_present and not report_available
@@ -315,6 +415,9 @@ def describe() -> dict:
                        "usage_error": EXIT_CODE_USAGE, "default": EXIT_CODE_DEFAULT},
         "request_statuses": list(REQUEST_STATUSES), "run_states": list(RUN_STATES),
         "judged_checks": sorted(JUDGED_CHECKS),
+        "baseline_comparability": list(BASELINE_COMPARABILITY),
+        "baseline_reason_codes": dict(BASELINE_REASON_CODES),
+        "load_acceptance_changes": list(LOAD_ACCEPTANCE_CHANGES),
         "server_activities": list(SERVER_ACTIVITIES),
         "admission": {operation: list(blockers) for operation, blockers in ADMISSION_BLOCKERS.items()},
         "run_in_progress_states": sorted(RUN_IN_PROGRESS_STATES),

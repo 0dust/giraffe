@@ -233,6 +233,8 @@ giraffe inspect runs/before/report.json
 
 ## Compare with a baseline
 
+For machine-readable comparison verdicts and reason codes, see [Baseline comparability](states.md#baseline-comparability).
+
 In the UI, open a completed run. Fully passing runs offer **Save baseline**; other
 completed runs offer **Save as reference baseline**. Give it a name and choose
 **Save baseline**.
