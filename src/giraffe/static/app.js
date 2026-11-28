@@ -40,7 +40,7 @@ function updateAPIKeySummary() {
   const key=apiKeyFor(form.elements.url.value),ref=form.elements.api_key_env?.value.trim();
   $('.row-value',summary).textContent=key?'Set for this tab':ref||'Not set';
 }
-const state = {bootstrap:null, runs:[], storage:null, storageUnavailable:false, cleanup:null, cleanupResult:null, baselines:[], detail:null, mosaicFollow:true, config:null, active:null, diskActive:null, routeVersion:0, setupNavigationSequence:0, poll:null, tab:'checks', selectedCheck:null, checkNavigatorOpen:false, filter:'all', historySearch:'', comparisonFilter:null, comparisonCheck:'all', submitting:false, openTest:null, configView:'form', jsonDraft:null, jsonBase:null, configRevision:0, configBusy:false, showAvailableTests:false, formMode:'normal', formRestartTarget:null, requestPreview:null, previewSequence:0, planTimer:null, setupPreset:null, catalogueFilter:'all', catalogueCategory:'all', catalogueSearch:'', setupStep:1, focusSetupOnEntry:false, returnToReview:false, modelDiscovery:null, modelDiscoverySequence:0, connectionTestsInFlight:0, autoModel:null, datasetSelection:[], datasetImportSequence:0, judgeEditorOpen:null, datasetImport:null, datasetEditor:null, datasetTry:null, migrationNotes:[], migrationLimitNotes:[], migrationWarnings:[], dismissedMigrationNotes:[], loadPanels:{}, limitValues:{}, jsonValidation:null};
+const state = {bootstrap:null, runs:[], storage:null, storageUnavailable:false, cleanup:null, cleanupResult:null, baselines:[], detail:null, mosaicFollow:true, config:null, active:null, diskActive:null, routeVersion:0, setupNavigationSequence:0, poll:null, pollGeneration:0, tab:'checks', selectedCheck:null, checkNavigatorOpen:false, filter:'all', historySearch:'', comparisonFilter:null, comparisonCheck:'all', submitting:false, openTest:null, configView:'form', jsonDraft:null, jsonBase:null, configRevision:0, configBusy:false, showAvailableTests:false, formMode:'normal', formRestartTarget:null, requestPreview:null, previewSequence:0, planTimer:null, setupPreset:null, catalogueFilter:'all', catalogueCategory:'all', catalogueSearch:'', setupStep:1, focusSetupOnEntry:false, returnToReview:false, modelDiscovery:null, modelDiscoverySequence:0, connectionTestsInFlight:0, autoModel:null, datasetSelection:[], datasetImportSequence:0, judgeEditorOpen:null, datasetImport:null, datasetEditor:null, datasetTry:null, migrationNotes:[], migrationLimitNotes:[], migrationWarnings:[], dismissedMigrationNotes:[], loadPanels:{}, limitValues:{}, jsonValidation:null};
 state.setupWorkspace=null;
 function resetJsonDraft(){state.jsonDraft=null;state.jsonBase=null;}
 const statusLabels = {not_applicable:'Not applicable',measured:'Measured',warmup:'Warmup',pass:'Passed',fail:'Failed',failed:'Failed',timeout:'Timed out',inconclusive:'Inconclusive',skipped:'Not run',idle:'Unused',blocked:'Blocked',running:'Running',queued:'Queued',reserved:'Reserved',stopping:'Stopping',error:'Runner error',completed:'Finished',stopped:'Stopped',cancelled:'Cancelled',interrupted:'Interrupted'};
@@ -749,7 +749,7 @@ function expireAccess() {
   if(!state.accessExpired){
     connectionError('Giraffe was restarted. Open the new link printed by giraffe ui in your terminal.');
     state.accessExpired=true;
-    clearPoll();cancelLiveFetch();
+    applyPollMode();
   }
   return Object.assign(new Error('Access expired.'),{status:401});
 }
@@ -800,13 +800,30 @@ function updateTitle() {
 }
 function pageVisible() { return document.visibilityState!=='hidden'; }
 function storageVisible() { return pageVisible()&&(location.hash==='#runs'||Boolean($('#storage-dialog')?.open)); }
-function clearPoll() { clearTimeout(state.poll);state.poll=null; }
+function clearPoll() { if(state.poll!=null)clearTimeout(state.poll);state.poll=null; }
 function cancelLiveFetch() { state.eventAbort?.abort();state.eventAbort=null; }
-function schedulePoll(callback, version, delay=1800) { clearPoll();if(state.accessExpired||!pageVisible())return;state.poll=setTimeout(()=>{if(!state.accessExpired&&version===state.routeVersion&&pageVisible()) callback(version);},Math.max(300,delay,(state.eventPollAfter || 0)-Date.now())); }
-async function refreshStorage() {
+function pollCurrent(version, generation) { return version===state.routeVersion&&generation===state.pollGeneration&&!state.accessExpired&&pageVisible(); }
+function schedulePoll(callback, version, delay=1800) {
+  const generation=state.pollGeneration;
+  clearPoll();if(!pollCurrent(version,generation))return;
+  state.poll=setTimeout(()=>{state.poll=null;if(pollCurrent(version,generation))return callback(version,{generation});},Math.max(300,delay,(state.eventPollAfter || 0)-Date.now()));
+}
+function applyPollMode(delay) {
+  clearPoll();cancelLiveFetch();++state.pollGeneration;
+  if(delay===undefined&&pageVisible())state.pollStatusOnly=location.hash!=='#runs'&&location.hash!=='#new'&&!reportRoute();
+  if(delay===null||state.accessExpired||!pageVisible())return;
+  let callback,nextDelay=300;
+  if(state.pollStatusOnly){if(state.active)callback=pollRunStatus;}
+  else if(location.hash==='#new'){callback=pollNew;nextDelay=state.active?300:10000;}
+  else if(!reportRoute())callback=pollRuns;
+  else if(state.reportRouteActive&&state.detail?.id===reportRoute().id&&activeState(state.detail))callback=pollDetail;
+  else if(state.active)callback=pollRunStatus;
+  if(callback)schedulePoll(callback,state.routeVersion,delay??nextDelay);
+}
+async function refreshStorage(current=()=>true) {
   if(!storageVisible())return;
-  try{state.storage=await api('/api/storage');state.storageUnavailable=false;}
-  catch{state.storage=null;state.storageUnavailable=true;}
+  try{const storage=await api('/api/storage');if(!current())return;state.storage=storage;state.storageUnavailable=false;}
+  catch{if(!current())return;state.storage=null;state.storageUnavailable=true;}
 }
 // Reads and writes share a clock: arrival order alone cannot establish freshness.
 const runWrites=new Map(),runListReads=new Set(),runDetailReads=new WeakMap();
@@ -869,10 +886,11 @@ function reconcileRunDetail(detail){
     return detail;
   }finally{if(handoff){entry.reads.delete(read);entry.readers--;retireRunWrites(id,entry);}}
 }
-async function refreshRuns() {
+async function refreshRuns(current=()=>true) {
   const start=++runWriteClock;runListReads.add(start);
   let runs;
-  try{[runs]=await Promise.allSettled([api('/api/runs'),refreshStorage()]);
+  try{[runs]=await Promise.allSettled([api('/api/runs'),refreshStorage(current)]);
+    if(!current())return;
     if(runs.status==='fulfilled')for(const row of runs.value.runs||[]){
       const entry=runWrites.get(row.id),keep=entry?.keep;
       if(keep&&keep.at>start)row.kept=entry.detailStart>keep.at?entry.detailKept:keep.value;
@@ -881,12 +899,17 @@ async function refreshRuns() {
   if(runs.status==='rejected')throw runs.reason;
   const data=runs.value;state.runs=data.runs || [];state.diskActive=data.disk_active_id || null;setActive(data.active_run_id);$('#run-count').textContent=state.runs.length || '';renderRailRuns();return data;
 }
-async function runEvents(id, after=0) {
+async function runEvents(id, after=0, generation=state.pollGeneration) {
+  cancelLiveFetch();
   const controller=typeof AbortController==='function'?new AbortController():null;
   state.eventAbort=controller;
   state.eventPollAfter=Date.now()+300;
-  try{const delta=await api(`${runPath(id)}/events?after=${Number.isFinite(after)?after:0}`,controller?{signal:controller.signal}:{});state.eventPollAfter=Date.now()+(delta.reset||delta.idle?1800:300);return delta;}
-  finally{if(state.eventAbort===controller)state.eventAbort=null;}
+  try{
+    const delta=await api(`${runPath(id)}/events?after=${Number.isFinite(after)?after:0}`,controller?{signal:controller.signal}:{});
+    if(controller?.signal.aborted)throw controller.signal.reason??(typeof DOMException==='function'?new DOMException('Aborted','AbortError'):Object.assign(new Error('Aborted'),{name:'AbortError'}));
+    if(generation===state.pollGeneration)state.eventPollAfter=Date.now()+(delta.reset||delta.idle?1800:300);
+    return delta;
+  }finally{if(state.eventAbort===controller)state.eventAbort=null;}
 }
 function mergeRunEvents(detail, delta) {
   const events=delta.events || [],keys=['state','progress','live_request_count','live_request_summary','live_preparations','timeout_warnings','phases','error','abort_reason','scale_down_control'];
@@ -982,10 +1005,10 @@ async function route() {
   for(const id of ['baseline-dialog','comparison-dialog','storage-dialog']){const dialog=$('#'+id);if(dialog?.open)dialog.close();}
   if ($('#new-run-form')) captureFormDraft();
   window.scrollTo?.({top:0,left:0,behavior:'instant'});
-  clearPoll();cancelLiveFetch();const version=++state.routeVersion;const hash=location.hash;
+  state.pollStatusOnly=false;applyPollMode(null);const version=++state.routeVersion;const hash=location.hash;
   try {
     if(!hash){location.hash=state.active?linkRun(state.active):'#new';return;}
-    if (hash==='#new') { updateNav('new','New run');state.config ||= clone(state.bootstrap.config);const focusSetup=state.focusSetupOnEntry;state.focusSetupOnEntry=false;renderNew();enterRoute();if(pendingTimeoutSetting){const path=pendingTimeoutSetting;pendingTimeoutSetting=null;focusSetting(path,{explicit:true});}else if(focusSetup)syncSetupStep({focus:true});schedulePoll(pollNew,version,state.active?3000:10000);return; }
+    if (hash==='#new') { updateNav('new','New run');state.config ||= clone(state.bootstrap.config);const focusSetup=state.focusSetupOnEntry;state.focusSetupOnEntry=false;renderNew();enterRoute();if(pendingTimeoutSetting){const path=pendingTimeoutSetting;pendingTimeoutSetting=null;focusSetting(path,{explicit:true});}else if(focusSetup)syncSetupStep({focus:true});applyPollMode(state.active?3000:10000);return; }
     if (destination) {
       const id=destination.id;updateNav('runs','Run detail');
       state.detail=null;
@@ -995,66 +1018,73 @@ async function route() {
       if(reportView.tab==='performance'&&typeof fetch==='function')loadPerformance({force:true});
       if(destination?.requestId)await openRequest(destination.requestId);
       if(version!==state.routeVersion)return;
-      if(activeState(detail))schedulePoll(pollDetail,version,300);else if(state.active)schedulePoll(pollRunStatus,version,3000);return;
+      applyPollMode(activeState(detail)?300:3000);return;
     }
     updateNav('runs','Runs');$('#main').innerHTML='<div class="loading">Loading runs…</div>';
     await refreshRuns();if(version!==state.routeVersion)return;
-    renderRuns();enterRoute();schedulePoll(pollRuns,version,3000);
+    renderRuns();enterRoute();applyPollMode(3000);
   } catch(error) {
     if(version!==state.routeVersion)return;
+    state.pollStatusOnly=true;
     if(destination&&error.status===404){
       updateNav('runs','Run not found');
-      $('#main').innerHTML='<div class="page-heading"><h1>Run not found</h1><p>This run is not available in the current run directory.</p></div><a class="button" href="#runs">Back to runs</a>';schedulePoll(pollRunStatus,version,3000);focusRouteHeading();return;
+      $('#main').innerHTML='<div class="page-heading"><h1>Run not found</h1><p>This run is not available in the current run directory.</p></div><a class="button" href="#runs">Back to runs</a>';applyPollMode(3000);focusRouteHeading();return;
     }
     $('#main').innerHTML=`<div class="page-heading"><h1>Could not open this view</h1></div>${notice(error.message,'error')}<button class="button" data-action="retry">Try again</button>`;
-    schedulePoll(pollRunStatus,version,3000);focusRouteHeading();
+    applyPollMode(3000);focusRouteHeading();
   }
 }
-async function pollRuns(version) {
+async function pollRuns(version,{generation=state.pollGeneration}={}) {
+  const current=()=>pollCurrent(version,generation);if(!current())return;
   try {
     const active=state.active;
-    if(state.active)await Promise.all([pollRunStatus(version,{schedule:false}),refreshStorage()]);else await refreshRuns();if(version!==state.routeVersion)return;
+    if(state.active)await Promise.all([pollRunStatus(version,{schedule:false,generation}),refreshStorage(current)]);else await refreshRuns(current);if(!current())return;
     if(!active)connectionError();renderRunsIfChanged();
-  }catch(error){if(version===state.routeVersion)connectionError(error.message+' Your saved runs have not changed.');}
-  if(version===state.routeVersion)schedulePoll(pollRuns,version,3000);
+  }catch(error){if(error.name==='AbortError')return;if(current())connectionError(error.message+' Your saved runs have not changed.');}
+  if(current())applyPollMode(3000);
 }
-async function pollRunStatus(version,{schedule=true}={}) {
-  const id=state.active;if(!id)return;let delay=300;
+async function pollRunStatus(version,{schedule=true,generation=state.pollGeneration}={}) {
+  const current=()=>pollCurrent(version,generation);
+  const id=state.active;if(!id||!current())return;let delay=300;
   try{
     if(state.statusRun?.id!==id)state.statusRun={id,state:RUN.RUNNING,seq:0};
-    const delta=await runEvents(id,state.statusRun.seq);
-    if(version!==state.routeVersion||state.active!==id)return;
+    const delta=await runEvents(id,state.statusRun.seq,generation);
+    if(!current())return;
+    if(state.active!==id){if(schedule)applyPollMode(300);return;}
     if(delta.reset||delta.idle)delay=1800;
-    if(delta.reset)state.statusRun=reconcileRunDetail(await fetchRunDetail(id,{handoff:true}));else mergeRunEvents(state.statusRun,delta);
-    if(version!==state.routeVersion||state.active!==id)return;
+    const status=delta.reset?reconcileRunDetail(await fetchRunDetail(id,{handoff:true})):mergeRunEvents(state.statusRun,delta);
+    if(!current())return;
+    if(state.active!==id){if(schedule)applyPollMode(300);return;}
+    state.statusRun=status;
     const saved=state.runs.find(run=>run.id===id);if(saved)saved.state=state.statusRun.state;
-    if(!activeState(state.statusRun)){setActive(null);await refreshRuns();}
+    if(!activeState(state.statusRun)){setActive(null);await refreshRuns(current);if(!current())return;}
     connectionError();renderRailRuns();
-  }catch(error){if(error.name==='AbortError')return;delay=3000;if(version===state.routeVersion)connectionError(error.message);}
-  if(schedule&&version===state.routeVersion&&state.active)schedulePoll(pollRunStatus,version,delay);
+  }catch(error){if(error.name==='AbortError')return;delay=3000;if(current())connectionError(error.message);}
+  if(schedule&&current())applyPollMode(delay);
 }
-async function pollNew(version) {
-  if(!pageVisible())return;
-  try{if(state.active)await pollRunStatus(version,{schedule:false});else await refreshRuns();}
-  catch(error){if(error.name==='AbortError')return;if(version===state.routeVersion)connectionError(error.message);}
-  if(version!==state.routeVersion)return;
+async function pollNew(version,{generation=state.pollGeneration}={}) {
+  const current=()=>pollCurrent(version,generation);if(!current())return;
+  try{if(state.active)await pollRunStatus(version,{schedule:false,generation});else await refreshRuns(current);}
+  catch(error){if(error.name==='AbortError')return;if(current())connectionError(error.message);}
+  if(!current())return;
   const button=$('#start-run');if(button&&!state.submitting)button.disabled=!canStartRun();const activeNotice=$('#new-active-notice');if(activeNotice){activeNotice.hidden=!(state.active||state.diskActive);activeNotice.innerHTML=newActiveNotice();}
-  schedulePoll(pollNew,version,state.active?3000:10000);
+  applyPollMode(state.active?3000:10000);
 }
 let detailEpoch=0,detailSequence=0,lastDetailSequence=0;
-async function pollDetail(version) {
+async function pollDetail(version,{generation=state.pollGeneration}={}) {
+  const current=()=>pollCurrent(version,generation);if(!current())return;
   const key=reportRouteKey(),id=state.detail.id,epoch=detailEpoch,sequence=++detailSequence;
   try {
-    const delta=await runEvents(id,state.detail.seq);if(version!==state.routeVersion || state.detail?.id!==id || sequence<lastDetailSequence||reportRouteKey()!==key)return;
+    const delta=await runEvents(id,state.detail.seq,generation);if(!current() || state.detail?.id!==id || sequence<lastDetailSequence||reportRouteKey()!==key)return;
     if(!activeState(state.detail)&&activeState({state:delta.state}))return;
     const wasStopping=state.detail.state===RUN.STOPPING;
     let detail=delta.reset?reconcileRunDetail(await fetchRunDetail(id,{handoff:true})):mergeRunEvents(state.detail,delta);
-    if(version!==state.routeVersion || state.detail?.id!==id || sequence<lastDetailSequence||reportRouteKey()!==key)return;
+    if(!current() || state.detail?.id!==id || sequence<lastDetailSequence||reportRouteKey()!==key)return;
     const completed=!activeState(detail);
-    if(completed&&!delta.reset){detail=reconcileRunDetail(await fetchRunDetail(id,{handoff:true}));if(version!==state.routeVersion||state.detail?.id!==id||sequence<lastDetailSequence||reportRouteKey()!==key)return;}
+    if(completed&&!delta.reset){detail=reconcileRunDetail(await fetchRunDetail(id,{handoff:true}));if(!current()||state.detail?.id!==id||sequence<lastDetailSequence||reportRouteKey()!==key)return;}
     detail.state=nextLiveRunState(wasStopping?RUN.STOPPING:null,detail.state);
     if([RUN.RUNNING,RUN.QUEUED].includes(detail.state)&&(epoch!==detailEpoch||state.stopPending?.id===id)){
-      schedulePoll(pollDetail,version,500);return;
+      applyPollMode(500);return;
     }
     if(!activeState(state.detail)&&activeState(detail))return;
     detail.state=nextLiveRunState(state.detail.state,detail.state);
@@ -1066,8 +1096,9 @@ async function pollDetail(version) {
     if(slot!==undefined){const scope=$('.all-requests'),spot=scope?scope.querySelector(`[data-live-slot="${slot}"]`):$(`[data-live-slot="${slot}"]`);if(spot)spot.focus({preventScroll:true});else if(autoFocused&&activeState(detail)&&state.mosaicFollow!==false)focusMosaicStart();}
     else if(summaryFocus){const disclosure=$('.all-requests');disclosure?.querySelector('summary')?.focus({preventScroll:true});}
     else if(action==='stop')$('[data-action="stop"]')?.focus({preventScroll:true});
-    if(activeState(detail))schedulePoll(pollDetail,version,delta.reset||delta.idle?1800:300);else {if(state.active===id)setActive(null);await refreshRuns();if(version===state.routeVersion&&state.active)schedulePoll(pollRunStatus,version,3000);}
-  } catch(error) {if(error.name==='AbortError'||version!==state.routeVersion||state.detail?.id!==id||sequence<lastDetailSequence||reportRouteKey()!==key)return;if(epoch!==detailEpoch){schedulePoll(pollDetail,version,500);return;}connectionError(error.message+' Reconnecting; the suite may still be running.');schedulePoll(pollDetail,version,3000);}
+    if(activeState(detail))applyPollMode(delta.reset||delta.idle?1800:300);
+    else {if(state.active===id)setActive(null);await refreshRuns(current);if(current()&&reportRouteKey()===key)applyPollMode(3000);}
+  } catch(error) {if(error.name==='AbortError'||!current()||state.detail?.id!==id||sequence<lastDetailSequence||reportRouteKey()!==key)return;if(epoch!==detailEpoch){applyPollMode(500);return;}connectionError(error.message+' Reconnecting; the suite may still be running.');applyPollMode(3000);}
 }
 function suiteList() { return `<ol class="suite-list">${(state.bootstrap.checks || []).map((c,i)=>`<li><span class="index">${String(i+1).padStart(2,'0')}</span><span>${escape(c.title)}</span>${c.optional?'<small>OPT</small>':''}</li>`).join('')}</ol>`; }
 function runOutcome(run) {
@@ -5065,7 +5096,7 @@ async function stopRun(){
     state.stopPending=null;
     if(!activeState(state.detail))return;
     if(state.detail.state!==RUN.STOPPING)state.detail.state=result.state || RUN.STOPPING;
-    renderDetail();schedulePoll(pollDetail,version,500);
+    renderDetail();applyPollMode(500);
   }catch(error){
     if(!sameReportVisit(t)||epoch!==detailEpoch)return;
     state.stopPending=null;
@@ -5640,13 +5671,6 @@ document.addEventListener('pointermove',event=>{
 },{passive:true});
 window.addEventListener('hashchange',()=>{if(state.bootstrap)return route();});
 window.addEventListener('pagehide',saveDraft);
-document.addEventListener('visibilitychange',()=>{
-  clearPoll();cancelLiveFetch();if(!pageVisible())return;
-  const version=state.routeVersion;
-  if(location.hash==='#runs')schedulePoll(pollRuns,version,300);
-  else if(state.reportRouteActive&&activeState(state.detail))schedulePoll(pollDetail,version,300);
-  else if(location.hash==='#new')schedulePoll(pollNew,version,state.active?300:10000);
-  else if(state.active)schedulePoll(pollRunStatus,version,300);
-});
+document.addEventListener('visibilitychange',()=>applyPollMode());
 async function init(){initReticulate();try{const [bootstrap,baselines]=await Promise.all([api('/api/bootstrap'),api('/api/baselines')]);state.bootstrap=bootstrap;connectionError();state.baselines=baselines.baselines || [];state.config=clone(bootstrap.config);replaceMigrationNotes(bootstrap.migration_notes,bootstrap.migration_warnings,bootstrap.migration_limit_notes);await restoreDraft();state.config.restart_target=null;state.diskActive=bootstrap.disk_active_id || null;setActive(bootstrap.active_run_id);$('#suite-version').textContent=`suite ${bootstrap.suite_version || 'unknown'}`;$('#runner-location').textContent=bootstrap.hostname || 'UI server connected';const detailLink=location.hash.startsWith('#runs/');if(!detailLink)await refreshRuns().catch(()=>{});await route();if(detailLink)refreshRuns().catch(()=>{});}catch(error){if(state.accessExpired){$('#main').innerHTML='<div class="page-heading"><h1>Access expired</h1></div>';return;}if(document.body)document.body.dataset.runner='unavailable';$('#main').innerHTML=`<div class="page-heading"><h1>Local runner unavailable</h1></div>${notice(error.message,'error')}<button class="button" data-action="reconnect">Reconnect</button>`;}}
 init();
