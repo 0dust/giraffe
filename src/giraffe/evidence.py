@@ -72,6 +72,10 @@ class EvidenceWriter:
         self.fsync_records = max(1, fsync_records)
         self.fsync_seconds = max(0.001, fsync_seconds)
         self._queue = queue.Queue(maxsize=max(1, queue_size))
+        self._cause_lock = threading.Lock()
+        self._latest_cause = None
+        self._cause_dirty = False
+        self._cause_recorded = False
         self._error = None
         self._closed = False
         self._stop = threading.Event()
@@ -101,6 +105,14 @@ class EvidenceWriter:
             self._queue.put_nowait(item)
         except queue.Full:
             self.dropped_count += 1
+
+    def record_stop_cause(self, cause: dict | None) -> None:
+        with self._cause_lock:
+            if self._closed or self._error is not None:
+                self.dropped_count += 1
+                return
+            self._latest_cause = dict(cause) if cause is not None else None
+            self._cause_dirty = self._cause_recorded = True
 
     def progress(self, event: dict) -> None:
         if (event.get("event", "").startswith(("check_", "condition_"))
@@ -141,6 +153,17 @@ class EvidenceWriter:
                 pending = 0
                 last_dropped = 0
                 last_sync = time.monotonic()
+                def write_cause(*, final=False):
+                    with self._cause_lock:
+                        if not self._cause_dirty and not (final and self._cause_recorded):
+                            return 0
+                        cause = self._latest_cause
+                    stream.write(_json_line({"type": "stop_cause", "stop_cause": cause}))
+                    with self._cause_lock:
+                        if self._latest_cause is cause:
+                            self._cause_dirty = False
+                    return 1
+
                 while True:
                     timeout = min(QUEUE_WAIT_SECONDS, max(0, self.fsync_seconds - (
                         time.monotonic() - last_sync))) if pending else QUEUE_WAIT_SECONDS
@@ -148,11 +171,13 @@ class EvidenceWriter:
                         item = self._queue.get(timeout=timeout)
                     except queue.Empty:
                         item = None
+                    pending += write_cause()
                     if self.dropped_count != last_dropped:
                         last_dropped = self.dropped_count
                         stream.write(_json_line({"type": "dropped", "count": last_dropped}))
                         pending += 1
                     if item is None and self._stop.is_set() and self._queue.empty():
+                        write_cause(final=True)
                         stream.flush()
                         os.fsync(stream.fileno())
                         break
@@ -163,7 +188,7 @@ class EvidenceWriter:
                         if kind == "record":
                             non_finite = _has_non_finite(value.model_dump(mode="python"))
                             value = self._retained(value).requests[0].model_dump(mode="json")
-                        elif self.manifest.get("config", {}).get("retention", "failures") == "none":
+                        elif kind == "progress" and self.manifest.get("config", {}).get("retention", "failures") == "none":
                             # Apply the same summary scrubbing as final reports.
                             from .reporting import _without_answer_excerpts
                             value = deepcopy(value)
@@ -188,6 +213,10 @@ class EvidenceWriter:
                         last_sync = time.monotonic()
         except Exception as error:
             self._error = error
+            with self._cause_lock:
+                if self._cause_dirty:
+                    self.dropped_count += 1
+                    self._cause_dirty = False
             while True:
                 try:
                     self._queue.get_nowait()
@@ -199,6 +228,22 @@ class EvidenceWriter:
     @property
     def stopped(self) -> bool:
         return not self._thread.is_alive()
+
+    def append_final_stop_cause(self, cause: dict | None) -> None:
+        """Journal a cancellation received while closing, after the writer stops."""
+        try:
+            with self._cause_lock:
+                if not self.stopped:
+                    raise TimeoutError("Evidence writer is still running")
+                self._latest_cause = dict(cause) if cause is not None else None
+                descriptor = os.open(self.directory / "evidence.jsonl", os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW)
+                with os.fdopen(descriptor, "a", encoding="utf-8") as stream:
+                    stream.write(_json_line({"type": "stop_cause", "stop_cause": self._latest_cause}))
+                    stream.flush()
+                    os.fsync(stream.fileno())
+        except (OSError, TimeoutError):
+            self.dropped_count += 1
+            raise
 
     def close(self) -> None:
         if not self._closed:
@@ -222,6 +267,7 @@ def recover_evidence(directory: Path | str, meta: dict, *, pause=None) -> RunRep
     except FileNotFoundError:
         return None
     header, records, checks, conditions = {}, {}, {}, {}
+    stop_cause = None
     scale_down = {}
     timeout_warnings = {}
     dropped = meta.get("evidence_dropped_count", 0)
@@ -241,6 +287,14 @@ def recover_evidence(directory: Path | str, meta: dict, *, pause=None) -> RunRep
                     if record.judgement is not None or (record.evaluation and record.evaluation.scorer == "judge"):
                         record.score, record.score_message, record.judgement = None, None, None
                     records[record.id] = record
+                elif value.get("type") == "stop_cause":
+                    cause = value["stop_cause"]
+                    if cause is not None and (not isinstance(cause, dict)
+                            or cause.get("kind") not in states.STOP_KINDS
+                            or not isinstance(cause.get("text"), str)
+                            or cause.get("scope") not in (None, "gateway")):
+                        raise ValueError("Invalid stop cause")
+                    stop_cause = cause
                 elif value.get("type") == "progress":
                     event = value["progress"]
                     if event.get("event") == "timeout_warning":
@@ -308,7 +362,7 @@ def recover_evidence(directory: Path | str, meta: dict, *, pause=None) -> RunRep
             ([f"{dropped} evidence records not written to evidence.jsonl"] if dropped else []) +
             list(dict.fromkeys(warning_messages)),
         observations={"interrupted": True, "judge_scores_missing": True, "evidence_dropped_count": dropped,
-                      "targets": targets})
+                      "stop_cause": stop_cause, "targets": targets})
 
 
 def _recover_scale_down_event(targets: dict, event: dict) -> None:

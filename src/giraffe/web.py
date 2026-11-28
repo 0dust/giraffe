@@ -74,7 +74,8 @@ from giraffe.report_stream import expanded_report_chunks
 from giraffe.request_pack import pack_preview
 from giraffe.resources import PhaseSampler, SAMPLING
 from giraffe.runner import run_suite
-from giraffe.runner import record_sink
+from giraffe.runner import (record_sink, stop_cause_sink, StopCause, cause_of, stop_kind_of,
+                            stopping_fields, finished_fields, latch_report_cancellation)
 from giraffe.diagnostics import configure_logging, run_logging
 from giraffe.evidence import EvidenceWriter, recover_evidence
 from giraffe.storage import (DEFAULT_LIMITS, apply_cleanup, automatic_cleanup, check_start, cleanup_plan,
@@ -535,6 +536,11 @@ ConfigDraftInput = Annotated[ConfigDraft, WrapValidator(_config_input)]
 
 
 
+def _job_stop(job: dict) -> dict:
+    """Initialize announced fields for new and reconstructed jobs alike."""
+    return job.setdefault("stop", {key: job.get("meta", {}).get(key) for key in stopping_fields(None)})
+
+
 def _track_live_request(job: dict, event: dict, max_requests: int | None) -> None:
     """Keep a bounded slot window and count completed requests evicted while running."""
     slot = event.get("request_slot")
@@ -986,7 +992,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
     # across journal generations so replacement/reopened files invalidate clients.
     journal_cursor = time_ns() // 1000
 
-    def journal_live_state(directory: Path, after: int | None = None) -> dict:
+    def journal_live_state(directory: Path, after: int | None = None, *, include_requests: bool = True) -> dict:
         """Tail CLI warnings and bounded request measurements without retaining bodies."""
         nonlocal journal_cursor
         with live_journal_lock:
@@ -1001,6 +1007,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                     journal_cursor += 1
                     cached = {"identity": identity, "offset": 0, "warnings": OrderedDict(),
                               "seq": journal_cursor, "reset_after": journal_cursor, "config": {},
+                              **finished_fields(None, None),
                               "request_versions": OrderedDict(),
                               "requests": OrderedDict(), "live_request_count": 0,
                               "live_request_summary": {"evicted": 0, "through_slot": None, "statuses": {}},
@@ -1022,6 +1029,10 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                             config = manifest.get("config") if isinstance(manifest, dict) else None
                             if isinstance(config, dict):
                                 cached["config"] = config
+                            continue
+                        if isinstance(value, dict) and value.get("type") == "stop_cause":
+                            cause = cause_of(value)
+                            cached.update(stopping_fields(cause))
                             continue
                         if isinstance(value, dict) and value.get("type") == "record":
                             record = value.get("record")
@@ -1074,10 +1085,13 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                 live_journals.move_to_end(directory.name)
                 while len(live_journals) > 16:
                     live_journals.popitem(last=False)
+                if not include_requests:
+                    return {key: cached[key] for key in stopping_fields(None)}
                 reset = after is not None and (after < cached["reset_after"] or after > cached["seq"])
                 requests = {slot: row for slot, row in cached["requests"].items()
                             if after is None or reset or cached["request_versions"][slot] > after}
                 return {"seq": cached["seq"], "reset": reset, "config": deepcopy(cached["config"]),
+                        **{key: cached[key] for key in stopping_fields(None)},
                         "idle": after == cached["seq"] and not reset,
                         "timeout_warnings": deepcopy(list(cached["warnings"].values())),
                         "requests": deepcopy(requests),
@@ -1097,10 +1111,28 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
             result[key] = list(active[key])
         return result
 
+    async def persist_stop(job):
+        try:
+            await run_in_threadpool(save_metadata, job["directory"], job["meta"])
+        except OSError:
+            logger.exception("Could not save announced stop cause for %s", job["id"])
+
     def publish(job: dict, event: dict, max_requests: int | None) -> None:
         # Called exclusively on the server loop, including worker progress.
         if job is not active or job.get("terminal"):
             return
+        if event.get("event") in {"run_stopping", "run_finished"}:
+            kind = event.get("stop_kind")
+            fields = finished_fields(StopCause(kind, "") if kind else None, event.get("abort_reason"))
+            changed = fields != _job_stop(job)
+            job["stop"] = fields
+            job["meta"].update(fields)
+            if changed:
+                saves = job.setdefault("stop_saves", set())
+                task = asyncio.create_task(persist_stop(job))
+                saves.add(task)
+                task.add_done_callback(saves.discard)
+            event = {**event, **fields}
         _track_live_progress(job, event, max_requests)
         if "scale_down_control" in event:
             job["scale_down_control"] = deepcopy(event["scale_down_control"])
@@ -1253,7 +1285,8 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                         return True
                     if recovered is not None:
                         write_report(recovered, directory, max_run_storage=max_run_storage)
-                        meta.update(run_id=recovered.run_id, error=recovered.abort_reason)
+                        meta.update(run_id=recovered.run_id, error=recovered.abort_reason,
+                                    **finished_fields(cause_of(recovered), recovered.abort_reason))
                 except Exception as error:
                     attempts = meta.get("recovery_attempts", 0) + 1
                     terminal = attempts >= 5
@@ -1273,7 +1306,8 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                         meta["state"] = states.RUN_ERROR
             else:
                 state = states.RUN_INTERRUPTED if saved.observations.get("interrupted") else states.RUN_COMPLETED
-                meta.update(state=state, finished_at=saved.finished_at, run_id=saved.run_id)
+                meta.update(state=state, finished_at=saved.finished_at, run_id=saved.run_id,
+                            **finished_fields(cause_of(saved), saved.abort_reason))
                 meta.pop("error", None)
             try:
                 save_metadata(directory, meta)
@@ -1288,6 +1322,22 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
             if not active and not run_loop.busy() and not start_lock.locked():
                 recovery_pause.clear()
                 pending = await run_in_threadpool(recover_interrupted)
+
+    def reconcile_feed(identifier, meta):
+        feed = feeds.get(identifier)
+        if feed is None or not feed.get("terminal"):
+            return
+        fields = {key: meta.get(key) for key in stopping_fields(None)}
+        changed = fields != _job_stop(feed) or any(feed["meta"].get(key) != value for key, value in meta.items())
+        feed["meta"].update(meta)
+        if not changed:
+            return
+        feed["stop"] = fields
+        feed["seq"] += 1
+        feed["deltas"].append({"event": "run_finished", "state": feed["state"], **fields,
+                               "error": meta.get("error"), "error_id": meta.get("error_id"), "seq": feed["seq"]})
+        del feed["deltas"][:-_DELTA_WINDOW]
+        feed["changed"].set()
 
     def saving_partial(job):
         # One deadline covers shutdown and execute cancellation; retries must
@@ -1453,6 +1503,8 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                         value = reader.value()
                         if key in {"run_id", "overall", "started_at", "finished_at", "abort_reason"}:
                             result[key] = value
+                        elif key == "observations":
+                            result["stop_kind"] = stop_kind_of(value)
                         elif key == "checks":
                             result[key] = [{"status": check["status"]} for check in value]
                         elif key == "manifest":
@@ -1539,15 +1591,28 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
             meta = {**meta, "error": meta["error"] + f' [error {meta["error_id"]}]'}
         timeout_warnings = list(live["live_timeout_warnings"].values()) if "live_timeout_warnings" in live else meta.get("live_timeout_warnings", [])
         journal = {}
-        if not live and not listing and state in states.RUN_IN_PROGRESS_STATES:
-            journal = journal_live_state(directory, journal_after)
+        if not live and state in states.RUN_IN_PROGRESS_STATES:
+            journal = journal_live_state(directory, journal_after, include_requests=not listing)
             timeout_warnings = journal.get("timeout_warnings") or timeout_warnings
         request_feed = live or journal
+        if persisted is not None:
+            stop_kind = persisted.get("stop_kind") if listing else stop_kind_of(persisted)
+            abort_reason = persisted.get("abort_reason")
+        elif summary is not None:
+            stop_kind = summary.get("stop_kind")
+            abort_reason = summary.get("abort_reason")
+        elif live:
+            stop_kind = _job_stop(live)["stop_kind"]
+            abort_reason = _job_stop(live)["abort_reason"]
+        else:
+            stop_kind = meta.get("stop_kind", journal.get("stop_kind"))
+            abort_reason = meta.get("abort_reason", journal.get("abort_reason"))
         return {"id": identifier, "state": state,
                 **({"journal_reset": journal.get("reset", False), "journal_idle": journal.get("idle", True)}
                    if journal_after is not None else {}),
                 "timeout_warnings": timeout_warnings,
-                "abort_reason": (persisted or summary or {}).get("abort_reason") or meta.get("abort_reason"),
+                "abort_reason": abort_reason,
+                "stop_kind": stop_kind,
                 "error": meta.get("error"), "error_id": meta.get("error_id"),
                 "seq": request_feed.get("seq", meta.get("seq", 0)),
                 "progress": live.get("progress", meta.get("progress", {})),
@@ -1653,7 +1718,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
         counts = dict.fromkeys(states.CHECK_STATUSES, 0)
         for check in report.get("checks", []):
             counts[check["status"]] += 1
-        return {key: detail[key] for key in ("id", "state", "terminal", "recoverable", "error", "abort_reason", "progress", "baseline_id",
+        return {key: detail[key] for key in ("id", "state", "terminal", "recoverable", "error", "abort_reason", "stop_kind", "progress", "baseline_id",
                                              "started_at", "finished_at", "bytes", "kept")} | {
             "run_id": report.get("run_id"), "overall": report.get("overall"),
             "targets": _targets(detail["config"]), "check_counts": counts,
@@ -1678,6 +1743,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
 
     async def execute(job: dict, config: RunConfig, baseline: RunReport | None) -> None:
         nonlocal active
+        _job_stop(job)
         try:
             with run_logging(job["directory"]):
                 try:
@@ -1696,8 +1762,10 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
             try:
                 if job is active:
                     try:
+                        kind = job["meta"].get("stop_kind", _job_stop(job)["stop_kind"])
                         publish(job, {"event": "run_finished", "state": job["state"],
-                                      "abort_reason": job["meta"].get("abort_reason"),
+                                      **finished_fields(StopCause(kind, "") if kind else None,
+                                                        job["meta"].get("abort_reason", _job_stop(job)["abort_reason"])),
                                       "error": job["meta"].get("error"), "error_id": job["meta"].get("error_id")}, config.max_requests)
                     except Exception:
                         logger.exception("Could not publish final status for %s", job["id"])
@@ -1706,7 +1774,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                     if identifier != job["id"] and feed.get("terminal"):
                         del feeds[identifier]
                 feeds[job["id"]] = {key: job[key] for key in (
-                    "id", "state", "meta", "seq", "deltas", "changed", "terminal", "checks",
+                    "id", "state", "meta", "stop", "seq", "deltas", "changed", "terminal", "checks",
                     "progress", "phases", "live_preparations", "live_timeout_warnings", "live_request_count", "live_request_summary")}
             except Exception:
                 logger.exception("Could not retain terminal feed for %s", job["id"])
@@ -1769,7 +1837,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                 result["error"] += f" [error {export_error_id}]"
             else:
                 result = dict(state=states.RUN_COMPLETED, finished_at=_now())
-            result.update(run_id=report.run_id, abort_reason=report.abort_reason, resources={
+            result.update(run_id=report.run_id, **finished_fields(cause_of(report), report.abort_reason), resources={
                 "sampled_peak_rss_bytes": dict(sampler.peaks),
                 "memory_measurement": "unavailable" if sampler.peaks.get("export") is None else "sampled process RSS",
                 "sampling": SAMPLING})
@@ -1784,6 +1852,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
             async def measured(stop):
                 nonlocal writer_close_attempted
                 token = record_sink.set(writer.record_finished)
+                cause_token = stop_cause_sink.set(writer.record_stop_cause)
                 report = None
                 cancellation = None
                 try:
@@ -1797,6 +1866,11 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                             if report is None:
                                 raise
                             cancellation = error
+                    # Defensive fallback for runners that attach a partial report
+                    # without latching a cause before propagating cancellation.
+                    if cancellation is not None and not report.abort_reason:
+                        latch_report_cancellation(report, replace_soft=False)
+                        writer.record_stop_cause(report.observations["stop_cause"])
                     report.observations.setdefault("client_timing_health", {}).update(pauses)
                     for check in report.checks:
                         progress({"event": "check_finished", "target": check.target,
@@ -1804,6 +1878,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                     # Pass the exception as data: asyncio may replace a task's
                     # CancelledError when it crosses a Future/loop boundary.
                 finally:
+                    stop_cause_sink.reset(cause_token)
                     record_sink.reset(token)
                     # The producer owns the journal through terminal request
                     # handling and report construction. Server timeout must not
@@ -1821,6 +1896,13 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
 
             async def finish_report(report):
                 nonlocal condition_rows, export_error_id
+                if cancelled is not None and not report.abort_reason:
+                    latch_report_cancellation(report, replace_soft=False)
+                    try:
+                        await run_in_threadpool(writer.append_final_stop_cause, report.observations["stop_cause"])
+                    except (OSError, TimeoutError):
+                        logger.exception("Could not journal cancellation received while closing evidence")
+                        report.warnings.append("The final stop cause could not be written to the evidence journal.")
                 report.observations["evidence_dropped_count"] = writer.dropped_count
                 if writer.dropped_count:
                     report.warnings.append(f"{writer.dropped_count} evidence records not written to evidence.jsonl")
@@ -1847,8 +1929,6 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                     raise
                 report, engine_cancel = waiting.result()
             cancelled = engine_cancel or cancelled
-            if cancelled is not None and not report.abort_reason:
-                report.abort_reason = states.STOP_RUN_CANCELLED
             # Export has one owner even if shutdown cancels execute during disk
             # I/O. Finish that export before finalizing metadata and re-raising.
             _, export_cancel = await _finish_shielded(asyncio.create_task(finish_report(report)))
@@ -1894,6 +1974,11 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
 
                 def persist_final():
                     nonlocal status_warning_added
+                    if "run_id" not in meta:
+                        meta.update(_job_stop(job))
+                    else:
+                        for key in stopping_fields(None):
+                            meta.setdefault(key, _job_stop(job)[key])
                     warning = "Run status could not be saved to disk."
                     with metadata_lock:
                         payload = dict(meta)
@@ -2221,14 +2306,15 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
             directory = _directory(root, identifier)
             await run_in_threadpool(directory.mkdir, parents=True)
             meta = {"id": identifier, "state": states.RUN_RUNNING, "started_at": _now(), "heartbeat_at": _now(), "owner_pid": os.getpid(), "owner_host": socket.gethostname(),
-                    "config": safe_config(config.model_dump(mode="json")), "baseline_id": body.baseline_id}
+                    "config": safe_config(config.model_dump(mode="json")), "baseline_id": body.baseline_id,
+                    **stopping_fields(None)}
             await run_in_threadpool(save_metadata, directory, meta)
             waiting = planned_conditions(config)[:MAX_LIVE_CONDITIONS]
             condition_index = ConditionRequestIndex()
             for summary in waiting:
                 condition_index.summary(summary)
             active = dict(id=identifier, state=states.RUN_RUNNING, directory=directory, meta=meta,
-                          open_files=guard,
+                          open_files=guard, stop=stopping_fields(None),
                           progress={}, events=[], requests=OrderedDict(), live_preparations=OrderedDict(),
                           live_timeout_warnings=OrderedDict(),
                           conditions={(row["target"], row["condition_id"]): row for row in waiting},
@@ -2287,6 +2373,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                         return {"seq": detail["seq"], "reset": detail["journal_reset"], "idle": detail["journal_idle"],
                                 "events": [], "records": detail["live_requests"], "checks": [], "state": detail["state"],
                                 "terminal": detail["terminal"], "recoverable": detail["recoverable"],
+                                "stop_kind": detail["stop_kind"], "abort_reason": detail["abort_reason"],
                                 "scale_down_control": detail.get("scale_down_control"),
                                 "timeout_warnings": detail["timeout_warnings"],
                                 "live_request_summary": detail["live_request_summary"],
@@ -2294,10 +2381,16 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                 return {"seq": detail["seq"], "reset": True, "events": [], "records": [], "checks": [],
                         "state": detail["state"], "error": detail.get("error"),
                         "terminal": detail["terminal"], "recoverable": detail["recoverable"],
+                        "stop_kind": detail["stop_kind"], "abort_reason": detail["abort_reason"],
                         "scale_down_control": detail.get("scale_down_control"),
                         "timeout_warnings": detail["timeout_warnings"],
                         "live_request_summary": detail["live_request_summary"],
                         "live_request_count": detail["live_request_count"]}
+            if feed.get("terminal") and feed["state"] == states.RUN_INTERRUPTED:
+                if not await run_in_threadpool(pending_recovery, _directory(root, identifier)):
+                    detail = await run_in_threadpool(run_detail, identifier)
+                    reconcile_feed(identifier, {key: detail.get(key) for key in (
+                        "abort_reason", "stop_kind", "error", "error_id")})
             seq = feed["seq"]
             oldest = feed["deltas"][0]["seq"] if feed["deltas"] else seq + 1
             reset = after < oldest - 1 or after > seq
@@ -2345,7 +2438,8 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                 "live_request_summary": feed["live_request_summary"],
                 "live_preparations": list(feed["live_preparations"].values()),
                 "timeout_warnings": list(feed["live_timeout_warnings"].values()),
-                "phases": feed["phases"], "abort_reason": feed["meta"].get("abort_reason"),
+                "phases": feed["phases"], "abort_reason": feed["stop"]["abort_reason"],
+                "stop_kind": feed["stop"]["stop_kind"],
                 "error": feed["meta"].get("error"),
                 "error_id": feed["meta"].get("error_id")}
 
@@ -2478,12 +2572,13 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
             job["state"] = states.RUN_STOPPING
             job["meta"]["state"] = states.RUN_STOPPING
             job["worker"].request_stop()
-            publish(job, {"event": "run_stopping", "state": states.RUN_STOPPING}, None)
+            announced = dict(_job_stop(job))
+            publish(job, {"event": "run_stopping", "state": states.RUN_STOPPING, **announced}, None)
             try:
                 await run_in_threadpool(save_metadata, job["directory"], dict(job["meta"]))
             except OSError:
                 pass  # Stopping traffic must not depend on available disk space.
-            return {"id": identifier, "state": states.RUN_STOPPING, "terminal": False, "result": result}
+            return {"id": identifier, "state": states.RUN_STOPPING, "terminal": False, "result": result, **announced}
         detail = await run_in_threadpool(run_detail, identifier)
         return {"id": identifier, "state": detail["state"], "terminal": detail["terminal"],
                 "result": "already_finished" if detail["terminal"] else "not_owned"}

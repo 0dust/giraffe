@@ -75,3 +75,14 @@ def test_dependency_check_does_not_import_tiktoken():
     )
     assert result.returncode == 0, result.stderr
     assert "usage: giraffe" in result.stdout
+
+
+def test_cli_import_does_not_load_runner_or_httpx():
+    result = subprocess.run(
+        [sys.executable, "-c",
+         "import sys; import giraffe.cli; "
+         "assert 'giraffe.runner' not in sys.modules; "
+         "assert 'httpx' not in sys.modules"],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr

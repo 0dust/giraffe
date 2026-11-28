@@ -1,0 +1,1296 @@
+{
+  "budget": {
+    "abort_reason": "maximum request budget reached",
+    "checks": [
+      [
+        "service",
+        "access",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "cancellation",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "context",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "correctness",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "first_output",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "generation",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "gpu",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "json",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "load",
+        "skipped",
+        "Not selected.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "recovery",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "serving",
+        "inconclusive",
+        "Request budget reached before this check finished. Raise max_requests (or --max-requests) to at least 5, or select fewer checks. The plan needs at least 5 fixed requests; adaptive traffic may need more.",
+        "Request budget reached before this check finished.",
+        "{\"action\": \"set_limit\", \"limit\": \"max_requests\", \"minimum\": 5}",
+        "unfinished"
+      ]
+    ],
+    "conditions": [
+      [
+        [
+          "inconclusive",
+          "request budget reached"
+        ],
+        1
+      ],
+      [
+        [
+          "skipped",
+          null
+        ],
+        1
+      ]
+    ],
+    "events": [
+      [
+        "run_finished",
+        "request_budget",
+        "maximum request budget reached"
+      ]
+    ],
+    "judging_stop": null,
+    "limits": [
+      "max_requests"
+    ],
+    "overall": "inconclusive",
+    "records": [
+      [
+        [
+          "completed",
+          null,
+          null
+        ],
+        1
+      ]
+    ],
+    "stop_cause": {
+      "kind": "request_budget",
+      "scope": null,
+      "text": "maximum request budget reached"
+    }
+  },
+  "budget_user": {
+    "abort_reason": "cancelled by user",
+    "checks": [
+      [
+        "service",
+        "access",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "cancellation",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "context",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "correctness",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "first_output",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "generation",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "gpu",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "json",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "load",
+        "skipped",
+        "Not selected.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "recovery",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "serving",
+        "inconclusive",
+        "Stopped by you after 1 of 5 planned requests.",
+        "This check was unfinished when a run budget or stop condition was reached.",
+        "null",
+        "unfinished"
+      ]
+    ],
+    "conditions": [
+      [
+        [
+          "inconclusive",
+          "run stopped"
+        ],
+        1
+      ],
+      [
+        [
+          "skipped",
+          null
+        ],
+        1
+      ]
+    ],
+    "events": [
+      [
+        "run_stopping",
+        "user",
+        "cancelled by user"
+      ],
+      [
+        "run_finished",
+        "user",
+        "cancelled by user"
+      ]
+    ],
+    "judging_stop": null,
+    "limits": [],
+    "overall": "inconclusive",
+    "records": [
+      [
+        [
+          "completed",
+          null,
+          null
+        ],
+        1
+      ]
+    ],
+    "stop_cause": {
+      "kind": "user",
+      "scope": null,
+      "text": "cancelled by user"
+    }
+  },
+  "duration": {
+    "abort_reason": "maximum run duration reached",
+    "checks": [
+      [
+        "service",
+        "access",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "cancellation",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "context",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "correctness",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "first_output",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "generation",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "gpu",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "json",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "load",
+        "skipped",
+        "Not selected.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "recovery",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "serving",
+        "inconclusive",
+        "Run deadline reached before this check finished. Increase --max-duration (current 1 s) or select fewer checks.",
+        "Run deadline reached before this check finished.",
+        "{\"action\": \"set_limit\", \"limit\": \"max_duration\"}",
+        "unfinished"
+      ]
+    ],
+    "conditions": [
+      [
+        [
+          "inconclusive",
+          "time limit reached"
+        ],
+        1
+      ],
+      [
+        [
+          "skipped",
+          null
+        ],
+        1
+      ]
+    ],
+    "events": [
+      [
+        "run_stopping",
+        "duration",
+        "maximum run duration reached"
+      ],
+      [
+        "run_finished",
+        "duration",
+        "maximum run duration reached"
+      ]
+    ],
+    "judging_stop": null,
+    "limits": [
+      "max_duration_seconds"
+    ],
+    "overall": "inconclusive",
+    "records": [
+      [
+        [
+          "cancelled",
+          "maximum run duration reached",
+          "run_duration_limit"
+        ],
+        1
+      ],
+      [
+        [
+          "completed",
+          null,
+          null
+        ],
+        2
+      ]
+    ],
+    "stop_cause": {
+      "kind": "duration",
+      "scope": null,
+      "text": "maximum run duration reached"
+    }
+  },
+  "judged": {
+    "abort_reason": null,
+    "checks": [
+      [
+        "service",
+        "access",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "cancellation",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "context",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "correctness",
+        "inconclusive",
+        "Some fixtures have no complete, locally scored answer. To conclude, finish quiet and loaded scoring for every request-pack case and inspect any AI judge errors or unfinished answers; global samples does not select the case count. .",
+        "Some fixtures have no complete, locally scored answer.",
+        "{\"action\": \"review_check\", \"check\": \"correctness\", \"code\": \"inconclusive\"}",
+        null
+      ],
+      [
+        "service",
+        "first_output",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "generation",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "gpu",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "json",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "load",
+        "skipped",
+        "Not selected.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "recovery",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "serving",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ]
+    ],
+    "conditions": [
+      [
+        [
+          "inconclusive",
+          null
+        ],
+        2
+      ]
+    ],
+    "events": [
+      [
+        "run_finished",
+        null,
+        null
+      ]
+    ],
+    "judging_stop": null,
+    "limits": [],
+    "overall": "inconclusive",
+    "records": [
+      [
+        [
+          "completed",
+          null,
+          null
+        ],
+        3
+      ]
+    ],
+    "stop_cause": null
+  },
+  "judged_memory_early": {
+    "abort_reason": "memory limit reached: RAM grew by 10,240 MiB, over the 1 MiB limit",
+    "checks": [
+      [
+        "service",
+        "access",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "cancellation",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "context",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "correctness",
+        "inconclusive",
+        "Some fixtures have no complete, locally scored answer. To conclude, finish quiet and loaded scoring for every request-pack case and inspect any AI judge errors or unfinished answers; global samples does not select the case count. .",
+        "Some fixtures have no complete, locally scored answer.",
+        "{\"action\": \"review_check\", \"check\": \"correctness\", \"code\": \"inconclusive\"}",
+        null
+      ],
+      [
+        "service",
+        "first_output",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "generation",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "gpu",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "json",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "load",
+        "skipped",
+        "Not selected.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "recovery",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "serving",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ]
+    ],
+    "conditions": [
+      [
+        [
+          "inconclusive",
+          null
+        ],
+        2
+      ]
+    ],
+    "events": [
+      [
+        "run_stopping",
+        "memory",
+        "memory limit reached: RAM grew by 10,240 MiB, over the 1 MiB limit"
+      ],
+      [
+        "run_finished",
+        "memory",
+        "memory limit reached: RAM grew by 10,240 MiB, over the 1 MiB limit"
+      ]
+    ],
+    "judging_stop": "cancelled",
+    "limits": [],
+    "overall": "inconclusive",
+    "records": [
+      [
+        [
+          "completed",
+          null,
+          null
+        ],
+        3
+      ]
+    ],
+    "stop_cause": {
+      "kind": "memory",
+      "scope": null,
+      "text": "memory limit reached: RAM grew by 10,240 MiB, over the 1 MiB limit"
+    }
+  },
+  "load_user": {
+    "abort_reason": "cancelled by user",
+    "checks": [
+      [
+        "service",
+        "access",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "cancellation",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "context",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "correctness",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "first_output",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "generation",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "gpu",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "json",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "load",
+        "inconclusive",
+        "1 of 1 load conditions unfinished: stopped by you.",
+        "1 of 1 load conditions unfinished: stopped by you.",
+        "null",
+        "run_stopped"
+      ],
+      [
+        "service",
+        "recovery",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "serving",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ]
+    ],
+    "conditions": [
+      [
+        [
+          "inconclusive",
+          "cancelled by user"
+        ],
+        1
+      ]
+    ],
+    "events": [
+      [
+        "run_stopping",
+        "user",
+        "cancelled by user"
+      ],
+      [
+        "run_finished",
+        "user",
+        "cancelled by user"
+      ]
+    ],
+    "judging_stop": null,
+    "limits": [],
+    "overall": "inconclusive",
+    "records": [
+      [
+        [
+          "completed",
+          null,
+          null
+        ],
+        2
+      ]
+    ],
+    "stop_cause": {
+      "kind": "user",
+      "scope": null,
+      "text": "cancelled by user"
+    }
+  },
+  "memory_infer": {
+    "abort_reason": "memory limit reached: RAM grew by 10,240 MiB, over the 1 MiB limit",
+    "checks": [
+      [
+        "service",
+        "access",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "cancellation",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "context",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "correctness",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "first_output",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "generation",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "gpu",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "json",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "load",
+        "skipped",
+        "Not selected.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "recovery",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "serving",
+        "inconclusive",
+        "No applicable requests completed within the run budget. To conclude,  Allow more max_duration_seconds (or --max-duration) if the run deadline stops traffic.",
+        "No applicable requests completed within the run budget.",
+        "{\"action\": \"review_check\", \"check\": \"serving\", \"code\": \"unfinished\"}",
+        "unfinished"
+      ]
+    ],
+    "conditions": [],
+    "events": [
+      [
+        "run_stopping",
+        "memory",
+        "memory limit reached: RAM grew by 10,240 MiB, over the 1 MiB limit"
+      ],
+      [
+        "run_finished",
+        "memory",
+        "memory limit reached: RAM grew by 10,240 MiB, over the 1 MiB limit"
+      ]
+    ],
+    "judging_stop": null,
+    "limits": [],
+    "overall": "inconclusive",
+    "records": [],
+    "stop_cause": {
+      "kind": "memory",
+      "scope": null,
+      "text": "memory limit reached: RAM grew by 10,240 MiB, over the 1 MiB limit"
+    }
+  },
+  "none": {
+    "abort_reason": null,
+    "checks": [
+      [
+        "service",
+        "access",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "cancellation",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "context",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "correctness",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "first_output",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "generation",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "gpu",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "json",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "load",
+        "skipped",
+        "Not selected.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "recovery",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "serving",
+        "pass",
+        "Valid non-empty responses and required stream termination observed.",
+        null,
+        "null",
+        null
+      ]
+    ],
+    "conditions": [
+      [
+        [
+          "passed",
+          null
+        ],
+        1
+      ],
+      [
+        [
+          "skipped",
+          null
+        ],
+        1
+      ]
+    ],
+    "events": [
+      [
+        "run_finished",
+        null,
+        null
+      ]
+    ],
+    "judging_stop": null,
+    "limits": [],
+    "overall": "pass",
+    "records": [
+      [
+        [
+          "completed",
+          null,
+          null
+        ],
+        5
+      ]
+    ],
+    "stop_cause": null
+  },
+  "user": {
+    "abort_reason": "cancelled by user",
+    "checks": [
+      [
+        "service",
+        "access",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "cancellation",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "context",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "correctness",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "first_output",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "generation",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "gpu",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "json",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "load",
+        "skipped",
+        "Not selected.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "recovery",
+        "skipped",
+        "Not selected for this run.",
+        null,
+        "null",
+        null
+      ],
+      [
+        "service",
+        "serving",
+        "inconclusive",
+        "Stopped by you after 1 of 5 planned requests.",
+        "This check was unfinished when a run budget or stop condition was reached.",
+        "null",
+        "unfinished"
+      ]
+    ],
+    "conditions": [
+      [
+        [
+          "inconclusive",
+          "run stopped"
+        ],
+        1
+      ],
+      [
+        [
+          "skipped",
+          null
+        ],
+        1
+      ]
+    ],
+    "events": [
+      [
+        "run_stopping",
+        "user",
+        "cancelled by user"
+      ],
+      [
+        "run_finished",
+        "user",
+        "cancelled by user"
+      ]
+    ],
+    "judging_stop": null,
+    "limits": [],
+    "overall": "inconclusive",
+    "records": [
+      [
+        [
+          "completed",
+          null,
+          null
+        ],
+        1
+      ]
+    ],
+    "stop_cause": {
+      "kind": "user",
+      "scope": null,
+      "text": "cancelled by user"
+    }
+  }
+}

@@ -4,7 +4,7 @@ import asyncio
 
 import pytest
 
-from giraffe import resources, runner
+from giraffe import resources, runner, states
 from giraffe.models import Target
 from tests.test_runner import FakeClient, config
 
@@ -42,7 +42,10 @@ def test_memory_guardrail_preserves_first_real_stop_reason(reason):
     events = []
     run = runner._Run(config(max_memory_mb=1), events.append, None)
     run.rss_at_start_bytes = 100 * 1024**2
-    run.reason = reason
+    if reason in states.STOP_REASON_KIND:
+        run.reason = reason
+    else:
+        run._latch_stop(states.STOP_KIND_ENDPOINTS_UNRESPONSIVE, reason)
     run.memory_sample(102 * 1024**2)
     assert run.memory_limit_reached
     assert run.reason == reason
@@ -193,12 +196,18 @@ async def test_optional_check_interruption_does_not_downgrade_finished_required_
         run.memory_sample(2 * 1024**2)
     monkeypatch.setattr(runner, "_metrics", metrics)
     monkeypatch.setattr(runner, "_finish_gpu_observation", finish_gpu)
-    report = await runner.run_suite(config(checks=["serving", "gpu"], max_memory_mb=1))
+    events = []
+    report = await runner.run_suite(config(checks=["serving", "gpu"], max_memory_mb=1), progress=events.append)
     assert report.overall == "pass"
     assert report.abort_reason is None
+    assert report.observations["stop_cause"] == {
+        "kind": "memory", "text": "memory limit reached: RAM grew by 2 MiB, over the 1 MiB limit", "scope": None}
     assert next(check for check in report.checks if check.id == "serving").status == "pass"
     assert report.observations["resources"]["memory_interrupted_checks"] == [
         {"target": "service", "id": "gpu"}]
+
+    finished = next(event for event in events if event["event"] == "run_finished")
+    assert finished["abort_reason"] is None and finished["stop_kind"] == "memory"
 
 
 async def test_cancelled_later_request_does_not_mark_finished_check_unfinished(monkeypatch, fake_client):
@@ -235,7 +244,7 @@ def test_memory_sample_resolves_pending_real_stop_before_assigning_reason(initia
     run.memory_sample(2 * 1024**2)
     assert run.memory_limit_reached
     assert run.reason == expected
-    assert run.memory_stop_reason is None
+    assert run.stop_cause.kind != states.STOP_KIND_MEMORY
     assert [event["abort_reason"] for event in events if event["event"] == "run_stopping"] == [expected]
 
 

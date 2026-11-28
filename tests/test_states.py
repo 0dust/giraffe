@@ -122,6 +122,8 @@ def test_describe():
         "run_terminal_states": sorted(states.RUN_TERMINAL_STATES),
         "run_transitions": {state: sorted(successors) for state, successors in states.RUN_TRANSITIONS.items()},
         "stop_reasons": list(states.STOP_REASONS), "stop_reasons_open": True,
+        "stop_kinds": list(states.STOP_KINDS), "stop_soft_kinds": sorted(states.STOP_SOFT_KINDS),
+        "stop_reason_kinds": dict(states.STOP_REASON_KIND),
         "condition_lifecycle": list(states.CONDITION_LIFECYCLE),
         "condition_transitions": {state: sorted(successors) for state, successors in states.CONDITION_TRANSITIONS.items()},
         "connection_test_statuses": list(states.CONNECTION_TEST_STATUSES),
@@ -171,7 +173,7 @@ def test_documented_vocabulary():
     documentation = (ROOT / "docs" / "states.md").read_text()
     for name, vocabulary in vars(states).items():
         values = vocabulary if isinstance(vocabulary, (tuple, frozenset)) else (
-            (vocabulary,) if name.startswith("STOP_") else ())
+            (vocabulary,) if name.startswith("STOP_") and isinstance(vocabulary, str) else ())
         for value in values:
             assert f"`{value}`" in documentation, (name, value)
 

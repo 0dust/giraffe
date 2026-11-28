@@ -18,7 +18,9 @@ async def test_live_events_after_sequence_and_completion(tmp_path, monkeypatch):
                   "request": {"id": "request-one", "status": "completed", "valid": True, "elapsed_ms": 2}})
         ready.set()
         await stop_event.wait()
-        return report(configuration, cancelled=True)
+        stopped = report(configuration, cancelled=True)
+        stopped.observations["stop_cause"] = {"kind": "user", "text": "cancelled by user", "scope": None}
+        return stopped
 
     monkeypatch.setattr("giraffe.web.run_suite", waiting)
     async with browser(tmp_path) as client:
@@ -39,9 +41,15 @@ async def test_live_events_after_sequence_and_completion(tmp_path, monkeypatch):
         await client.post(path + "/cancel", json={})
         update = (await asyncio.wait_for(pending, 2)).json()
         assert all(event["seq"] > delta["seq"] for event in update["events"])
-        await finished(client, identifier)
+        detail = await finished(client, identifier)
+        assert detail["report"]["observations"]["stop_cause"]["kind"] == "user"
         terminal = (await client.get(path + f'/events?after={update["seq"]}')).json()
         assert terminal["state"] == "completed" and terminal["seq"] > delta["seq"]
+        tail = (await client.get(path + f'/events?after={terminal["seq"] - 1}')).json()
+        assert tail["terminal"] is True
+        assert len(tail["events"]) == 1
+        assert tail["events"][0]["event"] == "run_finished"
+        assert tail["events"][0]["stop_kind"] == "user"
 
 
 async def test_run_executes_off_server_loop_and_stop_on_its_loop(tmp_path, monkeypatch):
@@ -98,6 +106,9 @@ async def test_unexpected_run_failure_has_traceback_and_matching_error_id(tmp_pa
     async with browser(tmp_path) as client:
         identifier = await start(client)
         detail = await finished(client, identifier)
+        terminal = (await client.get(f'/api/runs/{identifier}/events?after={detail["seq"] - 1}')).json()
+        assert terminal["events"][0]["event"] == "run_finished"
+        assert terminal["events"][0]["stop_kind"] is None
     assert detail["state"] == "error"
     assert detail["error_id"] in detail["error"]
     log = (tmp_path / identifier / "giraffe.log").read_text()

@@ -91,6 +91,32 @@ Memory-limit and endpoint-abort reasons are free text.
 
 Compare the fixed strings exactly; treat any other non-empty value as a stop.
 
+### Stop causes
+
+| Kind | Fixed text or free text | Soft? |
+| --- | --- | --- |
+| `user` | `cancelled by user` | No |
+| `cancelled` | `run cancelled` | No |
+| `duration` | `maximum run duration reached` | No |
+| `request_budget` | `maximum request budget reached` | Yes |
+| `error_threshold` | `error threshold reached` | No |
+| `endpoints_unresponsive` | free text | No |
+| `memory` | free text | No |
+
+The first non-soft cause wins; a request budget is soft and can be replaced by a non-soft cause, while a soft cause never replaces an existing cause.
+Polling checks user stop, duration, all endpoints unresponsive, then error threshold in that order; memory sampling resolves those pending stops before latching memory, and outer cancellation latches user stop if requested or cancellation otherwise.
+
+After inference finishes, a user stop latches only when no cause exists: it never replaces a request budget. User-stop polling, forced cancellation, and the judging stop path follow the same phase rule. The duration checks continue to use the inference deadline during judging.
+For example, with `max_requests=1`, cancelling during judging leaves `observations.stop_cause.kind` as `request_budget` and sets `observations.judging.stop_reason` to `cancelled`. With no earlier cause, a judging-only user stop latches `user`.
+
+`report.json` `observations.stop_cause` is the raw latched cause as `{"kind", "text", "scope"}`, or null when no cause was latched. It records the cause across inference and judging. A user cause can have `scope: "gateway"`; other causes have null scope.
+`abort_reason` is the verdict-relevant stop text: it may be null for a budget-only or optional memory stop. On `run_stopping`, it is raw cause text; on `run_finished`, it is verdict text. A recovered report's `abort_reason` is free text describing the interruption and recorded request count, not a fixed stop reason; read its `observations.stop_cause.kind` for the cause.
+
+Every `run_stopping` and `run_finished` event includes both `abort_reason` and `stop_kind`, including explicit nulls. A web cancel acknowledgment carries the already-announced cause or null; it does not predict what the worker will latch. During inference, the runner's own `run_stopping` follows. The last `run_finished.stop_kind` is authoritative. If cancellation arrives during evidence-journal close, the runner has already emitted its final event; the later web terminal event carries the phase-correct latched cause and updated `abort_reason`, superseding that earlier event.
+
+Top-level `stop_kind` is also present in run detail, run list rows, every events response (live feed, journal, and reset), final and interrupted CLI JSON output, and `.web.json` metadata for web, CLI, recovered, and `giraffe report` runs. Summary-only export failures carry it too. Live API surfaces expose the announced non-soft cause, or explicit null when none has been announced. Once the runner announces `run_finished`, its fields become the live cause on both web and CLI, including a soft request budget during export. CLI writes those finished fields to `.web.json` while the run is still `running`; before any announcement, initial CLI metadata can omit them. Cancel acknowledgments for active runs mirror the live fields; terminal cancel responses retain their state-only contract. Final surfaces use the latched cause, including a soft request budget. A saved report is authoritative over metadata. Journal causes bypass the bounded evidence queue; recovery uses the last complete cause line.
+`giraffe describe` and GET `/api/capabilities` expose `stop_kinds`, `stop_soft_kinds`, and the fixed-text-to-kind map `stop_reason_kinds` in `states`.
+
 ## Condition lifecycle
 
 | Value | Meaning | Terminal? |

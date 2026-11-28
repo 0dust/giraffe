@@ -39,10 +39,43 @@ def test_recover_finished_records_before_runner_finalizes(tmp_path):
     assert report.conditions[0]["status"] == "inconclusive"
     assert report.conditions[0]["lifecycle_status"] == "interrupted"
     assert report.observations["judge_scores_missing"]
+    assert report.observations["stop_cause"] is None
     assert (tmp_path / "evidence.jsonl").exists()
     write_report(report, tmp_path)
     assert not (tmp_path / "evidence.jsonl").exists()
     assert len(RunReport.model_validate_json((tmp_path / "report.json").read_text()).requests) == 7
+
+
+@pytest.mark.parametrize("gateway", [False, True])
+def test_evidence_recovers_latest_latched_cause_before_report(tmp_path, gateway):
+    from giraffe import runner
+    from tests.test_runner import config
+
+    writer = EvidenceWriter(tmp_path, {"config": {"retention": "none"}})
+    token = runner.stop_cause_sink.set(writer.record_stop_cause)
+    try:
+        run = runner._Run(config(checks=["gateway_access"] if gateway else ["serving"]), None, None)
+        run.record_sink = writer.record_finished
+        run._latch_stop("request_budget")
+        run.record_finished(record())
+        run._gateway_only_phase = gateway
+        run.stop.set()
+        run.stop_reason()
+        # A later stop cannot replace the first non-soft cause.
+        run._latch_stop("duration")
+    finally:
+        runner.stop_cause_sink.reset(token)
+        writer.close()
+
+    rows = [json.loads(line) for line in (tmp_path / "evidence.jsonl").read_text().splitlines()]
+    assert rows[0]["type"] == "header"
+    assert rows[-1]["type"] == "stop_cause"
+    assert rows[-1]["stop_cause"] == {
+        "kind": "user", "text": "cancelled by user", "scope": "gateway" if gateway else None}
+    recovered = recover_evidence(tmp_path, {})
+    assert len(recovered.requests) == 1
+    assert recovered.observations["stop_cause"] == {
+        "kind": "user", "text": "cancelled by user", "scope": "gateway" if gateway else None}
 
 
 @pytest.mark.parametrize("retention,expected", [("all", "sensitive answer"), ("none", ""), ("failures", "")])
@@ -379,3 +412,85 @@ def test_recovered_timeout_warning_uses_latest_update_once(tmp_path):
     assert recovered.observations["targets"]["local"]["timeout_warnings"] == [latest]
     assert recovered.warnings.count(format_timeout_warning(latest)) == 1
     assert format_timeout_warning(payload) not in recovered.warnings
+
+
+def test_final_stop_cause_survives_saturated_evidence_queue(tmp_path, monkeypatch):
+    entered, release = threading.Event(), threading.Event()
+    retained = EvidenceWriter._retained
+
+    def held(self, *args, **kwargs):
+        entered.set()
+        assert release.wait(3)
+        return retained(self, *args, **kwargs)
+
+    monkeypatch.setattr(EvidenceWriter, "_retained", held)
+    writer = EvidenceWriter(tmp_path, queue_size=1)
+    try:
+        assert entered.wait(2)
+        writer.record_stop_cause({"kind": "request_budget", "text": "maximum request budget reached", "scope": None})
+        for index in range(100):
+            writer.record_finished(record(index))
+        cause = {"kind": "user", "text": "cancelled by user", "scope": "gateway"}
+        writer.record_stop_cause(cause)
+        assert writer.dropped_count == 99
+    finally:
+        release.set()
+        writer.close()
+    rows = [json.loads(line) for line in (tmp_path / "evidence.jsonl").read_text().splitlines()]
+    assert rows[-1] == {"type": "stop_cause", "stop_cause": cause}
+    assert recover_evidence(tmp_path, {}).observations["stop_cause"] == cause
+
+
+def test_failed_writer_counts_unwritten_stop_cause(tmp_path, monkeypatch):
+    def fail(*args, **kwargs):
+        raise OSError("journal unavailable")
+
+    monkeypatch.setattr(EvidenceWriter, "_retained", fail)
+    writer = EvidenceWriter(tmp_path)
+    writer._thread.join(2)
+    assert writer.stopped
+    with pytest.raises(OSError, match="journal unavailable"):
+        writer.close()
+    before = writer.dropped_count
+    writer.record_stop_cause({"kind": "user", "text": "cancelled by user", "scope": None})
+    assert writer.dropped_count == before + 1
+
+
+def test_final_stop_cause_append_failure_counts_drop_without_replacing_writer_error(tmp_path, monkeypatch):
+    from giraffe import evidence
+
+    writer = EvidenceWriter(tmp_path)
+    writer.close()
+    original_error = OSError("original writer failure")
+    writer._error = original_error
+    before = writer.dropped_count
+
+    def fail(*args, **kwargs):
+        raise OSError("final cause append failed")
+
+    monkeypatch.setattr(evidence.os, "open", fail)
+    with pytest.raises(OSError, match="final cause append failed"):
+        writer.append_final_stop_cause({"kind": "cancelled", "text": "run cancelled", "scope": None})
+    assert writer.dropped_count == before + 1
+    assert writer._error is original_error
+
+
+def test_writer_failure_counts_accepted_unwritten_cause(tmp_path, monkeypatch):
+    entered, release = threading.Event(), threading.Event()
+
+    def fail(*args, **kwargs):
+        entered.set()
+        assert release.wait(3)
+        raise OSError("journal unavailable")
+
+    monkeypatch.setattr(EvidenceWriter, "_retained", fail)
+    writer = EvidenceWriter(tmp_path)
+    try:
+        assert entered.wait(2)
+        writer.record_stop_cause({"kind": "user", "text": "cancelled by user", "scope": None})
+    finally:
+        release.set()
+    writer._thread.join(2)
+    with pytest.raises(OSError, match="journal unavailable"):
+        writer.close()
+    assert writer.dropped_count == 1
