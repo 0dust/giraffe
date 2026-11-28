@@ -31,6 +31,23 @@ Where you see it: `report.json` `overall` and `checks[].status`, CLI JSON `outco
 | `blocked` | `error` |
 | `skipped`, `inconclusive` | `skipped` |
 
+## Check phases
+
+| Phase | Meaning | Allowed next phases |
+| --- | --- | --- |
+| `inference` | Check workload is pending or running. | `inference`, `judging`, `done` |
+| `judging` | Inference finished; judge scoring is pending. | `judging`, `done` |
+| `done` | No work remains for this check. | `done` |
+
+Every configured check starts in `inference` for each target. When inference finishes,
+`correctness`, `capacity`, and `load` enter `judging` if the request pack contains
+judge-scored specs and judging is still pending. Other checks go directly to `done`.
+After judging, all checks become `done`.
+
+`unfinished` is a separate flag: a check can be `done` and still be unfinished
+because it stopped early. The phase is internal runner state, not a report field.
+These values are not exposed in `giraffe describe`; its `judged_checks` lists the checks that wait for judging.
+
 ## Request status
 
 | Value | Meaning | Terminal? |
