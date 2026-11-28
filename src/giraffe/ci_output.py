@@ -8,7 +8,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from . import states
 from .deployment import REDACTED
-from .models import CHECK_NAMES, CheckResult, RunReport
+from .models import CHECK_NAMES, CheckResult, RunReport, known_request_counts, unavailable_request_counts
 
 
 _XML_CONTROL = re.compile(r"[^\x09\x0a\x0d\x20-\ud7ff\ue000-\ufffd\U00010000-\U0010ffff]")
@@ -99,17 +99,19 @@ def write_junit(report: RunReport, path: Path) -> None:
         for name, value in (("model", target.get("model") or ""),
                             ("url", _url(target.get("url") or "")), ("run_id", report.run_id)):
             ET.SubElement(properties, "property", name=name, value=_text(value))
-        if request_counts := report.observations.get("request_counts"):
-            available = request_counts.get("available") is not False
-            ET.SubElement(properties, "property", name="requests.available",
-                          value=str(available).lower())
+        request_counts = known_request_counts(report.observations.get("request_counts"))
+        target_counts = request_counts["targets"].get(target_name) if request_counts is not None else None
+        ET.SubElement(properties, "property", name="requests.available",
+                      value=str(target_counts is not None).lower())
+        if request_counts is not None:
             ET.SubElement(properties, "property", name="requests.complete",
-                          value=str(request_counts.get("complete") is True).lower())
-            if available:
-                target_counts = request_counts["targets"].get(target_name, {})
-                for name in ("sent", "budget_counted", "budget_exempt", "saved_observations"):
-                    ET.SubElement(properties, "property", name=f"requests.{name}",
-                                  value=_text(target_counts.get(name, 0)))
+                          value=str(request_counts["complete"]).lower())
+        elif unavailable_request_counts(report.observations.get("request_counts")) is not None:
+            ET.SubElement(properties, "property", name="requests.complete", value="false")
+        if target_counts is not None:
+            for name in ("sent", "budget_counted", "budget_exempt", "saved_observations"):
+                ET.SubElement(properties, "property", name=f"requests.{name}",
+                              value=_text(target_counts[name]))
         for check, status, reason in selected:
             case = ET.SubElement(suite, "testcase", name=_text(check.id), classname=_text(check.target))
             if status in {"fail", "blocked"}:

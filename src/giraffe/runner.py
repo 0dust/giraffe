@@ -50,6 +50,7 @@ logger = logging.getLogger(__name__)
 record_sink = ContextVar("giraffe_record_sink", default=lambda record: None)
 request_counts_sink = ContextVar("giraffe_request_counts_sink", default=None)
 _transport_sent_callback = ContextVar("giraffe_transport_sent_callback", default=None)
+_request_budget_slot = ContextVar("giraffe_request_budget_slot", default=None)
 
 
 def _observe_transport_sent():
@@ -532,7 +533,7 @@ class _Run:
             event = "condition_scoring"
         self.emit(event, row["target"], scenario, condition_summary={**row, "aggregate_status": aggregate["status"],
                   **{key: aggregate[key] for key in ("condition_id", "check_id", "name", "concurrency_description", "not_started", "reasons")}},
-                  **{k: v for k, v in row.items() if k not in {"target", "completed"}})
+                  **{k: v for k, v in row.items() if k not in {"target", "completed", "sent"}})
 
     def condition_reason(self, target, fallback=states.CONDITION_STOP_EARLY):
         if self.stop.is_set() or self.reason == states.STOP_CANCELLED_BY_USER:
@@ -609,12 +610,8 @@ class _Run:
                                    "elapsed_seconds": time.monotonic()-self.start})
         if self.progress:
             self.progress({"event": event, "target": target, "scenario": scenario,
-                           "completed": len(self.records), "attempted": self.attempted,
-                           "budget_used": self.budget_used,
+                           "completed": len(self.records),
                            "request_counts": self.request_counts(saved_counts=self.saved_counts),
-                           "sent": sum(self.sent_counts.values()),
-                           "budget_exempt": sum(sum(counts.values()) for counts in self.exempt_counts.values()),
-                           "dropped_offers": self.dropped_offers,
                            "max_requests": self.config.max_requests,
                            "elapsed_seconds": round(time.monotonic() - self.start, 3), **extra})
 
@@ -813,7 +810,12 @@ class _Run:
         return True
 
     def refund_offer(self, target: str) -> None:
-        """Refund a charged reservation that never reached the transport."""
+        """Refund only an offer that has not acquired a request tile."""
+        identity = _request_budget_slot.get()
+        if identity is not None and identity[0] is self and identity[1] is not None:
+            raise RuntimeError("Cannot refund a request after begin_attempt assigned its budget slot")
+        if self.budget_used <= self.counted_attempted:
+            raise RuntimeError("Cannot refund budget already assigned to request slots")
         self.budget_used -= 1
         self.budget_counts[target] -= 1
         self.budget_unsent_counts[target] -= 1
@@ -856,6 +858,14 @@ class _Run:
         finally:
             if not reserved:
                 self.release_slot()
+
+    @asynccontextmanager
+    async def _request_identity(self):
+        identity = _request_budget_slot.set((self, None))
+        try:
+            yield
+        finally:
+            _request_budget_slot.reset(identity)
 
     def timeout_origin(self, spec):
         """Validate producer provenance against the request's actual deadline."""
@@ -942,7 +952,7 @@ class _Run:
         slot_deadline = min(self.deadline, deadline_override if deadline_override is not None else self.deadline)
         if admission_deadline is not None:
             slot_deadline = min(slot_deadline, admission_deadline)
-        async with self.slot(slot_reserved, slot_deadline, gateway_probe=gateway_probe) as admitted:
+        async with self.slot(slot_reserved, slot_deadline, gateway_probe=gateway_probe) as admitted, self._request_identity():
             # An offered arrival owns its budget even if a later arrival exhausts
             # the ceiling. Only a real stop condition can prevent its dispatch.
             reason = self.stop_reason(target.name)
@@ -1047,6 +1057,8 @@ class _Run:
 
             def begin_attempt():
                 nonlocal started, started_at, request_slot, budget_request_slot, token, pending_start
+                if token is not None:
+                    raise RuntimeError("begin_attempt cannot assign a request slot twice")
                 if admission_deadline is not None:
                     started = admission_clock()
                     if (not budget_reserved and not budget_exempt
@@ -1062,8 +1074,11 @@ class _Run:
                         condition["not_sent"] = max(0, condition["planned"] - condition["sent"])
                 request_slot = self.attempted - 1
                 if not budget_exempt:
+                    if self.counted_attempted >= self.budget_used:
+                        raise RuntimeError("Request slot requires an unassigned charged offer")
                     budget_request_slot = self.counted_attempted
                     self.counted_attempted += 1
+                    _request_budget_slot.set((self, budget_request_slot))
                 self.counts[target.name] += 1
                 if not readiness and not evidence_probe:
                     self.endpoint_attempt(target.name)
@@ -1073,15 +1088,17 @@ class _Run:
                     started = time.monotonic()
                 started_at = _now()
                 token = self.inflight.start(target.name)
-                if on_start:
-                    on_start()
-                if guard_admission and self.progress:
-                    # An admitted request enters transport before yielding to
-                    # public progress. A synchronous observer cannot hold it
-                    # past the checked admission boundary before dispatch.
-                    pending_start = task.get_loop().call_soon(emit_scheduled_start)
-                else:
-                    emit_start()
+                try:
+                    if on_start:
+                        on_start()
+                finally:
+                    if guard_admission and self.progress:
+                        # An admitted request enters transport before yielding to
+                        # public progress. A synchronous observer cannot hold it
+                        # past the checked admission boundary before dispatch.
+                        pending_start = task.get_loop().call_soon(emit_scheduled_start)
+                    else:
+                        emit_start()
                 if guard_transport:
                     deadline.reschedule(min(self.deadline, task.get_loop().time() + request_budget()))
 
@@ -1212,7 +1229,7 @@ class _Run:
             record.sent = sent
             record._budget_exempt = budget_exempt
             record._budget_exemption = budget_exemption
-            record._budget_request_slot = budget_request_slot if sent else None
+            record._budget_request_slot = budget_request_slot
             if (spec.deadline_source == "run" and spec.timeout_setting is not None
                     and spec.workload.get("request_source") == "custom_fixtures"
                     and spec._fixture_request_timeout_seconds == record.request_timeout_seconds):
@@ -1345,7 +1362,7 @@ class _Run:
                               **({"user": {key: spec.workload[key] for key in ("user_id", "population", "profile", "window_id", "phase", "request_sequence", "session_id", "turn_id", "conversation_sequence", "role", "matched_work_sequence", "trigger", "heavy_profile", "cancellation_role", "cohort", "origin", "work_sequence", "activation_seconds") if key in spec.workload}} if "multi_user" in spec.check_ids else {}),
                               request_slot=request_slot, request=record.model_dump(mode="json", include={
                                   "id", "target", "fixture_id", "scenario", "condition_id", "intentional", "status", "valid", "score",
-                                  "elapsed_ms", "first_output_ms", "check_ids", "http_status",
+                                  "elapsed_ms", "first_output_ms", "check_ids", "http_status", "sent",
                                   "request_timeout_seconds", "termination_reason", "termination_limit_seconds",
                                   "started_at", "dispatch_ms", "completed_ms", "timing_start_ms",
                                   *({"request_body_sent_ms"} if record.request_body_sent_ms is not None else ()),

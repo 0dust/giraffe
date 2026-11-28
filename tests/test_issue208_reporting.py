@@ -14,7 +14,7 @@ def report():
     counts = {"sent": 2, "budget_counted": 1, "budget_exempt": 1,
               "budget_counted_unsent": 0, "saved_observations": 0, "budget_exempt_by_reason": {"restart_readiness": 1}}
     return RunReport(run_id="accounting", started_at="now", finished_at="now", overall="pass", manifest={},
-                     observations={"request_counts": {**counts, "complete": True, "targets": {"local": dict(counts)}}})
+                     observations={"request_counts": {**counts, "complete": True, "available": True, "targets": {"local": dict(counts)}}})
 
 
 def test_text_and_html_accounting(tmp_path, capsys):
@@ -45,6 +45,7 @@ def test_saved_observations_counts_only_present_measurements():
     assert counts["saved_observations"] == counts["targets"]["local"]["saved_observations"] == 1
     value.requests.pop()  # A record removed by a memory/evidence guard is not saved.
     refresh_saved_observations(value)
+    counts = value.observations["request_counts"]
     assert counts["saved_observations"] == counts["targets"]["local"]["saved_observations"] == 0
 
 
@@ -52,7 +53,7 @@ async def test_live_progress_uses_charged_budget_and_forwards_preflight(monkeypa
     async def run(config, *, progress, stop_event, preflight_counts):
         assert preflight_counts == {"local": 1}
         progress({"target": "local", "scenario": "initial", "completed": 8,
-                  "budget_used": 1, "sent": 2, "budget_exempt": 1})
+                  "request_counts": report().observations["request_counts"]})
         return report()
 
     monkeypatch.setattr("giraffe.runner.run_suite", run)
@@ -120,13 +121,14 @@ def test_counted_unsent_and_recovered_suffix_on_text_and_html():
     assert expected in _render(value)
 
 
-def test_saved_observations_creates_missing_target():
+def test_saved_observations_keeps_missing_target_unknown():
     value = report()
     value.requests = [RequestRecord(id="other", target="missing", fixture_id="answer", scenario="initial",
                                     check_ids=["access"], started_at="now", status="completed")]
     refresh_saved_observations(value)
     counts = value.observations["request_counts"]
-    assert counts["saved_observations"] == counts["targets"]["missing"]["saved_observations"] == 1
+    assert counts["saved_observations"] == 1
+    assert "missing" not in counts["targets"]
 
 
 async def test_journal_drops_do_not_remove_saved_report_observations(monkeypatch, tmp_path):
@@ -184,3 +186,18 @@ def test_report_summary_uses_selected_artifact_path(tmp_path, capsys, html):
     expected = destination if html else source
     assert f"report: {expected}" in capsys.readouterr().out
     assert expected.is_file()
+
+
+@pytest.mark.parametrize("counts", [None, {"available": False}, {"available": True, "budget_counted": 1}])
+async def test_cli_progress_omits_count_clause_when_accounting_unknown(monkeypatch, capsys, counts):
+    async def run(config, *, progress, stop_event):
+        progress({"target": "local", "scenario": "initial", "budget_used": 99,
+                  "sent": 101, "budget_exempt": 2, "request_counts": counts})
+        return report()
+
+    monkeypatch.setattr("giraffe.runner.run_suite", run)
+    config = RunConfig(targets=[Target(name="local", url="http://server", model="tiny")], max_requests=2)
+    await _run(config)
+    output = capsys.readouterr().err
+    assert "Connection check" in output
+    assert "counted requests" not in output and "exempt" not in output and "99" not in output

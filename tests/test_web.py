@@ -198,7 +198,7 @@ def report(configuration, *, cancelled=False):
                      overall="inconclusive" if cancelled else "pass",
                      observations={"request_counts": {"sent": 1, "budget_counted": 1,
                          "budget_counted_unsent": 0, "budget_exempt": 0, "saved_observations": 1,
-                         "budget_exempt_by_reason": {}, "complete": True, "targets": {}}},
+                         "budget_exempt_by_reason": {}, "available": True, "complete": True, "targets": {}}},
                      manifest={"config": configuration.model_dump(mode="json")},
                      abort_reason="cancelled by user" if cancelled else None,
                      checks=[CheckResult(id="serving", target="local", title="Serving success",
@@ -1044,12 +1044,15 @@ async def test_first_run_and_baseline_create_only_their_required_directories(tmp
 
 async def test_dropped_offer_count_in_live_judging_and_reopened_payload(tmp_path, monkeypatch):
     release = threading.Event()
+    target = {"sent": 2, "budget_counted": 4, "budget_counted_unsent": 2,
+              "budget_exempt": 0, "saved_observations": 2, "budget_exempt_by_reason": {}}
+    counts = {**target, "available": True, "complete": True, "targets": {"local": target}}
 
     async def waiting(configuration, *, progress, stop_event):
         progress({"event": "offer_dropped", "budget_used": 4, "attempted": 2,
-                  "completed": 2, "dropped_offers": 2})
+                  "completed": 2, "dropped_offers": 2, "request_counts": counts})
         progress({"event": "judging_started", "phase": "judging", "budget_used": 4,
-                  "attempted": 2, "completed": 2, "dropped_offers": 2})
+                  "attempted": 2, "completed": 2, "dropped_offers": 2, "request_counts": counts})
         await asyncio.to_thread(release.wait, 2)
         return report(configuration)
 
@@ -1060,15 +1063,17 @@ async def test_dropped_offer_count_in_live_judging_and_reopened_payload(tmp_path
                                   lambda value: value["progress"].get("phase") == "judging")
         assert detail["state"] == "running"
         assert detail["progress"]["phase"] == "judging"
-        assert detail["progress"]["dropped_offers"] == 2
-        assert detail["progress"]["budget_used"] > detail["progress"]["attempted"]
-        assert detail["events"][0]["dropped_offers"] == 2
+        assert detail["progress"]["request_counts"] == counts
+        assert detail["events"][0]["request_counts"] == counts
+        for value in [detail["progress"], *detail["events"]]:
+            assert not {"budget_used", "sent", "budget_exempt", "attempted", "dropped_offers"} & value.keys()
         release.set()
         await finished(client, identifier)
     async with browser(tmp_path) as client:
         saved = (await client.get(f"/api/runs/{identifier}")).json()
         assert saved["state"] == "completed"
-        assert saved["progress"]["dropped_offers"] == 2
+        assert saved["progress"]["request_counts"] == counts
+        assert not {"budget_used", "sent", "budget_exempt", "attempted", "dropped_offers"} & saved["progress"].keys()
 
 
 def saved_comparison_fixture(root, name, *, latency=100):
@@ -1283,3 +1288,19 @@ def test_live_mosaic_requires_explicit_budget_slot():
     _track_live_request(job, {"event": "request_started", "request_slot": 0}, 1)
     assert not job["requests"]
     assert job["live_request_count"] == 0
+
+
+def test_web_progress_does_not_use_flat_or_unvalidated_request_counts():
+    from giraffe.web import _public_progress
+    event = {"event": "request_completed", "budget_used": 4, "sent": 3,
+             "budget_exempt": 1, "attempted": 4, "dropped_offers": 1,
+             "request_counts": {"sent": 3}, "request": {"sent": False, "status": "failed"}}
+    assert _public_progress(event) == {
+        "event": "request_completed", "request": {"sent": False, "status": "failed"}}
+
+
+def test_compact_api_report_keeps_explicit_unsent_record():
+    from giraffe.web import _api_report
+    saved = report(RunConfig.model_validate(config()))
+    saved.requests[0].sent = False
+    assert _api_report(saved)["requests"][0]["sent"] is False

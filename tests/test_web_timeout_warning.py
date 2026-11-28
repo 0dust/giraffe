@@ -356,7 +356,8 @@ async def test_cli_journal_restart_probe_and_preparation_failure_do_not_take_mos
             (0, None, "readiness", True, "restart_readiness"),
             (1, None, "initial", False, None),
             (2, 0, "initial", True, None),
-            (3, 1, "warm", True, None)):
+            (3, 1, "warm", True, None),
+            (4, 2, "warm", False, None)):
         record = RequestRecord(id=f"request-{raw_slot}", target="local", fixture_id="short",
             scenario=scenario, check_ids=["serving"], started_at=_now(),
             status="completed" if sent else "failed", sent=sent)
@@ -365,7 +366,7 @@ async def test_cli_journal_restart_probe_and_preparation_failure_do_not_take_mos
         record._budget_exempt = bool(exemption)
         record._budget_exemption = exemption
         writer.record_finished(record)
-    target_counts = {"sent": 3, "budget_counted": 2, "budget_counted_unsent": 0,
+    target_counts = {"sent": 3, "budget_counted": 3, "budget_counted_unsent": 1,
         "budget_exempt": 1, "saved_observations": 0,
         "budget_exempt_by_reason": {"restart_readiness": 1}}
     writer.request_counts_snapshot({**target_counts, "available": True, "complete": True,
@@ -373,10 +374,12 @@ async def test_cli_journal_restart_probe_and_preparation_failure_do_not_take_mos
     writer.close()
     async with browser(tmp_path) as client:
         detail = (await client.get('/api/runs/cli')).json()
-        assert [(row["id"], row["slot"]) for row in detail["live_requests"]] == [("request-2", 0), ("request-3", 1)]
-        assert detail["live_request_count"] == 2
+        assert [(row["id"], row["slot"]) for row in detail["live_requests"]] == [("request-2", 0), ("request-3", 1), ("request-4", 2)]
+        assert detail["live_request_count"] == 3
+        assert detail["live_requests"][-1]["sent"] is False
         replay = (await client.get('/api/runs/cli/events')).json()
-        assert [row["slot"] for row in replay["records"]] == [0, 1]
+        assert [row["slot"] for row in replay["records"]] == [0, 1, 2]
+        assert replay["records"][-1]["sent"] is False
     recovered = recover_evidence(directory, {"config": config(), "started_at": _now()})
     assert recovered is not None
     failure = next(record for record in recovered.requests if record.id == "request-1")
@@ -453,8 +456,7 @@ async def test_cli_journal_progress_counters_reach_detail_events_and_live_headin
     async with browser(tmp_path) as client:
         detail = (await client.get('/api/runs/cli')).json()
         for progress in (detail["progress"], (await client.get('/api/runs/cli/events')).json()["progress"]):
-            assert progress == {"budget_used": 1, "sent": 2, "budget_exempt": 1,
-                                "completed": 2, "attempted": 2, "request_counts": counts}
+            assert progress == {"completed": 2, "request_counts": counts}
         assert detail["live_requests"] == []
         cursor = detail["seq"]
         idle = (await client.get(f'/api/runs/cli/events?after={cursor}')).json()
@@ -468,3 +470,23 @@ async def test_cli_journal_progress_counters_reach_detail_events_and_live_headin
     run_render_checks("state.detail=" + json.dumps(detail) + ";renderLive();"
         "assert.match($('.live-progress').textContent,/1 of ~2 planned requests/);"
         "assert.match($('.live-progress').textContent,/1 exempt/);", dom=True)
+
+
+def test_unsent_terminal_updates_retained_and_evicted_running_slots(monkeypatch, caplog):
+    from giraffe.web import _track_live_request
+    monkeypatch.setattr("giraffe.web.MAX_LIVE_REQUESTS", 1)
+    job = {"requests": OrderedDict(), "live_request_count": 0, "evicted_running": set(),
+           "live_request_summary": {"evicted": 0, "through_slot": None, "statuses": {}}}
+    for slot in (0, 1):
+        _track_live_request(job, {"event": "request_started", "budget_request_slot": slot}, 2)
+    for slot in (0, 1):
+        _track_live_request(job, {"event": "request_completed", "budget_request_slot": slot,
+            "request": {"id": str(slot), "status": "failed", "sent": False}}, 2)
+    assert job["requests"][1]["status"] == "failed" and job["requests"][1]["sent"] is False
+    assert not job["evicted_running"]
+    assert job["live_request_summary"]["statuses"] == {"running": 0, "failed": 1}
+    _track_live_request(job, {"event": "request_completed", "budget_request_slot": None,
+        "request": {"id": "preparation", "status": "failed", "sent": False}}, 2)
+    assert list(job["requests"]) == [1]
+    _track_live_request(job, {"event": "request_started", "budget_request_slot": 2}, 2)
+    assert "Request budget slot invariant violated" in caplog.text

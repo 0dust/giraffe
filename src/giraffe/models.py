@@ -3447,7 +3447,7 @@ class TargetRequestCounts(TypedDict):
     budget_counted_unsent: Annotated[int, Field(ge=0, description="Charged offers not sent to the endpoint, including pending reservations and dropped offers without a refund.")]
     budget_exempt: Annotated[int, Field(ge=0, description="Sent inference requests exempt from max_requests.")]
     saved_observations: Annotated[int, Field(ge=0, description="Measurement records present in report.json requests after retention, excluding setup probes; evidence_dropped_count separately counts journal drops.")]
-    budget_exempt_by_reason: Annotated[dict[Literal["preflight", "restart_readiness"], int], Field(description="Sent exempt inference requests grouped by connection preflight or restart readiness reason.")]
+    budget_exempt_by_reason: Annotated[dict[Literal["preflight", "restart_readiness"], Annotated[int, Field(ge=0)]], Field(description="Sent exempt inference requests grouped by connection preflight or restart readiness reason.")]
 
 
 class RequestCounts(TargetRequestCounts):
@@ -3460,6 +3460,30 @@ class UnavailableRequestCounts(TypedDict):
     complete: Annotated[Literal[False], Field(description="Recovered accounting is incomplete.")]
     available: Annotated[Literal[False], Field(description="No consistent accounting snapshot was saved before interruption.")]
     saved_observations: Annotated[int, Field(ge=0, description="Measurement records present in the recovered report.json requests, excluding setup probes.")]
+
+
+_REQUEST_COUNTS_ADAPTER = TypeAdapter(RequestCounts)
+_UNAVAILABLE_REQUEST_COUNTS_ADAPTER = TypeAdapter(UnavailableRequestCounts)
+
+
+def known_request_counts(value: object) -> RequestCounts | None:
+    """Return strictly validated accounting only when explicitly available."""
+    if not isinstance(value, dict) or value.get("available") is not True:
+        return None
+    try:
+        return _REQUEST_COUNTS_ADAPTER.validate_python(value, strict=True)
+    except ValidationError:
+        return None
+
+
+def unavailable_request_counts(value: object) -> UnavailableRequestCounts | None:
+    """Return a valid explicit declaration that recovered counts are unavailable."""
+    if not isinstance(value, dict) or value.get("available") is not False or value.get("complete") is not False:
+        return None
+    try:
+        return _UNAVAILABLE_REQUEST_COUNTS_ADAPTER.validate_python(value, strict=True)
+    except ValidationError:
+        return None
 
 
 def request_counts_schema() -> dict[str, Any]:

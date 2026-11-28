@@ -33,7 +33,7 @@ from .report_inputs import input_ref as _input_ref
 from .multi_user_metrics import (_error as _user_error, _length_mix_differs, _total_generated_tokens,
                                  _uncached_input_tokens, _valid as _user_valid_completion,
                                  fairness_applies, truncated_conversation_turn, user_delivery_completions, user_latency)
-from .models import (CHECK_NAMES, SHAPES, SHARED_BASELINE_EXCLUDED_WORKLOADS, CheckResult, GatewayAccess,
+from .models import (known_request_counts, unavailable_request_counts, CHECK_NAMES, SHAPES, SHARED_BASELINE_EXCLUDED_WORKLOADS, CheckResult, GatewayAccess,
                      GatewayAttribution, GatewayEvidence, GatewayPolicy, RequestRecord, RunConfig, RunReport,
                      TestIdentity, overall_status, load_shape_label,
                      migrate_concurrent_load, migrate_run_limits, is_supported_schema, CURRENT_SCHEMA)
@@ -4165,36 +4165,42 @@ def _scale_down_html(check, report, anchors):
 
 def refresh_saved_observations(report: RunReport) -> RunReport:
     """Refresh measurement counts from the records actually retained in the report."""
-    counts = report.observations.get("request_counts")
+    raw_counts = report.observations.get("request_counts")
+    counts = known_request_counts(raw_counts)
     if counts is None:
-        return report
-    if counts.get("available") is False:
-        counts["saved_observations"] = sum(
-            record.scenario not in states.SETUP_PROBE_SCENARIOS for record in report.requests)
+        unavailable = unavailable_request_counts(raw_counts)
+        if unavailable is not None:
+            unavailable["saved_observations"] = sum(
+                record.scenario not in states.SETUP_PROBE_SCENARIOS for record in report.requests)
+            report.observations["request_counts"] = unavailable
         return report
     targets = counts["targets"]
     for target_counts in targets.values():
         target_counts["saved_observations"] = 0
+    saved = 0
     for record in report.requests:
         if record.scenario not in states.SETUP_PROBE_SCENARIOS:
-            target_counts = targets.setdefault(record.target, {
-                "sent": 0, "budget_counted": 0, "budget_counted_unsent": 0, "budget_exempt": 0,
-                "saved_observations": 0, "budget_exempt_by_reason": {},
-            })
-            target_counts["saved_observations"] += 1
-    counts["saved_observations"] = sum(target["saved_observations"] for target in targets.values())
+            saved += 1
+            if record.target in targets:
+                targets[record.target]["saved_observations"] += 1
+    counts["saved_observations"] = saved
+    report.observations["request_counts"] = counts
     return report
 
 
 def request_count_lines(report: RunReport) -> list[str]:
     """Format recorded inference accounting without inventing missing evidence."""
-    counts = report.observations.get("request_counts")
+    raw_counts = report.observations.get("request_counts")
+    counts = known_request_counts(raw_counts)
     if counts is None:
-        return []
+        unavailable = unavailable_request_counts(raw_counts)
+        if unavailable is None:
+            return ["Requests: not recorded for this report"]
+        saved = unavailable["saved_observations"]
+        noun = "saved observation" if saved == 1 else "saved observations"
+        return [f"Requests: counts unavailable for this recovered run · {saved} {noun}"]
     saved = counts["saved_observations"]
     saved_label = "saved observation" if saved == 1 else "saved observations"
-    if counts.get("available") is False:
-        return [f"Requests: counts unavailable for this recovered run · {saved} {saved_label}"]
     lines = [f"Requests: {counts['sent']} sent · {counts['budget_counted']} counted toward the limit"
              f" · {counts['budget_exempt']} exempt · {saved} {saved_label}"]
     if counts.get("budget_counted_unsent", 0):

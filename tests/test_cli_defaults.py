@@ -215,7 +215,8 @@ def test_final_block_starts_with_verdict_collapses_unselected_and_gates_ram(outc
     assert "skipped — Not selected" not in output
     assert ("Peak memory (RAM)" in output) == verbose
     if outcome != "pass":
-        assert output.splitlines()[1] == f"  local / first_output: {outcome} — First output exceeded its limit."
+        assert output.splitlines()[1] == "Requests: not recorded for this report"
+        assert output.splitlines()[2] == f"  local / first_output: {outcome} — First output exceeded its limit."
 
 
 @pytest.mark.parametrize("with_baseline", [False, True])

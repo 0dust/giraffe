@@ -407,9 +407,10 @@ def test_run_surfaces_optional_overall_summary(summary, output_format, tmp_path,
     else:
         lines = output.splitlines()
         assert lines[0].startswith("BLOCKED  0 checks passed · report: ")
-        assert lines[1] == "Stopped: stopped"
+        assert lines[1] == "Requests: not recorded for this report"
+        assert lines[2] == "Stopped: stopped"
         if summary:
-            assert lines[2] == summary
+            assert lines[3] == summary
         assert "RAM" not in output
 
 

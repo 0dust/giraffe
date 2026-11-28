@@ -393,3 +393,19 @@ await page.run(`
 })()
 `);
 """)
+
+
+def test_named_slotless_completions_do_not_enter_live_budget_mosaic():
+    run_browser_script(r"""
+const page=browser();await page.run('init()');
+await page.run(`
+const run={id:'slots',live_requests:[{slot:0,id:'sent',sent:true,status:'running'}]};
+mergeRunEvents(run,{seq:1,records:[{id:'preparation-failure',sent:false,status:'failed'},
+ {id:'probe',request_budget_exempt:true,status:'completed'},
+ {slot:0,id:'sent',sent:true,status:'completed'},
+ {slot:1,id:'offer',sent:false,status:'failed'}]});
+assert.deepEqual(run.live_requests.map(record=>record.slot),[0,1]);
+assert.deepEqual(run.live_requests.map(record=>record.id),['sent','offer']);
+assert.equal(run.live_requests[1].sent,false);
+`);
+""")

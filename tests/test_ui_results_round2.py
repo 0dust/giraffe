@@ -36,7 +36,7 @@ const reason='Stopped by you after 16 of 20 planned requests.';
 assert.equal(shortReason(reason).summary,reason);
 for(const abort_reason of [null,'cancelled by user',reason]){
  const value=report([check('generation','inconclusive',{summary:'Partial timing evidence recorded.'})],{overall:'inconclusive',abort_reason,observations:{summary:reason}});
- const html=detail(value,{progress:{completed:16,budget_used:16},request_plan:{planned_total:20}}),hero=html.split('report-toolbar')[0];
+ const html=detail(value,{progress:{completed:16,request_counts:requestCounts({sent:16,budget_counted:16})},request_plan:{planned_total:20}}),hero=html.split('report-toolbar')[0];
  assert.equal((hero.match(/Stopped by you/g)||[]).length,1);
  assert.doesNotMatch(hero,/Stopped by you.*Stopped by you|stopped by you/);
  if(abort_reason==='cancelled by user'){

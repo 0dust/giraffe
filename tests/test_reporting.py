@@ -2029,3 +2029,32 @@ def test_unavailable_recovered_counts_render_without_inventing_totals(tmp_path, 
     output = capsys.readouterr().out
     assert line in output
     assert "requests sent" not in output
+
+
+@pytest.mark.parametrize("counts", [None, {}, {"sent": 1}, {"available": True, "sent": 1},
+                                     {"available": False, "complete": False, "saved_observations": "1"}])
+def test_missing_or_invalid_request_counts_are_explicit(counts):
+    from giraffe.reporting import request_count_lines, refresh_saved_observations, _request_counts_html
+
+    source = make_report(count=1)
+    if counts is not None:
+        source.observations["request_counts"] = counts
+    refresh_saved_observations(source)
+    assert request_count_lines(source) == ["Requests: not recorded for this report"]
+    assert "Requests: not recorded for this report" in _request_counts_html(source)
+
+
+def test_saved_observations_does_not_invent_missing_target_accounting():
+    from giraffe.reporting import refresh_saved_observations
+
+    source = make_report(count=1)
+    row = {"sent": 1, "budget_counted": 1, "budget_counted_unsent": 0, "budget_exempt": 0,
+           "saved_observations": 0, "budget_exempt_by_reason": {}}
+    source.observations["request_counts"] = {
+        **row, "available": True, "complete": False, "targets": {"other": row},
+    }
+    refresh_saved_observations(source)
+    counts = source.observations["request_counts"]
+    assert counts["saved_observations"] == 1
+    assert counts["targets"] == {"other": row}
+    assert counts["targets"]["other"]["saved_observations"] == 0

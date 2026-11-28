@@ -71,8 +71,9 @@ async def test_sent_counts_charged_and_exempt_at_real_transport(inference_posts)
                               "budget_exempt_by_reason": {"restart_readiness": 1}}},
     }
     completed = [event for event in events if event["event"] == "request_completed"]
-    assert [(event["sent"], event["budget_used"], event["budget_exempt"])
-            for event in completed] == [(1, 0, 1), (2, 1, 1)]
+    assert [(event["request_counts"]["sent"], event["request_counts"]["budget_counted"],
+             event["request_counts"]["budget_exempt"]) for event in completed] == [(1, 0, 1), (2, 1, 1)]
+    assert all(not {"budget_used", "sent", "budget_exempt"} & event.keys() for event in events)
 
 
 async def test_shared_client_sent_observer_keeps_concurrent_exempt_reasons(inference_posts, monkeypatch):
@@ -352,3 +353,135 @@ async def test_counter_sink_observes_transport_before_request_finishes(inference
             assert row["sent"] == row["budget_counted"] - row["budget_counted_unsent"] + row["budget_exempt"]
     finally:
         runner.request_counts_sink.reset(token)
+
+
+def assert_terminal_slot(events, record, status):
+    from collections import OrderedDict
+    from giraffe.web import _track_live_request
+
+    start, = [event for event in events if event["event"] == "request_started"]
+    terminal, = [event for event in events if event["event"] == "request_completed"]
+    assert start["budget_request_slot"] == terminal["budget_request_slot"] == record._budget_request_slot == 0
+    assert record.sent is False and terminal["request"]["sent"] is False
+    assert record.status == status
+    job = {"requests": OrderedDict(), "live_request_count": 0, "evicted_running": set(),
+           "live_request_summary": {"through_slot": None, "evicted": 0, "statuses": {}}}
+    _track_live_request(job, start, 2)
+    assert job["requests"][0]["status"] == "running"
+    _track_live_request(job, terminal, 2)
+    assert job["requests"][0]["status"] == status and job["requests"][0]["sent"] is False
+
+
+async def test_non_guard_preparation_failure_keeps_charged_terminal_slot(inference_posts, monkeypatch):
+    config = configuration()
+    events = []
+    run = runner._Run(config, events.append, None)
+    async with LLMClient(config.targets[0], config) as client:
+        def fail(*args, **kwargs):
+            raise ValueError("local preparation failed")
+        monkeypatch.setattr(client._client, "build_request", fail)
+        record = await run.request(config.targets[0], client, request_spec())
+    assert_terminal_slot(events, record, "failed")
+    counts = assert_reconciles(run, inference_posts)
+    assert counts["budget_counted"] == counts["budget_counted_unsent"] == run.counted_attempted == 1
+
+
+@pytest.mark.parametrize("cause", ["timeout", "deadline", "user", "memory", "cancel"])
+async def test_unsent_pool_lane_wait_ends_its_original_tile(inference_posts, cause):
+    config = configuration(request_timeout_seconds=0.03 if cause == "timeout" else 10)
+    events = []
+    started = asyncio.Event()
+
+    def progress(event):
+        events.append(event)
+        if event["event"] == "request_started":
+            started.set()
+
+    run = runner._Run(config, progress, None)
+    if cause == "deadline":
+        run.deadline = time.monotonic() + 0.03
+    async with LLMClient(config.targets[0], config, max_connections=1) as client:
+        await client._client._slots.acquire()
+        try:
+            task = asyncio.create_task(run.request(config.targets[0], client, request_spec()))
+            await asyncio.wait_for(started.wait(), 1)
+            if cause in {"user", "memory", "cancel"}:
+                if cause == "user":
+                    run.stop.set()
+                elif cause == "memory":
+                    run.memory_limit_reached = True
+                    run.memory_stop_reason = run.reason = "memory limit reached"
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+                record = run.records[-1]
+            else:
+                record = await task
+        finally:
+            client._client._slots.release()
+    assert_terminal_slot(events, record, "timeout" if cause == "timeout" else "cancelled")
+    counts = assert_reconciles(run, inference_posts)
+    assert counts["budget_counted"] == counts["budget_counted_unsent"] == 1
+
+
+async def test_refund_rejects_a_request_that_already_holds_a_slot(inference_posts):
+    config = configuration()
+    events = []
+    run = runner._Run(config, events.append, None)
+    # Leave a second unassigned offer: the task-local check must reject a refund
+    # of the running request even while another offer could legally be refunded.
+    assert run.reserve_offer("local")
+    async with LLMClient(config.targets[0], config) as client:
+        with pytest.raises(RuntimeError, match="after begin_attempt"):
+            await run.request(config.targets[0], client, request_spec(),
+                              on_start=lambda: run.refund_offer("local"))
+    assert run.counted_attempted == 1 and run.budget_used == 2
+    assert run.records[0]._budget_request_slot == 0
+    assert_terminal_slot(events, run.records[0], "failed")
+
+
+async def test_nested_concurrency_slot_cannot_hide_assigned_request_from_refund(inference_posts, monkeypatch):
+    config = configuration()
+    run = runner._Run(config, None, None)
+    assert run.reserve_offer("local")
+    async with LLMClient(config.targets[0], config) as client:
+        execute = client.execute
+        async def nested(spec, **kwargs):
+            async with run.slot(True):
+                with pytest.raises(RuntimeError, match="after begin_attempt"):
+                    run.refund_offer("local")
+            return await execute(spec, **kwargs)
+        monkeypatch.setattr(client, "execute", nested)
+        record = await run.request(config.targets[0], client, request_spec())
+    assert record.sent and run.counted_attempted == 1 and run.budget_used == 2
+
+
+async def test_dense_budget_slots_survive_exempt_refund_drop_and_unsent_attempt(inference_posts, monkeypatch):
+    config = configuration().model_copy(update={"max_requests": 3})
+    events = []
+    run = runner._Run(config, events.append, None)
+    target = config.targets[0]
+    async with LLMClient(target, config) as client:
+        await run.request(target, client, request_spec("readiness"), budget_exemption="restart_readiness")
+        build = client._client.build_request
+        def fail(*args, **kwargs):
+            raise ValueError("local preparation failed")
+        monkeypatch.setattr(client._client, "build_request", fail)
+        assert run.reserve_offer("local")
+        refunded = await run.request(target, client, request_spec(), budget_reserved=True,
+                                     admission_deadline=time.monotonic() + 10)
+        assert refunded._budget_request_slot is None and run.counted_attempted == run.budget_used == 0
+        assert not [event for event in events if event["event"] == "request_started" and not event["request_budget_exempt"]]
+        assert run.reserve_offer("local")
+        run.drop_offer("local", "load")
+        unsent = await run.request(target, client, request_spec())
+        monkeypatch.setattr(client._client, "build_request", build)
+        sent = await run.request(target, client, request_spec())
+    assert [unsent._budget_request_slot, sent._budget_request_slot] == [0, 1]
+    starts = [event["budget_request_slot"] for event in events if event["event"] == "request_started"
+              and event["budget_request_slot"] is not None]
+    ends = [event["budget_request_slot"] for event in events if event["event"] == "request_completed"
+            and event["budget_request_slot"] is not None]
+    assert starts == ends == [0, 1]
+    assert run.counted_attempted <= run.budget_used <= config.max_requests
+    assert max(starts) < config.max_requests

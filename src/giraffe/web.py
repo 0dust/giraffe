@@ -46,7 +46,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import Headers
 from anyio import CancelScope
-from pydantic import Field, TypeAdapter, ValidationError, WrapValidator
+from pydantic import Field, ValidationError, WrapValidator
 
 from . import states
 from giraffe import __version__
@@ -62,8 +62,9 @@ from giraffe.conditions import ConditionRequestIndex, aggregate_conditions, cond
 from giraffe.deployment import probe_context_windows, safe_config
 from giraffe.fixtures import load_custom_fixtures
 from giraffe.latency import load_observations
-from giraffe.models import (ConfigDraft, CleanupCriteria, Model, RequestCounts, RequestRecord, RunConfig, RunReport, ScaleDownMarker,
+from giraffe.models import (ConfigDraft, CleanupCriteria, Model, RequestRecord, RunConfig, RunReport, ScaleDownMarker,
                             migrate_concurrent_load, migrate_load_test, migrate_run_limits, migration_limit_notes, MigrationWarning, merge_migration_warnings)
+from giraffe.models import known_request_counts, unavailable_request_counts
 from giraffe.planning import request_plan
 from giraffe.open_files import open_file_guard
 from giraffe.preflight import APIKeyInput, ConnectionTest, ModelDiscovery, PreflightError, TokenizerSelection, attach_api_key
@@ -540,11 +541,16 @@ def _track_live_request(job: dict, event: dict, max_requests: int | None) -> Non
     kind = event["event"]
     if kind not in {"request_started", "request_completed"}:
         return
+    slot = event.get("budget_request_slot")
+    if kind == "request_completed" and slot is None:
+        # Local preparation failures never owned a budget traffic slot.
+        return
     if event.get("request_budget_exempt"):
         return
-    slot = event.get("budget_request_slot")
-    if (not isinstance(slot, int) or isinstance(slot, bool) or slot < 0
-            or max_requests is not None and slot >= max_requests):
+    if type(slot) is not int or slot < 0:
+        return
+    if max_requests is not None and slot >= max_requests:
+        logger.error("Request budget slot invariant violated: slot %s exceeds limit %s", slot, max_requests)
         return
     requests = job["requests"]
     summary = job["live_request_summary"]
@@ -591,11 +597,24 @@ def _track_live_request(job: dict, event: dict, max_requests: int | None) -> Non
 
 
 
+def _public_progress(event: dict) -> dict:
+    """Expose accounting only through one validated request_counts object."""
+    event = {key: value for key, value in event.items() if key not in {
+        "performance", "budget_used", "sent", "budget_exempt", "attempted", "dropped_offers"}}
+    if "request_counts" in event:
+        counts = known_request_counts(event["request_counts"]) or unavailable_request_counts(event["request_counts"])
+        if counts is None:
+            event.pop("request_counts")
+        else:
+            event["request_counts"] = counts
+    return event
+
+
 def _track_live_progress(job: dict, event: dict, max_requests: int | None) -> None:
     """Bound live web metadata independently of the configured arrival count."""
     # Derived performance is requested separately, never copied into polling
     # progress/events (including events from third-party runner integrations).
-    event = {key: value for key, value in event.items() if key != "performance"}
+    event = _public_progress(event)
     if event.get("event") == "timeout_warning" and isinstance(event.get("timeout_warning"), dict):
         warning = deepcopy(event["timeout_warning"])
         warnings = job.setdefault("live_timeout_warnings", OrderedDict())
@@ -828,9 +847,15 @@ def _api_report(report: RunReport) -> dict:
               "output_chars", "stream", "finish_reason", "input_tokens", "output_tokens", "evaluation_error",
               "requested_input_tokens", "requested_output_tokens", "input_chars", "requested_max_tokens",
               "sent", "traffic_stage", "traffic_rate_rps", "traffic_class", "arrival_elapsed_ms", "arrival_first_output_ms", "load_point", "workload"}
-    result.update(request_counts=report.observations.get("request_counts"), requests_compact=True,
+    counts = (known_request_counts(report.observations.get("request_counts"))
+              or unavailable_request_counts(report.observations.get("request_counts")))
+    if counts is None:
+        result["observations"].pop("request_counts", None)
+    else:
+        result["observations"]["request_counts"] = counts
+    result.update(request_counts=counts, requests_compact=True,
                   requests=[{**row.model_dump(mode="json", include=fields, exclude_defaults=True),
-                             "valid": row.valid, "elapsed_ms": row.elapsed_ms, "output_chars": row.output_chars,
+                             "valid": row.valid, "sent": row.sent, "elapsed_ms": row.elapsed_ms, "output_chars": row.output_chars,
                              "generation_tokens_per_second": row.generation_tokens_per_second}
                             for row in report.requests])
     return result
@@ -983,7 +1008,6 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
     last_auto_cleanup: dict = {}
     observation_cache: dict = {}
     live_journals: OrderedDict = OrderedDict()
-    request_counts_adapter = TypeAdapter(RequestCounts)
     live_journal_lock = threading.Lock()
     # Microsecond epoch remains exact in JavaScript numbers. Allocate cursors
     # across journal generations so replacement/reopened files invalidate clients.
@@ -1042,6 +1066,8 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                                     "max_stream_gap_ms", "input_tokens", "output_tokens", "completion_tokens",
                                     "reasoning_tokens", "cached_prompt_tokens", "finish_reason",
                                     "input_chars", "requested_max_tokens", "requested_input_tokens") if key in record}
+                                if type(value.get("sent")) is bool:
+                                    request["sent"] = value["sent"]
                                 budget_slot = value.get("budget_request_slot")
                                 if (value.get("budget_exempt") or not isinstance(budget_slot, int)
                                         or isinstance(budget_slot, bool) or budget_slot < 0):
@@ -1066,15 +1092,9 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                                         cached["reset_after"] = max(cached["reset_after"], versions.pop(evicted_slot))
                             continue
                         if isinstance(value, dict) and value.get("type") == "request_counts":
-                            try:
-                                counts = request_counts_adapter.validate_python(
-                                    {key: child for key, child in value.items() if key != "type"})
-                            except ValidationError:
-                                continue
-                            cached["progress"]["request_counts"] = counts
-                            if counts.get("available") is True:
-                                cached["progress"].update(budget_used=counts["budget_counted"],
-                                    sent=counts["sent"], budget_exempt=counts["budget_exempt"])
+                            counts = known_request_counts({key: child for key, child in value.items() if key != "type"})
+                            if counts is not None:
+                                cached["progress"]["request_counts"] = counts
                             continue
                         event = value.get("progress", {}) if isinstance(value, dict) else {}
                         if not isinstance(event, dict):
@@ -1082,8 +1102,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                         # Journal progress carries request bodies and condition state in
                         # other fields; replay only explicit accounting and timing.
                         cached["progress"].update({key: event[key] for key in (
-                            "completed", "attempted",
-                            "dropped_offers", "max_requests", "planned_total", "elapsed_seconds")
+                            "completed", "max_requests", "planned_total", "elapsed_seconds")
                             if key in event and (event[key] is None or type(event[key]) in (int, float))})
                         if event.get("event") != "timeout_warning":
                             continue
@@ -1126,6 +1145,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
         # Called exclusively on the server loop, including worker progress.
         if job is not active or job.get("terminal"):
             return
+        event = _public_progress(event)
         _track_live_progress(job, event, max_requests)
         if "scale_down_control" in event:
             job["scale_down_control"] = deepcopy(event["scale_down_control"])
@@ -1323,8 +1343,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
         job["state"] = job["meta"]["state"] = states.RUN_STOPPING
         # Preserve run counters without replaying a stale request/condition event.
         job["progress"] = {key: value for key, value in job["progress"].items()
-                           if key in {"completed", "attempted", "elapsed_seconds", "budget_used", "sent",
-                                      "budget_exempt", "dropped_offers", "max_requests", "request_counts"}}
+                           if key in {"completed", "elapsed_seconds", "max_requests", "request_counts"}}
         job["progress"].update(event="saving_partial_report", phase="saving_partial_report",
                                message="Saving partial report…", state=states.RUN_STOPPING)
         publish(job, job["progress"], None)
@@ -1481,7 +1500,8 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                         if key in {"run_id", "overall", "started_at", "finished_at", "abort_reason"}:
                             result[key] = value
                         elif key == "observations":
-                            result["request_counts"] = value.get("request_counts")
+                            result["request_counts"] = (known_request_counts(value.get("request_counts"))
+                                                        or unavailable_request_counts(value.get("request_counts")))
                         elif key == "checks":
                             result[key] = [{"status": check["status"]} for check in value]
                         elif key == "manifest":
@@ -1579,9 +1599,9 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                 "abort_reason": (persisted or summary or {}).get("abort_reason") or meta.get("abort_reason"),
                 "error": meta.get("error"), "error_id": meta.get("error_id"),
                 "seq": request_feed.get("seq", meta.get("seq", 0)),
-                "progress": live.get("progress", {**meta.get("progress", {}), **journal.get("progress", {})}),
+                "progress": _public_progress(live.get("progress", {**meta.get("progress", {}), **journal.get("progress", {})})),
                 "scale_down_control": control,
-                "events": live.get("events", meta.get("events", [])),
+                "events": [_public_progress(event) for event in live.get("events", meta.get("events", []))],
                 "live_preparations": list(live["live_preparations"].values()) if "live_preparations" in live else meta.get("live_preparations", []),
                 "live_requests": list(request_feed.get("requests", {}).values()),
                 "live_request_summary": request_feed.get("live_request_summary", meta.get("live_request_summary", {})),
@@ -1686,8 +1706,9 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                                              "started_at", "finished_at", "bytes", "kept")} | {
             "run_id": report.get("run_id"), "overall": report.get("overall"),
             "targets": _targets(detail["config"]), "check_counts": counts,
-            "request_counts": (report.get("request_counts") or report.get("observations", {}).get("request_counts")
-                               or detail["progress"].get("request_counts"))}
+            "request_counts": next((counts for value in (report.get("request_counts"),
+                report.get("observations", {}).get("request_counts"), detail["progress"].get("request_counts"))
+                if (counts := known_request_counts(value) or unavailable_request_counts(value)) is not None), None)}
 
     def saved_baselines() -> list[dict]:
         if not baseline_root.exists():
@@ -2356,7 +2377,9 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                 check["id"] = event["check_id"]
                 checks[("check", check.get("target"), check["id"])] = check
             slot = event.get("budget_request_slot")
-            if (not event.get("request_budget_exempt") and type(slot) is int and slot >= 0):
+            limit = feed.get("meta", {}).get("config", {}).get("max_requests")
+            if (not event.get("request_budget_exempt") and type(slot) is int and slot >= 0
+                    and (limit is None or slot < limit)):
                 record = feed.get("requests", {}).get(slot)
                 if record is None and event.get("request"):
                     record = {**event["request"], "slot": slot}

@@ -29,7 +29,8 @@ def test_verdict_policy_and_quiet(policy, verdict, expected, tmp_path, monkeypat
                  '--output', str(tmp_path / 'run'), '--fail-on', policy, '--quiet']) == expected
     captured = capsys.readouterr()
     assert captured.out.startswith(verdict.upper())
-    assert len(captured.out.splitlines()) == 1
+    assert len(captured.out.splitlines()) == 2
+    assert captured.out.splitlines()[1] == "Requests: not recorded for this report"
     assert 'Giraffe:' not in captured.err and 'Per-check' not in captured.err
     if (verdict == 'inconclusive' and policy in {'fail', 'never'}) or (verdict == 'fail' and policy == 'never'):
         assert verdict in captured.err and f'--fail-on {policy}' in captured.err

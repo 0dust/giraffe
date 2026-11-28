@@ -905,7 +905,7 @@ async def test_access_only_counts_requests_admitted_to_transport(monkeypatch, li
     assert allowed["observed"] == "allow" and denied["observed"] == "unverified"
     assert denied["reason"] == case_reason and denied["request_id"] is None
     assert check.evidence_ids == [allowed["request_id"]] == [record.id for record in report.requests]
-    assert report.observations["request_counts"]["budget_counted"] == events[-1]["attempted"] == 1
+    assert report.observations["request_counts"]["budget_counted"] == events[-1]["request_counts"]["budget_counted"] == 1
     assert [event["fixture_id"] for event in events if event["event"] == "request_started"] == ["gateway-access-valid"]
 
 
@@ -1020,7 +1020,7 @@ async def test_rotated_credential_does_not_observe_another_access_identity(monke
     assert denied["observed"] == "unverified" and denied["reason"] == reason and denied["request_id"] is None
     assert sent == ["Bearer allow-secret"]
     assert check.evidence_ids == [allowed["request_id"]] == [record.id for record in report.requests]
-    assert report.observations["request_counts"]["budget_counted"] == events[-1]["attempted"] == 1
+    assert report.observations["request_counts"]["budget_counted"] == events[-1]["request_counts"]["budget_counted"] == 1
     assert [event["fixture_id"] for event in events if event["event"] == "request_started"] == ["gateway-access-valid"]
     serialized = report.model_dump_json() + json.dumps(events)
     assert "allow-secret" not in serialized and "deny-secret" not in serialized

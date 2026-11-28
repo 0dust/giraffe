@@ -355,13 +355,14 @@ async def test_live_delta_uses_counted_slots_and_excludes_exempt_requests(tmp_pa
     ready = threading.Event()
 
     async def waiting(configuration, *, progress, stop_event):
-        for raw_slot, budget_slot, exempt in [(0, None, True), (1, 0, False), (2, 1, False)]:
+        for raw_slot, budget_slot, exempt in [(0, None, True), (1, 0, False), (2, 1, False), (3, 2, False)]:
             progress({"event": "request_started", "target": "local", "request_slot": raw_slot,
                       "budget_request_slot": budget_slot, "request_budget_exempt": exempt})
-        for raw_slot, budget_slot, exempt in [(1, 0, False), (2, 1, False), (0, None, True)]:
+        for raw_slot, budget_slot, exempt in [(1, 0, False), (2, 1, False), (3, 2, False), (4, None, False), (0, None, True)]:
             progress({"event": "request_completed", "target": "local", "request_slot": raw_slot,
                       "budget_request_slot": budget_slot, "request_budget_exempt": exempt,
-                      "request": {"id": f"request-{raw_slot}", "status": "completed", "valid": True},
+                      "request": {"id": f"request-{raw_slot}", "status": "failed" if raw_slot in {3, 4} else "completed",
+                                  "sent": raw_slot not in {3, 4}, "valid": raw_slot not in {3, 4}},
                       **({"check": {"id": "access", "target": "local", "status": "pass"},
                           "condition_summary": lifecycle()} if exempt else {})})
         ready.set()
@@ -376,10 +377,13 @@ async def test_live_delta_uses_counted_slots_and_excludes_exempt_requests(tmp_pa
         detail = (await client.get(path)).json()
         delta = (await client.get(path + "/events?after=0")).json()
         assert not delta["reset"]
-        expected = [("request-1", 0), ("request-2", 1)]
+        expected = [("request-1", 0), ("request-2", 1), ("request-3", 2)]
         assert [(row["id"], row["slot"]) for row in detail["live_requests"]] == expected
         assert [(row["id"], row["slot"]) for row in delta["records"]] == expected
-        assert delta["live_request_count"] == 2
+        assert delta["live_request_count"] == 3
+        assert detail["live_requests"][-1]["sent"] is False
+        assert delta["records"][-1]["sent"] is False
+        assert delta["records"][-1]["status"] == "failed"
         assert any(check.get("id") == "access" and check["status"] == "pass" for check in delta["checks"])
         assert any(check.get("condition", {}).get("id") == "bucket_c32_short_short"
                    for check in delta["checks"])

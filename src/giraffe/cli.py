@@ -638,10 +638,14 @@ async def _run(config: RunConfig, *, json_progress: bool = False, verbose: bool 
         title = (current[1] if verbose else _stage_name(current[1], config)) if current[1] else None
         if title:
             parts = [f"  {current[0]}: {title}"]
-            if config.max_requests is not None:
-                parts.append(f"{event.get('budget_used', 0)} of {config.max_requests} counted requests")
-            if event.get("budget_exempt", 0):
-                parts.append(f"{event['budget_exempt']} exempt")
+            from giraffe.models import known_request_counts
+
+            counts = known_request_counts(event.get("request_counts"))
+            if counts is not None:
+                if config.max_requests is not None:
+                    parts.append(f"{counts['budget_counted']} of {config.max_requests} counted requests")
+                if counts["budget_exempt"]:
+                    parts.append(f"{counts['budget_exempt']} exempt")
             parts.append(f"{event.get('elapsed_seconds', 0):g}s")
             _progress_print(" · ".join(parts))
             last = current
@@ -1443,9 +1447,11 @@ def _print_result(report: RunReport, json_path: Path, html_path: Path | None,
 
     passed = sum(check.status == "pass" for check in report.checks)
     report_path = html_path or json_path
-    counts = report.observations.get("request_counts")
+    from giraffe.models import known_request_counts
+
+    counts = known_request_counts(report.observations.get("request_counts"))
     requests = ""
-    if counts is not None and counts.get("available") is not False:
+    if counts is not None:
         noun = "request" if counts["sent"] == 1 else "requests"
         requests = f" · {counts['sent']} {noun} sent"
     print(f"{report.overall.upper()}  {passed} checks passed{requests} · report: {report_path}")

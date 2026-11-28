@@ -361,3 +361,21 @@ def test_request_count_schema_is_discoverable():
     assert reasons == list(states.REQUEST_BUDGET_EXEMPTIONS)
     assert description["states"]["request_budget_exemptions"] == reasons
     assert "known planned requests" in description["plan_fields"]["known_total"]
+
+
+def test_known_request_counts_requires_explicit_strict_complete_shape():
+    from giraffe.models import known_request_counts
+
+    row = {"sent": 1, "budget_counted": 1, "budget_counted_unsent": 0, "budget_exempt": 0,
+           "saved_observations": 1, "budget_exempt_by_reason": {}}
+    valid = {**row, "available": True, "complete": True, "targets": {"local": row}}
+    assert known_request_counts(valid) == valid
+    for value in (None, {}, {**valid, "available": False}, {**valid, "available": 1},
+                  {**valid, "sent": "1"}, {**valid, "sent": True},
+                  {**valid, "complete": "true"}, {**valid, "sent": -1},
+                  {**valid, "budget_exempt_by_reason": {"unknown": 1}},
+                  {**valid, "budget_exempt_by_reason": {"preflight": -1}},
+                  {**valid, "targets": {"local": {"sent": 1}}}):
+        assert known_request_counts(value) is None
+    for field in valid:
+        assert known_request_counts({key: value for key, value in valid.items() if key != field}) is None

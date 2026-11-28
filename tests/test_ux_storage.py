@@ -165,7 +165,7 @@ def test_keep_reply_respects_report_navigation_and_blocks_duplicate(mode, fails)
 
 def test_summary_only_error_and_storage_omissions_remain_visible():
     run_render_checks(r"""
-let html=detail(null,{state:'error',error:'Report could not be saved (disk full). Request evidence for 3 requests was lost; a summary was saved.',summary:{overall:'pass',request_counts:{sent:3,budget_counted:3,budget_exempt:0,saved_observations:3,available:true,complete:true},checks:[{id:'access',title:'Access check',status:'pass',summary:'Endpoint responded <quickly>'}]}});
+let html=detail(null,{state:'error',error:'Report could not be saved (disk full). Request evidence for 3 requests was lost; a summary was saved.',summary:{overall:'pass',request_counts:requestCounts({sent:3,budget_counted:3,saved_observations:3}),checks:[{id:'access',title:'Access check',status:'pass',summary:'Endpoint responded <quickly>'}]}});
 assert.match(html,/<h1>Run could not finish/);assert.match(html,/class="notice error"/);assert.match(html,/disk full/);
 assert.match(html,/Only a summary was saved/);assert.match(html,/Recorded overall: Passed · 3 requests sent/);assert.match(html,/Endpoint response/);assert.match(html,/Endpoint responded &lt;quickly&gt;/);
 assert.doesNotMatch(html,/Acceptance passed|Save baseline/);assert.match(html,/data-action="keep-run"/);
@@ -176,7 +176,7 @@ assert.match(nodes['#main'].innerHTML,/Recorded overall: Passed<\/p>/);
 assert.match(nodes['#main'].innerHTML,/Requests: counts unavailable for this recovered run · 3 saved observations/);
 assert.doesNotMatch(nodes['#main'].innerHTML,/requests? sent/);
 delete state.detail.summary.request_counts;renderDetail();
-assert.doesNotMatch(nodes['#main'].innerHTML,/requests? sent|Requests:/);
+assert.doesNotMatch(nodes['#main'].innerHTML,/requests? sent/);assert.match(nodes['#main'].innerHTML,/Requests: not recorded for this report/);
 html=detail(report([check('access','pass')]),{state:'error',error:'Export failed'});assert.match(html,/<h1>Run could not finish/);assert.doesNotMatch(html,/Acceptance passed|Selected acceptance checks passed/);
 const value=report([check('access','pass')]);value.manifest.storage={limit_bytes:1000,response_bodies_omitted:0};html=detail(value);assert.doesNotMatch(html,/Storage limit on disk/);
 value.manifest.storage={limit_bytes:1000,response_bodies_omitted:2,reason:'Response text omitted to fit on disk.',limit_exceeded:true};

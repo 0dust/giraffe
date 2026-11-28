@@ -42,7 +42,7 @@ def test_junit_schema_counts_identity_reasons_and_url_redaction(tmp_path):
     properties = {p.get("name"): p.get("value") for p in suite.findall("properties/property")}
     assert cases[0].find("system-out").text == "Title: Endpoint access"
     assert properties == {"model": "test-model", "url":
-                          "https://[::1]:8000/v1[redacted]", "run_id": "run-123"}
+                          "https://[::1]:8000/v1[redacted]", "run_id": "run-123", "requests.available": "false"}
     assert all(secret not in path.read_text() for secret in ("user", "p'ass", "SECRET", "TOKEN"))
     assert source.model_dump_json() == before
 
@@ -258,3 +258,34 @@ def test_unavailable_recovered_request_counts_in_ci(tmp_path, saved):
     write_summary_md(source, summary, None)
     noun = "saved observation" if saved == 1 else "saved observations"
     assert f"Requests: counts unavailable for this recovered run · {saved} {noun}" in summary.read_text()
+
+
+@pytest.mark.parametrize("counts", [None, {}, {"available": True, "sent": 1}])
+def test_invalid_or_missing_counts_are_unavailable_in_ci(tmp_path, counts):
+    source = report()
+    if counts is not None:
+        source.observations["request_counts"] = counts
+    path = tmp_path / "junit.xml"
+    write_junit(source, path)
+    props = {item.get("name"): item.get("value")
+             for item in ET.parse(path).getroot().findall("testsuite/properties/property")
+             if item.get("name").startswith("requests.")}
+    assert props == {"requests.available": "false"}
+    summary = tmp_path / "summary.md"
+    write_summary_md(source, summary, None)
+    assert "Requests: not recorded for this report" in summary.read_text()
+
+
+def test_junit_does_not_invent_missing_target_counts(tmp_path):
+    source = report()
+    row = {"sent": 1, "budget_counted": 1, "budget_counted_unsent": 0, "budget_exempt": 0,
+           "saved_observations": 1, "budget_exempt_by_reason": {}}
+    source.observations["request_counts"] = {
+        **row, "available": True, "complete": True, "targets": {"other": row},
+    }
+    path = tmp_path / "junit.xml"
+    write_junit(source, path)
+    props = {item.get("name"): item.get("value")
+             for item in ET.parse(path).getroot().findall("testsuite/properties/property")
+             if item.get("name").startswith("requests.")}
+    assert props == {"requests.available": "false", "requests.complete": "true"}

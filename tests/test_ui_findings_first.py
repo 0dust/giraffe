@@ -31,7 +31,7 @@ assert.match(html,/<p class="finding-check-reason">Wrong city\.<\/p>/);
 
 def test_stopped_by_user_overrides_backend_budget_guidance():
     run_render_checks(r"""
-const value=report([check('generation','inconclusive',{summary:'Raise max_requests above 200.'})],{overall:'inconclusive',abort_reason:'Cancelled by user',observations:{request_counts:{sent:2,budget_counted:2}},requests:[{status:'completed'},{status:'cancelled'}],manifest:{request_plan:{planned_total:8},config:{checks:['generation'],targets:[]}}});
+const value=report([check('generation','inconclusive',{summary:'Raise max_requests above 200.'})],{overall:'inconclusive',abort_reason:'Cancelled by user',observations:{request_counts:requestCounts({sent:2,budget_counted:2})},requests:[{status:'completed'},{status:'cancelled'}],manifest:{request_plan:{planned_total:8},config:{checks:['generation'],targets:[]}}});
 const html=detail(value);assert.match(html,/<h1>Stopped by you<\/h1>/);assert.match(html,/2 of 8 planned requests counted\. Partial results below\./);
 assert.doesNotMatch(html.split('report-toolbar')[0],/Raise max_requests/);
 assert.equal(shortReason('One. Two. Three.').summary,'One. Two.');
@@ -344,7 +344,7 @@ value.comparison_summary.rows[0].other_scopes=1;detail(value);assert.match($('.c
 
 def test_live_plan_progress_collapsed_activity_and_one_completion_announcement():
     run_render_checks(r"""
-state.detail={id:'live',state:'running',request_plan:{planned_total:20},config:{max_requests:100,targets:[],checks:['access']},progress:{completed:5,budget_used:4,attempted:6,elapsed_seconds:3},events:Array.from({length:8},(_,i)=>({event:'request_completed',elapsed_seconds:i,completed:i}))};
+state.detail={id:'live',state:'running',request_plan:{planned_total:20},config:{max_requests:100,targets:[],checks:['access']},progress:{completed:5,request_counts:requestCounts({sent:4,budget_counted:4}),attempted:6,elapsed_seconds:3},events:Array.from({length:8},(_,i)=>({event:'request_completed',elapsed_seconds:i,completed:i}))};
 renderDetail();assert.match($('#main').textContent,/Running/);assert.match($('#main').textContent,/4 of ~20 planned requests · 3s · limit 100/);
 const log=$('.live-activity');assert(!log.open);assert.equal(log.querySelectorAll('.event-row').length,5);assert.equal($('#tab-results').textContent,'Results');
 state.detail={id:'live',state:'completed',report:report([check('access','pass')])};renderDetail();const live=$('#run-announcement');assert.equal(live.getAttribute('aria-live'),'polite');assert.match(live.textContent,/Run complete/);const writes=live.writes;renderDetail();assert.equal(live.writes,writes);
@@ -471,7 +471,7 @@ def test_returning_to_same_run_during_evidence_fetch_starts_current_visit_fetch(
 
 def test_saved_partial_summary_uses_findings_and_user_stop_copy():
     run_render_checks(r"""
-state.detail={id:'partial',state:'interrupted',abort_reason:'cancelled by user',request_plan:{planned_total:8},config:{targets:[],checks:['access']},summary:{overall:'inconclusive',request_counts:{sent:2,budget_counted:2},checks:[check('access','inconclusive'),check('json','skipped',{summary:'Not selected for this run.'})]},live_requests:[{id:'a',status:'completed'},{id:'b',status:'cancelled'}]};
+state.detail={id:'partial',state:'interrupted',abort_reason:'cancelled by user',request_plan:{planned_total:8},config:{targets:[],checks:['access']},summary:{overall:'inconclusive',request_counts:requestCounts({sent:2,budget_counted:2}),checks:[check('access','inconclusive'),check('json','skipped',{summary:'Not selected for this run.'})]},live_requests:[{id:'a',status:'completed'},{id:'b',status:'cancelled'}]};
 renderDetail();const html=nodes['#main'].innerHTML;assert.match(html,/<h1>Stopped by you<\/h1>/);assert.match(html,/2 of 8 planned requests counted/);
 assert.match(html,/Not selected: JSON correctness/);assert.doesNotMatch(html,/data-verdict-check|data-check="local:json"/);assert.match(html,/<details class="run-diagnostics">/);
 nodes['#result-content']={innerHTML:''};listeners.click({target:{closest:q=>q==='[data-check]'?{dataset:{check:'local:access'}}:null}});

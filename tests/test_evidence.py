@@ -569,3 +569,26 @@ def test_each_record_batch_ends_with_fresh_counts_and_recovers_before_close(tmp_
         for target, total in sent.items():
             assert rows[-1]["targets"][target]["sent"] >= total
     assert batches == 3
+
+
+def test_recovery_does_not_fabricate_missing_target_counters():
+    from giraffe.evidence import _recovered_request_counts
+    from giraffe.models import RunConfig, Target
+    from giraffe.runner import _Run
+    run = _Run(RunConfig(targets=[Target(name="local", model="m", url="http://local/v1")],
+                         checks=["access"]), None, None)
+    saved = record().model_copy(update={"target": "missing"})
+    counts = _recovered_request_counts([saved], {"missing": 1}, run.request_counts())
+    assert counts["saved_observations"] == 1
+    assert "missing" not in counts["targets"]
+    assert counts["targets"]["local"]["saved_observations"] == 0
+    assert counts["sent"] == counts["budget_exempt"] == 1
+    assert counts["budget_exempt_by_reason"] == {"preflight": 1}
+
+
+@pytest.mark.parametrize("snapshot", [{"sent": 3}, {"available": True, "complete": True,
+    "sent": "3"}, {"available": True, "complete": True, "sent": True}])
+def test_recovery_rejects_partial_or_invalid_snapshots(snapshot):
+    from giraffe.evidence import _recovered_request_counts
+    assert _recovered_request_counts([record()], {}, snapshot) == {
+        "available": False, "complete": False, "saved_observations": 1}

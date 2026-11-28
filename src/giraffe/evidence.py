@@ -19,7 +19,7 @@ from pydantic import ValidationError
 
 from . import states
 from .caps import MAX_SANITIZE_ITEMS
-from .models import MAX_SCALE_DOWN_SNAPSHOTS, CHECK_NAMES, CheckResult, RequestRecord, RunReport
+from .models import MAX_SCALE_DOWN_SNAPSHOTS, CHECK_NAMES, CheckResult, RequestRecord, RunReport, known_request_counts
 from .storage import fsync_directory
 from .timeout_warning import format_timeout_warning
 
@@ -130,7 +130,7 @@ class EvidenceWriter:
                 return
             # Request bodies have their own record line; do not traverse or duplicate
             # them when persisting a condition transition alongside a completion.
-            value = {key: child for key, child in event.items() if key not in {"request", "request_counts"}}
+            value = {key: child for key, child in event.items() if key not in {"request", "request_counts", "budget_used", "sent", "budget_exempt", "attempted", "dropped_offers"}}
             for key in ("condition", "condition_summary", "scale_down",
                         "scale_down_snapshots", "scale_down_control", "timeout_warning"):
                 if key in value:
@@ -277,7 +277,7 @@ def recover_evidence(directory: Path | str, meta: dict, *, pause=None) -> RunRep
                 elif value.get("type") == "request_counts_start":
                     preflight = value["preflight"]
                 elif value.get("type") == "request_counts":
-                    snapshot = {key: child for key, child in value.items() if key != "type"}
+                    snapshot = known_request_counts({key: child for key, child in value.items() if key != "type"})
                 elif value.get("type") == "dropped":
                     dropped = max(dropped, int(value["count"]))
                 elif value.get("type") == "record":
@@ -364,27 +364,27 @@ def _recovered_request_counts(records, preflight, snapshot):
     """Use one internally consistent snapshot, never infer missing traffic."""
     saved = Counter(record.target for record in records
                     if record.scenario not in states.SETUP_PROBE_SCENARIOS)
+    snapshot = known_request_counts(snapshot)
     if snapshot is None:
         return {"complete": False, "available": False, "saved_observations": sum(saved.values())}
     result = deepcopy(snapshot)
     result.update(complete=False, available=True, saved_observations=sum(saved.values()))
     targets = result["targets"]
-
-    def empty():
-        return {"sent": 0, "budget_counted": 0, "budget_counted_unsent": 0,
-                "budget_exempt": 0, "saved_observations": 0, "budget_exempt_by_reason": {}}
-
-    for target in saved:
-        targets.setdefault(target, empty())
+    reason = states.REQUEST_BUDGET_EXEMPTION_PREFLIGHT
     for target, count in preflight.items():
-        value = targets.setdefault(target, empty())
-        missing = max(0, count - value["budget_exempt_by_reason"].get(states.REQUEST_BUDGET_EXEMPTION_PREFLIGHT, 0))
+        if target not in targets:
+            continue  # A journal cannot establish missing per-target counters.
+        value = targets[target]
+        missing = max(0, count - value["budget_exempt_by_reason"].get(reason, 0))
         if missing:
-            for row in (value, result):
-                row["sent"] += missing
-                row["budget_exempt"] += missing
-                reasons = row["budget_exempt_by_reason"]
-                reasons[states.REQUEST_BUDGET_EXEMPTION_PREFLIGHT] = reasons.get(states.REQUEST_BUDGET_EXEMPTION_PREFLIGHT, 0) + missing
+            value["sent"] += missing
+            value["budget_exempt"] += missing
+            value["budget_exempt_by_reason"][reason] = value["budget_exempt_by_reason"].get(reason, 0) + missing
+    missing = max(0, sum(preflight.values()) - result["budget_exempt_by_reason"].get(reason, 0))
+    if missing:
+        result["sent"] += missing
+        result["budget_exempt"] += missing
+        result["budget_exempt_by_reason"][reason] = result["budget_exempt_by_reason"].get(reason, 0) + missing
     for target, value in targets.items():
         value["saved_observations"] = saved[target]
     return result

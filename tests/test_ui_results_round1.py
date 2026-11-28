@@ -15,7 +15,7 @@ def test_hashchange_after_tab_navigation_does_not_steal_focus():
 def test_user_stop_uses_exact_reason_and_authoritative_finished_count():
     run_render_checks(r"""
 const value=report([check('generation','inconclusive')],{overall:'inconclusive',abort_reason:'cancelled by user',requests:[{status:'completed'}]});
-const html=detail(value,{progress:{completed:16,budget_used:16},request_plan:{planned_total:20}});
+const html=detail(value,{progress:{completed:16,request_counts:requestCounts({sent:16,budget_counted:16})},request_plan:{planned_total:20}});
 assert.match(html,/16 of 20 planned requests counted/);
 for(const reason of ['User queue exhausted','Not cancelled by user','cancelled by user: memory limit'])assert.equal(userStopped({...value,abort_reason:reason}),false);
 assert.equal(userStopped({...value,abort_reason:'Cancelled by user'}),true);
@@ -34,8 +34,8 @@ assert.match(html,/\. Set limits.latency_ms/);assert.doesNotMatch(html,/\. set l
 
 def test_live_progress_falls_back_without_unknown_and_uses_bootstrap_plan():
     run_render_checks(r"""
-state.detail={id:'live',state:'running',config:{targets:[],max_requests:50},progress:{completed:3,budget_used:3,elapsed_seconds:2},events:[]};
-renderLive();assert.match($('#main').textContent,/3 requests finished · 2s · limit 50/);assert.doesNotMatch($('#main').textContent,/of unknown/);
+state.detail={id:'live',state:'running',config:{targets:[],max_requests:50},progress:{completed:3,request_counts:requestCounts({sent:3,budget_counted:3}),elapsed_seconds:2},events:[]};
+renderLive();assert.match($('#main').textContent,/3 requests counted · 2s · limit 50/);assert.doesNotMatch($('#main').textContent,/of unknown/);
 state.bootstrap.config=state.detail.config;state.bootstrap.request_plan={planned_total:12};renderLive();assert.match($('#main').textContent,/3 of ~12 planned requests/);
 """, dom=True)
 
@@ -102,7 +102,7 @@ def test_live_plan_fetch_retries_after_returning_to_same_run():
     run_render_checks(r"""
 (async()=>{
  fetch=()=>{};clearPoll=schedulePoll=updateNav=loadPerformance=()=>{};const pending=[];
- const live={id:'A',state:'running',config:{checks:['access'],targets:[],max_requests:100},progress:{completed:4,budget_used:3},events:[]};
+ const live={id:'A',state:'running',config:{checks:['access'],targets:[],max_requests:100},progress:{completed:4,request_counts:requestCounts({sent:3,budget_counted:3})},events:[]};
  api=async(path,options)=>{
   if(path==='/api/config/plan'){assert.equal(options.method,'POST');assert.equal(JSON.parse(options.body).max_requests,100);return new Promise(resolve=>pending.push(resolve));}
   return path==='/api/runs/A'?structuredClone(live):{id:'B',state:'completed',report:report([check('access','pass')])};
