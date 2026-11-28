@@ -20,6 +20,19 @@ EXIT_CODE_USAGE: Final = 4
 # Request record: report.json requests[].status and evidence.jsonl (models.RequestRecord.status).
 REQUEST_STATUSES: Final = ("completed", "failed", "timeout", "cancelled")
 
+# Per-check phase: internal runner state, not a public contract; not in describe().
+CHECK_PHASE_INFERENCE: Final = "inference"
+CHECK_PHASE_JUDGING: Final = "judging"
+CHECK_PHASE_DONE: Final = "done"
+CHECK_PHASES: Final = (CHECK_PHASE_INFERENCE, CHECK_PHASE_JUDGING, CHECK_PHASE_DONE)
+CHECK_PHASE_TRANSITIONS: Final = {
+    CHECK_PHASE_INFERENCE: frozenset({CHECK_PHASE_INFERENCE, CHECK_PHASE_JUDGING, CHECK_PHASE_DONE}),
+    CHECK_PHASE_JUDGING: frozenset({CHECK_PHASE_JUDGING, CHECK_PHASE_DONE}),
+    CHECK_PHASE_DONE: frozenset({CHECK_PHASE_DONE}),
+}
+# These checks wait for judging when the request pack contains judge-scored specs.
+JUDGED_CHECKS: Final = frozenset({"correctness", "capacity", "load"})
+
 # Run lifecycle: .web.json state and run API state.
 RUN_QUEUED: Final = "queued"
 RUN_RUNNING: Final = "running"
@@ -257,6 +270,17 @@ def check_token_evidence_transition(current: str, new: str) -> None:
     logger.warning(message)
 
 
+def check_check_phase_transition(current: str, new: str) -> None:
+    """Warn about an undeclared check-phase write, or raise under STRICT_TRANSITIONS."""
+    if new in CHECK_PHASE_TRANSITIONS and (
+            current not in CHECK_PHASE_TRANSITIONS or new in CHECK_PHASE_TRANSITIONS[current]):
+        return
+    message = f"Undeclared check phase transition: {current!r} -> {new!r}"
+    if STRICT_TRANSITIONS:
+        raise AssertionError(message)
+    logger.warning(message)
+
+
 def run_recoverable(state: str | None, journal_present: bool, report_available: bool) -> bool:
     """An interrupted journal needs recovery until a valid report owns its evidence."""
     return state == RUN_INTERRUPTED and journal_present and not report_available
@@ -268,6 +292,7 @@ def describe() -> dict:
         "exit_codes": {**EXIT_CODES, "cancelled": EXIT_CODE_CANCELLED,
                        "usage_error": EXIT_CODE_USAGE, "default": EXIT_CODE_DEFAULT},
         "request_statuses": list(REQUEST_STATUSES), "run_states": list(RUN_STATES),
+        "judged_checks": sorted(JUDGED_CHECKS),
         "run_in_progress_states": sorted(RUN_IN_PROGRESS_STATES),
         "run_terminal_states": sorted(RUN_TERMINAL_STATES),
         "run_transitions": {state: sorted(successors) for state, successors in RUN_TRANSITIONS.items()},

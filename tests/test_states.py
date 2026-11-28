@@ -32,6 +32,7 @@ def test_run_state_partitions():
 
 @pytest.mark.parametrize("vocabulary,transitions", [
     (states.RUN_STATES, states.RUN_TRANSITIONS),
+    (states.CHECK_PHASES, states.CHECK_PHASE_TRANSITIONS),
     (states.CONDITION_LIFECYCLE, states.CONDITION_TRANSITIONS),
     (states.SCALE_DOWN_PHASES, states.SCALE_DOWN_TRANSITIONS),
     (states.TOKEN_EVIDENCE_STATUSES, states.TOKEN_EVIDENCE_TRANSITIONS),
@@ -88,6 +89,40 @@ def test_token_evidence_transition_guard(monkeypatch, caplog):
     assert "Undeclared token evidence transition" in caplog.text
 
 
+def test_check_phase_vocabulary_and_docs():
+    assert states.CHECK_PHASES == ("inference", "judging", "done")
+    assert states.CHECK_PHASE_TRANSITIONS == {
+        "inference": {"inference", "judging", "done"},
+        "judging": {"judging", "done"}, "done": {"done"},
+    }
+    assert states.JUDGED_CHECKS == frozenset({"correctness", "capacity", "load"})
+    section = (ROOT / "docs" / "states.md").read_text().split("## Check phases\n", 1)[1].split("\n## ", 1)[0]
+    for phase in states.CHECK_PHASES:
+        assert f"`{phase}`" in section
+
+
+@pytest.mark.parametrize("current", ["inference", "judging", "done"])
+@pytest.mark.parametrize("new", ["inference", "judging", "done"])
+def test_check_phase_transitions(current, new):
+    assert states.STRICT_TRANSITIONS is True
+    allowed = {("inference", "inference"), ("inference", "judging"), ("inference", "done"),
+               ("judging", "judging"), ("judging", "done"), ("done", "done")}
+    if (current, new) in allowed:
+        states.check_check_phase_transition(current, new)
+    else:
+        with pytest.raises(AssertionError, match="Undeclared check phase transition"):
+            states.check_check_phase_transition(current, new)
+
+
+def test_undeclared_check_phase_warns_in_production(monkeypatch, caplog):
+    with pytest.raises(AssertionError, match="Undeclared check phase transition"):
+        states.check_check_phase_transition("inference", "unknown")
+    monkeypatch.setattr(states, "STRICT_TRANSITIONS", False)
+    with caplog.at_level("WARNING", logger="giraffe.states"):
+        states.check_check_phase_transition("done", "inference")
+    assert "Undeclared check phase transition: 'done' -> 'inference'" in caplog.text
+
+
 def test_finished_condition_can_restart():
     from giraffe.runner import _Run
 
@@ -118,6 +153,7 @@ def test_describe():
         "exit_codes": {**states.EXIT_CODES, "cancelled": states.EXIT_CODE_CANCELLED,
                        "usage_error": states.EXIT_CODE_USAGE, "default": states.EXIT_CODE_DEFAULT},
         "request_statuses": list(states.REQUEST_STATUSES), "run_states": list(states.RUN_STATES),
+        "judged_checks": sorted(states.JUDGED_CHECKS),
         "run_in_progress_states": sorted(states.RUN_IN_PROGRESS_STATES),
         "run_terminal_states": sorted(states.RUN_TERMINAL_STATES),
         "run_transitions": {state: sorted(successors) for state, successors in states.RUN_TRANSITIONS.items()},

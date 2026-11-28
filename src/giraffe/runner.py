@@ -19,7 +19,7 @@ from contextvars import ContextVar
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Literal
+from typing import Callable
 
 import httpx
 
@@ -407,8 +407,8 @@ class _Run:
         self.memory_sampling_done = False
         self.rss_at_start_bytes = None
         self.memory_interrupted_checks = set()
-        self.pending_checks: dict[tuple[str, str], Literal["inference", "judging"]] = {
-            (target.name, check): "inference" for target in config.targets for check in config.checks}
+        self.check_phases: dict[tuple[str, str], str] = {
+            (target.name, check): states.CHECK_PHASE_INFERENCE for target in config.targets for check in config.checks}
         self.judging_pending = any(spec.scorer == "judge" for spec in self.pack_specs)
         self.counts = Counter()
         if config.max_requests is None:
@@ -619,16 +619,27 @@ class _Run:
         self.unfinished[target].update(check for check in checks if not self.memory_limit_reached
                                       or (target, check) in self.memory_interrupted_checks)
 
+    @property
+    def pending_checks(self) -> dict[tuple[str, str], str]:
+        return {key: phase for key, phase in self.check_phases.items() if phase != states.CHECK_PHASE_DONE}
+
+    def _set_check_phase(self, target: str, check: str, phase: str) -> None:
+        key = target, check
+        if key not in self.check_phases:
+            return
+        states.check_check_phase_transition(self.check_phases[key], phase)
+        self.check_phases[key] = phase
+
     def finish_checks(self, target, checks):
         for check in checks:
             key = target, check
-            if self.judging_pending and check in {"correctness", "capacity", "load"}:
-                if key in self.pending_checks:
-                    self.pending_checks[key] = "judging"
+            if self.judging_pending and check in states.JUDGED_CHECKS:
+                if self.check_phases.get(key, states.CHECK_PHASE_DONE) != states.CHECK_PHASE_DONE:
+                    self._set_check_phase(target, check, states.CHECK_PHASE_JUDGING)
             else:
-                self.pending_checks.pop(key, None)
+                self._set_check_phase(target, check, states.CHECK_PHASE_DONE)
         if (self.config.unresponsive_after_failures and target not in self._retired_endpoint_watchdogs
-                and not any(name == target and phase == "inference"
+                and not any(name == target and phase == states.CHECK_PHASE_INFERENCE
                             and check != "gpu" and check not in SHARED_BASELINE_EXCLUDED_WORKLOADS
                             for (name, check), phase in self.pending_checks.items())):
             self.retire_endpoint_watchdog(target)
@@ -637,7 +648,7 @@ class _Run:
     def gateway_limit_phase(self):
         non_inference = SHARED_BASELINE_EXCLUDED_WORKLOADS | {"gpu"}
         restart = self.observations.get(self.config.restart_target, {}).get("restart")
-        if (any(check not in non_inference and phase == "inference"
+        if (any(check not in non_inference and phase == states.CHECK_PHASE_INFERENCE
                 for (_, check), phase in self.pending_checks.items())
                 or any(checks - non_inference for checks in self.unfinished.values())
                 or any(target.get("client_error") for target in self.observations.values())
@@ -1915,7 +1926,7 @@ async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attributio
         gateway_deadline = (run.duration_limit_scope == "gateway"
                             and states.STOP_REASON_KIND.get(run.reason) == states.STOP_KIND_DURATION)
         run.unfinished[target.name].update(check for (name, check), phase in run.pending_checks.items()
-                                           if name == target.name and (phase == "inference" or not gateway_deadline))
+                                           if name == target.name and (phase == states.CHECK_PHASE_INFERENCE or not gateway_deadline))
         raise
     except Exception as exc:
         _target_error(run, target, enabled, exc)
