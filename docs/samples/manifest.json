@@ -1,0 +1,252 @@
+{
+  "format_version": 1,
+  "report_copy_changes": [
+    "Personal hostnames replaced with sample-mac.local.",
+    "Absolute local CLI config/output paths replaced with portable sample paths.",
+    "JSON whitespace compacted inside ZIPs; requests, scores, verdicts and measurements unchanged."
+  ],
+  "bundles": {
+    "load-comparison.zip": {
+      "sha256": "ceb2e94d75e3170c939f49dc7fdfd6b87394473963e73bdd653cccd77cdf60f1",
+      "bytes": 1948537,
+      "reports": [
+        {
+          "directory": "comparison",
+          "run_id": "04eb7af44622400088dcdf884bac856a",
+          "started_at": "2026-11-17T04:41:53.889516+00:00",
+          "overall": "inconclusive",
+          "source_report_sha256": "ace736c34dc3833947b70e4c16b1d8209e406ba1d31bb7dafc3374b203c230be",
+          "distributed_report_sha256": "dcb22d041d947e4b0474fb62ecafd071979f696568bdde23cb205a0fa0cb16ce",
+          "distributed_html_sha256": "ef4aebdfee2a0d047cb0fd8dc0cb8bf7679f5377b73b8eb15b8151b071dbbba8",
+          "config_sha256": "6d9fadc7862193ad07e1e19dfa4b947e7c759adb7f152c5f440bcf8dc76aa948",
+          "changed_metadata_fields": [
+            "manifest.run_location.hostname",
+            "manifest.invocation.argv"
+          ]
+        },
+        {
+          "directory": "first-sweep",
+          "run_id": "0baabec9b0354014a71adca56213fa6e",
+          "started_at": "2026-11-17T04:31:20.738875+00:00",
+          "overall": "inconclusive",
+          "source_report_sha256": "c84692dc9e8b5467eddefce78e9944c1591c7d91967f0cf250f97044afa64980",
+          "distributed_report_sha256": "6445f26452bd366de7ea50929b6aaeae4e4a4bbe8116ed59f4d63cbabf6f4f22",
+          "distributed_html_sha256": "3a3f1c1428cd2d2058bf8a034b4fd07a891ba7476039dbf525fdc1a715175d82",
+          "config_sha256": "6d9fadc7862193ad07e1e19dfa4b947e7c759adb7f152c5f440bcf8dc76aa948",
+          "changed_metadata_fields": [
+            "manifest.run_location.hostname",
+            "manifest.invocation.argv"
+          ]
+        },
+        {
+          "directory": "confirmation",
+          "run_id": "04eb7af44622400088dcdf884bac856a",
+          "started_at": "2026-11-17T04:41:53.889516+00:00",
+          "overall": "inconclusive",
+          "source_report_sha256": "4a95e7531392ae1dc66459aeb368801061640e0c3bb4bd9a36c8bad82dbd9a75",
+          "distributed_report_sha256": "ff772155f6a694add25694e48915f3dfd4e5654390437eb647b49fcd7d8ecd2d",
+          "distributed_html_sha256": "271da72f0589a812807e1a64303f22b24e362824a487e51a31434da5f1cd4f83",
+          "config_sha256": "6d9fadc7862193ad07e1e19dfa4b947e7c759adb7f152c5f440bcf8dc76aa948",
+          "changed_metadata_fields": [
+            "manifest.run_location.hostname",
+            "manifest.invocation.argv"
+          ]
+        }
+      ]
+    },
+    "browser-ui-demo.zip": {
+      "sha256": "84907d3107b43d85f8e4c17695b1ea28956b55734fd57f0d8cafcc4dc46759ea",
+      "bytes": 88629,
+      "reports": [
+        {
+          "directory": ".",
+          "run_id": "f50226a58da24bb1a4b76abd6270cd2b",
+          "started_at": "2026-11-18T11:28:27.243029+00:00",
+          "overall": "pass",
+          "source_report_sha256": "900e601ba40a891cb57a13c67587af5b8691a9edfa2d03c4b855734d55aa86e8",
+          "distributed_report_sha256": "2d009203a6fbcdfa5f88d73c89b5465ded2b3fffca65f737787f8c5847dfa0b7",
+          "distributed_html_sha256": "64316dd01ffcc43746c7081c175d7008bae7f0d1bf1bea955a562b10d9d62c86",
+          "config_sha256": "80d20cba9be77a96a704604c77ae621de43ba1f77fac952472fb5ffc697e9374",
+          "changed_metadata_fields": [
+            "manifest.run_location.hostname"
+          ]
+        }
+      ]
+    },
+    "token-timing.zip": {
+      "sha256": "ba3f7ea0c8badd7e4a7d62b751ac2ad9083c6a115fe2862ff972779be22567cc",
+      "bytes": 954319,
+      "reports": [
+        {
+          "directory": ".",
+          "run_id": "4121bab47d9040068e5cbee14209c4fb",
+          "started_at": "2026-11-18T14:01:25.498595+00:00",
+          "overall": "pass",
+          "source_report_sha256": "668de4ea53cb186f097e99aebffc5bcf6ded07dee3f16aa9700ba3f83123a8a1",
+          "distributed_report_sha256": "f4b9d7dcc69e95a174037660740083ea95a42b63524b8f137a917c73aa325bfd",
+          "distributed_html_sha256": "70b9eb7157bea8c803185cd39175cdc20baf3a8f9a77d80951d22518f9447518",
+          "config_sha256": "d307611356fa1d1cec2b8de857e34aa7db86bf67b13107bcacc500cab5c6de85",
+          "changed_metadata_fields": [
+            "manifest.run_location.hostname",
+            "manifest.invocation.argv"
+          ],
+          "previous_distributed_html_sha256": "2cdbe4a613a44219863b641dd9c7d97de4a83ee45e148f08d50e3ad74a847f0f",
+          "html_presentation_changes": "Re-rendered the distributed JSON with grouped measurement notes and stage labels fitted above the concurrency plot.",
+          "presentation_commit": "2fd70a8a34feb4c4b70ab1ddafd8da3ac80b29c8"
+        }
+      ]
+    },
+    "order-extraction.zip": {
+      "sha256": "67aa09016746230205a34b90e5c2a54e9cea3cd653e75dfa539b646d07efc0de",
+      "bytes": 496769,
+      "reports": [
+        {
+          "directory": "before",
+          "run_id": "1d97cea922ec4f14928a1cc367dbf9c6",
+          "started_at": "2026-11-01T05:03:31.316510+00:00",
+          "overall": "fail",
+          "source_report_sha256": "f643fcc61cf6b23c08ac39ffb21865491fb22631dacf607137034ffcda903368",
+          "distributed_report_sha256": "9bd1bda44347a6f9a930c083f10b0210696eb0531ef654c3ec2ec7f3912ef4ed",
+          "distributed_html_sha256": "c0203e7b5ce6ab104ce9bca6cab194cf33808631f9309611c96286173a5b2695",
+          "config_sha256": "5864af78cbcc693430f048a487000c4b02ec371e19c1960e9617efe5fd219ca7",
+          "changed_metadata_fields": [
+            "manifest.run_location.hostname"
+          ],
+          "html_presentation_changes": "Saved report rendered with the PR review branch; screenshots retain the original recorded product UI. No new inference or recomputed verdicts.",
+          "presentation_commit": "9c34260584b5e479e09f13c28dfcf9f610c99a8d"
+        },
+        {
+          "directory": "after",
+          "run_id": "3411391abe324c7ebdc05fd599bcde60",
+          "started_at": "2026-11-01T05:08:16.409986+00:00",
+          "overall": "pass",
+          "source_report_sha256": "6ddd96fe92ec159f4981f3cce1ea197865faebc565510d0c62526c27784d67ea",
+          "distributed_report_sha256": "ba680b9ccef63ad68f3ee563bc46010906830c5bf7c1e02f5854fd2258201719",
+          "distributed_html_sha256": "9b41c6494504be95a6e10070ca4ab68b4d828c17ddd67a2b3bc4642b13650592",
+          "config_sha256": "aa8f84cd2f5f7502dddc4845e5bfe4762cb9c2c08470118d349aa9f28243de3a",
+          "changed_metadata_fields": [
+            "manifest.run_location.hostname"
+          ],
+          "html_presentation_changes": "Saved report rendered with the PR review branch; screenshots retain the original recorded product UI. No new inference or recomputed verdicts.",
+          "presentation_commit": "9c34260584b5e479e09f13c28dfcf9f610c99a8d"
+        }
+      ]
+    }
+  },
+  "images": {
+    "browser-ui-live.gif": {
+      "sha256": "9a0cac2ff2c502af8ec9ee1ee82155d1d026c101a88a4ac4708d43f4e76a7e64",
+      "bytes": 281621,
+      "evidence": "browser-ui-demo.zip",
+      "capture_changes": "Re-encoded the original source frames. Live frames: crop 1120x540 at x=112,y=180 to the Tests panel; final report: crop 1120x540 at x=112,y=95 to the run summary. Resized to 720x347. No added cells, altered text, data or verdicts.",
+      "run_id": "f50226a58da24bb1a4b76abd6270cd2b",
+      "code_commit": "b5068162b8e78f2840541c9e368b7eca61aaed92",
+      "source_report_sha256": "900e601ba40a891cb57a13c67587af5b8691a9edfa2d03c4b855734d55aa86e8",
+      "playback": "Original frame timing retained: live excerpt at 2.5x; final report held for 3.5 seconds; 10.8 seconds total at 10 fps. GIF palette reduced.",
+      "previous_sha256": "ccaa99e4434f42a837613412f5168436bb75250d5a80ea55299447cb11103d0f",
+      "source_frames_archive": "captured-frames.zip",
+      "source_frames_sha256": "198503765ab4b9c2ba0b5cf7ad2732d468f61d9cb92643f91c78bf3be0cde0a8"
+    },
+    "fresh-load-results.jpg": {
+      "sha256": "c635b375638f7459c52da029203bfa6abe6783e3e43e951fe123a5ef4285849b",
+      "bytes": 71774,
+      "evidence": "load-comparison.zip",
+      "capture_changes": "None; copied byte-for-byte from the reviewed preview.",
+      "ui_commit": "b5068162b8e78f2840541c9e368b7eca61aaed92"
+    },
+    "fresh-load-kpis.jpg": {
+      "sha256": "d602a1597453760043d719a0dd284cd3b6c13ed864d54ad823a5a6d3589efde0",
+      "bytes": 95030,
+      "evidence": "token-timing.zip",
+      "capture_changes": "None; copied byte-for-byte from the reviewed preview.",
+      "source_run_id": "4121bab47d9040068e5cbee14209c4fb",
+      "source_run_code_commit": "b5068162b8e78f2840541c9e368b7eca61aaed92",
+      "source_report_sha256": "668de4ea53cb186f097e99aebffc5bcf6ded07dee3f16aa9700ba3f83123a8a1"
+    },
+    "fresh-load-concurrency.jpg": {
+      "sha256": "d4d30060cfbc64dc47bfc335dad5a764cdb32fca56012c9bcea98cc0bd53cbb1",
+      "bytes": 29866,
+      "evidence": "token-timing.zip",
+      "capture_changes": "Concurrency chart card captured at a 700 CSS pixel viewport in dark mode from the redistributed report.html.",
+      "source_run_id": "4121bab47d9040068e5cbee14209c4fb",
+      "source_run_code_commit": "b5068162b8e78f2840541c9e368b7eca61aaed92",
+      "source_report_sha256": "668de4ea53cb186f097e99aebffc5bcf6ded07dee3f16aa9700ba3f83123a8a1",
+      "source_html_sha256": "70b9eb7157bea8c803185cd39175cdc20baf3a8f9a77d80951d22518f9447518"
+    },
+    "ollama-default-recall-medium-d0-0-ui.jpg": {
+      "sha256": "cba4b71f60bad9f0c711456aad4ab3ba6eed17b8b34d3769543a5a8238a7b9a7",
+      "bytes": 114303,
+      "evidence": "context-request-evidence.json",
+      "capture_changes": "JPEG quality 80; resized from 2560 to 1280 pixels wide. No content, score, or verdict edits.",
+      "source_report_sha256": "248d4e7d6a01c202937b12c44ee45a000a2ce2887b2552f47a245c5de25d3d61",
+      "request_id": "89102e58b1c64142ba693961203bf08a",
+      "case_id": "recall-medium-d0-0",
+      "configuration": "ollama-default",
+      "source_image_sha256": "da00d5eb4919b9db91512aa7017767a3e596c5abeff7000d5897488835fa4da9"
+    },
+    "ollama-ctx8k-recall-medium-d0-0-ui.jpg": {
+      "sha256": "f2f6a512c8000180fb33786462a4dadc2c906347630860a200b4eeb7e6d2d0e9",
+      "bytes": 104713,
+      "evidence": "context-request-evidence.json",
+      "capture_changes": "JPEG quality 80; resized from 2560 to 1280 pixels wide. No content, score, or verdict edits.",
+      "source_report_sha256": "73325e492165edcc79a087aad268b2824e790f10b08bc4de2ed9bbba0c1eed27",
+      "request_id": "db9481c8df1d460d9df4a7bacf1eab6d",
+      "case_id": "recall-medium-d0-0",
+      "configuration": "ollama-ctx8k",
+      "source_image_sha256": "d8ea783a195e0e9f90595d773939ca91c97898ae061846c98d655c7408270b5f"
+    },
+    "order-extraction-before.png": {
+      "sha256": "3966f2548d362f34d21713866fe5e5e141b7089411497dcdd122a9b252cbd4d6",
+      "bytes": 140527,
+      "evidence": "order-extraction.zip",
+      "run_id": "1d97cea922ec4f14928a1cc367dbf9c6",
+      "ui_run": "20261101T050331-32375a5e",
+      "code_commit": "6ea042908ac4cc0770c353fe6f1c0faf864ba5e0",
+      "source_report_sha256": "f643fcc61cf6b23c08ac39ffb21865491fb22631dacf607137034ffcda903368",
+      "source_recording": "manual-before-load-results-8s-take1.mp4",
+      "source_recording_sha256": "7a5671e7b581cccc8eec8af4e9d3d41b4e01b34cad604119e583fe1aa289f927",
+      "frame_timestamp_seconds": 2,
+      "capture_changes": "One frame from the original screen recording; removed the 144-pixel browser chrome above the application. Native 1200x602 crop; no scaling, overlays, UI edits, drawn elements or data changes."
+    },
+    "order-extraction-after.png": {
+      "sha256": "69be50e11fa18f027148740348c7be5cbcc84b5ae12e86ba34f97fe54e6dd720",
+      "bytes": 132157,
+      "evidence": "order-extraction.zip",
+      "run_id": "3411391abe324c7ebdc05fd599bcde60",
+      "ui_run": "20261101T050816-a84e0e4d",
+      "code_commit": "6ea042908ac4cc0770c353fe6f1c0faf864ba5e0",
+      "source_report_sha256": "6ddd96fe92ec159f4981f3cce1ea197865faebc565510d0c62526c27784d67ea",
+      "source_recording": "manual-after-load-results-8s-take1.mp4",
+      "source_recording_sha256": "4a079b2c55d3c74b010ec05069310277551a77bc7f18c335da64e067005d5ab8",
+      "frame_timestamp_seconds": 2,
+      "capture_changes": "One frame from the original screen recording; removed the 144-pixel browser chrome above the application. Native 1200x602 crop; no scaling, overlays, UI edits, drawn elements or data changes."
+    },
+    "order-extraction-comparison.png": {
+      "sha256": "5d70bea9c845588b20edd00b8757d8f69ee0a9c175473b9d170562c6aedf2ca4",
+      "bytes": 63510,
+      "evidence": "order-extraction.zip",
+      "baseline_run_id": "1d97cea922ec4f14928a1cc367dbf9c6",
+      "run_id": "3411391abe324c7ebdc05fd599bcde60",
+      "ui_run": "20261101T050816-a84e0e4d",
+      "code_commit": "6ea042908ac4cc0770c353fe6f1c0faf864ba5e0",
+      "source_report_sha256": "6ddd96fe92ec159f4981f3cce1ea197865faebc565510d0c62526c27784d67ea",
+      "source_recording": "manual-comparison-8s-take1.mp4",
+      "source_recording_sha256": "6f2f4fb84eb6e92f1e8b9a2fec1b8e39df9279ca6642021a24b6891e84e523c9",
+      "frame_timestamp_seconds": 32,
+      "crop": {
+        "x": 280,
+        "y": 244,
+        "width": 880,
+        "height": 294
+      },
+      "capture_changes": "One frame from the original comparison recording after the cursor moved below the table, cropped to both tested-load rows and the highest accepted concurrency. Native resolution; no scaling, overlays, UI edits, drawn elements or data changes."
+    }
+  },
+  "context_request_evidence_sha256": "6ae00365f85d67228b6082ecdfdd4e94cb18ed3a9b04c257edadf9a8b909170c",
+  "evidence_files": {
+    "context-recall-evidence.json": "bdd14a7995552086d653a01d1f6e561225da5474fa9c2fd446e24f99c701c2e4",
+    "tool-call-evidence.json": "46885e186289722fecfd6e7a3bd5463104a9a65727986e0c81bfe553e9a2cc49",
+    "order-extraction-evidence.json": "ea4b35a6058d3c2922dbf03f39c495c1678d2c4f9e92b041fd89732ddaded113",
+    "order-extraction-questions.json": "a0ad0aec28d520a0113c010d346575ced69862352e828ace1bc21363a9149e01"
+  }
+}

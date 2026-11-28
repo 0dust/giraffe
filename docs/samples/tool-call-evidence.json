@@ -1,0 +1,54 @@
+{
+  "scope": "One streamed request; calls validated without execution.",
+  "date": "2026-11-17",
+  "model": "Qwen2.5 7B Q8_0",
+  "runtime": "llama.cpp",
+  "hardware": "Colab T4",
+  "run_id": "0f5a52c6779040da9211ca5b785ec63d",
+  "source_report_sha256": "e36a5fd07a1a04b28b75cb4d8141e38bd79bb1fbc6b31f690ff6d133e37218f7",
+  "request_id": "41522d191ba14ee8b5960bc5d637a513",
+  "fixture_id": "tools_tool-search_orders-00_auto_stream.v1",
+  "input_messages": [
+    {
+      "role": "user",
+      "content": "Show me the last 5 cancelled orders for customer C-41442."
+    }
+  ],
+  "expected_call": {
+    "name": "search_orders",
+    "arguments": {
+      "customer_id": "C-41442",
+      "status": "cancelled",
+      "limit": 5
+    }
+  },
+  "recorded_tool_calls": [
+    {
+      "id": "T5sf6yzY0XjxRy9SA3JmEU1IieelQ4V0",
+      "type": "function",
+      "function": {
+        "name": "search_orders",
+        "arguments": "{\"customer_id\": \"C-41422\", \"status\": \"cancelled\", \"limit\": 5}"
+      }
+    }
+  ],
+  "score": false,
+  "tool_evaluation": {
+    "choice": null,
+    "arguments": null,
+    "task": null,
+    "support": null,
+    "protocol": {
+      "status": "pass",
+      "message": "Request completed validly."
+    },
+    "calls": {
+      "status": "fail",
+      "message": "Tool arguments differ from the fixture's expected values."
+    },
+    "content": {
+      "status": "not_checked",
+      "message": "No assistant content expectation configured."
+    }
+  }
+}

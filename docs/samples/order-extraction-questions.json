@@ -1,0 +1,221 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "fixture_id": "order-01",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Extract the order described below. Return one JSON object with exactly these keys: order_id, status, quantity. Quantity must be an integer. Return JSON only, with no explanation or Markdown.\n\nOrder ID: A-104\nStatus: shipped\nQuantity: 1\n\nThe delivery notes are for internal reference only. The customer asked the team to check the address before dispatch. Packaging instructions are unchanged. The warehouse will contact support if any extra details are needed. Do not include the delivery notes in the JSON."
+        }
+      ],
+      "scorer": "json",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "order_id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "quantity": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "order_id",
+          "status",
+          "quantity"
+        ],
+        "additionalProperties": false
+      },
+      "expected": {
+        "order_id": "A-104",
+        "status": "shipped",
+        "quantity": 1
+      },
+      "max_tokens": 64
+    },
+    {
+      "fixture_id": "order-02",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Extract the order described below. Return one JSON object with exactly these keys: order_id, status, quantity. Quantity must be an integer. Return JSON only, with no explanation or Markdown.\n\nOrder ID: A-105\nStatus: pending\nQuantity: 2\n\nThe delivery notes are for internal reference only. The customer asked the team to check the address before dispatch. Packaging instructions are unchanged. The warehouse will contact support if any extra details are needed. Do not include the delivery notes in the JSON."
+        }
+      ],
+      "scorer": "json",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "order_id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "quantity": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "order_id",
+          "status",
+          "quantity"
+        ],
+        "additionalProperties": false
+      },
+      "expected": {
+        "order_id": "A-105",
+        "status": "pending",
+        "quantity": 2
+      },
+      "max_tokens": 64
+    },
+    {
+      "fixture_id": "order-03",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Extract the order described below. Return one JSON object with exactly these keys: order_id, status, quantity. Quantity must be an integer. Return JSON only, with no explanation or Markdown.\n\nOrder ID: A-106\nStatus: cancelled\nQuantity: 3\n\nThe delivery notes are for internal reference only. The customer asked the team to check the address before dispatch. Packaging instructions are unchanged. The warehouse will contact support if any extra details are needed. Do not include the delivery notes in the JSON."
+        }
+      ],
+      "scorer": "json",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "order_id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "quantity": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "order_id",
+          "status",
+          "quantity"
+        ],
+        "additionalProperties": false
+      },
+      "expected": {
+        "order_id": "A-106",
+        "status": "cancelled",
+        "quantity": 3
+      },
+      "max_tokens": 64
+    },
+    {
+      "fixture_id": "order-04",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Extract the order described below. Return one JSON object with exactly these keys: order_id, status, quantity. Quantity must be an integer. Return JSON only, with no explanation or Markdown.\n\nOrder ID: A-107\nStatus: delivered\nQuantity: 4\n\nThe delivery notes are for internal reference only. The customer asked the team to check the address before dispatch. Packaging instructions are unchanged. The warehouse will contact support if any extra details are needed. Do not include the delivery notes in the JSON."
+        }
+      ],
+      "scorer": "json",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "order_id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "quantity": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "order_id",
+          "status",
+          "quantity"
+        ],
+        "additionalProperties": false
+      },
+      "expected": {
+        "order_id": "A-107",
+        "status": "delivered",
+        "quantity": 4
+      },
+      "max_tokens": 64
+    },
+    {
+      "fixture_id": "order-05",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Extract the order described below. Return one JSON object with exactly these keys: order_id, status, quantity. Quantity must be an integer. Return JSON only, with no explanation or Markdown.\n\nOrder ID: A-108\nStatus: shipped\nQuantity: 5\n\nThe delivery notes are for internal reference only. The customer asked the team to check the address before dispatch. Packaging instructions are unchanged. The warehouse will contact support if any extra details are needed. Do not include the delivery notes in the JSON."
+        }
+      ],
+      "scorer": "json",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "order_id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "quantity": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "order_id",
+          "status",
+          "quantity"
+        ],
+        "additionalProperties": false
+      },
+      "expected": {
+        "order_id": "A-108",
+        "status": "shipped",
+        "quantity": 5
+      },
+      "max_tokens": 64
+    },
+    {
+      "fixture_id": "order-06",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Extract the order described below. Return one JSON object with exactly these keys: order_id, status, quantity. Quantity must be an integer. Return JSON only, with no explanation or Markdown.\n\nOrder ID: A-109\nStatus: pending\nQuantity: 1\n\nThe delivery notes are for internal reference only. The customer asked the team to check the address before dispatch. Packaging instructions are unchanged. The warehouse will contact support if any extra details are needed. Do not include the delivery notes in the JSON."
+        }
+      ],
+      "scorer": "json",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "order_id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "quantity": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "order_id",
+          "status",
+          "quantity"
+        ],
+        "additionalProperties": false
+      },
+      "expected": {
+        "order_id": "A-109",
+        "status": "pending",
+        "quantity": 1
+      },
+      "max_tokens": 64
+    }
+  ]
+}

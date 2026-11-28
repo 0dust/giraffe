@@ -36,6 +36,45 @@ def test_standalone_findings_first_order_and_complete_sections():
     assert report.model_dump_json() == before
 
 
+def test_measurement_scope_has_one_population_explanation():
+    from giraffe.performance_html import render_performance
+
+    performance = build_performance(synthetic_report_1000())
+    html = render_performance(performance)
+    scope = html.split('<div class="html-scope">', 1)[1].split('</div>', 1)[0]
+    assert scope.lower().count('one comparable workload across its recorded load stages') == 1
+    assert scope.count(performance['targets'][0]['scope_note']) == 1
+    assert '<summary>About these measurements</summary>' in scope
+
+
+def test_measurement_scope_uses_metadata_and_omits_empty_label():
+    from giraffe.performance_html import render_performance
+
+    performance = build_performance(synthetic_report_1000())
+    target = performance['targets'][0]
+    target['scope_note'] = 'Recorded scope: <selected> & separate.'
+    window = target['summaries'][target['selected_window']]['window']
+    window.pop('workload_label', None)
+    window.pop('stages_description', None)
+    scope = render_performance(performance).split('<div class="html-scope">', 1)[1].split('</div>', 1)[0]
+    assert 'Recorded scope: &lt;selected&gt; &amp; separate.' in scope
+    assert '<p class="html-note">' not in scope
+    assert 'Every request remains in the dispatch-ordered series' not in scope
+
+
+def test_measurement_scope_retains_stage_population():
+    from giraffe.performance_html import render_performance
+
+    performance = build_performance(synthetic_report_1000())
+    target = performance['targets'][0]
+    target['scope_note'] = 'Keep all request evidence.'
+    window = target['summaries'][target['selected_window']]['window']
+    window.update(kind='stage', population='Count dispatches; measure terminal events.')
+    scope = render_performance(performance).split('<div class="html-scope">', 1)[1].split('</div>', 1)[0]
+    assert 'Count dispatches; measure terminal events.' in scope
+    assert 'Keep all request evidence.' in scope
+
+
 def test_standalone_chart_decimation_preserves_extrema_and_bounds_geometry():
     from giraffe.performance_html import decimate
 
@@ -55,6 +94,27 @@ def test_standalone_chart_decimation_preserves_extrema_and_bounds_geometry():
     assert 'class="html-throughput"' in html
     assert '.html-throughput{display:grid;grid-template-columns:' in html
     assert '.html-throughput{grid-template-columns:1fr}' in html
+
+
+def test_standalone_concurrency_labels_fit_their_schedule_bands_above_the_plot():
+    from giraffe.performance_html import _chart
+
+    html = _chart('Actual and intended concurrency', [('Actual', [(0, 1), (90, 2), (180, 0)])],
+                  xlabel='Elapsed seconds', step=True, bands=[
+                      {'elapsed_s': 0, 'end_elapsed_s': 89, 'label': 'Short input',
+                       'kind': 'concurrency', 'intended_concurrency': 1},
+                      {'elapsed_s': 89, 'end_elapsed_s': 90, 'label': 'Drain'},
+                      {'elapsed_s': 90, 'end_elapsed_s': 180, 'label': 'Short input'},
+                  ])
+    row, plot = html.split('<div class="html-chart-frame">', 1)
+    assert '<div class="html-stage-labels">' in row
+    labels = re.findall(r'left:([\d.]+)%;right:([\d.]+)%" title="([^"]+)"', row)
+    assert [label for _, _, label in labels] == ['Short input', 'Drain', 'Short input']
+    assert 'title="Short input">1 at once</span>' in row
+    assert 0 < 100 - float(labels[1][0]) - float(labels[1][1]) < 1
+    for (_, right, _), (left, _, _) in zip(labels, labels[1:]):
+        assert abs(100 - float(right) - float(left)) < 0.001
+    assert '<title>Drain</title>' in plot
 
 
 def test_standalone_old_empty_reports_show_availability_without_empty_charts():

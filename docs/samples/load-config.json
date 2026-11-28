@@ -1,0 +1,120 @@
+{
+  "config_version": 2,
+  "targets": [
+    {
+      "name": "m1-ollama",
+      "url": "http://127.0.0.1:11436/v1",
+      "model": "qwen2.5:1.5b",
+      "tokenizer": "builtin",
+      "deployment": {
+        "runtime": {
+          "name": "ollama",
+          "version": "0.12.10"
+        },
+        "serving": {
+          "context_limit": 512,
+          "max_num_seqs": 4
+        }
+      }
+    }
+  ],
+  "checks": [
+    "load"
+  ],
+  "default_concurrency": 1,
+  "concurrency": 4,
+  "context_limit": 512,
+  "max_requests": 2000,
+  "max_duration_seconds": 720,
+  "max_memory_mb": 1024,
+  "request_timeout_seconds": 60,
+  "max_output_tokens": 128,
+  "retention": "all",
+  "load_test": {
+    "profile": {
+      "short": {
+        "input_tokens": 128,
+        "output_tokens": 64
+      },
+      "medium": {
+        "input_tokens": 256,
+        "output_tokens": 128
+      },
+      "long": {
+        "input_tokens": 512,
+        "output_tokens": 256
+      }
+    },
+    "workloads": {
+      "combinations": {
+        "selected": [
+          "short_short"
+        ]
+      }
+    },
+    "patterns": {
+      "concurrent": {
+        "levels": [
+          1,
+          2,
+          4
+        ]
+      },
+      "constant": {
+        "enabled": false
+      }
+    },
+    "schedule": {
+      "duration_seconds": 180
+    },
+    "request_timeout_seconds": 60,
+    "pass_criteria": {
+      "max_first_answer_ms": 2000,
+      "max_completion_ms": 10000,
+      "max_error_percent": 0,
+      "min_correct_percent": 100,
+      "min_valid_responses": 60
+    }
+  },
+  "request_source": "request_pack",
+  "request_pack": {
+    "version": 1,
+    "cases": [
+      {
+        "fixture_id": "order-extraction",
+        "weight": 1,
+        "messages": [
+          {
+            "role": "user",
+            "content": "Extract this order as JSON with only order_id and status. Order ID: A-104. Status: shipped. Return JSON only."
+          }
+        ],
+        "scorer": "json",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "order_id": {
+              "type": "string"
+            },
+            "status": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "order_id",
+            "status"
+          ],
+          "additionalProperties": false
+        },
+        "expected": {
+          "order_id": "A-104",
+          "status": "shipped"
+        },
+        "max_tokens": 64,
+        "options": {
+          "temperature": 0
+        }
+      }
+    ]
+  }
+}
