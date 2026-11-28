@@ -18,47 +18,32 @@
 
 ---
 
-Giraffe is for engineers running self-hosted LLMs. It has built-in tests to check
-whether your deployment continues to operate reliably and meet your requirements
-under changing conditions.
-
-Point it at an existing **OpenAI-compatible chat API**, such as Ollama or vLLM.
-Check answers against what your app expects, including JSON fields and tool
-arguments. Measure how long users wait for the first answer token and the complete
-response when requests arrive together. Repeat the same checks after a server
-update or model switch.
-
-Run it from the command line or a local web UI, inspect failed requests, and
-compare before-and-after runs against the same requirements.
-
-Use it to answer questions like:
+Giraffe checks whether your self-hosted LLM deployment still meets your
+requirements under changing conditions. Point the CLI or local web UI at an
+**OpenAI-compatible chat API** to grade answers and measure time to the first
+answer token and the complete response under the same load.
 
 - Do answers that pass individually still pass when requests run concurrently?
 - Which tested traffic rates meet our correctness and response-time limits?
 - After a server upgrade, which checks or measurements got worse?
 
-Start with built-in checks, or supply your own questions and expected answers.
-You choose the checks, traffic and acceptance limits. A passing run applies to
-those tests and settings; it does not establish general model quality or certify
-production capacity.
-
 [Quick start](#quick-start) · [Inference engines](#inference-engines) · [Conversations](#test-multi-turn-conversations) · [Baselines](#save-a-baseline-and-compare) · [Tests](#tests) · [Docs](#documentation) · [Discord](https://discord.gg/GBefPbWebr)
 
 ## A correct answer can still arrive too late
 
-An order-to-JSON workflow passed with one request at a time. With four requests
-in flight, every answer was still correct, but **9 of 51 responses missed the
-eight-second deadline**.
+At four requests in flight, every order-to-JSON answer was correct in both runs.
+We kept the same six prompts and 8-second deadline and changed Ollama's
+parallelism from one to four.
 
-We changed Ollama's parallelism from one to four and repeated the same six
-prompts and requirements. **All 100 responses at that load were correct and on
-time**; the slowest finished in 6.68 seconds. Giraffe caught the missed requirement
-and checked the result after the configuration change.
+| At four requests in flight | Before (1 Ollama slot) | After (4 Ollama slots) |
+| --- | ---: | ---: |
+| Responses over the 8 s deadline | **9 of 51** | **0 of 100** |
+| p95 completion time | **9.3 s** | **5.8 s** |
 
-[![Giraffe's recorded comparison: at four requests in flight, the baseline failed with 51 valid responses and the repeat passed with 100](https://raw.githubusercontent.com/0dust/giraffe/6fdf44c864f137b1a28a9af24ef50d36269821ce/docs/assets/readme/order-extraction-comparison.png)](https://raw.githubusercontent.com/0dust/giraffe/6fdf44c864f137b1a28a9af24ef50d36269821ce/docs/assets/readme/order-extraction-comparison.png)
+[![The recorded Giraffe report shows the four-request stage failing before and passing after the parallelism change](https://raw.githubusercontent.com/0dust/giraffe/main/docs/assets/readme/order-extraction-comparison.png)](https://raw.githubusercontent.com/0dust/giraffe/main/docs/assets/readme/order-extraction-comparison.png)
 
-*Recorded local demo with sample orders: Llama 3.2 1B, Ollama 0.12.10, M1 Mac.
-[Prompts, settings and evidence](https://github.com/0dust/giraffe/blob/6fdf44c864f137b1a28a9af24ef50d36269821ce/docs/samples/README.md#order-extraction-under-load) · [Download both reports](https://github.com/0dust/giraffe/raw/6fdf44c864f137b1a28a9af24ef50d36269821ce/docs/samples/order-extraction.zip).*
+*Local demo with sample orders on an M1 Mac running Llama 3.2 1B and Ollama 0.12.10.*
+[Prompts, settings and evidence](https://github.com/0dust/giraffe/blob/main/docs/samples/README.md#order-extraction-under-load) · [Download both reports](https://raw.githubusercontent.com/0dust/giraffe/main/docs/samples/order-extraction.zip)
 
 ## Quick start
 
@@ -112,12 +97,6 @@ giraffe ui
 ```
 
 Open the access link printed in the terminal (it contains a per-launch token), enter your endpoint and model, choose checks, then **Launch**. Keep the terminal open; **Ctrl+C** stops the UI. Use `--port` to choose a different port.
-
-[![Giraffe test conditions updating during a recorded local run](https://raw.githubusercontent.com/0dust/giraffe/6fdf44c864f137b1a28a9af24ef50d36269821ce/docs/assets/readme/browser-ui-live.gif)](https://raw.githubusercontent.com/0dust/giraffe/6fdf44c864f137b1a28a9af24ef50d36269821ce/docs/assets/readme/browser-ui-live.gif)
-
-*Watch three test conditions update during a real Qwen2.5 1.5B run, with up to four
-requests in flight. Playback is condensed.
-[Download this run](https://github.com/0dust/giraffe/raw/6fdf44c864f137b1a28a9af24ef50d36269821ce/docs/samples/browser-ui-demo.zip) · [Recording details](https://github.com/0dust/giraffe/blob/6fdf44c864f137b1a28a9af24ef50d36269821ce/docs/samples/README.md#browser-ui-demo).*
 
 ## Inference engines
 
@@ -225,11 +204,24 @@ your own questions and expected answers to test the work your application needs.
 See the [Load test guide](https://github.com/0dust/giraffe/blob/main/docs/workloads.md#load-test)
 for traffic patterns, answer checks and configuration examples.
 
-[![Actual and intended concurrency across the 1, 2 and 4 request stages](https://raw.githubusercontent.com/0dust/giraffe/6fdf44c864f137b1a28a9af24ef50d36269821ce/docs/assets/readme/fresh-load-concurrency.jpg)](https://raw.githubusercontent.com/0dust/giraffe/6fdf44c864f137b1a28a9af24ef50d36269821ce/docs/assets/readme/fresh-load-concurrency.jpg)
+[![Actual and intended concurrency across the 1, 2 and 4 request stages](https://raw.githubusercontent.com/0dust/giraffe/main/docs/assets/readme/fresh-load-concurrency.jpg)](https://raw.githubusercontent.com/0dust/giraffe/main/docs/assets/readme/fresh-load-concurrency.jpg)
 
 *A separate November 18 run: Qwen2.5 1.5B on Ollama 0.34.1, with 1,154 correct
 responses across concurrency 1, 2, and 4. All three stages passed.
-[Download the performance run](https://github.com/0dust/giraffe/raw/6fdf44c864f137b1a28a9af24ef50d36269821ce/docs/samples/token-timing.zip) · [Measurement details](https://github.com/0dust/giraffe/blob/6fdf44c864f137b1a28a9af24ef50d36269821ce/docs/samples/README.md#token-timing).*
+[Download the performance run](https://raw.githubusercontent.com/0dust/giraffe/main/docs/samples/token-timing.zip) · [Measurement details](https://github.com/0dust/giraffe/blob/main/docs/samples/README.md#token-timing).*
+
+### Observe an external scale-down
+
+The opt-in `scale_down` check keeps streamed answers active while you remove one
+replica externally, then reports **client-visible continuity**, **backend drain
+semantics** and **remaining capacity** separately. Start with
+[`examples/scale-down.yaml`](https://github.com/0dust/giraffe/blob/main/examples/scale-down.yaml) and the
+[operator workflow](https://github.com/0dust/giraffe/blob/main/docs/running.md#scale-down-continuity).
+A read-only lifecycle exporter and a representative long-answer fixture are
+needed for complete coverage. Missing evidence stays inconclusive; successful
+traffic alone does not establish graceful draining. Giraffe does not provision or
+remove replicas. Controlled HTTP tests are available; qualification on a real
+multi-replica deployment is still pending.
 
 ## Test multi-turn conversations
 
@@ -374,7 +366,13 @@ Results are **pass**, **fail**, **inconclusive**, **skipped** or **blocked**. Mi
 
 An order-lookup prompt asked for customer `C-41442`; the model's `search_orders`
 call used `C-41422`. Giraffe flagged the mismatch without executing the tool.
-[Inspect the recorded request](https://github.com/0dust/giraffe/blob/6fdf44c864f137b1a28a9af24ef50d36269821ce/docs/samples/README.md#tool-call-mismatch).
+[Inspect the recorded request](https://github.com/0dust/giraffe/blob/main/docs/samples/README.md#tool-call-mismatch).
+
+## Sample reports
+
+[Reports, recordings and JSON evidence](https://github.com/0dust/giraffe/blob/main/docs/samples/README.md) ·
+[Download the load comparison](https://raw.githubusercontent.com/0dust/giraffe/main/docs/samples/load-comparison.zip) ·
+[Run configuration](https://github.com/0dust/giraffe/blob/main/docs/samples/load-config.json)
 
 ## Documentation
 
@@ -389,21 +387,3 @@ call used `C-41422`. Giraffe flagged the mismatch without executing the tool.
 [Report an issue](https://github.com/0dust/giraffe/issues) with your Giraffe version, engine/model and reproduction steps. Remove API keys and private prompts or answers before sharing reports.
 
 [Contributing](https://github.com/0dust/giraffe/blob/main/CONTRIBUTING.md) · [Apache 2.0 license](https://github.com/0dust/giraffe/blob/main/LICENSE)
-
-### Observe an external scale-down
-
-The opt-in `scale_down` check keeps streamed answers active while you remove one
-replica externally, then reports **client-visible continuity**, **backend drain
-semantics** and **remaining capacity** separately. Start with
-[`examples/scale-down.yaml`](https://github.com/0dust/giraffe/blob/main/examples/scale-down.yaml) and the
-[operator workflow](https://github.com/0dust/giraffe/blob/main/docs/running.md#scale-down-continuity).
-A read-only lifecycle exporter and a representative long-answer fixture are
-needed for complete coverage. Missing evidence stays inconclusive; successful
-traffic alone does not establish graceful draining. Giraffe does not provision or
-remove replicas. Controlled HTTP tests are available; qualification on a real
-multi-replica deployment is still pending.
-
-## Sample reports
-
-[Download the load comparison](https://github.com/0dust/giraffe/raw/6fdf44c864f137b1a28a9af24ef50d36269821ce/docs/samples/load-comparison.zip) ·
-[Reports and JSON evidence](https://github.com/0dust/giraffe/blob/6fdf44c864f137b1a28a9af24ef50d36269821ce/docs/samples/README.md) · [Run configuration](https://github.com/0dust/giraffe/blob/6fdf44c864f137b1a28a9af24ef50d36269821ce/docs/samples/load-config.json)

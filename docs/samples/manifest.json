@@ -74,8 +74,8 @@
       ]
     },
     "token-timing.zip": {
-      "sha256": "3dc247d461f80ad320c69e7aec017f6063c4cdbbbf2d616ab811e7d62e6d93ff",
-      "bytes": 954157,
+      "sha256": "ba3f7ea0c8badd7e4a7d62b751ac2ad9083c6a115fe2862ff972779be22567cc",
+      "bytes": 954319,
       "reports": [
         {
           "directory": ".",
@@ -84,15 +84,15 @@
           "overall": "pass",
           "source_report_sha256": "668de4ea53cb186f097e99aebffc5bcf6ded07dee3f16aa9700ba3f83123a8a1",
           "distributed_report_sha256": "f4b9d7dcc69e95a174037660740083ea95a42b63524b8f137a917c73aa325bfd",
-          "distributed_html_sha256": "2cdbe4a613a44219863b641dd9c7d97de4a83ee45e148f08d50e3ad74a847f0f",
+          "distributed_html_sha256": "70b9eb7157bea8c803185cd39175cdc20baf3a8f9a77d80951d22518f9447518",
           "config_sha256": "d307611356fa1d1cec2b8de857e34aa7db86bf67b13107bcacc500cab5c6de85",
           "changed_metadata_fields": [
             "manifest.run_location.hostname",
             "manifest.invocation.argv"
           ],
-          "previous_distributed_html_sha256": "447312c87f88bd965c36e184361e2062c094dfc6ecb13e9eafa45a73459288c1",
-          "html_presentation_changes": "Re-rendered the distributed JSON with the corrected measurement-scope copy. JSON, configuration, scores and measurements are byte-identical.",
-          "presentation_commit": "336552816c878e9d26e4a760789e3012104b37ae"
+          "previous_distributed_html_sha256": "2cdbe4a613a44219863b641dd9c7d97de4a83ee45e148f08d50e3ad74a847f0f",
+          "html_presentation_changes": "Re-rendered the distributed JSON with grouped measurement notes and stage labels fitted above the concurrency plot.",
+          "presentation_commit": "2fd70a8a34feb4c4b70ab1ddafd8da3ac80b29c8"
         }
       ]
     },
@@ -164,13 +164,14 @@
       "source_report_sha256": "668de4ea53cb186f097e99aebffc5bcf6ded07dee3f16aa9700ba3f83123a8a1"
     },
     "fresh-load-concurrency.jpg": {
-      "sha256": "da1784800b5a8323fd6a1e223b2e7e5f8fb96b4d2fb229a5a9d19e45159e60ec",
-      "bytes": 67499,
+      "sha256": "d4d30060cfbc64dc47bfc335dad5a764cdb32fca56012c9bcea98cc0bd53cbb1",
+      "bytes": 29866,
       "evidence": "token-timing.zip",
-      "capture_changes": "None; copied byte-for-byte from the reviewed preview.",
+      "capture_changes": "Concurrency chart card captured at a 700 CSS pixel viewport in dark mode from the redistributed report.html.",
       "source_run_id": "4121bab47d9040068e5cbee14209c4fb",
       "source_run_code_commit": "b5068162b8e78f2840541c9e368b7eca61aaed92",
-      "source_report_sha256": "668de4ea53cb186f097e99aebffc5bcf6ded07dee3f16aa9700ba3f83123a8a1"
+      "source_report_sha256": "668de4ea53cb186f097e99aebffc5bcf6ded07dee3f16aa9700ba3f83123a8a1",
+      "source_html_sha256": "70b9eb7157bea8c803185cd39175cdc20baf3a8f9a77d80951d22518f9447518"
     },
     "ollama-default-recall-medium-d0-0-ui.jpg": {
       "sha256": "cba4b71f60bad9f0c711456aad4ab3ba6eed17b8b34d3769543a5a8238a7b9a7",

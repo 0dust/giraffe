@@ -116,7 +116,7 @@ longer; this example does not claim a speed improvement.
 
 ## Browser UI demo
 
-[Download the GIF's run](browser-ui-demo.zip?raw=true)
+[View the recording](../assets/readme/browser-ui-live.gif) · [Download the run](browser-ui-demo.zip?raw=true)
 
 The November 18 GIF shows three test conditions in a separate, brief run:
 17/17 scored answers passed at concurrency 1, 2, and 4. Its 12-second stages and
@@ -158,6 +158,8 @@ was recorded; its cause is unknown.
 
 ![Actual and intended concurrency in the same November 18 run](../assets/readme/fresh-load-concurrency.jpg)
 
+The chart screenshot shows the downloadable report's stage labels.
+
 This repeated JSON extraction task is a local serving example. It does not
 establish general model quality or production capacity.
 
@@ -183,7 +185,6 @@ capture revisions, and image origins. Personal hostnames and absolute local CLI
 paths are replaced in the report copies. Requests, scores, verdicts, and timing
 measurements are unchanged.
 
-The context screenshots are JPEG conversions at 1280 pixels wide. The original
-GIF and performance screenshots retain their recorded content.
-The token-timing ZIP has only a presentation update to
-`report.html`; the manifest records its previous and current HTML hashes.
+The context screenshots are JPEG conversions at 1280 pixels wide. The manifest
+records the previous and current hashes for the token-timing `report.html` and
+the sources of its screenshots.
