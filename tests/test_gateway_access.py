@@ -19,6 +19,34 @@ def config(**changes):
             {"name": "invalid", "identity": "denied", "expected": "deny"}]}, **changes)
 
 
+async def test_local_preparation_failure_is_retained_and_stops_access_probes(monkeypatch):
+    from giraffe.gateway_access import execute, result
+
+    monkeypatch.setenv("ALLOW_KEY", "allow-secret")
+    monkeypatch.setenv("DENY_KEY", "deny-secret")
+    cfg = config(stop_after_errors=1)
+    state = _Run(cfg, None, None)
+    async with LLMClient(cfg.targets[0], cfg) as client:
+        def invalid_request(*args, **kwargs):
+            raise ValueError("invalid request inputs")
+
+        monkeypatch.setattr(client._client, "build_request", invalid_request)
+        await execute(state, cfg.targets[0], client)
+    assert state.errors == 1
+    assert state.stop_reason() == "error threshold reached"
+    assert len(state.records) == 1
+    record, = state.records
+    assert record.outcome == "not_dispatched"
+    assert state.attempted == state.budget_used == 0
+    check = result(state, cfg.targets[0])
+    assert check.status == "inconclusive"
+    assert check.summary.startswith("Access policy unverified:")
+    first, second = check.metrics["gateway_access"]["cases"]
+    assert first["reason"] == "request_not_dispatched"
+    assert first["request_id"] == record.id
+    assert second["reason"] == "run_stopped"
+
+
 @pytest.mark.parametrize("status,error_type,body,expected", [
     (401, "token_not_found_in_db", None, "pass"),
     (403, "key_model_access_denied", None, "pass"),

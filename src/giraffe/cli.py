@@ -664,7 +664,8 @@ async def _run(config: RunConfig, *, json_progress: bool = False, verbose: bool 
             from giraffe.evidence import EvidenceWriter
             from giraffe.runner import record_sink
 
-            writer = EvidenceWriter(directory, manifest={"config": safe_config(config.model_dump(mode="json"))})
+            writer = EvidenceWriter(directory, manifest={
+                "config": safe_config(config.model_dump(mode="json")), "outcome_counting_version": 2})
             sink_token = record_sink.set(writer.record_finished)
             if "scale_down" in config.checks:
                 from giraffe.scale_down_control import ScaleDownFileControl
@@ -1473,7 +1474,8 @@ def _blocked_outputs(config: RunConfig, args: argparse.Namespace, directory: Pat
     from giraffe.models import CheckResult
     now = datetime.now(timezone.utc).isoformat()
     report = RunReport(run_id=directory.name, started_at=now, finished_at=now, overall="blocked",
-                       abort_reason=reason, manifest={"config": config.model_dump(mode="json")},
+                       abort_reason=reason, manifest={
+                           "config": config.model_dump(mode="json"), "outcome_counting_version": 2},
                        checks=[CheckResult(id=check, target=target.name, title=CHECK_NAMES[check],
                                            status="blocked", summary=reason)
                                for target in config.targets for check in config.checks])

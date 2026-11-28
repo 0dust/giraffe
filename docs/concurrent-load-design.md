@@ -247,9 +247,10 @@ Its result is then labelled e.g. "pass · budget-limited window 3.2 s of 10 s". 
 ## 5. Scoring
 
 Per test point, in this order. **Cut short / not run / insufficient evidence can only downgrade a would-be pass. They never mask a failure.**
+The evaluated denominator follows [Request outcomes](states.md#request-outcomes).
 
 1. **Blocked.** Configuration impossibility discovered at run time (e.g. a known server context exceeded), with reason.
-2. **Error rate.** Error % = (failed + timeouts) ÷ sent × 100. Requests cancelled by the run stop or deadline are excluded but reported. If error % > `max_error_percent` → **fail**. This applies even when the point was cut short or the run stopped (e.g. the error-threshold stop). Calibration failures for the shape → **fail**.
+2. **Error rate.** Error % = (invalid + failed + timeouts) ÷ evaluated × 100. Cancelled, intentional-stop, reasoning-budget-exhausted, and not-dispatched requests are excluded but reported. If error % > `max_error_percent` → **fail**. This applies even when the point was cut short or the run stopped (e.g. the error-threshold stop). Calibration failures for the shape → **fail**.
 3. **Output cap.** Any `completion_tokens` > requested cap → **fail**.
 4. **Correctness.** Every shape uses the label scorer: the label must appear first, allowing one surrounding emphasis/code/quote layer and an optional leading `Label:` / `Box label:` prefix, following built-in `exact_matches` leniency. Additional introductions, wrong labels and nested wrappers are incorrect. Let wrong = scored − correct.
    - Correct % < `min_correct_percent` with scored ≥ `min_valid_responses` → **fail**.

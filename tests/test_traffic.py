@@ -393,6 +393,10 @@ async def test_escaped_callback_failure_is_not_reported_as_success():
     harness.execute = broken_callback
     result = await harness.run()
     assert result["failed"] == result["started"] > 0 and result["status"] == "fail"
+    assert result["errors"] == result["evaluated"] == result["started"]
+    assert result["error_rate"] == 1
+    assert sum(window["failed"] for window in result["windows"]) == result["failed"]
+    assert sum(window["evaluated"] for window in result["windows"]) == result["evaluated"]
     assert "private transport" not in str(result)
 
 
@@ -570,3 +574,68 @@ async def test_reserved_offers_dropped_before_sending_notify_live_progress(monke
     expected = result["dropped_local"] + result["dropped_late"]
     assert len(drops) == expected > 0
     assert not harness.starts
+
+
+@pytest.mark.parametrize("server_failure", [False, True])
+async def test_local_preparation_failure_blocks_stage_pass_but_server_failure_wins(server_failure):
+    from giraffe.request_outcome import preparation_failure_reason
+
+    harness = Harness()
+
+    def change(record):
+        if record.id == "0":
+            return record.model_copy(update={
+                "status": "failed", "valid": False, "score": None,
+                "not_dispatched": True, "dispatch_ms": None,
+            })
+        if server_failure and record.id == "1":
+            return record.model_copy(update={"valid": False, "score": None})
+        return record
+
+    harness.transform = change
+    result = await harness.run()
+    assert result["status"] == ("fail" if server_failure else "inconclusive")
+    assert not result["accepted"]
+    assert result["not_dispatched"] == 1
+    assert result["evaluated"] == result["started"] - 1
+    assert result["errors"] == int(server_failure)
+    reason = preparation_failure_reason([change(record) for record in harness.records])
+    assert (reason in result["reasons"]) is not server_failure
+
+
+@pytest.mark.parametrize("excluded", ["cancelled", "budget_exhausted", "intentional_stop"])
+async def test_error_denominator_excludes_non_evaluated_request_outcomes(excluded):
+    harness = Harness()
+
+    def change(record):
+        if record.id == "0":
+            return record.model_copy(update={"valid": False})
+        if excluded == "budget_exhausted":
+            return record.model_copy(update={
+                "valid": False, "reasoning": "thinking", "output": "",
+                "finish_reason": "length",
+                "error": "reasoning exhausted the output budget before an answer",
+            })
+        return record.model_copy(update={"status": "cancelled", "valid": False,
+                                         "intentional": excluded == "intentional_stop"})
+
+    harness.transform = change
+    result = await harness.run()
+    assert result[excluded] == result["started"] - 1
+    assert result["failed"] == result["errors"] == result["evaluated"] == 1
+    assert result["error_rate"] == 1
+    assert result["outcome_counts"]["failed"] == 0
+    assert result["outcome_counts"]["invalid"] == 1
+    assert sum(window["evaluated"] for window in result["windows"]) == 1
+    assert result["status"] == "fail"
+
+
+async def test_nonintentional_cancellation_still_blocks_stage_pass():
+    harness = Harness()
+    harness.transform = lambda record: record.model_copy(update={
+        "status": "cancelled", "valid": False}) if record.id == "0" else record
+    result = await harness.run()
+    assert result["error_rate"] == 0
+    assert result["evaluated"] == result["started"] - 1
+    assert result["status"] == "inconclusive"
+    assert not result["accepted"]

@@ -1017,9 +1017,11 @@ async def test_rotated_credential_does_not_observe_another_access_identity(monke
     allowed, denied = check.metrics["gateway_access"]["cases"]
     assert report.overall == check.status == "inconclusive"
     assert allowed["observed"] == "allow"
-    assert denied["observed"] == "unverified" and denied["reason"] == reason and denied["request_id"] is None
+    assert denied["observed"] == "unverified" and denied["reason"] == reason
+    assert denied["request_id"] == report.requests[1].id
+    assert report.requests[1].outcome == "not_dispatched"
     assert sent == ["Bearer allow-secret"]
-    assert check.evidence_ids == [allowed["request_id"]] == [record.id for record in report.requests]
+    assert check.evidence_ids == [allowed["request_id"], denied["request_id"]] == [record.id for record in report.requests]
     assert report.observations["request_budget_used"] == events[-1]["attempted"] == 1
     assert [event["fixture_id"] for event in events if event["event"] == "request_started"] == ["gateway-access-valid"]
     serialized = report.model_dump_json() + json.dumps(events)

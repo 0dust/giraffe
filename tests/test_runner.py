@@ -2052,7 +2052,7 @@ async def test_live_request_events_keep_identity_and_exclude_response_bodies(cli
         record = event["request"]
         assert record["elapsed_ms"] == by_id[record["id"]].elapsed_ms
         assert record["score"] == by_id[record["id"]].score
-        assert set(record) == {"id", "target", "fixture_id", "scenario", "condition_id", "intentional", "status", "valid", "score",
+        assert set(record) == {"id", "target", "fixture_id", "scenario", "condition_id", "intentional", "status", "valid", "score", "outcome", "not_dispatched",
                 "request_timeout_seconds", "termination_reason", "termination_limit_seconds",
                 "elapsed_ms", "first_output_ms", "check_ids", "http_status", "started_at", "dispatch_ms",
                 "completed_ms", "timing_start_ms", "timing_schema", "first_token_ms", "first_reasoning_ms",

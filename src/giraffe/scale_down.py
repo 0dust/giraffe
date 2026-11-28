@@ -9,14 +9,13 @@ from dataclasses import dataclass
 
 from . import states
 from .caps import MAX_SANITIZE_ITEMS
-from .client import REASONING_BUDGET_ERROR
 from .deployment import scale_down_enabled
-from .fixtures import reasoning_budget
 from .models import (
     MAX_PLANNED_ARRIVALS, MAX_SCALE_DOWN_SNAPSHOTS, MAX_SIMULTANEOUS_REQUESTS,
     CheckResult, Limits, RequestRecord, ScaleDownConfig, ScaleDownEvidence,
     ScaleDownInventory, ScaleDownLifecycleFact, ScaleDownSnapshot, ScaleDownSubresult,
 )
+from .request_outcome import preparation_failure_reason, request_outcome
 from .timing import configured_metrics, qualify, qualified_violations, threshold
 from .traffic import _timing
 
@@ -152,23 +151,19 @@ def _answer_started(record: RequestRecord, evidence: ScaleDownEvidence) -> float
     return max(observed, record.timing_start_ms + record.answer_read_timestamps_ms[0])
 
 
-def _budget_exhausted(record: RequestRecord) -> bool:
-    return reasoning_budget(record) or (record.status == "completed" and not record.valid
-        and record.finish_reason == "length" and record.error == REASONING_BUDGET_ERROR)
-
-
 def _request_outcome(records: list[RequestRecord], limits: Limits, evidence: ScaleDownEvidence,
                      minimum: int, *, strict_errors: bool) -> tuple[list[str], list[str], dict]:
     violations, missing = [], []
-    interrupted = [r for r in records if r.status == "cancelled"]
-    measured = [r for r in records if r.status != "cancelled" and not _budget_exhausted(r)]
-    errors = [r for r in measured if (r.status != "completed" or not r.valid
+    interrupted = [r for r in records if request_outcome(r) in {"cancelled", "intentional_stop"}]
+    measured = [r for r in records if request_outcome(r) == "ok" or request_outcome(r) in states.REQUEST_OUTCOME_ERRORS]
+    # Scale-down also requires proof that an otherwise valid stream ended cleanly.
+    errors = [r for r in measured if (request_outcome(r) in states.REQUEST_OUTCOME_ERRORS
               or r.error or not r.stream_terminated or r.finish_reason not in {"stop", "length", "end_turn", "eos_token"})]
     if errors and (strict_errors or len(errors) / max(1, len(measured)) > limits.max_error_rate):
         violations.append("Original requests failed or did not end with a valid terminal response.")
     if interrupted:
         missing.append("Giraffe cancelled requests; those outcomes do not establish endpoint interruption.")
-    if any(_budget_exhausted(r) for r in records):
+    if any(request_outcome(r) == "budget_exhausted" for r in records):
         missing.append("Some responses exhausted Giraffe's output budget before an answer; they are not endpoint failures.")
     valid = [r for r in measured if r not in errors]
     if len(valid) < minimum:
@@ -232,6 +227,8 @@ def evaluate_scale_down(settings: ScaleDownConfig, evidence: ScaleDownEvidence,
     history = _history(settings, evidence)
     shared = list(evidence.limitations)
     shared.extend(history.conflicts)
+    local_failure = preparation_failure_reason(
+        r for r in records if r.target == settings.target and "scale_down" in r.check_ids)
     marker = evidence.marker
     accepted_marker = (marker is not None and marker.target == settings.target and evidence.marker_accepted_ms is not None
                        and evidence.armed_ms is not None and evidence.marker_accepted_ms >= evidence.armed_ms)
@@ -329,7 +326,9 @@ def evaluate_scale_down(settings: ScaleDownConfig, evidence: ScaleDownEvidence,
                 continue
             if record.completed_ms >= transition[1]:
                 cohort.append(record)
-            elif record.completed_ms >= transition[0] and record.status in {"failed", "timeout"} and source_proves_overlap(record):
+            elif (record.completed_ms >= transition[0]
+                  and request_outcome(record) in {*states.REQUEST_OUTCOME_ERRORS, "budget_exhausted"}
+                  and source_proves_overlap(record)):
                 cohort.append(record)
     continuity_bad, continuity_missing, continuity_timing = _request_outcome(cohort, limits, evidence, settings.min_overlap_samples, strict_errors=True)
     continuity_missing = [*shared, *continuity_missing]
@@ -436,6 +435,17 @@ def evaluate_scale_down(settings: ScaleDownConfig, evidence: ScaleDownEvidence,
     capacity.summary = (f"Drain-window requests: {drain_window.status}; post-exit requests: {post_window.status}. "
                         + capacity.summary)
     results = {"continuity": continuity, "drain": backend, "capacity": capacity}
+    if local_failure:
+        for result in results.values():
+            if result.status == "pass":
+                result.status, result.summary = "inconclusive", local_failure
+            if result.status != "fail":
+                result.limitations.append(local_failure)
+        for window in capacity.metrics["windows"].values():
+            if window["status"] == "pass":
+                window.update(status="inconclusive", summary=local_failure)
+            if window["status"] != "fail":
+                window["limitations"].append(local_failure)
     status = "fail" if any(r.status == "fail" for r in results.values()) else "inconclusive" if any(r.status == "inconclusive" for r in results.values()) else "pass"
     return CheckResult(id="scale_down", target=settings.target, title="Scale-down continuity", status=status,
                        summary=f"Continuity: {continuity.status}; drain: {backend.status}; capacity: {capacity.status}.",
@@ -757,7 +767,8 @@ async def execute(run, target, client, fixtures, *, collector_task=None):
                     break
                 await pause()
             ingest_deployment(run, target.name, evidence)
-            if any(record.status == "cancelled" and record.id in evidence.long_request_ids for record in run.records):
+            if any(request_outcome(record) in {"cancelled", "intentional_stop"}
+                   and record.id in evidence.long_request_ids for record in run.records):
                 evidence.limitations.append("The client completion allowance or a run limit interrupted active work.")
             control.set_phase("finished")
 

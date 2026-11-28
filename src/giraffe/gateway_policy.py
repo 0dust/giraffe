@@ -11,6 +11,7 @@ import time
 from . import states
 from .identities import gateway_identities_only, identity_headers, litellm_key_fingerprint
 from .models import CheckResult, RequestSpec
+from .request_outcome import preparation_failure_reason, request_outcome
 
 
 VERSION = 23
@@ -165,7 +166,7 @@ def _scoped_limit_conflicts(record, expected):
 
 
 def _proven_admission(record):
-    return (record.status == "completed" and record.valid
+    return (request_outcome(record) == "ok"
             and record.http_status is not None and 200 <= record.http_status < 300)
 
 
@@ -173,12 +174,13 @@ def summarize(settings, observation, records):
     users = []
     for user in settings.users if settings else []:
         own = [record for record in records if record.identity == user.identity]
-        completed = [record for record in own if record.status == "completed" and record.valid]
+        completed = [record for record in own if request_outcome(record) == "ok"]
+        # Cancellation is a lifecycle interruption count; 429s are policy evidence.
         users.append({"identity": user.identity, "declared_rpm": user.rpm, "priority": user.priority,
             "planned": user.requests, "dispatched": len(own), "completed": len(completed),
             "admitted": sum(_proven_admission(record) for record in completed),
             "rejected": sum(record.http_status == 429 for record in own),
-            "other_failures": sum((record.status in {"failed", "timeout"} or record.status == "completed" and not record.valid) and record.http_status != 429 for record in own),
+            "other_failures": sum(request_outcome(record) in states.REQUEST_OUTCOME_ERRORS and record.http_status != 429 for record in own),
             "cancelled": sum(record.status == "cancelled" for record in own),
             "input_tokens": [record.input_tokens for record in completed],
             "output_tokens": [record.output_tokens for record in completed],
@@ -198,8 +200,20 @@ def summarize(settings, observation, records):
         "interpretation": "Observed admission under declared policy and window assumptions; no queue-order, latency-causality or production-wide guarantee."}
 
     def outcome(qualification, reason, status="inconclusive"):
+        preparation_reason = preparation_failure_reason(records)
+        budget_reason = ("Some responses exhausted Giraffe's output budget before an answer; policy evidence is incomplete."
+                         if any(request_outcome(record) == "budget_exhausted" for record in records) else None)
+        excluded_reasons = [text for text in (preparation_reason if status in {"pass", "inconclusive"} else None, budget_reason) if text]
+        if status == "pass" and excluded_reasons:
+            qualification, status = "unverified", "inconclusive"
+            reason = None
         summary.update(qualification=qualification, status=status)
-        summary["reasons"].append(reason)
+        if status != "fail":
+            summary["reasons"].extend(excluded_reasons)
+        if reason:
+            summary["reasons"].append(reason)
+        if status == "fail":
+            summary["reasons"].extend(excluded_reasons)
         return summary
 
     if settings is None:
@@ -336,7 +350,7 @@ def summarize(settings, observation, records):
             reported = rejection.gateway_evidence._reported_saturation
             # A recognized priority rejection changes neither counter. Other
             # failures may have been charged before the gateway replied.
-            possible = sum(record.id not in rejected_ids and (
+            possible = sum(request_outcome(record) != "not_dispatched" and record.id not in rejected_ids and (
                 record.dispatch_ms is None or rejection.completed_ms is None
                 or record.dispatch_ms <= rejection.completed_ms
             ) for record in records)
@@ -396,6 +410,7 @@ def summarize(settings, observation, records):
     if len(prior_admissions) < declared.rpm:
         # RPM can be charged before a downstream failure; its admission is unknown.
         uncertain_prior = sum(record.identity == settings.affected_identity
+                              and request_outcome(record) != "not_dispatched"
                               and record not in prior_admissions and record not in recognized
                               and (record.dispatch_ms is None or record.dispatch_ms < first_rejection)
                               for record in records)

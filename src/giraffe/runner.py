@@ -36,6 +36,7 @@ from .identities import gateway_identities_only
 from .overlap import NEEDS_STREAM, max_evidenced_overlap, scheduling_delay_windows
 from .request_pack import pack_identity, pack_preview, pack_specs
 from .timeout_warning import TimeoutWatch, format_timeout_warning
+from .request_outcome import count_outcomes, preparation_failure_reason, request_outcome
 from .stats import percentile
 from .local_tokenizer import TokenizerUnavailable
 from .resources import PhaseSampler, SAMPLING, peak_rss_bytes
@@ -146,26 +147,22 @@ def model_identity_warnings(config: RunConfig, records: list[RequestRecord]) -> 
 
 
 def _stats(records: list[RequestRecord]) -> dict:
-    """attempted = completed + failed + timed_out + cancelled + reasoning_budget_exhausted.
-
-    Reasoning-budget records are neither errors nor answers; they are excluded from error_rate.
-    """
-    good = [r for r in records if r.status == "completed" and r.valid]
+    """Count errors only among ok, invalid, failed and timeout outcomes."""
+    outcomes = count_outcomes(records)
+    good = [r for r in records if request_outcome(r) == "ok"]
     latencies = [r.elapsed_ms for r in good]
     output = [r.first_output_ms for r in good if r.first_output_ms is not None]
-    evaluated = [r for r in records if r.status != "cancelled" and not _reasoning_budget(r)]
-    errors = sum(r.status in {"failed", "timeout"} or (r.status == "completed" and not r.valid) for r in evaluated)
     rates = [r.output_tokens / (r.elapsed_ms / 1000) for r in good
              if r.output_tokens is not None and r.elapsed_ms > 0]
     generation_rates = [rate for r in good if (rate := r.generation_tokens_per_second) is not None]
     result = {
         "attempted": len(records), "completed": len(good),
-        "failed": sum((r.status == "failed" or (r.status == "completed" and not r.valid))
-                      and not _reasoning_budget(r) for r in records),
-        "reasoning_budget_exhausted": sum(map(_reasoning_budget, records)),
-        "timed_out": sum(r.status == "timeout" for r in records),
-        "cancelled": sum(r.status == "cancelled" for r in records),
-        "error_rate": errors / len(evaluated) if evaluated else None,
+        "failed": outcomes["failed"] + outcomes["invalid"],
+        "reasoning_budget_exhausted": outcomes["budget_exhausted"],
+        "timed_out": outcomes["timeout"], "cancelled": outcomes["cancelled"],
+        "intentional_stop": outcomes["intentional_stop"], "not_dispatched": outcomes["not_dispatched"],
+        "evaluated": outcomes["evaluated"], "error_rate": outcomes["error_rate"],
+        "outcome_counts": outcomes,
         "p50_ms": percentile(latencies, .5), "p95_ms": percentile(latencies, .95),
         "first_output_p50_ms": percentile(output, .5),
         "first_output_p95_ms": percentile(output, .95),
@@ -220,24 +217,28 @@ def _context_rejection(record):
 
 
 def _serving_failure(record, scenario):
-    if (record.identity is not None or scenario in {"sustained", "performance_evidence_probe"} or scenario.startswith("traffic_stage_") or record.status == "cancelled"
-            or _reasoning_budget(record)):
+    outcome = request_outcome(record)
+    if (record.identity is not None or scenario in {"sustained", "performance_evidence_probe"}
+            or scenario.startswith("traffic_stage_") or outcome not in states.REQUEST_OUTCOME_ERRORS):
         return False
     if (scenario.startswith("load_calibration_") and record.input_tokens is not None
-            and record.status == "failed" and (record.http_status is None or record.http_status < 400)
+            and outcome == "failed" and (record.http_status is None or record.http_status < 400)
             and record.error == "response contained no useful answer output"):
         return False
-    if _stress(scenario) and (record.status == "timeout" or _context_rejection(record)):
+    if _stress(scenario) and (outcome == "timeout" or _context_rejection(record)):
         return False
-    return record.status != "completed" or not record.valid
+    return True
 
 
 def _request_failed(record):
+    outcome = request_outcome(record)
+    # Local input failures still stop runaway runs, independently of server rates.
+    if outcome == "not_dispatched":
+        return True
     if (record.intentional or record.scenario in {"client_cancel", "client_deadline", "deadline_probe"}
             or "intentional cancellation" in (record.error or "").lower()):
         return False
-    return record.status in {"failed", "timeout"} or (
-        record.status == "completed" and (not record.valid or record.score is False))
+    return outcome in states.REQUEST_OUTCOME_ERRORS or outcome == "ok" and record.score is False
 
 
 def _spec(spec: RequestSpec, scenario: str, checks: list[str] = ()) -> RequestSpec:
@@ -898,7 +899,8 @@ class _Run:
         their ordinary timeout, unlike ``deadline_override``.
         With ``prepared_admission``, HTTP preparation precedes admission and progress.
         ``admission_check`` checks caller-owned eligibility before committing an attempt.
-        ``on_preparation_failure`` can read a client diagnostic without recording an attempt.
+        ``on_preparation_failure`` reads the original client diagnostic before the
+        local failure is retained; no HTTP attempt is recorded.
         """
         source, timeout_check, timeout_setting = self.timeout_origin(spec)
         spec = spec.model_copy(update={"deadline_source": source, "timeout_check": timeout_check,
@@ -984,7 +986,7 @@ class _Run:
                 return RequestRecord(
                     id=uuid.uuid4().hex, target=target.name, fixture_id=spec.fixture_id,
                     scenario=spec.scenario, check_ids=spec.check_ids, started_at=_now(),
-                    status="failed", valid=False, error=f"request could not be prepared ({kind})",
+                    status="failed", valid=False, not_dispatched=True, error=f"request could not be prepared ({kind})",
                     input_chars=spec.input_chars, requested_max_tokens=output_cap, stream=spec.stream,
                 )
 
@@ -1083,10 +1085,9 @@ class _Run:
                             raise asyncio.CancelledError
                         if deadline.expired():
                             self.mark_unfinished(target.name, _scenario_checks(spec))
-                        else:
-                            admission_clock()
-                            on_preparation_failure(record)
-                        return None
+                            return None
+                        admission_clock()
+                        on_preparation_failure(record)
                     kind = re.fullmatch(r"request (?:failed|timeout) \(([A-Za-z_]\w*)\)", record.error or "")
                     record = preparation_failure(kind[1] if kind else "Exception")
                     if record is None:
@@ -1165,6 +1166,7 @@ class _Run:
                     and spec._fixture_request_timeout_seconds == record.request_timeout_seconds):
                 record._timeout_fixture = {"setting": spec.timeout_setting, "file": self.config.custom_fixtures,
                     "fixture_id": spec.fixture_id, "field": "request_timeout_seconds"}
+            # These transport statuses establish the stop cause before outcome derivation.
             if record.status in {"timeout", "cancelled"}:
                 try:
                     reason = self.stop_reason(target.name)
@@ -1220,7 +1222,12 @@ class _Run:
             intentional = (record.status == "cancelled" and record.termination_reason in {
                 "generation_chunk_limit", "intentional_cancellation", "intentional_cancellation_deadline",
             }) or (
-                record.status == "timeout" and record.termination_reason == "intentional_deadline")
+                record.status == "timeout" and (record.termination_reason == "intentional_deadline"
+                    or (spec.scenario in {"client_deadline", "deadline_probe", "client_cancel"}
+                        and timeout_override is not None and record.termination_reason in {
+                            "request_timeout", "read_timeout", "write_timeout", "pool_timeout",
+                            "transport_timeout", "request_deadline",
+                        })))
             record.intentional = intentional
             propagating_error = False
             try:
@@ -1254,6 +1261,9 @@ class _Run:
                             record.error = self.endpoint_health[target.name]["abort_reason"]
                         self.mark_unfinished(target.name, _scenario_checks(spec))
                 budget_only = bool(set(spec.check_ids) & {"prefix", "sessions", "tools"}) and reasoning_budget(record)
+                if request_outcome(record) == "not_dispatched" and not readiness:
+                    # Input failures consume the error stop budget, not server error rates.
+                    self.errors += 1
                 if _serving_failure(record, spec.scenario) and not readiness and not intentional and not budget_only:
                     self.errors += 1
                     record.check_ids = list(dict.fromkeys([*record.check_ids, *[
@@ -1278,24 +1288,31 @@ class _Run:
                         self.observations[target.name]["timeout_warnings"] = [
                             item for item in self.timeout_watch.warnings if item["target"] == target.name][-16:]
                         self.emit("timeout_warning", target.name, spec.scenario, timeout_warning=warning)
+                    request_snapshot = record.model_dump(mode="json", include={
+                        "id", "target", "fixture_id", "scenario", "condition_id", "intentional", "status", "valid", "score", "outcome", "not_dispatched",
+                        "elapsed_ms", "first_output_ms", "check_ids", "http_status",
+                        "request_timeout_seconds", "termination_reason", "termination_limit_seconds",
+                        "started_at", "dispatch_ms", "completed_ms", "timing_start_ms",
+                        *({"request_body_sent_ms"} if record.request_body_sent_ms is not None else ()),
+                        "timing_schema", "first_token_ms", "first_reasoning_ms", "last_output_ms",
+                        "stream", "stream_end_ms", "answer_reads", "answer_chunks", "answer_chars",
+                        "first_read_answer_chars", "first_read_output_tokens", "last_read_output_tokens",
+                        "read_output_tokens_source",
+                        "max_stream_gap_ms", "input_tokens", "output_tokens",
+                        "completion_tokens", "reasoning_tokens", "cached_prompt_tokens", "finish_reason",
+                    })
+                    if record.outcome == "budget_exhausted":
+                        # Preserve the budget predicate when live reports rebuild records,
+                        # without retaining any response or reasoning content.
+                        request_snapshot.update(reasoning_stripped=True, error=(
+                            "reasoning exhausted the output budget before an answer"
+                            if record.status == "completed" else "response contained no useful answer output"))
                     self.emit("request_completed", target.name, spec.scenario, status=record.status,
                               condition_id=condition_id, condition_summary=dict(condition) if condition else None,
                               input_chars=request_parameters["input_chars"], requested_max_tokens=output_cap,
                               requested_input_tokens=spec.requested_input_tokens,
                               **({"user": {key: spec.workload[key] for key in ("user_id", "population", "profile", "window_id", "phase", "request_sequence", "session_id", "turn_id", "conversation_sequence", "role", "matched_work_sequence", "trigger", "heavy_profile", "cancellation_role", "cohort", "origin", "work_sequence", "activation_seconds") if key in spec.workload}} if "multi_user" in spec.check_ids else {}),
-                              request_slot=request_slot, request=record.model_dump(mode="json", include={
-                                  "id", "target", "fixture_id", "scenario", "condition_id", "intentional", "status", "valid", "score",
-                                  "elapsed_ms", "first_output_ms", "check_ids", "http_status",
-                                  "request_timeout_seconds", "termination_reason", "termination_limit_seconds",
-                                  "started_at", "dispatch_ms", "completed_ms", "timing_start_ms",
-                                  *({"request_body_sent_ms"} if record.request_body_sent_ms is not None else ()),
-                                  "timing_schema", "first_token_ms", "first_reasoning_ms", "last_output_ms",
-                                  "stream", "stream_end_ms", "answer_reads", "answer_chunks", "answer_chars",
-                                  "first_read_answer_chars", "first_read_output_tokens", "last_read_output_tokens",
-                                  "read_output_tokens_source",
-                                  "max_stream_gap_ms", "input_tokens", "output_tokens",
-                                  "completion_tokens", "reasoning_tokens", "cached_prompt_tokens", "finish_reason",
-                              }), intentional=intentional)
+                              request_slot=request_slot, request=request_snapshot, intentional=intentional)
                 except Exception:
                     if not isinstance(failure, asyncio.CancelledError):
                         raise
@@ -1667,7 +1684,7 @@ async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attributio
                             probe = _spec(initial_specs[0], "readiness").model_copy(update={"check_ids": []})
                             record = await run.request(target, client, probe, deadline_override=ready_deadline,
                                                        budget_exempt=True)
-                            if record and record.valid:
+                            if record and request_outcome(record) == "ok":
                                 record.check_ids = [name for name in ("access", "serving", "first_output")
                                                     if name in enabled]
                                 initial = [record]
@@ -1902,7 +1919,7 @@ async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attributio
                 # impossible. Require >=90% occupancy as well as the observed peak.
                 loaded = enough and weighted >= effective.concurrency*.9 and run.peak[(target.name, "sustained")] >= effective.concurrency
                 elapsed = time.monotonic() >= end and end < run.deadline
-                successful = sum(r.status == "completed" and r.valid for r in sustained)
+                successful = sum(request_outcome(r) == "ok" for r in sustained)
                 occupied = weighted >= effective.concurrency*.9 and run.peak[(target.name, "sustained")] >= effective.concurrency
                 complete = successful >= effective.limits.min_samples and ((elapsed and occupied) or (exhausted and loaded))
                 run.observations[target.name]["sustained_complete"] = complete
@@ -2079,7 +2096,7 @@ async def _deferred_attribution(run, target, *, deferred=True):
 def _timing_violations(records, limits, *, unfinished=False):
     failures = []
     for record in records:
-        if record.status != "completed" or not record.valid:
+        if request_outcome(record) != "ok":
             if unfinished and exceeded_unfinished(record, limits):
                 failures.append(record.id)
             continue
@@ -2099,7 +2116,7 @@ def _timing_violations(records, limits, *, unfinished=False):
 def _missing_timing(records, limits):
     missing = set()
     for record in records:
-        if not record.valid or record.status != "completed":
+        if request_outcome(record) != "ok":
             continue
         if limits.first_output_ms is not None and record.first_output_ms is None:
             missing.add("first_output_ms")
@@ -2135,15 +2152,19 @@ def _pack_results(run: _Run, target: Target) -> dict:
     for spec in run.pack_specs:
         case_id = spec.workload["case_id"]
         records = [record for record in quiet if record.fixture_id == spec.fixture_id]
-        valid = [record for record in records if record.status == "completed" and record.valid]
+        valid = [record for record in records if request_outcome(record) == "ok"]
         scored = [record for record in valid if record.score is not None]
-        failed = any(record.score is False or record.status in {"failed", "timeout"}
-                     or (record.status == "completed" and not record.valid) for record in records)
+        failed = any(request_outcome(record) in states.REQUEST_OUTCOME_ERRORS
+                     or request_outcome(record) == "ok" and record.score is False for record in records)
         status = "fail" if failed else "pass" if scored else "inconclusive"
+        preparation_reason = preparation_failure_reason(records)
+        if preparation_reason and status == "pass":
+            status = "inconclusive"
         cases.append({"case_id": case_id, "quiet": {
             "planned": 1, "offered": len(records), "started": len(records),
             "valid": len(valid), "scored": len(scored),
             "correct": sum(record.score is True for record in scored), "status": status,
+            **({"reason": preparation_reason} if preparation_reason and not failed else {}),
         }, "stages": [{"stage_index": stage["stage_index"], "rate_rps": stage["rate_rps"],
                         **stage["case_counts"][case_id]} for stage in stages]})
     limits = _check_config(run.config, "correctness").limits
@@ -2156,7 +2177,7 @@ def _pack_results(run: _Run, target: Target) -> dict:
         stats = _stats(loaded)
         accuracy = stats["correct"] / stats["scored"] if stats["scored"] else None
         failed = _cannot_meet_correctness(stats, limits.min_correctness)
-        observed = bool(loaded) and all(r.valid and r.score is not None for r in loaded)
+        observed = bool(loaded) and all(request_outcome(r) == "ok" and r.score is not None for r in loaded)
         evidenced = max_evidenced_overlap((r for r in loaded if r.score is not None), target_records, delays)
         concurrency = run.config.effective_check("correctness")["concurrency"]
         concurrent = concurrency == 1 or evidenced >= 2
@@ -2165,10 +2186,14 @@ def _pack_results(run: _Run, target: Target) -> dict:
                           "concurrency_reason": None if concurrent else NEEDS_STREAM
                               if not any(r.stream for r in loaded) else "No streamed responses overlapped outside client scheduling delays.",
                           "status": "fail" if failed else "pass" if observed and concurrent else "inconclusive"}
+        preparation_reason = preparation_failure_reason(loaded)
+        if preparation_reason and case["loaded"]["status"] == "pass":
+            case["loaded"].update(status="inconclusive", reason=preparation_reason)
     coverage = bool(cases) and all(case["quiet"]["scored"] >= 1 for case in cases)
     all_scored = all(spec.scorer != "none" for spec in run.pack_specs)
     control_status = ("fail" if any(case["quiet"]["status"] == "fail" for case in cases)
-                      else "pass" if coverage and all_scored else "inconclusive")
+                      else "pass" if coverage and all_scored
+                          and all(case["quiet"]["status"] == "pass" for case in cases) else "inconclusive")
     preview = pack_preview(run.config)
     loaded_status = ("fail" if any(case["loaded"]["status"] == "fail" for case in cases)
                      else "pass" if cases and all(case["loaded"]["status"] == "pass" for case in cases)
@@ -2252,14 +2277,14 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                 metrics["reason_code"] = "unfinished"
         elif check_id == "access":
             denied = [r for r in records if r.http_status in {401, 403}]
-            disconnected = [r for r in records if r.http_status is None and r.status == "failed"
+            disconnected = [r for r in records if r.http_status is None and request_outcome(r) == "failed"
                             and any(name in (r.error or "") for name in
                                     ("ConnectError", "ConnectTimeout", "SSLError", "ConnectionError",
                                      "ProxyError", "UnsupportedProtocol"))]
             if denied or disconnected:
-                status = "blocked" if not any(r.valid for r in records) else "fail"
+                status = "blocked" if not any(request_outcome(r) == "ok" for r in records) else "fail"
                 summary = "Authentication or transport continuity failed on the configured route."
-            elif not any(r.valid for r in records):
+            elif not any(request_outcome(r) == "ok" for r in records):
                 status, summary = "inconclusive", "No valid access response; timeout or inference failure observed."
             else:
                 summary = "Configured route accepted requests; TLS trust is enforced for HTTPS."
@@ -2288,7 +2313,7 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
             if check_id == "first_output" and limits.first_output_ms is not None:
                 # Completed answers are a p95 cohort; unfinished requests can
                 # independently establish a lower-bound timing failure.
-                unfinished_ids = {r.id for r in records if not r.valid
+                unfinished_ids = {r.id for r in records if request_outcome(r) != "ok"
                                   and "first_output_ms" in exceeded_unfinished(r, limits)}
                 p95 = metrics["first_output_p95_ms"]
                 if p95 is not None and p95 <= limits.first_output_ms:
@@ -2299,10 +2324,10 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                 # be attributed to the endpoint.
                 affected = set(quality["affected_metrics"].get("first_output_ms", []))
                 best_case_p95 = percentile([0 if r.id in affected else r.first_output_ms
-                    for r in records if r.valid and r.status == "completed" and r.first_output_ms is not None], .95)
+                    for r in records if request_outcome(r) == "ok" and r.first_output_ms is not None], .95)
                 if best_case_p95 is None or best_case_p95 <= limits.first_output_ms:
                     qualified = [identifier for identifier in qualified if identifier in unfinished_ids]
-            gap_samples = sum(r.valid and r.status == "completed" and r.measured_stream_gap for r in records)
+            gap_samples = sum(request_outcome(r) == "ok" and r.measured_stream_gap for r in records)
             metrics["measured_gap_samples"] = gap_samples
             if qualified:
                 status, summary = "fail", "Observed request timing exceeded a configured limit without overlapping client scheduling delay."
@@ -2322,7 +2347,7 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                 metrics["reason_code"] = "client_delayed" if saturated else "insufficient_timing_samples"
             elif metrics["reasoning_budget_exhausted"]:
                 status, summary = "inconclusive", "Reasoning exhausted the output budget before an answer."
-            elif check_id == "first_output" and any(r.valid and r.first_output_ms is None for r in records):
+            elif check_id == "first_output" and any(request_outcome(r) == "ok" and r.first_output_ms is None for r in records):
                 status, summary = "inconclusive", "Useful first-output timing unavailable for some responses."
             elif check_id == "generation" and _missing_timing(records, limits.model_copy(update={"first_output_ms": None})):
                 metrics["missing_timing_metrics"] = _missing_timing(records, limits.model_copy(update={"first_output_ms": None}))
@@ -2330,7 +2355,7 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                 # Name the reasoning accounting limit only when usage arrived without
                 # a breakdown for every unpaced answer; missing usage or other gaps
                 # keep the stream/usage evidence remedy.
-                unpaced = [r for r in records if r.valid and r.status == "completed" and r.stream
+                unpaced = [r for r in records if request_outcome(r) == "ok" and r.stream
                            and r.generation_tokens_per_second is None]
                 if ("generation_tokens_per_second" in metrics["missing_timing_metrics"] and unpaced
                         and all(r.output_tokens is None and r.completion_tokens is not None
@@ -2510,6 +2535,7 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
             baseline = next((r for r in records if r.scenario == "cancellation_baseline"), None)
             # Reasoning spent the whole output budget: the cap held, but there is no answer to judge.
             budget = {r.id for r in records if reasoning_budget(r)}
+            # Raw transport statuses verify the designed disconnect/timer self-tests.
             metrics.update({"intentional_cancellations": len(cancelled),
                             "client_disconnect_observed": sum(r.status == "cancelled" for r in cancelled),
                             "backend_cancellation": observations.get("backend_cancellation", {"status": "unverified", "summary": "Backend verification was not enabled."}), "probes": _stats(probes),
@@ -2530,28 +2556,28 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                                and (r.finish_reason != "length" or not cap_bound[r.id])]
             controls = [r for r in records if r.fixture_id.startswith("limits.stop_control")]
             stops = [r for r in records if r.fixture_id.startswith("limits.stop.")]
-            reached = any(r.valid and r.output.strip() == "blue [END] green" for r in controls)
+            reached = any(request_outcome(r) == "ok" and r.output.strip() == "blue [END] green" for r in controls)
             stop_failed = any("[END]" in r.output or (reached and "green" in r.output) for r in stops if r.id not in budget)
             stop_observed = reached and bool(stops) and all(
-                r.valid and r.output.strip() == "blue" and r.finish_reason == "stop" for r in stops)
+                request_outcome(r) == "ok" and r.output.strip() == "blue" and r.finish_reason == "stop" for r in stops)
             metrics["stop_enforcement"] = {"control_reached_stop": reached,
                 "status": "fail" if stop_failed else "pass" if stop_observed else "inconclusive"}
             metrics["output_cap_finish_reasons"] = [r.finish_reason for r in caps]
             metrics["output_cap_token_evidence"] = [{"id": r.id, "usage": cap_usage[r.id], "lower_bound": cap_bound[r.id],
                                                      "requested_max_tokens": r.requested_max_tokens} for r in caps]
-            failed_limits = [r.id for r in records if r.scenario == "limits" and not r.valid
-                             and r.status != "cancelled" and r.id not in budget]
+            failed_limits = [r.id for r in records if r.scenario == "limits"
+                             and request_outcome(r) in states.REQUEST_OUTCOME_ERRORS]
             # Follow-up delay against a same-fixture baseline exposes leaked generation on shared slots.
             first_probe = next((r for r in probes if baseline and r.fixture_id == baseline.fixture_id), None)
-            before = baseline.first_output_ms if baseline and baseline.valid else None
-            after = first_probe.first_output_ms if first_probe and first_probe.valid else None
+            before = baseline.first_output_ms if baseline and request_outcome(baseline) == "ok" else None
+            after = first_probe.first_output_ms if first_probe and request_outcome(first_probe) == "ok" else None
             threshold = max(3 * before, before + 1000) if before is not None else None
             delayed = threshold is not None and after is not None and after > threshold
             metrics["followup_delay"] = {"baseline_first_output_ms": before, "followup_first_output_ms": after,
                                          "threshold_ms": threshold, "delayed": delayed}
             if bad_caps or failed_limits or stop_failed or any(
                     r.score is False for r in records if r.scenario != "client_deadline" and r.id not in budget) or any(
-                    not r.valid and r.status != "cancelled" and r.id not in budget for r in probes):
+                    request_outcome(r) in states.REQUEST_OUTCOME_ERRORS for r in probes):
                 status, summary = "fail", "Output/stop limits or inference after client cancellation failed."
                 metrics["output_cap_violations"] = bad_caps
                 metrics["failed_limit_requests"] = failed_limits
@@ -2617,16 +2643,14 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
             probe_stats = _stats(probes)
             accuracy = metrics["correct"] / metrics["scored"] if metrics["scored"] else None
             # Deadline/stop cancellations are unfinished evidence, not endpoint errors.
-            evaluated = [r for r in sustained if r.status != "cancelled" and not _reasoning_budget(r)]
-            sustained_errors = sum(r.status != "completed" or not r.valid for r in evaluated)
-            sustained_error_rate = sustained_errors / len(evaluated) if evaluated else 0
             sustained_stats = _stats(sustained)
+            sustained_outcomes = sustained_stats["outcome_counts"]
+            sustained_error_rate = sustained_outcomes["error_rate"]
             # Light-load failures before any sustained traffic are endpoint failures;
             # timeouts and cancellations there only leave the baseline incomplete.
-            baseline_evaluated = [r for r in baseline if r.status != "cancelled" and not _reasoning_budget(r)]
-            baseline_error_rate = (sum(r.status == "failed" or (r.status == "completed" and not r.valid)
-                                       for r in baseline_evaluated) / len(baseline_evaluated)
-                                   if baseline_evaluated else None)
+            baseline_outcomes = before["outcome_counts"]
+            baseline_error_rate = ((baseline_outcomes["failed"] + baseline_outcomes["invalid"])
+                                   / baseline_outcomes["evaluated"] if baseline_outcomes["evaluated"] else None)
             metrics["violations"] = qualified_violations(probes, limits, quality)
             if ratio_failed and not saturated:
                 ratio_violations = [r.id for r in probes if any(
@@ -2637,16 +2661,16 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
             metrics.update({"sustained": sustained_stats, "recovery": after,
                             "baseline": before, "latency_ratio": latency_ratio, "first_output_ratio": first_ratio,
                             "sustained_budget": observations.get("sustained_budget"), "accuracy": accuracy,
-                            "unscored_completions": sum(r.status == "completed" and r.valid and r.score is None
+                            "unscored_completions": sum(request_outcome(r) == "ok" and r.score is None
                                                         for r in baseline + probes + sustained),
                             "baseline_non_timeout_error_rate": baseline_error_rate,
                             "sustained_error_rate": sustained_error_rate,
-                            "sustained_non_timeout_error_rate": sum(r.status not in {"completed", "timeout", "cancelled"}
-                                or (r.status == "completed" and not r.valid) for r in evaluated) / len(evaluated) if evaluated else 0,
+                            "sustained_non_timeout_error_rate": (sustained_outcomes["failed"] + sustained_outcomes["invalid"])
+                                / sustained_outcomes["evaluated"] if sustained_outcomes["evaluated"] else None,
                             "sustained_completion": observations.get("sustained_completion"),
                             "rolling_windows": [_stats(window) for window in windows]})
             if ((probe_stats["error_rate"] is not None and probe_stats["error_rate"] > limits.max_error_rate)
-                    or sustained_error_rate > limits.max_error_rate
+                    or (sustained_error_rate is not None and sustained_error_rate > limits.max_error_rate)
                     or (baseline_error_rate is not None and baseline_error_rate > limits.max_error_rate)
                     or (metrics["violations"] or (ratio_failed and not saturated))
                     or _cannot_meet_correctness(metrics, limits.min_correctness)):
@@ -2712,7 +2736,7 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                 ordinary_records = [r for r in records if r.scenario not in {
                     "client_cancel", "client_deadline", "backend_cancel",
                 }]
-                if any(not r.valid or r.status != "completed" for r in ordinary_records):
+                if any(request_outcome(r) in states.REQUEST_OUTCOME_ERRORS for r in ordinary_records):
                     summary += " Request or protocol failures were also observed."
                 timing_failed = False
                 if check_id in {"capacity", "recovery"}:
@@ -2795,6 +2819,19 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
         elif disconnected:
             check.summary = (f"{disconnected}. {check.summary} "
                              "Start the server and verify the target URL, port, proxy and TLS settings, then rerun.")
+    # Apply this after verdict wording and across delegated/early check branches.
+    # Check membership also covers local failures filtered out of timing evidence.
+    for check in result + workload_results:
+        if check.status != "pass":
+            continue
+        evidence = set(check.evidence_ids)
+        records = [record for record in all_records
+                   if record.id in evidence or check.id in record.check_ids]
+        preparation_reason = preparation_failure_reason(records)
+        if preparation_reason:
+            check.status = "inconclusive"
+            check.summary = check.finding_summary = preparation_reason
+            check.metrics["reason_code"] = "not_dispatched"
     return result + workload_results
 
 
@@ -2978,7 +3015,7 @@ def _verdict_summary(check, config, records, budget):
                     check.id == "generation" and field == "first_output_ms"):
                 continue
             values = [value for r in measured if (value := getattr(r, field)) is not None
-                      and (r.valid or field in exceeded_unfinished(r, limits))]
+                      and (request_outcome(r) == "ok" or field in exceeded_unfinished(r, limits))]
             value = (min(values) if minimum else max(values)) if values else None
             if value is not None and (value < allowed if minimum else value > allowed):
                 details.append(f"{name} {value:g} {unit} {'<' if minimum else '>'} allowed {allowed:g} {unit}")
@@ -2997,7 +3034,7 @@ def _verdict_summary(check, config, records, budget):
         if metrics.get("stop_enforcement", {}).get("status") == "fail":
             details.append("stop output contained text at or after the configured [END] stop string")
         if not details:
-            failed = next((r for r in records if r.status in {"failed", "timeout"} or not r.valid), None)
+            failed = next((r for r in records if request_outcome(r) in states.REQUEST_OUTCOME_ERRORS), None)
             if failed:
                 details.append(f"{failed.fixture_id}: {failed.error or ('HTTP ' + str(failed.http_status) if failed.http_status else 'invalid or unfinished response')}")
         if details:
@@ -3096,7 +3133,7 @@ def _verdict_summary(check, config, records, budget):
                   "cannot account for hidden control tokens, so they do not establish answer-token usage")
         # Separated reasoning usage is necessary, not sufficient: pace also needs
         # token counts at answer reads, and other missing timings keep their remedy.
-        if any(check.id in r.check_ids and r.valid and r.status == "completed" and r.stream
+        if any(check.id in r.check_ids and request_outcome(r) == "ok" and r.stream
                and r.read_output_tokens_source is None for r in records):
             remedy += "; also " + _READ_COUNT_GUIDANCE
         if set(metrics.get("missing_timing_metrics", [])) - {"generation_tokens_per_second"}:
@@ -3171,7 +3208,7 @@ async def _stop_judging(evaluation, run):
         evaluation.add_done_callback(lambda task: None if task.cancelled() else task.exception())
     judged = {spec.fixture_id for spec in run.pack_specs if spec.scorer == "judge"}
     records = [record for record in run.records if record.fixture_id in judged
-               and record.status == "completed" and record.valid]
+               and request_outcome(record) == "ok"]
     votes = [vote for record in records if record.judgement for vote in record.judgement.votes]
     return {"eligible_requests": len(records), "scored_requests": sum(r.score is not None for r in records),
             "passed_requests": sum(r.score is True for r in records),
@@ -3519,6 +3556,7 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
                 "config_migration_notes": list(config._migration_notes),
                 "config_migration_warnings": list(config._migration_warnings),
                 "timing_measurement_version": 4,
+                "outcome_counting_version": 2,
                 **({"gateway_access_workload_version": workload_identity["workload_versions"]["gateway_access"]}
                    if "gateway_access" in workload_identity["workload_versions"] else {}),
                 **({"gateway_policy_workload_version": workload_identity["workload_versions"]["gateway_policy"]}

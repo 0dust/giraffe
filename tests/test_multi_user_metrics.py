@@ -57,14 +57,45 @@ def test_equal_delivered_tokens_use_common_window_not_individual_activity():
 
 def test_local_preparation_failure_does_not_cover_a_missing_dispatched_record():
     failed = record("user-01", status="failed", valid=False, dispatch_ms=None, timing_start_ms=None,
-                    error="request could not be prepared (ValueError)")
+                    error="request could not be prepared (ValueError)", not_dispatched=True)
     source = observation([failed], users=("user-01",))
     user = row(summarize(source, [failed]))
-    assert user["outcomes"]["errors"] == 1
+    assert user["outcomes"]["errors"] == 0
+    assert user["outcomes"]["not_dispatched"] == 1
     assert user["outcomes"]["missing_terminal"] == 1
-    assert user["criteria"]["max_error_percent"]["denominator"] == 2
+    assert user["criteria"]["max_error_percent"]["denominator"] == 1
     assert user["criteria"]["max_error_percent"]["unknown"] == 1
     assert user["latency"]["client_wait_ms"]["max"] is None
+
+
+@pytest.mark.parametrize("criteria", [
+    {}, {"max_error_percent": None}, {"min_output_tokens_per_second": 100},
+])
+@pytest.mark.parametrize("server_failure", [False, True])
+def test_preparation_failure_prevents_user_and_window_pass_without_hiding_server_failure(
+        criteria, server_failure):
+    from giraffe.request_outcome import preparation_failure_reason
+
+    records = [record("user-01", identity="prepared", status="failed", valid=False,
+                      not_dispatched=True),
+               record("user-01", identity="sent", status="failed" if server_failure else "completed",
+                      valid=not server_failure)]
+    if server_failure:
+        criteria = {**criteria, "max_error_percent": 0}
+    source = observation(records, users=("user-01",), criteria=criteria)
+    result = summarize(source, records)
+    user = row(result)
+    expected = ("fail" if server_failure or "min_output_tokens_per_second" in criteria else
+                "measured" if criteria == {"max_error_percent": None} else "inconclusive")
+    assert result["status"] == result["windows"][0]["status"] == user["status"] == expected
+    reason = preparation_failure_reason(records)
+    if expected == "fail":
+        assert reason not in user["reasons"]
+        assert reason not in result["windows"][0].get("reasons", [])
+    else:
+        assert reason in user["reasons"]
+        assert reason in result["windows"][0]["reasons"]
+    assert user["criteria"].get("max_error_percent", {}).get("denominator", 1) == 1
 
 
 def test_failure_during_drain_survives_healthy_peers_and_incomplete_window():
@@ -372,6 +403,31 @@ def test_equal_work_fairness_counts_the_slowest_user(counts, expected, ratio):
     assert source == before
 
 
+@pytest.mark.parametrize("counts", [(2, 2), (4, 1)])
+@pytest.mark.parametrize("server_failure", [False, True])
+def test_preparation_failure_unqualifies_fairness_without_hiding_server_failure(counts, server_failure):
+    from giraffe.request_outcome import preparation_failure_reason
+
+    records = fairness_records(counts)
+    prepared = record("user-02", identity="prepared", status="failed", valid=False,
+                      not_dispatched=True, dispatch_ms=None, timing_start_ms=None)
+    records.append(prepared)
+    source = fairness_observation(records)
+    source["windows"][0]["users"][1]["dispatched_count"] -= 1
+    if server_failure:
+        records[0].score = False
+        source["settings"]["pass_criteria"]["max_error_percent"] = 0
+    result = summarize(source, records)
+    measured = fairness(result)
+    fairness_failed = counts == (4, 1) and not server_failure
+    assert measured["status"] == ("fail" if fairness_failed else "inconclusive")
+    assert measured["qualified"] is fairness_failed
+    reason_present = any(preparation_failure_reason([prepared]) in reason for reason in measured["reasons"])
+    assert reason_present is (not fairness_failed and not server_failure)
+    assert result["status"] == result["windows"][0]["status"] == (
+        "fail" if server_failure or fairness_failed else "inconclusive")
+
+
 @pytest.mark.parametrize(("first", "second", "reason"), [
     ({"cached_prompt_tokens": 100}, {"cached_prompt_tokens": 0}, "uncached input"),
     ({"cached_prompt_tokens": 100}, {}, "Cached input usage is missing"),
@@ -660,3 +716,77 @@ def test_truncated_conversation_is_partial_but_stateless_cap_is_valid(conversati
         assert user['partial_output_tokens'] == 0
         assert user['known_output_tokens'] == 100
         assert user['status'] == 'pass'
+
+
+@pytest.mark.parametrize("status,error", [
+    ("completed", "reasoning exhausted the output budget before an answer"),
+    ("failed", "response contained no useful answer output"),
+])
+def test_reasoning_budget_exhaustion_is_excluded_from_user_error_rate(status, error):
+    records = [record("user-01", identity="ok"), record(
+        "user-01", identity="budget", status=status, valid=False, output="",
+        reasoning="thinking", error=error)]
+    user = row(summarize(observation(records, users=("user-01",)), records))
+    criterion = user["criteria"]["max_error_percent"]
+    assert criterion["value"] == 0
+    assert criterion["denominator"] == 1
+    assert criterion["excluded"] == 1
+    assert user["outcomes"]["budget_exhausted"] == 1
+    assert user["outcomes"]["errors"] == 0
+    assert user["outcomes"]["evaluated"] == 1
+
+
+def test_cancelled_is_excluded_from_user_error_denominator_but_timing_stays_unknown():
+    records = [record("user-01", identity="ok"), record(
+        "user-01", identity="cancel", status="cancelled", valid=False)]
+    user = row(summarize(observation(records, users=("user-01",),
+        criteria={"max_completion_ms": 2000}), records))
+    assert user["criteria"]["max_error_percent"]["denominator"] == 1
+    assert user["criteria"]["max_error_percent"]["excluded"] == 1
+    assert user["criteria"]["max_completion_ms"]["denominator"] == 2
+    assert user["criteria"]["max_completion_ms"]["unknown"] == 1
+    assert user["status"] == "inconclusive"
+
+
+def test_wrong_answer_remains_a_user_visible_error_on_successful_outcome():
+    records = [record("user-01", score=False)]
+    user = row(summarize(observation(records, users=("user-01",)), records))
+    assert records[0].outcome == "ok"
+    assert user["outcome_counts"]["ok"] == 1
+    assert user["outcome_counts"]["errors"] == 0
+    assert user["outcome_counts"]["error_rate"] == 0
+    assert user["outcomes"]["errors"] == user["outcomes"]["evaluated"] == 1
+    assert user["criteria"]["max_error_percent"]["value"] == 100
+    assert user["status"] == "fail"
+
+
+def test_undispatched_intentional_row_stays_out_of_timing_attempts():
+    records = [record("user-01", identity="ok"), record(
+        "user-01", identity="prepared", status="failed", valid=False,
+        not_dispatched=True, intentional=True)]
+    user = row(summarize(observation(records, users=("user-01",),
+        criteria={"max_completion_ms": 2000}), records))
+    assert records[1].outcome == "not_dispatched"
+    criterion = user["criteria"]["max_completion_ms"]
+    assert (criterion["denominator"], criterion["met"], criterion["excluded"]) == (1, 1, 1)
+    assert user["outcome_counts"]["not_dispatched"] == 1
+    assert user["criteria"]["max_error_percent"]["denominator"] == 1
+
+
+def test_measured_multi_user_result_keeps_measurement_and_preparation_warning():
+    from giraffe import runner
+    from giraffe.models import RunConfig, Target
+    from giraffe.multi_user import result
+
+    target = Target(name="service", url="http://service", model="test")
+    state = runner._Run(RunConfig(targets=[target], checks=["serving"]), None, None)
+    state.records = [record("user-01", status="failed", valid=False, not_dispatched=True,
+                            dispatch_ms=None, timing_start_ms=None)]
+    state.observations[target.name]["multi_user"] = observation(
+        state.records, users=("user-01",), criteria={"max_error_percent": None})
+    check = result(state, target)
+    summary = check.metrics["multi_user"]
+    assert summary["status"] == summary["windows"][0]["status"] == "measured"
+    assert summary["windows"][0]["users"][0]["status"] == "measured"
+    assert check.summary.startswith("Per-user delivery measured; no acceptance criteria selected.")
+    assert "1 request(s) could not be prepared locally" in check.summary

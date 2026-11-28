@@ -511,6 +511,7 @@ def planned_conditions(config: Any) -> list[dict[str, Any]]:
 
 def request_status(record: Mapping[str, Any]) -> str:
     """UI result classes; transport completion alone never establishes correctness."""
+    # UI classes retain local preparation failures and correctness; they are not server-error outcomes.
     status = record.get("status")
     if status == "running":
         return "running"

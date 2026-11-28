@@ -107,10 +107,12 @@ def test_recovery_with_retention_none_preserves_output_budget_uncertainty(tmp_pa
         status='completed', valid=False, error=REASONING_BUDGET_ERROR, finish_reason='length',
         output='', reasoning='thinking...', reasoning_tokens=None, score=None, answer_chars=0))
     assert reasoning_budget(report.requests[2]) is True
+    assert report.requests[2].outcome == 'budget_exhausted'
     recovered = journal_report(tmp_path, report)
     post = next(record for record in recovered.requests if record.id == 'post')
     assert post.output == post.reasoning == '' and post.reasoning_tokens is None
-    assert reasoning_budget(post) is False
+    assert reasoning_budget(post) is True
+    assert post.reasoning_stripped and post.outcome == 'budget_exhausted'
     check = next(check for check in recovered.checks if check.id == 'scale_down')
     assert statuses(check) == dict(continuity='inconclusive', drain='inconclusive', capacity='inconclusive')
     window = check.metrics['results']['capacity']['metrics']['windows']['post_removal']

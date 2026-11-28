@@ -1,8 +1,8 @@
 import random
-from types import SimpleNamespace
 
 import pytest
 
+from giraffe.models import RequestRecord
 from giraffe.reporting import _output_tail_shifted, compare_baseline
 from tests.test_reporting import baseline_check, make_report
 
@@ -86,9 +86,11 @@ def test_same_distribution_runs_do_not_fail_tail_comparison(count):
 
 
 def _answers(rng, count, scale=1):
-    return [SimpleNamespace(status="completed", valid=True, workload={},
-                            output_tokens=(tokens := max(1, int(rng.lognormvariate(5, .8) * scale))),
-                            output_chars=tokens * 4) for _ in range(count)]
+    return [RequestRecord(id=f"answer-{index}", target="local", fixture_id="answer",
+                          scenario="initial", check_ids=["serving"], started_at="now",
+                          status="completed", valid=True, workload={},
+                          output_tokens=(tokens := max(1, int(rng.lognormvariate(5, .8) * scale))),
+                          output_chars=tokens * 4) for index in range(count)]
 
 
 @pytest.mark.parametrize("count,bound", [(30, .10), (60, .05)])

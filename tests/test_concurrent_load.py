@@ -510,7 +510,7 @@ async def test_request_timeout_drain_and_deadline_cancellation():
     run.deadline = time.monotonic() + .04
     await execute(run, c.targets[0], Slow())
     p = point(result(run, c.targets[0]))
-    assert p['cancelled'] == 1 and p['timed_out'] == 0 and p['groups'][0]['error_percent'] == 0
+    assert p['cancelled'] == 1 and p['timed_out'] == 0 and p['groups'][0]['error_percent'] is None
     assert p['status'] == 'inconclusive'
 
 
@@ -666,7 +666,7 @@ async def test_cancelling_executor_finalizes_inflight_and_unreached_points():
         await asyncio.wait_for(task, 1)
     rows = result(run, c.targets[0]).metrics['points']
     assert rows[0]['cancelled'] == rows[0]['dispatched'] > 0
-    assert rows[0]['groups'][0]['error_percent'] == 0 and rows[0]['status'] == 'inconclusive'
+    assert rows[0]['groups'][0]['error_percent'] is None and rows[0]['status'] == 'inconclusive'
     assert rows[1]['not_run'] and rows[1]['status'] == 'inconclusive'
     assert run.records[0].id == 'quiet' and run.records[0].load_point is None
 

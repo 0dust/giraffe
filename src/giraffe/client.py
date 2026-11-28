@@ -654,7 +654,7 @@ class LLMClient:
             identity=spec.identity,
             id=uuid.uuid4().hex, target=self.target.name, fixture_id=spec.fixture_id,
             scenario=spec.scenario, check_ids=spec.check_ids,
-            started_at=datetime.now(timezone.utc).isoformat(), status="failed",
+            started_at=datetime.now(timezone.utc).isoformat(), status="failed", not_dispatched=True,
             input_chars=spec.input_chars, requested_max_tokens=budget, stream=stream, answer_reads=0,
             timing_schema=1, first_token_reason=(
                 "No qualifying streamed generated-content event was observed." if stream else
@@ -1207,6 +1207,7 @@ class LLMClient:
                     record.started_at = datetime.now(timezone.utc).isoformat()
                     record.client_preparation_ms = (start - preparation_start) * 1000
                     transport_started = True
+                    record.not_dispatched = False
                     if probing:
                         self._evidence_probe_attempts += 1
                         self.token_evidence["probe_requests"] = self._evidence_probe_attempts
@@ -1409,9 +1410,11 @@ class LLMClient:
                         finally:
                             await response.aclose()
         except _IntentionalCancellation:
+            record.intentional = True
             record.status, record.error = "cancelled", "intentional cancellation after generation chunks"
             record.termination_reason = "generation_chunk_limit"
         except TimeoutError:
+            record.intentional = intentional
             record.status = "cancelled" if intentional else "timeout"
             record.error = "intentional cancellation" if intentional else "request deadline exceeded"
             record.termination_reason = "intentional_cancellation_deadline" if intentional else "request_deadline"

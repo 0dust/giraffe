@@ -81,6 +81,7 @@ in production; strict test mode raises, so new reason paths must declare a code.
 | `target_differs` | `not_comparable` | Recorded target identity values differ. |
 | `schema_differs` | `not_comparable` | Report schema is unsupported. |
 | `timing_method_differs` | `not_comparable` | Client timing measurement methods differ. |
+| `outcome_counting_differs` | `not_comparable` | Request outcome counting rules differ; rerun the baseline. |
 | `run_aborted` | `not_comparable` | Run was aborted. |
 | `evaluation_failed` | `not_comparable` | Answer evaluation failed. |
 | `config_unsupported` | `not_comparable` | Recorded configuration version is unsupported. |
@@ -149,7 +150,57 @@ These values are not exposed in `giraffe describe`; its `judged_checks` lists th
 
 Where you see it: `report.json` `requests[].status`, `evidence.jsonl`.
 
-`valid` is true only for `completed` requests whose response was usable; `completed` with `valid: false` is a failed response.
+`valid` is true only for `completed` requests whose response was usable. Request outcomes distinguish invalid responses from excluded cases such as reasoning-budget exhaustion.
+
+## Request outcomes
+
+Each record declares its derived `outcome` in `report.json` and `request_completed`
+events. This is an output field, derived from the request evidence when loading old
+reports too. The first matching row below wins; correctness (`score`) is a separate
+axis and does not change the outcome.
+
+| Precedence | Outcome | Meaning | Counting class |
+| --- | --- | --- | --- |
+| 1 | `not_dispatched` | Preparation failed before the request could be sent; explicitly marked `not_dispatched: true`. Missing dispatch timing alone does not establish this. | Excluded |
+| 2 | `intentional_stop` | `intentional` is true: a designed client cancel, deadline, chunk limit, or timeout override stopped the request. | Excluded |
+| 3 | `cancelled` | Status is `cancelled` without an intentional stop; `termination_reason` describes the run, user, memory, or external stop. | Excluded |
+| 4 | `timeout` | Status is `timeout` without an intentional stop. | Error |
+| 5 | `budget_exhausted` | The reasoning-budget predicate identifies exhaustion without a useful answer, including matching `failed` records. | Excluded |
+| 6 | `failed` | Status is `failed` and no earlier outcome matched, including connection errors. | Error |
+| 7 | `invalid` | Status is `completed` and `valid` is false. | Error |
+| 8 | `ok` | Status is `completed` and `valid` is true. | Evaluated success |
+
+Errors are `invalid + failed + timeout`. Evaluated requests are `ok + errors`;
+error rate is `errors / evaluated`, or null when evaluated is zero. Excluded
+outcomes (`intentional_stop`, `cancelled`, `budget_exhausted`, `not_dispatched`)
+are reported separately and enter neither numerator nor denominator.
+`giraffe describe` exposes `request_outcomes`, `request_outcome_errors`, and
+`request_outcome_excluded` in its `states` block.
+
+Preparation failures are Giraffe-side failures. They count toward the live failed
+count and `stop_after_errors`, while staying outside the server error rate. A
+check, load point or group, traffic stage, or multi-user window or user containing
+one cannot pass. Only a passing result becomes inconclusive; all other statuses
+keep their status and existing failure, blocked, execution-error, or skipped
+explanations. A measurement with no acceptance criteria remains `measured` and
+includes the preparation warning. The shared reason is: "N request(s) could not be prepared
+locally and were not sent; fix the request inputs and rerun."
+
+### Module rules
+
+The shared outcome and error denominator leave these deliberate additions:
+
+| Module | Additional rule |
+| --- | --- |
+| Runner | Serving failures exclude stress-scenario timeouts and context rejections. The live failed count includes preparation failures and `score is False`; probe scenarios are otherwise excluded. Designed deadline/cancel probes remain intentional stops when their request timeout fires first. |
+| Multi-user | User-visible errors also include `score is False` and truncated conversation turns. Missing terminal turns remain in that error denominator. Intentional rows remain outside timing-attainment attempts. Preparation failures still stop the run at the error threshold and prevent affected users and windows from passing; existing throughput and comparison failures retain their verdicts, while measurement-only results stay measured with the warning. |
+| Traffic | A non-intentional cancellation still blocks a stage pass. A preparation failure prevents a passing stage; existing failure explanations remain unchanged. Offer-ledger `dropped_*` and `not_offered` counts have no request record. Execution errors remain failed and evaluated in aggregate counts; nested `outcome_counts` partitions actual records only. |
+| Load test | Offer-ledger `not_sent` stays separate. Any cancellation still makes a group inconclusive. |
+| Scale down / gateway policy | Preparation failures and reasoning-budget exhaustion are not server errors and cannot establish a pass. Observed server or policy failures still take precedence. Scale down additionally requires clean stream termination, a recognized terminal finish reason, and no response-level error. Gateway HTTP 429 evidence is classified against the declared policy. |
+
+New manifests declare `outcome_counting_version: 2`; an absent value means version
+1. Different versions produce baseline reason `outcome_counting_differs`, verdict
+`not_comparable`, and prose "Request outcome counting rules differ; rerun the baseline."
 
 ## Run state
 

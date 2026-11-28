@@ -321,13 +321,24 @@ def test_retained_output_budget_exhaustion_is_not_endpoint_failure():
     settings, evidence, records = scenario()
     records[2] = records[2].model_copy(update=dict(
         status="completed", valid=False, error=REASONING_BUDGET_ERROR, finish_reason="length",
-        output="", reasoning="", reasoning_tokens=None, score=None, answer_chars=0))
-    assert reasoning_budget(records[2]) is False
+        output="", reasoning="", reasoning_stripped=True, reasoning_tokens=None, score=None, answer_chars=0))
+    assert reasoning_budget(records[2]) is True
     result = evaluate(settings, evidence, records)
     assert statuses(result) == dict(continuity="pass", drain="pass", capacity="inconclusive")
     windows = result.metrics["results"]["capacity"]["metrics"]["windows"]
     assert windows["post_removal"]["status"] == "inconclusive"
     assert "Some responses exhausted Giraffe's output budget before an answer; they are not endpoint failures." in windows["post_removal"]["limitations"]
+
+
+def test_budget_error_text_without_reasoning_evidence_uses_canonical_invalid_outcome():
+    settings, evidence, records = scenario()
+    records[2] = records[2].model_copy(update=dict(
+        status="completed", valid=False, error=REASONING_BUDGET_ERROR, finish_reason="length",
+        output="", reasoning="", reasoning_tokens=None, score=None, answer_chars=0))
+    assert records[2].outcome == "invalid"
+    result = evaluate(settings, evidence, records)
+    assert result.status == "fail"
+    assert result.metrics["results"]["capacity"]["status"] == "fail"
 
 
 @pytest.mark.parametrize("phase,dispatch", [("drain", 250), ("post_removal", 500)])
@@ -810,3 +821,30 @@ def test_recovery_retains_scoped_timing_instead_of_reintroducing_false_failure(t
     assert evidence["timing_threshold_ms"] == 100
     assert check.metrics["results"]["continuity"]["status"] == "inconclusive"
     assert check.metrics["results"]["continuity"]["metrics"]["unattributed_timing_violations"] == ["long"]
+
+
+@pytest.mark.parametrize("phase", ["baseline", "long", "post", "draining"])
+def test_local_preparation_failure_prevents_scale_down_pass(phase):
+    from giraffe.request_outcome import preparation_failure_reason
+
+    settings, evidence, records = scenario()
+    index = next(index for index, record in enumerate(records) if record.id == phase)
+    records[index] = records[index].model_copy(update=dict(
+        status="failed", valid=False, not_dispatched=True, dispatch_ms=None))
+    result = evaluate(settings, evidence, records)
+    reason = preparation_failure_reason(records)
+    assert result.status == "inconclusive"
+    assert all(value["status"] != "pass" for value in result.metrics["results"].values())
+    assert all(reason in value["limitations"] for value in result.metrics["results"].values())
+
+
+def test_local_preparation_failure_does_not_hide_proven_scale_down_failure():
+    settings, evidence, records = scenario()
+    records.append(records[2].model_copy(update=dict(
+        id="not-sent", status="failed", valid=False, not_dispatched=True, dispatch_ms=None)))
+    records[2] = records[2].model_copy(update=dict(status="failed", valid=False))
+    result = evaluate(settings, evidence, records)
+    assert result.status == "fail"
+    assert result.metrics["results"]["capacity"]["status"] == "fail"
+    original = evaluate(settings, evidence, records[:-1])
+    assert result.metrics["results"]["capacity"]["summary"] == original.metrics["results"]["capacity"]["summary"]

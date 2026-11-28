@@ -16,6 +16,7 @@ import math
 import re
 
 from . import states
+from .request_outcome import request_outcome
 from .stats import PERCENTILES, distribution as sample_distribution, percentile as percentile
 
 PERFORMANCE_SCHEMA = 1
@@ -109,7 +110,7 @@ def completion_buckets(records, start_ms, end_ms):
             continue
         index = min(len(buckets) - 1, int((record.completed_ms-start_ms) / 1000 / width))
         buckets[index]["count"] += 1
-        buckets[index]["valid_completions"] += int(record.status == "completed" and record.valid)
+        buckets[index]["valid_completions"] += int(request_outcome(record) == "ok")
     return {"unit": "requests", "width_s": width, "buckets": buckets,
             "rule": "Aim for 10–20 buckets; choose first 1/2/5/10/15/30/60/120/300/600/900/1800/3600-second width giving at most 20 (whole hours thereafter).",
             "boundary_rule": "Half-open [start,end), final endpoint inclusive; every terminal request assigned once.",
@@ -364,8 +365,8 @@ def _window_summary(report, target, window, records, series, observation):
     finished = [r for r in records if r.completed_ms is not None and start is not None and end is not None
                 and start <= r.completed_ms <= end and (window.get("end_inclusive") or window["kind"] == "full" or r.completed_ms < end)]
     population = records if window["kind"] == "full" else finished
-    good = [r for r in population if r.status == "completed" and r.valid]
-    rate_good = [r for r in finished if r.status == "completed" and r.valid]
+    good = [r for r in population if request_outcome(r) == "ok"]
+    rate_good = [r for r in finished if request_outcome(r) == "ok"]
     n = len(population)
     base = dict(target=target, window=wid, eligible_count=n)
     metrics, distributions = {}, {}
@@ -391,7 +392,8 @@ def _window_summary(report, target, window, records, series, observation):
 
     ids = {r.id for r in population}
     selected_series = [row for row in series if row["request_id"] in ids]
-    valid_series = [row for row in selected_series if row["valid"] and row["status"] == "completed"]
+    valid_ids = {r.id for r in good}
+    valid_series = [row for row in selected_series if row["request_id"] in valid_ids]
     for key, field, label in (
         ("response_latency", "response_latency_ms", "Response latency"),
         ("first_useful_output", "first_useful_output_ms", "First useful output"),
@@ -399,6 +401,7 @@ def _window_summary(report, target, window, records, series, observation):
         ("completion_tail", "completion_tail_ms", "Completion time (tail)"),
         ("client_ttft", "client_ttft_ms", "TTFT (client)"),
         ("first_reasoning", "first_reasoning_ms", "First reasoning latency")):
+        # Receipt timing remains observable on partial responses and designed stops.
         observed_series = selected_series if key in {"client_ttft", "first_reasoning", "first_useful_output"} else valid_series
         row = dist(key, [row["values"][field] for row in observed_series], label)
         if key == "client_ttft" and row["sample_count"] == 0:
@@ -467,13 +470,14 @@ def _window_summary(report, target, window, records, series, observation):
                        ("failed", "Failed / invalid"), ("timed_out", "Timeouts"),
                        ("cancelled", "Cancelled"), ("reasoning_budget_exhausted", "Reasoning budget exhausted")):
         put(key, stats[key], label, "requests")
-    put("error_rate", stats["error_rate"], "Error rate", "ratio", "Existing outcome accounting; failures + timeouts / non-cancelled, non-reasoning-budget requests",
-        samples=n-stats["cancelled"]-stats["reasoning_budget_exhausted"], eligible=n-stats["cancelled"]-stats["reasoning_budget_exhausted"])
+    put("error_rate", stats["error_rate"], "Error rate", "ratio", "Invalid + failed + timeout outcomes / evaluated outcomes (ok + errors)",
+        samples=stats["evaluated"], eligible=stats["evaluated"])
     scored = [r for r in population if r.score is not None]
     put("scored", len(scored), "Scored", "requests")
     put("unscored", n-len(scored), "Unscored", "requests")
     put("correctness", sum(r.score is True for r in scored)/len(scored) if scored else None,
         "Answer correctness", "ratio", "Correct / scored; unscored answers are not correct", samples=len(scored))
+    # These describe response evidence/termination shape, including designed stops, rather than server errors.
     for key, label, predicate in (
         ("partial_failed", "Partial failed responses", lambda r: r.status != "completed" and (r.first_output_ms is not None or r.first_reasoning_ms is not None)),
         ("length_capped", "Length-capped replies", lambda r: r.finish_reason == "length"),
@@ -487,7 +491,7 @@ def _window_summary(report, target, window, records, series, observation):
     judgements = [r.load_point.get("response_criteria") for r in population if r.load_point and r.load_point.get("response_criteria")]
     put("latency_attainment", judgements or None, "Latency-limit attainment", "responses",
         "Existing per-response load criteria; no new acceptance decision", samples=len(judgements))
-    put("request_throughput", len([r for r in finished if r.status == "completed" and r.valid])/duration if duration else None,
+    put("request_throughput", len(rate_good)/duration if duration else None,
         "Request throughput", "req/s", "Valid completions with observed completion timestamps in window / window seconds", samples=len(finished),
         partial=window["kind"] == "full" and len(finished) < n)
 
@@ -656,7 +660,7 @@ def _bind_existing(report, target, window, records, observation, put):
     valid_counts, scored_counts = Counter(), Counter()
     if stage_entries:
         for record in capacity_records:
-            if record.valid and record.status == "completed":
+            if request_outcome(record) == "ok":
                 valid_counts[record.traffic_stage] += 1
                 scored_counts[record.traffic_stage] += record.score is not None
     for stage_index, stage in stage_entries:
@@ -994,7 +998,7 @@ def build_performance(report, *, target=None, window=None):
         for key, group in groups.items():
             check, label = _cohort_label(group, observation)
             cohorts.append(dict(id=key, label=label, check=check, request_count=len(group),
-                valid_completions=sum(row.status == "completed" and row.valid for row in group),
+                valid_completions=sum(request_outcome(row) == "ok" for row in group),
                 preparation=all(_preparation(row) for row in group),
                 measurement_scope=any(row.scenario != "performance_evidence_probe" for row in group),
                 performance_workload=bool(_PERFORMANCE_CHECKS.intersection(group[0].check_ids)),

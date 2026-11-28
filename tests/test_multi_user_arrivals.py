@@ -49,12 +49,13 @@ def test_preparation_failures_are_unissued_and_do_not_stop_peer_arrivals(monkeyp
         assert len(state.records) == 3
         failed, = [record for record in state.records if record.status == "failed"]
         assert failed.dispatch_ms is None
+        assert failed.outcome == "not_dispatched"
         assert failed.error == "request could not be prepared (ValueError)"
         assert window["users"][0]["stop_reason"] == "request could not be prepared"
         assert all(offer["outcome"] == "unissued" for offer in window["offers"]
                    if offer["user_id"] == "user-01")
         check = result(state, target)
-        assert check.status == "fail"
+        assert check.status == "inconclusive"
         assert check.metrics["multi_user"]["worst_user"]["user_id"] == "user-01"
 
     run_virtual(monkeypatch, scenario())

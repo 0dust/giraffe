@@ -5,7 +5,7 @@ from collections import OrderedDict
 import httpx
 import pytest
 
-from giraffe.conditions import ConditionRequestIndex, aggregate_conditions, condition_aggregate, condition_for
+from giraffe.conditions import ConditionRequestIndex, aggregate_conditions, condition_aggregate, condition_for, request_status
 from giraffe.models import RequestRecord, RunReport
 from giraffe.reporting import write_report
 from giraffe.web import _track_live_progress, create_app
@@ -29,6 +29,12 @@ def saved_report(records, summary=None, checks=()):
                      finished_at="2026-10-22T00:01:00+00:00", overall="pass", manifest={},
                      requests=[RequestRecord(**row) for row in records], checks=list(checks),
                      observations={"targets": {"local": {"conditions": [summary] if summary else []}}})
+
+
+def test_local_preparation_failure_remains_failed_in_live_request_classes():
+    row = record(1, status="failed", valid=False, score=None,
+                 not_dispatched=True, outcome="not_dispatched")
+    assert request_status(row) == "failed"
 
 
 @pytest.mark.parametrize("concurrency", [32, 1000])

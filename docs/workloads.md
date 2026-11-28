@@ -372,6 +372,7 @@ to catch a large slowdown that remains inside an absolute limit. An
 absolute-only pass states both measured probe/baseline ratios and that no ratio
 limit was configured. With no timing limit or ratio, recovery concludes from
 correctness and error rate, and reports timing as an observation.
+Request error denominators follow [Request outcomes](states.md#request-outcomes), with the documented module additions.
 
 Cancellation uses `test_options.cancellation.cancel_after_chunks` (default 5) to
 interrupt an active generation stream after that many nonempty content or reasoning

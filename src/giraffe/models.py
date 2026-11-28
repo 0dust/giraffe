@@ -13,7 +13,7 @@ from typing import Annotated, Any, Literal, get_args, get_origin
 from typing_extensions import TypedDict
 
 from pydantic_core import PydanticCustomError
-from pydantic import BeforeValidator, TypeAdapter, ValidationError, StrictInt, field_validator, BaseModel, ConfigDict, Field, PrivateAttr, SecretStr, StrictBool, ValidationInfo, field_serializer, model_serializer, model_validator
+from pydantic import BeforeValidator, TypeAdapter, ValidationError, StrictInt, field_validator, BaseModel, ConfigDict, Field, PrivateAttr, SecretStr, StrictBool, ValidationInfo, field_serializer, model_serializer, model_validator, computed_field
 
 
 from . import __version__
@@ -3182,6 +3182,8 @@ class RequestRecord(PersistedModel):
     scenario: str
     condition_id: str | None = None
     intentional: bool = False
+    # Transport entry is explicit: runner dispatch_ms also covers client preparation.
+    not_dispatched: bool = False
     check_ids: list[str]
     started_at: str
     status: Literal["completed", "failed", "timeout", "cancelled"]
@@ -3283,6 +3285,13 @@ class RequestRecord(PersistedModel):
     cached_prompt_tokens: int | None = None
     cache_source: str | None = None
     tool_calls: list[dict[str, Any]] = Field(default_factory=list)
+
+    @computed_field
+    @property
+    def outcome(self) -> str:
+        from .request_outcome import request_outcome
+
+        return request_outcome(self)
 
     @property
     def read_gaps_ms(self) -> list[float] | None:

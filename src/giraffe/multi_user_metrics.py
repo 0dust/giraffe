@@ -11,6 +11,8 @@ from .models import LoadTestSettings, MultiUserCriteria, RequestRecord
 from .overlap import _delays, _overlap, answer_window, max_evidenced_overlap
 from .stats import distribution, median
 from .timing import qualify, threshold
+from .request_outcome import count_outcomes, preparation_failure_reason, request_outcome
+from .states import REQUEST_OUTCOME_ERRORS
 
 
 SUMMARY_VERSION = 1
@@ -26,15 +28,17 @@ def _status(statuses: list[str], *, measured: bool = False) -> str:
 
 
 def _valid(record: RequestRecord) -> bool:
-    return record.status == "completed" and not _error(record)
+    return request_outcome(record) == "ok" and not _error(record)
 
 
 def _error(record: RequestRecord) -> bool:
-    return record.status in {"failed", "timeout"} or record.status == "completed" and (
-        not record.valid or record.score is False or truncated_conversation_turn(record))
+    outcome = request_outcome(record)
+    return outcome in REQUEST_OUTCOME_ERRORS or outcome == "ok" and (
+        record.score is False or truncated_conversation_turn(record))
 
 
 def truncated_conversation_turn(record: RequestRecord) -> bool:
+    # Truncation describes a terminal conversation turn, including invalid output.
     return (record.status == "completed" and bool(record.workload.get("session_id"))
             and record.finish_reason == "length")
 
@@ -88,17 +92,20 @@ def _user_summary(user: dict[str, Any], window: dict[str, Any], records: list[Re
     rows = [r for r in records if r.workload.get("user_id") == user["user_id"]
             and r.workload.get("window_id") == window["id"]
             and start is not None and end is not None
-            and (r.dispatch_ms is None and r.status == "failed" and r.id in user.get("request_ids", [])
+            and (request_outcome(r) == "not_dispatched" and r.id in user.get("request_ids", [])
                  or r.dispatch_ms is not None and start <= r.dispatch_ms
                  and (r.dispatch_ms < end or window.get("cut_short") and r.dispatch_ms == end))]
     dispatched_terminal = sum(r.dispatch_ms is not None for r in rows)
     missing_terminal = max(0, user.get("dispatched_count", dispatched_terminal)-dispatched_terminal)
+    outcome_counts = count_outcomes(rows)
+    # Timing attainment excludes intentional rows even when local preparation wins outcome precedence.
     intentional = [r for r in rows if r.intentional]
     attempts = [r for r in rows if not r.intentional]
     valid = [r for r in attempts if _valid(r)]
+    # These legacy terminal counters include completed/cancelled excluded outcomes.
     completed = [r for r in attempts if r.status == "completed"]
     errors = [r for r in attempts if _error(r)]
-    cancelled = [r for r in attempts if r.status == "cancelled"]
+    cancelled = [r for r in attempts if request_outcome(r) == "cancelled"]
     terminal_failures = {r.id for r in errors + cancelled}
     conversations = user.get("conversations", [])
     unadmitted_turn = any(item.get("stopped_before_cutoff") and terminal_failures.isdisjoint(item["turns"])
@@ -116,6 +123,7 @@ def _user_summary(user: dict[str, Any], window: dict[str, Any], records: list[Re
     known, missing = _tokens(eligible)
     late_tokens, late_missing = _tokens(late)
     partial_tokens, partial_missing = _tokens(partial)
+    # Partial-output accounting includes both designed and external cancellations.
     cancelled_tokens, cancelled_missing = _tokens([r for r in rows if r.status == "cancelled"])
     known_rate = known/duration if duration > 0 else None
     rate = known_rate if not missing and not unclassified and not missing_terminal else None
@@ -135,7 +143,8 @@ def _user_summary(user: dict[str, Any], window: dict[str, Any], records: list[Re
                    "status": "right_censored", "attribution": "client_admission",
                    "timing_quality": pending_quality["status"], "breached_criteria": []}
 
-    incomplete = []
+    local_failure = preparation_failure_reason(rows)
+    incomplete = [local_failure] if local_failure else []
     if not attempts:
         incomplete.append("No nonintentional requests were dispatched.")
     if len(valid) < criteria.min_samples:
@@ -148,7 +157,7 @@ def _user_summary(user: dict[str, Any], window: dict[str, Any], records: list[Re
         incomplete.append("Some required conversation turns were not admitted before the window closed.")
     if missing_modes:
         incomplete.append(f"Conversation coverage is incomplete for {', '.join(missing_modes)}.")
-    reasons = []
+    reasons = [local_failure] if local_failure else []
     selected = {}
     for name, first, metric in (("max_first_answer_ms", True, "first_output_ms"),
                                 ("max_completion_ms", False, "latency_ms")):
@@ -160,7 +169,7 @@ def _user_summary(user: dict[str, Any], window: dict[str, Any], records: list[Re
         for record in attempts:
             if _error(record):
                 missed += 1
-            elif record.status == "cancelled":
+            elif request_outcome(record) != "ok":
                 unknown += 1
             else:
                 value = user_latency(record, first)
@@ -193,7 +202,8 @@ def _user_summary(user: dict[str, Any], window: dict[str, Any], records: list[Re
         if unknown or pending_unknown:
             reasons.append(f"Some {name} measurements are missing or affected by client scheduling delay.")
 
-    denominator = len(attempts)+missing_terminal
+    denominator = outcome_counts["evaluated"]+missing_terminal
+    excluded = len(rows)-outcome_counts["evaluated"]
     error_percent = 100*len(errors)/denominator if denominator else None
     if criteria.max_error_percent is not None:
         failed = error_percent is not None and error_percent > criteria.max_error_percent
@@ -201,7 +211,7 @@ def _user_summary(user: dict[str, Any], window: dict[str, Any], records: list[Re
             "status": "fail" if failed else "inconclusive" if incomplete else "pass",
             "limit": criteria.max_error_percent, "value": error_percent,
             "errors": len(errors), "denominator": denominator,
-            "unknown": len(cancelled)+missing_terminal, "excluded": len(intentional)}
+            "unknown": len(cancelled)+missing_terminal, "excluded": excluded}
         if failed:
             reasons.append(f"Observed request error rate exceeds {criteria.max_error_percent:g}%.")
     if criteria.min_output_tokens_per_second is not None:
@@ -216,6 +226,10 @@ def _user_summary(user: dict[str, Any], window: dict[str, Any], records: list[Re
         if failed:
             reasons.append("Shared-window output throughput is below the selected minimum.")
     status = _status([item["status"] for item in selected.values()]) if selected else "measured"
+    if local_failure and status == "pass":
+        status = "inconclusive"
+    if status == "fail" and local_failure:
+        reasons = [reason for reason in reasons if reason != local_failure]
     if status == "inconclusive":
         reasons.extend(incomplete)
     ready_first = [user_latency(r, True) for r in valid]
@@ -235,12 +249,19 @@ def _user_summary(user: dict[str, Any], window: dict[str, Any], records: list[Re
         coverage_reasons.append("Pending client admission wait overlaps scheduling delay.")
     return {**user, "status": status, "reasons": list(dict.fromkeys(reasons)),
             "request_ids": [r.id for r in rows],
-            "outcomes": {"attempted": len(rows)+missing_terminal, "completed": len(completed),
+            "outcome_counts": outcome_counts,
+            "outcomes": {"attempted": len(rows)+missing_terminal,
+                         "evaluated": outcome_counts["evaluated"],
+                         "intentional_stop": outcome_counts["intentional_stop"],
+                         "budget_exhausted": outcome_counts["budget_exhausted"],
+                         "not_dispatched": outcome_counts["not_dispatched"], "completed": len(completed),
                          "valid_completed": len(valid), "errors": len(errors),
-                         "failed": sum(r.status == "failed" for r in attempts),
-                         "invalid": sum(r.status == "completed" and _error(r) for r in attempts),
-                         "timeouts": sum(r.status == "timeout" for r in attempts),
+                         "failed": outcome_counts["failed"],
+                         # User-visible invalid completions include wrong/truncated answers.
+                         "invalid": sum(request_outcome(r) in {"ok", "invalid"} and _error(r) for r in attempts),
+                         "timeouts": outcome_counts["timeout"],
                          "cancelled": len(cancelled),
+                         # Preserve the legacy cancellation subset of intentional stops.
                          "intentional_cancelled": sum(r.status == "cancelled" for r in intentional),
                          "missing_terminal": missing_terminal},
             "known_output_tokens": known, "missing_usage_count": missing,
@@ -502,6 +523,12 @@ def _fairness(observation, window, users, records, criteria, health, lag, timing
               "fail" if ratio > limit else "pass")
     if status == "fail":
         reasons.append(f"Observed delivery ratio {ratio:g} exceeds the selected maximum {limit:g}.")
+    local_failure = preparation_failure_reason(
+        record for (window_id, _), rows in records.items() if window_id == window["id"] for record in rows)
+    if local_failure and status in {"pass", "measured"}:
+        if status == "pass":
+            status, qualified = "inconclusive", False
+        reasons.append(local_failure)
     return {"status": status, "qualified": qualified, "threshold": limit, "tolerance_percent": tolerance,
             "ratio": ratio, "compared_user_ids": [user["user_id"] for user in users],
             "eligible_user_ids": eligible, "overlap_user_ids": overlap_users, "reasons": reasons,
@@ -509,6 +536,7 @@ def _fairness(observation, window, users, records, criteria, health, lag, timing
 
 
 def _cancellation(window, records, criteria, health, lag, timing_threshold, delays):
+    # Verify this designed chunk-limit cancellation, rather than its counting class.
     triggered = [r for r in records if r.workload.get("cancellation_role") == "selected"
                  and r.status == "cancelled" and r.intentional and r.termination_reason == "generation_chunk_limit"
                  and r.generation_chunks > 0 and r.finish_reason is None
@@ -603,6 +631,9 @@ def _interference(observation, window, control, user_records, criteria, health, 
                       legacy_max_lag_ms=lag, phase_intervals=((a, b),))["status"] != "qualified"
               or any(a < end and start < b for start, end in delays.windows)):
             reasons.append("Client scheduling delay affects the comparison window.")
+    phase_ids = {phase["id"] for phase in (control, window) if phase}
+    local_failure = preparation_failure_reason(
+        record for (window_id, _), rows in user_records.items() if window_id in phase_ids for record in rows)
     measured = []
     for user in window["users"]:
         uid = user["user_id"]
@@ -734,6 +765,10 @@ def _interference(observation, window, control, user_records, criteria, health, 
         status = "inconclusive" if not qualified else "measured" if limit is None else "fail" if slowdown > limit else "pass"
         if status == "fail":
             notes.append(f"Observed slowdown {slowdown:g} exceeds {limit:g}.")
+        if local_failure and status in {"pass", "measured"}:
+            if status == "pass":
+                status, qualified = "inconclusive", False
+            notes.append(local_failure)
         def difference(a, b):
             return b-a if a is not None and b is not None else None
         measured.append({"user_id": uid, "status": status, "qualified": qualified, "reasons": list(dict.fromkeys(notes)),
@@ -745,7 +780,10 @@ def _interference(observation, window, control, user_records, criteria, health, 
             "stream_gap_change_ms": difference(median([r.max_stream_gap_ms for r in before]), median([r.max_stream_gap_ms for r in after])),
             "output_tokens_change": difference(values["control_output_median_tokens"], values["probe_output_median_tokens"]), **values})
     statuses = [item["status"] for item in measured]
-    return {"status": _status(statuses, measured=all(s == "measured" for s in statuses)),
+    status = _status(statuses, measured=all(s == "measured" for s in statuses))
+    if local_failure and status in {"measured", "inconclusive"}:
+        reasons.append(local_failure)
+    return {"status": status,
             "qualified": bool(measured) and all(item["qualified"] for item in measured),
             "control_window_id": window["control_window_id"], "trigger": window["trigger"],
             "heavy_profile": window["heavy_profile"], "heavy_user_ids": window["heavy_user_ids"],
@@ -911,7 +949,12 @@ def summarize(observation: dict[str, Any], records: list[RequestRecord], *,
         if selected_fairness:
             statuses.append(fairness["status"])
         window_status = _status(statuses, measured=all(status == "measured" for status in statuses))
-        windows.append({**window, "users": users, "status": window_status, "fairness": fairness})
+        local_failure = preparation_failure_reason(
+            record for record in records if record.workload.get("window_id") == window["id"])
+        if local_failure and window_status == "pass":
+            window_status = "inconclusive"
+        windows.append({**window, "users": users, "status": window_status, "fairness": fairness,
+                        **({"reasons": [local_failure]} if local_failure and window_status != "fail" else {})})
     scenario_delays = _delays(observation.get("scheduling_delay_windows", []))
     for window in windows:
         if window["phase"] != "measurement":
@@ -958,6 +1001,9 @@ def summarize(observation: dict[str, Any], records: list[RequestRecord], *,
             window["fairness"]["status"] == "not_applicable" for window in fairness_windows):
         statuses.append("inconclusive")
     status = _status(statuses, measured=bool(all_users) and all(value == "measured" for value in statuses))
+    local_failure = preparation_failure_reason(records)
+    if local_failure and status == "pass":
+        status = "inconclusive"
     ranked = sorted(all_users, key=lambda user: (
         {"fail": 0, "inconclusive": 1, "measured": 2, "pass": 2}[user["status"]],
         user["output_tokens_per_second"] if user["output_tokens_per_second"] is not None else -1,
@@ -967,6 +1013,7 @@ def summarize(observation: dict[str, Any], records: list[RequestRecord], *,
     return {"version": SUMMARY_VERSION, "window_policy": observation.get("window_policy"),
             "settings": observation.get("settings", {}), "population": observation.get("population", []),
             "windows": windows, "status": status, "worst_user": worst,
+            **({"reasons": [local_failure]} if local_failure and status != "fail" else {}),
             "user_windows": len(all_users),
             "failed_user_windows": sum(user["status"] == "fail" for user in all_users),
             "inconclusive_user_windows": sum(user["status"] == "inconclusive" for user in all_users),

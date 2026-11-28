@@ -6,7 +6,7 @@ import uuid
 from collections import Counter
 from giraffe.stats import distribution, median, percentile
 
-from giraffe.fixtures import reasoning_budget
+from giraffe.request_outcome import count_outcomes, request_outcome
 from giraffe.models import RequestSpec, load_shape_label
 from giraffe.local_tokenizer import prepare_messages
 from giraffe.overlap import answer_window, peak_evidenced_concurrency, scheduling_delay_windows
@@ -161,7 +161,7 @@ def point_shapes(settings, point):
 
 
 def interference_measurements(records, level, duration, latencies=(), never_triggered=0):
-    short = [r for r in records if r.load_point["role"] == "short_stream" and r.valid and r.status == "completed"]
+    short = [r for r in records if r.load_point["role"] == "short_stream" and request_outcome(r) == "ok"]
     probes = [r for r in records if r.load_point["role"] == "probe"]
     groups, matched_groups, ambiguous = {}, {0: [], 1: []}, []
     for record in short:
@@ -216,14 +216,15 @@ def inflight(records, start, end):
 
 
 def measurements(run, target, settings, point, records):
+    outcomes = count_outcomes(records)
+    # Completed throughput retains every completed transport, including excluded budgets.
     completed = [r for r in records if r.status == "completed"]
-    exhausted = [r for r in records if reasoning_budget(r)]
-    valid = [r for r in completed if r.valid and r not in exhausted]
-    scored = [r for r in records if r.score is not None and r not in exhausted]
-    failed = sum(r not in exhausted and (r.status == "failed" or r.status == "completed" and not r.valid) for r in records)
-    timeouts = sum(r.status == "timeout" for r in records)
+    valid = [r for r in records if request_outcome(r) == "ok"]
+    scored = [r for r in records if r.score is not None and request_outcome(r) in {"ok", "invalid", "failed", "timeout"}]
+    failed = outcomes["failed"] + outcomes["invalid"]
+    timeouts = outcomes["timeout"]
+    # Any cancellation makes load evidence inconclusive, including intentional stops.
     cancelled = sum(r.status == "cancelled" for r in records)
-    population = len(records) - cancelled
     start, end = point.get("sending_start_ms"), point.get("sending_end_ms")
     average, peak = inflight(records, start, end)
     evidenced = peak_evidenced_concurrency(records, scheduling_delay_windows(run))
@@ -245,7 +246,10 @@ def measurements(run, target, settings, point, records):
             "cached_prompt_tokens": _distribution([r.cached_prompt_tokens for r in cohort if r.cached_prompt_tokens is not None])}
     point.update(sent=len(records), completed=len(completed), failed=failed, timed_out=timeouts, cancelled=cancelled,
         valid=len(valid), required=settings.pass_criteria.min_valid_responses, scored=len(scored), correct=sum(r.score is True for r in scored),
-        reasoning_budget_exhausted=len(exhausted), error_percent=(failed + timeouts) / population * 100 if population else 0,
+        reasoning_budget_exhausted=outcomes["budget_exhausted"], intentional_stop=outcomes["intentional_stop"],
+        not_dispatched=outcomes["not_dispatched"], outcome_counts=outcomes, error_denominator=outcomes["evaluated"],
+        error_denominator_description="OK responses plus invalid completions, failures and timeouts; intentional stops, cancellations, exhausted reasoning budgets and preparation failures are excluded.",
+        error_percent=outcomes["error_rate"] * 100 if outcomes["error_rate"] is not None else None,
         correct_percent=sum(r.score is True for r in scored) / len(scored) * 100 if scored else None,
         correctness_applicable=bool(scored), requested_concurrency=point["level"], client_mean_inflight=average,
         client_peak_inflight=peak, server_evidenced_concurrency=evidenced,

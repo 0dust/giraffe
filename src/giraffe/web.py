@@ -1718,7 +1718,8 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
             for condition in conditions:
                 targets.setdefault(condition["target"], {"conditions": []})["conditions"].append(condition)
             report = RunReport.model_validate(dict(run_id=identifier, started_at=live["meta"]["started_at"],
-                finished_at=_now(), overall="inconclusive", manifest={"config": live["meta"]["config"]},
+                finished_at=_now(), overall="inconclusive", manifest={
+                    "config": live["meta"]["config"], "outcome_counting_version": 2},
                 requests=records, observations={"targets": targets}), context={"metadata_only": True})
         try:
             value = build_performance(report, target=target, window=window)
@@ -1878,7 +1879,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
 
         try:
             writer = await run_in_threadpool(EvidenceWriter, job["directory"],
-                manifest={"config": safe_config(config.model_dump(mode="json"))},
+                manifest={"config": safe_config(config.model_dump(mode="json")), "outcome_counting_version": 2},
                 started_at=meta["started_at"])
             heartbeat = await run_in_threadpool(lambda: Heartbeat(job["directory"]).start())
 
