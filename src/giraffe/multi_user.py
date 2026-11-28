@@ -417,14 +417,14 @@ def _offer_plan(window, settings):
                 for user in window["users"]}
     offers.sort(key=lambda offer: (offer["offset_seconds"], priority[offer["user_id"]]))
     for index, offer in enumerate(offers):
-        offer.update(index=index, outcome="not_offered", offered=False, dispatched=False, request_id=None)
+        offer.update(index=index, outcome=states.OFFER_NOT_OFFERED, offered=False, dispatched=False, request_id=None)
     return offers
 
 
 def _offer_counts(offers):
     return {"planned": len(offers), "offered": sum(o["offered"] for o in offers),
             **{name: sum(o["outcome"] == name for o in offers) for name in
-               ("dispatched", "dropped_local", "dropped_late", "unissued", "not_offered")}}
+               states.MULTI_USER_OFFER_OUTCOMES}}
 
 
 def _arrival_transitions(sending, activations, per_user_rate, planned_seconds):
@@ -559,8 +559,10 @@ async def run_arrival_window(run, target, client, settings, load_settings, calib
     end = start + evidence.sending_seconds*1000
     for index, offer in enumerate(offers):
         raw = evidence.outcomes[index]
-        offer["outcome"] = ("dispatched" if offer["dispatched"] else raw if raw in {"dropped_local", "dropped_late"}
-                            else "unissued" if offer["offered"] else "not_offered")
+        offer["outcome"] = (states.OFFER_DISPATCHED if offer["dispatched"] else raw
+                            if raw in {states.OFFER_DROPPED_LOCAL, states.OFFER_DROPPED_LATE}
+                            else states.OFFER_UNISSUED if offer["offered"] else states.OFFER_NOT_OFFERED)
+        states.check_multi_user_offer_outcome(offer["outcome"])
         offer["scheduled_ms"] = start + offer["offset_seconds"]*1000
         offer["scheduler_lag_ms"] = evidence.offer_lags_ms[index]
     accounting = _offer_counts(offers)

@@ -122,6 +122,143 @@ These preserve the existing acceptance comparison independently of comparability
 | `not_established_in_current` | Preservation is unverified in the current run. |
 | `not_established_in_baseline` | Baseline acceptance was not established. |
 
+## Gateway policy qualification
+
+Where you see it: check `metrics.gateway_policy.qualification`, paired with the
+summary's `status` and the check verdict. These are final conclusions, not run phases.
+`GATEWAY_POLICY_QUALIFICATIONS` and `GATEWAY_POLICY_STATUSES` declare the complete pairs.
+
+| Value | Meaning | Terminal? | Status/verdict |
+| --- | --- | --- | --- |
+| `unverified` | Evidence or window assumptions cannot establish enforcement. | Yes | `inconclusive` |
+| `unavailable` | Policy is absent or the selected capability is unsupported. | Yes | `inconclusive` |
+| `observed_failure` | Qualified evidence contradicts the declared allowance. | Yes | `fail` |
+| `observed` | Attributed rejection and continued peer service establish the bounded observation. | Yes | `pass` |
+| `unexercised` | No dispatched policy traffic, no attributed rejection, or no continued peer service. | Yes | `inconclusive` |
+
+A would-be `observed` / `pass` becomes `unverified` / `inconclusive` when request
+preparation or output-budget exclusions exist. Failure evidence retains its verdict.
+`unavailable` is optional unless gateway policy is the only selected check; all other
+qualifications remain required. Reasons and `interpretation` are prose, not enums.
+`peer_continuation`, `overlap_observed`, `comparable_actual_work`, `complete`,
+`identities_distinct` and `response_cache_hit_reported` are booleans, not qualifications.
+There is no additional summary vocabulary: `settings` retains declared configuration,
+`users` retains counts and evidence, and `stop_reason` retains its original reason text.
+
+## Gateway access observation
+
+Where you see it: `metrics.gateway_access.cases[]`. `GATEWAY_ACCESS_EXPECTED`
+declares the policy-side `expected` values `allow` and `deny`.
+`GATEWAY_ACCESS_OBSERVATIONS` declares the observed decisions.
+`GATEWAY_ACCESS_CASE_STATUSES` maps observed decision to expected decision to status.
+
+| Value | Meaning | Terminal? | Status/verdict |
+| --- | --- | --- | --- |
+| `allow` | Qualified assistant completion, refusal, or metered reasoning completion. | Yes | `pass` for expected `allow`; otherwise `fail` |
+| `deny` | Recognized gateway authentication or model-access denial. | Yes | `pass` for expected `deny`; otherwise `fail` |
+| `unverified` | Unrun or unsupported/incomplete evidence. | Initial and final | `inconclusive` for either expectation |
+
+`denial_kind()` has a separate `GATEWAY_ACCESS_DENIAL_KINDS` vocabulary:
+
+| Value | Meaning | Terminal? | Status/verdict |
+| --- | --- | --- | --- |
+| `unknown` | The response does not prove a supported denial. | Yes | Does not establish `deny` |
+| `authentication` | Recognized LiteLLM HTTP 401 authentication denial. | Yes | Establishes `deny` with matching request evidence |
+| `model_access` | Recognized LiteLLM HTTP 403 model-access denial. | Yes | Establishes `deny` with matching request evidence |
+
+Case `reason` uses `GATEWAY_ACCESS_REASONS`. Reasons describe evidence; they do not
+independently determine a verdict. The observation/expectation table above does.
+
+| Value | Meaning | Terminal? | Observation / status rule |
+| --- | --- | --- | --- |
+| `not_run` | No completed case probe. | Initial and final | `unverified` |
+| `request_cancelled` | Probe cancelled. | Yes | `unverified` |
+| `identity_changed` | Credentials changed after preflight. | Yes | `unverified` |
+| `identity_unavailable` | Declared credentials are unavailable. | Yes | `unverified` |
+| `fallback_reported` | Gateway reported attempted fallback routing. | Yes | `unverified` |
+| `model_group_mismatch` | Resolved model group differs. | Yes | `unverified` |
+| `valid_completion` | Qualified valid assistant answer. | Yes | `allow` |
+| `assistant_refusal` | Qualified nonempty assistant refusal. | Yes | `allow` |
+| `metered_reasoning_completion` | Full output cap accounted for by reasoning. | Yes | `allow` |
+| `gateway_authentication` | Qualified authentication denial. | Yes | `deny` |
+| `gateway_model_access` | Qualified model-access denial. | Yes | `deny` |
+| `incomplete_or_unsupported_response` | No supported access proof. | Yes | `unverified` |
+| `request_not_dispatched` | Probe could not reach transport dispatch. | Yes | `unverified` |
+| `auth_header_unverified` | Credential headers could not be qualified. | Yes | `unverified` |
+| `identity_conflict` | Opposite expectations share credentials. | Yes | `unverified` |
+| `unsupported_profile` | Access profile is unsupported. | Yes | `unverified` |
+| `run_deadline` | Run duration prevented the probe. | Yes | `unverified` |
+| `run_stopped` | Another run stop prevented the probe. | Yes | `unverified` |
+| `request_budget_exhausted` | Request budget prevented the probe. | Yes | `unverified` |
+
+Rows retain their original decisions and reasons; aggregation does not fold them.
+Any failed case makes the check fail. A pass requires both expected `allow` and
+expected `deny`, with every case verified; otherwise the check is inconclusive.
+A preparation failure downgrades a would-be check pass. The summary's `qualification`
+is explanatory prose, independent of gateway policy qualification above.
+
+## Traffic offer outcomes
+
+`OFFER_OUTCOMES` is the union of the traffic and multi-user offer vocabularies.
+It is independent of request outcomes: an offer can exist without an HTTP attempt.
+`TRAFFIC_OFFER_OUTCOMES` contains the six values below. `OFFER_TRANSIENT_OUTCOMES`
+is only `dispatching`; `OFFER_TERMINAL_OUTCOMES` contains every other union value.
+Here terminal means eligible for final accounting, not immutable: dispatch can still
+revise `started` and cancellation can still revise `cancelled`.
+
+| Value | Meaning | Terminal? | Summary / verdict effect |
+| --- | --- | --- | --- |
+| `not_offered` | Initial entry or offer that never dispatched. | Initial and final | Counts as `not_offered`; prevents fully offered stage |
+| `dispatching` | Slot acquired, coroutine not yet entered. | No | Folded into `not_offered` |
+| `started` | Dispatch coroutine entered; transport dispatch is not yet established. | Yes, revisable | Counts as `started`; request evidence determines verdict |
+| `cancelled` | Dispatch coroutine was cancelled. | Yes, revisable | Folded into `started`; cancellation provenance determines request outcome |
+| `dropped_local` | No immediate local slot. | Yes | Generator-limited; prevents stage pass |
+| `dropped_late` | Scheduled arrival missed its lag tolerance. | Yes | Generator-limited; prevents stage pass |
+
+Every traffic ledger write is guarded against `OFFER_TRANSITIONS`, including the
+idempotent `not_offered` write. Initialization fills the ledger with `not_offered`.
+
+| From | Allowed writes |
+| --- | --- |
+| `not_offered` | `not_offered`, `dispatching`, `dropped_local`, `dropped_late` |
+| `dispatching` | `started`, `dropped_late`, `not_offered` |
+| `started` | `cancelled`, `dropped_late`, `not_offered` |
+| `cancelled` | `not_offered` |
+| `dropped_local` | None |
+| `dropped_late` | None |
+
+Tasks cancelled before coroutine entry become `not_offered`. Explicit traffic also
+maps cancellation without a request record to `not_offered`. A normal cancellation
+with a record retains `cancelled`. Stage, case, and time-window summaries all fold
+`dispatching` into `not_offered` and `cancelled` into `started`; drop counts stay separate.
+Offer `started` is not the count of proven endpoint attempts. Request record outcome
+counts retain the independent per-module rules in the request outcome section.
+
+## Multi-user offer outcomes
+
+`MULTI_USER_OFFER_OUTCOMES` contains five final accounting values. `offered` and
+`dispatched` are separate boolean flags: reservation sets `offered`; the transport
+start callback sets `dispatched`. Initialization uses `not_offered` with both false.
+
+| Value | Meaning | Terminal? | Summary / verdict effect |
+| --- | --- | --- | --- |
+| `dispatched` | Transport start callback ran, regardless of the raw traffic value. | Yes | Counts one dispatched offer; request evidence determines verdict |
+| `dropped_local` | No dispatch and raw traffic outcome is a local drop. | Yes | Counts a local drop |
+| `dropped_late` | No dispatch and raw traffic outcome is a late drop. | Yes | Counts a late drop |
+| `unissued` | No dispatch/drop, but the offer was reserved. | Yes | Counts reserved work without an endpoint attempt |
+| `not_offered` | No dispatch/drop and offer was not reserved. | Initial and final | Counts work beyond the budget/stop boundary |
+
+Final mapping uses that table's order: `dispatched` flag first, then raw drop value,
+then `offered` flag for `unissued`, else `not_offered`. Final values are guarded
+against the multi-user subset. Counts preserve `planned = offered + not_offered` and
+`offered = dispatched + dropped_local + dropped_late + unissued`. Traffic's `started`
+and `cancelled` folding is deliberately not used for multi-user accounting.
+
+Guards warn in production and raise under `STRICT_TRANSITIONS` in tests. Traffic
+propagates strict offer-guard failures (`OfferTransitionError`, an `AssertionError`)
+from its dispatch tasks after releasing slots; callback assertions keep their existing failure counts.
+The declarations and sorted JSON-serialisable mappings appear in `describe()`.
+
 ## Check phases
 
 | Phase | Meaning | Allowed next phases |
