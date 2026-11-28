@@ -374,6 +374,32 @@ def _evidence_version(directory: Path) -> list[int] | None:
     return None
 
 
+def run_recovery(directory: Path, meta: dict, *, report_available: bool,
+                 active_id: str | None = None) -> dict:
+    """One recovery projection for API and CLI readers, using their report availability check."""
+    state = meta.get("state")
+    if state in states.RUN_OWNED_STATES and not run_alive(directory, meta, active_id=active_id):
+        state = states.RUN_INTERRUPTED
+    version = _evidence_version(directory)
+    attempts = meta.get("recovery_attempts", 0)
+    if isinstance(attempts, bool) or not isinstance(attempts, int) or attempts < 0:
+        attempts = 0
+    recovery = states.recovery_state(state, (directory / "evidence.jsonl").is_file(), report_available,
+        summary_present=(directory / "summary.json").is_file(),
+        released=version is not None and meta.get("released_evidence") == version, attempts=attempts)
+    retry_at = None
+    timestamp = meta.get("recovery_retry_at")
+    if (recovery == states.RECOVERY_RETRYING and isinstance(timestamp, (int, float))
+            and not isinstance(timestamp, bool)):
+        try:
+            retry_at = datetime.fromtimestamp(timestamp, timezone.utc).isoformat()
+        except (ValueError, OverflowError, OSError):
+            pass
+    return {"state": recovery, "attempts": 0 if recovery == states.RECOVERY_NONE else attempts,
+            "max_attempts": states.RECOVERY_MAX_ATTEMPTS,
+            "retry_at": retry_at}
+
+
 def _run(directory: Path, active_id: str | None, sources: set[str], unknown_source: bool) -> dict | None:
     if directory.name.startswith(".") or directory.is_symlink() or not directory.is_dir():
         return None
@@ -415,6 +441,8 @@ def _run(directory: Path, active_id: str | None, sources: set[str], unknown_sour
     if not directory.is_dir():
         return None
     return {"id": directory.name, "bytes": run_size(directory),
+            "recovery": run_recovery(directory, meta, report_available=(directory / "report.json").is_file(),
+                                     active_id=active_id),
             "started_at": datetime.fromtimestamp(started, timezone.utc).isoformat(),
             "protected": reason is not None, "protected_reason": reason, "kept": kept}
 

@@ -153,6 +153,7 @@ def test_describe():
         "exit_codes": {**states.EXIT_CODES, "cancelled": states.EXIT_CODE_CANCELLED,
                        "usage_error": states.EXIT_CODE_USAGE, "default": states.EXIT_CODE_DEFAULT},
         "request_statuses": list(states.REQUEST_STATUSES), "run_states": list(states.RUN_STATES),
+        "recovery_states": ["none", "pending", "retrying", "given_up"], "recovery_max_attempts": 5,
         "request_outcomes": list(states.REQUEST_OUTCOMES),
         "request_outcome_errors": sorted(states.REQUEST_OUTCOME_ERRORS),
         "request_outcome_excluded": sorted(states.REQUEST_OUTCOME_EXCLUDED),

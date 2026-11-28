@@ -1304,6 +1304,8 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
             if meta.get("recovery_retry_at", 0) > time.time():
                 pending = True
                 continue
+            recovery_succeeded = False
+            had_recovery_failures = bool(meta.get("recovery_attempts"))
             try:
                 saved = _report(directory / "report.json")
             except HTTPException:
@@ -1319,9 +1321,10 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                         write_report(recovered, directory, max_run_storage=max_run_storage)
                         meta.update(run_id=recovered.run_id, error=recovered.abort_reason,
                                     **finished_fields(cause_of(recovered), recovered.abort_reason))
+                        recovery_succeeded = True
                 except Exception as error:
                     attempts = meta.get("recovery_attempts", 0) + 1
-                    terminal = attempts >= 5
+                    terminal = attempts >= states.RECOVERY_MAX_ATTEMPTS
                     pending = pending or not terminal
                     error_id = uuid.uuid4().hex[:8]
                     with run_logging(directory):
@@ -1333,7 +1336,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                     reason = ("disk full" if getattr(error, "errno", None) == 28 else type(error).__name__)
                     meta.update(error_id=error_id, recovery_attempts=attempts,
                         recovery_retry_at=time.time() + _RECOVERY_SECONDS * 2 ** (attempts - 1),
-                        error=f"Recovery failed: {reason} (attempt {attempts}/5). [error {error_id}]")
+                        error=f"Recovery failed: {reason} (attempt {attempts}/{states.RECOVERY_MAX_ATTEMPTS}). [error {error_id}]")
                     if terminal:
                         meta["state"] = states.RUN_ERROR
             else:
@@ -1341,6 +1344,12 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                 meta.update(state=state, finished_at=saved.finished_at, run_id=saved.run_id,
                             **finished_fields(cause_of(saved), saved.abort_reason))
                 meta.pop("error", None)
+                recovery_succeeded = True
+            if recovery_succeeded:
+                meta.pop("recovery_attempts", None)
+                meta.pop("recovery_retry_at", None)
+                if had_recovery_failures:
+                    meta.pop("error_id", None)
             try:
                 save_metadata(directory, meta)
             except OSError:
@@ -1551,12 +1560,12 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
         except (OSError, ValueError, KeyError, TypeError):
             return None
 
-    def pending_recovery(directory: Path, *, report_available: bool | None = None) -> bool:
-        state = metadata(directory).get("state")
-        journal_present = (directory / "evidence.jsonl").is_file()
-        if (directory / "summary.json").is_file():
-            return False  # Recovery leaves a final verdict summary in charge.
-        if state == states.RUN_INTERRUPTED and journal_present and report_available is None:
+    def recovery_status(directory: Path, *, report_available: bool | None = None) -> dict:
+        from .storage import run_recovery
+
+        meta = metadata(directory)
+        recovery = run_recovery(directory, meta, report_available=bool(report_available), active_id=active.get("id"))
+        if recovery["state"] != states.RECOVERY_NONE and report_available is None:
             # A listing summary does not validate the full report accepted by recovery.
             try:
                 _report(directory / "report.json")
@@ -1564,7 +1573,8 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                 report_available = False
             else:
                 report_available = True
-        return states.run_recoverable(state, journal_present, bool(report_available))
+            recovery = run_recovery(directory, meta, report_available=report_available, active_id=active.get("id"))
+        return recovery
 
     def run_detail(identifier: str, *, listing: bool = False, snapshot: dict | None = None,
                    journal_after: int | None = None) -> dict:
@@ -1640,6 +1650,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
         else:
             stop_kind = meta.get("stop_kind", journal.get("stop_kind"))
             abort_reason = meta.get("abort_reason", journal.get("abort_reason"))
+        recovery = recovery_status(directory, report_available=None if listing else persisted is not None)
         return {"id": identifier, "state": state,
                 **({"journal_reset": journal.get("reset", False), "journal_idle": journal.get("idle", True)}
                    if journal_after is not None else {}),
@@ -1659,8 +1670,8 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                 "live_checks": list(live.get("checks", {}).values()),
                 "stoppable": bool(live) and state in states.RUN_OWNED_STATES,
                 "terminal": state in states.RUN_TERMINAL_STATES,
-                "recoverable": pending_recovery(directory,
-                    report_available=None if listing else persisted is not None),
+                "recovery": recovery,
+                "recoverable": recovery["state"] in {states.RECOVERY_PENDING, states.RECOVERY_RETRYING},
                 "phases": live.get("phases", meta.get("phases", [])),
                 "config": meta.get("config") or (persisted or {}).get("manifest", {}).get("config") or journal.get("config", {}),
                 "baseline_id": ((persisted or {}).get("baseline") or {}).get("saved_baseline_id", meta.get("baseline_id")),
@@ -1752,7 +1763,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
         counts = dict.fromkeys(states.CHECK_STATUSES, 0)
         for check in report.get("checks", []):
             counts[check["status"]] += 1
-        return {key: detail[key] for key in ("id", "state", "terminal", "recoverable", "error", "abort_reason", "stop_kind", "progress", "baseline_id",
+        return {key: detail[key] for key in ("id", "state", "terminal", "recoverable", "recovery", "error", "abort_reason", "stop_kind", "progress", "baseline_id",
                                              "started_at", "finished_at", "bytes", "kept")} | {
             "run_id": report.get("run_id"), "overall": report.get("overall"),
             "targets": _targets(detail["config"]), "check_counts": counts,
@@ -2200,8 +2211,16 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
 
     @app.get("/api/storage")
     async def get_storage():
-        result = await run_in_threadpool(storage_summary, root, active_id=active.get("id"), limits=limits,
-                                         auto_cleanup=policy)
+        def read_storage():
+            result = storage_summary(root, active_id=active.get("id"), limits=limits, auto_cleanup=policy)
+            for row in result["runs"]:
+                if row["id"] in unsaved_metadata:
+                    directory = root / row["id"]
+                    row["recovery"] = recovery_status(directory,
+                        report_available=(directory / "report.json").is_file())
+            return result
+
+        result = await run_in_threadpool(read_storage)
         def latest_cleanup():
             if last_auto_cleanup:
                 return dict(last_auto_cleanup)
@@ -2397,6 +2416,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                                 "events": [], "records": detail["live_requests"], "checks": [], "state": detail["state"],
                                 "terminal": detail["terminal"], "recoverable": detail["recoverable"],
                                 "stop_kind": detail["stop_kind"], "abort_reason": detail["abort_reason"],
+                                "recovery": detail["recovery"],
                                 "scale_down_control": detail.get("scale_down_control"),
                                 "timeout_warnings": detail["timeout_warnings"],
                                 "live_request_summary": detail["live_request_summary"],
@@ -2405,12 +2425,14 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                         "state": detail["state"], "error": detail.get("error"),
                         "terminal": detail["terminal"], "recoverable": detail["recoverable"],
                         "stop_kind": detail["stop_kind"], "abort_reason": detail["abort_reason"],
+                        "recovery": detail["recovery"],
                         "scale_down_control": detail.get("scale_down_control"),
                         "timeout_warnings": detail["timeout_warnings"],
                         "live_request_summary": detail["live_request_summary"],
                         "live_request_count": detail["live_request_count"]}
             if feed.get("terminal") and feed["state"] == states.RUN_INTERRUPTED:
-                if not await run_in_threadpool(pending_recovery, _directory(root, identifier)):
+                recovery = await run_in_threadpool(recovery_status, _directory(root, identifier))
+                if recovery["state"] not in {states.RECOVERY_PENDING, states.RECOVERY_RETRYING}:
                     detail = await run_in_threadpool(run_detail, identifier)
                     reconcile_feed(identifier, {key: detail.get(key) for key in (
                         "abort_reason", "stop_kind", "error", "error_id")})
@@ -2451,11 +2473,12 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
             elif event.get("event", "").startswith("condition_") and event.get("condition"):
                 key = (event.get("target"), event["condition"]["id"])
                 checks[key] = feed.get("conditions", {}).get(key, event)
-        recoverable = await run_in_threadpool(pending_recovery, _directory(root, identifier))
+        recovery = await run_in_threadpool(recovery_status, _directory(root, identifier))
         return {"seq": seq, "reset": reset, "events": events, "records": list(records.values()),
                 "checks": list(checks.values()), "state": feed["state"],
                 "terminal": feed["state"] in states.RUN_TERMINAL_STATES,
-                "recoverable": recoverable,
+                "recovery": recovery,
+                "recoverable": recovery["state"] in {states.RECOVERY_PENDING, states.RECOVERY_RETRYING},
                 "progress": feed["progress"], "live_request_count": feed["live_request_count"],
                 "scale_down_control": feed.get("scale_down_control", feed["meta"].get("scale_down_control")),
                 "live_request_summary": feed["live_request_summary"],
