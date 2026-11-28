@@ -139,6 +139,14 @@ RUN_TRANSITIONS: Final = {
     RUN_ERROR: frozenset({RUN_INTERRUPTED}),  # Manual evidence recovery of a given-up run only.
 }
 
+# Evidence recovery is independent of the run lifecycle, one state per run directory.
+RECOVERY_NONE: Final = "none"
+RECOVERY_PENDING: Final = "pending"
+RECOVERY_RETRYING: Final = "retrying"
+RECOVERY_GIVEN_UP: Final = "given_up"
+RECOVERY_STATES: Final = (RECOVERY_NONE, RECOVERY_PENDING, RECOVERY_RETRYING, RECOVERY_GIVEN_UP)
+RECOVERY_MAX_ATTEMPTS: Final = 5
+
 # Server activity: admission blockers, also exposed as X-Giraffe-Error-Code.
 SERVER_RUN_ACTIVE: Final = "run_active"
 SERVER_RUN_STARTING: Final = "run_starting"
@@ -414,9 +422,23 @@ def baseline_comparability(codes: Collection[str]) -> str:
         BASELINE_REASON_CODES.get(code, BASELINE_UNKNOWN) for code in codes])
 
 
-def run_recoverable(state: str | None, journal_present: bool, report_available: bool) -> bool:
-    """An interrupted journal needs recovery until a valid report owns its evidence."""
-    return state == RUN_INTERRUPTED and journal_present and not report_available
+def recovery_state(state: str | None, journal_present: bool, report_available: bool,
+                   summary_present: bool = False, released: bool = False, attempts: int = 0) -> str:
+    """Derive recovery from plain inputs; callers normalize a dead writer to interrupted."""
+    if (not journal_present or report_available or summary_present or released
+            or state not in {RUN_INTERRUPTED, RUN_ERROR}):
+        return RECOVERY_NONE
+    if state == RUN_ERROR:
+        # An error run without the maximum failed attempts is not a recovery case.
+        return RECOVERY_GIVEN_UP if attempts >= RECOVERY_MAX_ATTEMPTS else RECOVERY_NONE
+    return RECOVERY_RETRYING if attempts else RECOVERY_PENDING
+
+
+def run_recoverable(state: str | None, journal_present: bool, report_available: bool,
+                    summary_present: bool = False, released: bool = False, attempts: int = 0) -> bool:
+    """Whether automatic evidence recovery remains pending."""
+    return recovery_state(state, journal_present, report_available, summary_present, released, attempts) in {
+        RECOVERY_PENDING, RECOVERY_RETRYING}
 
 
 def describe() -> dict:
@@ -425,6 +447,7 @@ def describe() -> dict:
         "exit_codes": {**EXIT_CODES, "cancelled": EXIT_CODE_CANCELLED,
                        "usage_error": EXIT_CODE_USAGE, "default": EXIT_CODE_DEFAULT},
         "request_statuses": list(REQUEST_STATUSES), "run_states": list(RUN_STATES),
+        "recovery_states": list(RECOVERY_STATES), "recovery_max_attempts": RECOVERY_MAX_ATTEMPTS,
         "request_outcomes": list(REQUEST_OUTCOMES),
         "request_outcome_errors": sorted(REQUEST_OUTCOME_ERRORS),
         "request_outcome_excluded": sorted(REQUEST_OUTCOME_EXCLUDED),

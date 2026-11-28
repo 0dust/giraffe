@@ -97,7 +97,7 @@ Recovery:
 
 Recovery saves `report.json`, marks the run interrupted in `.web.json`, and leaves
 `evidence.jsonl` unchanged. Once JSON is saved, the recovered run is eligible for
-normal cleanup. To explicitly release an unrecoverable journal, use
+normal cleanup. To explicitly release a journal in recovery state `given_up` (see [Evidence recovery](states.md#evidence-recovery)), use
 `giraffe runs keep RUN_DIR --off`, then preview and apply cleanup. This releases only
 the current journal: appending or replacing evidence protects it again. Active runs,
 saved baseline sources and directories containing unrelated files remain protected.

@@ -167,8 +167,11 @@ async def test_recoverable_is_reported_beside_terminal(tmp_path, monkeypatch, st
         if journal:
             (directory / "evidence.jsonl").write_text("")
         expected = journal and state == "interrupted"
-        assert (await client.get("/api/runs/saved")).json()["recoverable"] is expected
-        assert (await client.get("/api/runs/saved/events")).json()["recoverable"] is expected
+        for endpoint in ("/api/runs/saved", "/api/runs/saved/events"):
+            result = (await client.get(endpoint)).json()
+            assert result["recoverable"] is expected
+            assert result["recovery"] == {"state": "pending" if expected else "none",
+                "attempts": 0, "max_attempts": 5, "retry_at": None}
         if state in {"completed", "interrupted", "error"}:
             row = next(run for run in (await client.get("/api/runs")).json()["runs"] if run["id"] == "saved")
             assert row["recoverable"] is expected
@@ -197,10 +200,12 @@ async def test_recoverable_distinguishes_valid_report_from_retained_journal(tmp_
             # Unreadable reports retain their existing error presentation.
             assert result["state"] == ("error" if saved_report in {"unreadable", "invalid_schema"} else "interrupted")
             assert result["recoverable"] is (saved_report != "valid")
+            assert result["recovery"]["state"] == ("none" if saved_report == "valid" else "pending")
         row = next(row for row in (await client.get("/api/runs")).json()["runs"] if row["id"] == "saved")
         # The listing parser can read a summary from a schema-invalid report;
         # that summary must not count as successful recovery publication.
         assert row["recoverable"] is (saved_report != "valid")
+        assert row["recovery"]["state"] == ("none" if saved_report == "valid" else "pending")
 
 
 @pytest.mark.parametrize("saved_report", ["absent", "unreadable"])
@@ -225,6 +230,7 @@ async def test_final_summary_owns_interrupted_journal_recovery(tmp_path, saved_r
         for endpoint in ("/api/runs/saved", "/api/runs/saved/events"):
             result = (await client.get(endpoint)).json()
             assert result["terminal"] is True and result["recoverable"] is False
+            assert result["recovery"]["state"] == "none"
         row = next(row for row in (await client.get("/api/runs")).json()["runs"] if row["id"] == "saved")
         assert row["terminal"] is True and row["recoverable"] is False
 
@@ -275,7 +281,7 @@ async def test_published_recovery_report_with_retained_journal_finishes_polling(
         # The documented polling condition must finish despite retained evidence.
         for _ in range(3):
             detail = (await client.get("/api/runs/recovered")).json()
-            if detail["terminal"] and not detail["recoverable"]:
+            if detail["terminal"] and detail["recovery"]["state"] in {"none", "given_up"}:
                 break
         else:
             pytest.fail("Published recovery report still advertises pending recovery")
@@ -358,6 +364,7 @@ async def test_interrupted_event_feed_tracks_recovery_report_publication(tmp_pat
         path = f"/api/runs/{identifier}/events"
         events = (await client.get(path)).json()
         assert events["reset"] is False and events["recoverable"] is True
+        assert events["recovery"]["state"] == "pending"
         assert events["events"][-1]["event"] == "run_finished"
         assert events["events"][-1]["stop_kind"] is None
         directory = tmp_path / identifier
@@ -367,6 +374,7 @@ async def test_interrupted_event_feed_tracks_recovery_report_publication(tmp_pat
         events = (await client.get(path)).json()
         assert events["reset"] is False and events["terminal"] is True
         assert events["state"] == "interrupted" and events["recoverable"] is False
+        assert events["recovery"]["state"] == "none"
         assert events["events"][-1]["stop_kind"] is None
         assert (directory / "evidence.jsonl").is_file()
 

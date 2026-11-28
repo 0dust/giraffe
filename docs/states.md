@@ -226,12 +226,49 @@ CLI-owned runs write `running`, `completed`, `interrupted` or `error`. They neve
 | `stopping` | `completed`, `interrupted`, `error` |
 | `interrupted` | `completed`, `error` |
 | `completed` | `error` |
-| `error` | `interrupted` |
+| `error` | `interrupted` (manual evidence recovery after the server gives up) |
 
 An interrupted run can recover on the next server start to `completed` or `error`.
 After the server gives up recovering a run, `giraffe report <run-dir> --html` can manually recover its retained evidence and move `error` to `interrupted`.
 The API reports `error` for a completed run whose saved report is unreadable. This does not rewrite `.web.json`.
 Repeated writes of the same run state are allowed.
+
+## Evidence recovery
+
+Recovery has one state per run directory, independent of its run lifecycle:
+
+| State | Meaning | What to do |
+| --- | --- | --- |
+| `none` | No journal needs recovery: there is no journal, a valid report or `summary.json` owns the outcome, the journal was explicitly released, or the run is live or not interrupted. | Read the report or summary when available. |
+| `pending` | Unrecovered evidence, with no failed attempt yet. | Wait for the next server start or periodic recovery pass, or run `giraffe report RUN_DIR` with an export option. |
+| `retrying` | An interrupted run has at least one failed attempt, including when its stored count reaches the maximum but its state still permits retries. | The server retries at `retry_at`; manual recovery can also try. |
+| `given_up` | The run is `error` and the maximum attempts failed. The server will not retry; the journal is kept. | Run `giraffe report RUN_DIR` with an export option (no attempt limit), or release it with `giraffe runs keep RUN_DIR --off`, then [preview and apply cleanup](resources.md#recovering-an-interrupted-run). |
+
+Run detail, history and events expose a `recovery` object:
+
+| Field | Meaning |
+| --- | --- |
+| `state` | One of `none`, `pending`, `retrying`, `given_up`. |
+| `attempts` | Failed recovery attempts; always 0 for `none`. Invalid stored counts, including booleans and negative counts, read as 0. |
+| `max_attempts` | Automatic attempt limit, currently 5. |
+| `retry_at` | ISO-8601 UTC timestamp for `retrying`, or null when no retry is scheduled or the stored timestamp is invalid or out of range. |
+
+The server keeps its exponential backoff: `_RECOVERY_SECONDS * 2**(attempts - 1)`
+(currently a 5-second base). Recovery pauses under the same admission rules as before.
+A dead writer still labeled `running` or `stopping` on disk reads as recovery `pending`
+(or `retrying` after a failure) once its heartbeat and owner PID no longer count as alive.
+Its run state and `terminal` stay unchanged until a recovery pass updates them.
+This server's active run always reads recovery `none`, even if its heartbeat stalls.
+Successful recovery clears stored retry counts and deadlines. Manual recovery also
+clears `error` and `error_id`; server recovery clears a recovery failure's `error_id`
+and replaces its error text with the recovered report's abort reason, if any.
+
+`giraffe runs list` and the web storage API include the same `recovery` object.
+These storage listings use their existing cheap report-file presence check, so even an
+unreadable report file counts as available there. Run detail, history and events validate
+the report before it can finish recovery. A valid report finishes recovery even when a
+crash or failed cleanup leaves the journal behind. A release applies only to that exact
+journal; appending or replacing it makes its evidence pending again.
 
 ## Stop reasons
 
@@ -470,13 +507,13 @@ Aggregation compares these fixed values exactly. For reason text emitted by sour
 
 ## Reading states from a program
 
-`giraffe describe` and GET `/api/capabilities` include a `states` block with vocabularies, transitions, stop reasons and exit codes.
+`giraffe describe` and GET `/api/capabilities` include a `states` block with vocabularies, transitions, stop reasons and exit codes, plus `recovery_states` and `recovery_max_attempts`.
 Its `exit_codes` maps verdicts to codes and includes `cancelled`, `usage_error` and `default` keys. Stop reasons are open to free text.
 
 Run detail, history, events, start and cancel responses include `terminal`.
 It is true for `completed`, `interrupted` and `error`: no process is working on the run.
 
-Run detail, history and events also include `recoverable`. It is true only for an `interrupted` run that still has its `evidence.jsonl` and has no valid saved report; such a run can still become `completed` or `error`. A valid report finishes recovery even if journal cleanup failed or a crash left the journal behind. To wait for a final state, poll until `terminal` is true and `recoverable` is false, with your own time limit: recovery runs when the server starts or when you run the recovery command.
+Run detail, history and events also include `recoverable`. It is true while `recovery.state` is `pending` or `retrying`, and false for `none` or `given_up`. To wait for a final state, poll until `terminal` is true and `recovery.state` is `none` or `given_up`, with your own time limit. Recovery runs when the server starts, on its periodic retry loop while pending, or when you run the recovery command. `given_up` ends automatic recovery; manual recovery can still change the run to `interrupted` with recovery `none`.
 
 The web metadata helper, CLI run writer, and storage metadata updater check run-state writes against the transition table above. A write the table does not declare is still saved, and logged as a warning; the test suite fails on it.
 
