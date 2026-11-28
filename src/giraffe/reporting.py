@@ -28,6 +28,7 @@ from .caps import (MAX_HTML_PREVIEW_CHARS, MAX_HTML_JSON_PREVIEW_CHARS,
                    DEFAULT_HTML_REQUEST_DETAILS, MAX_FAILURE_SUMMARY_TITLE_CHARS,
                    MAX_FAILURE_SUMMARY_CHARS)
 from .deployment import deployment_diff, safe_config, sanitize
+from .launch_settings import comparison_warnings, setting_change_text
 from .report_inputs import input_ref as _input_ref
 from .multi_user_metrics import (_error as _user_error, _length_mix_differs, _total_generated_tokens,
                                  _uncached_input_tokens, _valid as _user_valid_completion,
@@ -3863,9 +3864,16 @@ def _deployment_change_html(diff: dict[str, Any]) -> str:
     intended = diff.get("intended_change")
     summary = ("Deployment change: " + ", ".join(changed) if changed
                else "No observed deployment changes.")
-    if changed and intended and not diff.get("confounded"):
+    launch = diff.get("launch_comparison") or {}
+    if changed and intended and not diff.get("confounded") and launch.get("status") != "unverified":
         summary += " (one intended change)"
     parts = [f'<p class="deployment-change">{_e(summary)}</p>']
+    if launch.get("status") == "unverified":
+        parts.append('<p><strong>Launch setting comparison unverified.</strong></p>')
+    parts.extend(f'<p class="muted">{_e(warning)}</p>' for warning in comparison_warnings(diff))
+    if launch.get("settings"):
+        parts.append('<ul>' + ''.join(f'<li>{_e(setting_change_text(row))}</li>'
+                                     for row in launch["settings"]) + '</ul>')
     if diff.get("confounded"):
         parts.append('<p><strong>Confounded: multiple unrelated changes.</strong></p>')
         if intended:

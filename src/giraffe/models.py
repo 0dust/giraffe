@@ -1711,9 +1711,10 @@ class Target(Model):
                 (collector.username, collector.password, collector.query, collector.fragment)
             ):
                 raise ValueError("collector_url must be an http(s) URL without credentials/query/fragment")
-        from giraffe.deployment import sanitize
+        from giraffe.deployment import sanitize, sanitize_serving
         self.identity = sanitize(self.identity)
-        for category in ("model", "runtime", "serving", "backend", "hardware", "software", "extension"):
+        self.deployment.serving = sanitize_serving(self.deployment.serving)
+        for category in ("model", "runtime", "backend", "hardware", "software", "extension"):
             setattr(self.deployment, category, sanitize(getattr(self.deployment, category)))
         self.deployment.scope = sanitize(self.deployment.scope)
         self.deployment.intended_change = sanitize(self.deployment.intended_change)

@@ -847,17 +847,55 @@ max_requests: 32
 The declaration belongs in the target configuration, not the imported metadata
 file. Existing string declarations remain valid. A list must contain 1–256
 nonempty strings, each at most 8,192 characters. Paths match complete deployment
-diff field names exactly; they do not expand wildcards, prefixes or nested keys.
+diff field names exactly; they do not expand wildcards, prefixes or arbitrary nested keys.
 Other observed additions, removals or changes still mark the experiment as
 confounded. For example, changed `extension.arm`, `extension.note` or
 `extension.status` fields remain confounders unless explicitly declared.
 
-Declarations apply to whole recorded fields: `serving.launch_arguments` includes
-all recorded launch arguments, so additional flag changes within that field are
-not distinguished. Inspect the complete diff before grouping fields. The report
-retains all differences, unknown fields and continuity qualifications; grouping
-is the user's declaration of intent, not verification that only one setting
-changed. Differences are context, not causality, and a non-confounded comparison
+For an individual launch setting, use one of these explicit selectors instead of
+declaring the whole command:
+
+| Intended setting selector | Equivalent metadata field |
+| --- | --- |
+| `serving.launch_arguments.--speculative-config` | `extension.requested_speculative_config` |
+| `serving.launch_arguments.--max-num-seqs` | `serving.max_num_seqs` |
+| `serving.launch_arguments.--max-num-batched-tokens` | `serving.max_num_batched_tokens` |
+
+For example, `intended_change: serving.launch_arguments.--speculative-config`
+declares the speculative-decoding switch. A simultaneous change from
+`--max-num-seqs 16` to `--max-num-seqs 32`, or another added/removed option, is
+shown separately and confounds that comparison. A list can combine individual
+selectors with other exact field paths. Equivalent metadata is covered only when
+the baseline and current values match the corresponding launch setting and their
+evidence context has not changed.
+
+Individual comparison supports bounded `vllm serve MODEL ...` argument lists or
+quoted command strings, with `--flag value` and `--flag=value` forms. The supported
+speculative JSON representation contains only `method` (`eagle`, `eagle3`,
+`ngram`, `mtp` or `draft_model`) and a positive integer `num_speculative_tokens`.
+The equivalent extension metadata can use `k` instead of `num_speculative_tokens`.
+Other speculative representations, including values containing model paths or
+unknown keys, remain redacted and unverified. No commands are executed.
+See [vLLM's speculative-decoding configuration](https://docs.vllm.ai/en/stable/features/speculative_decoding/)
+for the runtime's full configuration; Giraffe's comparison covers the bounded
+subset above, not runtime defaults or resolved server state.
+
+Duplicate or competing flags, unknown options, redacted/unsupported values, configuration-file
+merging and changed relative argument order make the individual comparison
+unverified. In particular, `launch_command` imports redact the positional model
+operand, so its equivalence remains unverified even when the supported option
+values match. A redacted value does not establish a separate setting change;
+observable option additions/removals and supported additional changes are still
+shown. The JSON
+`launch_comparison` records the status, setting changes, evidence source and
+warnings; the app, HTML and CLI display them beside the comparison.
+
+Existing whole-field declarations keep their meaning: `serving.launch_arguments`
+accepts all recorded arguments. Reports explicitly warn that additional changes
+within that field are not checked separately, including when viewing older
+reports. Grouping declares intent; it does not verify that only one setting
+changed. All field differences, unknowns and continuity qualifications remain
+available. Differences are context, not causality, and a non-confounded comparison
 does not establish a performance effect.
 
 ## Serving statistics
