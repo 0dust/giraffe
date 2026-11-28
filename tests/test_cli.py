@@ -1,3 +1,4 @@
+import asyncio
 import json
 import io
 from pathlib import Path
@@ -371,6 +372,131 @@ def test_baseline_save_json_preserves_explicit_replace_boundary(tmp_path, capsys
     assert result["kind"] == "baseline.save" and result["destination"] == str(destination.resolve())
     assert main(arguments) == 4
     assert json.loads(capsys.readouterr().out)["outcome"] == "error"
+
+
+@pytest.mark.parametrize("strict", [True, False])
+def test_run_transitions_ignore_previous_completed_metadata(tmp_path, monkeypatch, caplog, strict):
+    from giraffe import states
+
+    metadata = tmp_path / ".web.json"
+    latency_summary = {"source": "previous run"}
+    monkeypatch.setattr(states, "STRICT_TRANSITIONS", strict)
+
+    async def prepared(config):
+        # Inject stale metadata after the CLI's nonempty-directory guard.
+        metadata.write_text(json.dumps({"state": "completed", "latency_summary": latency_summary}))
+
+    async def run(config, **kwargs):
+        saved = json.loads(metadata.read_text())
+        assert saved["state"] == "running"
+        assert saved["latency_summary"] == latency_summary
+        return RunReport(run_id="new-run", started_at="now", finished_at="now", overall="pass",
+                         manifest={"config": config.model_dump(mode="json")})
+
+    monkeypatch.setattr("giraffe.local_tokenizer.ensure_tokenizers", prepared)
+    monkeypatch.setattr("giraffe.cli._run", run)
+    assert main(["run", "--url", "http://localhost", "--model", "tiny", "--checks", "correctness",
+                 "--skip-preflight", "--output", str(tmp_path)]) == 0
+    saved = json.loads(metadata.read_text())
+    assert saved["state"] == "completed"
+    assert saved["run_id"] == "new-run"
+    assert "Undeclared run state transition" not in caplog.text
+
+
+@pytest.mark.parametrize("strict", [True, False])
+@pytest.mark.parametrize("interrupt", [KeyboardInterrupt, asyncio.CancelledError])
+def test_interrupt_while_printing_preserves_completed_run(tmp_path, monkeypatch, capsys, caplog, strict, interrupt):
+    from giraffe import states
+
+    metadata = tmp_path / ".web.json"
+    monkeypatch.setattr(states, "STRICT_TRANSITIONS", strict)
+
+    async def run(config, **kwargs):
+        return RunReport(run_id="finished-run", started_at="now", finished_at="now", overall="pass",
+                         manifest={"config": config.model_dump(mode="json")})
+
+    def print_result(*args, **kwargs):
+        assert json.loads(metadata.read_text())["state"] == "completed"
+        raise interrupt
+
+    monkeypatch.setattr("giraffe.cli._run", run)
+    monkeypatch.setattr("giraffe.cli._print_result", print_result)
+    assert main(["run", "--url", "http://localhost", "--model", "tiny", "--checks", "correctness",
+                 "--skip-preflight", "--output", str(tmp_path)]) == 130
+    saved = json.loads(metadata.read_text())
+    assert saved["state"] == "completed"
+    assert saved["run_id"] == "finished-run"
+    assert capsys.readouterr().err.endswith("Stopped.\n")
+    assert "Undeclared run state transition" not in caplog.text
+
+
+@pytest.mark.parametrize("interrupt", [KeyboardInterrupt, asyncio.CancelledError])
+def test_interrupt_after_completed_metadata_rename_preserves_report(tmp_path, monkeypatch, caplog, interrupt):
+    from giraffe import storage
+
+    metadata = tmp_path / ".web.json"
+    saved_report = []
+    completed_metadata = []
+    fsync_directory = storage.fsync_directory
+
+    async def run(config, **kwargs):
+        return RunReport(run_id="finished-run", started_at="now", finished_at="now", overall="pass",
+                         manifest={"config": config.model_dump(mode="json")})
+
+    def interrupt_after_replace(directory):
+        contents = metadata.read_bytes()
+        if json.loads(contents)["state"] == "completed" and not completed_metadata:
+            completed_metadata.append(contents)
+            saved_report.append((tmp_path / "report.json").read_bytes())
+            raise interrupt
+        fsync_directory(directory)
+
+    monkeypatch.setattr("giraffe.cli._run", run)
+    monkeypatch.setattr(storage, "fsync_directory", interrupt_after_replace)
+    assert main(["run", "--url", "http://localhost", "--model", "tiny", "--checks", "correctness",
+                 "--skip-preflight", "--output", str(tmp_path)]) == 130
+    assert metadata.read_bytes() == completed_metadata[0]
+    assert json.loads(metadata.read_text())["state"] == "completed"
+    assert (tmp_path / "report.json").read_bytes() == saved_report[0]
+    report = json.loads(saved_report[0])
+    assert report["overall"] == "pass" and report["abort_reason"] is None
+    assert "Undeclared run state transition" not in caplog.text
+
+
+def test_interrupt_before_first_metadata_rename_replaces_previous_completion(tmp_path, monkeypatch, caplog):
+    from datetime import datetime, timezone
+    from giraffe import storage
+
+    metadata = tmp_path / ".web.json"
+    started_at = datetime.now(timezone.utc)
+
+    class FrozenDatetime:
+        @staticmethod
+        def now(tz):
+            return started_at
+
+    async def prepared(config):
+        metadata.write_text(json.dumps({"state": "completed", "started_at": started_at.isoformat(),
+                                        "invocation_id": "previous-invocation"}))
+
+    write_metadata = storage._write_metadata
+
+    def interrupt_before_replace(directory, values):
+        if values["state"] == "running":
+            raise KeyboardInterrupt
+        write_metadata(directory, values)
+
+    monkeypatch.setattr("giraffe.cli.datetime", FrozenDatetime)
+    monkeypatch.setattr("giraffe.local_tokenizer.ensure_tokenizers", prepared)
+    monkeypatch.setattr(storage, "_write_metadata", interrupt_before_replace)
+    monkeypatch.setattr("giraffe.cli._run", lambda *a, **k: pytest.fail("Run started after interruption"))
+    assert main(["run", "--url", "http://localhost", "--model", "tiny", "--checks", "correctness",
+                 "--skip-preflight", "--output", str(tmp_path)]) == 130
+    saved = json.loads(metadata.read_text())
+    assert saved["state"] == "interrupted"
+    assert saved["started_at"] == started_at.isoformat()
+    assert saved["invocation_id"] != "previous-invocation"
+    assert "Undeclared run state transition" not in caplog.text
 
 
 def test_run_banner_distinguishes_default_and_effective_load_timeout(tmp_path, capsys, monkeypatch):

@@ -19,6 +19,24 @@ def saved(root, identifier, days=0, **metadata):
     return directory
 
 
+def test_update_metadata_removes_keys_and_checks_transition(tmp_path, monkeypatch):
+    from giraffe import states
+    from giraffe.storage import update_metadata, write_metadata
+
+    monkeypatch.setattr(states, "STRICT_TRANSITIONS", True)
+    write_metadata(tmp_path, {"id": "run", "state": states.RUN_ERROR,
+                              "error": "disk full", "error_id": "failure", "recovery_attempts": 5})
+    recovered = update_metadata(tmp_path, {"state": states.RUN_INTERRUPTED, "run_id": "recovered"},
+                                remove=("error", "error_id", "recovery_attempts", "recovery_retry_at"))
+    assert recovered == {"id": "run", "state": states.RUN_INTERRUPTED, "run_id": "recovered"}
+    metadata = tmp_path / ".web.json"
+    assert json.loads(metadata.read_text()) == recovered
+    before = metadata.read_bytes()
+    with pytest.raises(AssertionError, match="Undeclared run state transition"):
+        update_metadata(tmp_path, {"state": states.RUN_RUNNING}, remove=("run_id",))
+    assert metadata.read_bytes() == before
+
+
 def test_run_size_counts_regular_files_without_following_symlinks(tmp_path):
     run = saved(tmp_path, "one")
     (run / "report.html").write_bytes(b"abc")

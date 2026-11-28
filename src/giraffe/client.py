@@ -22,6 +22,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from . import states
 from .caps import (
     MAX_GATEWAY_USAGE_TOKENS, MAX_SERVER_ID_CHARS, MAX_TOKEN_EVIDENCE_PROBE_ATTEMPTS, MAX_TOOL_CALLS,
 )
@@ -431,7 +432,9 @@ class LLMClient:
         self._evidence_fields = {"logprobs", "stream_options"}
         self._evidence_probe_attempts = 0
         self._evidence_probe_finished = False
-        self.token_evidence = {"status": "not_probed", "logprobs": "unverified", "usage": "unverified"}
+        self.token_evidence = {"status": states.TOKEN_EVIDENCE_NOT_PROBED,
+                               "logprobs": states.TOKEN_EVIDENCE_UNVERIFIED,
+                               "usage": states.TOKEN_EVIDENCE_UNVERIFIED}
 
     def token_evidence_probe(self) -> RequestSpec | None:
         """Return bounded setup traffic; callers account for it outside timed workloads.
@@ -442,7 +445,6 @@ class LLMClient:
         if (self._evidence_probe_finished or self._evidence_probe_attempts >= MAX_TOKEN_EVIDENCE_PROBE_ATTEMPTS
                 or not self.config.stream):
             return None
-        self._evidence_probe_attempts += 1
         options = {}
         if "logprobs" in self._evidence_fields:
             options.update(logprobs=True, top_logprobs=0)
@@ -457,12 +459,14 @@ class LLMClient:
                       "evidence_fields": sorted(self._evidence_fields)})
 
     def observe_token_evidence_probe(self, record: RequestRecord) -> dict:
+        previous = self.token_evidence["status"]
         rejected = record.workload.get("rejected_evidence_field")
         if rejected in {"logprobs", "top_logprobs", "stream_options"}:
             field = "logprobs" if rejected == "top_logprobs" else rejected
             self._evidence_fields.discard(field)
-            self.token_evidence["logprobs" if field == "logprobs" else "usage"] = "rejected"
-            self.token_evidence.update(status="probing", reason=f"Endpoint rejected {rejected} (HTTP {record.http_status}).")
+            self.token_evidence["logprobs" if field == "logprobs" else "usage"] = states.TOKEN_EVIDENCE_REJECTED
+            self.token_evidence.update(status=states.TOKEN_EVIDENCE_PROBING,
+                reason=f"Endpoint rejected {rejected} (HTTP {record.http_status}).")
             self._evidence_probe_finished = (not self._evidence_fields
                                             or self._evidence_probe_attempts >= MAX_TOKEN_EVIDENCE_PROBE_ATTEMPTS)
         else:
@@ -471,19 +475,20 @@ class LLMClient:
             returned_tokens = any(event.get("token_count") is not None for event in record.output_events)
             returned_usage = record.input_tokens is not None and record.completion_tokens is not None
             for key, available in (("logprobs", returned_tokens), ("usage", returned_usage)):
-                if self.token_evidence[key] != "rejected":
-                    self.token_evidence[key] = "supported" if available else "not_returned" if completed else "unverified"
-            if (completed and self.token_evidence["usage"] != "rejected"
+                if self.token_evidence[key] != states.TOKEN_EVIDENCE_REJECTED:
+                    self.token_evidence[key] = (states.TOKEN_EVIDENCE_SUPPORTED if available else
+                        states.TOKEN_EVIDENCE_NOT_RETURNED if completed else states.TOKEN_EVIDENCE_UNVERIFIED)
+            if (completed and self.token_evidence["usage"] != states.TOKEN_EVIDENCE_REJECTED
                     and (record.input_tokens is not None) != (record.completion_tokens is not None)):
-                self.token_evidence["usage"] = "partial"
+                self.token_evidence["usage"] = states.TOKEN_EVIDENCE_PARTIAL
             if completed:
                 notes = []
-                if self.token_evidence["logprobs"] == "rejected":
+                if self.token_evidence["logprobs"] == states.TOKEN_EVIDENCE_REJECTED:
                     notes.append("Endpoint rejected the logprobs options.")
                 elif not returned_tokens:
                     notes.append("The stream did not provide token boundaries (logprobs.content).")
                 missing_usage_fields = []
-                if self.token_evidence["usage"] == "rejected":
+                if self.token_evidence["usage"] == states.TOKEN_EVIDENCE_REJECTED:
                     notes.append("Endpoint rejected stream_options for requesting usage counts.")
                 else:
                     missing_usage_fields = [field for field, count in (
@@ -492,14 +497,30 @@ class LLMClient:
                     ) if count is None]
                     if missing_usage_fields:
                         notes.append(f"The stream did not provide usable {' and '.join(missing_usage_fields)}.")
-                self.token_evidence.update(status="observed", missing_usage_fields=missing_usage_fields,
+                self.token_evidence.update(status=states.TOKEN_EVIDENCE_OBSERVED, missing_usage_fields=missing_usage_fields,
                     reason=" ".join(notes) or "Returned streamed token boundaries and both usage counts.")
             else:
-                self.token_evidence.update(status="unavailable",
-                    reason=f"Compatibility probe did not complete ({record.error or record.status}).")
+                reason = f"Compatibility probe did not complete ({record.error or record.status})."
+                if previous == states.TOKEN_EVIDENCE_PROBING:
+                    reason = f"{self.token_evidence['reason']} {reason}"
+                self.token_evidence.update(status=states.TOKEN_EVIDENCE_UNAVAILABLE,
+                    reason=reason)
         self.token_evidence["probe_requests"] = self._evidence_probe_attempts
-        if self._evidence_probe_finished and self.token_evidence["status"] == "probing":
-            self.token_evidence["status"] = "unavailable"
+        if self._evidence_probe_finished and self.token_evidence["status"] == states.TOKEN_EVIDENCE_PROBING:
+            self.token_evidence["status"] = states.TOKEN_EVIDENCE_UNAVAILABLE
+        states.check_token_evidence_transition(previous, self.token_evidence["status"])
+        return dict(self.token_evidence)
+
+    def finish_token_evidence_probe(self, reason: str, *, interrupted: bool = False) -> dict:
+        previous = self.token_evidence["status"]
+        if (previous in {states.TOKEN_EVIDENCE_NOT_PROBED, states.TOKEN_EVIDENCE_PROBING}
+                or interrupted and previous == states.TOKEN_EVIDENCE_UNAVAILABLE):
+            states.check_token_evidence_transition(previous, states.TOKEN_EVIDENCE_UNAVAILABLE)
+            original = self.token_evidence.get("reason")
+            self.token_evidence.update(status=states.TOKEN_EVIDENCE_UNAVAILABLE,
+                                       reason=f"{original} {reason}" if original else reason)
+        self.token_evidence["probe_requests"] = self._evidence_probe_attempts
+        self._evidence_probe_finished = True
         return dict(self.token_evidence)
 
     def _request_headers(self) -> dict[str, str]:
@@ -698,7 +719,7 @@ class LLMClient:
         probing = spec.workload.get("performance_evidence_probe")
         # The shared key may route to a different backend from marked identities.
         if stream and not probing and not attribution:
-            if self.token_evidence["usage"] in {"supported", "partial"}:
+            if self.token_evidence["usage"] in {states.TOKEN_EVIDENCE_SUPPORTED, states.TOKEN_EVIDENCE_PARTIAL}:
                 options = payload.setdefault("stream_options", {})
                 if isinstance(options, dict):
                     payload["stream_options"] = {"include_usage": True, **options}
@@ -707,7 +728,8 @@ class LLMClient:
                 # A plain-text probe does not certify combinations with tools or
                 # constrained output. Explicit workload options remain authoritative.
                 compatible_shape = spec.scorer != "tool" and not payload.get("tools") and not payload.get("response_format")
-                if self.token_evidence["logprobs"] == "supported" and "logprobs" not in payload and compatible_shape:
+                if (self.token_evidence["logprobs"] == states.TOKEN_EVIDENCE_SUPPORTED
+                        and "logprobs" not in payload and compatible_shape):
                     payload["logprobs"] = True
                     payload.setdefault("top_logprobs", 0)
         record.workload = dict(spec.workload)
@@ -724,7 +746,7 @@ class LLMClient:
             evidence["requested_usage"] = requested_usage
             if not stream:
                 evidence["logprobs"] = "non_streamed"
-            if stream and not evidence["requested_logprobs"] and evidence["logprobs"] == "supported":
+            if stream and not evidence["requested_logprobs"] and evidence["logprobs"] == states.TOKEN_EVIDENCE_SUPPORTED:
                 evidence["logprobs"] = "disabled_by_request" if "logprobs" in payload else "shape_unverified"
                 evidence["reason"] = ("Explicit request options disabled logprobs." if "logprobs" in payload else
                     "Plain-text probe does not establish logprobs compatibility with tools or structured-output options; no automatic logprobs were added.")
@@ -1185,6 +1207,9 @@ class LLMClient:
                     record.started_at = datetime.now(timezone.utc).isoformat()
                     record.client_preparation_ms = (start - preparation_start) * 1000
                     transport_started = True
+                    if probing:
+                        self._evidence_probe_attempts += 1
+                        self.token_evidence["probe_requests"] = self._evidence_probe_attempts
 
                 if isinstance(self._client, HTTPClientPool):
                     response = await self._client.send(request, stream=True, _before_send=begin_transport)

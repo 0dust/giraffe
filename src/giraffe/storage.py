@@ -71,10 +71,26 @@ def write_metadata(directory: Path | str, values: dict) -> None:
         _write_metadata(Path(directory), values)
 
 
-def update_metadata(directory: Path | str, changes: dict) -> dict:
+def write_metadata_unless(directory: Path | str, values: dict,
+                          predicate: Callable[[dict], bool]) -> bool:
+    """Replace metadata unless its current contents match, in one transaction."""
     with _metadata_lock:
         directory = Path(directory)
-        values = _read(directory / ".web.json") | changes
+        if predicate(_read(directory / ".web.json")):
+            return False
+        _write_metadata(directory, values)
+        return True
+
+
+def update_metadata(directory: Path | str, changes: dict, *, remove: tuple[str, ...] = ()) -> dict:
+    with _metadata_lock:
+        directory = Path(directory)
+        values = _read(directory / ".web.json")
+        if "state" in changes:
+            states.check_run_transition(values.get("state"), changes["state"])
+        values |= changes
+        for key in remove:
+            values.pop(key, None)
         _write_metadata(directory, values)
         return values
 

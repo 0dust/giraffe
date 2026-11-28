@@ -1,8 +1,20 @@
 import {configureGatewayAccess, configureGatewayPolicy, gatewayPolicySettings, positiveBoundErrors, inferSetupPreset, configureLoadTest, loadTestIssues, loadTestSettings, loadFieldName, convertExpectedAnswer, datasetCaseFromValues, changeDatasetScorer, configureJudging, configureSessions, configureMultiUser, multiUserSettings, configureProfiles, parseLogprobSettings, parseToolFixtures, effectiveProfileDefaults, configureTests, configureRunLimits, limitValue, optionDefault, optionValue, sameConfig} from './form-config.mjs?v=20261028-results-merge-ci';
 
 // Source: src/giraffe/states.py.
-const RUN_IN_PROGRESS_STATES = ['running','queued','stopping'];
-const RUN_TERMINAL_STATES = ['completed','interrupted','error'];
+const RUN={QUEUED:'queued',RUNNING:'running',STOPPING:'stopping',COMPLETED:'completed',INTERRUPTED:'interrupted',ERROR:'error'};
+const RUN_IN_PROGRESS_STATES = [RUN.RUNNING,RUN.QUEUED,RUN.STOPPING];
+const RUN_TERMINAL_STATES = [RUN.COMPLETED,RUN.INTERRUPTED,RUN.ERROR];
+
+// A live run never moves backwards: stopping does not return to running/queued, and a terminal run does not become active again.
+function nextLiveRunState(previous, incoming, {stopRequested=false}={}) {
+  if(RUN_TERMINAL_STATES.includes(previous)&&!RUN_TERMINAL_STATES.includes(incoming))return previous;
+  if((previous===RUN.STOPPING||stopRequested)&&[RUN.RUNNING,RUN.QUEUED].includes(incoming))return RUN.STOPPING;
+  return incoming;
+}
+
+// Connection-test values from src/giraffe/preflight.py, plus the local pending state.
+const DISCOVERY={PENDING:'pending',CONNECTED:'connected',UNVERIFIED:'unverified',NEEDS_MODEL:'needs_model',ERROR:'error'};
+const DISCOVERY_USABLE=[DISCOVERY.CONNECTED,DISCOVERY.UNVERIFIED];
 
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
@@ -28,8 +40,9 @@ function updateAPIKeySummary() {
   const key=apiKeyFor(form.elements.url.value),ref=form.elements.api_key_env?.value.trim();
   $('.row-value',summary).textContent=key?'Set for this tab':ref||'Not set';
 }
-const state = {bootstrap:null, runs:[], storage:null, storageUnavailable:false, cleanup:null, cleanupResult:null, baselines:[], detail:null, mosaicFollow:true, config:null, active:null, diskActive:null, routeVersion:0, setupNavigationSequence:0, poll:null, tab:'checks', selectedCheck:null, checkNavigatorOpen:false, filter:'all', historySearch:'', comparisonFilter:null, comparisonCheck:'all', submitting:false, openTest:null, configView:'form', jsonDraft:null, jsonBase:null, configRevision:0, configBusy:false, showAvailableTests:false, formMode:'normal', formRestartTarget:null, requestPreview:null, previewSequence:0, planTimer:null, setupPreset:null, catalogueFilter:'all', catalogueCategory:'all', catalogueSearch:'', setupStep:1, focusSetupOnEntry:false, returnToReview:false, modelDiscovery:null, modelDiscoverySequence:0, autoModel:null, datasetSelection:[], datasetImportSequence:0, judgeEditorOpen:null, datasetImport:null, datasetEditor:null, datasetTry:null, migrationNotes:[], migrationLimitNotes:[], migrationWarnings:[], dismissedMigrationNotes:[], loadPanels:{}, limitValues:{}, jsonValidation:null};
+const state = {bootstrap:null, runs:[], storage:null, storageUnavailable:false, cleanup:null, cleanupResult:null, baselines:[], detail:null, mosaicFollow:true, config:null, active:null, diskActive:null, routeVersion:0, setupNavigationSequence:0, poll:null, tab:'checks', selectedCheck:null, checkNavigatorOpen:false, filter:'all', historySearch:'', comparisonFilter:null, comparisonCheck:'all', submitting:false, openTest:null, configView:'form', jsonDraft:null, jsonBase:null, configRevision:0, configBusy:false, showAvailableTests:false, formMode:'normal', formRestartTarget:null, requestPreview:null, previewSequence:0, planTimer:null, setupPreset:null, catalogueFilter:'all', catalogueCategory:'all', catalogueSearch:'', setupStep:1, focusSetupOnEntry:false, returnToReview:false, modelDiscovery:null, modelDiscoverySequence:0, connectionTestsInFlight:0, autoModel:null, datasetSelection:[], datasetImportSequence:0, judgeEditorOpen:null, datasetImport:null, datasetEditor:null, datasetTry:null, migrationNotes:[], migrationLimitNotes:[], migrationWarnings:[], dismissedMigrationNotes:[], loadPanels:{}, limitValues:{}, jsonValidation:null};
 state.setupWorkspace=null;
+function resetJsonDraft(){state.jsonDraft=null;state.jsonBase=null;}
 const statusLabels = {not_applicable:'Not applicable',measured:'Measured',warmup:'Warmup',pass:'Passed',fail:'Failed',failed:'Failed',timeout:'Timed out',inconclusive:'Inconclusive',skipped:'Not run',idle:'Unused',blocked:'Blocked',running:'Running',queued:'Queued',reserved:'Reserved',stopping:'Stopping',error:'Runner error',completed:'Finished',stopped:'Stopped',cancelled:'Cancelled',interrupted:'Interrupted'};
 const statusIcons = {pass:'✓',fail:'×',failed:'×',timeout:'◷',inconclusive:'?',skipped:'–',idle:'○',blocked:'!',running:'·',queued:'○',reserved:'○',stopping:'·',error:'×',completed:'✓',stopped:'⊘',cancelled:'⊘',interrupted:'!'};
 const order = {fail:0,blocked:1,inconclusive:2,pass:3,skipped:4};
@@ -45,7 +58,8 @@ const duration = (run) => run.started_at && run.finished_at ? elapsed((new Date(
 const human = (name) => String(name).replaceAll('_',' ').replace(/\b\w/, c=>c.toUpperCase());
 const activeState = (run) => run && RUN_IN_PROGRESS_STATES.includes(run.state);
 function displayStatus(status,run=state.detail) {
-  if(run?.state&&!activeState(run)&&['running','queued','reserved','stopping'].includes(status))return status==='queued'?'skipped':['cancelled','interrupted'].includes(run.state)?'cancelled':'inconclusive';
+  // Legacy saved runs can still have the cancelled lifecycle state.
+  if(run?.state&&!activeState(run)&&[RUN.RUNNING,RUN.QUEUED,'reserved',RUN.STOPPING].includes(status))return status===RUN.QUEUED?'skipped':['cancelled',RUN.INTERRUPTED].includes(run.state)?'cancelled':'inconclusive';
   return status;
 }
 function probeCondition(record,report=state.detail?.report) {
@@ -64,7 +78,7 @@ function renderProbeReason(record) {
 }
 function requestStatus(record) {
   if(record.scenario==='performance_evidence_probe'&&record.status==='completed')return probePassed(record)?'pass':'inconclusive';
-  return ['running','queued','reserved','stopping','timeout','cancelled','skipped'].includes(record.status)?displayStatus(record.status):requestOutcome(record);
+  return [RUN.RUNNING,RUN.QUEUED,'reserved',RUN.STOPPING,'timeout','cancelled','skipped'].includes(record.status)?displayStatus(record.status):requestOutcome(record);
 }
 const runPath = (id) => `/api/runs/${encodeURIComponent(id)}`;
 const linkRun = (id) => `#runs/${encodeURIComponent(id)}`;
@@ -82,7 +96,7 @@ function requestOutcome(record) {
 }
 const landedItems=new Set(),landingAnimations=new Set(),terminalRequests=new Map();
 let landedRun=null;
-const inProgress=status=>['running','queued','reserved','stopping'].includes(status);
+const inProgress=status=>[RUN.RUNNING,RUN.QUEUED,'reserved',RUN.STOPPING].includes(status);
 function cancelLandings(root=null) {
   for(const animation of landingAnimations)if(!root||root.contains(animation.effect.target)){animation.cancel();landingAnimations.delete(animation);}
 }
@@ -254,7 +268,7 @@ function renderMosaic(records,{budget=records.length,live=false,budgetUsed=recor
   const bySlot=new Map(records.map((r,i)=>[liveBudget?r.slot:i,r]));
   // Request slots are compact dispatch IDs; unsent offers occupy the remaining budget.
   const sent=Math.max(attempted,live?records.reduce((count,r)=>Math.max(count,r.slot+1),0):records.length),droppedEnd=Math.min(budgetUsed,sent+droppedOffers);
-  const statuses=['pass','fail','timeout','cancelled','skipped','inconclusive',...(live?['running','queued',...(countOnly?[]:['reserved','idle'])]:[])];
+  const statuses=['pass','fail','timeout','cancelled','skipped','inconclusive',...(live?[RUN.RUNNING,RUN.QUEUED,...(countOnly?[]:['reserved','idle'])]:[])];
   return `<section class="request-viz"><div class="viz-heading"><h2>${liveBudget&&!countOnly?'Request budget':'Requests'}</h2><span class="mono hint">${countOnly?`${number(total)} started · ${number(records.length)} in live window`:`${number(records.length)} ${live?'started':'recorded'}`}${live&&droppedOffers?` · ${number(droppedOffers)} dropped before sending`:''}</span>${liveBudget&&pages>1?`<span class="mosaic-live-controls">${state.mosaicFollow!==false?'<span class="mosaic-following">Following live</span>':`<span class="hint">Live on requests ${liveOffset+1}–${Math.min(total,liveOffset+mosaicPageSize)}</span><button class="text-button mosaic-live" data-action="mosaic-live">Back to live</button>`}</span>`:''}</div><div class="mosaic-scroll"><svg class="request-mosaic${live?' is-live':''}${entrance?' is-entering':''}" viewBox="0 0 ${geometry.width} ${geometry.height}" style="--mosaic-w:${geometry.width}px;--spot-round:${geometry.round}" data-columns="${geometry.columns}" role="group" aria-label="${live?countOnly||filtered?'Live requests':'Live request budget':'Recorded requests'}. Arrow keys move between spots.">${geometry.cells.map((points,i)=>{
     const slot=offset+i,r=bySlot.get(slot);if(countOnly&&!r)return '';
     const dropped=!r&&slot>=sent&&slot<droppedEnd,status=r?requestStatus(r):dropped?'skipped':slot<sent?'inconclusive':slot<budgetUsed?displayStatus('reserved'):'idle',current=live&&status==='running'&&slot===frontier,label=r?requestLabel(r,records,undefined,positions):dropped?`Budget slot ${slot+1}: Not run · dropped before sending`:status!=='idle'?`Budget slot ${slot+1}: ${statusLabels[status]}, request evidence unavailable`:`Budget slot ${slot+1}: not used`;
@@ -292,7 +306,7 @@ function conditionStatus(summary,{live=false,failed=0,started=0,completed=0,pass
     else if(completed&&passed===completed)status='passed';
     else status=live&&!started?'waiting':'inconclusive';
   }
-  if(!live&&['running','waiting'].includes(status))status=state.detail?.state==='cancelled'?'cancelled':'inconclusive';
+  if(!live&&[RUN.RUNNING,'waiting'].includes(status))status=state.detail?.state==='cancelled'?'cancelled':'inconclusive';
   return aliases[status] || status;
 }
 function conditionProgress(view) {
@@ -770,7 +784,7 @@ function setActive(id) {
   state.active=id || null;
   updateTitle();
   const link=$('#active-run-link');link.hidden=!id;link.href=id?linkRun(id):'#runs';
-  const html=id?`${badge('running','Run in progress',{state:'running'})}<span aria-hidden="true"> →</span>`:'';if(link.innerHTML!==html)link.innerHTML=html;
+  const html=id?`${badge(RUN.RUNNING,'Run in progress',{state:RUN.RUNNING})}<span aria-hidden="true"> →</span>`:'';if(link.innerHTML!==html)link.innerHTML=html;
 }
 function updateNav(section, label) {
   renderRailRuns();
@@ -927,7 +941,7 @@ let spotTipTarget=null,spotTipPosition=null;
 function showSpotTip(target,x,y) {
   const tip=$('#spot-tip'),label=target?.getAttribute('aria-label');if(!tip||!label)return;
   spotTipTarget=target;spotTipPosition={x,y};
-  const outcome=['pass','fail','timeout','cancelled','skipped','inconclusive','running','queued','reserved','stopping','idle'].find(name=>target.classList.contains(name)) || 'idle';
+  const outcome=['pass','fail','timeout','cancelled','skipped','inconclusive',RUN.RUNNING,RUN.QUEUED,'reserved',RUN.STOPPING,'idle'].find(name=>target.classList.contains(name)) || 'idle';
   const split=label.indexOf('. Request '),head=split<0?label:label.slice(0,split),rest=split<0?[]:[label.slice(split+2)];
   tip.innerHTML=`<span class="status-icon" aria-hidden="true">${statusIcons[outcome]}</span><span><strong>${escape(head.replace(/[.:]$/,''))}</strong>${rest.length?`<small>${escape(rest.join(' ').replace(/\.\s+/g,' · ').replace(/\.$/,''))}</small>`:''}</span>`;
   tip.hidden=false;
@@ -1007,7 +1021,7 @@ async function pollRuns(version) {
 async function pollRunStatus(version,{schedule=true}={}) {
   const id=state.active;if(!id)return;let delay=300;
   try{
-    if(state.statusRun?.id!==id)state.statusRun={id,state:'running',seq:0};
+    if(state.statusRun?.id!==id)state.statusRun={id,state:RUN.RUNNING,seq:0};
     const delta=await runEvents(id,state.statusRun.seq);
     if(version!==state.routeVersion||state.active!==id)return;
     if(delta.reset||delta.idle)delay=1800;
@@ -1033,17 +1047,17 @@ async function pollDetail(version) {
   try {
     const delta=await runEvents(id,state.detail.seq);if(version!==state.routeVersion || state.detail?.id!==id || sequence<lastDetailSequence||reportRouteKey()!==key)return;
     if(!activeState(state.detail)&&activeState({state:delta.state}))return;
-    const wasStopping=state.detail.state==='stopping';
+    const wasStopping=state.detail.state===RUN.STOPPING;
     let detail=delta.reset?reconcileRunDetail(await fetchRunDetail(id,{handoff:true})):mergeRunEvents(state.detail,delta);
     if(version!==state.routeVersion || state.detail?.id!==id || sequence<lastDetailSequence||reportRouteKey()!==key)return;
     const completed=!activeState(detail);
     if(completed&&!delta.reset){detail=reconcileRunDetail(await fetchRunDetail(id,{handoff:true}));if(version!==state.routeVersion||state.detail?.id!==id||sequence<lastDetailSequence||reportRouteKey()!==key)return;}
-    if(wasStopping&&activeState(detail))detail.state='stopping';
-    if(['running','queued'].includes(detail.state)&&(epoch!==detailEpoch||state.stopPending?.id===id)){
+    detail.state=nextLiveRunState(wasStopping?RUN.STOPPING:null,detail.state);
+    if([RUN.RUNNING,RUN.QUEUED].includes(detail.state)&&(epoch!==detailEpoch||state.stopPending?.id===id)){
       schedulePoll(pollDetail,version,500);return;
     }
     if(!activeState(state.detail)&&activeState(detail))return;
-    if(state.detail.state==='stopping'&&['running','queued'].includes(detail.state))detail.state='stopping';
+    detail.state=nextLiveRunState(state.detail.state,detail.state);
     lastDetailSequence=sequence;
     if(state.liveError?.id===id&&sequence>state.liveError.sequence)state.liveError=null;
     const focused=document.activeElement,slot=focused?.dataset?.liveSlot,action=focused?.dataset?.action,autoFocused=slot!==undefined&&slot===state.mosaicAutoFocus,summaryFocus=focused?.tagName==='SUMMARY'&&Boolean(focused.closest?.('.all-requests'));
@@ -1057,8 +1071,9 @@ async function pollDetail(version) {
 }
 function suiteList() { return `<ol class="suite-list">${(state.bootstrap.checks || []).map((c,i)=>`<li><span class="index">${String(i+1).padStart(2,'0')}</span><span>${escape(c.title)}</span>${c.optional?'<small>OPT</small>':''}</li>`).join('')}</ol>`; }
 function runOutcome(run) {
-  if(run.state==='cancelled'||run.state==='completed'&&(run.abort_reason||run.report?.abort_reason||run.summary?.abort_reason))return 'stopped';
-  return activeState(run)||['error','failed','cancelled','interrupted'].includes(run.state)?run.state:run.overall || run.state;
+  // Legacy saved runs can still have cancelled or failed lifecycle states.
+  if(run.state==='cancelled'||run.state===RUN.COMPLETED&&(run.abort_reason||run.report?.abort_reason||run.summary?.abort_reason))return 'stopped';
+  return activeState(run)||[RUN.ERROR,'failed','cancelled',RUN.INTERRUPTED].includes(run.state)?run.state:run.overall || run.state;
 }
 function filteredRuns() {
   const query=state.historySearch.trim().toLowerCase();
@@ -1145,7 +1160,7 @@ function renderRuns() {
     return;
   }
   const runs=filteredRuns();
-  $('#main').innerHTML=`<div class="page-heading"><h1>Runs</h1><a class="button primary" href="#new">${icon('plus')} New run</a></div>${storageLine()}${cleanupResultNotice()}${renderOutcomeStrip()}<div class="history-chips" aria-label="Filter runs">${['all','pass','fail','inconclusive','blocked','skipped','active','stopped','interrupted','error'].filter(status=>status==='all'||status===state.filter||state.runs.some(r=>(activeState(r)?'active':runOutcome(r))===status)).map(status=>`<button class="filter-chip" data-run-filter="${status}" aria-pressed="${state.filter===status}">${status==='all'?'All runs':status==='active'?'Running':statusLabels[status]}</button>`).join('')}</div>
+  $('#main').innerHTML=`<div class="page-heading"><h1>Runs</h1><a class="button primary" href="#new">${icon('plus')} New run</a></div>${storageLine()}${cleanupResultNotice()}${renderOutcomeStrip()}<div class="history-chips" aria-label="Filter runs">${['all','pass','fail','inconclusive','blocked','skipped','active','stopped',RUN.INTERRUPTED,RUN.ERROR].filter(status=>status==='all'||status===state.filter||state.runs.some(r=>(activeState(r)?'active':runOutcome(r))===status)).map(status=>`<button class="filter-chip" data-run-filter="${status}" aria-pressed="${state.filter===status}">${status==='all'?'All runs':status==='active'?'Running':statusLabels[status]}</button>`).join('')}</div>
   <div class="history-layout history-focused"><section class="panel"><div class="section-heading"><div class="history-tools"><label class="history-search"><span class="sr-only">Search runs</span><input id="run-search" type="search" placeholder="Search runs" value="${escape(state.historySearch)}" autocomplete="off"></label><div class="filter-group"><label class="sr-only" for="run-filter">Filter run status</label><select id="run-filter" aria-label="Filter run status"><option value="all">All outcomes</option><option value="fail">Failed</option><option value="pass">Passed</option><option value="inconclusive">Inconclusive</option><option value="blocked">Blocked</option><option value="skipped">Not run</option><option value="active">Active</option><option value="stopped">Stopped</option><option value="interrupted">Interrupted</option><option value="error">Runner error</option></select></div></div></div>
   ${runs.length?`<div class="history-table"><table aria-label="Saved endpoint runs"><thead><tr><th>Model</th><th>Outcome</th><th>Started</th><th><span class="sr-only">Open run</span></th></tr></thead><tbody>${runs.map(r=>{
     const targets=r.targets || [],model=targets.map(t=>t.model).filter(Boolean).join(', ') || 'Unknown model';
@@ -1991,13 +2006,13 @@ function renderScaleDownControl(detail) {
   const control=detail.scale_down_control;if(!control)return '';
   const local=state.scaleDownSubmission?.id===detail.id?state.scaleDownSubmission:null,ack=control.acknowledgment?.accepted===true?control.acknowledgment:local?.ack||control.acknowledgment;
   const standalone=detail.stoppable===false&&activeState(detail);
-  const active=detail.stoppable!==false&&detail.state==='running'&&control.phase==='armed'&&!ack?.accepted;
+  const active=detail.stoppable!==false&&detail.state===RUN.RUNNING&&control.phase==='armed'&&!ack?.accepted;
   const message=control.phase==='finished'?'Finished. See the results below.':ack?.accepted?'Marker accepted. Remove the replica if you have not already; Giraffe is waiting for backend lifecycle evidence.':control.phase==='finalizing'?'Collecting final evidence.':control.phase==='armed'?'Armed: mark the removal, then remove the replica externally.':'Waiting for an active answer stream before arming.';
   return `<section class="panel" id="scale-down-control" data-live-key="scale-down-control"><h2>Scale-down continuity · ${escape(human(control.phase))}</h2><div class="field-label"><p>${escape(message)}</p>${infoHelp('scale_down_control_help','About scale-down marking','Only real answer streams arm this scenario. Remove the replica externally. A marker is not backend confirmation; final results require lifecycle evidence and sufficient overlap.')}</div>${standalone?'<p class="hint">This run is owned by a standalone CLI process. Mark the removal with <code>giraffe mark-scale-down &lt;run-directory&gt; --event-id &lt;unique-event-id&gt;</code>, using the active run directory and a unique event ID.</p>':''}${active?`<div class="fields">${field('scale_down_replica_marker','Intended replica incarnation (optional)',local?.marker?.replica_id||'',{})}${field('scale_down_marker_source','Operator source',local?.marker?.source||'browser',{})}</div><button type="button" class="button" data-action="mark-scale-down" ${local?.pending?'disabled':''}>${local?.pending?'Submitting…':'Mark removal'}</button>`:''}<p role="status" aria-live="polite">${ack?`${ack.accepted===true?'Accepted':'Rejected'}: ${escape(ack.reason||(ack.accepted===true?'Removal marker recorded.':'Marker was not accepted.'))}`:local?.error?escape(local.error):'No marker accepted.'}</p></section>`;
 }
 async function markScaleDown() {
   const detail=state.detail,control=detail?.scale_down_control,version=state.routeVersion;
-  if(detail?.stoppable===false||detail?.state!=='running'||control?.phase!=='armed'||(state.scaleDownSubmission?.id===detail.id&&state.scaleDownSubmission.pending))return;
+  if(detail?.stoppable===false||detail?.state!==RUN.RUNNING||control?.phase!=='armed'||(state.scaleDownSubmission?.id===detail.id&&state.scaleDownSubmission.pending))return;
   const previous=state.scaleDownSubmission?.id===detail.id?state.scaleDownSubmission:null;
   const marker=previous?.retrySameMarker&&previous.marker?.nonce===control.nonce?previous.marker:{event_id:globalThis.crypto?.randomUUID?.()||`browser-${Date.now()}-${Math.random().toString(16).slice(2)}`,nonce:control.nonce,target:control.target,replica_id:$('#field-scale_down_replica_marker')?.value?.trim()||null,source:$('#field-scale_down_marker_source')?.value?.trim()||'browser',operator_at:new Date().toISOString()};
   state.scaleDownSubmission={id:detail.id,pending:true,marker};renderLive();
@@ -2009,7 +2024,7 @@ async function markScaleDown() {
     const message=retrySameMarker?`Acknowledgment unavailable: ${error.message}. Retry to check the same marker.`:`Marker rejected: ${error.message}${error.status===422?'. Correct the fields and submit again.':''}`;
     if(state.scaleDownSubmission?.id===detail.id)state.scaleDownSubmission={id:detail.id,marker,retrySameMarker,error:message};
   }
-  if(state.reportRouteActive&&version===state.routeVersion&&reportRoute()?.id===detail.id&&state.detail?.id===detail.id&&state.detail.state==='running')renderLive();
+  if(state.reportRouteActive&&version===state.routeVersion&&reportRoute()?.id===detail.id&&state.detail?.id===detail.id&&state.detail.state===RUN.RUNNING)renderLive();
 }
 
 const loadSizes=['short','medium','long'];
@@ -2339,7 +2354,7 @@ function editUserRecall(action) {
   }
   else if(action==='user-remove-recall-turn'&&turns.length>bounds.minItems)turns.pop();
   else return;
-  configChanged();state.jsonDraft=null;state.jsonBase=null;renderNew();
+  configChanged();resetJsonDraft();renderNew();
   $(`#field-multi_user_conversation_turn_${turns.length-1}`)?.focus({preventScroll:true});
 }
 
@@ -2362,7 +2377,7 @@ function editUserConversation(action,index) {
     if(action==='user-remove-turn'&&task.turns.length>2)task.turns.pop();
     if(action==='user-remove-task')tasks.splice(position,1);
   }
-  configChanged();state.jsonDraft=null;state.jsonBase=null;renderNew();
+  configChanged();resetJsonDraft();renderNew();
 }
 
 function renderMultiUserResults(summary) {
@@ -2443,7 +2458,7 @@ function editSessionWorkload(action,index) {
     if(action==='add-session-turn'&&item.turns.length<state.bootstrap.limits['sessions.workloads[].turns'].maxItems)item.turns.push('Build on your previous answer and explain the next step in detail.');
     if(action==='remove-session-turn'&&item.turns.length>state.bootstrap.limits['sessions.workloads[].turns'].minItems)item.turns.pop();
   }
-  configChanged();state.jsonDraft=null;state.jsonBase=null;renderNew();
+  configChanged();resetJsonDraft();renderNew();
   state.openTest='sessions';syncTestControls();
   const advanced=$('#setup-advanced');if(advanced)advanced.open=true;
   const taskIndex=settings.workloads.findIndex(item=>item.name===taskName);
@@ -2698,7 +2713,7 @@ function saveEvaluator(event) {
     const judging=readEvaluatorDraft(false);
     const names=judging.judges.map(judge=>judge.name).filter(Boolean);
     if(new Set(names).size!==names.length)throw new Error('Evaluator names must be unique.');
-    state.config.judging=clone(judging);state.jsonDraft=null;state.jsonBase=null;
+    state.config.judging=clone(judging);resetJsonDraft();
     configChanged();refreshQuestionSetupSummary();finishEvaluator();
   }catch(error){evaluatorError(error.message);}
 }
@@ -2870,7 +2885,7 @@ async function applyDataset(pack,{guard=()=>true,clearSelection=false,validated=
     if(version!==state.routeVersion||revision!==state.configRevision)throw new Error('Configuration changed. Review the questions and try again.');
     assertAppliedConfig();state.config.request_source='request_pack';state.config.request_pack=normalized;
     state.datasetSelection=clearSelection?[]:state.datasetSelection.filter(id=>datasetCases().some(item=>item.fixture_id===id));
-    state.jsonDraft=null;state.jsonBase=null;configChanged();refreshQuestionSetupSummary();return true;
+    resetJsonDraft();configChanged();refreshQuestionSetupSummary();return true;
   }catch(error){if(questionDatasetOperation!==operation||!guard())return false;throw error;}
   finally{if(questionDatasetOperation===operation){questionDatasetOperation=null;state.configBusy=false;}}
 }
@@ -3031,7 +3046,8 @@ function currentRequestPlan() {
   return !hasJsonChanges()&&saved?.status==='current'&&saved.revision===state.configRevision&&saved.route===state.routeVersion?saved.plan:null;
 }
 function canStartRun() {
-  return Boolean(currentRequestPlan())&&!currentSettingErrors().length&&!currentResourceErrors().length&&!state.submitting&&!state.configBusy&&!state.active&&state.modelDiscovery?.status!=='pending'&&tokenizerSetupReady();
+  const pending=state.connectionTestsInFlight>0||(state.modelDiscovery?.status===DISCOVERY.PENDING&&currentDiscovery()===state.modelDiscovery);
+  return Boolean(currentRequestPlan())&&!currentSettingErrors().length&&!currentResourceErrors().length&&!state.submitting&&!state.configBusy&&!state.active&&!pending&&tokenizerSetupReady();
 }
 function renderReviewPassCriteria(config) {
   if(!config?.limits||!state.bootstrap?.checks)return '';
@@ -3181,7 +3197,7 @@ function changeRequestSource(source,{remove=false}={}) {
   try{
     assertAppliedConfig();
     captureFormDraft();state.config.request_source=source;if(remove)state.config.request_pack=null;
-    configChanged();state.jsonDraft=null;state.jsonBase=null;refreshQuestionSetupSummary();updateBounds();
+    configChanged();resetJsonDraft();refreshQuestionSetupSummary();updateBounds();
     $(`[name="request_source"][value="${source}"]`)?.focus({preventScroll:true});
   }catch(error){configError(error);}
 }
@@ -3387,19 +3403,23 @@ function modelDiscoveryKey() {
     deployment:{discovery:state.config?.targets?.[0]?.deployment?.discovery || 'none'},
     ca_bundle:state.config?.ca_bundle || null,proxy:state.config?.proxy || null,request_options:state.config?.request_options || {}});
 }
+function currentDiscovery(){
+  const d=state.modelDiscovery;
+  return d?.key===modelDiscoveryKey()&&(d.status!==DISCOVERY.PENDING||d.route===state.routeVersion)?d:null;
+}
 function invalidateModelDiscovery() {
   state.modelDiscoverySequence++;state.modelDiscovery=null;renderModelDiscovery();scheduleTokenizerSelection();
 }
 function renderModelDiscovery() {
   const status=$('#model-discovery-status'),button=$('[data-action="test-connection"]');
   if(!status||!button)return;
-  if(state.modelDiscovery?.status==='pending'&&state.modelDiscovery.route!==state.routeVersion)state.modelDiscovery=null;
-  const discovery=state.modelDiscovery?.key===modelDiscoveryKey()?state.modelDiscovery:null;
+  if(state.modelDiscovery?.status===DISCOVERY.PENDING&&state.modelDiscovery.route!==state.routeVersion)state.modelDiscovery=null;
+  const discovery=currentDiscovery();
   const model=$('#new-run-form')?.elements.model.value.trim();
-  button.disabled=discovery?.status==='pending'||hasJsonChanges();button.textContent=discovery?.status==='pending'?'Connecting…':discovery?.status==='connected'?'Reconnect':'Connect';button.classList.toggle('handshaking',discovery?.status==='pending');
+  button.disabled=discovery?.status===DISCOVERY.PENDING||hasJsonChanges();button.textContent=discovery?.status===DISCOVERY.PENDING?'Connecting…':discovery?.status===DISCOVERY.CONNECTED?'Reconnect':'Connect';button.classList.toggle('handshaking',discovery?.status===DISCOVERY.PENDING);
   button.classList.toggle('primary',!model);button.classList.toggle('small',Boolean(model));button.title='Sends one short request (32-token limit).';
   status.textContent=discovery?.message || '';
-  status.classList.toggle('error',discovery?.status==='error');status.classList.toggle('connected',discovery?.status==='connected');status.classList.toggle('unverified',discovery?.status==='unverified');
+  status.classList.toggle('error',discovery?.status===DISCOVERY.ERROR);status.classList.toggle('connected',discovery?.status===DISCOVERY.CONNECTED);status.classList.toggle('unverified',discovery?.status===DISCOVERY.UNVERIFIED);
   const choice=$('#connection-model-choice'),manual=$('#manual-model-field'),options=$('#model-options');
   const models=discovery?.models || [];
   if(choice){
@@ -3408,10 +3428,10 @@ function renderModelDiscovery() {
     choice.hidden=models.length<2;choice.previousElementSibling.hidden=models.length<2;
     manual.hidden=models.length>1&&value!=='__manual__'&&(!value||models.includes(value));
   }
-  if(discovery?.status==='needs_model'&&options)options.open=true;
-  const connectionOptions=$('#connection-options');if(connectionOptions&&['needs_model','error'].includes(discovery?.status))connectionOptions.open=true;
-  const label=$('#model-options-label');if(label)label.textContent=discovery?.status==='needs_model'?`Giraffe found ${models.length} models. Choose one.`:['connected','unverified'].includes(discovery?.status)?'Found on your server.':discovery?.status==='error'?'Type the exact model name to continue without a check.':discovery?.status==='pending'?'Looking for models…':model?'Typed by you. Connecting first is optional.':'Found when you connect, or type the exact name.';
-  const auth=$('#connection-auth');if(auth&&discovery?.status==='error'&&/key|401|403|unauthor/i.test(discovery.message || ''))auth.open=true;
+  if(discovery?.status===DISCOVERY.NEEDS_MODEL&&options)options.open=true;
+  const connectionOptions=$('#connection-options');if(connectionOptions&&[DISCOVERY.NEEDS_MODEL,DISCOVERY.ERROR].includes(discovery?.status))connectionOptions.open=true;
+  const label=$('#model-options-label');if(label)label.textContent=discovery?.status===DISCOVERY.NEEDS_MODEL?`Giraffe found ${models.length} models. Choose one.`:DISCOVERY_USABLE.includes(discovery?.status)?'Found on your server.':discovery?.status===DISCOVERY.ERROR?'Type the exact model name to continue without a check.':discovery?.status===DISCOVERY.PENDING?'Looking for models…':model?'Typed by you. Connecting first is optional.':'Found when you connect, or type the exact name.';
+  const auth=$('#connection-auth');if(auth&&discovery?.status===DISCOVERY.ERROR&&/key|401|403|unauthor/i.test(discovery.message || ''))auth.open=true;
   syncSetupStep();
 }
 async function testConnection() {
@@ -3420,24 +3440,27 @@ async function testConnection() {
   url?.setCustomValidity(url.value.trim()?'':'Enter an endpoint URL.');
   if(!url?.checkValidity()){url?.reportValidity();return;}
   const key=modelDiscoveryKey(),sequence=++state.modelDiscoverySequence,route=state.routeVersion;
-  state.modelDiscovery={key,route,status:'pending',models:[],message:'Checking your endpoint. A model may take a moment to load…'};renderModelDiscovery();
+  state.connectionTestsInFlight++;
+  state.modelDiscovery={key,route,status:DISCOVERY.PENDING,models:[],message:'Checking your endpoint. A model may take a moment to load…'};renderModelDiscovery();
   try{
     const api_key=apiKeyFor(url.value);
     const result=await api('/api/targets/test-connection',{method:'POST',body:JSON.stringify({...JSON.parse(key),...(state.autoModel&&state.autoModel===JSON.parse(key).model?{discovered:true}:{}),...(api_key?{api_key}:{})})});
     if(sequence!==state.modelDiscoverySequence||route!==state.routeVersion||key!==modelDiscoveryKey())return;
-    if(['connected','unverified'].includes(result.status)){
+    if(DISCOVERY_USABLE.includes(result.status)){
       if(!JSON.parse(key).model)state.autoModel=result.model;
       form.elements.model.value=result.model;form.elements.model.setCustomValidity('');
       state.config.targets[0].model=result.model;
       configChanged();updateBounds();
     }
-    state.modelDiscovery={key:modelDiscoveryKey(),route,status:result.status,models:result.models || [],message:result.status==='connected'?`Connected · ${result.model}${result.latency_ms==null?' · latency unavailable':` · ${ms(result.latency_ms)}`}`:result.message};
+    state.modelDiscovery={key:modelDiscoveryKey(),route,status:result.status,models:result.models || [],message:result.status===DISCOVERY.CONNECTED?`Connected · ${result.model}${result.latency_ms==null?' · latency unavailable':` · ${ms(result.latency_ms)}`}`:result.message};
     renderModelDiscovery();scheduleTokenizerSelection({immediate:true});
-    if(result.status==='connected')$('#model-options').open=false;
-    if(result.status==='needs_model')(result.models?.length>1?$('#connection-model-choice'):form.elements.model)?.focus();
+    if(result.status===DISCOVERY.CONNECTED)$('#model-options').open=false;
+    if(result.status===DISCOVERY.NEEDS_MODEL)(result.models?.length>1?$('#connection-model-choice'):form.elements.model)?.focus();
   }catch(error){
     if(sequence!==state.modelDiscoverySequence||route!==state.routeVersion||key!==modelDiscoveryKey())return;
-    state.modelDiscovery={key,route,status:'error',models:[],message:error.message};renderModelDiscovery();
+    state.modelDiscovery={key,route,status:DISCOVERY.ERROR,models:[],message:error.message};renderModelDiscovery();
+  }finally{
+    state.connectionTestsInFlight--;syncSetupStep();
   }
 }
 function renderPlanBounds(config,className='workload-bounds') {
@@ -4229,7 +4252,8 @@ async function loadPerformance({force=false}={}) {
   if(reportView.pending){if(force)reportView.again=true;return;}
   const now=Date.now();if(!force&&(reportView.performance||reportView.lastFetch))return;
   const t=reportToken(),id=state.detail.id,version=state.routeVersion,sequence=++reportView.sequence,target=reportView.target,window=reportView.window;
-  reportView.pending=true;reportView.lastFetch=now;
+  reportView.pending=true;reportView.error='';reportView.lastFetch=now;
+  if(state.reportRouteActive)renderDetail();
   const params=Object.entries({target,window}).filter(([,value])=>value!=null).map(([key,value])=>`${key}=${encodeURIComponent(value)}`).join('&');
   try{
     const value=await api(`${runPath(id)}/performance${params?'?'+params:''}`);
@@ -4289,8 +4313,8 @@ function renderDetail() {
   state.reportRouteActive=true;
   const d=state.detail;
   syncReportView();
-  if(state.liveError&&(state.liveError.id!==d.id||d.state==='stopping'||!activeState(d)))state.liveError=null;
-  if(state.stopPending&&(state.stopPending.id!==d.id||d.state==='stopping'||!activeState(d)))state.stopPending=null;
+  if(state.liveError&&(state.liveError.id!==d.id||d.state===RUN.STOPPING||!activeState(d)))state.liveError=null;
+  if(state.stopPending&&(state.stopPending.id!==d.id||d.state===RUN.STOPPING||!activeState(d)))state.stopPending=null;
   if(!activeState(d)){
     cancelLandings();hideSpotTip();renderRailRuns();
     if(state.liveRendered===d.id){const dialog=$('#request-dialog');if(dialog?.open){dialog.close();dialog.innerHTML='';}state.liveRendered=null;}
@@ -4307,21 +4331,21 @@ function renderDetail() {
   const required=checks.filter(c=>c.required);
   const memoryInterrupted=report.observations?.resources?.memory_interrupted_checks || [];
   const requiredMemoryInterrupted=required.some(c=>memoryInterrupted.some(item=>item.target===c.target&&item.id===c.id));
-  const absolute=d.state==='error'?'error':checks.some(c=>c.status==='fail')?'fail':requiredMemoryInterrupted?'inconclusive':required.some(c=>c.status==='blocked')?'blocked':report.abort_reason||!required.length||required.some(c=>c.status==='inconclusive')||required.some(c=>c.status==='skipped'&&!unselectedCheck(c,report))?'inconclusive':required.every(c=>c.status==='skipped')?'skipped':'pass';
-  const completePass=d.state==='completed'&&!report.abort_reason&&report.overall==='pass'&&checks.some(c=>c.status==='pass')&&checks.every(c=>c.status==='pass'||c.required===false&&c.status==='inconclusive'||unselectedCheck(c,report));
+  const absolute=d.state===RUN.ERROR?'error':checks.some(c=>c.status==='fail')?'fail':requiredMemoryInterrupted?'inconclusive':required.some(c=>c.status==='blocked')?'blocked':report.abort_reason||!required.length||required.some(c=>c.status==='inconclusive')||required.some(c=>c.status==='skipped'&&!unselectedCheck(c,report))?'inconclusive':required.every(c=>c.status==='skipped')?'skipped':'pass';
+  const completePass=d.state===RUN.COMPLETED&&!report.abort_reason&&report.overall==='pass'&&checks.some(c=>c.status==='pass')&&checks.every(c=>c.status==='pass'||c.required===false&&c.status==='inconclusive'||unselectedCheck(c,report));
   const savedBaseline=(state.baselines || []).find(item=>item.run_id===d.id);
   const entering=state.enteredRun!==d.id;state.enteredRun=d.id;
-  const compareButton=d.state==='completed'?`<button class="button" data-action="compare-saved">${report.baseline?'Change baseline':'Compare with baseline'}</button>`:'';
+  const compareButton=d.state===RUN.COMPLETED?`<button class="button" data-action="compare-saved">${report.baseline?'Change baseline':'Compare with baseline'}</button>`:'';
   patchHTML($('#main'),`<div class="page-heading result-heading ${absolute}${entering?' is-entering':''}"><div><div class="eyebrow">Run <span class="mono">${escape(d.id)}</span></div><h1>${escape(absolute==='error'?'Run could not finish':mainFinding(report))}</h1>${renderGuidance(report,d)}<div class="run-meta"><span><strong>${escape((config.targets || []).map(t=>t.model).join(', '))}</strong></span><span>${date(report.started_at)}</span><span>${duration(report)}</span><span>${number(report.requests.length)} requests recorded</span></div><p class="hint">${escape((config.targets || []).map(t=>t.url).filter(Boolean).join(' · '))}</p></div><div class="actions">${savedBaseline?`<p class="baseline-saved"><span aria-hidden="true">✓</span> Saved as baseline <strong>${escape(savedBaseline.name)}</strong></p>`:''}${resultActions(report,{completePass,savedBaseline})}<button class="button" data-action="rerun">${icon('repeat')} Run again</button>${compareButton}</div></div>
   ${renderBaselineSummary(report,absolute)}
-  ${d.error?notice(d.error,d.state==='error'?'error':'warning'):''}${storageOmission(report)}${d.auto_cleanup?.deleted?.length?notice(`Automatic cleanup deleted runs: ${d.auto_cleanup.deleted.map(escape).join(', ')}`):''}${renderReportToolbar()}${renderPerformance()}
+  ${d.error?notice(d.error,d.state===RUN.ERROR?'error':'warning'):''}${storageOmission(report)}${d.auto_cleanup?.deleted?.length?notice(`Automatic cleanup deleted runs: ${d.auto_cleanup.deleted.map(escape).join(', ')}`):''}${renderReportToolbar()}${renderPerformance()}
   <section id="report-results" role="tabpanel" aria-labelledby="tab-results" data-live-key="report-results" ${reportView.tab==='results'?'':'hidden'}>${renderResultsJump()}
   <section id="results-checks" class="report-result-section"><section id="result-content">${renderChecks(report)}</section></section>
   <details id="report-baseline-reference" class="report-reference report-result-section comparison-container" ${report.baseline||state.tab==='baseline'?'open':''}><summary><h2>Baseline comparison</h2></summary><div id="baseline-content" data-comparison-scope="results">${renderComparison(report)}</div></details>
   <section id="results-configuration" class="report-result-section"><details id="report-config-reference" class="report-reference" ${state.tab==='config'?'open':''}><summary><h2>Run configuration</h2></summary>${renderConfig(report)}</details></section>
   <details class="report-reference condition-reference"><summary>Test conditions</summary>${renderTests(report.requests,{report})}</details>
   <section id="results-requests" class="report-result-section">${renderAllRequests(orderedRequests(report))}</section><section id="results-resources" class="report-result-section">${renderDiagnostics(report,d)}</section></section>
-  <div class="actions" style="margin-top:24px">${keepButton()}<a class="button small" href="${runPath(d.id)}/report.html" download>Download HTML report</a><a class="button small" href="${runPath(d.id)}/report.json" download>Download JSON</a>${savedBaseline?`<button class="button small" data-action="compare-run">Compare a new run with this baseline</button><button class="button small" data-action="baseline-dialog">Save again under another name</button>`:!completePass&&d.state==='completed'?'<button class="button small" data-action="baseline-dialog">Save as reference baseline</button>':''}</div>`);
+  <div class="actions" style="margin-top:24px">${keepButton()}<a class="button small" href="${runPath(d.id)}/report.html" download>Download HTML report</a><a class="button small" href="${runPath(d.id)}/report.json" download>Download JSON</a>${savedBaseline?`<button class="button small" data-action="compare-run">Compare a new run with this baseline</button><button class="button small" data-action="baseline-dialog">Save again under another name</button>`:!completePass&&d.state===RUN.COMPLETED?'<button class="button small" data-action="baseline-dialog">Save as reference baseline</button>':''}</div>`);
   syncAllRequestsFilter();syncPerformanceSelection();syncComparisonFilters();refreshConditionDialog();loadFindingEvidence();
 }
 function renderDiagnostics(report,detail) {
@@ -4467,7 +4491,7 @@ function renderChecks(report) {
   };
   const available=checkGroups.flatMap(group=>group.checks).filter(id=>!state.bootstrap?.checks||state.bootstrap.checks.some(check=>check.id===id));
   const configured=reportConfig(report).checks;
-  const chooseNext=state.detail?.state==='completed'&&state.detail.report&&(Array.isArray(configured)?available.some(id=>!configured.includes(id)):unselected.length>0);
+  const chooseNext=state.detail?.state===RUN.COMPLETED&&state.detail.report&&(Array.isArray(configured)?available.some(id=>!configured.includes(id)):unselected.length>0);
   const notSelected=unselected.length?`<details class="checks-not-selected"><summary>Not selected: ${unselected.map(c=>escape(checkGuide[c.id]?.name || c.title)).join(', ')}</summary><p>No traffic was sent for these checks.</p></details>`:'';
   const nextChecks=chooseNext?`<div class="checks-not-selected-row">${notSelected}<button type="button" class="button" data-action="choose-next-checks">Choose checks for next run</button></div>`:notSelected;
   return `<div class="findings" id="failing-requests" tabindex="-1"><p class="hint check-count">${number(selected.length)} checks · ${number(attention.length)} need attention · ${number(passed.length)} passed</p>${attention.map(item).join('')}${passed.length?`<details class="passed-checks" ${!attention.length||passed.some(c=>`${c.target}:${c.id}`===state.selectedCheck)?'open':''}><summary>Passed checks · ${passed.length}</summary>${passed.map(item).join('')}</details>`:''}${nextChecks}${!selected.length?'<p>No selected checks produced a result.</p>':''}</div>`;
@@ -4729,7 +4753,7 @@ function renderComparison(report,{scope='results'}={}) {
   const warningCount=allRows.filter(row=>comparisonWarnings(row).length).length,acceptance=b.acceptance||{};
   const acceptanceLabel=value=>value?escape(statusLabels[value]||value):'Not recorded';
   const filterRow=row=>(state.comparisonFilter==='all'||(state.comparisonFilter==='with_warnings'?comparisonWarnings(row).length>0:comparisonWarnings(row).length===0))&&(state.comparisonCheck==='all'||row.check===state.comparisonCheck);
-  return `<header id="${sectionPrefix}-comparison" class="comparison-conclusion"><div><p>${number(allRows.length)} measurements · ${number(warningCount)} with warnings</p></div><div class="baseline-reference"><span>Compared with</span>${baselineIdentity(b)}${state.detail?.state==='completed'?'<button class="button small" data-action="compare-saved">Change baseline</button>':''}</div></header><section id="${sectionPrefix}-acceptance" class="comparison-acceptance"><h3>Pass / fail</h3><div><span>Baseline: <strong>${acceptanceLabel(acceptance.baseline)}</strong></span><span>Current: <strong>${acceptanceLabel(acceptance.current)}</strong></span></div><p class="hint">Against each run’s requirements.</p></section>${(b.targets||[]).filter(target=>target.configuration_diff).map(target=>`<section class="comparison-section"><h3>${escape(target.target||target.name||'Target')} · Deployment</h3>${renderDeploymentChange(target.configuration_diff)}</section>`).join('')}${renderLoadAcceptance(b.targets||[],sectionPrefix)}<div class="comparison-filters">${allRows.length?`<div><label for="${filterPrefix}-outcome">Show</label><select id="${filterPrefix}-outcome" data-comparison-filter="outcome"><option value="all">All measurements</option><option value="with_warnings">With warnings</option><option value="without_warnings">Without warnings</option></select></div>${checkIds.length>1?`<div><label for="${filterPrefix}-check">Check</label><select id="${filterPrefix}-check" data-comparison-filter="check"><option value="all">All checks</option>${checkIds.map(id=>`<option value="${escape(id)}">${escape(catalogTitle(id))}</option>`).join('')}</select></div>`:''}`:''}<details class="comparison-support comparison-method"><summary>How comparison is done</summary><p>${escape(b.method||'Not recorded.')}</p></details></div>${(b.targets||[]).flatMap(t=>(t.reasons||[]).map(reason=>`<p class="notice warning">${escape(t.target||'Target')}: ${escape(reason)}</p>`)).join('')}${(b.targets||[]).map((t,targetIndex)=>t.traffic_capacity?`<section class="comparison-section" id="${sectionPrefix}-comparison-traffic-${targetIndex}" tabindex="-1"><h3>${escape(t.target||t.name||'Target')}</h3>${renderTrafficComparison(t.traffic_capacity)}</section>`:'').join('')}${comparisonSections.filter(([id])=>allRows.some(row=>comparisonCategory(row)===id)).map(([id,title])=>{
+  return `<header id="${sectionPrefix}-comparison" class="comparison-conclusion"><div><p>${number(allRows.length)} measurements · ${number(warningCount)} with warnings</p></div><div class="baseline-reference"><span>Compared with</span>${baselineIdentity(b)}${state.detail?.state===RUN.COMPLETED?'<button class="button small" data-action="compare-saved">Change baseline</button>':''}</div></header><section id="${sectionPrefix}-acceptance" class="comparison-acceptance"><h3>Pass / fail</h3><div><span>Baseline: <strong>${acceptanceLabel(acceptance.baseline)}</strong></span><span>Current: <strong>${acceptanceLabel(acceptance.current)}</strong></span></div><p class="hint">Against each run’s requirements.</p></section>${(b.targets||[]).filter(target=>target.configuration_diff).map(target=>`<section class="comparison-section"><h3>${escape(target.target||target.name||'Target')} · Deployment</h3>${renderDeploymentChange(target.configuration_diff)}</section>`).join('')}${renderLoadAcceptance(b.targets||[],sectionPrefix)}<div class="comparison-filters">${allRows.length?`<div><label for="${filterPrefix}-outcome">Show</label><select id="${filterPrefix}-outcome" data-comparison-filter="outcome"><option value="all">All measurements</option><option value="with_warnings">With warnings</option><option value="without_warnings">Without warnings</option></select></div>${checkIds.length>1?`<div><label for="${filterPrefix}-check">Check</label><select id="${filterPrefix}-check" data-comparison-filter="check"><option value="all">All checks</option>${checkIds.map(id=>`<option value="${escape(id)}">${escape(catalogTitle(id))}</option>`).join('')}</select></div>`:''}`:''}<details class="comparison-support comparison-method"><summary>How comparison is done</summary><p>${escape(b.method||'Not recorded.')}</p></details></div>${(b.targets||[]).flatMap(t=>(t.reasons||[]).map(reason=>`<p class="notice warning">${escape(t.target||'Target')}: ${escape(reason)}</p>`)).join('')}${(b.targets||[]).map((t,targetIndex)=>t.traffic_capacity?`<section class="comparison-section" id="${sectionPrefix}-comparison-traffic-${targetIndex}" tabindex="-1"><h3>${escape(t.target||t.name||'Target')}</h3>${renderTrafficComparison(t.traffic_capacity)}</section>`:'').join('')}${comparisonSections.filter(([id])=>allRows.some(row=>comparisonCategory(row)===id)).map(([id,title])=>{
     const rows=allRows.filter(row=>comparisonCategory(row)===id&&filterRow(row)),groups=new Map();
     for(const row of rows){const key=JSON.stringify([row.targetName,row.check,comparisonCohort(row)]);if(!groups.has(key))groups.set(key,[]);groups.get(key).push(row);}
     return `<section id="${sectionPrefix}-${id}" class="comparison-section"><h3>${escape(title)}</h3>${[...groups.values()].map(values=>comparisonGroup(values[0].check,values)).join('')}${!rows.length?'<p class="hint">No measurements match these filters.</p>':''}</section>`;
@@ -4805,12 +4829,12 @@ function renderLive() {
   state.liveRendered=state.detail.id;
   state.mosaicAnimated=state.detail.id;
   const d=state.detail,p=d.progress || {},c=d.config || reportConfig(d.report),events=(d.events || []).filter(e=>!String(e.event || '').startsWith('condition_')),last=events.at(-1) || {},progress={...last,...p};
-  const finished=progress.completed || 0,started=progress.attempted || 0,secs=progress.elapsed_seconds || 0,stopping=d.state==='stopping',stopPending=state.stopPending?.id===d.id;
+  const finished=progress.completed || 0,started=progress.attempted || 0,secs=progress.elapsed_seconds || 0,stopping=d.state===RUN.STOPPING,stopPending=state.stopPending?.id===d.id;
   const judging=progress.phase==='judging'||String(progress.event || '').startsWith('judging_');
   const judgeDone=progress.judge_calls_completed || 0,judgeTotal=progress.judge_calls_total || 0;
   const planned=plannedRequests(d),confirmation=state.stopConfirmation?.id===d.id&&Date.now()<state.stopConfirmation.until;
   const stopReasons=liveStopReasons(d),liveError=state.liveError?.id===d.id?state.liveError.message:'';
-  const title=d.stoppable===false?'Running from the CLI':judging?'Evaluating answers':d.state==='queued'?'Preparing run':'Running';
+  const title=d.stoppable===false?'Running from the CLI':judging?'Evaluating answers':d.state===RUN.QUEUED?'Preparing run':'Running';
   const description=judging?'Target traffic finished. Evaluating generated answers against golden answers; target measurements are frozen.':'One spot per test. Select a spot for its requests and results.';
   const bounds=judging?[['Evaluator concurrency',c.judging?.concurrency],['Evaluation duration',elapsed(c.judging?.max_duration_seconds)],['Judge deadline',elapsed(c.judging?.request_timeout_seconds)],['Judge output cap',`${c.judging?.max_output_tokens} tokens`]]:[['Simultaneous limit',c.concurrency??'Not set'],['Maximum requests',c.max_requests??'Not set'],['Maximum duration',c.max_duration_seconds==null?'Not set':elapsed(c.max_duration_seconds)],['Request timeout',elapsed(c.request_timeout_seconds)],['Maximum output tokens',`${c.max_output_tokens} tokens`]];
   patchHTML($('#main'),`<div class="page-heading"><div><div class="eyebrow">Live run <span class="mono">${escape(d.id)}</span></div><h1>${p.phase==='saving_partial_report'?'Saving partial report…':stopping?'Stopping your check':title}</h1><p>${stopping?'Stopping further work and saving the evidence collected so far.':description}</p><p class="live-progress">${judging?`Evaluation calls · ${number(judgeDone)} of ${number(judgeTotal)}`:`${planned==null?`${number(finished)} requests finished`:`${number(finished)} of ~${number(planned)} planned requests`} · ${elapsed(secs)} · limit ${c.max_requests==null?'not set':number(c.max_requests)}`}</p></div>${d.stoppable===false?'':`<button class="button danger" data-action="stop" aria-label="${confirmation?'Confirm stop run':'Stop run'}" ${stopping||stopPending?'disabled':''}>${icon('stop')}${stopping||stopPending?'Stopping…':confirmation?'Confirm stop':'Stop run'}</button>`}</div>
@@ -4947,7 +4971,7 @@ async function refreshBaselines(read=beginBaselineRead()){
 function mergeBaseline(summary){if(!summary?.id)return;baselineConfirmations.set(summary.id,++baselineConfirmationClock);const index=state.baselines.findIndex(item=>item.id===summary.id);if(index<0)state.baselines.push(summary);else state.baselines[index]=summary;}
 async function openComparisonDialog() {
   const t=reportToken(),id=t.id;
-  if(!id||state.detail.state!=='completed')return;
+  if(!id||state.detail.state!==RUN.COMPLETED)return;
   if(pendingComparisons.has(id)){toast('A comparison is still being saved for this run.');return;}
   const s=++comparisonDialogSequence;
   try {
@@ -5025,14 +5049,14 @@ function scheduleStopConfirmationReset() {
   },Math.max(0,confirmation.until-Date.now()));
 }
 async function confirmStop(){
-  const id=state.detail?.id;if(!activeState(state.detail)||state.detail.stoppable===false||state.detail.state==='stopping')return;
+  const id=state.detail?.id;if(!activeState(state.detail)||state.detail.stoppable===false||state.detail.state===RUN.STOPPING)return;
   const current=state.stopConfirmation,now=Date.now();
   if(current?.id===id&&now<current.until){if(now-current.armedAt<300)return;cancelStopConfirmationTimer({reset:true});await stopRun();return;}
   state.stopConfirmation={id,armedAt:now,until:now+4000};renderDetail();
 }
 
 async function stopRun(){
-  if(!activeState(state.detail)||state.detail.stoppable===false||state.detail.state==='stopping'||state.stopPending?.id===state.detail.id)return;
+  if(!activeState(state.detail)||state.detail.stoppable===false||state.detail.state===RUN.STOPPING||state.stopPending?.id===state.detail.id)return;
   const t=reportToken(),button=$('[data-action="stop"]'),id=state.detail.id,version=state.routeVersion,epoch=++detailEpoch;
   state.liveError=null;state.stopPending={id};button.disabled=true;button.textContent='Stopping…';
   try{
@@ -5040,12 +5064,12 @@ async function stopRun(){
     if(!sameReportVisit(t)||epoch!==detailEpoch)return;
     state.stopPending=null;
     if(!activeState(state.detail))return;
-    if(state.detail.state!=='stopping')state.detail.state=result.state || 'stopping';
+    if(state.detail.state!==RUN.STOPPING)state.detail.state=result.state || RUN.STOPPING;
     renderDetail();schedulePoll(pollDetail,version,500);
   }catch(error){
     if(!sameReportVisit(t)||epoch!==detailEpoch)return;
     state.stopPending=null;
-    if(state.detail.state==='stopping'||!activeState(state.detail))return;
+    if(state.detail.state===RUN.STOPPING||!activeState(state.detail))return;
     state.liveError={id,message:error.message,sequence:detailSequence};
     renderDetail();
   }finally{
@@ -5089,7 +5113,7 @@ async function rerun({step=1,baseline,focusPath=null}={}){
   source=normalizeRateThreshold(source);
   replaceMigrationNotes(notes,warnings,limitNotes);state.config=clone(source);state.gatewayAccessDraft={};state.autoModel=null;state.setupStep=step===2&&source.targets?.length&&source.targets.every(t=>t.model?.trim())?2:1;state.focusSetupOnEntry=state.setupStep===2;
   if(step===2){state.returnToReview=false;state.catalogueFilter='all';state.catalogueCategory='all';state.catalogueSearch='';}
-  invalidateModelDiscovery();state.datasetSelection=[];state.config.restart_target=null;state.formMode='normal';state.formRestartTarget=null;state.jsonDraft=null;state.jsonBase=null;state.configView='form';configChanged();state.prefillBaseline=baseline ?? (detail.baseline_id || '');pendingTimeoutSetting=focusPath;location.hash='#new';
+  invalidateModelDiscovery();state.datasetSelection=[];state.config.restart_target=null;state.formMode='normal';state.formRestartTarget=null;resetJsonDraft();state.configView='form';configChanged();state.prefillBaseline=baseline ?? (detail.baseline_id || '');pendingTimeoutSetting=focusPath;location.hash='#new';
 }
 function portableConfig(payload) {return {...payload.config,restart_target:payload.mode==='cold-start'?payload.restart_target:null};}
 function hasJsonChanges() {return state.jsonDraft!==null&&state.jsonDraft!==state.jsonBase;}
@@ -5173,7 +5197,7 @@ async function applyConfig(text=state.jsonDraft,{importing=false,intent}={}) {
     // An explicit restart target in imported/edited JSON remains visible and intentional.
     state.formMode=result.config.restart_target?'cold-start':'normal';state.formRestartTarget=result.config.restart_target;
     state.config.restart_target=null;
-    state.jsonDraft=null;state.jsonBase=null;configChanged();
+    resetJsonDraft();configChanged();
     renderNew();toast(importing?'Configuration imported.':'Configuration applied.');
   }catch(error){if(!intent||intent.current()){configError(error);if(!importing&&text===state.jsonDraft){state.jsonValidation={draft:text,revision,route:version,errors:error.errors?.length?error.errors:[{fields:['config'],msg:error.message}]};renderRequestPreview();}}}
   finally{state.configBusy=false;}
@@ -5315,8 +5339,8 @@ document.addEventListener('click',async(event)=>{
   const resetSetting=event.target.closest('[data-reset-check-setting]');
   if(resetSetting){try{resetCheckSetting(resetSetting);}catch(error){configError(error);}return;}
   const reset=event.target.closest('[data-reset-test]')?.dataset.resetTest;
-  if(reset==='multi_user'){captureFormDraft();delete state.config.multi_user;delete state.config.test_options?.multi_user;state.jsonDraft=null;state.jsonBase=null;configChanged();renderNew();return;}
-  if(reset==='load'){captureFormDraft();replaceMigrationNotes();delete state.config.load_test;state.loadPanels={};delete state.config.test_options?.load;state.jsonDraft=null;state.jsonBase=null;configChanged();renderNew();return;}
+  if(reset==='multi_user'){captureFormDraft();delete state.config.multi_user;delete state.config.test_options?.multi_user;resetJsonDraft();configChanged();renderNew();return;}
+  if(reset==='load'){captureFormDraft();replaceMigrationNotes();delete state.config.load_test;state.loadPanels={};delete state.config.test_options?.load;resetJsonDraft();configChanged();renderNew();return;}
   if(reset){configChanged();if(state.config.test_options)delete state.config.test_options[reset];const form=$('#new-run-form');form.elements[`test_mode_${reset}`].value='default';refreshInheritedFields(reset);syncTestControls();updateBounds();return;}
   if(action==='use-check-concurrency'){
     try{
@@ -5329,7 +5353,7 @@ document.addEventListener('click',async(event)=>{
       const setting=check==='consistency'?profileDefaults('consistency',state.config).levels:check==='load'?loadSettings(state.config).patterns.concurrent.levels:value;
       for(const part of parts.slice(0,-1))target=target[part] ||= {};
       target[parts.at(-1)]=clone(setting);
-      state.jsonDraft=null;state.jsonBase=null;configChanged();renderNew();focusSetting(path);
+      resetJsonDraft();configChanged();renderNew();focusSetting(path);
     }catch(error){configError(error);}return;
   }
   if(action==='use-setting-correction'){
@@ -5344,7 +5368,7 @@ document.addEventListener('click',async(event)=>{
         const parts=field.split('.');let target=state.config;
         for(const part of parts.slice(0,-1))target=target[part] ||= {};
         target[parts.at(-1)]=value;
-        state.jsonDraft=null;state.jsonBase=null;configChanged();renderNew();focusSetting(field,{explicit:true});return;
+        resetJsonDraft();configChanged();renderNew();focusSetting(field,{explicit:true});return;
       }
 
       if(hasJsonChanges()){
@@ -5531,7 +5555,7 @@ document.addEventListener('change',event=>{
     input.value=value==='__manual__'?'':value;input.setCustomValidity('');state.autoModel=value==='__manual__'?null:value;
     // Keep the discovered choices while invalidating any earlier verification.
     const models=state.modelDiscovery?.models || [];
-    state.modelDiscoverySequence++;state.modelDiscovery={key:modelDiscoveryKey(),route:state.routeVersion,status:'needs_model',models,message:'Model selected. Test the connection, or continue to choose checks.'};
+    state.modelDiscoverySequence++;state.modelDiscovery={key:modelDiscoveryKey(),route:state.routeVersion,status:DISCOVERY.NEEDS_MODEL,models,message:'Model selected. Test the connection, or continue to choose checks.'};
     renderModelDiscovery();scheduleTokenizerSelection({immediate:true});if(value==='__manual__'){$('#manual-model-field').hidden=false;input.focus();}
     configChanged();updateBounds();return;
   }

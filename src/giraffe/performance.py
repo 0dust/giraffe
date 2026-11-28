@@ -15,6 +15,7 @@ from collections import Counter, defaultdict
 import math
 import re
 
+from . import states
 from .stats import PERCENTILES, distribution as sample_distribution, percentile as percentile
 
 PERFORMANCE_SCHEMA = 1
@@ -431,11 +432,11 @@ def _window_summary(report, target, window, records, series, observation):
     evidence_states = Counter(r.workload.get("token_evidence", {}).get("logprobs", "not_recorded") for r in good)
     if good and not any(r.stream for r in good):
         itl_state, itl_reason = "not_applicable", "Non-streamed replies provide no individual token arrival timestamps."
-    elif evidence_states.get("supported"):
+    elif evidence_states.get(states.TOKEN_EVIDENCE_SUPPORTED):
         itl_state, itl_reason = "insufficient_evidence", "Streamed logprobs were requested automatically, but these responses lack separate single-token reads with matching answer usage."
-    elif evidence_states.get("rejected"):
+    elif evidence_states.get(states.TOKEN_EVIDENCE_REJECTED):
         itl_state, itl_reason = "not_supported", "The endpoint rejected logprobs during the compatibility probe; chunk receipt gaps cannot establish individual token arrival times."
-    elif evidence_states.get("not_returned"):
+    elif evidence_states.get(states.TOKEN_EVIDENCE_NOT_RETURNED):
         itl_state, itl_reason = "insufficient_evidence", "The endpoint accepted the compatibility probe but did not return matching streamed logprob token boundaries."
     elif evidence_states.get("shape_unverified"):
         itl_state, itl_reason = "not_collected", "Plain-text probe did not establish logprobs compatibility with this tool or structured-output request shape; automatic fields were not added."
@@ -445,7 +446,7 @@ def _window_summary(report, target, window, records, series, observation):
         itl_state, itl_reason = "not_collected", "No successful streamed token-evidence compatibility probe was recorded for these requests."
     dist("itl", itl, "Inter-token latency (ITL)", "ms/token", "Proven single-token events in separate reads; usage reconciled",
          state="measured" if itl else itl_state, reason=None if itl else itl_reason,
-         action=None if itl or evidence_states.get("supported") or evidence_states.get("rejected") else
+         action=None if itl or evidence_states.get(states.TOKEN_EVIDENCE_SUPPORTED) or evidence_states.get(states.TOKEN_EVIDENCE_REJECTED) else
                 "A new run probes token-evidence compatibility automatically; exact ITL still requires unbuffered single-token events and matching usage.")
     metrics["itl"]["capability_evidence"] = dict(evidence_states)
     if itl or itl_state == "not_applicable" or any(evidence_states.get(state) for state in ("supported", "rejected", "shape_unverified", "disabled_by_request")):

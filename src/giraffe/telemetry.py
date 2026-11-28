@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 
 import httpx
 
+from . import states
 from .caps import (
     MAX_DEPLOYMENT_HISTORY, MAX_METRICS_BODY_BYTES, MAX_METRICS_LABELS,
     MAX_METRICS_LABEL_CHARS,
@@ -22,6 +23,14 @@ from giraffe.deployment import sanitize
 from .models import MAX_SCALE_DOWN_SNAPSHOTS
 
 logger = logging.getLogger(__name__)
+
+# Public snapshot reasons emitted by the Prometheus parser.
+TELEMETRY_SNAPSHOT_REASONS = {
+    states.TELEMETRY_EMPTY_RESPONSE: "Successful response contains no usable statistics; system health and instrumentation state unknown.",
+    states.TELEMETRY_ABSENT_FAMILIES: "Relevant metric families absent; missing is unknown, not zero.",
+    states.TELEMETRY_UNSUPPORTED_FORMAT: "Unrecognized metrics format or runtime profile.",
+    states.TELEMETRY_STALE_SAMPLES: "Only stale source samples were returned.",
+}
 
 
 # Exact names and units, not substring guesses. Profiles are explicit runtime contracts.
@@ -174,7 +183,7 @@ def assess_gpu(snapshots, max_age_seconds, *, gpu_count=None, gpu_max_temperatur
     warnings, informational = [], []
     completed = 0
     for index, snap in enumerate(snapshots):
-        if snap.get("status") not in {"available", "stale_samples", "absent_families"}:
+        if snap.get("status") not in states.TELEMETRY_USABLE_STATUSES:
             continue
         samples = [s for s in snap.get("samples", []) if s["family"] in GPU_FAMILIES]
         if _families_truncated(snap, GPU_FAMILIES):
@@ -423,7 +432,8 @@ def _parse_mtplx(payload, target, config):
             "provenance": "MTPLX latest completed request; not linked to this run",
         })
     families = {sample["family"] for sample in samples if not sample["stale"]}
-    state = "unsupported_format" if payload is None else "stale_samples" if samples and stale else "available"
+    state = (states.TELEMETRY_UNSUPPORTED_FORMAT if payload is None else
+             states.TELEMETRY_STALE_SAMPLES if samples and stale else states.TELEMETRY_AVAILABLE)
     return {
         "status": state, "samples": samples,
         "missing_families": sorted((SERVING_FAMILIES | {entry[0] for entry in MTPLX.values()}) - families),
@@ -541,16 +551,16 @@ def parse(body, target, config, *, host=False):
             )
     families = {s["family"] for s in samples if not s["stale"]}
     state = (
-        "stale_samples"
+        states.TELEMETRY_STALE_SAMPLES
         if samples and all(s["stale"] for s in samples)
-        else "available"
+        else states.TELEMETRY_AVAILABLE
         if samples
-        else "absent_families"
+        else states.TELEMETRY_ABSENT_FAMILIES
         if recognized
-        else "unsupported_format"
+        else states.TELEMETRY_UNSUPPORTED_FORMAT
     )
     if not body.strip() or body.strip() in {"[]", "{}"}:
-        state = "empty_response"
+        state = states.TELEMETRY_EMPTY_RESPONSE
     required = {"host_cpu_seconds", "host_ram_total", "host_ram_available"} if host else (
         (SERVING_FAMILIES - {"preemptions"}) | {"retractions"}
         if target.metrics_profile == "sglang" else SERVING_FAMILIES
@@ -577,12 +587,8 @@ def parse(body, target, config, *, host=False):
                                  if detected else "user-supplied profile/version; verify with recorded deployment discovery"),
         "instrumentation": target.instrumentation,
         "instrumentation_provenance": "user-supplied; unverified",
-        "reason": {
-            "empty_response": "Successful response contains no usable statistics; system health and instrumentation state unknown.",
-            "absent_families": "Relevant metric families absent; missing is unknown, not zero.",
-            "unsupported_format": "Unrecognized metrics format or runtime profile.",
-            "stale_samples": "Only stale source samples were returned.",
-        }.get(state, "Observed metrics; shared traffic and between-scrape peaks remain unknown."),
+        "reason": TELEMETRY_SNAPSHOT_REASONS.get(
+            state, "Observed metrics; shared traffic and between-scrape peaks remain unknown."),
     }
 
 
@@ -617,11 +623,11 @@ async def _scrape_runtime(run, target, phase, *, force=False):
         "endpoint_source": "configured metrics_url" if target.metrics_url else "same-origin /metrics discovery",
     }
     previous = run.observations[target.name].get("runtime_metrics_discovery")
-    if not target.metrics_url and previous and previous["status"] not in {"available", "stale_samples"}:
+    if not target.metrics_url and previous and previous["status"] not in states.TELEMETRY_DISCOVERY_REUSABLE_STATUSES:
         return result | {"status": previous["status"], "reason": previous["reason"], "attempted": False}
     remaining = min(run.config.metrics_timeout_seconds, run.deadline - time.monotonic())
     if run.stop.is_set() or remaining <= 0:
-        return result | {"status": "run_stopped", "reason": "Run stopped or deadline reached."}
+        return result | {"status": states.TELEMETRY_RUN_STOPPED, "reason": "Run stopped or deadline reached."}
     try:
         async with asyncio.timeout(remaining):
             client = await asyncio.to_thread(_metrics_client, run.config, target, remaining)
@@ -630,13 +636,13 @@ async def _scrape_runtime(run, target, phase, *, force=False):
                     result["http_status"] = response.status_code
                     if response.status_code in {401, 403}:
                         result.update({
-                            "status": "authentication_denied",
+                            "status": states.TELEMETRY_AUTHENTICATION_DENIED,
                             "reason": f"Metrics endpoint {url} denied access (HTTP {response.status_code}); inference credentials were not forwarded.",
                         })
                         return _remember_discovery(run, target, result)
                     if response.status_code == 404:
                         result.update({
-                            "status": "endpoint_absent",
+                            "status": states.TELEMETRY_ENDPOINT_ABSENT,
                             "reason": f"Metrics endpoint {url} returned HTTP 404; no runtime exporter was available at that route.",
                         })
                         return _remember_discovery(run, target, result)
@@ -645,7 +651,7 @@ async def _scrape_runtime(run, target, phase, *, force=False):
                     async for chunk in response.aiter_bytes():
                         if len(body) + len(chunk) > MAX_METRICS_BODY_BYTES:
                             result.update({
-                                "status": "response_limit",
+                                "status": states.TELEMETRY_RESPONSE_LIMIT,
                                 "reason": "Statistics response exceeds 1 MiB.",
                             })
                             return _remember_discovery(run, target, result)
@@ -654,7 +660,7 @@ async def _scrape_runtime(run, target, phase, *, force=False):
     except (httpx.HTTPError, OSError, ValueError, UnicodeError, TimeoutError) as exc:
         logger.debug("Statistics collection failed", exc_info=True)
         result.update(
-            status="connection_failure",
+            status=states.TELEMETRY_CONNECTION_FAILURE,
             reason=f"Statistics unavailable ({type(exc).__name__}); instrumentation state unknown.",
         )
     instrument = (
@@ -801,7 +807,7 @@ def summarize(data, threshold):
             else "unverified",
         },
         label_scopes=sorted(identities),
-        failures=sum(s["status"] != "available" for s in data["snapshots"]),
+        failures=sum(s["status"] not in states.TELEMETRY_USABLE_STATUSES for s in data["snapshots"]),
         interpretation="Concurrent observations provide context, not causality. Sampling can miss peaks. Missing counters are unknown. Label changes create separate series; counters are never joined across replicas.",
     )
     data["derived"] = derive_server_metrics(data, host_configured=data.get("host_configured", False))
@@ -820,7 +826,7 @@ async def _scrape_host(run, target, phase):
               "scope": "server-wide; configured exporter host, not runner resources"}
     remaining = min(run.config.metrics_timeout_seconds, run.deadline - time.monotonic())
     if run.stop.is_set() or remaining <= 0:
-        return result | {"status": "run_stopped", "reason": "Run stopped or deadline reached."}
+        return result | {"status": states.TELEMETRY_RUN_STOPPED, "reason": "Run stopped or deadline reached."}
     try:
         def make_client():
             verify = ssl.create_default_context(cafile=run.config.ca_bundle) if run.config.ca_bundle else True
@@ -834,7 +840,7 @@ async def _scrape_host(run, target, phase):
                     body = bytearray()
                     async for chunk in response.aiter_bytes():
                         if len(body) + len(chunk) > MAX_METRICS_BODY_BYTES:
-                            return result | {"status": "response_limit", "reason": "Host statistics response exceeds 1 MiB."}
+                            return result | {"status": states.TELEMETRY_RESPONSE_LIMIT, "reason": "Host statistics response exceeds 1 MiB."}
                         body.extend(chunk)
         result.update(await asyncio.to_thread(_parse_body, body, target, run.config, host=True))
         hosts = {s["labels"].get("nodename") for s in result["samples"]
@@ -842,7 +848,7 @@ async def _scrape_host(run, target, phase):
         result["reported_host_identities"] = sorted(h for h in hosts if h)
     except (httpx.HTTPError, OSError, ValueError, UnicodeError, TimeoutError) as exc:
         logger.debug("Statistics collection failed", exc_info=True)
-        result.update(status="connection_failure", reason=f"Host statistics unavailable ({type(exc).__name__}).")
+        result.update(status=states.TELEMETRY_CONNECTION_FAILURE, reason=f"Host statistics unavailable ({type(exc).__name__}).")
     result["scrape_duration_seconds"] = time.monotonic() - run.start - result["elapsed_seconds"]
     return result
 
@@ -875,7 +881,7 @@ def _families_truncated(snapshot, families):
 
 def _fresh_families(snapshot, families):
     """A failed, truncated, duplicate or stale scope cannot form a counter interval."""
-    if (snapshot.get("status") not in {"available", "absent_families"}
+    if (snapshot.get("status") not in {states.TELEMETRY_AVAILABLE, states.TELEMETRY_ABSENT_FAMILIES}
             or _families_truncated(snapshot, families)
             or set(families).intersection(snapshot.get("invalid_families", []))):
         return None
@@ -1212,11 +1218,11 @@ def derive_server_metrics(data, *, host_configured=False):
             if not snapshots or all(snap.get("status") == "not_enabled" for snap in snapshots):
                 row.update(state="not_collected", reason="This saved run has no runtime metrics discovery or collection evidence.",
                            action="New runs discover same-origin /metrics automatically; set targets[].metrics_url only for a different exporter route.")
-            elif not any(snap.get("status") in {"available", "absent_families", "stale_samples"} for snap in snapshots):
+            elif not any(snap.get("status") in states.TELEMETRY_USABLE_STATUSES for snap in snapshots):
                 latest = snapshots[-1]
                 row.update(state="not_collected", reason=latest.get("reason", "Runtime metrics discovery did not return usable evidence."),
-                    action=("Supply targets[].metrics_url for an existing exporter at a different route." if latest.get("status") == "endpoint_absent"
-                            else "Supply metrics_api_key_env or metrics_headers_env for the exporter." if latest.get("status") == "authentication_denied"
+                    action=("Supply targets[].metrics_url for an existing exporter at a different route." if latest.get("status") == states.TELEMETRY_ENDPOINT_ABSENT
+                            else "Supply metrics_api_key_env or metrics_headers_env for the exporter." if latest.get("status") == states.TELEMETRY_AUTHENTICATION_DENIED
                             else "Check the recorded exporter discovery result; server-only evidence is unavailable from chat responses."))
                 row["details"].update(collection_status=latest.get("status"), endpoint=latest.get("endpoint"),
                                       endpoint_source=latest.get("endpoint_source"))
