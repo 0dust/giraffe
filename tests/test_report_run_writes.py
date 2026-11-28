@@ -255,6 +255,8 @@ def test_poll_detail_get_overlays_keep_confirmed_after_read_started(path):
 (async()=>{
  const get=deferred(),post=deferred();let reading=false;
  state.active=initial.id;state.statusRun={...initial};
+ // Keep's repaint must not retire the active run while status awaits its reset.
+ if(PATH==='status'){state.detail.state='running';state.statusRun.state='running';}
  api=async(url,options)=>{
   if(url.endsWith('/keep'))return post.promise;
   if(url.includes('/events?'))return {seq:1,state:'completed',reset:PATH!=='complete',events:[]};
@@ -462,6 +464,8 @@ def test_copied_detail_reconciles_keep_confirmed_during_await_handoff(consumer):
   await openComparisonDialog();loading=compareSavedRun({preventDefault(){},target:$('#comparison-dialog').querySelector('form')});
  }else{
   state.active=initial.id;state.statusRun={...initial};
+  // Model a live run so Keep's repaint does not invalidate the status reader.
+  if(CONSUMER==='status'){state.detail.state='running';state.statusRun.state='running';}
   loading=CONSUMER==='status'?pollRunStatus(state.routeVersion,{schedule:false}):pollDetail(state.routeVersion);
  }
  for(let i=0;i<8&&!reading;i++)await Promise.resolve();assert(reading);

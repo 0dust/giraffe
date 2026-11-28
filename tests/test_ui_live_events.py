@@ -240,8 +240,10 @@ await page.run(`
   state.detail={id:'live',state:'running',seq:1};setActive('live');
   for(const flag of ['reset','idle',null]){
     api=async path=>path.includes('/events?')?{seq:2,state:'running',events:[],records:[],checks:[],...(flag?{[flag]:true}:{})}:{id:'live',state:'running',seq:2};
+    location.hash='#runs/live';state.reportRouteActive=true;
     await pollDetail(state.routeVersion);
     assert.equal(scheduled.at(-1)[0],pollDetail);assert(scheduled.at(-1)[2]>=(flag?1800:300));
+    location.hash='#runs/archived';state.reportRouteActive=false;
     await pollRunStatus(state.routeVersion);
     assert.equal(scheduled.at(-1)[0],pollRunStatus);assert(scheduled.at(-1)[2]>=(flag?1800:300));
   }
