@@ -3,6 +3,8 @@
 import logging
 from typing import Final
 
+from .availability import CAUSES
+
 logger = logging.getLogger(__name__)
 # Tests turn this on so an undeclared lifecycle write fails instead of logging.
 STRICT_TRANSITIONS = False
@@ -16,6 +18,11 @@ EXIT_CODE_BLOCKED: Final = EXIT_CODES["blocked"]
 EXIT_CODE_DEFAULT: Final = 2
 EXIT_CODE_CANCELLED: Final = 130
 EXIT_CODE_USAGE: Final = 4
+
+# Performance metric availability: report.json performance summaries.
+METRIC_STATES: Final = ("measured", "estimated", "not_measured", "not_collected", "not_applicable",
+                        "insufficient_evidence", "not_supported", "not_observed", "no_baseline")
+UNAVAILABLE_CAUSES: Final = CAUSES
 
 # Request record: report.json requests[].status and evidence.jsonl (models.RequestRecord.status).
 REQUEST_STATUSES: Final = ("completed", "failed", "timeout", "cancelled")
@@ -104,6 +111,7 @@ def describe() -> dict:
         "check_statuses": list(CHECK_STATUSES), "problem_statuses": sorted(PROBLEM_STATUSES),
         "exit_codes": {**EXIT_CODES, "cancelled": EXIT_CODE_CANCELLED,
                        "usage_error": EXIT_CODE_USAGE, "default": EXIT_CODE_DEFAULT},
+        "metric_states": list(METRIC_STATES), "unavailable_causes": list(UNAVAILABLE_CAUSES),
         "request_statuses": list(REQUEST_STATUSES), "run_states": list(RUN_STATES),
         "run_in_progress_states": sorted(RUN_IN_PROGRESS_STATES),
         "run_terminal_states": sorted(RUN_TERMINAL_STATES),

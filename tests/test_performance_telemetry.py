@@ -641,3 +641,137 @@ async def test_mtplx_error_receipt_is_withheld_in_saved_report_and_later_success
     assert len(requests) == 4 and final["status"] == "available"
     row = telemetry.derive_server_metrics({"snapshots": snaps + [final]})["mtplx_latest_decode_tokens_per_second"]
     assert row["value"] == 60
+
+
+@pytest.mark.parametrize("scenario,cause", [
+    ("absent_families", "endpoint_unsupported"),
+    ("stale_samples", "too_few_samples"),
+    ("stale_samples_empty", "endpoint_unsupported"),
+    ("single_scrape", "too_few_samples"),
+    ("zero_delta", "too_few_samples"),
+    ("http_404", "collector_unavailable"),
+])
+def test_server_ttft_explains_unavailable_exporter_evidence(scenario, cause):
+    first = snapshot(counters("a", 1, 1), 0)
+    first["endpoint"] = "http://inference/metrics"
+    if scenario == "absent_families":
+        first = snapshot("vllm:num_requests_running 1\n", 0)
+        first.update(endpoint="http://inference/metrics", status="absent_families")
+        snaps = [first]
+    elif scenario in {"stale_samples", "stale_samples_empty"}:
+        first["status"] = "stale_samples"
+        for sample in first["samples"]:
+            sample["stale"] = True
+        if scenario == "stale_samples_empty":
+            first["samples"] = []
+        snaps = [first]
+    elif scenario == "http_404":
+        snaps = [{"status": "endpoint_absent", "reason": "Runtime metrics endpoint returned HTTP 404.",
+                  "endpoint": "http://inference/metrics", "samples": []}]
+    elif scenario == "zero_delta":
+        snaps = [first, snapshot(counters("a", 1, 1), 2)]
+    else:
+        snaps = [first]
+    rows = telemetry.derive_server_metrics({"snapshots": snaps})
+    row = rows["server_ttft_mean_ms"]
+    assert row["value"] is None and row["cause"] == cause
+    if scenario in {"absent_families", "stale_samples_empty"}:
+        assert row["state"] == "not_supported"
+        assert "does not expose a TTFT histogram (profile vllm-v1)" in row["reason"]
+        assert row["action"] is None
+    elif scenario in {"single_scrape", "stale_samples"}:
+        assert f"got {len(snaps)} scrape(s) and 0 new request(s)" in row["reason"]
+        assert "Maximum requests" in row["action"]
+    elif scenario == "zero_delta":
+        assert "zero count" in row["reason"]
+        assert "duration counters change between scrapes" in row["action"]
+    else:
+        assert "returned HTTP 404" in row["reason"]
+        assert "targets[].metrics_url" in row["action"]
+    for key, item in rows.items():
+        if item["value"] is None:
+            assert item["reason"], key
+            assert item["cause"] and item["cause"] != "unknown", key
+            assert len(item["reason"]) <= 200, key
+            assert len(item["action"] or "") <= 170, key
+            assert item["action"] or item["cause"] in {"not_applicable", "endpoint_unsupported", "not_observed"}, key
+
+
+def test_all_unavailable_telemetry_rows_have_source_classification():
+    fixtures = [[], [snapshot("", 0)], [snapshot(counters("a", 1, 1), 0)],
+                [snapshot(mtplx_body(None), 0, "mtplx")],
+                [snapshot("tgi_request_queue_duration_sum 1\ntgi_request_queue_duration_count 1\n", 0, "tgi")]]
+    for snaps in fixtures:
+        rows = telemetry.derive_server_metrics({"snapshots": snaps}, host_configured=True)
+        for key, row in rows.items():
+            if row["value"] is None:
+                assert row["reason"] and row["cause"] != "unknown" and row["cause"], key
+                assert row["action"] or row["cause"] in {"endpoint_unsupported", "not_applicable", "not_observed"}, key
+
+
+def test_unavailable_exporter_long_reason_is_preserved_in_popover_detail():
+    reason = "Runtime metrics endpoint returned HTTP 404: " + "http://inference/" + "route/" * 40
+    rows = telemetry.derive_server_metrics({"snapshots": [{"status": "endpoint_absent", "reason": reason}]})
+    row = rows["server_ttft_mean_ms"]
+    assert row["reason"] == "The metrics exporter returned HTTP 404."
+    assert row["detail"] == reason
+    assert row["cause"] == "collector_unavailable"
+
+
+@pytest.mark.parametrize("profile,key", [
+    ("mtplx", "running"),
+    ("vllm-v1", "spec_decode_sglang_acceptance_length"),
+    ("tgi", "spec_decode_proposal_length"),
+    ("tgi", "server_ttft_mean_ms"),
+])
+def test_unsupported_runtime_contract_wins_over_stale_samples(profile, key):
+    snap = {"status": "stale_samples", "profile": profile, "samples": []}
+    rows = telemetry.derive_server_metrics({"snapshots": [snap]})
+    row = rows[key]
+    assert row["value"] is None
+    assert row["cause"] == "endpoint_unsupported"
+    assert row["state"] == "not_supported"
+    assert "stale" not in row["reason"].lower()
+    assert row["action"] is None
+
+
+def test_duration_counter_reset_keeps_specific_interval_reason():
+    snaps = [snapshot(counters("a", 10, 5), 0), snapshot(counters("a", 1, 1), 2)]
+    row = telemetry.derive_server_metrics({"snapshots": snaps})["server_ttft_mean_ms"]
+    assert row["cause"] == "data_missing"
+    assert "reset, missing scope or zero count" in row["reason"]
+    assert "exporter resets and matching label scopes" in row["action"]
+    assert "needs two scrapes" not in row["reason"]
+
+
+@pytest.mark.parametrize("kind", ["percentile", "counter_reset"])
+def test_partly_stale_scrapes_keep_specific_duration_explanation(kind):
+    name = "vllm:time_to_first_token_seconds"
+    if kind == "percentile":
+        body = histogram(name, [("1", 0), ("+Inf", 0)], 0, 0)
+        snaps = [snapshot(body, 0), snapshot(body, 1), snapshot(body, 2)]
+        key = "server_ttft_p95_ms"
+        cause, reason, action = "too_few_samples", "No complete compatible histogram increments", "histogram counters change"
+    else:
+        snaps = [snapshot(counters("a", 10, 5), 0), snapshot(counters("a", 1, 1), 1),
+                 snapshot(counters("a", 2, 2), 2)]
+        key = "server_ttft_mean_ms"
+        cause, reason, action = "data_missing", "reset, missing scope or zero count", "exporter resets and matching label scopes"
+    snaps[-1]["status"] = "stale_samples"
+    for sample in snaps[-1]["samples"]:
+        sample["stale"] = True
+    row = telemetry.derive_server_metrics({"snapshots": snaps})[key]
+    assert row["value"] is None
+    assert row["cause"] == cause
+    assert reason in row["reason"]
+    assert action in row["action"]
+
+
+def test_partly_stale_duration_scrapes_still_check_exported_family():
+    snaps = [snapshot("vllm:num_requests_running 1\n", 0),
+             snapshot("vllm:num_requests_running 1\n", 1)]
+    snaps[-1]["status"] = "stale_samples"
+    row = telemetry.derive_server_metrics({"snapshots": snaps})["server_ttft_mean_ms"]
+    assert row["cause"] == "endpoint_unsupported"
+    assert "does not expose a TTFT histogram" in row["reason"]
+    assert row["action"] is None

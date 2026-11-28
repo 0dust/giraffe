@@ -37,7 +37,7 @@ def _number(value):
 
 
 def metric(value=None, *, label, unit, source, target, window, state=None, reason=None,
-           action=None, sample_count=0, eligible_count=0, **details):
+           action=None, cause=None, detail=None, sample_count=0, eligible_count=0, **details):
     """One envelope for scalar, structured and distribution-valued metrics."""
     if isinstance(value, float) and not math.isfinite(value):
         value = None
@@ -45,12 +45,7 @@ def metric(value=None, *, label, unit, source, target, window, state=None, reaso
     if value is None and state in {"measured", "estimated"}:
         state = "insufficient_evidence"
     return dict(value=value, label=label, unit=unit, source=source, state=state,
-                reason=reason or (None if value is not None else "No eligible observations in this scope."),
-                action=action or (None if value is not None else {
-                    "no_baseline": "Attach a baseline with comparable workload and measurement coverage.",
-                    "not_applicable": "Select the corresponding workload or transport to collect this measure.",
-                    "not_collected": "Enable the corresponding collector and rerun the workload.",
-                }.get(state, "Collect eligible observations for this scope.")),
+                reason=reason, action=action, cause=cause, detail=detail,
                 sample_count=sample_count, eligible_count=eligible_count,
                 counts={"sample": sample_count, "eligible": eligible_count,
                         "missing": max(0, eligible_count - sample_count)},
@@ -400,10 +395,6 @@ def _window_summary(report, target, window, records, series, observation):
         ("first_reasoning", "first_reasoning_ms", "First reasoning latency")):
         observed_series = selected_series if key in {"client_ttft", "first_reasoning", "first_useful_output"} else valid_series
         row = dist(key, [row["values"][field] for row in observed_series], label)
-        if key == "client_ttft" and row["sample_count"] == 0:
-            row["reason"] = metrics[key]["reason"] = (
-                "Versioned streamed generated-content receipt timing was not collected."
-            )
     modern = [r for r in good if getattr(r, "timing_schema", 0) >= 1]
     event_records = [r for r in population if getattr(r, "timing_schema", 0) >= 1]
     gaps = [gap for r in event_records for gap in (getattr(r, "read_gaps_ms", None) or [])]
@@ -429,27 +420,8 @@ def _window_summary(report, target, window, records, series, observation):
          "Client-observed pace from server token counts (cumulative usage or streamed logprobs) at first/last answer reads" + legacy_source, state="estimated")
     itl = [gap for r in modern for gap in (getattr(r, "itl_ms", None) or [])]
     evidence_states = Counter(r.workload.get("token_evidence", {}).get("logprobs", "not_recorded") for r in good)
-    if good and not any(r.stream for r in good):
-        itl_state, itl_reason = "not_applicable", "Non-streamed replies provide no individual token arrival timestamps."
-    elif evidence_states.get("supported"):
-        itl_state, itl_reason = "insufficient_evidence", "Streamed logprobs were requested automatically, but these responses lack separate single-token reads with matching answer usage."
-    elif evidence_states.get("rejected"):
-        itl_state, itl_reason = "not_supported", "The endpoint rejected logprobs during the compatibility probe; chunk receipt gaps cannot establish individual token arrival times."
-    elif evidence_states.get("not_returned"):
-        itl_state, itl_reason = "insufficient_evidence", "The endpoint accepted the compatibility probe but did not return matching streamed logprob token boundaries."
-    elif evidence_states.get("shape_unverified"):
-        itl_state, itl_reason = "not_collected", "Plain-text probe did not establish logprobs compatibility with this tool or structured-output request shape; automatic fields were not added."
-    elif evidence_states.get("disabled_by_request"):
-        itl_state, itl_reason = "not_collected", "Explicit request options disabled logprobs; automatic collection preserves those options."
-    else:
-        itl_state, itl_reason = "not_collected", "No successful streamed token-evidence compatibility probe was recorded for these requests."
-    dist("itl", itl, "Inter-token latency (ITL)", "ms/token", "Proven single-token events in separate reads; usage reconciled",
-         state="measured" if itl else itl_state, reason=None if itl else itl_reason,
-         action=None if itl or evidence_states.get("supported") or evidence_states.get("rejected") else
-                "A new run probes token-evidence compatibility automatically; exact ITL still requires unbuffered single-token events and matching usage.")
+    dist("itl", itl, "Inter-token latency (ITL)", "ms/token", "Proven single-token events in separate reads; usage reconciled")
     metrics["itl"]["capability_evidence"] = dict(evidence_states)
-    if itl or itl_state == "not_applicable" or any(evidence_states.get(state) for state in ("supported", "rejected", "shape_unverified", "disabled_by_request")):
-        metrics["itl"]["action"] = distributions["itl"]["action"] = None
     metrics["itl"]["exclusion_reasons"] = dict(Counter(getattr(r, "itl_reason", "Missing timing evidence") for r in good if getattr(r, "itl_reason", None)))
     for key, prop in (("answer_read_gap", "read_gaps_ms"), ("reasoning_read_gap", "reasoning_read_gaps_ms"), ("itl", "itl_ms")):
         eligible_records = modern if key == "itl" else event_records
@@ -458,9 +430,6 @@ def _window_summary(report, target, window, records, series, observation):
         for row in (metrics[key], distributions[key]):
             row["request_coverage"] = {"sample": covered, "eligible": eligible_count, "missing": eligible_count-covered}
             row["sample_unit"] = "gaps"
-    if not event_records:
-        for key in ("tpot_direct", "client_ttft", "answer_read_gap", "reasoning_read_gap"):
-            metrics[key].update(value=None, state="not_collected", reason="No versioned timing evidence; old records remain unavailable.", action="Rerun with timing schema 1 instrumentation.")
     stats = _stats(population)
     for key, label in (("attempted", "Requests started"), ("completed", "Valid completions"),
                        ("failed", "Failed / invalid"), ("timed_out", "Timeouts"),
@@ -577,7 +546,10 @@ def _window_summary(report, target, window, records, series, observation):
                   + tuple(key for key in metrics if key.startswith("mtplx_latest_")),
         "baseline": ("baseline_throughput", "baseline_timing", "baseline_generation", "baseline_quality", "baseline_capacity"),
     }
-    return {"metrics": metrics, "kpis": list(KPI_IDS), "distributions": distributions,
+    from .availability import WindowFacts, explain_window
+    facts = WindowFacts(report, window, population, good, rate_good, selected_series, duration, finished)
+    availability = explain_window(metrics, distributions, facts)
+    return {"availability": availability, "metrics": metrics, "kpis": list(KPI_IDS), "distributions": distributions,
             "sections": {name: [metrics[key] for key in keys] for name, keys in sections.items()},
             "request_row_indices": [row["number"] - 1 for row in selected_series],
             "window": window,
@@ -800,6 +772,12 @@ def _server_rows(report, target, window, observation, put, metrics):
     telemetry = observation.get("serving_telemetry", {})
     target_config = next((t for t in report.manifest.get("config", {}).get("targets", []) if t.get("name") == target), {})
     derived = telemetry.get("derived") or derive_server_metrics(telemetry, host_configured=bool(target_config.get("host_metrics_url")))
+    # Older stored derivations lack classification; rebuild unavailable rows from
+    # their saved scrape evidence while retaining every measured value.
+    missing_causes = {key for key, row in derived.items() if row.get("value") is None and not row.get("cause")}
+    if missing_causes:
+        fresh = derive_server_metrics(telemetry, host_configured=bool(target_config.get("host_metrics_url")))
+        derived = {key: fresh.get(key, row) if key in missing_causes else row for key, row in derived.items()}
     if any(key not in derived for key, _, _ in SPEC_DECODE_ROWS):
         fresh = derive_server_metrics(telemetry)
         derived = {**derived, **{key: fresh[key] for key, _, _ in SPEC_DECODE_ROWS
@@ -826,11 +804,11 @@ def _server_rows(report, target, window, observation, put, metrics):
     for key, derived_key, label, unit in mapping:
         row = derived.get(derived_key, {})
         if row.get("value") is None and key not in {"host_cpu", "host_ram"} and not key.startswith("spec_decode_") and not telemetry.get("snapshots"):
-            row = {**row, "state": "not_collected", "reason": "This saved run has no runtime telemetry collection evidence.",
+            row = {**row, "state": "not_collected", "cause": "collector_unavailable", "reason": "This saved run has no runtime telemetry collection evidence.",
                    "action": "New runs discover same-origin /metrics automatically; an exporter at another route requires targets[].metrics_url."}
         put(key, row.get("value"), label, row.get("unit", unit), row.get("source", "Server telemetry"),
             samples=row.get("sample_count", 0), state=row.get("state", "not_collected"),
-            reason=row.get("reason"), action=row.get("action"), scope="server-wide",
+            reason=row.get("reason"), action=row.get("action"), cause=row.get("cause"), detail=row.get("detail"), scope="server-wide",
             collection_window="telemetry sample interval; may extend beyond selected request window",
             details={**row.get("details", {}), "selected_window_attribution": "not established"})
         metrics[key]["action"] = row.get("action")
@@ -860,6 +838,7 @@ def _server_rows(report, target, window, observation, put, metrics):
         label = row.get("label", key.replace('_', ' ').capitalize()) if mtplx else key.replace('_', ' ').capitalize()
         put(key, row.get("value"), label, row.get("unit", ""), row.get("source", "Server telemetry"),
             samples=row.get("sample_count", 0), state=row.get("state", "not_collected"), reason=row.get("reason"), action=row.get("action"),
+            cause=row.get("cause"), detail=row.get("detail"),
             scope=row.get("scope", "server-wide") if mtplx else "server-wide",
             collection_window="telemetry sample interval", details=row.get("details", {}),
             **({"eligible": row.get("eligible_count", 0)} if mtplx else {}))
@@ -1094,16 +1073,28 @@ def cli_summary(report):
         wid = target["default_window"]
         summary = target["summaries"][wid]
         rows = summary["metrics"]
-        available, unavailable = [], []
+        available, unavailable, shared = [], [], []
+        availability = summary.get("availability")
         for key in KPI_IDS:
             row = rows[key]
             if row["value"] is not None:
                 available.append(f"{row['label']}: {row['value']:.3g} {row['unit']}" + (" (estimate)" if row["state"] == "estimated" else ""))
+            elif availability and all(row.get(field) == availability.get(field)
+                                      for field in ("cause", "reason", "action")):
+                shared.append(row)
             else:
-                unavailable.append(f"{row['label']}: {row['state'].replace('_', ' ')}")
+                unavailable.append(f"    {row['label']}: {row['state'].replace('_', ' ')} - {row['reason']}"
+                                   + (f" Next: {row['action']}" if row.get("action") else ""))
+        if shared:
+            labels = ", ".join(row["label"] for row in shared)
+            states = {row["state"] for row in shared}
+            state = next(iter(states)).replace("_", " ") if len(states) == 1 else "unavailable"
+            unavailable.insert(0, f"    {labels}: {state} - {availability['reason']}"
+                               + (f" Next: {availability['action']}" if availability.get("action") else ""))
         lines.append(f"Performance · {target['target']} · {wid}")
         if available:
             lines.append("  " + " · ".join(available))
         if unavailable:
-            lines.append("  Availability: " + "; ".join(unavailable))
+            lines.append("  Not available:")
+            lines.extend(unavailable)
     return lines

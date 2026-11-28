@@ -170,3 +170,31 @@ Start conflicts keep their HTTP 409 status and detail text. `X-Giraffe-Error-Cod
 `mark-scale-down` has its own outcomes and exit codes: `accepted` exits 0, `rejected` exits 1, and `submitted_without_acknowledgment` exits 2.
 
 Source of truth: `src/giraffe/states.py`.
+
+## Metric availability
+
+Performance values retain a state; unavailable values also give a cause, a reason and a next step when one applies.
+
+| State | Meaning |
+| --- | --- |
+| `measured` | Recorded observations support the value. |
+| `estimated` | Recorded observations support an estimate. |
+| `not_measured` | No measurement was made. |
+| `not_collected` | The required check, configuration or collector was absent. |
+| `not_applicable` | The measure does not apply to this workload. |
+| `insufficient_evidence` | Evidence is missing or too sparse. |
+| `not_supported` | The endpoint cannot supply the required evidence. |
+| `not_observed` | The event was not observed. |
+| `no_baseline` | No baseline report is attached. |
+
+| Cause | Meaning |
+| --- | --- |
+| `check_not_selected` | The check that supplies the measure was not selected. |
+| `data_missing` | Required request or exporter fields are missing. |
+| `too_few_samples` | Too few observations support the measure. |
+| `not_applicable` | The workload has no such measurement. |
+| `endpoint_unsupported` | The endpoint does not expose the required evidence. |
+| `not_configured` | A required setting is absent. |
+| `collector_unavailable` | The collector could not provide usable evidence. |
+| `not_observed` | An event did not occur; this may be a healthy outcome. |
+| `unknown` | No specific cause could be determined from the recorded evidence. |

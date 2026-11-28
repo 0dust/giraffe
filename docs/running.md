@@ -38,6 +38,8 @@ useful answer. The default p95 first-output limit is 10,000 ms; override it with
 Results appear in the terminal and in `runs/<timestamp>/report.json` and
 `report.html`. The command exits when done.
 
+An unavailable performance value states why and what to change; older saved reports rebuild performance from recorded requests when their schema is migrated.
+
 Standard built-in answer fixtures, including `short.copy`, use `max_output_tokens` as their
 output allowance. For a reasoning model that exhausts its budget before answering,
 raise it with `--max-output-tokens 2048` or YAML `max_output_tokens: 2048`.

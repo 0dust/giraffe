@@ -27,6 +27,8 @@ def saved_report(*, partial=False, unavailable=False):
     derived = {**derive_server_metrics({}), **{key: dict(value=None if unavailable else value, unit=unit,
                         source="vLLM speculative decoding counter deltas", state="insufficient_evidence" if unavailable else "measured",
                         reason="Optional counters were not exposed; enabled state is unknown." if unavailable else None,
+                        cause="data_missing" if unavailable else None, detail=None,
+                        action="Check that the exporter exposes coherent speculative-decoding counters." if unavailable else None,
                         sample_count=1, eligible_count=2 if partial else 1, details=dict(details))
                for key, (value, unit) in SPEC_VALUES.items()}}
     derived["spec_decode_accepted_tokens"]["details"].update(

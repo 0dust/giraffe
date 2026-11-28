@@ -26,7 +26,7 @@ def test_main_schema_three_fixture_preserves_checks_outcome_and_conditions():
     # Captured using main's unmodified serializer and loader before this patch.
     saved = RunReport.model_validate_json((FIXTURES / "main_schema3_report.json").read_text())
     expected = json.loads((FIXTURES / "main_schema3_expected.json").read_text())
-    assert saved.schema_version == "4"
+    assert saved.schema_version == "5"
     assert saved.overall == expected["overall"]
     assert [check.model_dump(mode="json") for check in saved.checks] == expected["checks"]
     assert saved.conditions == expected["conditions"]
@@ -57,13 +57,23 @@ def test_main_schema_three_fixture_preserves_checks_outcome_and_conditions():
                 row = frozen["metrics"][key]
                 assert row["counts"] == {"sample": 5, "eligible": 5, "missing": 0}
                 row.update(value=None, p95=None, sample_count=0, state="insufficient_evidence",
-                    counts={"sample": 0, "eligible": 5, "missing": 5}, source=source,
-                    reason="No eligible observations in this scope.", action="Collect eligible observations for this scope.")
+                    counts={"sample": 0, "eligible": 5, "missing": 5}, source=source)
                 if key in frozen["distributions"]:
                     frozen["distributions"][key].update(value=None, sample_count=0, state="insufficient_evidence",
-                        counts={"sample": 0, "eligible": 5, "missing": 5}, source=source,
-                        reason="No eligible observations in this scope.", action="Collect eligible observations for this scope.")
-    assert actual == expected["performance"]
+                        counts={"sample": 0, "eligible": 5, "missing": 5}, source=source)
+    def strip_volatile(value):
+        if isinstance(value, dict):
+            # Availability states now follow the cause; measured states and all
+            # numeric evidence remain part of this frozen comparison.
+            omitted = {"reason", "action", "cause", "detail", "availability"}
+            if "value" in value and value["value"] is None:
+                omitted.add("state")
+            return {key: strip_volatile(item) for key, item in value.items()
+                    if key not in omitted}
+        if isinstance(value, list):
+            return [strip_volatile(item) for item in value]
+        return value
+    assert strip_volatile(actual) == strip_volatile(expected["performance"])
     assert saved.observations["derived_recomputed"] is True
 
 
@@ -91,16 +101,16 @@ def test_saved_default_derived_values_are_used_without_recomputation(chunks, mon
     assert build_performance(saved, target="local")["targets"][0]["summaries"][target["default_window"]]["metrics"]["response_latency"]["value"] != 987654
 
 
-@pytest.mark.parametrize("version", [2, 3, 4, "2", "3", "4"])
+@pytest.mark.parametrize("version", [2, 3, 4, 5, "2", "3", "4", "5"])
 def test_supported_saved_schema_forms_migrate_to_current_string(version):
     raw = json.loads("".join(_report_json_chunks(make_report())))
     raw["schema_version"] = version
     assert is_supported_schema(version)
-    assert RunReport.model_validate(raw).schema_version == "4"
-    assert set(REPORT_MIGRATIONS) == {"2", "3"}
+    assert RunReport.model_validate(raw).schema_version == "5"
+    assert set(REPORT_MIGRATIONS) == {"2", "3", "4"}
 
 
-@pytest.mark.parametrize("version", [True, None, "unknown", "5", 5])
+@pytest.mark.parametrize("version", [True, None, "unknown", "6", 6])
 def test_unsupported_saved_schemas_are_rejected(version):
     raw = json.loads("".join(_report_json_chunks(make_report())))
     raw["schema_version"] = version
@@ -166,7 +176,7 @@ def test_streamed_export_preserves_stored_default_summary(tmp_path):
     assert "derived_recomputed" not in exported["observations"]
 
 
-@pytest.mark.parametrize("source_schema", [4, None])
+@pytest.mark.parametrize("source_schema", [5, None])
 def test_baseline_save_canonicalizes_integer_and_unversioned_sources(tmp_path, source_schema):
     from giraffe.reporting import save_baseline_report
     raw = json.loads("".join(_report_json_chunks(make_report(count=5))))
@@ -178,7 +188,7 @@ def test_baseline_save_canonicalizes_integer_and_unversioned_sources(tmp_path, s
     source.write_text(json.dumps(raw))
     destination = tmp_path / "baseline.json"
     save_baseline_report(source, destination)
-    assert json.loads(destination.read_text())["schema_version"] == "4"
+    assert json.loads(destination.read_text())["schema_version"] == "5"
     assert destination.stat().st_ino != source.stat().st_ino
 
 
@@ -210,7 +220,7 @@ def test_phase_a_performance_cache_is_migrated_for_model_cli_and_export(tmp_path
     path = tmp_path / "report.json"
     path.write_text(json.dumps(raw))
     for loaded in (RunReport.model_validate(raw), load_report(path)):
-        assert loaded.schema_version == "4"
+        assert loaded.schema_version == "5"
         assert loaded.performance["performance_schema"] == 1
         assert loaded.observations["derived_recomputed"] is True
         assert loaded.conditions == raw["conditions"]
@@ -357,3 +367,22 @@ def test_empty_comparison_summary_separates_excluded_metrics_with_a_period():
     assert check.summary.startswith("Nothing comparable between the runs. ")
     assert "metric(s) not comparable" in check.summary
     assert result.baseline["targets"][0]["comparisons"]
+
+
+def test_schema_four_rebuilds_stored_performance_from_requests():
+    raw = json.loads("".join(_report_json_chunks(make_report(count=5))))
+    raw["schema_version"] = "4"
+    target = raw["performance"]["targets"][0]
+    row = target["summaries"][target["default_window"]]["metrics"]["response_latency"]
+    row.update(value=987654, reason="No eligible observations in this scope.")
+    saved = RunReport.model_validate(raw)
+    assert saved.schema_version == "5"
+    assert saved.conditions == raw["conditions"]
+    assert saved.observations["derived_recomputed"] is True
+    target = saved.performance["targets"][0]
+    assert target["summaries"][target["default_window"]]["metrics"]["response_latency"]["value"] != 987654
+    for summary in target["summaries"].values():
+        for row in summary["metrics"].values():
+            if row["value"] is None:
+                assert row["cause"] and row["cause"] != "unknown"
+                assert "No eligible observations" not in row["reason"]

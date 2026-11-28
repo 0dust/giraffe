@@ -26,8 +26,10 @@ class FakeEndpoint:
         fault_contains: str | None = None,
         service_slots: int | None = None,
         cached_tokens: int | None = None,
+        omit_usage: bool = False,
         response_delay=None,
     ):
+        self.omit_usage = omit_usage
         self.cached_tokens = cached_tokens
         self.response_delay = response_delay
         self.mode = mode
@@ -414,7 +416,7 @@ class FakeEndpoint:
                         "model": payload["model"],
                         "choices": [{"index": 0, "message": {"role": "assistant", "content": output},
                                      "finish_reason": finish}],
-                        "usage": usage,
+                        **({} if endpoint.omit_usage else {"usage": usage}),
                     })
                     return
                 self.send_response(200)
@@ -439,10 +441,10 @@ class FakeEndpoint:
                 for index, piece in enumerate(pieces, 1):
                     if endpoint._stop.is_set():
                         return
-                    extra = {"usage": {**usage, "completion_tokens": index}} if continuous and include_usage else {}
+                    extra = {"usage": {**usage, "completion_tokens": index}} if continuous and include_usage and not endpoint.omit_usage else {}
                     event({"content": piece}, **extra)
                     endpoint._stop.wait(endpoint.chunk_delay)
-                event({}, finish, usage=usage)
+                event({}, finish, **({} if endpoint.omit_usage else {"usage": usage}))
                 if mode != "truncated":
                     self.wfile.write(b"data: [DONE]\n\n")
                     self.wfile.flush()

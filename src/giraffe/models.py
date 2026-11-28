@@ -49,6 +49,7 @@ CHECK_NAMES = {
     "consistency": "Answer consistency",
     "tools": "Tool-call correctness",
 }
+LOAD_CHECK_ALIASES = dict.fromkeys(("concurrency", "capacity", "arrivals"), "load")
 CATALOGUE_NAMES = INTERNAL_CHECK_NAMES = CHECK_NAMES
 # These checks compare their own declared workload and evidence.
 SHARED_BASELINE_EXCLUDED_WORKLOADS = frozenset({"gateway_access", "gateway_attribution", "gateway_policy"})
@@ -71,8 +72,8 @@ class PersistedModel(Model):
     model_config = ConfigDict(extra="ignore", allow_inf_nan=False)
 
 
-CURRENT_SCHEMA = "4"
-SUPPORTED_SCHEMAS = frozenset({"2", "3", CURRENT_SCHEMA})
+CURRENT_SCHEMA = "5"
+SUPPORTED_SCHEMAS = frozenset({"2", "3", "4", CURRENT_SCHEMA})
 
 
 def is_supported_schema(value: Any) -> bool:
@@ -84,14 +85,21 @@ def _migrate_report_v2(value: dict) -> dict:
 
 
 def _migrate_report_v3(value: dict) -> dict:
-    # Pre-v4 Phase-A performance blocks were display caches, not authoritative
-    # snapshots. Rebuild them from requests; only v4 pins derived performance.
+    # Pre-v4 Phase-A performance blocks were display caches. Rebuild them
+    # from requests with the current availability explanations.
     value = {**value, "schema_version": CURRENT_SCHEMA}
     value.pop("performance", None)
     return value
 
 
-REPORT_MIGRATIONS = {"2": _migrate_report_v2, "3": _migrate_report_v3}
+def _migrate_report_v4(value: dict) -> dict:
+    # Availability explanations are derived from the retained request evidence.
+    value = {**value, "schema_version": CURRENT_SCHEMA}
+    value.pop("performance", None)
+    return value
+
+
+REPORT_MIGRATIONS = {"2": _migrate_report_v2, "3": _migrate_report_v3, "4": _migrate_report_v4}
 
 
 def migrate_report(value: dict) -> dict:
@@ -524,7 +532,7 @@ def merge_migration_warnings(*groups: list[MigrationWarning]) -> list[MigrationW
 
 
 def _finish_migration_warnings(value: dict, warnings: list[MigrationWarning]) -> list[MigrationWarning]:
-    names = list(dict.fromkeys(CHECK_NAMES.get("load" if check in {"concurrency", "capacity", "arrivals"} else check, check) for check in value.get("checks", [])))
+    names = list(dict.fromkeys(CHECK_NAMES.get(LOAD_CHECK_ALIASES.get(check, check), check) for check in value.get("checks", [])))
     remaining = " and ".join([", ".join(names[:-1]), names[-1]]) if len(names) > 1 else "".join(names)
     for warning in warnings:
         if warning["removed_check"] and remaining:
@@ -686,7 +694,7 @@ def migrate_load_test(value):
     if converted:
         value["load_test"].setdefault("migrated_tests", []).extend(converted)
         notes.append("Multiple saved checks remain separate sequential tests in load_test.migrated_tests; their rates, durations and burst schedules are not blended.")
-    value["checks"] = (list(dict.fromkeys("load" if c in {"concurrency", "capacity", "arrivals"} else c for c in old_checks))
+    value["checks"] = (list(dict.fromkeys(LOAD_CHECK_ALIASES.get(c, c) for c in old_checks))
                        if old_checks or "checks" in value else list(_LEGACY_DEFAULT_CHECKS))
     value.pop("concurrent_load", None)
     value.pop("traffic", None)
@@ -3379,6 +3387,33 @@ class RequestRecord(PersistedModel):
         return self.stream and self.answer_reads >= 2 and self.max_stream_gap_ms is not None
 
     @property
+    def generation_pace_reason(self) -> tuple[str, str] | None:
+        """Why answer-read boundary counts cannot establish generation pace."""
+        if not self.valid or self.status != "completed":
+            return "not_complete", "A valid completed reply is required."
+        if not self.stream:
+            return "not_streamed", "Reply was not streamed."
+        if self.output_tokens is None:
+            if self.completion_tokens is None:
+                return "no_usage", "Reply carried no token counts."
+            return "reasoning_unseparated", "Reply mixed reasoning into the token count without reasoning_tokens."
+        if self.output_tokens <= 1:
+            return "short_answer", "Reply had one answer token or fewer."
+        if self.answer_reads < 2:
+            return "single_read", "Answer arrived in fewer than two network reads."
+        if (self.first_output_ms is None or self.last_output_ms is None
+                or self.last_output_ms <= self.first_output_ms):
+            return "no_timing", "First/last answer times were not recorded."
+        if self.tool_calls:
+            return "tool_call", "Tool-call replies have no answer-token stream to time."
+        first, last = self.first_read_output_tokens, self.last_read_output_tokens
+        if first is None or last is None or not 0 < first < last <= self.output_tokens:
+            return "final_only_usage", "Token counts at the first and last answer reads were not recorded."
+        if (self.reasoning_stripped or self.reasoning.strip()) and not self.reasoning_tokens:
+            return "reasoning_unseparated", "Reply mixed reasoning into the token count without reasoning_tokens."
+        return None
+
+    @property
     def generation_tokens_per_second(self) -> float | None:
         """Client-observed pace from reported counts at answer-read boundaries.
 
@@ -3386,16 +3421,9 @@ class RequestRecord(PersistedModel):
         Exclude the whole first read and any tokens reported only in later trailers.
         Legacy/final-only usage cannot reconstruct either boundary.
         """
-        first, last = self.first_read_output_tokens, self.last_read_output_tokens
-        if (not self.valid or self.status != "completed" or not self.stream
-                or self.output_tokens is None or self.output_tokens <= 1
-                or self.answer_reads < 2 or self.first_output_ms is None
-                or self.last_output_ms is None or self.last_output_ms <= self.first_output_ms
-                or first is None or last is None or not 0 < first < last <= self.output_tokens
-                or self.tool_calls
-                or ((self.reasoning_stripped or self.reasoning.strip()) and not self.reasoning_tokens)):
+        if self.generation_pace_reason is not None:
             return None
-        return (last - first) * 1000 / (self.last_output_ms - self.first_output_ms)
+        return (self.last_read_output_tokens - self.first_read_output_tokens) * 1000 / (self.last_output_ms - self.first_output_ms)
 
 
 class CheckResult(PersistedModel):

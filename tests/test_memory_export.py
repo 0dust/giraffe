@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from giraffe.models import CheckResult, RequestRecord, RunReport
+from giraffe.performance import build_performance
 from giraffe.reporting import _json_size, _retained, write_report
 
 
@@ -53,7 +54,7 @@ def reference_size(report):
     value["performance"] = {**value["performance"], "targets": [
         {key: field for key, field in target.items() if key != "request_series"}
         for target in value["performance"].get("targets", [])]}
-    value.update(schema_version="4", report_format=2, inputs={})
+    value.update(schema_version="5", report_format=2, inputs={})
     for row in value["requests"]:
         if row["evaluation"] and row["evaluation"]["messages"]:
             messages = row["evaluation"].pop("messages")
@@ -66,7 +67,10 @@ def reference_size(report):
 
 def reference_limited(report, limit, legacy):
     report = legacy._old_retained(report)
-    report.schema_version = "4"
+    # Availability reads retained reasoning/tool evidence as well as token fields.
+    # Rebuild the oracle summary after its independent retention transform.
+    report.performance = build_performance(report)
+    report.schema_version = "5"
     storage = {"limit_bytes": limit, "response_bodies_omitted": 0,
                "reason": "Per-run JSON storage limit on disk.", "limit_exceeded": False}
     report.manifest["storage"] = storage

@@ -201,9 +201,20 @@ def expanded_report_chunks(path: Path):
                     if "input_ref" in raw and metadata.get("report_format") != 2:
                         raise ValueError("Input references require report format 2 before requests")
                     record = _request(raw, inputs)
+                    # Preserve availability facts before dropping large text and
+                    # evaluator payloads from this aggregation-only copy. The
+                    # second pass still emits the original saved request data.
+                    availability = {}
+                    if record.evaluation and record.evaluation.scorer != "none":
+                        availability["_answer_scoring_configured"] = True
                     measurements.append(record.model_copy(update={
-                            "output": "", "reasoning": "", "reasoning_stripped": bool(record.reasoning.strip()) or record.reasoning_stripped,
-                            "evaluation": None, "tool_calls": [], "assistant_message": None,
+                            "workload": {**record.workload, **availability},
+                            # These fields feed presence predicates. Keep bounded
+                            # sentinels rather than changing their truth values or
+                            # reinterpreting separate inline-reasoning evidence.
+                            "output": "present" if record.output else "",
+                            "reasoning": "present" if record.reasoning.strip() else "",
+                            "evaluation": None, "tool_calls": [{}] if record.tool_calls else [], "assistant_message": None,
                             "tool_conversation": None, "logprob_evidence": None,
                             "response_events": [], "judgement": None}))
             else:
@@ -213,8 +224,8 @@ def expanded_report_chunks(path: Path):
         report_format = metadata.pop("report_format", None)
         if has_inputs != (report_format == 2) or report_format not in (None, 2):
             raise ValueError("Unsupported saved report format")
-        # Schema-4 default summaries remain authoritative across code upgrades.
-        # RunReport migrates v2/v3 display caches, fills missing legacy blocks
+        # Schema-5 default summaries remain authoritative across code upgrades.
+        # RunReport migrates v2/v3/v4 summaries, fills missing derived blocks
         # and supplies the raw request series.
         header = RunReport.model_validate({**metadata, "requests": measurements})
         yield header.model_dump_json(exclude={"requests"})[:-1] + ',"requests":['
