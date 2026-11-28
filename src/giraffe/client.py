@@ -445,7 +445,6 @@ class LLMClient:
         if (self._evidence_probe_finished or self._evidence_probe_attempts >= MAX_TOKEN_EVIDENCE_PROBE_ATTEMPTS
                 or not self.config.stream):
             return None
-        self._evidence_probe_attempts += 1
         options = {}
         if "logprobs" in self._evidence_fields:
             options.update(logprobs=True, top_logprobs=0)
@@ -460,6 +459,7 @@ class LLMClient:
                       "evidence_fields": sorted(self._evidence_fields)})
 
     def observe_token_evidence_probe(self, record: RequestRecord) -> dict:
+        previous = self.token_evidence["status"]
         rejected = record.workload.get("rejected_evidence_field")
         if rejected in {"logprobs", "top_logprobs", "stream_options"}:
             field = "logprobs" if rejected == "top_logprobs" else rejected
@@ -500,11 +500,27 @@ class LLMClient:
                 self.token_evidence.update(status=states.TOKEN_EVIDENCE_OBSERVED, missing_usage_fields=missing_usage_fields,
                     reason=" ".join(notes) or "Returned streamed token boundaries and both usage counts.")
             else:
+                reason = f"Compatibility probe did not complete ({record.error or record.status})."
+                if previous == states.TOKEN_EVIDENCE_PROBING:
+                    reason = f"{self.token_evidence['reason']} {reason}"
                 self.token_evidence.update(status=states.TOKEN_EVIDENCE_UNAVAILABLE,
-                    reason=f"Compatibility probe did not complete ({record.error or record.status}).")
+                    reason=reason)
         self.token_evidence["probe_requests"] = self._evidence_probe_attempts
         if self._evidence_probe_finished and self.token_evidence["status"] == states.TOKEN_EVIDENCE_PROBING:
             self.token_evidence["status"] = states.TOKEN_EVIDENCE_UNAVAILABLE
+        states.check_token_evidence_transition(previous, self.token_evidence["status"])
+        return dict(self.token_evidence)
+
+    def finish_token_evidence_probe(self, reason: str, *, interrupted: bool = False) -> dict:
+        previous = self.token_evidence["status"]
+        if (previous in {states.TOKEN_EVIDENCE_NOT_PROBED, states.TOKEN_EVIDENCE_PROBING}
+                or interrupted and previous == states.TOKEN_EVIDENCE_UNAVAILABLE):
+            states.check_token_evidence_transition(previous, states.TOKEN_EVIDENCE_UNAVAILABLE)
+            original = self.token_evidence.get("reason")
+            self.token_evidence.update(status=states.TOKEN_EVIDENCE_UNAVAILABLE,
+                                       reason=f"{original} {reason}" if original else reason)
+        self.token_evidence["probe_requests"] = self._evidence_probe_attempts
+        self._evidence_probe_finished = True
         return dict(self.token_evidence)
 
     def _request_headers(self) -> dict[str, str]:
@@ -1191,6 +1207,9 @@ class LLMClient:
                     record.started_at = datetime.now(timezone.utc).isoformat()
                     record.client_preparation_ms = (start - preparation_start) * 1000
                     transport_started = True
+                    if probing:
+                        self._evidence_probe_attempts += 1
+                        self.token_evidence["probe_requests"] = self._evidence_probe_attempts
 
                 if isinstance(self._client, HTTPClientPool):
                     response = await self._client.send(request, stream=True, _before_send=begin_transport)

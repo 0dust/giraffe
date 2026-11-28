@@ -229,6 +229,85 @@ async def test_saved_probe_is_unavailable_when_rejection_has_no_retry_budget(mon
     assert all(row["reason"] == evidence["reason"] for row in measured_evidence)
 
 
+@pytest.mark.parametrize("exit_path", ["cancelled", "exception", "no_record", "stopped", "deadline", "stopped_response"])
+async def test_probe_finalizes_every_interrupted_request_exit(monkeypatch, exit_path):
+    from giraffe import states
+    from giraffe.runner import _Run, _target
+
+    def endpoint(request):
+        if request.method == "GET":
+            return httpx.Response(404)
+        body = json.loads(request.content)
+        if body.get("logprobs"):
+            return httpx.Response(400, json={"error": {"param": "logprobs"}})
+        if exit_path == "stopped_response" and body.get("max_tokens") == 16:
+            return httpx.Response(500)
+        return completion()
+
+    mock_http(monkeypatch, endpoint)
+    target = Target(name="test", url="http://runtime/v1", model="model")
+    config = RunConfig(targets=[target], checks=["serving"], samples=1, max_requests=100,
+                       max_duration_seconds=10, metrics=False)
+    run = _Run(config, None, None)
+    original = run.request
+    cancellation = asyncio.CancelledError("probe cancellation")
+    clients = []
+
+    async def request(target, client, spec, **kwargs):
+        if spec.scenario == "performance_evidence_probe" and "logprobs" not in spec.options:
+            clients.append(client)
+            if exit_path == "stopped_response":
+                record = await original(target, client, spec, **kwargs)
+                run.stop.set()
+                return record
+            if exit_path == "cancelled":
+                raise cancellation
+            if exit_path == "exception":
+                raise RuntimeError("private exception details")
+            if exit_path == "stopped":
+                run.stop.set()
+            if exit_path == "deadline":
+                run.deadline = time.monotonic()
+            return None
+        return await original(target, client, spec, **kwargs)
+
+    monkeypatch.setattr(run, "request", request)
+    if exit_path == "cancelled":
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await _target(run, target, {})
+        assert caught.value is cancellation
+    else:
+        await _target(run, target, {})
+    evidence = run.observations[target.name]["token_evidence"]
+    assert evidence == clients[0].token_evidence
+    assert evidence["status"] == states.TOKEN_EVIDENCE_UNAVAILABLE
+    assert evidence["probe_requests"] == clients[0]._evidence_probe_attempts == (2 if exit_path == "stopped_response" else 1)
+    assert evidence["logprobs"] == states.TOKEN_EVIDENCE_REJECTED
+    assert evidence["usage"] == states.TOKEN_EVIDENCE_UNVERIFIED
+    assert "Endpoint rejected logprobs (HTTP 400)." in evidence["reason"]
+    assert "budget" not in evidence["reason"].lower()
+    expected = {"cancelled": states.STOP_RUN_CANCELLED, "exception": "RuntimeError",
+                "no_record": "did not complete", "stopped": states.STOP_CANCELLED_BY_USER,
+                "deadline": states.STOP_MAX_DURATION, "stopped_response": states.STOP_CANCELLED_BY_USER}[exit_path]
+    assert expected in evidence["reason"]
+    assert "private exception details" not in evidence["reason"]
+    condition = run.conditions[target.name, "performance_evidence_probe"]
+    assert condition["status"] == "finished" and condition["condition_verdict"] == "inconclusive"
+    assert condition["reason"] == evidence["reason"]
+    preparation = run.observations[target.name]["preparations"]["performance_evidence_probe"]
+    assert preparation["status"] == "unavailable" and preparation["reason"] == evidence["reason"]
+    assert clients[0].token_evidence_probe() is None
+
+
+def test_building_probe_does_not_count_an_unsent_request():
+    target = Target(name="test", url="http://runtime/v1", model="model")
+    client = LLMClient(target, RunConfig(targets=[target]))
+    assert client.token_evidence_probe() is not None
+    assert client._evidence_probe_attempts == 0
+    evidence = client.finish_token_evidence_probe("Stopped before dispatch.")
+    assert evidence["status"] == "unavailable" and evidence["probe_requests"] == 0
+
+
 @pytest.mark.parametrize(("tokens", "usage", "status", "diagnostic"), [
     (False, False, "inconclusive", "usage.prompt_tokens and usage.completion_tokens"),
     (True, {"prompt_tokens": 8}, "inconclusive", "usage.completion_tokens"),

@@ -1646,31 +1646,53 @@ async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attributio
                 client.on_response = None
                 probe_count = 0
                 planned_reserve = run.token_evidence_reserve(target)
-                while (run.allowed(target.name) and time.monotonic() < probe_end
-                       and (run.remaining(target.name) is None or run.remaining(target.name) > max(
-                           1, planned_reserve - (run.budget_counts[target.name] - probe_count)))):
-                    spec = client.token_evidence_probe()
-                    if spec is None:
-                        break
-                    spec = spec.model_copy(update={"request_timeout_seconds": min(spec.request_timeout_seconds, max(.001, probe_end - time.monotonic()))})
-                    record = await run.request(target, client, spec)
-                    if record is None:
-                        break
-                    probe_count += 1
-                    run.observations[target.name]["token_evidence"] = client.observe_token_evidence_probe(record)
-                client.on_response = lambda: run.endpoint_response(target.name)
-                evidence = run.observations[target.name].setdefault("token_evidence", {"status": states.TOKEN_EVIDENCE_UNAVAILABLE, "reason": "No request budget or preparation time remained for a token-evidence compatibility probe."})
-                if evidence.get("status") == states.TOKEN_EVIDENCE_PROBING:
-                    evidence["status"] = states.TOKEN_EVIDENCE_UNAVAILABLE
-                    evidence["reason"] = f"{evidence['reason']} No request budget or preparation time remained for a token-evidence compatibility retry."
-                    client.token_evidence.update(evidence)
-                complete_evidence = (evidence.get("status") == states.TOKEN_EVIDENCE_OBSERVED
-                                     and evidence.get("logprobs") == evidence.get("usage") == states.TOKEN_EVIDENCE_SUPPORTED
-                                     and not evidence.get("missing_usage_fields"))
-                run.preparation(target.name, "performance_evidence_probe", "Streamed token and usage support",
-                                "completed" if complete_evidence else "unavailable", evidence.get("reason"))
-                run.finish_condition(target.name, "performance_evidence_probe", reason=evidence.get("reason"),
-                                     verdict="pass" if complete_evidence else "inconclusive")
+                probe_failure = None
+                try:
+                    while (run.allowed(target.name) and time.monotonic() < probe_end
+                           and (run.remaining(target.name) is None or run.remaining(target.name) > max(
+                               1, planned_reserve - (run.budget_counts[target.name] - probe_count)))):
+                        spec = client.token_evidence_probe()
+                        if spec is None:
+                            break
+                        spec = spec.model_copy(update={"request_timeout_seconds": min(spec.request_timeout_seconds, max(.001, probe_end - time.monotonic()))})
+                        record = await run.request(target, client, spec)
+                        if record is None:
+                            break
+                        probe_count += 1
+                        run.observations[target.name]["token_evidence"] = client.observe_token_evidence_probe(record)
+                except asyncio.CancelledError:
+                    probe_failure = states.STOP_RUN_CANCELLED
+                    raise
+                except Exception as exc:
+                    probe_failure = f"Compatibility probe did not complete ({type(exc).__name__})."
+                    raise
+                finally:
+                    # No awaits: request() persists cancellation before re-raising,
+                    # and both live and saved summaries must close before it escapes.
+                    client.on_response = lambda: run.endpoint_response(target.name)
+                    stop_reason = run.stop_reason(target.name)
+                    stopped = stop_reason is not None and stop_reason != states.STOP_REQUEST_BUDGET
+                    if stopped:
+                        reason = f"Token-evidence compatibility probe stopped: {stop_reason}."
+                    elif probe_failure:
+                        reason = probe_failure
+                    else:
+                        remaining = run.remaining(target.name)
+                        reserve = max(1, planned_reserve - (run.budget_counts[target.name] - probe_count))
+                        if time.monotonic() >= probe_end or remaining is not None and remaining <= reserve:
+                            phase = "retry" if probe_count else "probe"
+                            reason = f"No request budget or preparation time remained for a token-evidence compatibility {phase}."
+                        else:
+                            reason = "Token-evidence compatibility probe did not complete."
+                    evidence = client.finish_token_evidence_probe(reason, interrupted=stopped or probe_failure is not None)
+                    run.observations[target.name]["token_evidence"] = evidence
+                    complete_evidence = (evidence.get("status") == states.TOKEN_EVIDENCE_OBSERVED
+                                         and evidence.get("logprobs") == evidence.get("usage") == states.TOKEN_EVIDENCE_SUPPORTED
+                                         and not evidence.get("missing_usage_fields"))
+                    run.preparation(target.name, "performance_evidence_probe", "Streamed token and usage support",
+                                    "completed" if complete_evidence else "unavailable", evidence.get("reason"))
+                    run.finish_condition(target.name, "performance_evidence_probe", reason=evidence.get("reason"),
+                                         verdict="pass" if complete_evidence else "inconclusive")
             run.observations[target.name]["deployment"]["model_residency"]["after_preparation"] = (
                 await deployment.model_residency(target, config, deadline=run.deadline, stop=run.stop))
             if enabled & {"serving", "first_output"}:

@@ -230,6 +230,15 @@ def check_scale_down_transition(current: str, new: str) -> None:
     logger.warning(message)
 
 
+def check_token_evidence_transition(current: str, new: str) -> None:
+    if new in TOKEN_EVIDENCE_TRANSITIONS.get(current, ()):
+        return
+    message = f"Undeclared token evidence transition: {current!r} -> {new!r}"
+    if STRICT_TRANSITIONS:
+        raise AssertionError(message)
+    logger.warning(message)
+
+
 def run_recoverable(state: str | None, journal_present: bool, report_available: bool) -> bool:
     """An interrupted journal needs recovery until a valid report owns its evidence."""
     return state == RUN_INTERRUPTED and journal_present and not report_available

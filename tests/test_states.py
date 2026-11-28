@@ -77,6 +77,18 @@ def test_condition_transitions():
     assert states.CONDITION_RECOVERED == "interrupted"
 
 
+def test_token_evidence_transition_guard(monkeypatch, caplog):
+    for current, successors in states.TOKEN_EVIDENCE_TRANSITIONS.items():
+        for new in successors:
+            states.check_token_evidence_transition(current, new)
+    with pytest.raises(AssertionError, match="Undeclared token evidence transition"):
+        states.check_token_evidence_transition(states.TOKEN_EVIDENCE_OBSERVED, states.TOKEN_EVIDENCE_PROBING)
+    with monkeypatch.context() as patch:
+        patch.setattr(states, "STRICT_TRANSITIONS", False)
+        states.check_token_evidence_transition(states.TOKEN_EVIDENCE_UNAVAILABLE, states.TOKEN_EVIDENCE_PROBING)
+    assert "Undeclared token evidence transition" in caplog.text
+
+
 def test_finished_condition_can_restart():
     from giraffe.runner import _Run
 
