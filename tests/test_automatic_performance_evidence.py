@@ -191,6 +191,44 @@ async def test_runner_negotiation_is_budgeted_setup_and_optional_failure_does_no
     assert len([r for r in calls if r.method == "GET" and r.url.path == "/metrics"]) == 1
 
 
+async def test_saved_probe_is_unavailable_when_rejection_has_no_retry_budget(monkeypatch, tmp_path):
+    from giraffe import states
+    from giraffe.reporting import write_report
+    from giraffe.runner import run_suite
+
+    def handler(request):
+        if request.method == "GET":
+            return httpx.Response(404)
+        if json.loads(request.content).get("logprobs"):
+            return httpx.Response(400, json={"error": {"param": "logprobs"}})
+        return completion(tokens=False)
+
+    mock_http(monkeypatch, handler)
+    target = Target(name="test", url="http://runtime/v1", model="model")
+    config = RunConfig(targets=[target], checks=["serving"], samples=1, max_requests=3,
+                       max_duration_seconds=5, metrics=False)
+    report = await run_suite(config)
+    path, _ = write_report(report, tmp_path)
+    saved = json.loads(path.read_text())
+    probes = [row for row in saved["requests"] if row["scenario"] == "performance_evidence_probe"]
+    assert len(probes) == 1
+    assert probes[0]["workload"]["rejected_evidence_field"] == "logprobs"
+    evidence = saved["observations"]["targets"][target.name]["token_evidence"]
+    assert evidence["status"] == states.TOKEN_EVIDENCE_UNAVAILABLE
+    assert evidence["logprobs"] == states.TOKEN_EVIDENCE_REJECTED
+    assert evidence["usage"] == states.TOKEN_EVIDENCE_UNVERIFIED
+    assert evidence["probe_requests"] == 1
+    assert "Endpoint rejected logprobs (HTTP 400)." in evidence["reason"]
+    assert "No request budget or preparation time remained" in evidence["reason"]
+    assert "retry" in evidence["reason"]
+    assert states.TOKEN_EVIDENCE_UNAVAILABLE in states.TOKEN_EVIDENCE_TRANSITIONS[states.TOKEN_EVIDENCE_PROBING]
+    measured_evidence = [row["workload"]["token_evidence"] for row in saved["requests"]
+                         if "token_evidence" in row["workload"]]
+    assert measured_evidence
+    assert all(row["status"] == states.TOKEN_EVIDENCE_UNAVAILABLE for row in measured_evidence)
+    assert all(row["reason"] == evidence["reason"] for row in measured_evidence)
+
+
 @pytest.mark.parametrize(("tokens", "usage", "status", "diagnostic"), [
     (False, False, "inconclusive", "usage.prompt_tokens and usage.completion_tokens"),
     (True, {"prompt_tokens": 8}, "inconclusive", "usage.completion_tokens"),

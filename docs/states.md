@@ -100,7 +100,7 @@ Compare the fixed strings exactly; treat any other non-empty value as a stop.
 
 Where you see it: `observations.targets.*.conditions[].status` before aggregation.
 
-After a run ends, each condition's `status` is an aggregate (`passed`, `failed`, `inconclusive`, `skipped`, `stopped`) and the lifecycle value moves to `lifecycle_status`.
+After aggregation, the lifecycle value moves to `lifecycle_status`; the aggregate vocabulary is documented below.
 
 Recovered condition rows use status `interrupted`.
 
@@ -144,6 +144,145 @@ A phase write the table does not declare is still saved, and logged as a warning
 
 Phases normally follow the declared order. Cleanup may skip to `finalizing`; the runner can force `finished`.
 
+## Connection test result
+
+| Value | Meaning |
+| --- | --- |
+| `connected` | A test request completed successfully. |
+| `unverified` | The configured model can be tried, but model discovery could not verify it. |
+| `needs_model` | A model must be selected before a test request can run. |
+
+Where you see it: POST `/api/targets/test-connection` response `status`.
+
+`connected` and `unverified` are usable connection results for the context-window cache gate. Errors are HTTP errors, not an additional status.
+
+| Value | Meaning |
+| --- | --- |
+| `unavailable` | Context-window discovery could not obtain usable metadata. |
+| `no_window` | Discovery completed without a context-window value for this model. |
+
+Where you see it: the same response's `context_window_reason`. It is null when a context window is found.
+
+## Token-evidence probe
+
+| Value | Meaning | Terminal? |
+| --- | --- | --- |
+| `not_probed` | No compatibility probe result has been observed. | No |
+| `probing` | An option was rejected; another bounded probe may try the remaining options. | No |
+| `observed` | A stream completed; inspect the field states for usable evidence. | Yes |
+| `unavailable` | Probing could not complete, exhausted its attempts, or had no remaining budget. | Yes |
+
+Where you see it: `report.json` `observations.targets.*.token_evidence.status`.
+
+| From | To |
+| --- | --- |
+| `not_probed` | `probing`, `observed`, `unavailable` |
+| `probing` | `probing`, `observed`, `unavailable` |
+| `observed` | `observed` |
+| `unavailable` | `unavailable` |
+
+The probe scheduler stops requesting probes after an observed or unavailable result; those terminal values remain unchanged.
+
+| Value | Meaning |
+| --- | --- |
+| `unverified` | No completed probe establishes support. |
+| `supported` | The probe returned the requested token boundaries or both usage counts. |
+| `partial` | The probe returned only one of the two usage counts. |
+| `not_returned` | A completed probe omitted the requested evidence. |
+| `rejected` | The endpoint rejected the corresponding request options. |
+
+Where you see it: `report.json` `observations.targets.*.token_evidence.logprobs` and `.usage`.
+
+These are target probe field states. Request-local copies in `requests[].workload.token_evidence` can additionally qualify fields as `non_streamed`, `disabled_by_request`, or `shape_unverified`.
+
+## Restart observation
+
+| Value | Meaning | Terminal? |
+| --- | --- | --- |
+| `blocked` | Restart is not ready: the hook could not run or readiness failed. `reason` explains which. | On failure |
+| `hook_completed` | The configured hook succeeded; inference readiness is still being checked. | No |
+| `ready` | A readiness poll and inference request succeeded. | Yes |
+
+Where you see it: `report.json` `observations.targets.*.restart.status`.
+
+| From | To |
+| --- | --- |
+| `blocked` | `hook_completed` |
+| `hook_completed` | `ready`, `blocked` |
+| `ready` | None |
+
+An observation starts `blocked`. Hook failures leave it there; only a successful hook enters readiness checking. A final `blocked` result is not retried within that observation.
+
+## Telemetry snapshot and discovery status
+
+| Value | Meaning | Discovery? |
+| --- | --- | --- |
+| `available` | Recognized metric samples were returned. | Yes |
+| `stale_samples` | Only stale source samples were returned. | Yes |
+| `absent_families` | Metrics format was recognized but relevant families were absent. | Yes |
+| `unsupported_format` | Metrics format or runtime profile was not recognized. | Yes |
+| `empty_response` | The response contained no usable statistics. | Yes |
+| `connection_failure` | Collection failed or timed out. | Yes |
+| `run_stopped` | Collection could not start before stop or deadline. | No |
+| `authentication_denied` | The runtime metrics endpoint returned HTTP 401 or 403. | Yes |
+| `endpoint_absent` | The runtime metrics endpoint returned HTTP 404. | Yes |
+| `response_limit` | The response exceeded the bounded body size. | Yes |
+
+Where you see it: `report.json` `observations.targets.*.serving_telemetry.snapshots[].status`, nested `.host.status`, and `observations.targets.*.runtime_metrics_discovery.status`.
+
+Discovery remembers runtime scrape outcomes except `run_stopped`, which returns before discovery is recorded. Host scrapes do not update runtime discovery. `available`, `stale_samples`, and `absent_families` are usable collection outcomes and do not count toward `serving_telemetry.failures`; this does not make stale or missing measurements fresh evidence. Same-origin discovery is retried only after `available` or `stale_samples`; other remembered outcomes are reused without another attempt.
+
+## Gateway attribution state
+
+| Value | Meaning | Check status |
+| --- | --- | --- |
+| `not_selected` | Attribution was not selected. | `skipped` |
+| `unavailable` | The configured evidence endpoint or credentials were unavailable. | `inconclusive` |
+| `unsupported` | No supported adapter or read-only spend-log interface was available. | `inconclusive` |
+| `unverified` | Evidence could not establish complete attribution. | `inconclusive` |
+| `verified` | Every marked request matched its identity and final token counts. | `pass` |
+| `mismatch` | Marked requests had different identity or token attribution. | `fail` |
+
+Where you see it: `report.json` `observations.targets.*.gateway_attribution.state` and the attribution check's `metrics.state`.
+
+Every declared state maps to the check status in the table. An undeclared state is a programming error.
+
+## Condition aggregate status
+
+| Value | Meaning |
+| --- | --- |
+| `waiting` | The condition has not started. |
+| `running` | The condition is active or has requests in progress. |
+| `passed` | An explicit passing verdict or all completed requests establish success. |
+| `failed` | An explicit failing verdict or request failures establish failure. |
+| `inconclusive` | The condition completed without a supported verdict. |
+| `skipped` | The condition was not evaluated or stopped before any request started. |
+| `stopped` | The condition started but ended early due to a run stop. |
+
+Where you see it: `report.json` `conditions[].status` and condition API/event `aggregate_status`. The original lifecycle value is retained as `lifecycle_status`.
+
+| Check verdict | Aggregate status |
+| --- | --- |
+| `pass` | `passed` |
+| `fail` | `failed` |
+| `blocked`, `inconclusive` | `inconclusive` |
+| `skipped` | `skipped` |
+
+An explicit verdict takes precedence over stop-reason classification.
+
+## Condition stop reasons
+
+| Value | Meaning |
+| --- | --- |
+| `run stopped` | The run stop signal or explicit cancellation ended the condition. |
+| `time limit reached` | The run deadline ended the condition. |
+| `request budget reached` | No request budget remained. |
+| `check stopped early` | Another stop cause, including memory limits or an unresponsive endpoint, ended the condition. |
+
+Where you see it: condition rows and condition API/event `reason`.
+
+Aggregation compares these fixed values exactly. For reason text emitted by source-hashed workloads, it also retains the case-insensitive markers `run stopped`, `time limit`, `request budget`, `cancelled`, and `aborted`. A stopped condition aggregates to `stopped` if any request started, or `skipped` otherwise, unless an explicit verdict or request failure takes precedence.
+
 ## Reading states from a program
 
 `giraffe describe` and GET `/api/capabilities` include a `states` block with vocabularies, transitions, stop reasons and exit codes.
@@ -154,7 +293,7 @@ It is true for `completed`, `interrupted` and `error`: no process is working on 
 
 Run detail, history and events also include `recoverable`. It is true only for an `interrupted` run that still has its `evidence.jsonl` and has no valid saved report; such a run can still become `completed` or `error`. A valid report finishes recovery even if journal cleanup failed or a crash left the journal behind. To wait for a final state, poll until `terminal` is true and `recoverable` is false, with your own time limit: recovery runs when the server starts or when you run the recovery command.
 
-The server checks every run-state write against the transition table above. A write the table does not declare is still saved, and logged as a warning; the test suite fails on it.
+The web metadata helper, CLI run writer, and storage metadata updater check run-state writes against the transition table above. A write the table does not declare is still saved, and logged as a warning; the test suite fails on it.
 
 POST `/api/runs/{id}/cancel` includes `result`:
 

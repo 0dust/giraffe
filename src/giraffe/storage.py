@@ -74,7 +74,10 @@ def write_metadata(directory: Path | str, values: dict) -> None:
 def update_metadata(directory: Path | str, changes: dict) -> dict:
     with _metadata_lock:
         directory = Path(directory)
-        values = _read(directory / ".web.json") | changes
+        values = _read(directory / ".web.json")
+        if "state" in changes:
+            states.check_run_transition(values.get("state"), changes["state"])
+        values |= changes
         _write_metadata(directory, values)
         return values
 

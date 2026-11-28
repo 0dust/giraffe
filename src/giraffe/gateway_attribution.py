@@ -114,7 +114,7 @@ def _normalize(rows, marker, expected):
 
 def _assess(records, matched, planned, *, complete, unstable=False):
     identities = {}
-    totals = _state("unverified", "Some marked requests lack complete attribution evidence.",
+    totals = _state(states.GATEWAY_ATTRIBUTION_UNVERIFIED, "Some marked requests lack complete attribution evidence.",
                     planned_requests=planned, observed_requests=len(records))
     for record in records:
         alias = record.identity
@@ -143,9 +143,11 @@ def _assess(records, matched, planned, *, complete, unstable=False):
         totals[field] += 1
     totals["identities"] = list(identities.values())
     if totals["mismatched_requests"]:
-        totals.update(state="mismatch", reason="Marked requests have different gateway identity or token attribution.")
+        totals.update(state=states.GATEWAY_ATTRIBUTION_MISMATCH,
+                      reason="Marked requests have different gateway identity or token attribution.")
     elif records and len(records) == planned and totals["matched_requests"] == planned:
-        totals.update(state="verified", reason="Every marked request matches its gateway identity and final token counts.")
+        totals.update(state=states.GATEWAY_ATTRIBUTION_VERIFIED,
+                      reason="Every marked request matches its gateway identity and final token counts.")
     return totals
 
 
@@ -224,9 +226,9 @@ async def _pages(client, url, marker, *, start_date, end_date, max_rows, stop, d
             if response is None:
                 return rows, False
             if response.status_code in _UNSUPPORTED_READER_STATUSES:
-                return "unsupported", False
+                return states.GATEWAY_ATTRIBUTION_UNSUPPORTED, False
             if response.status_code != 200:
-                return "unavailable", False
+                return states.GATEWAY_ATTRIBUTION_UNAVAILABLE, False
             # HTTPX decodes compressed chunks before the body size can be checked.
             if response.headers.get("content-encoding", "identity").strip().lower() != "identity":
                 return rows, False
@@ -279,12 +281,13 @@ async def execute(run, target, client, *, deferred=False):
 
 async def _execute(run, target, client, *, deferred=False):
     settings, gateway = run.config.gateway_attribution, target.gateway
-    observation = _state("unavailable", "Gateway evidence endpoint and credentials are not configured.")
+    observation = _state(states.GATEWAY_ATTRIBUTION_UNAVAILABLE, "Gateway evidence endpoint and credentials are not configured.")
     run.observations[target.name][CHECK] = observation
     if gateway is None or settings is None:
         return
     if gateway.profile != "litellm":
-        observation.update(state="unsupported", reason="No supported attribution adapter selected for this gateway profile.")
+        observation.update(state=states.GATEWAY_ATTRIBUTION_UNSUPPORTED,
+                           reason="No supported attribution adapter selected for this gateway profile.")
         return
     # The same credential-reference validation/resolution applies to the reader,
     # but its credential is never taken from an inference identity.
@@ -296,7 +299,8 @@ async def _execute(run, target, client, *, deferred=False):
             if fingerprint is None:
                 continue
             if fingerprint in fingerprints:
-                observation.update(state="unverified", reason="Selected aliases must resolve to distinct LiteLLM keys.")
+                observation.update(state=states.GATEWAY_ATTRIBUTION_UNVERIFIED,
+                                   reason="Selected aliases must resolve to distinct LiteLLM keys.")
                 return
             fingerprints.add(fingerprint)
     except ValueError:
@@ -305,7 +309,7 @@ async def _execute(run, target, client, *, deferred=False):
     planned = settings.samples * len(settings.identities)
     row_limit = min(run.config.metrics_max_series, PAGE_SIZE * MAX_PAGES)
     if planned > row_limit:
-        observation.update(state="unverified", reason_code="spend_log_row_limit",
+        observation.update(state=states.GATEWAY_ATTRIBUTION_UNVERIFIED, reason_code="spend_log_row_limit",
                            planned_requests=planned, observed_requests=0, collection_attempts=0,
                            collection_complete=False,
                            reason=f"The configured attribution probes require at least {planned} spend-log rows. "
@@ -316,7 +320,7 @@ async def _execute(run, target, client, *, deferred=False):
     reader_status = None
     if preflight_bound := reader_preflight_bound(run.config, deferred=deferred):
         def report_preflight_stop(reason):
-            observation.update(state="unverified", planned_requests=planned, observed_requests=0,
+            observation.update(state=states.GATEWAY_ATTRIBUTION_UNVERIFIED, planned_requests=planned, observed_requests=0,
                                collection_attempts=0, collection_complete=False,
                                reason="Gateway spend-log reader preflight was interrupted.")
             if reason == states.STOP_MAX_DURATION and not run.stop.is_set():
@@ -340,7 +344,7 @@ async def _execute(run, target, client, *, deferred=False):
                                collection_attempts=0, collection_complete=False)
             return
         if reader_status in _UNSUPPORTED_READER_STATUSES:
-            observation.update(state="unsupported", reason="Read-only gateway spend logs are unsupported.",
+            observation.update(state=states.GATEWAY_ATTRIBUTION_UNSUPPORTED, reason="Read-only gateway spend logs are unsupported.",
                                planned_requests=0, observed_requests=0)
             return
         if deferred and reader_status != 200:
@@ -402,9 +406,11 @@ async def _execute(run, target, client, *, deferred=False):
     if not records:
         observation.update(planned_requests=planned, observed_requests=0)
         if budget_limited and reader_status not in {None, 200}:
-            observation.update(state="unavailable", reason="Read-only gateway spend logs were unavailable during preflight.")
+            observation.update(state=states.GATEWAY_ATTRIBUTION_UNAVAILABLE,
+                               reason="Read-only gateway spend logs were unavailable during preflight.")
             return
-        observation.update(state="unverified", reason="No identified requests were admitted within the run budget.")
+        observation.update(state=states.GATEWAY_ATTRIBUTION_UNVERIFIED,
+                           reason="No identified requests were admitted within the run budget.")
         if budget_limited:
             observation.update(reason_code="budget_limited", reason=budget_reason)
         return
@@ -462,21 +468,22 @@ async def _execute(run, target, client, *, deferred=False):
                                       collection_complete=settled and complete, evidence_changed=unstable)
                 if run.stop.is_set():
                     run.stop_reason(target.name)
-                    if assessment["state"] == "unverified":
+                    if assessment["state"] == states.GATEWAY_ATTRIBUTION_UNVERIFIED:
                         assessment.update(reason="Gateway evidence collection was interrupted.")
-                elif (assessment["state"] == "unverified"
+                elif (assessment["state"] == states.GATEWAY_ATTRIBUTION_UNVERIFIED
                       and (attempts < len(POLL_FRACTIONS) or deadline < settle_deadline
                            or (time.monotonic() >= deadline and not assessment.get("collection_complete")))):
                     assessment.update(reason="The final spend-log read could not qualify within the run budget.")
     except asyncio.CancelledError:
         cancelled = True
-        if assessment["state"] == "unverified":
+        if assessment["state"] == states.GATEWAY_ATTRIBUTION_UNVERIFIED:
             assessment.update(reason="Gateway evidence collection was interrupted.")
         raise
     except httpx.InvalidURL:
-        assessment.update(state="unavailable", reason="Read-only gateway spend-log reader URL is invalid.")
+        assessment.update(state=states.GATEWAY_ATTRIBUTION_UNAVAILABLE,
+                          reason="Read-only gateway spend-log reader URL is invalid.")
     except (httpx.HTTPError, OSError, TimeoutError, ValueError):
-        if assessment["state"] == "unverified":
+        if assessment["state"] == states.GATEWAY_ATTRIBUTION_UNVERIFIED:
             assessment.update(reason="Gateway evidence collection did not complete within its bounded window.",
                               collection_complete=False, evidence_changed=unstable)
     finally:
@@ -486,12 +493,12 @@ async def _execute(run, target, client, *, deferred=False):
         if time.monotonic() >= run.deadline:
             # The reader's own timeout can finish before the run monitor wakes.
             run.stop_reason(target.name)
-        if (assessment["state"] == "unverified" and len(records) == planned
+        if (assessment["state"] == states.GATEWAY_ATTRIBUTION_UNVERIFIED and len(records) == planned
                 and deadline < settle_deadline and not run.stop.is_set()
                 and (not cancelled or run.reason == states.STOP_MAX_DURATION)):
             assessment.update(reason_code="time_limited",
                               reason="The run deadline did not leave the configured spend-log settle window after all identity probes.")
-        if budget_limited and assessment["state"] == "unverified" and not cancelled and not run.stop.is_set():
+        if budget_limited and assessment["state"] == states.GATEWAY_ATTRIBUTION_UNVERIFIED and not cancelled and not run.stop.is_set():
             assessment.update(reason_code="budget_limited", reason=budget_reason)
         assessment.setdefault("collection_complete", False)
         assessment.update(collection_attempts=attempts, collection_version=COLLECTION_VERSION,
@@ -502,12 +509,14 @@ async def _execute(run, target, client, *, deferred=False):
 
 def result(run, target):
     selected = CHECK in run.config.checks
-    data = (run.observations[target.name].get(CHECK)
-            or _state("unverified", "Gateway attribution was not exercised.")) if selected else _state("not_selected", "Not selected.")
-    status = {"not_selected": "skipped", "verified": "pass", "mismatch": "fail"}.get(data["state"], "inconclusive")
+    data = ((run.observations[target.name].get(CHECK)
+             or _state(states.GATEWAY_ATTRIBUTION_UNVERIFIED, "Gateway attribution was not exercised."))
+            if selected else _state(states.GATEWAY_ATTRIBUTION_NOT_SELECTED, "Not selected."))
+    status = states.GATEWAY_ATTRIBUTION_CHECK_STATUS[data["state"]]
     configured = (run.config.gateway_attribution is not None and target.gateway is not None
                   and target.gateway.profile == "litellm")
-    required = selected and (run.config.checks == [CHECK] or (configured and data["state"] != "unsupported"))
+    required = selected and (run.config.checks == [CHECK]
+                            or (configured and data["state"] != states.GATEWAY_ATTRIBUTION_UNSUPPORTED))
     return CheckResult(id=CHECK, target=target.name, title="Gateway usage attribution", required=required,
                        status=status, summary=data["reason"], metrics=data,
                        evidence_ids=[r.id for r in run.records if r.target == target.name and CHECK in r.check_ids])

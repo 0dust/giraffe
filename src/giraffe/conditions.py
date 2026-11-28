@@ -565,25 +565,25 @@ def condition_aggregate(summary: Mapping[str, Any], *, verdict: str | None = Non
     terminal = summary.get("status") not in states.CONDITION_UNFINISHED
     explicit = verdict or summary.get("condition_verdict") or (summary.get("load_point_result") or {}).get("status")
     if running or not terminal and summary.get("status") == "running":
-        status = "running"
+        status = states.CONDITION_AGGREGATE_RUNNING
     elif not terminal:
-        status = "waiting"
+        status = states.CONDITION_AGGREGATE_WAITING
     elif not started and ((summary.get("load_point_result") or {}).get("status") == "skipped"
                          or (summary.get("load_point_result") or {}).get("input_not_calibrated")):
-        status = "skipped"
+        status = states.CONDITION_AGGREGATE_SKIPPED
     elif explicit in {"pending", "measured"}:
-        status = "inconclusive"
-    elif explicit in {"pass", "fail", "inconclusive", "blocked", "skipped"}:
-        status = {"pass": "passed", "fail": "failed", "blocked": "inconclusive"}.get(explicit, explicit)
+        status = states.CONDITION_AGGREGATE_INCONCLUSIVE
+    elif explicit in states.CONDITION_VERDICT_STATUS:
+        status = states.CONDITION_VERDICT_STATUS[explicit]
     elif failed:
-        status = "failed"
-    elif reason and (not started or kind == "exact" and not_started or any(
-            word in reason.lower() for word in ("run stopped", "time limit", "request budget", "cancelled", "aborted"))):
-        status = "stopped" if started else "skipped"
+        status = states.CONDITION_AGGREGATE_FAILED
+    elif reason and (not started or kind == "exact" and not_started or reason in states.CONDITION_STOP_REASONS or any(
+            marker in reason.lower() for marker in states.CONDITION_STOP_REASON_MARKERS)):
+        status = states.CONDITION_AGGREGATE_STOPPED if started else states.CONDITION_AGGREGATE_SKIPPED
     elif completed and statuses.get("passed", 0) == completed:
-        status = "passed"
+        status = states.CONDITION_AGGREGATE_PASSED
     else:
-        status = "inconclusive"
+        status = states.CONDITION_AGGREGATE_INCONCLUSIVE
     rate = parameters.get("rate_rps", condition.get("rate_rps"))
     concurrency = parameters.get("concurrency", condition.get("level"))
     description = f"{rate:g} requests/s" if isinstance(rate, (int, float)) else (
@@ -808,7 +808,7 @@ class ConditionRequestIndex:
                 rows.append({"number": len(slots) + offset - len(selected) + 1, "request_id": None,
                              "status": "not_started", "result_text": f"Not sent: {reason}"})
         aggregate = condition_aggregate(summary, statuses={name: len(values) for name, values in statuses.items()})
-        if aggregate["status"] != "running" and summary.get("aggregate_status"):
+        if aggregate["status"] != states.CONDITION_AGGREGATE_RUNNING and summary.get("aggregate_status"):
             aggregate["status"] = aggregate["aggregate_status"] = summary["aggregate_status"]
         return {"condition_id": condition_id, "target": key[0], "page": page, "page_size": page_size,
                 "total": total, "pages": pages, "range_start": start + 1 if total else 0,

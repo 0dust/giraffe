@@ -16,6 +16,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
+from . import states
 from .launch_settings import (
     LAUNCH_FIELD, LAUNCH_SIZE_LIMIT, TENSOR_PARALLEL_FLAG, compare_launch_settings,
     launch_evidence_at_limit, launch_option_name, looks_like_launch_option, positive_launch_integer,
@@ -455,7 +456,7 @@ async def probe_context_window(target, config, timeout=6, *, detail=False):
     from giraffe.client import _headers, models_url
 
     errors = (httpx.HTTPError, httpx.InvalidURL, ValueError, TypeError, AttributeError, OSError, TimeoutError)
-    reason = "unavailable"
+    reason = states.CONNECTION_CONTEXT_UNAVAILABLE
     try:
         async with asyncio.timeout(timeout):
             client = await asyncio.to_thread(_discovery_client, config, timeout)
@@ -497,12 +498,12 @@ async def probe_context_window(target, config, timeout=6, *, detail=False):
                     info = await _read(client, models_url(target.url))
                     value = _models_context_limit(info, target.model)
                     source = "/v1/models max_model_len"
-                    reason = "no_window" if value is None else None
+                    reason = states.CONNECTION_CONTEXT_NO_WINDOW if value is None else None
                 if value is not None:
                     entry = {"value": value, "source": source, "collected_at": now()}
                     return (entry, None) if detail else entry
     except errors as exc:
-        reason = "unavailable"
+        reason = states.CONNECTION_CONTEXT_UNAVAILABLE
         logger.debug("Context window probe unavailable: %s", type(exc).__name__)
     return (None, reason) if detail else None
 
