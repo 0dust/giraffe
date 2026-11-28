@@ -605,7 +605,7 @@ async def _run(config: RunConfig, *, json_progress: bool = False, verbose: bool 
     timeout_warning_counts: dict[str, int] = {}
     timeout_warning_lines: dict[str, str] = {}
     latest_timeout_warnings: dict[str, dict] = {}
-    writer = adapter = sink_token = report = None
+    writer = adapter = sink_token = stop_cause_token = report = None
 
     def progress(event: dict) -> None:
         nonlocal last, last_update
@@ -649,10 +649,11 @@ async def _run(config: RunConfig, *, json_progress: bool = False, verbose: bool 
         if directory is not None:
             from giraffe.deployment import safe_config
             from giraffe.evidence import EvidenceWriter
-            from giraffe.runner import record_sink
+            from giraffe.runner import record_sink, stop_cause_sink
 
             writer = EvidenceWriter(directory, manifest={"config": safe_config(config.model_dump(mode="json"))})
             sink_token = record_sink.set(writer.record_finished)
+            stop_cause_token = stop_cause_sink.set(writer.record_stop_cause)
             if "scale_down" in config.checks:
                 from giraffe.scale_down_control import ScaleDownFileControl
                 adapter = ScaleDownFileControl(directory)
@@ -673,8 +674,9 @@ async def _run(config: RunConfig, *, json_progress: bool = False, verbose: bool 
                     report.warnings.append("Scale-down control status file could not be saved; inspect report evidence.")
             finally:
                 if writer is not None:
-                    from giraffe.runner import record_sink
+                    from giraffe.runner import record_sink, stop_cause_sink
                     record_sink.reset(sink_token)
+                    stop_cause_sink.reset(stop_cause_token)
                     try:
                         await asyncio.to_thread(writer.close)
                     except Exception:

@@ -91,6 +91,29 @@ Memory-limit and endpoint-abort reasons are free text.
 
 Compare the fixed strings exactly; treat any other non-empty value as a stop.
 
+### Stop causes
+
+| Kind | Fixed text or free text | Soft? |
+| --- | --- | --- |
+| `user` | `cancelled by user` | No |
+| `cancelled` | `run cancelled` | No |
+| `duration` | `maximum run duration reached` | No |
+| `request_budget` | `maximum request budget reached` | Yes |
+| `error_threshold` | `error threshold reached` | No |
+| `endpoints_unresponsive` | free text | No |
+| `memory` | free text | No |
+
+The first non-soft cause wins; a request budget is soft and can be replaced by a non-soft cause, while a soft cause never replaces an existing cause.
+Polling checks user stop, duration, all endpoints unresponsive, then error threshold in that order; memory sampling resolves those pending stops before latching memory, and outer cancellation latches user stop if requested or cancellation otherwise.
+
+Where agents see it: `report.json` `observations.stop_cause` is the raw latched cause as `{"kind", "text", "scope"}`, or null when no cause was latched; `run_stopping` and `run_finished` events include its `stop_kind` (or null).
+`abort_reason` is the verdict-relevant stop text, while `stop_cause` records what actually stopped work even when a budget-only or optional memory stop leaves `abort_reason` null.
+`observations.stop_cause` describes what stopped inference or workload work; `observations.judging.stop_reason` describes what stopped the later judging phase.
+Callers should read both fields when judging ran to distinguish the workload stop from the judging stop.
+For example, with `max_requests=1`, cancelling during judging leaves `observations.stop_cause.kind` as `request_budget` and sets `observations.judging.stop_reason` to `cancelled`.
+A user cause can have `scope: "gateway"`; other causes have null scope.
+`giraffe describe` and GET `/api/capabilities` expose `stop_kinds`, `stop_soft_kinds`, and the fixed-text-to-kind map `stop_reason_kinds` in `states`.
+
 ## Condition lifecycle
 
 | Value | Meaning | Terminal? |

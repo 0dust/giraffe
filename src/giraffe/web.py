@@ -74,7 +74,7 @@ from giraffe.report_stream import expanded_report_chunks
 from giraffe.request_pack import pack_preview
 from giraffe.resources import PhaseSampler, SAMPLING
 from giraffe.runner import run_suite
-from giraffe.runner import record_sink
+from giraffe.runner import record_sink, stop_cause_sink
 from giraffe.diagnostics import configure_logging, run_logging
 from giraffe.evidence import EvidenceWriter, recover_evidence
 from giraffe.storage import (DEFAULT_LIMITS, apply_cleanup, automatic_cleanup, check_start, cleanup_plan,
@@ -1698,6 +1698,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                     try:
                         publish(job, {"event": "run_finished", "state": job["state"],
                                       "abort_reason": job["meta"].get("abort_reason"),
+                                      "stop_kind": job["meta"].get("stop_kind"),
                                       "error": job["meta"].get("error"), "error_id": job["meta"].get("error_id")}, config.max_requests)
                     except Exception:
                         logger.exception("Could not publish final status for %s", job["id"])
@@ -1769,7 +1770,8 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                 result["error"] += f" [error {export_error_id}]"
             else:
                 result = dict(state=states.RUN_COMPLETED, finished_at=_now())
-            result.update(run_id=report.run_id, abort_reason=report.abort_reason, resources={
+            result.update(run_id=report.run_id, abort_reason=report.abort_reason,
+                stop_kind=(report.observations.get("stop_cause") or {}).get("kind"), resources={
                 "sampled_peak_rss_bytes": dict(sampler.peaks),
                 "memory_measurement": "unavailable" if sampler.peaks.get("export") is None else "sampled process RSS",
                 "sampling": SAMPLING})
@@ -1784,6 +1786,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
             async def measured(stop):
                 nonlocal writer_close_attempted
                 token = record_sink.set(writer.record_finished)
+                cause_token = stop_cause_sink.set(writer.record_stop_cause)
                 report = None
                 cancellation = None
                 try:
@@ -1804,6 +1807,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                     # Pass the exception as data: asyncio may replace a task's
                     # CancelledError when it crosses a Future/loop boundary.
                 finally:
+                    stop_cause_sink.reset(cause_token)
                     record_sink.reset(token)
                     # The producer owns the journal through terminal request
                     # handling and report construction. Server timeout must not

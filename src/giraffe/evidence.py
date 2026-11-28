@@ -102,6 +102,9 @@ class EvidenceWriter:
         except queue.Full:
             self.dropped_count += 1
 
+    def record_stop_cause(self, cause: dict | None) -> None:
+        self._enqueue(("stop_cause", dict(cause) if cause is not None else None))
+
     def progress(self, event: dict) -> None:
         if (event.get("event", "").startswith(("check_", "condition_"))
                                  or event.get("check") or event.get("condition_summary")
@@ -163,7 +166,7 @@ class EvidenceWriter:
                         if kind == "record":
                             non_finite = _has_non_finite(value.model_dump(mode="python"))
                             value = self._retained(value).requests[0].model_dump(mode="json")
-                        elif self.manifest.get("config", {}).get("retention", "failures") == "none":
+                        elif kind == "progress" and self.manifest.get("config", {}).get("retention", "failures") == "none":
                             # Apply the same summary scrubbing as final reports.
                             from .reporting import _without_answer_excerpts
                             value = deepcopy(value)
@@ -222,6 +225,7 @@ def recover_evidence(directory: Path | str, meta: dict, *, pause=None) -> RunRep
     except FileNotFoundError:
         return None
     header, records, checks, conditions = {}, {}, {}, {}
+    stop_cause = None
     scale_down = {}
     timeout_warnings = {}
     dropped = meta.get("evidence_dropped_count", 0)
@@ -241,6 +245,14 @@ def recover_evidence(directory: Path | str, meta: dict, *, pause=None) -> RunRep
                     if record.judgement is not None or (record.evaluation and record.evaluation.scorer == "judge"):
                         record.score, record.score_message, record.judgement = None, None, None
                     records[record.id] = record
+                elif value.get("type") == "stop_cause":
+                    cause = value["stop_cause"]
+                    if cause is not None and (not isinstance(cause, dict)
+                            or cause.get("kind") not in states.STOP_KINDS
+                            or not isinstance(cause.get("text"), str)
+                            or cause.get("scope") not in (None, "gateway")):
+                        raise ValueError("Invalid stop cause")
+                    stop_cause = cause
                 elif value.get("type") == "progress":
                     event = value["progress"]
                     if event.get("event") == "timeout_warning":
@@ -308,7 +320,7 @@ def recover_evidence(directory: Path | str, meta: dict, *, pause=None) -> RunRep
             ([f"{dropped} evidence records not written to evidence.jsonl"] if dropped else []) +
             list(dict.fromkeys(warning_messages)),
         observations={"interrupted": True, "judge_scores_missing": True, "evidence_dropped_count": dropped,
-                      "targets": targets})
+                      "stop_cause": stop_cause, "targets": targets})
 
 
 def _recover_scale_down_event(targets: dict, event: dict) -> None:

@@ -357,6 +357,8 @@ async def test_interrupted_event_feed_tracks_recovery_report_publication(tmp_pat
         path = f"/api/runs/{identifier}/events"
         events = (await client.get(path)).json()
         assert events["reset"] is False and events["recoverable"] is True
+        assert events["events"][-1]["event"] == "run_finished"
+        assert events["events"][-1]["stop_kind"] is None
         directory = tmp_path / identifier
         recovered = recover_evidence(directory, json.loads((directory / ".web.json").read_text()))
         assert recovered is not None
@@ -364,6 +366,7 @@ async def test_interrupted_event_feed_tracks_recovery_report_publication(tmp_pat
         events = (await client.get(path)).json()
         assert events["reset"] is False and events["terminal"] is True
         assert events["state"] == "interrupted" and events["recoverable"] is False
+        assert events["events"][-1]["stop_kind"] is None
         assert (directory / "evidence.jsonl").is_file()
 
 

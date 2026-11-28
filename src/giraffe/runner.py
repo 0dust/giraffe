@@ -16,6 +16,7 @@ import uuid
 from collections import Counter, defaultdict
 from contextlib import asynccontextmanager, contextmanager, nullcontext
 from contextvars import ContextVar
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Literal
@@ -48,6 +49,7 @@ logger = logging.getLogger(__name__)
 # A context-local sink lets web runs persist evidence without changing request()
 # or sharing a writer between concurrent CLI invocations.
 record_sink = ContextVar("giraffe_record_sink", default=lambda record: None)
+stop_cause_sink = ContextVar("giraffe_stop_cause_sink", default=lambda cause: None)
 
 
 class _DispatchRefused(Exception):
@@ -354,6 +356,13 @@ class _InflightPeaks:
         return peak
 
 
+@dataclass(frozen=True)
+class StopCause:
+    kind: str
+    text: str
+    scope: str | None = None
+
+
 class _Run:
     def __init__(self, config: RunConfig, progress, stop_event):
         self.config = config
@@ -375,6 +384,7 @@ class _Run:
         self.records: list[RequestRecord] = []
         self.timeout_watch = TimeoutWatch()
         self.record_sink = record_sink.get()
+        self.stop_cause_sink = stop_cause_sink.get()
         from giraffe.logprobs import LogprobBudget
         self.logprob_budget = LogprobBudget()
         self.attempted = 0
@@ -382,15 +392,13 @@ class _Run:
         self.dropped_offers = 0
         self.budget_counts = Counter()
         self.errors = 0
-        self.reason: str | None = None
+        self.stop_cause: StopCause | None = None
         self.limits_reached = set()
         self.request_limit_scopes: set[str] = set()
         self.concurrency_limit_scopes: set[str] = set()
         self.duration_limit_scope: str | None = None
-        self.user_stop_scope: Literal["gateway"] | None = None
         self._gateway_only_phase = False
         self.memory_limit_reached = False
-        self.memory_stop_reason = None
         self.memory_measured = False
         self.memory_sampling_done = False
         self.rss_at_start_bytes = None
@@ -433,6 +441,35 @@ class _Run:
                     "timeout_seconds": config.metrics_timeout_seconds,
                     "max_samples": config.metrics_max_samples,
                     "max_series": config.metrics_max_series, "collection_gaps_seconds": []})
+
+    @property
+    def reason(self) -> str | None:
+        return self.stop_cause.text if self.stop_cause is not None else None
+
+    @reason.setter
+    def reason(self, text: str | None) -> None:
+        if text is None:
+            self.stop_cause = None
+        elif text in states.STOP_REASON_KIND:
+            self.stop_cause = StopCause(states.STOP_REASON_KIND[text], text)
+        else:
+            raise ValueError(f"Free-text stop reasons must use _latch_stop: {text!r}")
+        self.stop_cause_sink(asdict(self.stop_cause) if self.stop_cause is not None else None)
+
+    @property
+    def user_stop_scope(self) -> str | None:
+        return self.stop_cause.scope if self.stop_cause is not None and self.stop_cause.kind == states.STOP_KIND_USER else None
+
+    def _latch_stop(self, kind: str, text: str | None = None, *, scope: str | None = None,
+                    replace_soft: bool = True) -> bool:
+        if text is None:
+            text = next(reason for reason, reason_kind in states.STOP_REASON_KIND.items() if reason_kind == kind)
+        if self.stop_cause is None or (self.stop_cause.kind in states.STOP_SOFT_KINDS
+                and replace_soft and kind not in states.STOP_SOFT_KINDS):
+            self.stop_cause = StopCause(kind, text, scope)
+            self.stop_cause_sink(asdict(self.stop_cause))
+            return True
+        return False
 
     def runtime_gateway_request_counts(self, target):
         from .gateway_access import eligible_probe_count
@@ -512,11 +549,12 @@ class _Run:
                   **{k: v for k, v in row.items() if k not in {"target", "completed"}})
 
     def condition_reason(self, target, fallback=states.CONDITION_STOP_EARLY):
-        if self.stop.is_set() or self.reason == states.STOP_CANCELLED_BY_USER:
+        stop_kind = states.STOP_REASON_KIND.get(getattr(self, "reason", None))
+        if self.stop.is_set() or stop_kind == states.STOP_KIND_USER:
             return states.CONDITION_STOP_RUN
-        if time.monotonic() >= self.deadline or self.reason == states.STOP_MAX_DURATION:
+        if time.monotonic() >= self.deadline or stop_kind == states.STOP_KIND_DURATION:
             return states.CONDITION_STOP_TIME_LIMIT
-        if self.remaining(target) == 0 or self.reason == states.STOP_REQUEST_BUDGET:
+        if self.remaining(target) == 0 or stop_kind == states.STOP_KIND_REQUEST_BUDGET:
             return states.CONDITION_STOP_REQUEST_BUDGET
         return fallback
 
@@ -640,43 +678,39 @@ class _Run:
         if not self.memory_interrupted_checks:
             return
         self.stop_reason()
-        if self.reason in {None, states.STOP_REQUEST_BUDGET}:
-            self.memory_stop_reason = (f"memory limit reached: RAM grew by {math.ceil(growth / 1024**2):,} MiB, "
-                                       f"over the {self.config.max_memory_mb:,} MiB limit")
-            self.reason = self.memory_stop_reason
+        self._latch_stop(states.STOP_KIND_MEMORY,
+            f"memory limit reached: RAM grew by {math.ceil(growth / 1024**2):,} MiB, "
+            f"over the {self.config.max_memory_mb:,} MiB limit")
         for target, check in self.memory_interrupted_checks:
             self.unfinished[target].add(check)
         self.stop_reason()
 
     def stop_reason(self, target: str | None = None) -> str | None:
-        previous = self.reason
         # A full offer budget must not hide a real stop during the drain.
-        if self.reason == states.STOP_REQUEST_BUDGET:
-            self.reason = None
-        if self.stop.is_set():
-            self.reason = self.reason or states.STOP_CANCELLED_BY_USER
+        user_latched = self.stop.is_set() and self._latch_stop(states.STOP_KIND_USER)
         if time.monotonic() >= self.deadline:
             self.limits_reached.add("max_duration_seconds")
             if self.duration_limit_scope is None:
                 self.duration_limit_scope = "gateway" if self._gateway_only_phase else "shared"
-            self.reason = self.reason or states.STOP_MAX_DURATION
+            self._latch_stop(states.STOP_KIND_DURATION)
         if self.config.unresponsive_after_failures:
             for name in self.endpoint_health:
                 self._check_endpoint_watchdog(name)
-        if all(health["abort_reason"] for health in self.endpoint_health.values()):
-            self.reason = self.reason or "; ".join(health["abort_reason"] for health in self.endpoint_health.values())
+        if self.endpoint_health and all(health["abort_reason"] for health in self.endpoint_health.values()):
+            self._latch_stop(states.STOP_KIND_ENDPOINTS_UNRESPONSIVE,
+                "; ".join(health["abort_reason"] for health in self.endpoint_health.values()))
         if self.errors >= self.config.stop_after_errors:
-            self.reason = self.reason or states.STOP_ERROR_THRESHOLD
-        self.reason = self.reason or previous
-        if (self.reason == states.STOP_CANCELLED_BY_USER and previous != self.reason and self._gateway_only_phase
+            self._latch_stop(states.STOP_KIND_ERROR_THRESHOLD)
+        if (user_latched and self._gateway_only_phase
                 and all(check in SHARED_BASELINE_EXCLUDED_WORKLOADS for _, check in self.pending_checks)
                 and all(checks <= SHARED_BASELINE_EXCLUDED_WORKLOADS for checks in self.unfinished.values())
                 and not any(health["abort_reason"] for health in self.endpoint_health.values())):
             # A user stop also skips judging, which the inference deadline allows.
-            self.user_stop_scope = "gateway"
-        if self.reason and self.reason != states.STOP_REQUEST_BUDGET and not self.stop_notified:
+            self.stop_cause = replace(self.stop_cause, scope="gateway")
+            self.stop_cause_sink(asdict(self.stop_cause))
+        if self.stop_cause is not None and self.stop_cause.kind not in states.STOP_SOFT_KINDS and not self.stop_notified:
             self.stop_notified = True
-            self.emit("run_stopping", abort_reason=self.reason)
+            self.emit("run_stopping", abort_reason=self.reason, stop_kind=self.stop_cause.kind)
         return (self.endpoint_health[target]["abort_reason"] if target else None) or self.reason
 
     def _check_endpoint_watchdog(self, target):
@@ -738,7 +772,7 @@ class _Run:
         if remaining == 0:
             self.mark_request_limit(gateway_probe=gateway_probe)
         if self.config.max_requests is not None and self.budget_used >= self.config.max_requests:
-            self.reason = self.reason or states.STOP_REQUEST_BUDGET
+            self._latch_stop(states.STOP_KIND_REQUEST_BUDGET)
         return not reason and not self.reason and (remaining is None or remaining > 0)
 
     def reserve_offer(self, target: str, *, gateway_probe: bool = False) -> bool:
@@ -1202,10 +1236,7 @@ class _Run:
                     reason = self.stop_reason(target.name)
                     # Stress phases can cancel their own requests while the run continues.
                     if reason or not _stress(spec.scenario):
-                        if not self.endpoint_health[target.name]["abort_reason"]:
-                            if reason:
-                                self.reason = reason
-                        else:
+                        if self.endpoint_health[target.name]["abort_reason"]:
                             record.error = self.endpoint_health[target.name]["abort_reason"]
                         self.mark_unfinished(target.name, _scenario_checks(spec))
                 budget_only = bool(set(spec.check_ids) & {"prefix", "sessions", "tools"}) and reasoning_budget(record)
@@ -1878,7 +1909,8 @@ async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attributio
                                     defer_policy=defer_policy, defer_access=defer_access)
             run.finish_checks(target.name, enabled - {"gpu"})
     except asyncio.CancelledError:
-        gateway_deadline = run.duration_limit_scope == "gateway" and run.reason == states.STOP_MAX_DURATION
+        gateway_deadline = (run.duration_limit_scope == "gateway"
+                            and states.STOP_REASON_KIND.get(run.reason) == states.STOP_KIND_DURATION)
         run.unfinished[target.name].update(check for (name, check), phase in run.pending_checks.items()
                                            if name == target.name and (phase == "inference" or not gateway_deadline))
         raise
@@ -2698,6 +2730,7 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
     from .reporting import connection_summary
     budget = getattr(run, "verdict_budget_guidance", None) or _budget_guidance(run.config)
     disconnected = connection_summary(all_records, target.url)
+    stop_kind = states.STOP_REASON_KIND.get(getattr(run, "reason", None))
     for check in result + workload_results:
         if check.status not in states.PROBLEM_STATUSES:
             continue
@@ -2711,7 +2744,7 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                                                                "budget_limited", "time_limited"})
         stopped_short_of_samples = (check.id in run.unfinished[target.name] and check.status == "inconclusive"
                                     and check.metrics.get("reason_code") == "insufficient_timing_samples")
-        if (interrupted or stopped_short_of_samples) and run.reason == states.STOP_CANCELLED_BY_USER:
+        if (interrupted or stopped_short_of_samples) and stop_kind == states.STOP_KIND_USER:
             from .planning import request_plan
             plan = request_plan(run.config)
             planned = plan["planned_total"]
@@ -2721,18 +2754,18 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
                              if planned is not None else
                              f"Stopped by you after {len(run.records)} requests. This duration-based workload has no fixed request count.")
             continue
-        if (interrupted or stopped_short_of_samples) and run.reason == states.STOP_REQUEST_BUDGET and check.id not in {"load", "recovery"}:
+        if (interrupted or stopped_short_of_samples) and stop_kind == states.STOP_KIND_REQUEST_BUDGET and check.id not in {"load", "recovery"}:
             check.finding_summary = "Request budget reached before this check finished."
             check.remediation = _budget_remediation(run.config, check.id)
             check.summary = check.finding_summary + " " + budget
             continue
-        if (interrupted or stopped_short_of_samples) and run.reason == states.STOP_MAX_DURATION and check.id not in {"load", "recovery"}:
+        if (interrupted or stopped_short_of_samples) and stop_kind == states.STOP_KIND_DURATION and check.id not in {"load", "recovery"}:
             if check.id != "gateway_attribution" or check.metrics.get("reason_code") != "time_limited":
                 check.finding_summary = "Run deadline reached before this check finished."
             check.remediation = _deadline_remediation(run.config)
             check.summary = check.finding_summary + " " + _deadline_guidance(run.config)
             continue
-        if check.status == "inconclusive" and check.id in run.unfinished[target.name] and run.reason == states.STOP_ERROR_THRESHOLD:
+        if check.status == "inconclusive" and check.id in run.unfinished[target.name] and stop_kind == states.STOP_KIND_ERROR_THRESHOLD:
             check.finding_summary = "Run stopped after the configured number of request errors before this check finished."
             check.summary = (check.finding_summary + " Inspect the failed requests, fix the error cause, "
                              "then rerun the unfinished checks.")
@@ -3154,8 +3187,7 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
             outer_cancellation = exc
             # Internally setting the event for cleanup must not attribute a
             # timeout or forced task cancellation to an explicit user stop.
-            if run.reason in {None, states.STOP_REQUEST_BUDGET}:
-                run.reason = states.STOP_CANCELLED_BY_USER if run.stop.is_set() else states.STOP_RUN_CANCELLED
+            run._latch_stop(states.STOP_KIND_USER if run.stop.is_set() else states.STOP_KIND_CANCELLED)
             run.stop.set()
 
     public_config = config.model_copy(deep=True)
@@ -3287,7 +3319,8 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
         # Child cleanup can propagate the monitor's cancellation. An older
         # cancellation count on the caller is not a new cancellation request.
         absorb_outer_cancellation(exc)
-        run.reason = run.stop_reason() or states.STOP_RUN_CANCELLED
+        if run.stop_reason() is None:
+            run._latch_stop(states.STOP_KIND_CANCELLED)
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -3338,7 +3371,7 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
             memory_monitor.cancel()
             await asyncio.gather(stopped, memory_monitor, return_exceptions=True)
         if run.stop.is_set():
-            run.reason = run.reason or states.STOP_CANCELLED_BY_USER
+            run._latch_stop(states.STOP_KIND_USER, replace_soft=False)
         limits = _check_config(config, "capacity").limits
         for target in config.targets:
             if run.stage_evidence[target.name]:
@@ -3432,6 +3465,7 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
                         "sampling": SAMPLING},
                     "targets": run.observations, "generator_max_lag_ms": round(run.max_lag_ms, 3),
                     "target_abort_reasons": target_abort_reasons,
+                    "stop_cause": asdict(run.stop_cause) if run.stop_cause is not None else None,
                     "client_timing_health": run.timing_health.snapshot(),
                     "request_budget_used": run.budget_used,
                     "request_limit_scopes": sorted(run.request_limit_scopes),
@@ -3507,14 +3541,14 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
     memory_required_interrupted = any(check.required and (check.target, check.id)
                                      in run.memory_interrupted_checks for check in checks)
     verdict_reason = run.reason
-    if verdict_reason == states.STOP_REQUEST_BUDGET:
+    if run.stop_cause is not None and run.stop_cause.kind == states.STOP_KIND_REQUEST_BUDGET:
         unfinished = set().union(*run.unfinished.values())
         # A limit reached only during optional gateway work leaves the
         # completed shared checks eligible for baseline comparison.
         if not unfinished or (not gateway_identities_only(config.checks)
                               and unfinished <= SHARED_BASELINE_EXCLUDED_WORKLOADS):
             verdict_reason = None
-    if run.memory_stop_reason and verdict_reason == run.memory_stop_reason and not memory_required_interrupted:
+    if run.stop_cause is not None and run.stop_cause.kind == states.STOP_KIND_MEMORY and not memory_required_interrupted:
         verdict_reason = None
     report = RunReport(run_id=run_id, suite_version=__version__,
                      started_at=started_at, finished_at=_now(),
@@ -3529,7 +3563,9 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
     try:
         for row in gateway_conditions:
             run.emit_condition("condition_finished", row["condition"]["id"], row)
-        run.emit("run_finished", abort_reason=verdict_reason, target_abort_reasons=target_abort_reasons)
+        run.emit("run_finished", abort_reason=verdict_reason,
+                 stop_kind=run.stop_cause.kind if run.stop_cause is not None else None,
+                 target_abort_reasons=target_abort_reasons)
     except Exception:
         if outer_cancellation is None:
             raise

@@ -39,10 +39,42 @@ def test_recover_finished_records_before_runner_finalizes(tmp_path):
     assert report.conditions[0]["status"] == "inconclusive"
     assert report.conditions[0]["lifecycle_status"] == "interrupted"
     assert report.observations["judge_scores_missing"]
+    assert report.observations["stop_cause"] is None
     assert (tmp_path / "evidence.jsonl").exists()
     write_report(report, tmp_path)
     assert not (tmp_path / "evidence.jsonl").exists()
     assert len(RunReport.model_validate_json((tmp_path / "report.json").read_text()).requests) == 7
+
+
+@pytest.mark.parametrize("gateway", [False, True])
+def test_evidence_recovers_latest_latched_cause_before_report(tmp_path, gateway):
+    from giraffe import runner
+    from tests.test_runner import config
+
+    writer = EvidenceWriter(tmp_path, {"config": {"retention": "none"}})
+    token = runner.stop_cause_sink.set(writer.record_stop_cause)
+    try:
+        run = runner._Run(config(checks=["gateway_access"] if gateway else ["serving"]), None, None)
+        run.record_sink = writer.record_finished
+        run._latch_stop("request_budget")
+        run.record_finished(record())
+        run._gateway_only_phase = gateway
+        run.stop.set()
+        run.stop_reason()
+        # A later stop cannot replace the first non-soft cause.
+        run._latch_stop("duration")
+    finally:
+        runner.stop_cause_sink.reset(token)
+        writer.close()
+
+    rows = [json.loads(line) for line in (tmp_path / "evidence.jsonl").read_text().splitlines()]
+    assert [row["type"] for row in rows] == ["header", "stop_cause", "record", "stop_cause"] + (
+        ["stop_cause"] if gateway else [])
+    assert rows[1]["stop_cause"]["kind"] == "request_budget"
+    recovered = recover_evidence(tmp_path, {})
+    assert len(recovered.requests) == 1
+    assert recovered.observations["stop_cause"] == {
+        "kind": "user", "text": "cancelled by user", "scope": "gateway" if gateway else None}
 
 
 @pytest.mark.parametrize("retention,expected", [("all", "sensitive answer"), ("none", ""), ("failures", "")])

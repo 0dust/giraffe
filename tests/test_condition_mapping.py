@@ -112,7 +112,7 @@ def test_condition_cut_short_by_other_run_limits(started, expected, stop_reason)
 
     config = RunConfig(targets=[{"name": "t", "url": "http://localhost:1", "model": "m"}])
     run = _Run(config, None, None)
-    run.reason = stop_reason
+    run._latch_stop("memory" if stop_reason.startswith("memory") else "endpoints_unresponsive", stop_reason)
     reason = run.condition_reason("t")
     assert reason == "check stopped early"
     result = condition_aggregate({"status": "finished", "planned": None,

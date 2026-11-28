@@ -49,6 +49,24 @@ STOP_ERROR_THRESHOLD: Final = "error threshold reached"
 STOP_REASONS: Final = (STOP_CANCELLED_BY_USER, STOP_RUN_CANCELLED, STOP_MAX_DURATION,
                        STOP_REQUEST_BUDGET, STOP_ERROR_THRESHOLD)
 
+# Run stop causes: raw latched state, including free-text reasons.
+STOP_KIND_USER: Final = "user"
+STOP_KIND_CANCELLED: Final = "cancelled"
+STOP_KIND_DURATION: Final = "duration"
+STOP_KIND_REQUEST_BUDGET: Final = "request_budget"
+STOP_KIND_ERROR_THRESHOLD: Final = "error_threshold"
+STOP_KIND_ENDPOINTS_UNRESPONSIVE: Final = "endpoints_unresponsive"
+STOP_KIND_MEMORY: Final = "memory"
+STOP_KINDS: Final = (STOP_KIND_USER, STOP_KIND_CANCELLED, STOP_KIND_DURATION,
+                     STOP_KIND_REQUEST_BUDGET, STOP_KIND_ERROR_THRESHOLD,
+                     STOP_KIND_ENDPOINTS_UNRESPONSIVE, STOP_KIND_MEMORY)
+STOP_SOFT_KINDS: Final = frozenset({STOP_KIND_REQUEST_BUDGET})
+STOP_REASON_KIND: Final = {
+    STOP_CANCELLED_BY_USER: STOP_KIND_USER, STOP_RUN_CANCELLED: STOP_KIND_CANCELLED,
+    STOP_MAX_DURATION: STOP_KIND_DURATION, STOP_REQUEST_BUDGET: STOP_KIND_REQUEST_BUDGET,
+    STOP_ERROR_THRESHOLD: STOP_KIND_ERROR_THRESHOLD,
+}
+
 # Condition lifecycle: observations.targets.*.conditions[].status before aggregation.
 CONDITION_LIFECYCLE: Final = ("waiting", "running", "finished")
 CONDITION_UNFINISHED: Final = frozenset({"waiting", "running"})
@@ -254,6 +272,8 @@ def describe() -> dict:
         "run_terminal_states": sorted(RUN_TERMINAL_STATES),
         "run_transitions": {state: sorted(successors) for state, successors in RUN_TRANSITIONS.items()},
         "stop_reasons": list(STOP_REASONS), "stop_reasons_open": True,
+        "stop_kinds": list(STOP_KINDS), "stop_soft_kinds": sorted(STOP_SOFT_KINDS),
+        "stop_reason_kinds": dict(STOP_REASON_KIND),
         "condition_lifecycle": list(CONDITION_LIFECYCLE),
         "condition_transitions": {state: sorted(successors) for state, successors in CONDITION_TRANSITIONS.items()},
         "connection_test_statuses": list(CONNECTION_TEST_STATUSES),

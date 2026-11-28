@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from giraffe import runner
+from giraffe import runner, states
 from giraffe.models import Limits, RequestRecord, RunConfig, Target
 
 
@@ -785,7 +785,12 @@ async def test_outer_cancellation_preserves_recorded_stop_reason(monkeypatch, re
     stop = asyncio.Event()
 
     async def waiting(run, *args, **kwargs):
-        run.reason = reason
+        kind = states.STOP_REASON_KIND.get(reason)
+        if kind is None:
+            kind = states.STOP_KIND_MEMORY if reason.startswith("memory") else states.STOP_KIND_ENDPOINTS_UNRESPONSIVE
+        run._latch_stop(kind, reason)
+        if kind == states.STOP_KIND_MEMORY:
+            run.memory_interrupted_checks.update(run.pending_checks)
         if user_stop:
             stop.set()
         started.set()
