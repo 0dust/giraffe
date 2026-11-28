@@ -47,6 +47,9 @@ Priority qualification requires the gateway's specific priority-pool rejection, 
 - **Unexercised:** bounded traffic did not exercise policy rejection or subsequent peer service.
 - **Unavailable:** the selected gateway or capability is unsupported; no policy traffic is sent.
 
+The complete qualification/status pairs and boolean evidence fields are documented in
+[Gateway policy qualification](states.md#gateway-policy-qualification).
+
 Reports retain admitted, rejected, completed, cancelled and other failed requests per identity, actual token counts, declared settings, and qualifications. Generic 429s and provider rate limits cannot establish gateway policy enforcement. Raw gateway error messages and response headers are discarded. JSON, HTML, CLI, UI and reproduction exports carry the same qualifications. Baseline comparisons require matching policy settings and a qualified passing baseline, and compare observed acceptance without timing-based priority claims.
 
 The controlled HTTP fixtures test Giraffe's classification, scheduling and reporting. They do not certify a live LiteLLM deployment. Live gateway enforcement must be exercised using the operator's actual configured test environment.

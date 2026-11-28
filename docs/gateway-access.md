@@ -40,6 +40,9 @@ opposite expectations must use distinct credentials. Conflicting cases send no
 request and remain unverified. Every case must produce qualified evidence before
 the matrix can pass.
 
+The machine-readable decisions, reason codes and verdict rule are declared in
+[Gateway access observation](states.md#gateway-access-observation).
+
 | Response | Observation |
 | --- | --- |
 | HTTP 200 with a valid assistant answer and a `stop` or `length` finish reason | Allow |

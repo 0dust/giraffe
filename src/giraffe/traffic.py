@@ -15,6 +15,7 @@ from collections import Counter, defaultdict
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
+from . import states
 from .stats import median, percentile
 from .models import MAX_PLANNED_ARRIVALS, Limits, RequestRecord, RequestSpec, TrafficConfig
 from .timing import qualify, qualified_violations
@@ -279,7 +280,7 @@ async def run_stage(
     explicit = isinstance(traffic, ExplicitTrafficStage)
     sending_finished_at = None
     offer_lags_ms = [None] * len(schedule)
-    outcomes = ["not_offered"] * len(schedule)
+    outcomes = [states.OFFER_NOT_OFFERED] * len(schedule)
     dropped_indices: set[int] = set()
     records: list[tuple[int, RequestRecord]] = []
     lifetimes: dict[int, tuple[float, float]] = {}
@@ -287,6 +288,7 @@ async def run_stage(
     reasons = []
     peak = 0
     execution_errors = 0
+    strict_errors: list[states.OfferTransitionError] = []
     discard_through = -math.inf if explicit else -1.0
     stalls: list[tuple[float, float]] = []
     interrupted = overflow
@@ -322,17 +324,17 @@ async def run_stage(
 
     def blocked_offer(offset: float, now: float, *, refused: bool = False) -> str | None:
         if not explicit:
-            return "dropped_late" if missed_arrival(offset, now) else None
+            return states.OFFER_DROPPED_LATE if missed_arrival(offset, now) else None
         if interruption() is not None:
-            return "not_offered"
+            return states.OFFER_NOT_OFFERED
         cutoff = stage_cutoff if sending_finished_at is None else sending_finished_at
         if refused or now >= cutoff:
             # A closed window takes precedence when it precedes the lag limit.
             # The public ledger keeps reserved offers that did not dispatch.
             late = (started_at+offset+traffic.scheduler_lag_tolerance_ms/1000 < cutoff
                     and missed_arrival(offset, now))
-            return "dropped_late" if late else "not_offered"
-        return "dropped_late" if missed_arrival(offset, now) else None
+            return states.OFFER_DROPPED_LATE if late else states.OFFER_NOT_OFFERED
+        return states.OFFER_DROPPED_LATE if missed_arrival(offset, now) else None
 
     def finish_sending() -> float:
         nonlocal sending_finished_at
@@ -343,6 +345,7 @@ async def run_stage(
         return sending_finished_at
 
     def drop(index: int, outcome: str):
+        states.check_offer_transition(outcomes[index], outcome)
         outcomes[index] = outcome
         if index not in dropped_indices:
             dropped_indices.add(index)
@@ -381,7 +384,8 @@ async def run_stage(
         if outcome := blocked_offer(offset, dispatched):
             drop(index, outcome)
             return
-        outcomes[index] = "started"
+        states.check_offer_transition(outcomes[index], states.OFFER_STARTED)
+        outcomes[index] = states.OFFER_STARTED
         try:
             spec = (spec_factory(index) if spec_factory is not None else selected_specs[index]).model_copy(update={
                 "scenario": scenario or f"traffic_stage_{stage_index}", "check_ids": [check_id],
@@ -416,17 +420,20 @@ async def run_stage(
                     refused = time.monotonic()
                     offer_lags_ms[index] = max(0.0, (refused-started_at-offset)*1000)
                     refusal = blocked_offer(offset, refused, refused=True)
-                drop(index, refusal or "not_offered")
+                drop(index, refusal or states.OFFER_NOT_OFFERED)
                 return
             records.append((index, record))
         except asyncio.CancelledError as exc:
-            outcomes[index] = "cancelled"
+            states.check_offer_transition(outcomes[index], states.OFFER_CANCELLED)
+            outcomes[index] = states.OFFER_CANCELLED
             record = getattr(exc, "giraffe_record", None)
             if record is not None:
                 records.append((index, record))
             elif explicit:
-                drop(index, "not_offered")
-        except Exception:
+                drop(index, states.OFFER_NOT_OFFERED)
+        except Exception as exc:
+            if states.STRICT_TRANSITIONS and isinstance(exc, states.OfferTransitionError):
+                raise
             # Backend normally records exceptions. Keep a truthful failure if a
             # callback unexpectedly escapes without leaking transport text.
             execution_errors += 1
@@ -438,6 +445,10 @@ async def run_stage(
         # coroutine starts; a coroutine finalizer alone can leak that slot.
         release()
         tasks.discard(task)
+        # Leave production exceptions unretrieved so asyncio still reports them.
+        if (states.STRICT_TRANSITIONS and not task.cancelled()
+                and isinstance(error := task.exception(), states.OfferTransitionError)):
+            strict_errors.append(error)
 
     try:
         if not overflow:
@@ -458,9 +469,14 @@ async def run_stage(
                     continue
                 active = sum(not task.done() for task in tasks)
                 if active >= traffic.max_in_flight or not try_acquire():
-                    drop(index, "dropped_local")
+                    drop(index, states.OFFER_DROPPED_LOCAL)
                     continue
-                outcomes[index] = "dispatching"
+                try:
+                    states.check_offer_transition(outcomes[index], states.OFFER_DISPATCHING)
+                except states.OfferTransitionError:
+                    release()
+                    raise
+                outcomes[index] = states.OFFER_DISPATCHING
                 task = asyncio.create_task(dispatch(index, kind, offset))
                 tasks.add(task)
                 task.add_done_callback(finished)
@@ -509,10 +525,13 @@ async def run_stage(
                     interrupted = True
         intent.finish(time.monotonic())
 
+    if strict_errors:
+        raise strict_errors[0]
+
     # A task cancelled before its coroutine starts still consumed an offer.
     for index, outcome in enumerate(outcomes):
-        if outcome == "dispatching":
-            drop(index, "not_offered")
+        if outcome == states.OFFER_DISPATCHING:
+            drop(index, states.OFFER_NOT_OFFERED)
 
     case_scorers = None
     if case_specs is not None:
@@ -544,8 +563,8 @@ def finalize_stage(evidence: StageEvidence, limits: Limits) -> dict:
     schedule, outcomes, records = evidence.schedule, evidence.outcomes, evidence.records
     reasons = list(evidence.reasons)
     counts = Counter(outcomes)
-    started = counts["started"] + counts["cancelled"]
-    not_offered = counts["not_offered"] + counts["dispatching"]
+    started = counts[states.OFFER_STARTED] + counts[states.OFFER_CANCELLED]
+    not_offered = counts[states.OFFER_NOT_OFFERED] + counts[states.OFFER_DISPATCHING]
     stats = _record_stats([record for _, record in records], limits)
     local_failure = preparation_failure_reason(record for _, record in records)
     # outcome_counts partitions records; escaped execution errors have no record.
@@ -553,11 +572,11 @@ def finalize_stage(evidence: StageEvidence, limits: Limits) -> dict:
     stats["errors"] += evidence.execution_errors
     stats["evaluated"] += evidence.execution_errors
     recorded_indices = {index for index, _ in records}
-    stats["cancelled"] += sum(outcome == "cancelled" and index not in recorded_indices
+    stats["cancelled"] += sum(outcome == states.OFFER_CANCELLED and index not in recorded_indices
                               for index, outcome in enumerate(outcomes))
     error_rate = stats["errors"] / stats["evaluated"] if stats["evaluated"] else None
     stats["error_rate"] = error_rate
-    generator_limited = bool(counts["dropped_local"] or counts["dropped_late"] or evidence.overflow)
+    generator_limited = bool(counts[states.OFFER_DROPPED_LOCAL] or counts[states.OFFER_DROPPED_LATE] or evidence.overflow)
     fully_offered = not (not_offered or generator_limited or evidence.interrupted)
     service_failure = error_rate is not None and error_rate > limits.max_error_rate
     # Missing judgments are uncertainty, not wrong answers. Only fail when even
@@ -637,15 +656,15 @@ def finalize_stage(evidence: StageEvidence, limits: Limits) -> dict:
             case_outcomes = Counter(outcomes[index] for index in indices)
             case_records = records_by_case[case_id]
             case_stats = _record_stats(case_records, limits)
-            missing = case_outcomes["not_offered"] + case_outcomes["dispatching"]
+            missing = case_outcomes[states.OFFER_NOT_OFFERED] + case_outcomes[states.OFFER_DISPATCHING]
             case_counts[case_id] = {
                 "planned": len(indices), "offered": len(indices) - missing,
-                "started": case_outcomes["started"] + case_outcomes["cancelled"],
+                "started": case_outcomes[states.OFFER_STARTED] + case_outcomes[states.OFFER_CANCELLED],
                 "valid": case_stats["completed"], "scored": case_stats["scored"],
                 "correct": case_stats["correct"],
-                "dropped_local": case_outcomes["dropped_local"],
-                "dropped_late": case_outcomes["dropped_late"], "not_offered": missing,
-                "drops": case_outcomes["dropped_local"] + case_outcomes["dropped_late"],
+                "dropped_local": case_outcomes[states.OFFER_DROPPED_LOCAL],
+                "dropped_late": case_outcomes[states.OFFER_DROPPED_LATE], "not_offered": missing,
+                "drops": case_outcomes[states.OFFER_DROPPED_LOCAL] + case_outcomes[states.OFFER_DROPPED_LATE],
             }
         coverage_complete = bool(case_counts) and all(row["scored"] >= 1 for row in case_counts.values())
         if not coverage_complete:
@@ -667,23 +686,23 @@ def finalize_stage(evidence: StageEvidence, limits: Limits) -> dict:
         window_records = [record for index, record in records if index in indices]
         window_counts = Counter(outcomes[index] for index in indices)
         window_stats = _record_stats(window_records, limits)
-        execution_errors = sum(outcomes[index] == "started" and index not in recorded_indices
+        execution_errors = sum(outcomes[index] == states.OFFER_STARTED and index not in recorded_indices
                                for index in indices)
         window_stats["failed"] += execution_errors
         window_stats["errors"] += execution_errors
         window_stats["evaluated"] += execution_errors
         window_stats["error_rate"] = (window_stats["errors"] / window_stats["evaluated"]
                                       if window_stats["evaluated"] else None)
-        window_stats["cancelled"] += sum(outcomes[index] == "cancelled" and index not in recorded_indices
+        window_stats["cancelled"] += sum(outcomes[index] == states.OFFER_CANCELLED and index not in recorded_indices
                                           for index in indices)
         # Qualified request IDs belong to the stage; window counts remain raw.
         window_stats.pop("violations", None)
-        window_started = window_counts["started"] + window_counts["cancelled"]
+        window_started = window_counts[states.OFFER_STARTED] + window_counts[states.OFFER_CANCELLED]
         windows.append({
             "from_seconds": lower, "to_seconds": upper, "scheduled": len(indices),
-            "started": window_started, "dropped_local": window_counts["dropped_local"],
-            "dropped_late": window_counts["dropped_late"],
-            "not_offered": window_counts["not_offered"] + window_counts["dispatching"],
+            "started": window_started, "dropped_local": window_counts[states.OFFER_DROPPED_LOCAL],
+            "dropped_late": window_counts[states.OFFER_DROPPED_LATE],
+            "not_offered": window_counts[states.OFFER_NOT_OFFERED] + window_counts[states.OFFER_DISPATCHING],
             "pending_at_end": sum(begin <= upper < end for begin, end in evidence.lifetimes),
             "time_weighted_in_flight": sum(max(0, min(end, upper)-max(begin, lower))
                                            for begin, end in evidence.lifetimes) / (upper-lower),
@@ -730,7 +749,7 @@ def finalize_stage(evidence: StageEvidence, limits: Limits) -> dict:
         "duration_seconds": evidence.duration_seconds,
         "observation_seconds": evidence.observation_seconds,
         "scheduled": len(schedule), "started": started,
-        "dropped_local": counts["dropped_local"], "dropped_late": counts["dropped_late"],
+        "dropped_local": counts[states.OFFER_DROPPED_LOCAL], "dropped_late": counts[states.OFFER_DROPPED_LATE],
         "not_offered": not_offered, "schedule_truncated": evidence.overflow,
         "scheduled_rps": len(schedule) / evidence.duration_seconds,
         "achieved_rps": started / evidence.duration_seconds,

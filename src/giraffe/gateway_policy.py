@@ -194,7 +194,7 @@ def summarize(settings, observation, records):
         "start_ms": observation.get("start_ms"), "end_ms": observation.get("end_ms"),
         "complete": observation.get("complete", False), "stop_reason": observation.get("stop_reason"),
         "identities_distinct": observation.get("identities_distinct", False),
-        "qualification": "unverified", "status": "inconclusive", "reasons": [],
+        "qualification": states.GATEWAY_POLICY_UNVERIFIED, "status": "inconclusive", "reasons": [],
         "peer_continuation": False, "overlap_observed": False, "comparable_actual_work": False,
         "response_cache_hit_reported": False,
         "interpretation": "Observed admission under declared policy and window assumptions; no queue-order, latency-causality or production-wide guarantee."}
@@ -205,8 +205,9 @@ def summarize(settings, observation, records):
                          if any(request_outcome(record) == "budget_exhausted" for record in records) else None)
         excluded_reasons = [text for text in (preparation_reason if status in {"pass", "inconclusive"} else None, budget_reason) if text]
         if status == "pass" and excluded_reasons:
-            qualification, status = "unverified", "inconclusive"
+            qualification, status = states.GATEWAY_POLICY_UNVERIFIED, "inconclusive"
             reason = None
+        states.check_gateway_policy_outcome(qualification, status)
         summary.update(qualification=qualification, status=status)
         if status != "fail":
             summary["reasons"].extend(excluded_reasons)
@@ -217,20 +218,20 @@ def summarize(settings, observation, records):
         return summary
 
     if settings is None:
-        return outcome("unavailable", "Gateway policy is not configured; declare identities, policy and offered work.")
+        return outcome(states.GATEWAY_POLICY_UNAVAILABLE, "Gateway policy is not configured; declare identities, policy and offered work.")
     if not settings.supported:
-        return outcome("unavailable", "Selected gateway capability is unsupported.")
+        return outcome(states.GATEWAY_POLICY_UNAVAILABLE, "Selected gateway capability is unsupported.")
     if observation.get("execution_error"):
-        return outcome("unverified", observation["execution_error"])
+        return outcome(states.GATEWAY_POLICY_UNVERIFIED, observation["execution_error"])
     if observation.get("credential_issue") or (observation.get("budget_limited") and not records):
-        return outcome("unverified", observation["stop_reason"])
+        return outcome(states.GATEWAY_POLICY_UNVERIFIED, observation["stop_reason"])
     cached = {record.id for record in records
               if record.gateway_evidence and record.gateway_evidence._response_cache_hit_reported}
     summary["response_cache_hit_reported"] = bool(cached)
     if settings.capability == "priority_rpm" and any(user.priority == "default_pool" for user in settings.users):
-        return outcome("unverified", "LiteLLM reserves default_pool for unreserved traffic. Use distinct named reservations.")
+        return outcome(states.GATEWAY_POLICY_UNVERIFIED, "LiteLLM reserves default_pool for unreserved traffic. Use distinct named reservations.")
     if not records:
-        return outcome("unexercised", "No policy traffic was dispatched.")
+        return outcome(states.GATEWAY_POLICY_UNEXERCISED, "No policy traffic was dispatched.")
     start, end = summary["start_ms"], summary["end_ms"]
     # Completion bounds when the gateway might have admitted a request. A
     # client dispatch alone cannot place that admission inside this window.
@@ -241,7 +242,7 @@ def summarize(settings, observation, records):
     if incomplete_window:
         summary["complete"] = False
     if any(record.id in cached for record in window_records):
-        return outcome("unverified", "Gateway reported a cached completion, so this policy probe could not verify fresh work.")
+        return outcome(states.GATEWAY_POLICY_UNVERIFIED, "Gateway reported a cached completion, so this policy probe could not verify fresh work.")
     affected = [record for record in window_records if record.identity == settings.affected_identity]
     admissions = [record for record in window_records if _proven_admission(record)]
     affected_admissions = [record for record in admissions if record.identity == settings.affected_identity]
@@ -269,58 +270,58 @@ def summarize(settings, observation, records):
     if not observation.get("isolated_run"):
         reason = (summary["stop_reason"] if observation.get("budget_limited") else
                   "Policy qualification requires one target and only policy traffic, with no restart readiness probes.")
-        return outcome("unverified", reason)
+        return outcome(states.GATEWAY_POLICY_UNVERIFIED, reason)
     if settings.window_state == "unknown" or not settings.gateway_version:
-        return outcome("unverified", "Gateway version or isolated fresh single-target policy window is unknown.")
+        return outcome(states.GATEWAY_POLICY_UNVERIFIED, "Gateway version or isolated fresh single-target policy window is unknown.")
     if settings.window_state != "isolated_fresh_single_counter":
-        return outcome("unverified", "Policy qualification requires an operator-confirmed authoritative limiter counter.")
+        return outcome(states.GATEWAY_POLICY_UNVERIFIED, "Policy qualification requires an operator-confirmed authoritative limiter counter.")
     if not observation.get("identities_distinct"):
-        return outcome("unverified", "Distinct authenticated test credentials could not be established locally.")
+        return outcome(states.GATEWAY_POLICY_UNVERIFIED, "Distinct authenticated test credentials could not be established locally.")
     cutoff_reason = "Policy request timing could not be established within the observation window."
     if not recognized:
         if incomplete_window:
-            return outcome("unverified", cutoff_reason)
+            return outcome(states.GATEWAY_POLICY_UNVERIFIED, cutoff_reason)
         if affected_rejections:
-            return outcome("unverified", "Rejection does not identify the declared gateway policy.")
-        return outcome("unexercised", "No attributed policy rejection was observed within offered work.")
+            return outcome(states.GATEWAY_POLICY_UNVERIFIED, "Rejection does not identify the declared gateway policy.")
+        return outcome(states.GATEWAY_POLICY_UNEXERCISED, "No attributed policy rejection was observed within offered work.")
     windows = [record.gateway_evidence.retry_after_seconds for record in recognized]
     # LiteLLM v3 reports the configured window and truncates bucket start
     # timestamps to whole seconds. A fresh bucket can reset almost 1s early.
     if (any(window is None or window <= 1 for window in windows) or len(set(windows)) != 1
             or start is None or end is None or end < start or end - start >= (windows[0] - 1)*1000):
-        return outcome("unverified", "Cannot establish a single policy window from Retry-After and the observation duration.")
+        return outcome(states.GATEWAY_POLICY_UNVERIFIED, "Cannot establish a single policy window from Retry-After and the observation duration.")
     summary["effective_window_seconds"] = windows[0]
     allowance = declared.rpm
     if settings.capability == "priority_rpm":
         if not settings.named_reservations_confirmed:
-            return outcome("unverified", "Operator confirmation of distinct configured named reservations is required.")
+            return outcome(states.GATEWAY_POLICY_UNVERIFIED, "Operator confirmation of distinct configured named reservations is required.")
         if settings.saturation_cache_seconds != 0:
-            return outcome("unverified", "Cached saturation can differ between gateway nodes; this check requires zero cache delay.")
+            return outcome(states.GATEWAY_POLICY_UNVERIFIED, "Cached saturation can differ between gateway nodes; this check requires zero cache delay.")
         evidence = [record.gateway_evidence for record in recognized]
         if any(item.model_rpm != settings.model_rpm or item.priority_matches is not True for item in evidence):
-            return outcome("unverified", "Priority tier or model RPM evidence does not match the declaration.")
+            return outcome(states.GATEWAY_POLICY_UNVERIFIED, "Priority tier or model RPM evidence does not match the declaration.")
         tpm_configs = {(item._model_tpm, item._model_tpm_unconfigured) for item in evidence}
         if len(tpm_configs) != 1:
-            return outcome("unverified", "Model TPM configuration differs between rejections in the isolated window.")
+            return outcome(states.GATEWAY_POLICY_UNVERIFIED, "Model TPM configuration differs between rejections in the isolated window.")
         model_tpm, rpm_only_saturation = tpm_configs.pop()
         model_limits = {"model_rpm": settings.model_rpm, "model_tpm": model_tpm}
         if any(_scoped_limit_conflicts(record, model_limits) for record in [*admissions, *recognized]):
-            return outcome("unverified", "Scoped model RPM or TPM headers contradict the policy rejection evidence.")
+            return outcome(states.GATEWAY_POLICY_UNVERIFIED, "Scoped model RPM or TPM headers contradict the policy rejection evidence.")
         if any(_scoped_limit_conflicts(record, {"priority_rpm": declared.rpm}) for record in recognized):
-            return outcome("unverified", "Scoped priority RPM headers contradict the declared reservation.")
+            return outcome(states.GATEWAY_POLICY_UNVERIFIED, "Scoped priority RPM headers contradict the declared reservation.")
         if not summary["overlap_observed"] or not summary["comparable_actual_work"]:
-            return outcome("unverified", "Comparable actual token work and overlapping requests are required for priority observations.")
+            return outcome(states.GATEWAY_POLICY_UNVERIFIED, "Comparable actual token work and overlapping requests are required for priority observations.")
         if any(record.gateway_evidence is None or record.gateway_evidence.priority_matches is not True for record in admissions):
-            return outcome("unverified", "Successful responses do not confirm each declared priority tier.")
+            return outcome(states.GATEWAY_POLICY_UNVERIFIED, "Successful responses do not confirm each declared priority tier.")
         groups = {record.gateway_evidence._priority_model_group if record.gateway_evidence else None
                   for record in [*recognized, *admissions]}
         if len(groups) != 1 or None in groups:
-            return outcome("unverified", "A common resolved model pool is not established by the priority evidence.")
+            return outcome(states.GATEWAY_POLICY_UNVERIFIED, "A common resolved model pool is not established by the priority evidence.")
         reservations = {user.identity: user.rpm for user in settings.users}
         if any(record.gateway_evidence.limiter_version != "v3"
                or record.gateway_evidence.priority_request_limit != reservations[record.identity]
                for record in admissions):
-            return outcome("unverified", "Scoped v3 priority RPM limits are missing or differ from the declared reservations.")
+            return outcome(states.GATEWAY_POLICY_UNVERIFIED, "Scoped v3 priority RPM limits are missing or differ from the declared reservations.")
         # The last borrowed request crosses the same ratio threshold as LiteLLM.
         crossing = bisect_left(range(settings.model_rpm + 1), settings.saturation_threshold,
                                key=lambda count: count / settings.model_rpm)
@@ -332,10 +333,10 @@ def summarize(settings, observation, records):
         for rejection in ordered_rejections:
             bounds = rejection.gateway_evidence._saturation_bounds
             if bounds is None or bounds[1] < threshold_percent:
-                return outcome("unverified", strict_evidence_missing)
+                return outcome(states.GATEWAY_POLICY_UNVERIFIED, strict_evidence_missing)
             completed = _completed_before_dispatch(admissions, rejection)
             if completed * 100 > bounds[1] * settings.model_rpm:
-                return outcome("unverified", "Reported saturation contradicts completed admissions in the isolated window.")
+                return outcome(states.GATEWAY_POLICY_UNVERIFIED, "Reported saturation contradicts completed admissions in the isolated window.")
             # Both counters are nondecreasing in this window. Count only
             # admissions whose entire request fell between two known readings.
             preceding = [reading for reading in earlier_readings
@@ -346,7 +347,7 @@ def summarize(settings, observation, records):
             minimum_saturation = max(Fraction(bounds[0]), Fraction(minimum_rpm * 100, settings.model_rpm),
                                      max((saturation for _, _, saturation in preceding), default=0))
             if minimum_saturation > bounds[1]:
-                return outcome("unverified", "Reported saturation contradicts earlier limiter evidence in the isolated window.")
+                return outcome(states.GATEWAY_POLICY_UNVERIFIED, "Reported saturation contradicts earlier limiter evidence in the isolated window.")
             reported = rejection.gateway_evidence._reported_saturation
             # A recognized priority rejection changes neither counter. Other
             # failures may have been charged before the gateway replied.
@@ -358,7 +359,7 @@ def summarize(settings, observation, records):
             maximum_count = min(possible, floor(bounds[1] * settings.model_rpm / 100))
             least_matching_rpm = _least_reported_count(reported, settings.model_rpm, minimum_count, maximum_count)
             if least_matching_rpm is None:
-                return outcome("unverified", "Reported saturation cannot match any possible model RPM count in the isolated window.")
+                return outcome(states.GATEWAY_POLICY_UNVERIFIED, "Reported saturation cannot match any possible model RPM count in the isolated window.")
             # LiteLLM reports the larger of the RPM and TPM ratios. If TPM
             # could produce that number, the printed value cannot prove the
             # RPM counter crossed the threshold. Use observed admissions.
@@ -366,40 +367,40 @@ def summarize(settings, observation, records):
                            and _least_reported_count(reported, model_tpm, 0, model_tpm) is None)
             if rpm_reading:
                 if least_matching_rpm < crossing:
-                    return outcome("unverified", strict_evidence_missing)
+                    return outcome(states.GATEWAY_POLICY_UNVERIFIED, strict_evidence_missing)
                 minimum_rpm = least_matching_rpm
                 minimum_saturation = Fraction(least_matching_rpm * 100, settings.model_rpm)
             elif minimum_rpm < crossing:
-                return outcome("unverified", "Reported saturation may reflect TPM, and observed RPM admissions do not establish strict mode.")
+                return outcome(states.GATEWAY_POLICY_UNVERIFIED, "Reported saturation may reflect TPM, and observed RPM admissions do not establish strict mode.")
             if rejection.completed_ms is not None:
                 earlier_readings.append((rejection.completed_ms, minimum_rpm, minimum_saturation))
         if len(admissions) > settings.model_rpm:
-            return outcome("observed_failure", "Total admitted requests exceeded the declared model RPM in the isolated window.", "fail")
+            return outcome(states.GATEWAY_POLICY_OBSERVED_FAILURE, "Total admitted requests exceeded the declared model RPM in the isolated window.", "fail")
         allowance = max(allowance, crossing)
     elif (any(record.gateway_evidence.request_limit != declared.rpm or record.gateway_evidence.request_remaining != 0
               for record in recognized)
           or any(_scoped_limit_conflicts(record, {"api_key_rpm": declared.rpm})
                  for record in [*affected_admissions, *recognized])):
-        return outcome("unverified", "Gateway key limit differs from the declared RPM.")
+        return outcome(states.GATEWAY_POLICY_UNVERIFIED, "Gateway key limit differs from the declared RPM.")
     admitted = len(affected_admissions)
     if admitted > allowance:
-        return outcome("observed_failure", "Admitted requests exceeded the declared RPM allowance in the isolated window.", "fail")
+        return outcome(states.GATEWAY_POLICY_OBSERVED_FAILURE, "Admitted requests exceeded the declared RPM allowance in the isolated window.", "fail")
     first_rejection = min((record.completed_ms for record in recognized if record.completed_ms is not None), default=None)
     if first_rejection is None:
-        return outcome("unverified", "Attributed rejection timing is unavailable.")
+        return outcome(states.GATEWAY_POLICY_UNVERIFIED, "Attributed rejection timing is unavailable.")
     if settings.capability == "priority_rpm" and any(
         record.dispatch_ms is not None and record.dispatch_ms > first_rejection
         and record.completed_ms is not None and record.completed_ms <= observation.get("end_ms", 0)
         for record in affected_admissions
     ):
-        return outcome("observed_failure", "A request dispatched after strict priority pool exhaustion was admitted in the same window.", "fail")
+        return outcome(states.GATEWAY_POLICY_OBSERVED_FAILURE, "A request dispatched after strict priority pool exhaustion was admitted in the same window.", "fail")
     borrowing_uncertain = False
     if settings.capability == "priority_rpm":
         # Each identity dispatches serially, so only admissions beyond its
         # reservation depend on whether the shared pool had reached saturation.
         for record in affected_admissions[declared.rpm:]:
             if _completed_before_dispatch(admissions, record) >= crossing:
-                return outcome("observed_failure", "A request exceeded its reserved RPM after completed admissions reached model saturation.", "fail")
+                return outcome(states.GATEWAY_POLICY_OBSERVED_FAILURE, "A request exceeded its reserved RPM after completed admissions reached model saturation.", "fail")
             if record.completed_ms is None or sum(
                 other is not record and (other.dispatch_ms is None or other.dispatch_ms <= record.completed_ms)
                 for other in admissions
@@ -415,23 +416,23 @@ def summarize(settings, observation, records):
                               and (record.dispatch_ms is None or record.dispatch_ms < first_rejection)
                               for record in records)
         if len(prior_admissions) + uncertain_prior >= declared.rpm:
-            return outcome("unverified", "Prior requests with unknown admission could have consumed the declared RPM allowance.")
-        return outcome("observed_failure", "Attributed rejection occurred before the declared RPM allowance was served.", "fail")
+            return outcome(states.GATEWAY_POLICY_UNVERIFIED, "Prior requests with unknown admission could have consumed the declared RPM allowance.")
+        return outcome(states.GATEWAY_POLICY_OBSERVED_FAILURE, "Attributed rejection occurred before the declared RPM allowance was served.", "fail")
     if len(recognized) != len(affected_rejections):
-        return outcome("unverified", "Affected identity received 429 responses that do not identify the declared gateway policy.")
+        return outcome(states.GATEWAY_POLICY_UNVERIFIED, "Affected identity received 429 responses that do not identify the declared gateway policy.")
     if incomplete_window:
-        return outcome("unverified", cutoff_reason)
+        return outcome(states.GATEWAY_POLICY_UNVERIFIED, cutoff_reason)
     if not summary["complete"] or any(user["cancelled"] or user["other_failures"] for user in users):
-        return outcome("unverified", "Traffic was interrupted or non-policy failures left incomplete evidence.")
+        return outcome(states.GATEWAY_POLICY_UNVERIFIED, "Traffic was interrupted or non-policy failures left incomplete evidence.")
     if settings.capability == "priority_rpm" and admitted > declared.rpm and not rpm_only_saturation:
-        return outcome("unverified", "Model TPM is configured or unknown, so request counts cannot establish borrowing below saturation.")
+        return outcome(states.GATEWAY_POLICY_UNVERIFIED, "Model TPM is configured or unknown, so request counts cannot establish borrowing below saturation.")
     if borrowing_uncertain:
-        return outcome("unverified", "Overlapping admissions leave saturation uncertain when a request exceeded its reserved RPM.")
+        return outcome(states.GATEWAY_POLICY_UNVERIFIED, "Overlapping admissions leave saturation uncertain when a request exceeded its reserved RPM.")
     if not summary["peer_continuation"]:
-        return outcome("unexercised", "Peer service after policy rejection was not observed within the same window.")
+        return outcome(states.GATEWAY_POLICY_UNEXERCISED, "Peer service after policy rejection was not observed within the same window.")
     if any(user["rejected"] for user in users if user["identity"] != settings.affected_identity):
-        return outcome("unverified", "Peer rejections prevent establishing continued service within declared limits.")
-    return outcome("observed", "Attributed policy rejection and continued peer service were observed.", "pass")
+        return outcome(states.GATEWAY_POLICY_UNVERIFIED, "Peer rejections prevent establishing continued service within declared limits.")
+    return outcome(states.GATEWAY_POLICY_OBSERVED, "Attributed policy rejection and continued peer service were observed.", "pass")
 
 
 def result(run, target):
@@ -440,5 +441,5 @@ def result(run, target):
     summary = summarize(run.config.gateway_policy, observation, records)
     return CheckResult(id="gateway_policy", title="Gateway quotas & priorities", target=target.name,
         status=summary["status"], summary=" ".join(summary["reasons"]), metrics={"gateway_policy": summary},
-        required=summary["qualification"] != "unavailable" or run.config.checks == ["gateway_policy"],
+        required=summary["qualification"] != states.GATEWAY_POLICY_UNAVAILABLE or run.config.checks == ["gateway_policy"],
         evidence_ids=[record.id for record in records])

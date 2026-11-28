@@ -15,8 +15,8 @@ from giraffe.request_outcome import preparation_failure_reason, request_outcome
 EVIDENCE_VERSION = 4
 IDENTITY_CHANGED = "Test identity credentials changed after access preflight."
 _IDENTITY_FAILURE_REASONS = {
-    IDENTITY_CHANGED: "identity_changed",
-    "Test identity credentials are unavailable.": "identity_unavailable",
+    IDENTITY_CHANGED: states.GATEWAY_ACCESS_REASON_IDENTITY_CHANGED,
+    "Test identity credentials are unavailable.": states.GATEWAY_ACCESS_REASON_IDENTITY_UNAVAILABLE,
 }
 QUALIFICATION = ("Only the declared identities and endpoint/model were exercised. "
                  "These fixtures do not certify tenant isolation or comprehensive gateway security.")
@@ -94,9 +94,9 @@ def _metered_reasoning_usage(usage, record):
 
 def routing_issue(headers, model):
     if headers.get("x-litellm-attempted-fallbacks") not in (None, "0"):
-        return "fallback_reported"
+        return states.GATEWAY_ACCESS_REASON_FALLBACK_REPORTED
     if headers.get("x-litellm-model-group") not in (None, model):
-        return "model_group_mismatch"
+        return states.GATEWAY_ACCESS_REASON_MODEL_GROUP_MISMATCH
     return None
 
 
@@ -107,67 +107,74 @@ def denial_kind(status, body, *, anonymous=False):
     data = parse_gateway_json(body)
     error = data.get("error") if isinstance(data, dict) else None
     if not isinstance(error, dict):
-        return "unknown"
+        return states.GATEWAY_ACCESS_DENIAL_UNKNOWN
     error_type, message = error.get("type"), error.get("message", "")
     code = error.get("code", status)
     if (not isinstance(error_type, str) or not isinstance(message, str)
             or re.search(r"\b\w+Exception\b", message)
             or type(code) not in (int, str) or code not in (status, str(status))):
-        return "unknown"
+        return states.GATEWAY_ACCESS_DENIAL_UNKNOWN
     if status == 401:
         if error_type in {"token_not_found_in_db", "expired_key"}:
-            return "authentication"
+            return states.GATEWAY_ACCESS_DENIAL_AUTHENTICATION
         if (anonymous and error_type == "auth_error" and error.get("param") is None
                 and message == "Authentication Error, No api key passed in."):
-            return "authentication"
+            return states.GATEWAY_ACCESS_DENIAL_AUTHENTICATION
     if status == 403 and error.get("param") in (None, "model") and error_type in {
         "key_model_access_denied", "team_model_access_denied", "user_model_access_denied",
         "org_model_access_denied", "project_model_access_denied",
     }:
-        return "model_access"
-    return "unknown"
+        return states.GATEWAY_ACCESS_DENIAL_MODEL_ACCESS
+    return states.GATEWAY_ACCESS_DENIAL_UNKNOWN
 
 
 def observation(record):
     # Access proof uses HTTP and protocol evidence, including metered budget-only replies.
     if record is None:
-        return "unverified", "not_run"
+        return states.GATEWAY_ACCESS_UNVERIFIED, states.GATEWAY_ACCESS_REASON_NOT_RUN
     if record.status == "cancelled":
-        return "unverified", "request_cancelled"
+        return states.GATEWAY_ACCESS_UNVERIFIED, states.GATEWAY_ACCESS_REASON_REQUEST_CANCELLED
     if reason := _IDENTITY_FAILURE_REASONS.get(record.error):
-        return "unverified", reason
+        return states.GATEWAY_ACCESS_UNVERIFIED, reason
     if record._gateway_access_routing_issue:
-        return "unverified", record._gateway_access_routing_issue
+        return states.GATEWAY_ACCESS_UNVERIFIED, record._gateway_access_routing_issue
     if record.status == "completed" and record.http_status == 200:
         if record.valid:
-            return "allow", "valid_completion"
+            return states.GATEWAY_ACCESS_ALLOW, states.GATEWAY_ACCESS_REASON_VALID_COMPLETION
         if record._gateway_access_refusal:
-            return "allow", "assistant_refusal"
+            return states.GATEWAY_ACCESS_ALLOW, states.GATEWAY_ACCESS_REASON_ASSISTANT_REFUSAL
         if record.error == REASONING_BUDGET_ERROR and record._gateway_access_metered_reasoning:
-            return "allow", "metered_reasoning_completion"
+            return states.GATEWAY_ACCESS_ALLOW, states.GATEWAY_ACCESS_REASON_METERED_REASONING_COMPLETION
     evidence = record.gateway_evidence
     if (record.status == "failed" and record.error == f"HTTP {record.http_status}" and evidence
-            and ((record.http_status == 401 and evidence.error_kind == "authentication")
-                 or (record.http_status == 403 and evidence.error_kind == "model_access"))):
-        return "deny", "gateway_" + evidence.error_kind
-    return "unverified", "incomplete_or_unsupported_response"
+            and ((record.http_status == 401 and evidence.error_kind == states.GATEWAY_ACCESS_DENIAL_AUTHENTICATION)
+                 or (record.http_status == 403 and evidence.error_kind == states.GATEWAY_ACCESS_DENIAL_MODEL_ACCESS))):
+        return states.GATEWAY_ACCESS_DENY, (states.GATEWAY_ACCESS_REASON_GATEWAY_AUTHENTICATION
+            if evidence.error_kind == states.GATEWAY_ACCESS_DENIAL_AUTHENTICATION
+            else states.GATEWAY_ACCESS_REASON_GATEWAY_MODEL_ACCESS)
+    return states.GATEWAY_ACCESS_UNVERIFIED, states.GATEWAY_ACCESS_REASON_INCOMPLETE_OR_UNSUPPORTED_RESPONSE
 
 
 def _row(case):
-    return {**case.model_dump(), "observed": "unverified", "status": "inconclusive",
-            "reason": "not_run", "http_status": None, "request_id": None}
+    states.check_gateway_access_observation(states.GATEWAY_ACCESS_UNVERIFIED, states.GATEWAY_ACCESS_REASON_NOT_RUN)
+    return {**case.model_dump(), "observed": states.GATEWAY_ACCESS_UNVERIFIED,
+            "status": states.gateway_access_case_status(case.expected, states.GATEWAY_ACCESS_UNVERIFIED),
+            "reason": states.GATEWAY_ACCESS_REASON_NOT_RUN, "http_status": None, "request_id": None}
 
 
 def _record_case(row, record):
     if request_outcome(record) == "not_dispatched":
-        reason = row["reason"] if row["reason"] in _IDENTITY_FAILURE_REASONS.values() else "request_not_dispatched"
-        row.update(status="inconclusive", observed="unverified", reason=reason,
+        reason = (row["reason"] if row["reason"] in _IDENTITY_FAILURE_REASONS.values()
+                  else states.GATEWAY_ACCESS_REASON_REQUEST_NOT_DISPATCHED)
+        states.check_gateway_access_observation(states.GATEWAY_ACCESS_UNVERIFIED, reason)
+        row.update(status=states.gateway_access_case_status(row["expected"], states.GATEWAY_ACCESS_UNVERIFIED),
+                   observed=states.GATEWAY_ACCESS_UNVERIFIED, reason=reason,
                    http_status=None, request_id=record.id)
         return
     observed, reason = observation(record)
+    states.check_gateway_access_observation(observed, reason)
     row.update(observed=observed, reason=reason,
-               status="inconclusive" if observed == "unverified" else
-                      "pass" if observed == row["expected"] else "fail",
+               status=states.gateway_access_case_status(row["expected"], observed),
                http_status=record.http_status, request_id=record.id)
 
 
@@ -178,23 +185,23 @@ def _qualify_identities(target, rows, auth_header):
         try:
             headers = identity_headers(target, row["identity"])
         except ValueError:
-            row["reason"] = "identity_unavailable"
+            row["reason"] = states.GATEWAY_ACCESS_REASON_IDENTITY_UNAVAILABLE
             continue
         names = {name.lower() for name in headers} - {"accept"}
         if auth_header is None and names.difference(LITELLM_NATIVE_KEY_HEADERS):
-            row["reason"] = "auth_header_unverified"
+            row["reason"] = states.GATEWAY_ACCESS_REASON_AUTH_HEADER_UNVERIFIED
             continue
         credential = litellm_key_fingerprint(headers, auth_header=auth_header)
         if credential is None and names:
-            row["reason"] = "auth_header_unverified"
+            row["reason"] = states.GATEWAY_ACCESS_REASON_AUTH_HEADER_UNVERIFIED
             continue
         digests[row["name"]] = credential_digest(headers)
         by_credentials.setdefault(credential, []).append(row)
 
     for cases in by_credentials.values():
-        if {row["expected"] for row in cases} == {"allow", "deny"}:
+        if {row["expected"] for row in cases} == {states.GATEWAY_ACCESS_ALLOW, states.GATEWAY_ACCESS_DENY}:
             for row in cases:
-                row["reason"] = "identity_conflict"
+                row["reason"] = states.GATEWAY_ACCESS_REASON_IDENTITY_CONFLICT
                 del digests[row["name"]]
     return digests
 
@@ -206,7 +213,7 @@ def _prepare_cases(config, target):
     rows = [_row(case) for case in settings.cases]
     if settings.profile != "litellm":
         for row in rows:
-            row["reason"] = "unsupported_profile"
+            row["reason"] = states.GATEWAY_ACCESS_REASON_UNSUPPORTED_PROFILE
         return rows, {}
     return rows, _qualify_identities(target, rows, settings.auth_header)
 
@@ -219,18 +226,18 @@ def eligible_probe_count(config, target):
 
 
 def _record_cutoff(run, target, rows, *, inference_finished=False):
-    pending = [row for row in rows if row["reason"] == "not_run"]
+    pending = [row for row in rows if row["reason"] == states.GATEWAY_ACCESS_REASON_NOT_RUN]
     if not pending:
         return
     # A deadline expiring after inference cannot explain a probe that did not run.
     stopped = ((run.endpoint_health[target]["abort_reason"] or run.reason)
                if inference_finished else run.stop_reason(target))
     if stopped == states.STOP_MAX_DURATION:
-        reason = "run_deadline"
+        reason = states.GATEWAY_ACCESS_REASON_RUN_DEADLINE
     elif stopped and stopped != states.STOP_REQUEST_BUDGET:
-        reason = "run_stopped"
+        reason = states.GATEWAY_ACCESS_REASON_RUN_STOPPED
     elif stopped or run.remaining(target) == 0:
-        reason = "request_budget_exhausted"
+        reason = states.GATEWAY_ACCESS_REASON_REQUEST_BUDGET_EXHAUSTED
     else:
         return
     for row in pending:
@@ -258,7 +265,7 @@ async def execute(run, target, client):
         if not digests:
             return
         for case, row in zip(settings.cases, rows):
-            if row["reason"] != "not_run":
+            if row["reason"] != states.GATEWAY_ACCESS_REASON_NOT_RUN:
                 continue
             if not run.allowed(target.name, gateway_probe=True):
                 break
@@ -273,11 +280,11 @@ async def execute(run, target, client):
             record = await run.request(target, client, spec, admission_deadline=run.deadline,
                 prepared_admission=True, finalize_record=lambda record: _record_case(row, record),
                 on_preparation_failure=lambda record: row.update(reason=_IDENTITY_FAILURE_REASONS.get(
-                    record.error, "request_not_dispatched")))
-            if record is None and row["reason"] == "not_run":
+                    record.error, states.GATEWAY_ACCESS_REASON_REQUEST_NOT_DISPATCHED)))
+            if record is None and row["reason"] == states.GATEWAY_ACCESS_REASON_NOT_RUN:
                 if not run.allowed(target.name, gateway_probe=True):
                     break
-                row["reason"] = "request_not_dispatched"
+                row["reason"] = states.GATEWAY_ACCESS_REASON_REQUEST_NOT_DISPATCHED
     finally:
         _record_cutoff(run, target.name, rows)
         run.finish_condition(target.name, "gateway_access")
@@ -287,8 +294,11 @@ def result(run, target):
     settings = run.config.gateway_access
     data = run.observations[target.name].get("gateway_access", {})
     rows = data.get("cases", [])
-    matrix = {row["expected"] for row in rows} == {"allow", "deny"}
-    complete = bool(rows) and matrix and all(row["observed"] != "unverified" for row in rows)
+    for row in rows:
+        states.check_gateway_access_observation(row["observed"], row.get("reason"))
+        states.gateway_access_case_status(row["expected"], row["observed"])
+    matrix = {row["expected"] for row in rows} == {states.GATEWAY_ACCESS_ALLOW, states.GATEWAY_ACCESS_DENY}
+    complete = bool(rows) and matrix and all(row["observed"] != states.GATEWAY_ACCESS_UNVERIFIED for row in rows)
     status = ("fail" if any(row["status"] == "fail" for row in rows) else
               "pass" if complete else "inconclusive")
     summary = ("Observed access differs from the declared policy." if status == "fail" else

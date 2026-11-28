@@ -138,6 +138,142 @@ REQUEST_OUTCOME_EXCLUDED: Final = frozenset({
     "intentional_stop", "cancelled", "budget_exhausted", "not_dispatched",
 })
 
+# Gateway policy: check metrics.gateway_policy.qualification and its check status.
+GATEWAY_POLICY_UNVERIFIED: Final = "unverified"
+GATEWAY_POLICY_UNAVAILABLE: Final = "unavailable"
+GATEWAY_POLICY_OBSERVED_FAILURE: Final = "observed_failure"
+GATEWAY_POLICY_OBSERVED: Final = "observed"
+GATEWAY_POLICY_UNEXERCISED: Final = "unexercised"
+GATEWAY_POLICY_QUALIFICATIONS: Final = (
+    GATEWAY_POLICY_UNVERIFIED,
+    GATEWAY_POLICY_UNAVAILABLE,
+    GATEWAY_POLICY_OBSERVED_FAILURE,
+    GATEWAY_POLICY_OBSERVED,
+    GATEWAY_POLICY_UNEXERCISED,
+)
+GATEWAY_POLICY_STATUSES: Final = {
+    GATEWAY_POLICY_UNVERIFIED: frozenset({"inconclusive"}),
+    GATEWAY_POLICY_UNAVAILABLE: frozenset({"inconclusive"}),
+    GATEWAY_POLICY_OBSERVED_FAILURE: frozenset({"fail"}),
+    GATEWAY_POLICY_OBSERVED: frozenset({"pass"}),
+    GATEWAY_POLICY_UNEXERCISED: frozenset({"inconclusive"}),
+}
+
+# Gateway access: declared policy, observed decisions, and fixed reason codes.
+GATEWAY_ACCESS_ALLOW: Final = "allow"
+GATEWAY_ACCESS_DENY: Final = "deny"
+GATEWAY_ACCESS_UNVERIFIED: Final = "unverified"
+GATEWAY_ACCESS_EXPECTED: Final = (
+    GATEWAY_ACCESS_ALLOW,
+    GATEWAY_ACCESS_DENY,
+)
+GATEWAY_ACCESS_OBSERVATIONS: Final = (
+    GATEWAY_ACCESS_ALLOW,
+    GATEWAY_ACCESS_DENY,
+    GATEWAY_ACCESS_UNVERIFIED,
+)
+GATEWAY_ACCESS_REASON_NOT_RUN: Final = "not_run"
+GATEWAY_ACCESS_REASON_REQUEST_CANCELLED: Final = "request_cancelled"
+GATEWAY_ACCESS_REASON_IDENTITY_CHANGED: Final = "identity_changed"
+GATEWAY_ACCESS_REASON_IDENTITY_UNAVAILABLE: Final = "identity_unavailable"
+GATEWAY_ACCESS_REASON_FALLBACK_REPORTED: Final = "fallback_reported"
+GATEWAY_ACCESS_REASON_MODEL_GROUP_MISMATCH: Final = "model_group_mismatch"
+GATEWAY_ACCESS_REASON_VALID_COMPLETION: Final = "valid_completion"
+GATEWAY_ACCESS_REASON_ASSISTANT_REFUSAL: Final = "assistant_refusal"
+GATEWAY_ACCESS_REASON_METERED_REASONING_COMPLETION: Final = "metered_reasoning_completion"
+GATEWAY_ACCESS_REASON_GATEWAY_AUTHENTICATION: Final = "gateway_authentication"
+GATEWAY_ACCESS_REASON_GATEWAY_MODEL_ACCESS: Final = "gateway_model_access"
+GATEWAY_ACCESS_REASON_INCOMPLETE_OR_UNSUPPORTED_RESPONSE: Final = "incomplete_or_unsupported_response"
+GATEWAY_ACCESS_REASON_REQUEST_NOT_DISPATCHED: Final = "request_not_dispatched"
+GATEWAY_ACCESS_REASON_AUTH_HEADER_UNVERIFIED: Final = "auth_header_unverified"
+GATEWAY_ACCESS_REASON_IDENTITY_CONFLICT: Final = "identity_conflict"
+GATEWAY_ACCESS_REASON_UNSUPPORTED_PROFILE: Final = "unsupported_profile"
+GATEWAY_ACCESS_REASON_RUN_DEADLINE: Final = "run_deadline"
+GATEWAY_ACCESS_REASON_RUN_STOPPED: Final = "run_stopped"
+GATEWAY_ACCESS_REASON_REQUEST_BUDGET_EXHAUSTED: Final = "request_budget_exhausted"
+GATEWAY_ACCESS_REASONS: Final = (
+    GATEWAY_ACCESS_REASON_NOT_RUN,
+    GATEWAY_ACCESS_REASON_REQUEST_CANCELLED,
+    GATEWAY_ACCESS_REASON_IDENTITY_CHANGED,
+    GATEWAY_ACCESS_REASON_IDENTITY_UNAVAILABLE,
+    GATEWAY_ACCESS_REASON_FALLBACK_REPORTED,
+    GATEWAY_ACCESS_REASON_MODEL_GROUP_MISMATCH,
+    GATEWAY_ACCESS_REASON_VALID_COMPLETION,
+    GATEWAY_ACCESS_REASON_ASSISTANT_REFUSAL,
+    GATEWAY_ACCESS_REASON_METERED_REASONING_COMPLETION,
+    GATEWAY_ACCESS_REASON_GATEWAY_AUTHENTICATION,
+    GATEWAY_ACCESS_REASON_GATEWAY_MODEL_ACCESS,
+    GATEWAY_ACCESS_REASON_INCOMPLETE_OR_UNSUPPORTED_RESPONSE,
+    GATEWAY_ACCESS_REASON_REQUEST_NOT_DISPATCHED,
+    GATEWAY_ACCESS_REASON_AUTH_HEADER_UNVERIFIED,
+    GATEWAY_ACCESS_REASON_IDENTITY_CONFLICT,
+    GATEWAY_ACCESS_REASON_UNSUPPORTED_PROFILE,
+    GATEWAY_ACCESS_REASON_RUN_DEADLINE,
+    GATEWAY_ACCESS_REASON_RUN_STOPPED,
+    GATEWAY_ACCESS_REASON_REQUEST_BUDGET_EXHAUSTED,
+)
+GATEWAY_ACCESS_DENIAL_UNKNOWN: Final = "unknown"
+GATEWAY_ACCESS_DENIAL_AUTHENTICATION: Final = "authentication"
+GATEWAY_ACCESS_DENIAL_MODEL_ACCESS: Final = "model_access"
+GATEWAY_ACCESS_DENIAL_KINDS: Final = (
+    GATEWAY_ACCESS_DENIAL_UNKNOWN,
+    GATEWAY_ACCESS_DENIAL_AUTHENTICATION,
+    GATEWAY_ACCESS_DENIAL_MODEL_ACCESS,
+)
+# Observed decision -> expected decision -> check status.
+GATEWAY_ACCESS_CASE_STATUSES: Final = {
+    GATEWAY_ACCESS_UNVERIFIED: {GATEWAY_ACCESS_ALLOW: "inconclusive", GATEWAY_ACCESS_DENY: "inconclusive"},
+    GATEWAY_ACCESS_ALLOW: {GATEWAY_ACCESS_ALLOW: "pass", GATEWAY_ACCESS_DENY: "fail"},
+    GATEWAY_ACCESS_DENY: {GATEWAY_ACCESS_ALLOW: "fail", GATEWAY_ACCESS_DENY: "pass"},
+}
+
+# Offer ledgers are independent of request outcomes; see docs/states.md for counting.
+OFFER_NOT_OFFERED: Final = "not_offered"
+OFFER_DISPATCHING: Final = "dispatching"
+OFFER_STARTED: Final = "started"
+OFFER_CANCELLED: Final = "cancelled"
+OFFER_DROPPED_LOCAL: Final = "dropped_local"
+OFFER_DROPPED_LATE: Final = "dropped_late"
+OFFER_DISPATCHED: Final = "dispatched"
+OFFER_UNISSUED: Final = "unissued"
+OFFER_OUTCOMES: Final = (
+    OFFER_NOT_OFFERED,
+    OFFER_DISPATCHING,
+    OFFER_STARTED,
+    OFFER_CANCELLED,
+    OFFER_DROPPED_LOCAL,
+    OFFER_DROPPED_LATE,
+    OFFER_DISPATCHED,
+    OFFER_UNISSUED,
+)
+TRAFFIC_OFFER_OUTCOMES: Final = (
+    OFFER_NOT_OFFERED,
+    OFFER_DISPATCHING,
+    OFFER_STARTED,
+    OFFER_CANCELLED,
+    OFFER_DROPPED_LOCAL,
+    OFFER_DROPPED_LATE,
+)
+MULTI_USER_OFFER_OUTCOMES: Final = (
+    OFFER_DISPATCHED,
+    OFFER_DROPPED_LOCAL,
+    OFFER_DROPPED_LATE,
+    OFFER_UNISSUED,
+    OFFER_NOT_OFFERED,
+)
+# Terminal here means eligible for final accounting, not immutable during dispatch.
+OFFER_TRANSIENT_OUTCOMES: Final = frozenset({OFFER_DISPATCHING})
+OFFER_TERMINAL_OUTCOMES: Final = frozenset(OFFER_OUTCOMES) - OFFER_TRANSIENT_OUTCOMES
+OFFER_TRANSITIONS: Final = {
+    OFFER_NOT_OFFERED: frozenset({OFFER_NOT_OFFERED, OFFER_DISPATCHING, OFFER_DROPPED_LOCAL, OFFER_DROPPED_LATE}),
+    OFFER_DISPATCHING: frozenset({OFFER_STARTED, OFFER_DROPPED_LATE, OFFER_NOT_OFFERED}),
+    OFFER_STARTED: frozenset({OFFER_CANCELLED, OFFER_DROPPED_LATE, OFFER_NOT_OFFERED}),
+    OFFER_CANCELLED: frozenset({OFFER_NOT_OFFERED}),
+    OFFER_DROPPED_LOCAL: frozenset(),
+    OFFER_DROPPED_LATE: frozenset(),
+}
+
+
 # Per-check phase: internal runner state, not a public contract; not in describe().
 CHECK_PHASE_INFERENCE: Final = "inference"
 CHECK_PHASE_JUDGING: Final = "judging"
@@ -382,6 +518,62 @@ CONDITION_STOP_REASONS: Final = (CONDITION_STOP_RUN, CONDITION_STOP_TIME_LIMIT,
 CONDITION_STOP_REASON_MARKERS: Final = ("run stopped", "time limit", "request budget", "cancelled", "aborted")
 
 
+def check_gateway_policy_outcome(qualification: str, status: str) -> None:
+    """Flag an undeclared qualification or qualification/status pair."""
+    if status in GATEWAY_POLICY_STATUSES.get(qualification, ()):
+        return
+    message = f"Undeclared gateway policy outcome: {qualification!r} / {status!r}"
+    if STRICT_TRANSITIONS:
+        raise AssertionError(message)
+    logger.warning(message)
+
+
+def check_gateway_access_observation(observed: str, reason: str) -> None:
+    """Flag undeclared access observations or reason codes, including unrun cases."""
+    if observed in GATEWAY_ACCESS_OBSERVATIONS and reason in GATEWAY_ACCESS_REASONS:
+        return
+    message = f"Undeclared gateway access observation: {observed!r} / {reason!r}"
+    if STRICT_TRANSITIONS:
+        raise AssertionError(message)
+    logger.warning(message)
+
+
+def gateway_access_case_status(expected: str, observed: str) -> str:
+    """Apply the declared observation/expectation rule without changing unknown-value fallback."""
+    status = GATEWAY_ACCESS_CASE_STATUSES.get(observed, {}).get(expected)
+    if status is not None:
+        return status
+    message = f"Undeclared gateway access case: expected {expected!r}, observed {observed!r}"
+    if STRICT_TRANSITIONS:
+        raise AssertionError(message)
+    logger.warning(message)
+    return "inconclusive" if observed == GATEWAY_ACCESS_UNVERIFIED else "pass" if observed == expected else "fail"
+
+
+class OfferTransitionError(AssertionError):
+    """A strict offer-guard failure, distinct from request callback assertions."""
+
+
+def check_offer_transition(old: str, new: str) -> None:
+    """Flag traffic ledger writes outside the declared transition table."""
+    if new in OFFER_TRANSITIONS.get(old, ()):
+        return
+    message = f"Undeclared offer transition: {old!r} -> {new!r}"
+    if STRICT_TRANSITIONS:
+        raise OfferTransitionError(message)
+    logger.warning(message)
+
+
+def check_multi_user_offer_outcome(outcome: str) -> None:
+    """Flag a final multi-user offer value outside its own accounting vocabulary."""
+    if outcome in MULTI_USER_OFFER_OUTCOMES:
+        return
+    message = f"Undeclared multi-user offer outcome: {outcome!r}"
+    if STRICT_TRANSITIONS:
+        raise AssertionError(message)
+    logger.warning(message)
+
+
 def check_metric_state(state: str, value: object) -> None:
     """Reject undeclared metric states or inconsistent value presence in tests; warn otherwise."""
     if state in METRIC_STATES and (value is not None) == (state in METRIC_VALUE_STATES):
@@ -485,6 +677,19 @@ def run_recoverable(state: str | None, journal_present: bool, report_available: 
 
 def describe() -> dict:
     return {
+        "gateway_policy_qualifications": sorted(GATEWAY_POLICY_QUALIFICATIONS),
+        "gateway_access_expected": sorted(GATEWAY_ACCESS_EXPECTED),
+        "gateway_access_observations": sorted(GATEWAY_ACCESS_OBSERVATIONS),
+        "gateway_access_reasons": sorted(GATEWAY_ACCESS_REASONS),
+        "gateway_access_denial_kinds": sorted(GATEWAY_ACCESS_DENIAL_KINDS),
+        "offer_outcomes": sorted(OFFER_OUTCOMES),
+        "traffic_offer_outcomes": sorted(TRAFFIC_OFFER_OUTCOMES),
+        "multi_user_offer_outcomes": sorted(MULTI_USER_OFFER_OUTCOMES),
+        "offer_terminal_outcomes": sorted(OFFER_TERMINAL_OUTCOMES),
+        "offer_transient_outcomes": sorted(OFFER_TRANSIENT_OUTCOMES),
+        "gateway_policy_statuses": {key: sorted(value) for key, value in GATEWAY_POLICY_STATUSES.items()},
+        "gateway_access_case_statuses": {key: dict(value) for key, value in GATEWAY_ACCESS_CASE_STATUSES.items()},
+        "offer_transitions": {key: sorted(value) for key, value in OFFER_TRANSITIONS.items()},
         "metric_states": list(METRIC_STATES),
         "metric_value_states": [state for state in METRIC_STATES if state in METRIC_VALUE_STATES],
         "metric_state_labels": dict(METRIC_STATE_LABELS), "metric_state_actions": dict(METRIC_STATE_ACTIONS),

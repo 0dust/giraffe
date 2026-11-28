@@ -37,6 +37,7 @@ def test_run_state_partitions():
     (states.SCALE_DOWN_PHASES, states.SCALE_DOWN_TRANSITIONS),
     (states.TOKEN_EVIDENCE_STATUSES, states.TOKEN_EVIDENCE_TRANSITIONS),
     (states.RESTART_STATUSES, states.RESTART_TRANSITIONS),
+    (states.TRAFFIC_OFFER_OUTCOMES, states.OFFER_TRANSITIONS),
 ])
 def test_transition_vocabulary_and_reachability(vocabulary, transitions):
     assert set(transitions) == set(vocabulary)
@@ -149,6 +150,19 @@ def test_describe():
     description = states.describe()
     assert json.loads(json.dumps(description)) == description
     assert description == {
+        "gateway_policy_qualifications": sorted(states.GATEWAY_POLICY_QUALIFICATIONS),
+        "gateway_access_expected": sorted(states.GATEWAY_ACCESS_EXPECTED),
+        "gateway_access_observations": sorted(states.GATEWAY_ACCESS_OBSERVATIONS),
+        "gateway_access_reasons": sorted(states.GATEWAY_ACCESS_REASONS),
+        "gateway_access_denial_kinds": sorted(states.GATEWAY_ACCESS_DENIAL_KINDS),
+        "offer_outcomes": sorted(states.OFFER_OUTCOMES),
+        "traffic_offer_outcomes": sorted(states.TRAFFIC_OFFER_OUTCOMES),
+        "multi_user_offer_outcomes": sorted(states.MULTI_USER_OFFER_OUTCOMES),
+        "offer_terminal_outcomes": sorted(states.OFFER_TERMINAL_OUTCOMES),
+        "offer_transient_outcomes": sorted(states.OFFER_TRANSIENT_OUTCOMES),
+        "gateway_policy_statuses": {key: sorted(value) for key, value in states.GATEWAY_POLICY_STATUSES.items()},
+        "gateway_access_case_statuses": states.GATEWAY_ACCESS_CASE_STATUSES,
+        "offer_transitions": {key: sorted(value) for key, value in states.OFFER_TRANSITIONS.items()},
         "metric_states": list(states.METRIC_STATES),
         "metric_value_states": ["measured", "estimated"],
         "metric_state_labels": dict(states.METRIC_STATE_LABELS),
