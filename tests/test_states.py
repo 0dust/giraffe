@@ -149,6 +149,10 @@ def test_describe():
     description = states.describe()
     assert json.loads(json.dumps(description)) == description
     assert description == {
+        "metric_states": list(states.METRIC_STATES),
+        "metric_value_states": ["measured", "estimated"],
+        "metric_state_labels": dict(states.METRIC_STATE_LABELS),
+        "metric_state_actions": dict(states.METRIC_STATE_ACTIONS),
         "check_statuses": list(states.CHECK_STATUSES), "problem_statuses": sorted(states.PROBLEM_STATUSES),
         "exit_codes": {**states.EXIT_CODES, "cancelled": states.EXIT_CODE_CANCELLED,
                        "usage_error": states.EXIT_CODE_USAGE, "default": states.EXIT_CODE_DEFAULT},

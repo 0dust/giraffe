@@ -9,6 +9,38 @@ logger = logging.getLogger(__name__)
 STRICT_TRANSITIONS = False
 
 
+METRIC_MEASURED: Final = "measured"
+METRIC_ESTIMATED: Final = "estimated"
+METRIC_NOT_MEASURED: Final = "not_measured"
+METRIC_NOT_OBSERVED: Final = "not_observed"
+METRIC_NOT_COLLECTED: Final = "not_collected"
+METRIC_NOT_APPLICABLE: Final = "not_applicable"
+METRIC_INSUFFICIENT_EVIDENCE: Final = "insufficient_evidence"
+METRIC_NOT_SUPPORTED: Final = "not_supported"
+METRIC_NO_BASELINE: Final = "no_baseline"
+METRIC_STATES: Final = (
+    METRIC_MEASURED, METRIC_ESTIMATED, METRIC_NOT_MEASURED, METRIC_NOT_OBSERVED,
+    METRIC_NOT_COLLECTED, METRIC_NOT_APPLICABLE, METRIC_INSUFFICIENT_EVIDENCE,
+    METRIC_NOT_SUPPORTED, METRIC_NO_BASELINE,
+)
+METRIC_VALUE_STATES: Final = frozenset({METRIC_MEASURED, METRIC_ESTIMATED})
+METRIC_STATE_LABELS: Final = {
+    METRIC_MEASURED: "Measured", METRIC_ESTIMATED: "Estimated", METRIC_NOT_MEASURED: "Not measured",
+    METRIC_NOT_OBSERVED: "Not observed", METRIC_NOT_COLLECTED: "Not collected",
+    METRIC_NOT_APPLICABLE: "Not applicable", METRIC_INSUFFICIENT_EVIDENCE: "Insufficient evidence",
+    METRIC_NOT_SUPPORTED: "Not supported", METRIC_NO_BASELINE: "No baseline",
+}
+METRIC_STATE_ACTIONS: Final = {
+    METRIC_NOT_MEASURED: "Collect eligible observations for this scope.",
+    METRIC_NOT_OBSERVED: "Collect eligible observations for this scope.",
+    METRIC_NOT_COLLECTED: "Enable the corresponding collector and rerun the workload.",
+    METRIC_NOT_APPLICABLE: "Select the corresponding workload or transport to collect this measure.",
+    METRIC_INSUFFICIENT_EVIDENCE: "Collect eligible observations for this scope.",
+    METRIC_NOT_SUPPORTED: "Collect eligible observations for this scope.",
+    METRIC_NO_BASELINE: "Attach a baseline with comparable workload and measurement coverage.",
+}
+
+
 # Check / run verdict: report.json overall/checks[].status and CLI JSON outcome (models.Status).
 CHECK_STATUSES: Final = ("pass", "fail", "inconclusive", "skipped", "blocked")
 PROBLEM_STATUSES: Final = frozenset({"fail", "inconclusive", "blocked"})
@@ -350,6 +382,16 @@ CONDITION_STOP_REASONS: Final = (CONDITION_STOP_RUN, CONDITION_STOP_TIME_LIMIT,
 CONDITION_STOP_REASON_MARKERS: Final = ("run stopped", "time limit", "request budget", "cancelled", "aborted")
 
 
+def check_metric_state(state: str, value: object) -> None:
+    """Reject undeclared metric states or inconsistent value presence in tests; warn otherwise."""
+    if state in METRIC_STATES and (value is not None) == (state in METRIC_VALUE_STATES):
+        return
+    message = f"Invalid metric evidence state: {state!r} (value present: {value is not None})"
+    if STRICT_TRANSITIONS:
+        raise AssertionError(message)
+    logger.warning(message)
+
+
 def run_transition_allowed(current: str | None, new: str) -> bool:
     return current not in RUN_TRANSITIONS or current == new or new in RUN_TRANSITIONS[current]
 
@@ -443,6 +485,9 @@ def run_recoverable(state: str | None, journal_present: bool, report_available: 
 
 def describe() -> dict:
     return {
+        "metric_states": list(METRIC_STATES),
+        "metric_value_states": [state for state in METRIC_STATES if state in METRIC_VALUE_STATES],
+        "metric_state_labels": dict(METRIC_STATE_LABELS), "metric_state_actions": dict(METRIC_STATE_ACTIONS),
         "check_statuses": list(CHECK_STATUSES), "problem_statuses": sorted(PROBLEM_STATUSES),
         "exit_codes": {**EXIT_CODES, "cancelled": EXIT_CODE_CANCELLED,
                        "usage_error": EXIT_CODE_USAGE, "default": EXIT_CODE_DEFAULT},

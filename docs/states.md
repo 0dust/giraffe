@@ -435,6 +435,51 @@ Where you see it: `report.json` `observations.targets.*.restart.status`.
 
 An observation starts `blocked`. Hook failures leave it there; only a successful hook enters readiness checking. A final `blocked` result is not retried within that observation.
 
+## Metric evidence
+
+Performance and derived telemetry rows use the following evidence states. Only
+`measured` and `estimated` carry a non-null value, including zero, false, or a
+structured value. Every other state has `value: null`.
+
+| State | Meaning | Carries value? | Default action |
+| --- | --- | --- | --- |
+| `measured` | Eligible observations directly establish the reported measure. | Yes | None |
+| `estimated` | Eligible observations support an approximation; `source` explains its method. | Yes | None |
+| `not_measured` | No eligible measurement is available in this scope. | No | Collect eligible observations for this scope. |
+| `not_observed` | The event or phenomenon was not observed in this scope. | No | Collect eligible observations for this scope. |
+| `not_collected` | Required instrumentation or collection evidence is absent. | No | Enable the corresponding collector and rerun the workload. |
+| `not_applicable` | This workload, transport, or scope does not apply to the measure. | No | Select the corresponding workload or transport to collect this measure. |
+| `insufficient_evidence` | Available evidence cannot establish the measure. | No | Collect eligible observations for this scope. |
+| `not_supported` | The endpoint or runtime profile does not support the required evidence. | No | Collect eligible observations for this scope. |
+| `no_baseline` | No baseline is attached for the comparison. | No | Attach a baseline with comparable workload and measurement coverage. |
+
+The row envelope includes:
+
+| Field | Meaning |
+| --- | --- |
+| `value` | A scalar, structured value, or distribution; null for missing evidence. |
+| `state` | One of the metric evidence states above. |
+| `reason` | Why evidence is missing or qualified; otherwise null. |
+| `action` | Guidance for obtaining evidence; otherwise null. |
+| `sample_count` | Number of observations supporting this row. |
+| `eligible_count` | Number of eligible observations in the row's population. |
+| `counts` | `sample`, `eligible`, and `missing` (`max(0, eligible - sample)`) counts. |
+
+`reason` and `action` may be specific to the metric and override generic guidance.
+Telemetry rows use a telemetry-specific default action for missing evidence:
+"Collect at least two fresh compatible exporter samples during the workload."
+Individual telemetry metrics may provide more specific guidance.
+The source, scope, units, and collection window qualify what a value represents;
+server-wide telemetry does not establish attribution to a selected request window.
+`metric()` changes a requested `measured` or `estimated` state with no value to
+`insufficient_evidence` before validation. Undeclared states or inconsistent value
+presence raise in tests and log a warning in production.
+
+`giraffe describe`, GET `/api/capabilities`, and GET `/api/bootstrap` expose
+`metric_states`, `metric_value_states`, `metric_state_labels`, and
+`metric_state_actions` in their `states` block. The web UI and HTML/CLI reports use
+these shared labels; CLI summaries lowercase them for mid-line wording.
+
 ## Telemetry snapshot and discovery status
 
 | Value | Meaning | Discovery? |

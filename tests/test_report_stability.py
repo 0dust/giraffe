@@ -35,8 +35,9 @@ def test_main_schema_three_fixture_preserves_checks_outcome_and_conditions():
     # measurements are character-derived pace estimates: these requests lack
     # cumulative counts at the first/last read, so they now lack rate evidence.
     # This fixture has no saved performance, so its derived error-rate source
-    # also describes the current outcome rule. All other measurements, sections,
-    # verdicts and conditions stay unchanged.
+    # also describes the current outcome rule. Derived telemetry envelopes now
+    # include coverage counts. All other measurements, sections, verdicts and
+    # conditions stay unchanged.
     from giraffe.performance import SPEC_DECODE_ROWS
     actual = without_series(saved.performance)
     for target, frozen_target in zip(actual["targets"], expected["performance"]["targets"], strict=True):
@@ -50,6 +51,13 @@ def test_main_schema_three_fixture_preserves_checks_outcome_and_conditions():
                 summary["metrics"][key] for key, _, _ in SPEC_DECODE_ROWS]
             summary["sections"]["server"] = summary["sections"]["server"][:original_server_rows]
             summary["metrics"] = {key: value for key, value in summary["metrics"].items() if key not in added}
+            for rows in (frozen["metrics"].values(), *frozen["sections"].values()):
+                for row in rows:
+                    for percentile in row.get("histogram_percentiles", {}).values():
+                        assert "counts" not in percentile
+                        samples, eligible = percentile["sample_count"], percentile["eligible_count"]
+                        percentile["counts"] = {"sample": samples, "eligible": eligible,
+                                                "missing": max(0, eligible - samples)}
             error_rate = frozen["metrics"]["error_rate"]
             assert error_rate["source"] == "Existing outcome accounting; failures + timeouts / non-cancelled, non-reasoning-budget requests"
             error_rate["source"] = "Invalid + failed + timeout outcomes / evaluated outcomes (ok + errors)"

@@ -454,10 +454,34 @@ def test_delivery_envelope_counts_known_zero_rates_and_missing_usage(missing_use
     target = build_performance(report)["targets"][0]
     delivery = target["summaries"][target["default_window"]]["metrics"]["persistent_user_delivery"]
 
-    assert len(delivery["value"]) == 5
+    if missing_users == 5:
+        assert delivery["value"] is None
+    else:
+        assert len(delivery["value"]) == 5
+        assert {row["user_id"] for row in delivery["value"] if row["output_tokens_per_second"] is None} == missing
+        assert all(row["output_tokens_per_second"] == 0 for row in delivery["value"] if row["user_id"] not in missing)
     assert delivery["counts"] == {"sample": 5 - missing_users, "eligible": 5, "missing": missing_users}
     assert delivery["sample_count"] == 5 - missing_users
     assert delivery["eligible_count"] == 5
-    assert delivery["state"] == ("insufficient_evidence" if missing_users else "measured")
-    assert bool(delivery["reason"]) == bool(missing_users)
-    assert {row["user_id"] for row in delivery["value"] if row["output_tokens_per_second"] is None} == missing
+    assert delivery["state"] == ("insufficient_evidence" if missing_users == 5 else "measured")
+    assert delivery["partial"] == (0 < missing_users < 5)
+    assert delivery["reason"] == ("Not every planned user has a known shared-window output rate." if missing_users else None)
+    users = report.checks[0].metrics["multi_user"]["windows"][0]["users"]
+    assert len(users) == 5
+    assert {row["user_id"] for row in users if row["output_tokens_per_second"] is None} == missing
+
+    if 0 < missing_users < 5:
+        import json
+        from giraffe.performance_html import _card, _table
+        from tests.test_ux_results import run_render_checks
+
+        assert "Underlying values" in _table([delivery])
+        assert "Partial coverage" in _table([delivery])
+        assert "Partial usage coverage" in _card(delivery)
+        run_render_checks("const row=" + json.dumps(delivery) + r''';
+const table=performanceMetricTable([row]);
+assert(table.includes('Underlying values'));
+assert(table.includes(' · partial coverage'));
+const card=performanceCard(row,row.id);
+assert(card.includes('Partial usage / measurement coverage; known observations only.'));
+''')
