@@ -16,7 +16,7 @@ import uuid
 from collections import Counter, defaultdict
 from contextlib import asynccontextmanager, contextmanager, nullcontext
 from contextvars import ContextVar
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Literal
@@ -24,6 +24,8 @@ from typing import Callable, Literal
 import httpx
 
 from . import states
+from .stop_cause import (StopCause as StopCause, cause_of as cause_of, finished_fields as finished_fields,
+                         latch_cause as latch_cause, stop_kind_of as stop_kind_of, stopping_fields as stopping_fields)
 from . import __version__
 from .client import LLMClient, no_response_failure
 from .conditions import condition_aggregate, condition_for, request_status, scheduled_multi_user_window
@@ -356,11 +358,12 @@ class _InflightPeaks:
         return peak
 
 
-@dataclass(frozen=True)
-class StopCause:
-    kind: str
-    text: str
-    scope: str | None = None
+def latch_report_cancellation(report, *, replace_soft: bool = True) -> StopCause:
+    """Apply the cancellation fallback through the same first-wins table."""
+    cause = latch_cause(cause_of(report), states.STOP_KIND_CANCELLED, replace_soft=replace_soft)
+    report.observations["stop_cause"] = asdict(cause)
+    report.abort_reason = cause.text
+    return cause
 
 
 class _Run:
@@ -393,6 +396,7 @@ class _Run:
         self.budget_counts = Counter()
         self.errors = 0
         self.stop_cause: StopCause | None = None
+        self.inference_finished = False
         self.limits_reached = set()
         self.request_limit_scopes: set[str] = set()
         self.concurrency_limit_scopes: set[str] = set()
@@ -462,14 +466,12 @@ class _Run:
 
     def _latch_stop(self, kind: str, text: str | None = None, *, scope: str | None = None,
                     replace_soft: bool = True) -> bool:
-        if text is None:
-            text = next(reason for reason, reason_kind in states.STOP_REASON_KIND.items() if reason_kind == kind)
-        if self.stop_cause is None or (self.stop_cause.kind in states.STOP_SOFT_KINDS
-                and replace_soft and kind not in states.STOP_SOFT_KINDS):
-            self.stop_cause = StopCause(kind, text, scope)
-            self.stop_cause_sink(asdict(self.stop_cause))
-            return True
-        return False
+        cause = latch_cause(self.stop_cause, kind, text, scope, replace_soft=replace_soft)
+        if cause is self.stop_cause:
+            return False
+        self.stop_cause = cause
+        self.stop_cause_sink(asdict(cause))
+        return True
 
     def runtime_gateway_request_counts(self, target):
         from .gateway_access import eligible_probe_count
@@ -687,7 +689,8 @@ class _Run:
 
     def stop_reason(self, target: str | None = None) -> str | None:
         # A full offer budget must not hide a real stop during the drain.
-        user_latched = self.stop.is_set() and self._latch_stop(states.STOP_KIND_USER)
+        user_latched = self.stop.is_set() and self._latch_stop(
+            states.STOP_KIND_USER, replace_soft=not self.inference_finished)
         if time.monotonic() >= self.deadline:
             self.limits_reached.add("max_duration_seconds")
             if self.duration_limit_scope is None:
@@ -710,7 +713,7 @@ class _Run:
             self.stop_cause_sink(asdict(self.stop_cause))
         if self.stop_cause is not None and self.stop_cause.kind not in states.STOP_SOFT_KINDS and not self.stop_notified:
             self.stop_notified = True
-            self.emit("run_stopping", abort_reason=self.reason, stop_kind=self.stop_cause.kind)
+            self.emit("run_stopping", **stopping_fields(self.stop_cause))
         return (self.endpoint_health[target]["abort_reason"] if target else None) or self.reason
 
     def _check_endpoint_watchdog(self, target):
@@ -3187,7 +3190,8 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
             outer_cancellation = exc
             # Internally setting the event for cleanup must not attribute a
             # timeout or forced task cancellation to an explicit user stop.
-            run._latch_stop(states.STOP_KIND_USER if run.stop.is_set() else states.STOP_KIND_CANCELLED)
+            run._latch_stop(states.STOP_KIND_USER if run.stop.is_set() else states.STOP_KIND_CANCELLED,
+                            replace_soft=not run.inference_finished)
             run.stop.set()
 
     public_config = config.model_copy(deep=True)
@@ -3341,6 +3345,7 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
     inference_duration = time.monotonic() - run.start
     sampler.set_phase("scoring")
     consume_samples()
+    run.inference_finished = True
     judging_summary = None
     if any(spec.scorer == "judge" for spec in run.pack_specs) and not run.stop.is_set() and not run.memory_limit_reached:
         from .judging import judge_records
@@ -3371,7 +3376,7 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
             memory_monitor.cancel()
             await asyncio.gather(stopped, memory_monitor, return_exceptions=True)
         if run.stop.is_set():
-            run._latch_stop(states.STOP_KIND_USER, replace_soft=False)
+            run._latch_stop(states.STOP_KIND_USER, replace_soft=not run.inference_finished)
         limits = _check_config(config, "capacity").limits
         for target in config.targets:
             if run.stage_evidence[target.name]:
@@ -3550,6 +3555,8 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
             verdict_reason = None
     if run.stop_cause is not None and run.stop_cause.kind == states.STOP_KIND_MEMORY and not memory_required_interrupted:
         verdict_reason = None
+    if outer_cancellation is not None and verdict_reason is None:
+        verdict_reason = run.reason
     report = RunReport(run_id=run_id, suite_version=__version__,
                      started_at=started_at, finished_at=_now(),
                      overall=overall_status(checks, verdict_reason or next(iter(target_abort_reasons.values()), None),
@@ -3563,8 +3570,7 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
     try:
         for row in gateway_conditions:
             run.emit_condition("condition_finished", row["condition"]["id"], row)
-        run.emit("run_finished", abort_reason=verdict_reason,
-                 stop_kind=run.stop_cause.kind if run.stop_cause is not None else None,
+        run.emit("run_finished", **finished_fields(run.stop_cause, verdict_reason),
                  target_abort_reasons=target_abort_reasons)
     except Exception:
         if outer_cancellation is None:

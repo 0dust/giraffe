@@ -4602,6 +4602,8 @@ def save_failure_summary(report: RunReport, directory: Path, error: OSError) -> 
             except OSError:
                 pass
         return html_failure_warning(error)
+    from .runner import cause_of, finished_fields
+
     reason = _write_failure_reason(error)
     prefix = (f"Report could not be saved ({reason}). Request evidence for "
               f"{len(report.requests)} requests was lost; ")
@@ -4612,7 +4614,7 @@ def save_failure_summary(report: RunReport, directory: Path, error: OSError) -> 
         except OSError:
             pass
     message = prefix + "a summary was saved."
-    summary = {"run_id": report.run_id, "overall": report.overall, "state": "error",
+    summary = {**finished_fields(cause_of(report), report.abort_reason), "run_id": report.run_id, "overall": report.overall, "state": "error",
                "started_at": report.started_at, "finished_at": report.finished_at,
                "request_count": len(report.requests), "summary_saved": True, "error": message,
                "checks": [{"id": check.id, "target": check.target, "title": check.title[:MAX_FAILURE_SUMMARY_TITLE_CHARS],

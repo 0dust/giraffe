@@ -72,6 +72,10 @@ class EvidenceWriter:
         self.fsync_records = max(1, fsync_records)
         self.fsync_seconds = max(0.001, fsync_seconds)
         self._queue = queue.Queue(maxsize=max(1, queue_size))
+        self._cause_lock = threading.Lock()
+        self._latest_cause = None
+        self._cause_dirty = False
+        self._cause_recorded = False
         self._error = None
         self._closed = False
         self._stop = threading.Event()
@@ -103,7 +107,12 @@ class EvidenceWriter:
             self.dropped_count += 1
 
     def record_stop_cause(self, cause: dict | None) -> None:
-        self._enqueue(("stop_cause", dict(cause) if cause is not None else None))
+        with self._cause_lock:
+            if self._closed or self._error is not None:
+                self.dropped_count += 1
+                return
+            self._latest_cause = dict(cause) if cause is not None else None
+            self._cause_dirty = self._cause_recorded = True
 
     def progress(self, event: dict) -> None:
         if (event.get("event", "").startswith(("check_", "condition_"))
@@ -144,6 +153,17 @@ class EvidenceWriter:
                 pending = 0
                 last_dropped = 0
                 last_sync = time.monotonic()
+                def write_cause(*, final=False):
+                    with self._cause_lock:
+                        if not self._cause_dirty and not (final and self._cause_recorded):
+                            return 0
+                        cause = self._latest_cause
+                    stream.write(_json_line({"type": "stop_cause", "stop_cause": cause}))
+                    with self._cause_lock:
+                        if self._latest_cause is cause:
+                            self._cause_dirty = False
+                    return 1
+
                 while True:
                     timeout = min(QUEUE_WAIT_SECONDS, max(0, self.fsync_seconds - (
                         time.monotonic() - last_sync))) if pending else QUEUE_WAIT_SECONDS
@@ -151,11 +171,13 @@ class EvidenceWriter:
                         item = self._queue.get(timeout=timeout)
                     except queue.Empty:
                         item = None
+                    pending += write_cause()
                     if self.dropped_count != last_dropped:
                         last_dropped = self.dropped_count
                         stream.write(_json_line({"type": "dropped", "count": last_dropped}))
                         pending += 1
                     if item is None and self._stop.is_set() and self._queue.empty():
+                        write_cause(final=True)
                         stream.flush()
                         os.fsync(stream.fileno())
                         break
@@ -191,6 +213,10 @@ class EvidenceWriter:
                         last_sync = time.monotonic()
         except Exception as error:
             self._error = error
+            with self._cause_lock:
+                if self._cause_dirty:
+                    self.dropped_count += 1
+                    self._cause_dirty = False
             while True:
                 try:
                     self._queue.get_nowait()
@@ -202,6 +228,22 @@ class EvidenceWriter:
     @property
     def stopped(self) -> bool:
         return not self._thread.is_alive()
+
+    def append_final_stop_cause(self, cause: dict | None) -> None:
+        """Journal a cancellation received while closing, after the writer stops."""
+        try:
+            with self._cause_lock:
+                if not self.stopped:
+                    raise TimeoutError("Evidence writer is still running")
+                self._latest_cause = dict(cause) if cause is not None else None
+                descriptor = os.open(self.directory / "evidence.jsonl", os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW)
+                with os.fdopen(descriptor, "a", encoding="utf-8") as stream:
+                    stream.write(_json_line({"type": "stop_cause", "stop_cause": self._latest_cause}))
+                    stream.flush()
+                    os.fsync(stream.fileno())
+        except (OSError, TimeoutError):
+            self.dropped_count += 1
+            raise
 
     def close(self) -> None:
         if not self._closed:

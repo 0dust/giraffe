@@ -9,7 +9,7 @@ from giraffe import runner
 from tests.test_runner import client as client, config
 
 
-KINDS = ("user", "cancelled", "duration", "request_budget", "error_threshold",
+KINDS = ( "user", "cancelled", "duration", "request_budget", "error_threshold",
          "endpoints_unresponsive", "memory")
 FREE_TEXT = {"endpoints_unresponsive": "Endpoint service unresponsive",
              "memory": "memory limit reached: RAM grew by 2 MiB"}
@@ -24,6 +24,9 @@ def test_latch_table(current, new, replace_soft):
         assert run._latch_stop(current, FREE_TEXT.get(current))
     previous = run.stop_cause
     changed = current is None or (current == "request_budget" and new != "request_budget" and replace_soft)
+    pure = runner.latch_cause(previous, new, FREE_TEXT.get(new), replace_soft=replace_soft)
+    assert pure.kind == (new if changed else current)
+    assert (pure is previous) is (not changed)
     assert run._latch_stop(new, FREE_TEXT.get(new), replace_soft=replace_soft) is changed
     assert run.stop_cause.kind == (new if changed else current)
     if not changed:
@@ -290,3 +293,82 @@ async def test_cancelled_cli_run_recovers_stop_cause_from_kept_journal(client, m
     recovered = recover_evidence(tmp_path, {})
     assert len(recovered.requests) == len(report.requests)
     assert recovered.observations["stop_cause"] == expected
+
+
+@pytest.mark.parametrize("inference_finished", [False, True])
+@pytest.mark.parametrize("current", [None, "request_budget", "duration"])
+def test_user_latch_phase_rule_is_shared_by_memory_polling(inference_finished, current):
+    run = runner._Run(config(max_memory_mb=1), None, None)
+    if current:
+        run._latch_stop(current)
+    run.inference_finished = inference_finished
+    run.stop.set()
+    run.rss_at_start_bytes = 1
+    run.memory_sample(2 * 1024**2)
+    expected = ("duration" if current == "duration" else
+                "memory" if current == "request_budget" and inference_finished else "user")
+    assert run.stop_cause.kind == expected
+
+
+@pytest.mark.parametrize("replace_soft", [False, True])
+@pytest.mark.parametrize("current", [None, "request_budget", "memory", "user"])
+def test_report_cancellation_override_uses_latch_table(current, replace_soft):
+    from giraffe.models import RunReport
+    cause = runner.latch_cause(None, current, FREE_TEXT.get(current), replace_soft=True) if current else None
+    report = RunReport(run_id="test", started_at="now", finished_at="now", overall="inconclusive", manifest={},
+                       observations={"stop_cause": vars(cause) if cause else None})
+    expected = "cancelled" if current is None or (current == "request_budget" and replace_soft) else current
+    runner.latch_report_cancellation(report, replace_soft=replace_soft)
+    assert runner.stop_kind_of(report) == expected
+    assert report.abort_reason == report.observations["stop_cause"]["text"]
+    assert runner.finished_fields(runner.cause_of(report), report.abort_reason) == {
+        "abort_reason": report.abort_reason, "stop_kind": expected}
+
+
+@pytest.mark.parametrize("kind", [None, *KINDS])
+def test_stop_field_builders_keep_raw_and_verdict_text_distinct(kind):
+    cause = runner.latch_cause(None, kind, FREE_TEXT.get(kind), replace_soft=True) if kind else None
+    expected = {"abort_reason": None, "stop_kind": None} if kind in {None, "request_budget"} else {
+        "abort_reason": cause.text, "stop_kind": kind}
+    assert runner.stopping_fields(cause) == expected
+    assert runner.finished_fields(cause, None) == {"abort_reason": None, "stop_kind": kind}
+    assert runner.finished_fields(cause, "verdict text") == {"abort_reason": "verdict text", "stop_kind": kind}
+
+
+@pytest.mark.parametrize("value,expected", [
+    ({"stop_cause": {"kind": "user", "text": "cancelled by user", "scope": None, "extra": 1}}, "user"),
+    # #224 will make shutdown a recognized cause; preserve HEAD behavior here.
+    ({"stop_cause": {"kind": "shutdown", "text": "server shut down"}}, None),
+    ({"stop_cause": []}, None), ({"stop_cause": "user"}, None),
+    ({"stop_cause": {"kind": []}}, None), ({"stop_cause": {"text": "unknown"}}, None),
+    ({"observations": []}, None), ([], None),
+])
+def test_stop_cause_reader_tolerates_untrusted_saved_shapes(value, expected):
+    assert runner.stop_kind_of(value) == expected
+
+
+async def test_outer_cancel_budget_verdict_matches_report_and_finished_event(client, monkeypatch):
+    from giraffe import judging
+    from tests.test_runner import judge_summary, judged_pack_config
+
+    entered = asyncio.Event()
+    events = []
+
+    async def evaluate(config, records, specs, *, stop_event, **kwargs):
+        entered.set()
+        await stop_event.wait()
+        return judge_summary(records, stopped="cancelled")
+
+    monkeypatch.setattr(judging, "judge_records", evaluate)
+    settings = judged_pack_config(checks=["correctness"], max_requests=1)
+    settings.load_test.schedule.duration_seconds = 1
+    task = asyncio.create_task(runner.run_suite(settings, progress=events.append))
+    await asyncio.wait_for(entered.wait(), 2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError) as cancelled:
+        await task
+    report = cancelled.value.giraffe_report
+    assert report.observations["stop_cause"]["kind"] == "request_budget"
+    assert report.abort_reason == "maximum request budget reached"
+    assert events[-1]["event"] == "run_finished"
+    assert events[-1]["abort_reason"] == report.abort_reason

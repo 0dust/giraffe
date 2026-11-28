@@ -123,7 +123,8 @@ async def test_run_terminal_and_cancel_results(tmp_path, monkeypatch):
                 response = await client.post(f"/api/runs/{identifier}/cancel", json={})
                 assert response.status_code == 200
                 assert response.json() == {"id": identifier, "state": "stopping",
-                                           "terminal": False, "result": result}
+                                           "terminal": False, "result": result,
+                                           "stop_kind": None, "abort_reason": None}
         finally:
             release.set()
         assert (await finished(client, identifier))["terminal"] is True

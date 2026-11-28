@@ -16,6 +16,7 @@ import importlib.util
 import sys
 import time
 from contextlib import ExitStack, contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -40,6 +41,7 @@ if _required_modules_available():
     from pydantic import ValidationError
 
     from giraffe import __version__
+    from giraffe.stop_cause import cause_of, finished_fields, stopping_fields
     from giraffe.configuration_errors import configuration_errors
     from giraffe.diagnostics import configure_logging, run_logging
     from giraffe.models import (CATALOGUE_NAMES, CHECK_NAMES, ConfigDraft, RunConfig, RunReport, is_legacy_config,
@@ -113,6 +115,7 @@ def _cleanup_size(value: str) -> int:
 
 logger = logging.getLogger(__name__)
 _HEARTBEAT_SECONDS = 5
+_stop_cause_observer = ContextVar("giraffe_cli_stop_cause_observer", default=lambda cause, **kwargs: None)
 
 
 @contextmanager
@@ -396,7 +399,8 @@ def _report_for_render(path: Path) -> RunReport:
         if recovered is None:
             raise
         write_report(recovered, path, preserve_evidence=True)
-        update_metadata(path, {"state": states.RUN_INTERRUPTED, "run_id": recovered.run_id},
+        update_metadata(path, {"state": states.RUN_INTERRUPTED, "run_id": recovered.run_id,
+                               **finished_fields(cause_of(recovered), recovered.abort_reason)},
                         remove=("recovery_attempts", "recovery_retry_at", "error", "error_id"))
         print(f"Recovered {len(recovered.requests)} recorded requests from an interrupted run; "
               "results are incomplete.", file=sys.stderr)
@@ -579,7 +583,7 @@ def _stage_name(scenario: str, config=None) -> str | None:
 
 async def _run(config: RunConfig, *, json_progress: bool = False, verbose: bool = False, quiet: bool = False,
                directory: Path | None = None) -> RunReport:
-    from giraffe.runner import run_suite
+    from giraffe.runner import run_suite, stop_cause_sink
 
     stop = asyncio.Event()
     interrupted = False
@@ -606,11 +610,19 @@ async def _run(config: RunConfig, *, json_progress: bool = False, verbose: bool 
     timeout_warning_lines: dict[str, str] = {}
     latest_timeout_warnings: dict[str, dict] = {}
     writer = adapter = sink_token = stop_cause_token = report = None
+    observe_cause = _stop_cause_observer.get()
+
+    def record_cause(cause):
+        observe_cause(cause)
+        if writer is not None:
+            writer.record_stop_cause(cause)
 
     def progress(event: dict) -> None:
         nonlocal last, last_update
         if writer is not None:
             writer.progress(event)
+        if event.get("event") == "run_finished":
+            observe_cause(None, finished=event)
         if quiet:
             return
         if json_progress:
@@ -645,15 +657,15 @@ async def _run(config: RunConfig, *, json_progress: bool = False, verbose: bool 
             last_update = time.monotonic()
 
     try:
+        stop_cause_token = stop_cause_sink.set(record_cause)
         options = {}
         if directory is not None:
             from giraffe.deployment import safe_config
             from giraffe.evidence import EvidenceWriter
-            from giraffe.runner import record_sink, stop_cause_sink
+            from giraffe.runner import record_sink
 
             writer = EvidenceWriter(directory, manifest={"config": safe_config(config.model_dump(mode="json"))})
             sink_token = record_sink.set(writer.record_finished)
-            stop_cause_token = stop_cause_sink.set(writer.record_stop_cause)
             if "scale_down" in config.checks:
                 from giraffe.scale_down_control import ScaleDownFileControl
                 adapter = ScaleDownFileControl(directory)
@@ -674,9 +686,8 @@ async def _run(config: RunConfig, *, json_progress: bool = False, verbose: bool 
                     report.warnings.append("Scale-down control status file could not be saved; inspect report evidence.")
             finally:
                 if writer is not None:
-                    from giraffe.runner import record_sink, stop_cause_sink
+                    from giraffe.runner import record_sink
                     record_sink.reset(sink_token)
-                    stop_cause_sink.reset(stop_cause_token)
                     try:
                         await asyncio.to_thread(writer.close)
                     except Exception:
@@ -688,6 +699,7 @@ async def _run(config: RunConfig, *, json_progress: bool = False, verbose: bool 
                         if writer.dropped_count:
                             report.warnings.append(f"{writer.dropped_count} evidence records not written to evidence.jsonl")
         finally:
+            stop_cause_sink.reset(stop_cause_token)
             for sig, previous in installed:
                 loop.remove_signal_handler(sig)
                 signal.signal(sig, previous)
@@ -731,7 +743,7 @@ def _print_memory(resources: dict) -> None:
 
 
 @contextmanager
-def _defer_interrupts(*, already_stopped=False, restore_handlers=None):
+def _defer_interrupts(*, already_stopped=False, restore_handlers=None, finalizing=False):
     interrupted = {"requested": False, "output_started": False}
     previous = {}
     received = int(already_stopped)
@@ -739,7 +751,7 @@ def _defer_interrupts(*, already_stopped=False, restore_handlers=None):
     def stop(signum, frame):
         nonlocal received
         received += 1
-        if received > 1:
+        if received > 1 and not finalizing:
             raise KeyboardInterrupt
         if not interrupted["output_started"]:
             interrupted["requested"] = True
@@ -768,12 +780,87 @@ def _main(argv: list[str] | None = None) -> int:
     kind = arguments[0] if arguments else "usage"
     validation_input = {}
     interrupted = None
+    cancelled = None
     save_state = None
     last_saved_state = None
+    directory = report = None
+    latest_cause = None
+    live_stop_fields = stopping_fields(None)
+    interruption_finalized = False
+
+    def remember_cause(cause, *, finished=None):
+        nonlocal latest_cause, live_stop_fields
+        if finished is None:
+            latest_cause = cause
+            fields = stopping_fields(cause_of({"stop_cause": cause}))
+        else:
+            fields = {key: finished.get(key) for key in stopping_fields(None)}
+        if fields != live_stop_fields or finished is not None:
+            live_stop_fields = fields
+            if save_state is not None and last_saved_state == states.RUN_RUNNING:
+                try:
+                    save_state(states.RUN_RUNNING, **fields)
+                except OSError:
+                    pass
 
     def emit(outcome: str, exit_code: int, **details) -> None:
-        print(json.dumps({"kind": kind, "outcome": outcome, "exit_code": exit_code, **details},
-                         allow_nan=False))
+        if directory is not None and kind in {"run", "cold-start", "try-example"} and "stop_kind" not in details:
+            cause = cause_of(report) or cause_of({"stop_cause": latest_cause})
+            reason = report.abort_reason if report is not None else cause.text if cause else None
+            details = {**finished_fields(cause, reason), **details}
+
+        def write():
+            print(json.dumps({"kind": kind, "outcome": outcome, "exit_code": exit_code, **details},
+                             allow_nan=False))
+
+        if exit_code != states.EXIT_CODE_CANCELLED:
+            write()
+            return
+        with _defer_interrupts(finalizing=True):
+            for _ in range(2):
+                try:
+                    write()
+                    break
+                except (KeyboardInterrupt, asyncio.CancelledError):
+                    continue
+                except OSError:
+                    break
+            try:
+                sys.stdout.flush()
+            except (OSError, KeyboardInterrupt, asyncio.CancelledError):
+                pass
+
+    def finish_interruption(stop_heartbeat=None):
+        nonlocal interruption_finalized
+        with _defer_interrupts(finalizing=True):
+            if interruption_finalized:
+                return states.EXIT_CODE_CANCELLED
+            interruption_finalized = True
+            cause = cause_of(report) or cause_of({"stop_cause": latest_cause})
+            reason = report.abort_reason if report is not None else cause.text if cause else None
+            fields = finished_fields(cause, reason)
+            try:
+                logger.exception("CLI run stopped", extra={"giraffe_file_only": True})
+            except (OSError, KeyboardInterrupt, asyncio.CancelledError):
+                pass
+            if stop_heartbeat is not None:
+                try:
+                    stop_heartbeat()
+                except (OSError, KeyboardInterrupt, asyncio.CancelledError):
+                    pass
+            if save_state is not None and last_saved_state not in states.RUN_TERMINAL_STATES:
+                try:
+                    save_state(states.RUN_INTERRUPTED, preserve_terminal=True,
+                               finished_at=datetime.now(timezone.utc).isoformat(), **fields)
+                except (OSError, KeyboardInterrupt, asyncio.CancelledError):
+                    pass
+            try:
+                print("Stopped.", file=sys.stderr)
+            except (OSError, KeyboardInterrupt, asyncio.CancelledError):
+                pass
+            if json_output and not (interrupted and interrupted["output_started"]):
+                emit("interrupted", states.EXIT_CODE_CANCELLED, message="Stopped.", **fields)
+            return states.EXIT_CODE_CANCELLED
 
     def failure(errors: list[dict]) -> int:
         errors = [{**error, "message": error["message"].removeprefix("Value error, ").removeprefix("Assertion failed, ")}
@@ -1218,7 +1305,11 @@ def _main(argv: list[str] | None = None) -> int:
             with run_logging(directory), _heartbeat(directory / ".web.json") as stop_heartbeat:
                 try:
                     run_handlers = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
-                    report, cancelled = asyncio.run(run_with_partial_report())
+                    observer_token = _stop_cause_observer.set(remember_cause)
+                    try:
+                        report, cancelled = asyncio.run(run_with_partial_report())
+                    finally:
+                        _stop_cause_observer.reset(observer_token)
                     from giraffe.invocation import cli_invocation
                     report.manifest["invocation"] = cli_invocation(arguments)
                     if guard is not None:
@@ -1226,24 +1317,16 @@ def _main(argv: list[str] | None = None) -> int:
                     if baseline:
                         report = compare_baseline(report, baseline)
                 except (KeyboardInterrupt, asyncio.CancelledError):
-                    logger.exception("CLI run stopped", extra={"giraffe_file_only": True})
-                    stop_heartbeat()
-                    try:
-                        save_state(states.RUN_INTERRUPTED, preserve_terminal=True,
-                                   finished_at=datetime.now(timezone.utc).isoformat(),
-                                   abort_reason=states.STOP_RUN_CANCELLED)
-                    except OSError:
-                        pass
-                    print("Stopped.", file=sys.stderr)
-                    if json_output:
-                        emit("interrupted", states.EXIT_CODE_CANCELLED, message="Stopped.")
-                    return states.EXIT_CODE_CANCELLED
+                    return finish_interruption(stop_heartbeat)
                 except BaseException as error:
                     logger.exception("CLI run could not finish")
                     stop_heartbeat()
+                    cause = cause_of(report) or cause_of({"stop_cause": latest_cause})
+                    reason = report.abort_reason if report is not None else cause.text if cause else None
                     try:
                         save_state(states.RUN_ERROR, finished_at=datetime.now(timezone.utc).isoformat(),
-                                   error=f"Run could not finish ({type(error).__name__}).")
+                                   error=f"Run could not finish ({type(error).__name__}).",
+                                   **finished_fields(cause, reason))
                     except OSError:
                         pass
                     raise
@@ -1276,11 +1359,13 @@ def _main(argv: list[str] | None = None) -> int:
                         message = save_failure_summary(report, directory, error)
                         try:
                             save_state(states.RUN_ERROR, error=message, run_id=report.run_id, finished_at=report.finished_at,
-                                       progress={"completed": len(report.requests)}, resources=resources)
+                                       progress={"completed": len(report.requests)}, resources=resources,
+                                       **finished_fields(cause_of(report), report.abort_reason))
                         except OSError:
                             pass
                         if json_output:
-                            emit("error", states.EXIT_CODE_USAGE, run_id=report.run_id, message=message, request_count=len(report.requests), resources=resources)
+                            emit("error", states.EXIT_CODE_USAGE, run_id=report.run_id, message=message, request_count=len(report.requests), resources=resources,
+                                 **finished_fields(cause_of(report), report.abort_reason))
                         else:
                             print(f"giraffe: {message}", file=sys.stderr)
                             if getattr(args, "verbose", False) and not getattr(args, "quiet", False):
@@ -1303,7 +1388,7 @@ def _main(argv: list[str] | None = None) -> int:
                     if not json_output and not getattr(args, "quiet", False):
                         print(f"Automatic cleanup deleted run: {identifier}")
             try:
-                save_state(states.RUN_COMPLETED, run_id=report.run_id, finished_at=report.finished_at, abort_reason=report.abort_reason,
+                save_state(states.RUN_COMPLETED, run_id=report.run_id, finished_at=report.finished_at, **finished_fields(cause_of(report), report.abort_reason),
                            **({"auto_cleanup": cleanup_result, "auto_cleanup_policy": policy} if policy else {}),
                            **({"error": warning} if warning else {}), resources={
                     "sampled_peak_rss_bytes": dict(sampler.peaks), "sampling": resources["sampling"],
@@ -1341,7 +1426,7 @@ def _main(argv: list[str] | None = None) -> int:
             if json_output:
                 emit("interrupted" if interrupted["requested"] else report.overall, exit_code, warnings=warnings, run_id=report.run_id, request_count=len(report.requests),
                      performance=report.performance,
-                     abort_reason=report.abort_reason, resources=resources, auto_cleanup=cleanup_result,
+                     **finished_fields(cause_of(report), report.abort_reason), resources=resources, auto_cleanup=cleanup_result,
                      **({"summary": summary} if summary else {}),
                      report_paths={"json": str(json_path.resolve()), "html": str(html_path.resolve()) if html_path else None})
             else:
@@ -1349,17 +1434,7 @@ def _main(argv: list[str] | None = None) -> int:
             sys.stdout.flush()
             return states.EXIT_CODE_CANCELLED if interrupted["requested"] else exit_code
     except (KeyboardInterrupt, asyncio.CancelledError):
-        if save_state is not None and last_saved_state not in states.RUN_TERMINAL_STATES:
-            try:
-                save_state(states.RUN_INTERRUPTED, preserve_terminal=True,
-                           finished_at=datetime.now(timezone.utc).isoformat(),
-                           abort_reason=states.STOP_RUN_CANCELLED)
-            except OSError:
-                pass
-        print("Stopped.", file=sys.stderr)
-        if json_output and not (interrupted and interrupted["output_started"]):
-            emit("interrupted", states.EXIT_CODE_CANCELLED, message="Stopped.")
-        return states.EXIT_CODE_CANCELLED
+        return finish_interruption()
     except ModelSelectionError as error:
         print(f"giraffe: {error}", file=sys.stderr)
         if json_output:
@@ -1386,6 +1461,8 @@ def _main(argv: list[str] | None = None) -> int:
         location = ["config", mark.line + 1, mark.column + 1] if mark else []
         return failure([{"loc": location, "message": "Invalid YAML/JSON configuration", "type": "parse_error"}])
     except (OSError, ValueError, KeyError) as error:
+        if isinstance(error, OSError) and interruption_finalized:
+            return states.EXIT_CODE_CANCELLED
         return failure([{"loc": [], "message": str(error), "type": type(error).__name__}])
 
 
@@ -1636,17 +1713,27 @@ def main(argv: list[str] | None = None) -> int:
     stdout, stderr = sys.stdout, sys.stderr
     out, err = _PipeSafeStream(stdout), _PipeSafeStream(stderr)
     sys.stdout, sys.stderr = out, err
+    result = None
     try:
         try:
-            return _main(argv)
+            result = _main(argv)
+            return result
         except SystemExit as error:
             if out.broken or err.broken:
                 return int(error.code or 0)
             raise
     finally:
         try:
-            out.flush()
-            err.flush()
+            if result == states.EXIT_CODE_CANCELLED:
+                with _defer_interrupts(finalizing=True):
+                    for stream in (out, err):
+                        try:
+                            stream.flush()
+                        except (OSError, KeyboardInterrupt, asyncio.CancelledError):
+                            pass
+            else:
+                out.flush()
+                err.flush()
         finally:
             sys.stdout, sys.stderr = stdout, stderr
 
