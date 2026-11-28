@@ -1,6 +1,7 @@
 """Single source of truth for lifecycle vocabularies whose values are a public contract; see docs/states.md."""
 
 import logging
+from collections.abc import Collection
 from typing import Final
 
 logger = logging.getLogger(__name__)
@@ -52,6 +53,27 @@ RUN_TRANSITIONS: Final = {
     RUN_INTERRUPTED: frozenset({RUN_COMPLETED, RUN_ERROR}),
     RUN_ERROR: frozenset({RUN_INTERRUPTED}),  # Manual evidence recovery of a given-up run only.
 }
+
+# Server activity: admission blockers, also exposed as X-Giraffe-Error-Code.
+SERVER_RUN_ACTIVE: Final = "run_active"
+SERVER_RUN_STARTING: Final = "run_starting"
+SERVER_RUN_STOPPING: Final = "run_stopping"
+SERVER_CONNECTION_TEST: Final = "connection_test_running"
+SERVER_ACTIVITIES: Final = (SERVER_RUN_ACTIVE, SERVER_RUN_STARTING, SERVER_RUN_STOPPING,
+                            SERVER_CONNECTION_TEST)
+ADMISSION_BLOCKERS: Final = {
+    "start_run": (SERVER_RUN_ACTIVE, SERVER_RUN_STOPPING, SERVER_CONNECTION_TEST),
+    "test_connection": (SERVER_RUN_ACTIVE, SERVER_RUN_STARTING, SERVER_CONNECTION_TEST),
+    "tokenizer_preview": (SERVER_RUN_ACTIVE,),
+    "compare": (SERVER_RUN_ACTIVE,),
+    "recovery": (SERVER_RUN_ACTIVE, SERVER_RUN_STARTING, SERVER_RUN_STOPPING),
+}
+
+
+def admission_conflict(operation: str, activities: Collection[str]) -> str | None:
+    """Return the first listed blocker; unknown operations raise KeyError."""
+    return next((code for code in ADMISSION_BLOCKERS[operation] if code in activities), None)
+
 
 # Run stop reasons: RunState.reason and report.json abort_reason (fixed text only).
 STOP_CANCELLED_BY_USER: Final = "cancelled by user"
@@ -293,6 +315,8 @@ def describe() -> dict:
                        "usage_error": EXIT_CODE_USAGE, "default": EXIT_CODE_DEFAULT},
         "request_statuses": list(REQUEST_STATUSES), "run_states": list(RUN_STATES),
         "judged_checks": sorted(JUDGED_CHECKS),
+        "server_activities": list(SERVER_ACTIVITIES),
+        "admission": {operation: list(blockers) for operation, blockers in ADMISSION_BLOCKERS.items()},
         "run_in_progress_states": sorted(RUN_IN_PROGRESS_STATES),
         "run_terminal_states": sorted(RUN_TERMINAL_STATES),
         "run_transitions": {state: sorted(successors) for state, successors in RUN_TRANSITIONS.items()},

@@ -981,6 +981,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
     start_lock = asyncio.Lock()
     recovery_pause = threading.Event()
     download_lock = asyncio.Lock()
+    starting = False
     connection_pending = False
     unsaved_metadata: dict[str, dict] = {}
     metadata_lock = storage_metadata_lock
@@ -1100,6 +1101,36 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
             except OSError:
                 return {}
     context_window_cache: dict[tuple[str, str, str], tuple[dict, float]] = {}
+
+    admission_details = {
+        ("start_run", states.SERVER_RUN_ACTIVE): "A run is already active; stop it or wait for its report",
+        ("start_run", states.SERVER_RUN_STOPPING): "Previous run still stopping; wait for it to finish",
+        ("start_run", states.SERVER_CONNECTION_TEST): (
+            "A connection test is running. Wait for its result before starting a run."),
+        ("test_connection", states.SERVER_RUN_ACTIVE): (
+            "A run is active. Wait for it to finish or stop it before testing another connection."),
+        ("test_connection", states.SERVER_RUN_STARTING): (
+            "A run is active. Wait for it to finish or stop it before testing another connection."),
+        ("test_connection", states.SERVER_CONNECTION_TEST): (
+            "A connection test is already running. Wait for its result."),
+        ("tokenizer_preview", states.SERVER_RUN_ACTIVE): (
+            "A run is active. Wait for it to finish or stop it before preparing another tokenizer."),
+        ("compare", states.SERVER_RUN_ACTIVE): "Wait for the active run to finish before comparing saved reports",
+    }
+
+    def server_activities() -> frozenset[str]:
+        return frozenset(code for code, present in (
+            (states.SERVER_RUN_ACTIVE, bool(active)),
+            (states.SERVER_RUN_STARTING, starting),
+            (states.SERVER_RUN_STOPPING, run_loop.busy()),
+            (states.SERVER_CONNECTION_TEST, connection_pending),
+        ) if present)
+
+    def admit(operation: str) -> None:
+        code = states.admission_conflict(operation, server_activities())
+        if code is not None:
+            raise HTTPException(409, admission_details[operation, code],
+                                headers={"X-Giraffe-Error-Code": code})
 
     def live_snapshot() -> dict:
         if not active:
@@ -1249,7 +1280,8 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                 pass  # Resource-only failures never cache a possibly stale lifecycle state.
 
     def recover_interrupted(active_id=None) -> bool:
-        if active_id is not None or run_loop.busy() or disk_active_id() is not None:
+        if (active_id is not None or states.admission_conflict("recovery", server_activities()) is not None
+                or disk_active_id() is not None):
             return True
         pending = False
         try:
@@ -1319,7 +1351,8 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
     async def retry_recovery(pending):
         while pending:
             await asyncio.sleep(_RECOVERY_SECONDS)
-            if not active and not run_loop.busy() and not start_lock.locked():
+            # Cleanup also holds start_lock and must not overlap recovery.
+            if states.admission_conflict("recovery", server_activities()) is None and not start_lock.locked():
                 recovery_pause.clear()
                 pending = await run_in_threadpool(recover_interrupted)
 
@@ -2093,9 +2126,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
         from giraffe.local_tokenizer import TokenizerUnavailable, preview_tokenizer
 
         async with start_lock:
-            if active:
-                raise HTTPException(409, "A run is active. Wait for it to finish or stop it "
-                                    "before preparing another tokenizer.")
+            admit("tokenizer_preview")
         try:
             return await preview_tokenizer(body.model, body.token_id)
         except TokenizerUnavailable as error:
@@ -2104,11 +2135,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
     @app.post("/api/targets/test-connection")
     async def target_connection(body: ConnectionTest):
         nonlocal connection_pending
-        if active or start_lock.locked():
-            raise HTTPException(409, "A run is active. Wait for it to finish or stop it "
-                                "before testing another connection.")
-        if connection_pending:
-            raise HTTPException(409, "A connection test is already running. Wait for its result.")
+        admit("test_connection")
         # No await between checking and reserving: probes and runs share the event loop.
         connection_pending = True
         try:
@@ -2267,69 +2294,64 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
 
     @app.post("/api/runs", status_code=202)
     async def start_run(body: StartRun):
-        nonlocal active
+        nonlocal active, starting
         async with start_lock:
             # Recovery cooperatively stops at the next journal line; admission
             # never waits for parsing. The idle retry clears this pause.
             recovery_pause.set()
-            if active:
-                raise HTTPException(409, "A run is already active; stop it or wait for its report",
-                                    headers={"X-Giraffe-Error-Code": "run_active"})
-            if run_loop.busy():
-                raise HTTPException(409, "Previous run still stopping; wait for it to finish",
-                                    headers={"X-Giraffe-Error-Code": "run_stopping"})
-            if connection_pending:
-                raise HTTPException(409, "A connection test is running. Wait for its result "
-                                    "before starting a run.",
-                                    headers={"X-Giraffe-Error-Code": "connection_test_running"})
-            config, baseline = await run_in_threadpool(prepare_run, body)
-            if "load" in config.checks:
-                windows = await probe_context_windows(config)
-                config._preflight_context_windows = {**cached_context_windows(config), **windows}
-            _validated_plan(config)
-            guard = open_file_guard(config, raise_limit=True, web=True)
-            if guard["errors"]:
-                raise HTTPException(422, detail=guard["errors"])
+            admit("start_run")
+            starting = True
             try:
-                await run_in_threadpool(check_start, root, limits)
-            except ValueError as error:
-                raise HTTPException(507, str(error)) from None
-            from giraffe.local_tokenizer import TokenizerUnavailable, ensure_tokenizers
-            try:
-                await ensure_tokenizers(config)
-            except TokenizerUnavailable as error:
-                raise HTTPException(422, detail=[{
-                    "loc": ["targets", error.target_index, "tokenizer"],
-                    "msg": str(error), "type": "tokenizer_unavailable",
-                }]) from None
-            identifier = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8]
-            directory = _directory(root, identifier)
-            await run_in_threadpool(directory.mkdir, parents=True)
-            meta = {"id": identifier, "state": states.RUN_RUNNING, "started_at": _now(), "heartbeat_at": _now(), "owner_pid": os.getpid(), "owner_host": socket.gethostname(),
-                    "config": safe_config(config.model_dump(mode="json")), "baseline_id": body.baseline_id,
-                    **stopping_fields(None)}
-            await run_in_threadpool(save_metadata, directory, meta)
-            waiting = planned_conditions(config)[:MAX_LIVE_CONDITIONS]
-            condition_index = ConditionRequestIndex()
-            for summary in waiting:
-                condition_index.summary(summary)
-            active = dict(id=identifier, state=states.RUN_RUNNING, directory=directory, meta=meta,
-                          open_files=guard, stop=stopping_fields(None),
-                          progress={}, events=[], requests=OrderedDict(), live_preparations=OrderedDict(),
-                          live_timeout_warnings=OrderedDict(),
-                          conditions={(row["target"], row["condition_id"]): row for row in waiting},
-                          condition_requests=condition_index,
-                          condition_plans={(row["target"], row["condition_id"]): row for row in waiting}, phases=[],
-                          live_request_summary={"evicted": 0, "through_slot": None, "statuses": {}},
-                          live_request_count=0, evicted_running=set(), checks={}, seq=0, deltas=[], changed=asyncio.Event())
-            active["worker"] = _RunThread(None, owner=run_loop)
-            active["future"] = active["worker"].future
-            feeds[identifier] = active
-            while len(feeds) > 4:
-                feeds.popitem(last=False)
-            active["task"] = asyncio.create_task(execute(active, config, baseline))
-            return {"id": identifier, "state": states.RUN_RUNNING, "terminal": False, "migration_notes": config._migration_notes, "migration_warnings": config._migration_warnings,
-                    "live_conditions": waiting}
+                config, baseline = await run_in_threadpool(prepare_run, body)
+                if "load" in config.checks:
+                    windows = await probe_context_windows(config)
+                    config._preflight_context_windows = {**cached_context_windows(config), **windows}
+                _validated_plan(config)
+                guard = open_file_guard(config, raise_limit=True, web=True)
+                if guard["errors"]:
+                    raise HTTPException(422, detail=guard["errors"])
+                try:
+                    await run_in_threadpool(check_start, root, limits)
+                except ValueError as error:
+                    raise HTTPException(507, str(error)) from None
+                from giraffe.local_tokenizer import TokenizerUnavailable, ensure_tokenizers
+                try:
+                    await ensure_tokenizers(config)
+                except TokenizerUnavailable as error:
+                    raise HTTPException(422, detail=[{
+                        "loc": ["targets", error.target_index, "tokenizer"],
+                        "msg": str(error), "type": "tokenizer_unavailable",
+                    }]) from None
+                identifier = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8]
+                directory = _directory(root, identifier)
+                await run_in_threadpool(directory.mkdir, parents=True)
+                meta = {"id": identifier, "state": states.RUN_RUNNING, "started_at": _now(), "heartbeat_at": _now(), "owner_pid": os.getpid(), "owner_host": socket.gethostname(),
+                        "config": safe_config(config.model_dump(mode="json")), "baseline_id": body.baseline_id,
+                        **stopping_fields(None)}
+                await run_in_threadpool(save_metadata, directory, meta)
+                waiting = planned_conditions(config)[:MAX_LIVE_CONDITIONS]
+                condition_index = ConditionRequestIndex()
+                for summary in waiting:
+                    condition_index.summary(summary)
+                active = dict(id=identifier, state=states.RUN_RUNNING, directory=directory, meta=meta,
+                              open_files=guard, stop=stopping_fields(None),
+                              progress={}, events=[], requests=OrderedDict(), live_preparations=OrderedDict(),
+                              live_timeout_warnings=OrderedDict(),
+                              conditions={(row["target"], row["condition_id"]): row for row in waiting},
+                              condition_requests=condition_index,
+                              condition_plans={(row["target"], row["condition_id"]): row for row in waiting}, phases=[],
+                              live_request_summary={"evicted": 0, "through_slot": None, "statuses": {}},
+                              live_request_count=0, evicted_running=set(), checks={}, seq=0, deltas=[], changed=asyncio.Event())
+                active["worker"] = _RunThread(None, owner=run_loop)
+                active["future"] = active["worker"].future
+                feeds[identifier] = active
+                while len(feeds) > 4:
+                    feeds.popitem(last=False)
+                active["task"] = asyncio.create_task(execute(active, config, baseline))
+                return {"id": identifier, "state": states.RUN_RUNNING, "terminal": False, "migration_notes": config._migration_notes, "migration_warnings": config._migration_warnings,
+                        "live_conditions": waiting}
+            finally:
+                starting = False
 
     @app.get("/api/runs/{identifier}")
     async def get_run(identifier: str):
@@ -2470,8 +2492,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
         # Serialize with cleanup/start and report downloads. Comparison uses only
         # saved evidence; it must never start a suite or replace a reference.
         async with start_lock, download_lock:
-            if active:
-                raise HTTPException(409, "Wait for the active run to finish before comparing saved reports")
+            admit("compare")
             detail = run_detail(identifier)
             if detail["state"] != states.RUN_COMPLETED or detail["report"] is None:
                 raise HTTPException(409, "Wait for a completed report before comparing")

@@ -154,6 +154,8 @@ def test_describe():
                        "usage_error": states.EXIT_CODE_USAGE, "default": states.EXIT_CODE_DEFAULT},
         "request_statuses": list(states.REQUEST_STATUSES), "run_states": list(states.RUN_STATES),
         "judged_checks": sorted(states.JUDGED_CHECKS),
+        "server_activities": list(states.SERVER_ACTIVITIES),
+        "admission": {operation: list(blockers) for operation, blockers in states.ADMISSION_BLOCKERS.items()},
         "run_in_progress_states": sorted(states.RUN_IN_PROGRESS_STATES),
         "run_terminal_states": sorted(states.RUN_TERMINAL_STATES),
         "run_transitions": {state: sorted(successors) for state, successors in states.RUN_TRANSITIONS.items()},
@@ -212,6 +214,16 @@ def test_documented_vocabulary():
             (vocabulary,) if name.startswith("STOP_") and isinstance(vocabulary, str) else ())
         for value in values:
             assert f"`{value}`" in documentation, (name, value)
+
+
+def test_documented_admission():
+    section = (ROOT / "docs" / "states.md").read_text().split("## Server admission\n", 1)[1].split("\n## ", 1)[0]
+    for operation, blockers in states.ADMISSION_BLOCKERS.items():
+        assert f"| `{operation}` | " + ", ".join(f"`{code}`" for code in blockers) + " |" in section
+    for code in states.SERVER_ACTIVITIES:
+        assert f"`{code}`" in section
+    assert "first listed blocker wins" in section
+    assert "X-Giraffe-Error-Code" in section
 
 
 def test_stop_reasons_not_scattered():
