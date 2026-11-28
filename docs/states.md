@@ -440,6 +440,7 @@ Polling checks user stop, duration, all endpoints unresponsive, then error thres
 
 After inference finishes, a user stop latches only when no cause exists: it never replaces a request budget. User-stop polling, forced cancellation, and the judging stop path follow the same phase rule. The duration checks continue to use the inference deadline during judging.
 For example, with `max_requests=1`, cancelling during judging leaves `observations.stop_cause.kind` as `request_budget` and sets `observations.judging.stop_reason` to `cancelled`. With no earlier cause, a judging-only user stop latches `user`.
+`observations.judging.stop_reason` is null when judging finishes normally, `cancelled` when stopped, or `phase_deadline` when its independent time limit expires; read it alongside `observations.stop_cause` to tell the workload stop from the judging stop.
 
 `report.json` `observations.stop_cause` is the raw latched cause as `{"kind", "text", "scope"}`, or null when no cause was latched. It records the cause across inference and judging. A user cause can have `scope: "gateway"`; other causes have null scope.
 `abort_reason` is the verdict-relevant stop text: it may be null for a budget-only or optional memory stop. On `run_stopping`, it is raw cause text; on `run_finished`, it is verdict text. A recovered report's `abort_reason` is free text describing the interruption and recorded request count, not a fixed stop reason; read its `observations.stop_cause.kind` for the cause.
@@ -686,6 +687,99 @@ An explicit verdict takes precedence over stop-reason classification.
 Where you see it: condition rows and condition API/event `reason`.
 
 Aggregation compares these fixed values exactly. For reason text emitted by source-hashed workloads, it also retains the case-insensitive markers `run stopped`, `time limit`, `request budget`, `cancelled`, and `aborted`. A stopped condition aggregates to `stopped` if any request started, or `skipped` otherwise, unless an explicit verdict or request failure takes precedence.
+
+## Tokenizer source and calibration
+
+`target._tokenizer_setup.source` and load-test calibration records’ `tokenizer_source`
+use `TOKENIZER_SOURCES`:
+
+| Value | Meaning |
+| --- | --- |
+| `target_model` | The served model name loaded locally. |
+| `remembered_mapping` | A previously successful endpoint/model mapping. |
+| `server_model_root` | Tokenizer identity from server model metadata. |
+| `hub_resolution` | An exact or repository-suffix Hub name resolution. |
+| `builtin_fallback` | Automatic resolution or loading fell back to the built-in tokenizer. |
+| `configured` | An explicitly configured tokenizer. |
+| `builtin` | The explicitly selected built-in tokenizer, or the calibration reader’s built-in default. |
+
+The configuration sentinel is `auto`; its string stays unchanged. The former
+local source initializer `automatic` was always overwritten by resolution or
+fallback before saving setup and has been removed. It is not a saved source.
+Source writes and calibration reads warn on undeclared values in production and
+raise under `STRICT_TRANSITIONS`.
+
+Calibration `status` is `calibrated` or `unavailable`. Its optional `reason_code`
+is null or one of:
+
+| Value | Meaning |
+| --- | --- |
+| `tokenizer_unavailable` | Tokenizer preparation could not complete. |
+| `minimum_prompt_length` | The minimum prompt already exceeds the requested token target. |
+| `input_sizing_unavailable` | Bounded sizing attempts could not reach the requested target. |
+| `context_window_exceeded` | The context-specific final check found that prompt plus reserved output exceeds the window. |
+
+The local record builder and context-specific update guard status and reason
+values. `reason` remains explanatory free text. Describe keys:
+`tokenizer_sources`, `tokenizer_calibration_statuses`,
+`tokenizer_calibration_reasons`.
+
+## Model residency
+
+`observations.targets.*.deployment.model_residency` contains observations for the
+ordered `RESIDENCY_PHASES`: `before_preparation`, then `after_preparation`.
+Each phase has an independent `RESIDENCY_STATES` value:
+
+| Value | Meaning |
+| --- | --- |
+| `unknown` | Runtime inventory was unsupported, disabled, failed, invalid, or not yet collected. |
+| `resident` | The requested model appeared in the runtime inventory. |
+| `not_resident` | A valid runtime inventory did not list the requested model. |
+
+Both phases and their state, source, collection time and scope appear in the
+HTML report. Reproduction exports retain the same phase-keyed observations.
+Residency does not establish a cold start or explain latency. State writers warn
+on undeclared values in production and raise under `STRICT_TRANSITIONS`; HTML
+renders undeclared saved states as escaped raw text. Describe keys:
+`residency_states`, `residency_phases`.
+
+## Plan confidence
+
+`PLAN_CONFIDENCE` is ordered `low`, `medium`, `high`. The plan’s `confidence` is
+`low` when it has unknown duration components, uncertain observations, or no
+components. Otherwise it is `high` when fixed duration divided by the duration
+midpoint is at least 0.8 and drain uncertainty divided by the midpoint is at most
+0.2; otherwise it is `medium`. A `medium` result is demoted to `low` when the
+combined range width (`high - low`) exceeds the midpoint (`(low + high) / 2`).
+Emission is guarded; estimate inputs, formulas and explanatory prose are
+unchanged. Describe key: `plan_confidence`.
+
+## Judging stop and vote error reasons
+
+`JUDGING_STOP_REASONS` contains the non-null values `cancelled` and
+`phase_deadline`. `observations.judging.stop_reason` is null for normal completion;
+these reasons refer to the later judging phase, independently of workload stop
+causes. Cancellation includes a stop event or cancellation of the caller;
+`phase_deadline` means the judging phase exceeded its configured duration.
+
+`JUDGE_VOTE_ERROR_REASONS` declares all `JudgeVote.error_category` values:
+
+| Value | Meaning |
+| --- | --- |
+| `cancelled` | A judge request or judging phase was cancelled. |
+| `phase_deadline` | Judging exceeded its phase deadline. |
+| `not_evaluated` | An unfinished vote has no stop cause. |
+| `timeout` | A judge request timed out. |
+| `http_error` | A judge request failed with an HTTP error response. |
+| `request_failed` | A judge request otherwise failed or produced an invalid record. |
+| `truncated_response` | The judge response ended at its token limit. |
+| `invalid_completion` | The judge response did not finish normally. |
+| `invalid_verdict` | The judge output failed the verdict JSON contract. |
+| `client_initialization` | The judge client could not initialize. |
+
+Stop-summary writes and error-vote construction are guarded: undeclared values
+warn in production and raise under `STRICT_TRANSITIONS`. Describe keys:
+`judging_stop_reasons`, `judge_vote_error_reasons`.
 
 ## Reading states from a program
 

@@ -150,6 +150,14 @@ def test_describe():
     description = states.describe()
     assert json.loads(json.dumps(description)) == description
     assert description == {
+        "tokenizer_sources": list(states.TOKENIZER_SOURCES),
+        "tokenizer_calibration_statuses": list(states.TOKENIZER_CALIBRATION_STATUSES),
+        "tokenizer_calibration_reasons": list(states.TOKENIZER_CALIBRATION_REASONS),
+        "residency_states": list(states.RESIDENCY_STATES),
+        "residency_phases": list(states.RESIDENCY_PHASES),
+        "plan_confidence": list(states.PLAN_CONFIDENCE),
+        "judging_stop_reasons": list(states.JUDGING_STOP_REASONS),
+        "judge_vote_error_reasons": list(states.JUDGE_VOTE_ERROR_REASONS),
         "gateway_policy_qualifications": sorted(states.GATEWAY_POLICY_QUALIFICATIONS),
         "gateway_access_expected": sorted(states.GATEWAY_ACCESS_EXPECTED),
         "gateway_access_observations": sorted(states.GATEWAY_ACCESS_OBSERVATIONS),

@@ -4547,9 +4547,11 @@ def _render(report: RunReport) -> str:
         if residency:
             parts.append(f'<h3>{_e(name)}: model residency</h3>'
                          '<p>Observed around this run’s preparation. Residency does not prove a cold start or explain latency.</p>')
-            for phase, label in (("before_preparation", "Before preparation"), ("after_preparation", "After preparation")):
+            for phase in states.RESIDENCY_PHASES:
+                label = {states.RESIDENCY_BEFORE_PREPARATION: "Before preparation",
+                         states.RESIDENCY_AFTER_PREPARATION: "After preparation"}[phase]
                 row = residency.get(phase, {})
-                parts.append(f'<p><strong>{label}:</strong> {_e(row.get("state", "unknown"))} · '
+                parts.append(f'<p><strong>{label}:</strong> {_e(row.get("state", states.RESIDENCY_UNKNOWN))} · '
                              f'{_e(row.get("source") or "No runtime source")} · {_e(row.get("collected_at") or "Not observed")} · '
                              f'{_e(row.get("scope", "unknown"))}</p>')
         parts.append(f'<h3>{_e(name)}</h3>')

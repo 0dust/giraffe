@@ -9,6 +9,97 @@ logger = logging.getLogger(__name__)
 STRICT_TRANSITIONS = False
 
 
+# Tokenizer provenance, preparation observations, plan estimates, and judging evidence.
+TOKENIZER_SOURCE_TARGET_MODEL: Final = "target_model"
+TOKENIZER_SOURCE_REMEMBERED_MAPPING: Final = "remembered_mapping"
+TOKENIZER_SOURCE_SERVER_MODEL_ROOT: Final = "server_model_root"
+TOKENIZER_SOURCE_HUB_RESOLUTION: Final = "hub_resolution"
+TOKENIZER_SOURCE_BUILTIN_FALLBACK: Final = "builtin_fallback"
+TOKENIZER_SOURCE_CONFIGURED: Final = "configured"
+TOKENIZER_SOURCE_BUILTIN: Final = "builtin"
+TOKENIZER_SOURCES: Final = (
+    TOKENIZER_SOURCE_TARGET_MODEL,
+    TOKENIZER_SOURCE_REMEMBERED_MAPPING,
+    TOKENIZER_SOURCE_SERVER_MODEL_ROOT,
+    TOKENIZER_SOURCE_HUB_RESOLUTION,
+    TOKENIZER_SOURCE_BUILTIN_FALLBACK,
+    TOKENIZER_SOURCE_CONFIGURED,
+    TOKENIZER_SOURCE_BUILTIN,
+)
+
+TOKENIZER_CALIBRATION_CALIBRATED: Final = "calibrated"
+TOKENIZER_CALIBRATION_UNAVAILABLE: Final = "unavailable"
+TOKENIZER_CALIBRATION_STATUSES: Final = (
+    TOKENIZER_CALIBRATION_CALIBRATED,
+    TOKENIZER_CALIBRATION_UNAVAILABLE,
+)
+
+TOKENIZER_CALIBRATION_REASON_TOKENIZER_UNAVAILABLE: Final = "tokenizer_unavailable"
+TOKENIZER_CALIBRATION_REASON_MINIMUM_PROMPT_LENGTH: Final = "minimum_prompt_length"
+TOKENIZER_CALIBRATION_REASON_INPUT_SIZING_UNAVAILABLE: Final = "input_sizing_unavailable"
+TOKENIZER_CALIBRATION_REASON_CONTEXT_WINDOW_EXCEEDED: Final = "context_window_exceeded"
+TOKENIZER_CALIBRATION_REASONS: Final = (
+    TOKENIZER_CALIBRATION_REASON_TOKENIZER_UNAVAILABLE,
+    TOKENIZER_CALIBRATION_REASON_MINIMUM_PROMPT_LENGTH,
+    TOKENIZER_CALIBRATION_REASON_INPUT_SIZING_UNAVAILABLE,
+    TOKENIZER_CALIBRATION_REASON_CONTEXT_WINDOW_EXCEEDED,
+)
+
+RESIDENCY_UNKNOWN: Final = "unknown"
+RESIDENCY_RESIDENT: Final = "resident"
+RESIDENCY_NOT_RESIDENT: Final = "not_resident"
+RESIDENCY_STATES: Final = (
+    RESIDENCY_UNKNOWN,
+    RESIDENCY_RESIDENT,
+    RESIDENCY_NOT_RESIDENT,
+)
+
+RESIDENCY_BEFORE_PREPARATION: Final = "before_preparation"
+RESIDENCY_AFTER_PREPARATION: Final = "after_preparation"
+RESIDENCY_PHASES: Final = (
+    RESIDENCY_BEFORE_PREPARATION,
+    RESIDENCY_AFTER_PREPARATION,
+)
+
+PLAN_CONFIDENCE_LOW: Final = "low"
+PLAN_CONFIDENCE_MEDIUM: Final = "medium"
+PLAN_CONFIDENCE_HIGH: Final = "high"
+PLAN_CONFIDENCE: Final = (
+    PLAN_CONFIDENCE_LOW,
+    PLAN_CONFIDENCE_MEDIUM,
+    PLAN_CONFIDENCE_HIGH,
+)
+
+JUDGING_STOP_CANCELLED: Final = "cancelled"
+JUDGING_STOP_PHASE_DEADLINE: Final = "phase_deadline"
+JUDGING_STOP_REASONS: Final = (
+    JUDGING_STOP_CANCELLED,
+    JUDGING_STOP_PHASE_DEADLINE,
+)
+
+JUDGE_VOTE_ERROR_CANCELLED: Final = "cancelled"
+JUDGE_VOTE_ERROR_PHASE_DEADLINE: Final = "phase_deadline"
+JUDGE_VOTE_ERROR_NOT_EVALUATED: Final = "not_evaluated"
+JUDGE_VOTE_ERROR_TIMEOUT: Final = "timeout"
+JUDGE_VOTE_ERROR_HTTP_ERROR: Final = "http_error"
+JUDGE_VOTE_ERROR_REQUEST_FAILED: Final = "request_failed"
+JUDGE_VOTE_ERROR_TRUNCATED_RESPONSE: Final = "truncated_response"
+JUDGE_VOTE_ERROR_INVALID_COMPLETION: Final = "invalid_completion"
+JUDGE_VOTE_ERROR_INVALID_VERDICT: Final = "invalid_verdict"
+JUDGE_VOTE_ERROR_CLIENT_INITIALIZATION: Final = "client_initialization"
+JUDGE_VOTE_ERROR_REASONS: Final = (
+    JUDGE_VOTE_ERROR_CANCELLED,
+    JUDGE_VOTE_ERROR_PHASE_DEADLINE,
+    JUDGE_VOTE_ERROR_NOT_EVALUATED,
+    JUDGE_VOTE_ERROR_TIMEOUT,
+    JUDGE_VOTE_ERROR_HTTP_ERROR,
+    JUDGE_VOTE_ERROR_REQUEST_FAILED,
+    JUDGE_VOTE_ERROR_TRUNCATED_RESPONSE,
+    JUDGE_VOTE_ERROR_INVALID_COMPLETION,
+    JUDGE_VOTE_ERROR_INVALID_VERDICT,
+    JUDGE_VOTE_ERROR_CLIENT_INITIALIZATION,
+)
+
 METRIC_MEASURED: Final = "measured"
 METRIC_ESTIMATED: Final = "estimated"
 METRIC_NOT_MEASURED: Final = "not_measured"
@@ -518,6 +609,70 @@ CONDITION_STOP_REASONS: Final = (CONDITION_STOP_RUN, CONDITION_STOP_TIME_LIMIT,
 CONDITION_STOP_REASON_MARKERS: Final = ("run stopped", "time limit", "request budget", "cancelled", "aborted")
 
 
+def check_tokenizer_source(source: str) -> None:
+    """Warn about an undeclared tokenizer source, or raise in strict mode."""
+    if source in TOKENIZER_SOURCES:
+        return
+    message = f"Undeclared tokenizer source: {source!r}"
+    if STRICT_TRANSITIONS:
+        raise AssertionError(message)
+    logger.warning(message)
+
+
+def check_residency_state(state: str) -> None:
+    """Warn about an undeclared residency state, or raise in strict mode."""
+    if state in RESIDENCY_STATES:
+        return
+    message = f"Undeclared residency state: {state!r}"
+    if STRICT_TRANSITIONS:
+        raise AssertionError(message)
+    logger.warning(message)
+
+
+def check_plan_confidence(confidence: str) -> None:
+    """Warn about an undeclared plan confidence, or raise in strict mode."""
+    if confidence in PLAN_CONFIDENCE:
+        return
+    message = f"Undeclared plan confidence: {confidence!r}"
+    if STRICT_TRANSITIONS:
+        raise AssertionError(message)
+    logger.warning(message)
+
+
+def check_judging_stop_reason(reason: str | None) -> None:
+    """Warn about an undeclared judging stop reason, or raise in strict mode."""
+    if reason is None or reason in JUDGING_STOP_REASONS:
+        return
+    message = f"Undeclared judging stop reason: {reason!r}"
+    if STRICT_TRANSITIONS:
+        raise AssertionError(message)
+    logger.warning(message)
+
+
+class JudgeVoteError(AssertionError):
+    """A strict vote-vocabulary failure, distinct from endpoint/request exceptions."""
+
+
+def check_judge_vote_error_reason(reason: str) -> None:
+    """Warn about an undeclared judge vote error reason, or raise in strict mode."""
+    if reason in JUDGE_VOTE_ERROR_REASONS:
+        return
+    message = f"Undeclared judge vote error reason: {reason!r}"
+    if STRICT_TRANSITIONS:
+        raise JudgeVoteError(message)
+    logger.warning(message)
+
+
+def check_tokenizer_calibration(status: str, reason: str | None) -> None:
+    """Check the saved calibration vocabulary, including success without a reason."""
+    if status in TOKENIZER_CALIBRATION_STATUSES and (reason is None or reason in TOKENIZER_CALIBRATION_REASONS):
+        return
+    message = f"Undeclared tokenizer calibration: {status!r} / {reason!r}"
+    if STRICT_TRANSITIONS:
+        raise AssertionError(message)
+    logger.warning(message)
+
+
 def check_gateway_policy_outcome(qualification: str, status: str) -> None:
     """Flag an undeclared qualification or qualification/status pair."""
     if status in GATEWAY_POLICY_STATUSES.get(qualification, ()):
@@ -677,6 +832,15 @@ def run_recoverable(state: str | None, journal_present: bool, report_available: 
 
 def describe() -> dict:
     return {
+        "tokenizer_sources": list(TOKENIZER_SOURCES),
+        "tokenizer_calibration_statuses": list(TOKENIZER_CALIBRATION_STATUSES),
+        "tokenizer_calibration_reasons": list(TOKENIZER_CALIBRATION_REASONS),
+        "residency_states": list(RESIDENCY_STATES),
+        "residency_phases": list(RESIDENCY_PHASES),
+        "plan_confidence": list(PLAN_CONFIDENCE),
+        "judging_stop_reasons": list(JUDGING_STOP_REASONS),
+        "judge_vote_error_reasons": list(JUDGE_VOTE_ERROR_REASONS),
+
         "gateway_policy_qualifications": sorted(GATEWAY_POLICY_QUALIFICATIONS),
         "gateway_access_expected": sorted(GATEWAY_ACCESS_EXPECTED),
         "gateway_access_observations": sorted(GATEWAY_ACCESS_OBSERVATIONS),
