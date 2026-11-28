@@ -96,12 +96,12 @@ def test_cli_baseline_export_is_expanded_current_schema_with_previous_mode(tmp_p
     assert main(["baseline", "save", str(source), str(destination)]) == 0
     capsys.readouterr()
     value = json.loads(destination.read_text())
-    assert value["schema_version"] == "4"
+    assert value["schema_version"] == "5"
     assert "inputs" not in value and "report_format" not in value
     assert all("input_ref" not in row and "messages" in row["evaluation"] for row in value["requests"])
     assert destination.stat().st_mode & 0o777 == 0o644
     assert destination.stat().st_ino != (source / "report.json").stat().st_ino
-    assert json.loads((source / "report.json").read_text())["schema_version"] == "4"
+    assert json.loads((source / "report.json").read_text())["schema_version"] == "5"
 
 
 @pytest.mark.parametrize("fault", ["link_publish", "copy_write", "invalid_source", "validation_error"])
@@ -377,7 +377,7 @@ def test_managed_baseline_upgrades_unversioned_format_two_without_changing_sourc
     original = path.read_bytes()
     baseline = tmp_path / ".baselines" / "chosen" / "report.json"
     save_baseline_report(path, baseline)
-    assert json.loads(baseline.read_text())["schema_version"] == "4"
+    assert json.loads(baseline.read_text())["schema_version"] == "5"
     assert path.read_bytes() == original
     assert load_report(path).requests == load_report(baseline).requests
 

@@ -16,6 +16,7 @@ import math
 import re
 
 from . import states
+from .availability import window_check_ids
 from .stats import PERCENTILES, distribution as sample_distribution, percentile as percentile
 
 PERFORMANCE_SCHEMA = 1
@@ -38,7 +39,7 @@ def _number(value):
 
 
 def metric(value=None, *, label, unit, source, target, window, state=None, reason=None,
-           action=None, sample_count=0, eligible_count=0, **details):
+           action=None, cause=None, detail=None, sample_count=0, eligible_count=0, **details):
     """One envelope for scalar, structured and distribution-valued metrics."""
     if isinstance(value, float) and not math.isfinite(value):
         value = None
@@ -46,12 +47,7 @@ def metric(value=None, *, label, unit, source, target, window, state=None, reaso
     if value is None and state in {"measured", "estimated"}:
         state = "insufficient_evidence"
     return dict(value=value, label=label, unit=unit, source=source, state=state,
-                reason=reason or (None if value is not None else "No eligible observations in this scope."),
-                action=action or (None if value is not None else {
-                    "no_baseline": "Attach a baseline with comparable workload and measurement coverage.",
-                    "not_applicable": "Select the corresponding workload or transport to collect this measure.",
-                    "not_collected": "Enable the corresponding collector and rerun the workload.",
-                }.get(state, "Collect eligible observations for this scope.")),
+                reason=reason, action=action, cause=cause, detail=detail,
                 sample_count=sample_count, eligible_count=eligible_count,
                 counts={"sample": sample_count, "eligible": eligible_count,
                         "missing": max(0, eligible_count - sample_count)},
@@ -109,7 +105,7 @@ def completion_buckets(records, start_ms, end_ms):
             continue
         index = min(len(buckets) - 1, int((record.completed_ms-start_ms) / 1000 / width))
         buckets[index]["count"] += 1
-        buckets[index]["valid_completions"] += int(record.status == "completed" and record.valid)
+        buckets[index]["valid_completions"] += int(record.status == states.REQUEST_COMPLETED and record.valid)
     return {"unit": "requests", "width_s": width, "buckets": buckets,
             "rule": "Aim for 10–20 buckets; choose first 1/2/5/10/15/30/60/120/300/600/900/1800/3600-second width giving at most 20 (whole hours thereafter).",
             "boundary_rule": "Half-open [start,end), final endpoint inclusive; every terminal request assigned once.",
@@ -364,8 +360,8 @@ def _window_summary(report, target, window, records, series, observation):
     finished = [r for r in records if r.completed_ms is not None and start is not None and end is not None
                 and start <= r.completed_ms <= end and (window.get("end_inclusive") or window["kind"] == "full" or r.completed_ms < end)]
     population = records if window["kind"] == "full" else finished
-    good = [r for r in population if r.status == "completed" and r.valid]
-    rate_good = [r for r in finished if r.status == "completed" and r.valid]
+    good = [r for r in population if r.status == states.REQUEST_COMPLETED and r.valid]
+    rate_good = [r for r in finished if r.status == states.REQUEST_COMPLETED and r.valid]
     n = len(population)
     base = dict(target=target, window=wid, eligible_count=n)
     metrics, distributions = {}, {}
@@ -391,7 +387,7 @@ def _window_summary(report, target, window, records, series, observation):
 
     ids = {r.id for r in population}
     selected_series = [row for row in series if row["request_id"] in ids]
-    valid_series = [row for row in selected_series if row["valid"] and row["status"] == "completed"]
+    valid_series = [row for row in selected_series if row["valid"] and row["status"] == states.REQUEST_COMPLETED]
     for key, field, label in (
         ("response_latency", "response_latency_ms", "Response latency"),
         ("first_useful_output", "first_useful_output_ms", "First useful output"),
@@ -401,10 +397,6 @@ def _window_summary(report, target, window, records, series, observation):
         ("first_reasoning", "first_reasoning_ms", "First reasoning latency")):
         observed_series = selected_series if key in {"client_ttft", "first_reasoning", "first_useful_output"} else valid_series
         row = dist(key, [row["values"][field] for row in observed_series], label)
-        if key == "client_ttft" and row["sample_count"] == 0:
-            row["reason"] = metrics[key]["reason"] = (
-                "Versioned streamed generated-content receipt timing was not collected."
-            )
     modern = [r for r in good if getattr(r, "timing_schema", 0) >= 1]
     event_records = [r for r in population if getattr(r, "timing_schema", 0) >= 1]
     gaps = [gap for r in event_records for gap in (getattr(r, "read_gaps_ms", None) or [])]
@@ -430,27 +422,8 @@ def _window_summary(report, target, window, records, series, observation):
          "Client-observed pace from server token counts (cumulative usage or streamed logprobs) at first/last answer reads" + legacy_source, state="estimated")
     itl = [gap for r in modern for gap in (getattr(r, "itl_ms", None) or [])]
     evidence_states = Counter(r.workload.get("token_evidence", {}).get("logprobs", "not_recorded") for r in good)
-    if good and not any(r.stream for r in good):
-        itl_state, itl_reason = "not_applicable", "Non-streamed replies provide no individual token arrival timestamps."
-    elif evidence_states.get(states.TOKEN_EVIDENCE_SUPPORTED):
-        itl_state, itl_reason = "insufficient_evidence", "Streamed logprobs were requested automatically, but these responses lack separate single-token reads with matching answer usage."
-    elif evidence_states.get(states.TOKEN_EVIDENCE_REJECTED):
-        itl_state, itl_reason = "not_supported", "The endpoint rejected logprobs during the compatibility probe; chunk receipt gaps cannot establish individual token arrival times."
-    elif evidence_states.get(states.TOKEN_EVIDENCE_NOT_RETURNED):
-        itl_state, itl_reason = "insufficient_evidence", "The endpoint accepted the compatibility probe but did not return matching streamed logprob token boundaries."
-    elif evidence_states.get("shape_unverified"):
-        itl_state, itl_reason = "not_collected", "Plain-text probe did not establish logprobs compatibility with this tool or structured-output request shape; automatic fields were not added."
-    elif evidence_states.get("disabled_by_request"):
-        itl_state, itl_reason = "not_collected", "Explicit request options disabled logprobs; automatic collection preserves those options."
-    else:
-        itl_state, itl_reason = "not_collected", "No successful streamed token-evidence compatibility probe was recorded for these requests."
-    dist("itl", itl, "Inter-token latency (ITL)", "ms/token", "Proven single-token events in separate reads; usage reconciled",
-         state="measured" if itl else itl_state, reason=None if itl else itl_reason,
-         action=None if itl or evidence_states.get(states.TOKEN_EVIDENCE_SUPPORTED) or evidence_states.get(states.TOKEN_EVIDENCE_REJECTED) else
-                "A new run probes token-evidence compatibility automatically; exact ITL still requires unbuffered single-token events and matching usage.")
+    dist("itl", itl, "Inter-token latency (ITL)", "ms/token", "Proven single-token events in separate reads; usage reconciled")
     metrics["itl"]["capability_evidence"] = dict(evidence_states)
-    if itl or itl_state == "not_applicable" or any(evidence_states.get(state) for state in ("supported", "rejected", "shape_unverified", "disabled_by_request")):
-        metrics["itl"]["action"] = distributions["itl"]["action"] = None
     metrics["itl"]["exclusion_reasons"] = dict(Counter(getattr(r, "itl_reason", "Missing timing evidence") for r in good if getattr(r, "itl_reason", None)))
     for key, prop in (("answer_read_gap", "read_gaps_ms"), ("reasoning_read_gap", "reasoning_read_gaps_ms"), ("itl", "itl_ms")):
         eligible_records = modern if key == "itl" else event_records
@@ -459,9 +432,6 @@ def _window_summary(report, target, window, records, series, observation):
         for row in (metrics[key], distributions[key]):
             row["request_coverage"] = {"sample": covered, "eligible": eligible_count, "missing": eligible_count-covered}
             row["sample_unit"] = "gaps"
-    if not event_records:
-        for key in ("tpot_direct", "client_ttft", "answer_read_gap", "reasoning_read_gap"):
-            metrics[key].update(value=None, state="not_collected", reason="No versioned timing evidence; old records remain unavailable.", action="Rerun with timing schema 1 instrumentation.")
     stats = _stats(population)
     for key, label in (("attempted", "Requests started"), ("completed", "Valid completions"),
                        ("failed", "Failed / invalid"), ("timed_out", "Timeouts"),
@@ -475,7 +445,7 @@ def _window_summary(report, target, window, records, series, observation):
     put("correctness", sum(r.score is True for r in scored)/len(scored) if scored else None,
         "Answer correctness", "ratio", "Correct / scored; unscored answers are not correct", samples=len(scored))
     for key, label, predicate in (
-        ("partial_failed", "Partial failed responses", lambda r: r.status != "completed" and (r.first_output_ms is not None or r.first_reasoning_ms is not None)),
+        ("partial_failed", "Partial failed responses", lambda r: r.status != states.REQUEST_COMPLETED and (r.first_output_ms is not None or r.first_reasoning_ms is not None)),
         ("length_capped", "Length-capped replies", lambda r: r.finish_reason == "length"),
         ("normal_finish", "Normally stopped replies", lambda r: r.finish_reason == "stop")):
         put(key, sum(map(predicate, population)), label, "requests")
@@ -487,7 +457,7 @@ def _window_summary(report, target, window, records, series, observation):
     judgements = [r.load_point.get("response_criteria") for r in population if r.load_point and r.load_point.get("response_criteria")]
     put("latency_attainment", judgements or None, "Latency-limit attainment", "responses",
         "Existing per-response load criteria; no new acceptance decision", samples=len(judgements))
-    put("request_throughput", len([r for r in finished if r.status == "completed" and r.valid])/duration if duration else None,
+    put("request_throughput", len([r for r in finished if r.status == states.REQUEST_COMPLETED and r.valid])/duration if duration else None,
         "Request throughput", "req/s", "Valid completions with observed completion timestamps in window / window seconds", samples=len(finished),
         partial=window["kind"] == "full" and len(finished) < n)
 
@@ -578,7 +548,11 @@ def _window_summary(report, target, window, records, series, observation):
                   + tuple(key for key in metrics if key.startswith("mtplx_latest_")),
         "baseline": ("baseline_throughput", "baseline_timing", "baseline_generation", "baseline_quality", "baseline_capacity"),
     }
-    return {"metrics": metrics, "kpis": list(KPI_IDS), "distributions": distributions,
+    from .availability import WindowFacts, explain_window
+    facts = WindowFacts(report, window, population, good, rate_good, selected_series, duration, finished,
+                        cohort=records, dispatched=dispatched)
+    availability = explain_window(metrics, distributions, facts)
+    return {"availability": availability, "metrics": metrics, "kpis": list(KPI_IDS), "distributions": distributions,
             "sections": {name: [metrics[key] for key in keys] for name, keys in sections.items()},
             "request_row_indices": [row["number"] - 1 for row in selected_series],
             "window": window,
@@ -656,7 +630,7 @@ def _bind_existing(report, target, window, records, observation, put):
     valid_counts, scored_counts = Counter(), Counter()
     if stage_entries:
         for record in capacity_records:
-            if record.valid and record.status == "completed":
+            if record.valid and record.status == states.REQUEST_COMPLETED:
                 valid_counts[record.traffic_stage] += 1
                 scored_counts[record.traffic_stage] += record.score is not None
     for stage_index, stage in stage_entries:
@@ -801,6 +775,12 @@ def _server_rows(report, target, window, observation, put, metrics):
     telemetry = observation.get("serving_telemetry", {})
     target_config = next((t for t in report.manifest.get("config", {}).get("targets", []) if t.get("name") == target), {})
     derived = telemetry.get("derived") or derive_server_metrics(telemetry, host_configured=bool(target_config.get("host_metrics_url")))
+    # Older stored derivations lack classification; rebuild unavailable rows from
+    # their saved scrape evidence while retaining every measured value.
+    missing_causes = {key for key, row in derived.items() if row.get("value") is None and not row.get("cause")}
+    if missing_causes:
+        fresh = derive_server_metrics(telemetry, host_configured=bool(target_config.get("host_metrics_url")))
+        derived = {key: fresh.get(key, row) if key in missing_causes else row for key, row in derived.items()}
     if any(key not in derived for key, _, _ in SPEC_DECODE_ROWS):
         fresh = derive_server_metrics(telemetry)
         derived = {**derived, **{key: fresh[key] for key, _, _ in SPEC_DECODE_ROWS
@@ -827,11 +807,11 @@ def _server_rows(report, target, window, observation, put, metrics):
     for key, derived_key, label, unit in mapping:
         row = derived.get(derived_key, {})
         if row.get("value") is None and key not in {"host_cpu", "host_ram"} and not key.startswith("spec_decode_") and not telemetry.get("snapshots"):
-            row = {**row, "state": "not_collected", "reason": "This saved run has no runtime telemetry collection evidence.",
+            row = {**row, "state": "not_collected", "cause": "collector_unavailable", "reason": "This saved run has no runtime telemetry collection evidence.",
                    "action": "New runs discover same-origin /metrics automatically; an exporter at another route requires targets[].metrics_url."}
         put(key, row.get("value"), label, row.get("unit", unit), row.get("source", "Server telemetry"),
             samples=row.get("sample_count", 0), state=row.get("state", "not_collected"),
-            reason=row.get("reason"), action=row.get("action"), scope="server-wide",
+            reason=row.get("reason"), action=row.get("action"), cause=row.get("cause"), detail=row.get("detail"), scope="server-wide",
             collection_window="telemetry sample interval; may extend beyond selected request window",
             details={**row.get("details", {}), "selected_window_attribution": "not established"})
         metrics[key]["action"] = row.get("action")
@@ -861,6 +841,7 @@ def _server_rows(report, target, window, observation, put, metrics):
         label = row.get("label", key.replace('_', ' ').capitalize()) if mtplx else key.replace('_', ' ').capitalize()
         put(key, row.get("value"), label, row.get("unit", ""), row.get("source", "Server telemetry"),
             samples=row.get("sample_count", 0), state=row.get("state", "not_collected"), reason=row.get("reason"), action=row.get("action"),
+            cause=row.get("cause"), detail=row.get("detail"),
             scope=row.get("scope", "server-wide") if mtplx else "server-wide",
             collection_window="telemetry sample interval", details=row.get("details", {}),
             **({"eligible": row.get("eligible_count", 0)} if mtplx else {}))
@@ -994,7 +975,7 @@ def build_performance(report, *, target=None, window=None):
         for key, group in groups.items():
             check, label = _cohort_label(group, observation)
             cohorts.append(dict(id=key, label=label, check=check, request_count=len(group),
-                valid_completions=sum(row.status == "completed" and row.valid for row in group),
+                valid_completions=sum(row.status == states.REQUEST_COMPLETED and row.valid for row in group),
                 preparation=all(_preparation(row) for row in group),
                 measurement_scope=any(row.scenario != "performance_evidence_probe" for row in group),
                 performance_workload=bool(_PERFORMANCE_CHECKS.intersection(group[0].check_ids)),
@@ -1014,12 +995,14 @@ def build_performance(report, *, target=None, window=None):
             kinds = {row.get("kind") for row in sending}
             changes = (f"{count_words.get(len(sending), str(len(sending)))} changing " +
                        ("concurrency" if kinds == {"concurrency"} else "arrival-rate" if kinds == {"arrival_rate"} else "load") + " stages") if len(sending) > 1 else None
-            window = dict(id=f"full:{cohort}", kind="full", label="Full request window", cohort_id=cohort,
-                          workload_label=descriptor["label"], stage_count=len(sending),
+            window = dict(id=f"full:{cohort}", target=name, kind="full", label="Full request window", cohort_id=cohort,
+                          workload_label=descriptor["label"], cohort_check=descriptor["check"],
+                          check_ids=sorted(window_check_ids({}, group)), stage_count=len(sending),
                           stage_labels=[_stage_label(row) for row in sending], stages_description=changes,
                           schedule_indices=indices,
                           start_ms=start, end_ms=end, duration_s=(end-start)/1000 if start is not None and end is not None else None,
-                          request_count=len(group), includes_startup=True, includes_drain=True,
+                          request_count=len(group), dispatch_count=sum(r.dispatch_ms is not None for r in group),
+                          completion_count=sum(r.completed_ms is not None for r in group), includes_startup=True, includes_drain=True,
                           population="One comparable workload across its recorded load stages; preparation, shapes, sources and control/probe roles remain separate.")
             _window_labels(window, start)
             windows.append(window)
@@ -1037,8 +1020,9 @@ def build_performance(report, *, target=None, window=None):
                     continue
                 if drain and not completed and not any(row.dispatch_ms is not None and row.dispatch_ms < right and (row.completed_ms is None or row.completed_ms > left) for row in group):
                     continue
-                item = dict(id=f"stage:{index}:{cohort}", kind="stage", label=_stage_label(stage),
+                item = dict(id=f"stage:{index}:{cohort}", target=name, kind="stage", label=_stage_label(stage),
                     workload_label=descriptor["label"], cohort_id=cohort, stage_id=stage["stage_id"],
+                    cohort_check=descriptor["check"], check_ids=sorted(window_check_ids({}, group)),
                     schedule_indices=[index], start_ms=left, end_ms=right, end_inclusive=inclusive,
                     duration_s=(right-left)/1000, request_count=completed if drain else dispatched,
                     dispatch_count=dispatched, completion_count=completed, includes_startup=False,
@@ -1047,8 +1031,9 @@ def build_performance(report, *, target=None, window=None):
                 _window_labels(item, start)
                 windows.append(item)
         if not windows:
-            window = dict(id="full", kind="full", label="Full request window", cohort_id="empty", start_ms=None,
-                          end_ms=None, duration_s=None, request_count=0, includes_startup=True, includes_drain=True,
+            window = dict(id="full", target=name, kind="full", label="Full request window", cohort_id="empty", start_ms=None,
+                          end_ms=None, duration_s=None, request_count=0, dispatch_count=0, completion_count=0,
+                          check_ids=[], cohort_check=None, includes_startup=True, includes_drain=True,
                           population="No request lifetime evidence.", workload_label="No requests",
                           stage_count=0, stage_labels=[], schedule_indices=[])
             _window_labels(window, None)
@@ -1095,16 +1080,28 @@ def cli_summary(report):
         wid = target["default_window"]
         summary = target["summaries"][wid]
         rows = summary["metrics"]
-        available, unavailable = [], []
+        available, unavailable, shared = [], [], []
+        availability = summary.get("availability")
         for key in KPI_IDS:
             row = rows[key]
             if row["value"] is not None:
                 available.append(f"{row['label']}: {row['value']:.3g} {row['unit']}" + (" (estimate)" if row["state"] == "estimated" else ""))
+            elif availability and all(row.get(field) == availability.get(field)
+                                      for field in ("cause", "reason", "action")):
+                shared.append(row)
             else:
-                unavailable.append(f"{row['label']}: {row['state'].replace('_', ' ')}")
+                unavailable.append(f"    {row['label']}: {row['state'].replace('_', ' ')} - {row['reason']}"
+                                   + (f" Next: {row['action']}" if row.get("action") else ""))
+        if shared:
+            labels = ", ".join(row["label"] for row in shared)
+            states = {row["state"] for row in shared}
+            state = next(iter(states)).replace("_", " ") if len(states) == 1 else "unavailable"
+            unavailable.insert(0, f"    {labels}: {state} - {availability['reason']}"
+                               + (f" Next: {availability['action']}" if availability.get("action") else ""))
         lines.append(f"Performance · {target['target']} · {wid}")
         if available:
             lines.append("  " + " · ".join(available))
         if unavailable:
-            lines.append("  Availability: " + "; ".join(unavailable))
+            lines.append("  Not available:")
+            lines.extend(unavailable)
     return lines

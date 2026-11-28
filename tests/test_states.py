@@ -117,6 +117,7 @@ def test_describe():
         "check_statuses": list(states.CHECK_STATUSES), "problem_statuses": sorted(states.PROBLEM_STATUSES),
         "exit_codes": {**states.EXIT_CODES, "cancelled": states.EXIT_CODE_CANCELLED,
                        "usage_error": states.EXIT_CODE_USAGE, "default": states.EXIT_CODE_DEFAULT},
+        "metric_states": list(states.METRIC_STATES), "unavailable_causes": list(states.UNAVAILABLE_CAUSES),
         "request_statuses": list(states.REQUEST_STATUSES), "run_states": list(states.RUN_STATES),
         "run_in_progress_states": sorted(states.RUN_IN_PROGRESS_STATES),
         "run_terminal_states": sorted(states.RUN_TERMINAL_STATES),
@@ -231,6 +232,17 @@ def test_only_interrupted_runs_with_pending_evidence_are_recoverable(state, repo
     assert states.run_recoverable(state, False, report_available) is False
     assert states.run_recoverable(state, True, report_available) is (state == "interrupted" and not report_available)
 
+
+def test_metric_availability_vocabulary_is_shared_and_described():
+    from giraffe.availability import CAUSES
+    from giraffe.performance_html import STATES
+
+    description = states.describe()
+    assert states.UNAVAILABLE_CAUSES == CAUSES
+    assert description["unavailable_causes"] == list(CAUSES)
+    assert description["metric_states"] == list(states.METRIC_STATES)
+    assert set(STATES) == set(states.METRIC_STATES) - {"measured", "estimated"}
+    json.dumps(capabilities(), allow_nan=False)
 
 
 def test_observation_transition_tables():

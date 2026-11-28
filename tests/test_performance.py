@@ -35,7 +35,7 @@ def test_new_and_legacy_reports_expose_versioned_contract():
     hydrated = RunReport.model_validate(old)
     metrics = summary(hydrated)["metrics"]
     assert metrics["client_ttft"]["value"] is None
-    assert metrics["client_ttft"]["state"] == "not_collected"
+    assert metrics["client_ttft"]["state"] == "insufficient_evidence"
     assert metrics["tpot"]["value"] is None
     for row in metrics.values():
         assert set(("value", "unit", "source", "state", "reason", "action", "counts", "window", "target")) <= row.keys()
@@ -63,7 +63,7 @@ def test_distributions_timing_origins_dispatch_order_and_no_decimation():
 
 @pytest.mark.parametrize(("first_token_ms", "state", "sample_count", "reason"), [
     (0, "measured", 1, None),
-    (None, "not_measured", 0, "Versioned streamed generated-content receipt timing was not collected."),
+    (None, "insufficient_evidence", 0, "No timed streamed content event on 1/1 requests (legacy content-event evidence)."),
 ])
 def test_client_ttft_explains_missing_samples_only(first_token_ms, state, sample_count, reason):
     result = summary(report([record(timing_schema=1, first_token_ms=first_token_ms)]))
@@ -202,7 +202,7 @@ def test_all_sections_have_contract_rows_and_no_answer_text_leaks(tmp_path):
     assert all(row["value"] is None or row["state"] in {"measured", "estimated"} for row in summary(saved)["metrics"].values())
     lines = cli_summary(saved)
     assert "Request throughput: 1 req/s" in '\n'.join(lines)
-    assert "Availability:" in '\n'.join(lines)
+    assert "Not available:" in '\n'.join(lines)
     # The standalone report renders the same KPI as a card, with its unit in
     # separate markup, rather than the Phase A placeholder's CLI-style line.
     rendered = _render(saved)
@@ -491,15 +491,16 @@ def test_goodput_requires_scoring_and_latency_limits_without_losing_measured_zer
     data = build_performance(value)["targets"][0]
     metric = data["summaries"][data["default_window"]]["metrics"]["goodput"]
     assert metric["value"] == expected
-    assert metric["state"] == ("measured" if expected is not None else "insufficient_evidence")
+    assert metric["state"] == ("measured" if expected is not None else
+                               "not_collected" if not scored or limit in (None, "missing") else "insufficient_evidence")
     assert metric["sample_count"] == (0 if expected is None else 1)
     assert metric["eligible_count"] == 1
     assert metric["sample_unit"] == "load points"
     assert metric["request_coverage"] == {"sample": scored, "eligible": 16, "missing": 16-scored}
     assert f"{scored} / 16 scored valid requests" in metric["display_note"]
     if not scored:
-        assert "unscored" in metric["reason"].lower()
-    if limit in (None, "missing"):
+        assert "no expected answer or scorer" in metric["reason"].lower()
+    if scored and limit in (None, "missing"):
         assert "limit" in metric["reason"].lower()
     if 0 < scored < 16:
         assert metric["label"] == "Scored-subset correct goodput"
@@ -522,7 +523,8 @@ def test_historical_capacity_goodput_requires_scored_answers_and_saved_latency_l
     data = build_performance(value)['targets'][0]
     metric = data['summaries'][data['default_window']]['metrics']['goodput']
     assert metric['value'] == expected
-    assert metric['state'] == ('measured' if expected is not None else 'insufficient_evidence')
+    assert metric['state'] == ('measured' if expected is not None else
+                               'not_collected' if not scored or latency_limit is None else 'insufficient_evidence')
     assert value.checks[0].metrics['traffic_stages'][1]['goodput_rps'] == 0
 
 
@@ -570,3 +572,18 @@ def test_mixed_probe_cohort_is_in_measurement_scope():
     target = report(records).performance["targets"][0]
     assert len(target["cohorts"]) == 1
     assert target["cohorts"][0]["measurement_scope"] is True
+
+
+def test_window_summary_exposes_shared_precondition_without_dropping_row_copy():
+    failed = record('failed')
+    failed = failed.model_copy(update={'status': 'failed', 'valid': False, 'http_status': 503})
+    value = report([failed], config={'targets': [{'name': 't'}], 'checks': ['generation']})
+    window = summary(value)
+    note = window['availability']
+    assert note['cause'] == 'data_missing'
+    assert 'HTTP 503' in note['reason']
+    assert 'Fix the failing requests' in note['action']
+    for key in ('input_tokens', 'cached_tokens', 'itl'):
+        row = window['metrics'][key]
+        assert {field: row[field] for field in ('cause', 'reason', 'action')} == note
+    assert summary(report([record(stream=True, timing_schema=1)]))['availability'] is None

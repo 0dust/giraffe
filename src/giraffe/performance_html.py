@@ -24,7 +24,6 @@ a:focus-visible,summary:focus-visible{outline:2px solid var(--accent);outline-of
 
 CHART_STYLE = """.html-chart-frame{position:relative;margin:16px 0}.html-chart-frame svg{height:240px;width:100%}.html-axis-label,.html-stage-label{position:absolute;color:var(--text-2);font:11px/1.3 var(--mono);pointer-events:none}.html-axis-label.x-min{left:5.33%;bottom:8%}.html-axis-label.x-max{right:4%;bottom:8%}.html-axis-label.y-max{left:0;top:10%}.html-axis-label.y-min{left:0;bottom:20%}.html-axis-label.x-title{left:5.33%;right:4%;bottom:0;text-align:center}.html-axis-label.y-title{left:5.33%;top:0}.html-stage-label{top:8%;max-width:18%;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}.html-transition{stroke:var(--surface);stroke-width:1;vector-effect:non-scaling-stroke}@media(max-width:640px){.html-chart-frame svg{height:220px}}"""
 COLORS = ("#b5b2aa", "#9aa4ff", "#f5b544", "#3dd68c", "#63c8d2")
-COMMON_GUIDANCE = {"No eligible observations in this scope.", "Collect eligible observations for this scope."}
 
 STATES = {"not_measured": "Not measured", "not_observed": "Not observed", "not_collected": "Not collected",
           "not_applicable": "Not applicable", "insufficient_evidence": "Insufficient evidence",
@@ -142,43 +141,62 @@ def _value(row):
     return _fmt(value) + (f' <small>{_e(unit)}</small>' if unit else '')
 
 
-def _availability(row):
+def _same_availability(row, availability):
+    return bool(availability) and row.get("value") is None and all(
+        row.get(key) == availability.get(key) for key in ("cause", "reason", "action"))
+
+
+def _availability_note(rows, availability):
+    if not any(_same_availability(row, availability) for row in rows):
+        return ""
+    return '<p class="html-note">' + _e(" ".join(
+        str(availability.get(key) or "") for key in ("reason", "action")).strip()) + "</p>"
+
+
+def _availability(row, availability=None):
     if row.get("value") is not None:
         return ""
     state = STATES.get(row.get("state"), str(row.get("state", "Not measured")).replace("_", " ").capitalize())
-    return f'<strong>{_e(state)}</strong>. ' + _e(" ".join(str(row.get(k) or "") for k in ("reason", "action") if row.get(k) not in COMMON_GUIDANCE).strip())
+    if _same_availability(row, availability):
+        return f'<strong>{_e(state)}</strong>'
+    return f'<strong>{_e(state)}</strong>. ' + _e(" ".join(str(row.get(k) or "") for k in ("reason", "action")).strip())
 
 
-def _card(row):
-    info = " · ".join(str(v) for v in (row.get("source"), (row.get("action") if row.get("action") not in COMMON_GUIDANCE else None)) if v)
+def _card(row, availability=None):
+    shared = _same_availability(row, availability)
+    counts = f"n={row.get('sample_count', 0)}/{row.get('eligible_count', 0)}"
+    info = " · ".join(str(v) for v in (row.get("source"), counts if shared else row.get("detail")) if v)
     note = (f'Median · P95 {_fmt(row["p95"])} {_e(row.get("unit", ""))}'
             if row.get("distribution") and row.get("p95") is not None
             else f'{row.get("sample_count", 0)} / {row.get("eligible_count", 0)} eligible {_e(row.get("sample_unit", "samples"))}')
     note = _e(row['display_note']) if row.get('display_note') else note
     estimate = ' <span class="html-estimate">ESTIMATE</span>' if row.get("state") == "estimated" else ''
     missing = ('<strong>' + _e(STATES.get(row.get("state"), "Not measured")) + '</strong>. '
-               + _e(row.get("reason", "") if row.get("reason") not in COMMON_GUIDANCE else "")) if row.get("value") is None else ''
+               + ('' if shared else _e(row.get("reason", "")))) if row.get("value") is None else ''
     return ('<article class="html-kpi"><h3>' + _e(row.get("label", ""))
             + '<details class="html-info"><summary aria-label="Definition">i</summary><span>' + _e(info)
             + '</span></details></h3><div class="html-value">' + _value(row) + '</div>' + estimate
-            + '<p>' + (missing + (' ' + note if row.get("display_note") else '') if missing else note)
-            + (' · Partial usage coverage' if row.get("partial") else '') + '</p></article>')
+            + '<p>' + (missing.rstrip('. ') if shared else missing + (' ' + note if row.get("display_note") else '') if missing else note)
+            + ('<span class="html-next html-note"><br>' + _e(row['action']) + '</span>'
+               if row.get('value') is None and row.get('action') and not shared else '')
+            + (' · Partial usage coverage' if row.get("partial") and not shared else '') + '</p></article>')
 
 
-def _cards(rows, kind=""):
-    return f'<div class="html-cards {_e(kind)}">' + ''.join(_card(row) for row in rows) + '</div>'
+def _cards(rows, kind="", availability=None, *, show_note=True):
+    return (_availability_note(rows, availability) if show_note else "") + (
+        f'<div class="html-cards {_e(kind)}">' + ''.join(_card(row, availability) for row in rows) + '</div>')
 
 
-def _table(rows):
+def _table(rows, availability=None, *, show_note=True):
     # Adjacent identical definitions share a cell rather than repeating verbose
     # missing-collector guidance for every server metric.
-    notes = [(_availability(row) or _e(row.get("source", "")))
+    notes = [(_availability(row, availability) or _e(row.get("source", "")))
              + (' · ' + _e(row["display_note"]) if row.get("display_note") else '')
              + (' · ESTIMATE' if row.get("state") == "estimated" else '')
              + (' · Partial coverage' if row.get("partial") else '')
              + (' · Server-wide; separate telemetry collection interval' if row.get("scope") == "server-wide" else '')
              for row in rows]
-    parts = ['<div class="table"><table class="html-metrics"><tr><th>Metric<th>Value<th>Definition / availability']
+    parts = [_availability_note(rows, availability) if show_note else "", '<div class="table"><table class="html-metrics"><tr><th>Metric<th>Value<th>Definition / availability']
     remaining = 0
     for index, row in enumerate(rows):
         parts.append('<tr><th>' + _e(row.get("label", "")) + '<td>' + _value(row))
@@ -193,12 +211,12 @@ def _table(rows):
     return ''.join(parts)
 
 
-def _distributions(rows, convention):
-    parts = ['<div class="table"><table class="html-distributions"><tr><th>Metric / unit<th>n<th>Mean<th>Min<th>Median<th>P90<th>P95<th>P99<th>Max']
+def _distributions(rows, convention, availability=None, *, show_note=True):
+    parts = [_availability_note(rows, availability) if show_note else "", '<div class="table"><table class="html-distributions"><tr><th>Metric / unit<th>n<th>Mean<th>Min<th>Median<th>P90<th>P95<th>P99<th>Max']
     for row in rows:
         parts.append('<tr><th scope="row">' + _e(row['label']) + ' · ' + _e(row.get('unit', '')))
         if row.get('value') is None:
-            parts.append('<td>' + str(row.get('sample_count', 0)) + '<td colspan="7">' + _e(STATES.get(row.get('state'), 'Not measured')))
+            parts.append('<td>' + str(row.get('sample_count', 0)) + '<td colspan="7">' + _availability(row, availability))
         else:
             parts.extend('<td>' + _fmt(row['value'].get(key)) for key in ('n', 'mean', 'min', 'median', 'p90', 'p95', 'p99', 'max'))
     parts.append('</table></div><p class="html-note">' + _e(convention) + '</p>')
@@ -336,6 +354,7 @@ def render_performance(performance, *, prefix='performance'):
         summary = target['summaries'][target.get('selected_window', target['default_window'])]
         metrics, sections = summary['metrics'], summary['sections']
         window = summary['window']
+        availability = summary.get('availability')
         rows = [target['request_series'][index] for index in summary['request_row_indices']]
         pfx = prefix if len(performance['targets']) == 1 else prefix + '-' + str(len(parts))
         parts.append('<div class="html-scope"><strong>' + _e(target['target']) + '</strong> · '
@@ -343,7 +362,7 @@ def render_performance(performance, *, prefix='performance'):
             + _fmt(window['request_count']) + ' requests<p class="html-note">'
             + _e(' · '.join(filter(None, (window.get('workload_label'), window.get('stages_description')))))
             + ' ' + _e(window.get('population', '')) + ' ' + _e(target.get('scope_note', '')) + '</p>'
-            + '<p class="html-note">Absent evidence stays unavailable. Collect eligible observations for this scope. Specific exclusions and collection instructions appear below.</p></div>')
+            + '<p class="html-note">Absent evidence stays unavailable; each unavailable value states why and what to change.</p></div>')
         windows = [item for item in target.get('windows', [])
                    if item['id'] in (target.get('default_window'), target.get('selected_window'))
                    or not any(cohort['id'] == item.get('cohort_id')
@@ -360,7 +379,7 @@ def render_performance(performance, *, prefix='performance'):
                 + (f'<p>Showing 50 of {len(windows)} windows; complete catalog in report.json.</p>'
                    if len(windows) > 50 else '') + '</details>')
         timing = [r for key, r in summary['distributions'].items() if not key.endswith('_length')]
-        distributions = _distributions(timing, performance['percentile_convention'])
+        distributions = _distributions(timing, performance['percentile_convention'], availability, show_note=False)
         headlines = [dict(metrics[key]) for key in KPI_IDS]
         for row in headlines:
             if row['id'] == 'output_throughput':
@@ -368,7 +387,7 @@ def render_performance(performance, *, prefix='performance'):
             elif row['id'] == 'generation_pace':
                 row['display_note'] = 'Median · answer streaming only'
         parts.append(_section(pfx, 'overview', 'Performance overview', 'One target and measurement population.',
-            _cards(headlines) + '<details id="' + pfx + '-distributions"><summary>All timing percentiles &amp; definitions</summary>' + distributions + '</details>'))
+            _availability_note(headlines + timing, availability) + _cards(headlines, availability=availability, show_note=False) + '<details id="' + pfx + '-distributions"><summary>All timing percentiles &amp; definitions</summary>' + distributions + '</details>'))
         def points(field, divisor=1):
             return [(row['number'], row['values'].get(field)/divisor) for row in rows if _number(row['values'].get(field))]
         timing_series = [(name, points(field, 1000)) for name, field in (
@@ -381,7 +400,7 @@ def render_performance(performance, *, prefix='performance'):
         parts.append(_section(pfx, 'timing', '02 Request timing', 'Each observation is a request, ordered by dispatch.',
             _plot('Timing across requests', chart, 'No request timing observations to connect; at least two observations are needed.')
             + '<p class="html-note">Lines connect observations. Phases are not all additive; read gaps are not token ITL.</p>'
-            + _cards(support, 'html-support')
+            + _cards(support, 'html-support', availability)
             + '<details><summary>Timing distributions &amp; definitions</summary><p><a href="#' + pfx + '-distributions">All timing percentiles &amp; definitions above</a></p></details>'))
         capacity = [row for row in sections['throughput_capacity'] if not (row['id'] == 'completion_throughput' and row.get('semantically_identical_to_answer'))]
         bucket_data = summary.get('completion_buckets')
@@ -390,7 +409,7 @@ def render_performance(performance, *, prefix='performance'):
                          'No completed-request bucket observations; request lifetimes were not collected.')
         parts.append(_section(pfx, 'throughput', '03 Throughput & capacity', 'Input and normalized rates are distinct from headline output.',
             '<div class="html-throughput">' + _plot('Completed requests over time', _buckets(bucket_data), bucket_reason)
-            + _cards(capacity, 'html-capacity') + '</div>'))
+            + '<div>' + _cards(capacity, 'html-capacity', availability) + '</div></div>'))
         occupancy = summary.get('actual_concurrency', {})
         actual = [(p['elapsed_s'], p['in_flight']) for p in occupancy.get('points', [])] if occupancy.get('sample_count') else []
         intended = [(x, p['intended_concurrency']) for p in summary.get('intended_concurrency', []) for x in (p['elapsed_s'], p['end_elapsed_s'])]
@@ -400,19 +419,22 @@ def render_performance(performance, *, prefix='performance'):
             + (f'<p>{len(pause_rows)} pauses; showing first 50. Complete evidence in report.json.</p>' if len(pause_rows)>50 else '') if pause_rows
             else '<p class="html-note">' + ('No scheduling delays above the recording threshold were observed in this window.' if summary.get('client_pause_threshold_ms') is not None else 'Client scheduling-delay recording was not collected.') + '</p>')
         parts.append(_section(pfx, 'delivery', '04 Load delivery', 'Actual concurrency uses request lifetimes; intended uses recorded transitions.',
-            _cards([metrics[key] for key in ('peak_concurrency', 'average_concurrency', 'configured_ceiling')], 'html-load')
+            _availability_note([metrics[key] for key in ('peak_concurrency', 'average_concurrency', 'configured_ceiling')] + sections['delivery'], availability)
+            + _cards([metrics[key] for key in ('peak_concurrency', 'average_concurrency', 'configured_ceiling')], 'html-load', availability, show_note=False)
             + _plot('Actual and intended concurrency', concurrency, 'No request lifetime observations or recorded intended schedule.')
             + ('<p class="html-note">' + _e(summary['intended_reason']) + '</p>' if summary.get('intended_reason') else '')
-            + '<h3>When did the client pause?</h3>' + pauses + _table(sections['delivery'])))
-        parts.append(_section(pfx, 'outcomes', '05 Outcomes & quality', 'Completion does not establish answer correctness.', _table(sections['outcomes'])))
+            + '<h3>When did the client pause?</h3>' + pauses + _table(sections['delivery'], availability, show_note=False)))
+        parts.append(_section(pfx, 'outcomes', '05 Outcomes & quality', 'Completion does not establish answer correctness.', _table(sections['outcomes'], summary.get('availability'))))
         token_charts = '<div class="html-two">' + _plot('Input and answer size by request', _chart('Input and answer size by request', [('Input', points('input_tokens')), ('Answer', points('answer_tokens'))], ylabel='tokens'), 'Insufficient input/answer token observations; unknown usage remains unknown.')
         token_charts += _plot('Cached prompt tokens by request', _chart('Cached prompt tokens by request', [('Cached prompt', points('cached_prompt_tokens'))], ylabel='cached prompt tokens'), 'Insufficient cached-prompt usage observations; no cache reuse inferred.') + '</div>'
+        lengths = [r for key, r in summary['distributions'].items() if key.endswith('_length')]
         parts.append(_section(pfx, 'tokens', '06 Workload & tokens', 'Cached input is a subset, never extra tokens or a measured speedup.', token_charts
-            + '<h3>Token accounting · selected window</h3>' + _table(sections['token_accounting'])
-            + '<details><summary>Token-length distributions</summary>' + _distributions([r for key, r in summary['distributions'].items() if key.endswith('_length')], performance['percentile_convention']) + '</details>'))
+            + '<h3>Token accounting · selected window</h3>' + _availability_note(sections['token_accounting'] + lengths, availability)
+            + _table(sections['token_accounting'], availability, show_note=False)
+            + '<details><summary>Token-length distributions</summary>' + _distributions(lengths, performance['percentile_convention'], availability, show_note=False) + '</details>'))
         for name, title, key, note in (
             ('effects', '07 Conversations & workload effects', 'conversations', 'Workload-specific evidence remains separate.'),
             ('telemetry', '08 Server observations', 'server', 'Server-wide counters may include other traffic; separate collection window.')):
-            parts.append(_section(pfx, name, title, note, _table(sections[key])))
+            parts.append(_section(pfx, name, title, note, _table(sections[key], summary.get('availability'))))
     content = ''.join(parts)
     return ('<style>' + CHART_STYLE + '</style>' if '<svg' in content else '') + content

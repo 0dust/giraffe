@@ -4,10 +4,9 @@ from __future__ import annotations
 import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from urllib.parse import urlsplit, urlunsplit
 
 from . import states
-from .deployment import REDACTED
+from .deployment import redact_url
 from .models import CHECK_NAMES, CheckResult, RunReport
 
 
@@ -16,17 +15,6 @@ _XML_CONTROL = re.compile(r"[^\x09\x0a\x0d\x20-\ud7ff\ue000-\ufffd\U00010000-\U0
 
 def _text(value: object) -> str:
     return _XML_CONTROL.sub("", str(value))
-
-
-def _url(value: str) -> str:
-    # Parse the complete value: regex matching can stop inside quoted userinfo.
-    try:
-        parsed = urlsplit(value)
-        if parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment:
-            return urlunsplit((parsed.scheme, parsed.netloc.rsplit("@", 1)[-1], parsed.path, "", "")) + REDACTED
-        return value
-    except ValueError:
-        return REDACTED
 
 
 def _rows(report: RunReport) -> list[tuple[CheckResult, str, str]]:
@@ -97,7 +85,7 @@ def write_junit(report: RunReport, path: Path) -> None:
         properties = ET.SubElement(suite, "properties")
         target = targets.get(target_name, {})
         for name, value in (("model", target.get("model") or ""),
-                            ("url", _url(target.get("url") or "")), ("run_id", report.run_id)):
+                            ("url", redact_url(target.get("url") or "")), ("run_id", report.run_id)):
             ET.SubElement(properties, "property", name=name, value=_text(value))
         for check, status, reason in selected:
             case = ET.SubElement(suite, "testcase", name=_text(check.id), classname=_text(check.target))

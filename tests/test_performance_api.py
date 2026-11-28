@@ -20,7 +20,9 @@ async def test_default_payload_and_selected_window_are_bounded(tmp_path):
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(tmp_path)), base_url='http://localhost') as client:
         response = await client.get('/api/runs/saved')
         assert response.status_code == 200
-        assert len(response.content) < 1_500_000
+        # Cause/detail fields and specific guidance repeat in the existing metric
+        # sections; keep a tight bound around the expanded availability contract.
+        assert len(response.content) < 1_520_000
         data = response.json()['report']
         assert data['requests_compact'] and data['request_count'] == 1000
         assert len(data['requests']) == 1000

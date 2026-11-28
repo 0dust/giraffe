@@ -78,6 +78,18 @@ _URL = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
 REDACTED = "[redacted]"
 
 
+def redact_url(value: str) -> str:
+    """Keep a configured route, removing userinfo, query and fragment in full."""
+    # Parse the complete value: text matching can stop inside quoted userinfo.
+    try:
+        parsed = urlsplit(value)
+        if parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment:
+            return urlunsplit((parsed.scheme, parsed.netloc.rsplit("@", 1)[-1], parsed.path, "", "")) + REDACTED
+        return value
+    except ValueError:
+        return REDACTED
+
+
 def now():
     return datetime.now(timezone.utc).isoformat()
 

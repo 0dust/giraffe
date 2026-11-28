@@ -103,33 +103,34 @@ the current journal: appending or replacing evidence protects it again. Active r
 saved baseline sources and directories containing unrelated files remain protected.
 
 All newly serialized report, baseline, summary and web-state JSON is compact.
-Eligible immutable schema-4 baseline sources can be hard-linked as-is. Older
+Eligible immutable schema-5 baseline sources can be hard-linked as-is. Older
 sources are migrated and reserialized when saving a managed baseline. Fields are
 not omitted merely because they have default values. Native saved reports use
-`schema_version: "4"`, `report_format: 2` and an `inputs` table mapping SHA-256
+`schema_version: "5"`, `report_format: 2` and an `inputs` table mapping SHA-256
 references to exact message arrays. Nonempty `evaluation.messages` moves to that
 table; each request has `input_ref` instead. Empty messages stay empty. Table
 entries follow retention, so this cannot restore tool-conversation inputs stripped
 by `none` or `failures`. Readers verify each table entry's SHA-256 before
 rehydrating and reject mismatches rather than substituting altered input evidence.
 
-Schema 4 persists `conditions` and the default target/window `performance`
+Schema 5 persists `conditions` and the default target/window `performance`
 selection. The raw `request_series` is omitted from this snapshot because the
 requests already retain its measurements. Loading and downloads use the stored
 default metrics; explicit target/window selections are recomputed with the current
 measurement code. Missing derived blocks are recomputed and marked with
 `observations.derived_recomputed: true`. Schema-2 and schema-3 embedded Phase-A
-performance blocks were display caches rather than authoritative snapshots; their
-migration discards that cache and records its recomputation. Saved checks, overall
+performance blocks were display caches. Schema-4 performance summaries predate
+availability explanations. Migration discards these performance blocks and
+rebuilds them from requests with current code. Saved checks, overall
 verdicts and recorded conditions remain intact. Persisted evidence tolerates
 unknown fields, while user configuration validation remains strict.
 
-Native schema-4 reports require a reader that supports the current schema and
+Native schema-5 reports require a reader that supports the current schema and
 report-format-2 input table. Older pinned checkouts may not understand this
 representation. Inspect `schema_version`/`report_format` rather than relying on the
-package version alone. Current Giraffe migrates schema 2 and schema 3, accepting
+package version alone. Current Giraffe migrates schemas 2, 3 and 4, accepting
 historical integer schema values as well as strings. For portable exchange,
-`giraffe baseline save RUN_DIR file.json` streams expanded schema-4 JSON with input
+`giraffe baseline save RUN_DIR file.json` streams expanded schema-5 JSON with input
 messages in each request and no table/reference fields. Portable exports retain
 the stored derived snapshots and omit duplicate request series. CLI baseline
 exports retain their previous `0644` mode and have an independent inode; they

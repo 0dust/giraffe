@@ -19,7 +19,7 @@ from .caps import (
     MAX_DEPLOYMENT_HISTORY, MAX_METRICS_BODY_BYTES, MAX_METRICS_LABELS,
     MAX_METRICS_LABEL_CHARS,
 )
-from giraffe.deployment import sanitize
+from giraffe.deployment import redact_url, sanitize
 from .models import MAX_SCALE_DOWN_SNAPSHOTS
 
 logger = logging.getLogger(__name__)
@@ -637,13 +637,13 @@ async def _scrape_runtime(run, target, phase, *, force=False):
                     if response.status_code in {401, 403}:
                         result.update({
                             "status": states.TELEMETRY_AUTHENTICATION_DENIED,
-                            "reason": f"Metrics endpoint {url} denied access (HTTP {response.status_code}); inference credentials were not forwarded.",
+                            "reason": f"Metrics endpoint {redact_url(url)} denied access (HTTP {response.status_code}); inference credentials were not forwarded.",
                         })
                         return _remember_discovery(run, target, result)
                     if response.status_code == 404:
                         result.update({
                             "status": states.TELEMETRY_ENDPOINT_ABSENT,
-                            "reason": f"Metrics endpoint {url} returned HTTP 404; no runtime exporter was available at that route.",
+                            "reason": f"Metrics endpoint {redact_url(url)} returned HTTP 404; no runtime exporter was available at that route.",
                         })
                         return _remember_discovery(run, target, result)
                     response.raise_for_status()
@@ -863,11 +863,10 @@ async def scrape(run, target, phase, *, force=False):
     return result
 
 
-def _derived(value, unit, source, *, reason=None, state=None, samples=0, eligible=0, **details):
+def _derived(value, unit, source, *, reason=None, action=None, cause=None, detail=None, state=None, samples=0, eligible=0, **details):
     return {"value": value, "unit": unit, "source": source,
             "state": state or ("measured" if value is not None else "insufficient_evidence"),
-            "reason": reason or ("No fresh compatible observations or nonzero measurement population." if value is None else None),
-            "action": None if value is not None else "Collect at least two fresh compatible exporter samples during the workload.",
+            "reason": reason, "action": action, "cause": cause, "detail": detail,
             "sample_count": samples, "eligible_count": eligible, "scope": "server-wide",
             "details": details}
 
@@ -970,6 +969,7 @@ def _derive_sglang_spec_decode(snapshots):
         row = _derived(value, unit, f"{definition}; latest SGLang-reported gauge, not a run-window total",
             samples=len(series), eligible=sum(s.get("family") == family for s in latest.get("samples", [])),
             reason=None if series else "No valid SGLang gauge in the latest scrape; enabled state is unknown.",
+            cause="data_missing" if value is None else None,
             measurement="scheduler_gauge", activity="unknown", series=series,
             collected_at=latest.get("collected_at"), elapsed_seconds=latest.get("elapsed_seconds"),
             aggregation="Each scheduler label series is separate; no pooling, sums or run-window averages.",
@@ -1038,7 +1038,9 @@ def _derive_spec_decode(snapshots):
     for family, unit in zip(families, ("drafts", "tokens", "tokens")):
         metrics[family] = _derived(totals[family] if windows else None, unit,
             "Sum of matching adjacent speculative-decoding counter deltas; server-wide",
-            samples=len(windows), eligible=eligible, reason=None if windows else reason, **details)
+            samples=len(windows), eligible=eligible, reason=None if windows else reason,
+            cause="data_missing" if not windows else None,
+            action=None if windows else "Check that the exporter exposes coherent draft, proposed-token and accepted-token counters.", **details)
     for key, value, unit, formula in (
         ("spec_decode_proposal_length", proposed / drafts if drafts else None, "tokens/draft", "Δproposed tokens / Δdrafts"),
         ("spec_decode_acceptance_ratio", accepted / proposed if proposed else None, "fraction", "Δaccepted tokens / Δproposed tokens"),
@@ -1046,6 +1048,8 @@ def _derive_spec_decode(snapshots):
         metrics[key] = _derived(value, unit, formula + "; pooled matching server-wide intervals",
             samples=len(windows), eligible=eligible,
             reason=None if value is not None else reason if not windows else "No nonzero denominator in valid observed intervals; ratio unavailable.",
+            cause="data_missing" if not windows else "too_few_samples" if value is None else None,
+            action=None if value is not None else "Run more requests so speculative-decoding counters change between scrapes.",
             **details)
     metrics["spec_decode_accepted_tokens"]["details"].update(
         accepted_tokens_by_position=[{"position": position, "accepted_tokens": count, "drafts": denominator,
@@ -1064,6 +1068,10 @@ def _mean_duration(snapshots, family):
     return _derived(1000 * total / count if count else None, "ms", "1000 × matching Δsum / Δcount; server-wide",
                     samples=count, eligible=len(snapshots), reason=None if count else
                     "No fresh matching duration sum/count increments; reset, missing scope or zero count.",
+                    cause=("data_missing" if excluded else "too_few_samples") if not count else None,
+                    action=None if count else
+                    "Check exporter resets and matching label scopes; collect a fresh stable duration-counter interval." if excluded else
+                    "Run more requests so duration counters change between scrapes.",
                     duration_seconds=sum(t for t, _ in intervals), excluded_intervals=excluded,
                     attribution="Includes other server traffic; not request-linked.")
 
@@ -1116,6 +1124,8 @@ def _histogram_percentiles(snapshots, family):
             state="estimated" if value is not None else "insufficient_evidence", samples=population,
             eligible=len(snapshots), reason=None if value is not None else
             "No complete compatible histogram increments, zero observations, or percentile falls in unbounded +Inf bucket.",
+            cause="too_few_samples" if value is None else None,
+            action=None if value is not None else "Run more requests so histogram counters change between scrapes.",
             bucket_bounds_seconds=bounds,
             bucket_resolution_seconds=[b for b in sorted(buckets) if math.isfinite(b)],
             excluded_intervals=excluded, observed_intervals=valid_intervals,
@@ -1139,6 +1149,7 @@ def _derive_mtplx(snapshots):
             "MTPLX latest completed request; may predate this run; not linked to the selected requests. No averaging or counter deltas.",
             samples=int(value is not None), eligible=1,
             reason=None if value is not None else outcome_reason or timestamp_reason or "No valid fresh field in the final scrape's latest completed request; missing is unknown, not zero.",
+            cause="data_missing" if value is None else None,
             collected_at=latest.get("collected_at"), completed_at_s=latest.get("latest_completed_at_s"),
             latest_outcome=latest.get("latest_outcome"), latest_outcome_flags=latest.get("latest_outcome_flags", {}),
             invalid_outcome_flags=latest.get("invalid_outcome_flags", []),
@@ -1182,14 +1193,18 @@ def derive_server_metrics(data, *, host_configured=False):
                                "Compatible server-wide counter delta / actual sample duration",
                                samples=len(intervals), eligible=max(0, len(snapshots)-1),
                                duration_seconds=duration, counter_delta=delta, excluded_intervals=excluded,
-                               reason=None if duration else "No fresh stable counter interval; resets, missing samples or changing labels.")
+                               reason=None if duration else "No fresh stable counter interval; resets, missing samples or changing labels.",
+                               cause="data_missing" if not duration else None,
+                               action=None if duration else "Check for fresh matching counter samples without resets or changing labels; run more requests between scrapes.")
     intervals, excluded = _counter_intervals(snapshots, ["prefix_hits", "prefix_queries"])
     hits = sum(sum(d["prefix_hits"].values()) for _, d in intervals)
     queries = sum(sum(d["prefix_queries"].values()) for _, d in intervals)
     metrics["prefix_cache_hit_ratio"] = _derived(hits / queries if queries and hits <= queries else None,
         "fraction", "Matching prefix-cache hit/query token-counter deltas; server-wide",
         samples=queries, eligible=len(snapshots), excluded_intervals=excluded,
-        reason=None if queries and hits <= queries else "No compatible nonzero hit/query deltas; missing is not zero.")
+        reason=None if queries and hits <= queries else "No compatible nonzero hit/query deltas; missing is not zero.",
+        cause="data_missing" if not (queries and hits <= queries) else None,
+        action=None if queries and hits <= queries else "Check that the exporter exposes matching prefix-cache hit and query counters; run more requests between scrapes.")
     # Runtime direct gauges retain their units; average samples is not a time-weighted average.
     for family in ("running", "waiting", "cache_occupancy", "prefix_hit_rate", "memory", "utilization",
                    "temperature", "throttling", "device_errors"):
@@ -1201,7 +1216,9 @@ def derive_server_metrics(data, *, host_configured=False):
             "temperature": "celsius", "throttling": "bitmask", "device_errors": "code"}[family]
         metrics[family] = _derived(max((s["value"] for s in samples), default=None), unit,
             "Maximum fresh runtime-reported gauge sample; server-wide", samples=len(samples),
-            eligible=len(snapshots), reason=None if samples else "No fresh gauge observations.",
+            eligible=len(snapshots), reason=None if samples else f"The exporter returned no fresh {family} samples.",
+            cause="data_missing" if not samples else None,
+            action=None if samples else "Check the exporter exposes this gauge for your hardware/runtime.",
             aggregation="Maximum across observed samples/replicas, not sum or time-weighted mean.")
     host_snapshots = [snap.get("host", {"status": "missing", "elapsed_seconds": snap.get("elapsed_seconds", 0)})
                       for snap in snapshots]
@@ -1216,30 +1233,75 @@ def derive_server_metrics(data, *, host_configured=False):
         row["details"].setdefault("partial_coverage", bool(row["details"].get("excluded_intervals")))
         if row["value"] is None and not key.startswith("host_"):
             if not snapshots or all(snap.get("status") == "not_enabled" for snap in snapshots):
-                row.update(state="not_collected", reason="This saved run has no runtime metrics discovery or collection evidence.",
+                row.update(state="not_collected", cause="collector_unavailable", reason="This saved run has no runtime metrics discovery or collection evidence.",
                            action="New runs discover same-origin /metrics automatically; set targets[].metrics_url only for a different exporter route.")
             elif not any(snap.get("status") in states.TELEMETRY_USABLE_STATUSES for snap in snapshots):
                 latest = snapshots[-1]
-                row.update(state="not_collected", reason=latest.get("reason", "Runtime metrics discovery did not return usable evidence."),
+                row.update(state="not_collected", cause="collector_unavailable", reason=latest.get("reason") or "Runtime metrics discovery did not return usable evidence.",
                     action=("Supply targets[].metrics_url for an existing exporter at a different route." if latest.get("status") == states.TELEMETRY_ENDPOINT_ABSENT
                             else "Supply metrics_api_key_env or metrics_headers_env for the exporter." if latest.get("status") == states.TELEMETRY_AUTHENTICATION_DENIED
                             else "Check the recorded exporter discovery result; server-only evidence is unavailable from chat responses."))
                 row["details"].update(collection_status=latest.get("status"), endpoint=latest.get("endpoint"),
                                       endpoint_source=latest.get("endpoint_source"))
             elif profiles == {"mtplx"} and not key.startswith("mtplx_latest_"):
-                row.update(state="not_supported", reason="MTPLX completed-request JSON does not expose this live gauge or cumulative counter contract.",
+                row.update(state="not_supported", cause="endpoint_unsupported", reason="MTPLX completed-request JSON does not expose this live gauge or cumulative counter contract.",
                            action=None)
-            elif profiles and key.startswith("spec_decode_sglang_"):
-                if "sglang" not in profiles:
-                    row.update(state="not_supported", reason="SGLang scheduler gauges require the sglang metrics profile.", action=None)
-            elif profiles and key.startswith("spec_decode_") and "vllm-v1" not in profiles:
-                row.update(state="not_supported", reason="Optional speculative-decoding counters are documented only for the vllm-v1 profile.", action=None)
+            elif profiles and key.startswith("spec_decode_sglang_") and "sglang" not in profiles:
+                row.update(state="not_supported", cause="endpoint_unsupported", reason="SGLang scheduler gauges require the sglang metrics profile.", action=None)
+            elif profiles and key.startswith("spec_decode_") and not key.startswith("spec_decode_sglang_") and "vllm-v1" not in profiles:
+                row.update(state="not_supported", cause="endpoint_unsupported", reason="Optional speculative-decoding counters are documented only for the vllm-v1 profile.", action=None)
             elif profiles and key.startswith(("server_ttft_", "server_queue_", "server_inference_")):
                 family = key.rsplit("_", 2)[0]
                 required = family + ("_bucket" if "_p95_" in key or "_p99_" in key else "_sum")
                 if required not in support:
-                    row.update(state="not_supported", reason=f"Runtime profile {', '.join(sorted(profiles))} exposes no documented {required} family in Giraffe's metric contract.",
-                               action=None)
+                    reason = (f"The metrics exporter at {redact_url(snapshots[-1].get('endpoint') or 'the configured endpoint')} "
+                              f"does not expose a TTFT histogram (profile {', '.join(sorted(profiles))})."
+                              if family == "server_ttft" else
+                              f"Runtime profile {', '.join(sorted(profiles))} exposes no documented {required} family in Giraffe's metric contract.")
+                    row.update(state="not_supported", cause="endpoint_unsupported",
+                               reason=reason if len(reason) <= 200 else "The metrics exporter does not expose this documented duration histogram in the selected runtime profile.",
+                               detail=reason if len(reason) > 200 else None, action=None)
+            # Partial staleness must not replace an interval-specific explanation or
+            # bypass duration-family applicability checks below.
+            if not row.get("cause") and row["state"] != "not_collected" and any(
+                    snap.get("status") == states.TELEMETRY_STALE_SAMPLES for snap in snapshots):
+                row.update(cause="data_missing", reason="Exporter samples were stale (no fresh timestamps or changing values).",
+                           action="Check the exporter is live during the run.")
+            if row.get("cause") == "endpoint_unsupported" or row["state"] == "not_collected":
+                if len(row["reason"] or "") > 200:
+                    row["detail"] = row["reason"]
+                    latest = snapshots[-1]
+                    row["reason"] = ("The metrics exporter returned HTTP 404." if latest.get("status") == states.TELEMETRY_ENDPOINT_ABSENT
+                                     else "Runtime metrics collection did not return usable evidence; see the recorded exporter discovery result.")
+                continue
+            duration_family = next((family for family in ("server_ttft", "server_queue", "server_inference")
+                                    if key.startswith(family + "_")), None)
+            required = (duration_family + ("_bucket" if "_p95_" in key or "_p99_" in key else "_sum")
+                        if duration_family else None)
+            present = {sample.get("family") for snap in snapshots for sample in snap.get("samples", [])}
+            if required and required not in present and profiles:
+                latest = snapshots[-1]
+                if duration_family == "server_ttft":
+                    reason = (f"The metrics exporter at {redact_url(latest.get('endpoint') or 'the configured endpoint')} "
+                              f"does not expose a TTFT histogram (profile {', '.join(sorted(profiles))}).")
+                else:
+                    reason = f"The metrics exporter does not expose {required} (profile {', '.join(sorted(profiles))})."
+                row.update(state="not_supported", cause="endpoint_unsupported",
+                           reason=reason if len(reason) <= 200 else "The metrics exporter does not expose a TTFT histogram in this runtime profile.",
+                           detail=reason if len(reason) > 200 else None, action=None)
+            elif (duration_family and not ("_p95_" in key or "_p99_" in key)
+                  and (len(snapshots) < 2 or not row.get("reason"))):
+                row.update(cause="too_few_samples",
+                           reason=(f"{'Server TTFT' if duration_family == 'server_ttft' else duration_family.replace('_', ' ').capitalize()} "
+                                   f"needs two scrapes with new requests between them; got {len(snapshots)} scrape(s) "
+                                   f"and {row['sample_count']:g} new request(s)."),
+                           action="Run more requests (raise Maximum requests) so the counters move between scrapes.")
+            elif not row.get("cause"):
+                row.update(cause="too_few_samples" if len(snapshots) < 2 else "unknown")
+                if not row.get("reason"):
+                    row["reason"] = f"The exporter returned no compatible {key} observations in {len(snapshots)} scrape(s)."
+                if not row.get("action"):
+                    row["action"] = "Check the exporter samples for missing fields, counter resets or changing labels; rerun with more requests."
     return metrics
 
 
@@ -1290,6 +1352,12 @@ def _derive_host(snapshots, configured):
             s["collection_period_seconds"] for s in snapshots if "collection_period_seconds" in s}),
             freshness="Exporter timestamp when supplied; otherwise scrape time only, source freshness unknown.")
         if not configured:
-            row.update(state="not_collected", reason="Server host exporter not configured.",
+            row.update(state="not_collected", cause="not_configured", reason="Server host exporter not configured.",
                        action="Set targets[].host_metrics_url to an existing node_exporter Prometheus-text endpoint.")
+        elif row["value"] is None:
+            row.update(cause="too_few_samples" if len(snapshots) < 2 else "data_missing",
+                       reason=("The host exporter returned no fresh matching CPU counter interval."
+                               if row["unit"] == "percent" else "The host exporter returned no fresh matching total/available RAM samples."))
+            if not row.get("action"):
+                row["action"] = "Check that node_exporter exposes fresh node_cpu_seconds_total samples; run more requests between scrapes."
     return rows

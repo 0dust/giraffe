@@ -1,8 +1,6 @@
 """Run-launch provenance; never expand environment references or read input files."""
 
-from urllib.parse import urlsplit, urlunsplit
-
-from .deployment import REDACTED, sanitize
+from .deployment import REDACTED, redact_url, sanitize
 
 # Only known CLI settings may retain values. New/abbreviated flags fail closed,
 # so future inline prompts, headers or credentials cannot silently enter reports.
@@ -21,14 +19,7 @@ _URL_FLAGS = frozenset({"--url", "--metrics-url", "--host-metrics-url", "--proxy
 
 def _safe_value(flag: str, value: str) -> str:
     if flag in _URL_FLAGS:
-        # argv already delimits the URL. Text matching can stop inside userinfo
-        # (for example at an apostrophe) and leave credentials behind.
-        try:
-            url = urlsplit(value)
-            if url.username is not None or url.password is not None or url.query or url.fragment:
-                value = urlunsplit((url.scheme, url.netloc.rsplit("@", 1)[-1], url.path, "", "")) + REDACTED
-        except ValueError:
-            return REDACTED
+        value = redact_url(value)
     return sanitize(value)
 
 

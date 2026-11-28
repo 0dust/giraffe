@@ -168,3 +168,82 @@ def test_standalone_measurement_catalog_preview_is_bounded():
     html = render_performance(performance)
     assert 'Showing 50 of 1000 windows; complete catalog in report.json.' in html
     assert 'window-canary-49' in html and 'window-canary-50' not in html
+
+
+def test_unavailable_card_next_step_is_visible_and_detail_stays_in_info():
+    from giraffe.performance_html import _card
+
+    row = {'value': None, 'label': 'Output token throughput', 'state': 'insufficient_evidence',
+           'reason': 'The endpoint returned no token counts.', 'action': 'Check usage.completion_tokens.',
+           'detail': 'Long <evidence> belongs in the info popover.', 'source': 'Recorded reply usage'}
+    html = _card(row)
+    info = re.search(r'<details class="html-info">.*?</details>', html).group()
+    visible = html.replace(info, '')
+    assert row['reason'] in visible
+    assert '<span class="html-next html-note"><br>' + row['action'] + '</span>' in visible
+    assert row['action'] not in info
+    assert 'Long &lt;evidence&gt;' in info
+    assert 'Long &lt;evidence&gt;' not in visible
+
+
+def test_standalone_unavailable_evidence_note_has_no_generic_instruction():
+    html = _render(synthetic_report_1000())
+    assert 'Collect eligible observations' not in html
+    assert 'Absent evidence stays unavailable; each unavailable value states why and what to change.' in html
+
+
+def test_window_precondition_is_once_per_table_but_retained_on_cards():
+    from giraffe.performance_html import _card, _distributions, _table
+
+    availability = {'cause': 'data_missing', 'reason': 'WINDOW requests failed.',
+                    'action': 'Fix WINDOW requests first.'}
+    row = dict(availability, value=None, state='not_collected', label='First answer',
+               unit='ms', source='Recorded timing', sample_count=0)
+    other = dict(row, label='Other', cause='check_not_selected', action='Add another check.')
+    for html in (_table([row, dict(row, label='Second'), other], availability),
+                 _distributions([row, dict(row, label='Second'), other], 'Ranks', availability)):
+        assert html.count(availability['action']) == 1
+        assert html.count(availability['reason']) == 2  # The different explanation is not hidden.
+        assert html.count('class="html-note"') >= 1
+        table = html[html.index('<table'):]
+        assert availability['action'] not in table
+        assert 'Add another check.' in table
+        assert html.index(availability['action']) < html.index('<table')
+    card = _card(row)
+    assert availability['reason'] in card and availability['action'] in card
+
+
+def test_all_failed_window_note_covers_cards_and_tables_once_per_section():
+    from html import escape
+    from giraffe.performance import refresh_performance
+    from giraffe.performance_html import render_performance
+    from tests.test_reporting import dead_endpoint_report
+
+    report = refresh_performance(dead_endpoint_report())
+    performance = report.performance
+    before = report.model_dump_json()
+    target = performance['targets'][0]
+    summary = target['summaries'][target['default_window']]
+    common = summary['availability']
+    html = render_performance(performance)
+    overview = re.search(r'<section class="html-section" id="[^"]+-overview">.*?</section>', html).group()
+    assert overview.count(escape(common['reason'])) == 1
+    assert overview.count(escape(common['action'])) == 1
+    assert overview.index(escape(common['reason'])) < overview.index('class="html-cards')
+    for section in re.findall(r'<section class="html-section".*?</section>', html):
+        assert section.count(escape(common['reason'])) <= 1
+        assert section.count(escape(common['action'])) <= 1
+    matched = 0
+    for card in re.findall(r'<article class="html-kpi">.*?</article>', html):
+        label = re.search(r'<h3>(.*?)<details', card).group(1)
+        row = next(row for row in summary['metrics'].values() if escape(row['label']) == label)
+        if row.get('value') is None and all(row.get(field) == common[field] for field in common):
+            matched += 1
+            assert escape(common['reason']) not in card and escape(common['action']) not in card
+            assert '<strong>Insufficient evidence</strong>' in card
+            assert escape(row['source']) in card
+            assert f"{row['sample_count']}/{row['eligible_count']}" in card
+        elif row['id'] == 'goodput':
+            assert escape(row['reason']) in card and escape(row['action']) in card
+    assert matched > 1
+    assert report.model_dump_json() == before
