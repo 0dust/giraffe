@@ -97,6 +97,7 @@ def test_local_preparation_exception_records_an_error_without_an_http_attempt(mo
         assert state.records == retained == [record]
         assert record.error == f"request could not be prepared ({exception.__name__})"
         assert record.status == "failed" and not record.valid
+        assert record.not_dispatched and record.outcome == "not_dispatched"
         assert record.dispatch_ms is record.timing_start_ms is None
         assert record.overlap == 0
         assert state.attempted == state.budget_used == state.counts[target.name] == 0
@@ -128,6 +129,7 @@ def test_http_client_preparation_failure_returns_a_sanitized_local_record(monkey
         assert state.records == [record]
         assert record.error == "request could not be prepared (ValueError)"
         assert "secret-sk-123" not in record.model_dump_json()
+        assert record.status == "failed" and record.not_dispatched and record.outcome == "not_dispatched"
         assert state.errors == 1
         assert state.attempted == state.budget_used == 0
         assert record.dispatch_ms is None

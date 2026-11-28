@@ -75,7 +75,7 @@ def test_v3_recovery_budget_is_inconclusive_not_error(scenario):
     r.valid, r.error, r.finish_reason, r.output, r.reasoning = False, REASONING_BUDGET_ERROR, "length", "", "thinking"
     result = next(c for c in runner._checks(run, run.config.targets[0]) if c.id == "recovery")
     assert result.status == "inconclusive" and "reasoning exhausted the output budget" in result.summary.lower()
-    assert result.metrics["sustained_error_rate"] == 0
+    assert result.metrics["sustained_error_rate"] == (None if scenario == "sustained" else 0)
     assert result.metrics["baseline_non_timeout_error_rate"] in (None, 0)
 
 

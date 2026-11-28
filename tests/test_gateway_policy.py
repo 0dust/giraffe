@@ -403,3 +403,43 @@ def test_parser_never_persists_raw_rate_limit_identity():
 def test_malformed_policy_evidence_is_unknown(body):
     from giraffe.gateway_response import response_evidence
     assert response_evidence(429, body).policy_rejection == "unknown"
+
+
+@pytest.mark.parametrize("excluded", ["not_dispatched", "budget_exhausted"])
+async def test_excluded_local_outcomes_do_not_count_as_gateway_failures_or_pass(monkeypatch, excluded):
+    from giraffe.gateway_policy import summarize
+    from giraffe.request_outcome import preparation_failure_reason
+
+    _, state, _ = await exercise(monkeypatch)
+    record = next(record for record in state.records if record.identity == "peer" and record.valid)
+    if excluded == "not_dispatched":
+        extra = record.model_copy(update=dict(
+            id="excluded", status="failed", valid=False, not_dispatched=True, dispatch_ms=None))
+    else:
+        extra = record.model_copy(update=dict(
+            id="excluded", status="failed", valid=False, finish_reason="length",
+            output="", reasoning="thinking", error="response contained no useful answer output"))
+    records = [*state.records, extra]
+    summary = summarize(state.config.gateway_policy, state.observations["proxy"]["gateway_policy"], records)
+    peer = next(user for user in summary["users"] if user["identity"] == "peer")
+    assert peer["other_failures"] == 0
+    assert summary["status"] == "inconclusive"
+    if excluded == "not_dispatched":
+        assert preparation_failure_reason(records) in summary["reasons"]
+
+
+@pytest.mark.parametrize("behavior", ["overadmit", "early"])
+async def test_local_preparation_failure_does_not_hide_proven_gateway_violation(monkeypatch, behavior):
+    from giraffe.gateway_policy import summarize
+
+    _, state, _ = await exercise(monkeypatch, behavior=behavior)
+    original = next(record for record in state.records if record.identity == "limited")
+    extra = original.model_copy(update=dict(
+        id="not-sent", status="failed", valid=False, not_dispatched=True, dispatch_ms=None))
+    summary = summarize(state.config.gateway_policy, state.observations["proxy"]["gateway_policy"],
+                        [*state.records, extra])
+    assert summary["status"] == "fail"
+    assert summary["qualification"] == "observed_failure"
+    original_summary = summarize(state.config.gateway_policy, state.observations["proxy"]["gateway_policy"],
+                                 state.records)
+    assert summary["reasons"] == original_summary["reasons"]

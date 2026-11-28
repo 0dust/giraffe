@@ -44,6 +44,7 @@ BASELINE_REASON_CODES: Final = {
     "target_differs": BASELINE_NOT_COMPARABLE,
     "schema_differs": BASELINE_NOT_COMPARABLE,
     "timing_method_differs": BASELINE_NOT_COMPARABLE,
+    "outcome_counting_differs": BASELINE_NOT_COMPARABLE,
     "run_aborted": BASELINE_NOT_COMPARABLE,
     "evaluation_failed": BASELINE_NOT_COMPARABLE,
     "config_unsupported": BASELINE_NOT_COMPARABLE,
@@ -94,6 +95,16 @@ LOAD_ACCEPTANCE_CHANGES: Final = (
 
 # Request record: report.json requests[].status and evidence.jsonl (models.RequestRecord.status).
 REQUEST_STATUSES: Final = ("completed", "failed", "timeout", "cancelled")
+
+# Derived request outcome, in first-match precedence order (request_outcome.py).
+REQUEST_OUTCOMES: Final = (
+    "not_dispatched", "intentional_stop", "cancelled", "timeout",
+    "budget_exhausted", "failed", "invalid", "ok",
+)
+REQUEST_OUTCOME_ERRORS: Final = frozenset({"invalid", "failed", "timeout"})
+REQUEST_OUTCOME_EXCLUDED: Final = frozenset({
+    "intentional_stop", "cancelled", "budget_exhausted", "not_dispatched",
+})
 
 # Per-check phase: internal runner state, not a public contract; not in describe().
 CHECK_PHASE_INFERENCE: Final = "inference"
@@ -414,6 +425,9 @@ def describe() -> dict:
         "exit_codes": {**EXIT_CODES, "cancelled": EXIT_CODE_CANCELLED,
                        "usage_error": EXIT_CODE_USAGE, "default": EXIT_CODE_DEFAULT},
         "request_statuses": list(REQUEST_STATUSES), "run_states": list(RUN_STATES),
+        "request_outcomes": list(REQUEST_OUTCOMES),
+        "request_outcome_errors": sorted(REQUEST_OUTCOME_ERRORS),
+        "request_outcome_excluded": sorted(REQUEST_OUTCOME_EXCLUDED),
         "judged_checks": sorted(JUDGED_CHECKS),
         "baseline_comparability": list(BASELINE_COMPARABILITY),
         "baseline_reason_codes": dict(BASELINE_REASON_CODES),

@@ -19,6 +19,7 @@ from giraffe.models import (
     CheckResult, LoadTestSettings, Limits, _steady_offer_count, scheduled_multi_user_slots,
 )
 from giraffe.traffic import ExplicitTrafficStage, run_stage
+from giraffe.request_outcome import preparation_failure_reason, request_outcome
 
 
 WINDOW_POLICY = "completed-output-v1"
@@ -243,7 +244,7 @@ async def run_window(run, target, client, settings, load_settings, calibration, 
                 if finalize:
                     finalize(record)
                 user["request_ids"].append(record.id)
-                if record.status == "failed" and record.dispatch_ms is None:
+                if request_outcome(record) == "not_dispatched":
                     user["stop_reason"] = "request could not be prepared"
                     user["pending_ready_ms"] = None
 
@@ -520,7 +521,7 @@ async def run_arrival_window(run, target, client, settings, load_settings, calib
             record.traffic_rate_rps = None
             offer["request_id"] = record.id
             user["request_ids"].append(record.id)
-            if record.status == "failed" and record.dispatch_ms is None:
+            if request_outcome(record) == "not_dispatched":
                 user["stop_reason"] = "request could not be prepared"
 
         return await run.request(target, client, spec, slot_reserved=True, budget_reserved=True,
@@ -820,6 +821,8 @@ def result(run, target):
         message = "Every measured user met the selected criteria over the common windows."
     else:
         message = "Per-user acceptance is inconclusive because required evidence is incomplete."
+    if status == "measured" and (reason := preparation_failure_reason(records)):
+        message += " " + reason
     return CheckResult(id="multi_user", target=target.name, title="Multi-user",
                        status="inconclusive" if status == "measured" else status,
                        summary=message, metrics={"multi_user": summary},

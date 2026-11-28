@@ -58,26 +58,33 @@ def test_preparation_failure_is_reported_once_per_user_without_dispatch(
         assert not any(event["event"] == "request_started" for event in events)
         for item in report.requests:
             assert item.status == "failed" and not item.valid
+            assert item.outcome == "not_dispatched"
             assert item.error == "request could not be prepared (ValueError)"
             assert item.dispatch_ms is item.timing_start_ms is item.request_body_sent_ms is None
             assert item.input_tokens is item.output_tokens is None
             assert item.check_ids == ["multi_user"]
             assert item.workload["user_id"] in calls
         check = next(check for check in report.checks if check.id == "multi_user")
-        assert check.status == "fail"
+        assert check.status == "inconclusive"
         summary = check.metrics["multi_user"]
-        assert summary["worst_user"]["user_id"] in check.summary
+        assert check.summary.startswith(
+            "Run stopped after the configured number of request errors" if stop_after_errors == 1 else
+            "Per-user acceptance is inconclusive because required evidence is incomplete.")
+        assert summary["reasons"][0] in summary["windows"][0]["reasons"]
+        assert summary["worst_user"]["user_id"] in calls
         users = summary["windows"][0]["users"]
         for user in users:
             assert user["dispatched_count"] == 0
             if user["user_id"] in calls:
-                assert user["status"] == "fail"
-                assert user["outcomes"]["errors"] == 1
-                assert user["criteria"]["max_error_percent"]["value"] == 100
+                assert user["status"] == "inconclusive"
+                assert user["outcomes"]["errors"] == 0
+                assert user["outcomes"]["not_dispatched"] == 1
+                assert ("1 request(s) could not be prepared locally and were not sent; "
+                        "fix the request inputs and rerun.") in user["reasons"]
+                assert user["criteria"]["max_error_percent"]["value"] is None
                 assert user["stop_reason"] == "request could not be prepared"
                 assert user["pending_ready_ms"] is None
-        if stop_after_errors == 1:
-            assert report.abort_reason == "error threshold reached"
+        assert report.abort_reason == ("error threshold reached" if stop_after_errors == 1 else None)
 
     run_virtual(monkeypatch, scenario())
 
@@ -105,11 +112,12 @@ def test_preparation_failure_stops_only_the_affected_user(monkeypatch):
                        think_time_seconds={"values": [0]})
         state = runner._Run(cfg, None, None)
         await execute(state, cfg.targets[0], PreparationClient(cfg.targets[0], cfg))
-        assert calls.count("user-01") == state.errors == 1
+        assert calls.count("user-01") == 1
+        assert state.errors == 1
         assert calls.count("user-02") > 1
         assert state.budget_used == state.attempted == calls.count("user-02")
         check = result(state, cfg.targets[0])
-        assert check.status == "fail"
+        assert check.status == "inconclusive"
         assert check.metrics["multi_user"]["worst_user"]["user_id"] == "user-01"
 
     run_virtual(monkeypatch, scenario())
@@ -135,7 +143,8 @@ def test_preparation_failure_uses_nonzero_think_time_before_retrying(monkeypatch
         state = runner._Run(cfg, None, None)
         await execute(state, cfg.targets[0], PreparationClient(cfg.targets[0], cfg))
         assert calls == pytest.approx([calls[0], calls[0]+.01, calls[0]+.02])
-        assert state.errors == len(state.records) == 3
+        assert state.errors == 3
+        assert len(state.records) == 3
         assert state.budget_used == state.attempted == 0
 
     run_virtual(monkeypatch, scenario())
@@ -808,6 +817,35 @@ def test_matched_interference_requires_actual_trigger_and_lengths(trigger, profi
     assert user["control_request_ids"] == [records[0].id]
     assert user["probe_request_ids"] == [records[1].id]
     assert user["heavy_request_ids"] == [records[2].id]
+
+
+@pytest.mark.parametrize("prepared_index", [0, 1, 2], ids=["control", "probe", "heavy"])
+@pytest.mark.parametrize("limit,expected", [(1.1, "fail"), (10, "inconclusive"), (None, "measured")])
+def test_local_preparation_failure_only_prevents_interference_pass(prepared_index, limit, expected):
+    from giraffe.multi_user_metrics import summarize
+    from giraffe.request_outcome import preparation_failure_reason
+
+    source, records = matched_observation()
+    source["settings"]["noisy_neighbors"]["max_slowdown"] = limit
+    original = records[prepared_index]
+    prepared = original.model_copy(update={
+        "id": "prepared", "status": "failed", "valid": False, "not_dispatched": True,
+        "dispatch_ms": None, "timing_start_ms": None,
+        "workload": {**original.workload, "matched_work_sequence": 2},
+    })
+    records.append(prepared)
+    window = next(window for window in source["windows"]
+                  if window["id"] == prepared.workload["window_id"])
+    user = next(user for user in window["users"] if user["user_id"] == prepared.workload["user_id"])
+    user["request_ids"].append(prepared.id)
+    result = summarize(source, records)
+    evidence = result["windows"][1]["interference"]
+    assert evidence["status"] == expected
+    assert evidence["qualified"] is (expected != "inconclusive")
+    assert (preparation_failure_reason([prepared]) in evidence["reasons"]) is (expected != "fail")
+    assert result["status"] == ("fail" if expected == "fail" else "inconclusive")
+    assert result["windows"][1]["status"] == (
+        "fail" if expected == "fail" else "pass" if limit is None and prepared_index == 0 else "inconclusive")
 
 
 @pytest.mark.parametrize(("second_answer_at", "expected"), [(None, "inconclusive"), (80, "inconclusive"),

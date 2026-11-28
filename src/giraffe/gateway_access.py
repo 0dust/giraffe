@@ -8,6 +8,7 @@ from giraffe import states
 from giraffe.client import REASONING_BUDGET_ERROR, _ProtocolError, _text, _token_count
 from giraffe.identities import LITELLM_NATIVE_KEY_HEADERS, gateway_identities_only, identity_headers, litellm_key_fingerprint
 from giraffe.models import CheckResult, RequestSpec
+from giraffe.request_outcome import preparation_failure_reason, request_outcome
 
 
 # Version 4 also requires the client-side bounds on gateway response usage.
@@ -128,6 +129,7 @@ def denial_kind(status, body, *, anonymous=False):
 
 
 def observation(record):
+    # Access proof uses HTTP and protocol evidence, including metered budget-only replies.
     if record is None:
         return "unverified", "not_run"
     if record.status == "cancelled":
@@ -157,6 +159,11 @@ def _row(case):
 
 
 def _record_case(row, record):
+    if request_outcome(record) == "not_dispatched":
+        reason = row["reason"] if row["reason"] in _IDENTITY_FAILURE_REASONS.values() else "request_not_dispatched"
+        row.update(status="inconclusive", observed="unverified", reason=reason,
+                   http_status=None, request_id=record.id)
+        return
     observed, reason = observation(record)
     row.update(observed=observed, reason=reason,
                status="inconclusive" if observed == "unverified" else
@@ -287,6 +294,10 @@ def result(run, target):
     summary = ("Observed access differs from the declared policy." if status == "fail" else
                "Declared allow and deny cases matched the observed responses." if status == "pass" else
                "Access policy unverified: configure a supported profile and complete allow/deny cases with available test identities.")
+    records = [record for record in run.records if record.target == target.name
+               and "gateway_access" in record.check_ids]
+    if (reason := preparation_failure_reason(records)) and status == "pass":
+        status, summary = "inconclusive", reason
     metrics = {"evidence_version": EVIDENCE_VERSION,
                "profile": settings.profile if settings else "unknown", "cases": rows,
                "coverage_complete": complete, "has_allow_and_deny": matrix,

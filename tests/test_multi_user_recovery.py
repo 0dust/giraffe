@@ -187,6 +187,27 @@ def test_recovery_exposes_one_slow_user_when_median_recovers():
     assert result["worst_user"]["user_id"] == "user-03"
 
 
+@pytest.mark.parametrize("role", ["control", "sustained", "lighter"])
+def test_preparation_failure_keeps_recovery_comparison_unqualified(role):
+    source, records = recovery_observation()
+    window = next(window for window in source["windows"] if window["role"] == role)
+    original = next(record for record in records
+                    if record.workload["window_id"] == window["id"]
+                    and record.workload["user_id"] == "user-03")
+    prepared = original.model_copy(update={
+        "id": "prepared", "status": "failed", "valid": False, "not_dispatched": True,
+        "dispatch_ms": None, "timing_start_ms": None,
+    })
+    records.append(prepared)
+    window["users"][-1]["request_ids"].append(prepared.id)
+    result = summarize(source, records)
+    evidence = result["windows"][-1]["recovery"]
+    user = evidence["users"][-1]
+    assert user["status"] == evidence["status"] == result["status"] == "inconclusive"
+    assert not user["qualified"]
+    assert any("incomplete terminal coverage" in reason for reason in user["reasons"])
+
+
 @pytest.mark.parametrize("output_tokens", [0, None], ids=["known-zero", "missing-usage"])
 def test_recovery_distinguishes_zero_visible_output_from_missing_usage(output_tokens):
     source, records = recovery_observation()

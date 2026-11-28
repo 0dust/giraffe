@@ -92,6 +92,19 @@ def test_buckets_boundary_final_partial_and_failed_completions():
     assert result["buckets"][-1]["duration_s"] == .5
 
 
+def test_performance_success_cohorts_follow_declared_outcomes():
+    records = [record("ok"), record("designed-stop", intentional=True),
+               record("local-failure", not_dispatched=True)]
+    buckets = completion_buckets(records, 0, 1000)
+    assert sum(bucket["count"] for bucket in buckets["buckets"]) == 3
+    assert sum(bucket["valid_completions"] for bucket in buckets["buckets"]) == 1
+    value = report(records)
+    result = summary(value)
+    assert result["metrics"]["request_throughput"]["value"] == 1
+    assert result["distributions"]["response_latency"]["sample_count"] == 1
+    assert value.performance["targets"][0]["cohorts"][0]["valid_completions"] == 1
+
+
 def test_tokens_do_not_double_count_reasoning_cache_or_missing_usage():
     a = record("a", input_tokens=100, output_tokens=20, completion_tokens=30, reasoning_tokens=10, cached_prompt_tokens=50)
     b = record("b",start=100,end=2000,input_tokens=None,output_tokens=None,completion_tokens=None)
@@ -130,6 +143,23 @@ def test_outcomes_use_existing_reasoning_and_cancellation_accounting():
     assert metrics["correctness"]["value"] == 1
     assert metrics["unscored"]["value"] == 4
     assert metrics["partial_failed"]["value"] == 1
+
+
+def test_error_rate_sample_metadata_counts_only_evaluated_outcomes():
+    values = [record(str(index)) for index in range(6)]
+    values[1].valid = False
+    values[2].intentional = True
+    values[3].not_dispatched = True
+    values[3].status = "failed"
+    values[4].status = "cancelled"
+    values[5].valid = False
+    values[5].finish_reason = "length"
+    values[5].reasoning = "private reasoning"
+    values[5].error = "reasoning exhausted the output budget before an answer"
+
+    metric = summary(report(values))["metrics"]["error_rate"]
+    assert metric["value"] == .5
+    assert metric["sample_count"] == metric["eligible_count"] == 2
 
 
 def test_no_intended_history_invented_from_ceiling_and_zero_window():

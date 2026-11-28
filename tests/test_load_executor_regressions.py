@@ -54,6 +54,30 @@ async def test_blank_calibration_output_uses_received_prompt_usage():
     assert check.status == 'pass'
 
 
+async def test_closed_loop_permanent_preparation_failure_stops_at_error_threshold(monkeypatch):
+    from giraffe.client import LLMClient
+
+    def create_client(self):
+        client = httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda request: pytest.fail("an unpreparable request must not reach transport")))
+
+        def build_request(*args, **kwargs):
+            raise ValueError("request cannot be prepared")
+
+        client.build_request = build_request
+        return client
+
+    monkeypatch.setattr(LLMClient, '_create_client', create_client)
+    c = configuration(max_requests=None, stop_after_errors=3)
+    async with LLMClient(c.targets[0], c) as client:
+        run, check, _, _ = await asyncio.wait_for(perform(c, client), 1)
+    assert run.errors == len(run.records) == 3
+    assert run.reason == 'error threshold reached'
+    assert all(record.outcome == 'not_dispatched' for record in run.records)
+    assert check.status == 'inconclusive'
+    assert check.metrics['points'][0]['groups'][0]['error_denominator'] == 0
+
+
 async def test_below_minimum_prompt_length_calibrates_short_and_warns_in_plan():
     c = configuration(load={'profile': {'short': {'input_tokens': 16, 'output_tokens': 8},
         'medium': {'input_tokens': 96, 'output_tokens': 16}, 'long': {'input_tokens': 128, 'output_tokens': 32}}})
@@ -120,7 +144,9 @@ def test_failed_reasoning_exhaustion_is_not_an_error():
     r = record(status='failed',valid=False,score=None,output='',reasoning='thinking',finish_reason='length',error='response contained no useful answer output')
     load.assess_point(run,c.targets[0],c.load_test,p,[r])
     g = p['groups'][0]
-    assert g['reasoning_budget_exhausted'] == 1 and g['failed'] == g['error_percent'] == g['valid'] == 0
+    assert r.outcome == 'budget_exhausted'
+    assert g['reasoning_budget_exhausted'] == 1 and g['failed'] == g['valid'] == 0
+    assert g['error_denominator'] == 0 and g['error_percent'] is None
     assert g['status'] == 'inconclusive'
 
 

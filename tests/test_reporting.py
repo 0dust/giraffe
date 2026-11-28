@@ -36,6 +36,68 @@ def baseline_check(report: RunReport) -> CheckResult:
     return next(check for check in report.checks if check.id == "baseline")
 
 
+def test_per_record_error_rate_uses_evaluated_outcomes():
+    from giraffe.reporting import _metric_values
+
+    template = make_report(count=1).requests[0]
+    records = [template.model_copy(update=changes) for changes in (
+        {}, {"status": "cancelled", "valid": False}, {"valid": False},
+        {"status": "timeout", "valid": False, "intentional": True},
+    )]
+    assert _metric_values(records)["error_rate"] == [0.0, 1.0]
+
+
+def test_multi_user_per_record_error_rate_retains_wrong_answer_error():
+    from giraffe.reporting import _metric_values
+
+    record = make_report(count=1).requests[0]
+    record.check_ids = ["multi_user"]
+    record.workload = {"session_id": "one-session"}
+    record.score = False
+    assert _metric_values([record], check="multi_user")["error_rate"] == [1.0]
+
+
+def test_scenario_error_counts_follow_declared_outcomes(tmp_path):
+    template = make_report(count=1).requests[0]
+    report = make_report(count=0)
+    report.requests = [template.model_copy(update={"id": str(index), **changes})
+                       for index, changes in enumerate((
+                           {}, {"valid": False},
+                           {"status": "failed", "valid": False, "not_dispatched": True},
+                           {"status": "failed", "valid": False,
+                            "error": "response contained no useful answer output",
+                            "finish_reason": "length", "output": ""},
+                           {"status": "timeout", "valid": False, "intentional": True},
+                           {"status": "timeout", "valid": False},
+                           {"status": "cancelled", "valid": False},
+                       ))]
+    _, html_path = write_report(report, tmp_path, html=True)
+    html = html_path.read_text()
+    scenario_table = html.split('<section id="measurements">', 1)[1].split('</section>', 1)[0]
+    assert '<td>7</td><td>1</td><td>1 / 1</td><td>1</td>' in scenario_table
+
+
+@pytest.mark.parametrize("status,error", [
+    ("completed", "reasoning exhausted the output budget before an answer"),
+    ("failed", "response contained no useful answer output"),
+])
+def test_retention_none_preserves_reasoning_budget_outcome(status, error, tmp_path):
+    from giraffe.cli import load_report
+
+    report = make_report(count=1)
+    report.manifest["config"]["retention"] = "none"
+    record = report.requests[0]
+    record.status, record.error, record.valid = status, error, False
+    record.output, record.reasoning, record.reasoning_tokens = "", "private reasoning", None
+    record.finish_reason = "length"
+    json_path, _ = write_report(report, tmp_path)
+    raw = json.loads(json_path.read_text())["requests"][0]
+    saved = load_report(json_path).requests[0]
+    assert raw["outcome"] == saved.outcome == record.outcome == "budget_exhausted"
+    assert saved.reasoning == "" and saved.reasoning_stripped
+    assert record.reasoning_stripped is False
+
+
 @pytest.mark.parametrize("comparison_status", ["pass", "fail", "inconclusive"])
 def test_comparison_summary_keeps_absolute_failure_separate_from_recorded_verdict(comparison_status):
     from giraffe.reporting import _render, comparison_summary

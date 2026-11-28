@@ -327,7 +327,8 @@ async def test_user_stop_during_sustained_traffic_is_inconclusive_not_fail(endpo
     await task
     result = check(report, "recovery")
     assert [r.status for r in report.requests if r.scenario == "sustained"].count("cancelled") > 0
-    assert result.metrics["sustained_error_rate"] == 0
+    assert result.metrics["sustained_error_rate"] is None
+    assert result.metrics["sustained_non_timeout_error_rate"] is None
     assert result.status == "inconclusive" and report.overall != "fail"
 
 
@@ -336,7 +337,8 @@ async def test_run_deadline_during_sustained_traffic_is_inconclusive_not_fail(en
     report = await runner.run_suite(config(checks=["recovery"], sustained_seconds=.3, max_duration_seconds=.8,
         request_timeout_seconds=5, limits=Limits(recovery_max_ratio=10, min_samples=2)))
     result = check(report, "recovery")
-    assert result.metrics["sustained_error_rate"] == 0 and result.status == "inconclusive"
+    assert result.metrics["sustained_error_rate"] is None and result.status == "inconclusive"
+    assert result.metrics["sustained_non_timeout_error_rate"] is None
 
 
 async def test_probe_cancelled_at_deadline_does_not_count_as_a_sample(endpoint, monkeypatch):

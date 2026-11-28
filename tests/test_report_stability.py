@@ -34,7 +34,9 @@ def test_main_schema_three_fixture_preserves_checks_outcome_and_conditions():
     # frozen. Project those additive rows out. The only changed historical
     # measurements are character-derived pace estimates: these requests lack
     # cumulative counts at the first/last read, so they now lack rate evidence.
-    # All other measurements, sections, verdicts and conditions stay unchanged.
+    # This fixture has no saved performance, so its derived error-rate source
+    # also describes the current outcome rule. All other measurements, sections,
+    # verdicts and conditions stay unchanged.
     from giraffe.performance import SPEC_DECODE_ROWS
     actual = without_series(saved.performance)
     for target, frozen_target in zip(actual["targets"], expected["performance"]["targets"], strict=True):
@@ -48,6 +50,13 @@ def test_main_schema_three_fixture_preserves_checks_outcome_and_conditions():
                 summary["metrics"][key] for key, _, _ in SPEC_DECODE_ROWS]
             summary["sections"]["server"] = summary["sections"]["server"][:original_server_rows]
             summary["metrics"] = {key: value for key, value in summary["metrics"].items() if key not in added}
+            error_rate = frozen["metrics"]["error_rate"]
+            assert error_rate["source"] == "Existing outcome accounting; failures + timeouts / non-cancelled, non-reasoning-budget requests"
+            error_rate["source"] = "Invalid + failed + timeout outcomes / evaluated outcomes (ok + errors)"
+            for row in frozen["sections"]["outcomes"]:
+                if row["id"] == "error_rate":
+                    assert row["source"] == "Existing outcome accounting; failures + timeouts / non-cancelled, non-reasoning-budget requests"
+                    row["source"] = error_rate["source"]
             sources = {
                 "generation_pace": "Client-observed pace from server token counts (cumulative usage or streamed logprobs) at first/last answer reads",
                 "tpot_estimate": "1000 / generation_tokens_per_second",

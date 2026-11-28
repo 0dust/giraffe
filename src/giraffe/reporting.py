@@ -30,6 +30,7 @@ from .caps import (MAX_HTML_PREVIEW_CHARS, MAX_HTML_JSON_PREVIEW_CHARS,
 from .deployment import deployment_diff, safe_config, sanitize
 from .launch_settings import comparison_warnings, setting_change_text
 from .report_inputs import input_ref as _input_ref
+from .request_outcome import count_outcomes, request_outcome
 from .multi_user_metrics import (_error as _user_error, _length_mix_differs, _total_generated_tokens,
                                  _uncached_input_tokens, _valid as _user_valid_completion,
                                  fairness_applies, truncated_conversation_turn, user_delivery_completions, user_latency)
@@ -329,6 +330,8 @@ def _settings_reasons(report: RunReport, baseline: RunReport, *, details: dict[s
         setting_reason("Report schema versions differ.", "schema_differs")
     if report.manifest.get("timing_measurement_version", 1) != baseline.manifest.get("timing_measurement_version", 1):
         setting_reason("Client timing measurement methods differ; rerun the baseline.", "timing_method_differs")
+    if report.manifest.get("outcome_counting_version", 1) != baseline.manifest.get("outcome_counting_version", 1):
+        setting_reason("Request outcome counting rules differ; rerun the baseline.", "outcome_counting_differs")
     current_limits, baseline_limits = _limits_reached(report), _limits_reached(baseline)
 
     def shared_abort(run, limits):
@@ -399,8 +402,7 @@ def _settings_reasons(report: RunReport, baseline: RunReport, *, details: dict[s
             judged_ids = {f"pack:{case['fixture_id']}"
                           for case in (config.get("request_pack") or {}).get("cases", [])
                           if case.get("scorer") == "judge"}
-            if any(record.fixture_id in judged_ids and record.status == "completed"
-                   and record.valid and record.score is None for record in run.requests):
+            if any(record.fixture_id in judged_ids and request_outcome(record) == "ok" and record.score is None for record in run.requests):
                 setting_reason(f"{label} AI judge results are incomplete; "
                                "correctness and capacity cannot be compared.", "judge_incomplete", side=label.lower())
 
@@ -613,7 +615,7 @@ def _timing_quality(report, target, records, metrics):
 def _valid_completion(record: RequestRecord, check: str | None) -> bool:
     if check == "multi_user" and record.workload.get("session_id"):
         return _user_valid_completion(record)
-    return record.status == "completed" and record.valid
+    return request_outcome(record) == "ok"
 
 
 _P95_MINIMUM_SAMPLES = 20
@@ -659,7 +661,9 @@ def _metric_values(records: list[RequestRecord], *, check: str | None = None,
     return {
         "valid_completion_rate": [float(success) for success in valid],
         "error_rate": [float(_user_error(r) if check == "multi_user" and r.workload.get("session_id")
-                             else r.status in {"failed", "timeout"}) for r in records],
+                             else outcome in states.REQUEST_OUTCOME_ERRORS)
+                       for r in records if (outcome := request_outcome(r)) == "ok"
+                       or outcome in states.REQUEST_OUTCOME_ERRORS],
         "correctness_rate": [float(r.score) for r in records if r.score is not None],
         **values,
         **{tail: values[base] for tail, base in _TAIL_TIMING_METRICS.items()},
@@ -875,7 +879,7 @@ def _load_work_comparison(current, old, *, compare_stream_options=True):
 
 
 def _input_work_changed(current, old, threshold, *, include_tail=False):
-    cohorts = [[r.input_tokens for r in records if r.valid and r.input_tokens is not None]
+    cohorts = [[r.input_tokens for r in records if request_outcome(r) == "ok" and r.input_tokens is not None]
                for records in (current, old)]
     quantiles = (.5, .95) if include_tail else (.5,)
     for quantile in quantiles:
@@ -1036,6 +1040,7 @@ def _comparable_user_timing_miss(current, old, user, failed_criteria, threshold)
         for record in current:
             error = _user_error(record)
             if not error:
+                # Cancelled attempts cannot establish a completed-turn timing violation.
                 if record.status == "cancelled" or record.id in affected:
                     continue
                 value = user_latency(record, first)
@@ -1164,7 +1169,7 @@ def _compare_load_tests(
             required = run.manifest.get("config", {}).get("load_test", {}).get("pass_criteria", {}).get("min_valid_responses")
         valid = point.get("valid")
         if valid is None and records is not None:
-            valid = sum(r.status == "completed" and r.valid for r in records)
+            valid = sum(request_outcome(r) == "ok" for r in records)
         return {**{name: point.get(name) for name in (
             "id", "source", "type", "workload", "shape", "pattern", "level", "rate", "bursts",
             "status", "reason", "reason_code", "dispatched", "scheduled", "not_sent", "cancelled",
@@ -1567,7 +1572,7 @@ def _compare_interference_work(current, old, user_id, current_records, old_recor
             ids = evidence.get(field, [])
             cohort = [records[rid] for rid in ids if rid in records]
             complete = bool(ids) and len(cohort) == len(ids) == len(set(ids)) and all(
-                record.status == "completed" and record.valid for record in cohort)
+                request_outcome(record) == "ok" for record in cohort)
             if role != "heavy" and len(ids) != evidence.get("matched_samples"):
                 complete = False
             complete_sides.append(complete)
@@ -1755,7 +1760,7 @@ def _matched_recovery_work_changed(current, old, threshold, *, compare_visible=T
         for record in cohort:
             sequence = record.workload.get("matched_work_sequence")
             digest = record.workload.get("matched_work_sha256")
-            if sequence is None or not digest or record.status != "completed" or not record.valid:
+            if sequence is None or not digest or request_outcome(record) != "ok":
                 return True
             by_work[sequence, digest].append(record)
         matched.append(by_work)
@@ -2010,7 +2015,7 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold, slot_ch
                "method": "Observed completed-output delivery over matching common windows; no cross-run confidence interval."}
         if noisy_probe:
             row["timing_exposure_qualified"] = not (scenario_reason or interference_reason) and all(
-                _probe_has_overlap(evidence, [r for r in records if r.status == "completed" and r.valid])
+                _probe_has_overlap(evidence, [r for r in records if request_outcome(r) == "ok"])
                 for evidence, records in ((c_scenario, current_work), (b_scenario, old_work)))
         if missing:
             detail = (work_reason or "Requested work proportions differ." if mix_changed or work_reason else
@@ -2123,7 +2128,7 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold, slot_ch
                 or not c["criteria"][name].get("pending_breach") or c["criteria"][name].get("missed")]
             timing_work_changed = False
             if observed_timing_failures and scenario in {"arrivals", "recovery"}:
-                completions = [[r for r in cohort if r.status == "completed" and r.valid]
+                completions = [[r for r in cohort if request_outcome(r) == "ok"]
                                for cohort in (current_attempts, old_attempts)]
                 if scenario == "recovery":
                     timing_work_changed = all(_recovery_timing_work_changed(
@@ -2400,7 +2405,8 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
         rows = _compare_gateway_attribution(report, baseline, name, not target_reasons, target, old_target or {})
         current_access = next((check for check in report.checks if check.id == "gateway_access"
                                and check.target == name and check.required), None)
-        access_reasons = list(identity_reasons)
+        access_reasons = list(identity_reasons) + [text for text in reasons
+                                                  if reason_details[text]["code"] == "outcome_counting_differs"]
         if current_access and "gateway_access" in config.get("checks", []):
             old_access = next((check for check in baseline.checks if check.id == "gateway_access"
                                and check.target == name and check.required), None)
@@ -2723,7 +2729,7 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                                 warn("client_delayed", delay + " Some waiting time may come from Giraffe, "
                                      "so endpoint timing attribution is uncertain.")
                         if check == "load" and timing_metric in {"latency_ms", "first_output_ms"}:
-                            completed_counts = [sum(r.status == "completed" and r.valid for r in cohort)
+                            completed_counts = [sum(request_outcome(r) == "ok" for r in cohort)
                                                 for cohort in (current_records, old_records)]
                             if len(values) < completed_counts[0] or len(old_metrics[metric]) < completed_counts[1]:
                                 warn("missing_timing", "Per-response timing evidence is incomplete; missing clocks remain unknown.")
@@ -2912,6 +2918,7 @@ def _retained(report: RunReport) -> RunReport:
                        for rid in check.evidence_ids}
     result.requests = []
     for record in report.requests:
+        # Retention preserves diagnostic bodies by transport state, independently of outcome counting.
         keep = policy == "all" or (policy == "failures" and (
             (record.status in {"failed", "timeout"} and record.scenario not in {"client_cancel", "client_deadline"})
             or (record.status == "completed" and not record.valid) or record.score is False
@@ -2933,6 +2940,9 @@ def _retained(report: RunReport) -> RunReport:
 
 def _without_response(record: RequestRecord) -> RequestRecord:
     updates: dict[str, Any] = {"output": "", "reasoning": "", "tool_calls": [], "assistant_message": None}
+    if request_outcome(record) == "budget_exhausted":
+        # Retain the existence of reasoning after removing its response body.
+        updates["reasoning_stripped"] = True
     if record.score_message:
         updates["score_message"] = _without_answer_excerpts(record.score_message)
     if record.logprob_evidence and record.logprob_evidence.tokens:
@@ -3071,6 +3081,7 @@ def _storage_limited(report: RunReport, limit: int) -> None:
         return
     evidence = {rid for check in report.checks if check.status in {"fail", "blocked", "inconclusive"}
                 for rid in check.evidence_ids}
+    # Body eviction priority follows diagnostic transport evidence, independently of error counting.
     ordered = sorted((i for i, r in enumerate(report.requests) if _has_response(r)), key=lambda i: bool(
         report.requests[i].id in evidence or report.requests[i].score is False
         or report.requests[i].evaluation_error
@@ -3107,6 +3118,7 @@ def _without_answer_excerpts(text: str) -> str:
 
 
 def connection_summary(records: list[RequestRecord], url: str) -> str | None:
+    # Connectivity diagnosis uses observed transport failures, not the server-error denominator.
     attempted = [r for r in records if r.status != "cancelled"]
     classes = ("ConnectError", "ConnectTimeout", "SSLError", "ConnectionError",
                "ConnectionRefusedError", "ProxyError", "UnsupportedProtocol")
@@ -4172,6 +4184,7 @@ def _request_prompt_excerpt(record: RequestRecord) -> str:
 
 
 def _response_saving_note(record: RequestRecord, report: RunReport) -> str:
+    # These lifecycle/body predicates explain missing response evidence, rather than server errors.
     policy = report.manifest.get("config", {}).get("retention", "failures")
     if record.output and record.output_chars > len(record.output):
         return "Response truncated"
@@ -4323,6 +4336,7 @@ def _render(report: RunReport) -> str:
     timing_failures = {rid for check in report.checks if check.status == "fail"
                        for rid in _check_timing_violation_ids(check)}
     evidence.update(timing_failures)
+    # Diagnostic ordering also surfaces local failures and designed-stop evidence; it is not an error count.
     ordered = sorted(report.requests, key=lambda r: (
         r.id not in evidence,
         not (r.score is False or r.status in {"failed", "timeout"} or r.evaluation_error or r.id in timing_failures)))
@@ -4508,16 +4522,17 @@ def _render(report: RunReport) -> str:
     for record in report.requests:
         groups[(record.target, record.scenario)].append(record)
     for (target, scenario), records in groups.items():
-        valid = [r for r in records if r.valid and r.status == "completed"]
+        outcomes = count_outcomes(records)
+        valid = [r for r in records if request_outcome(r) == "ok"]
         times = [r.elapsed_ms for r in valid]
         first = [r.first_output_ms for r in valid if r.first_output_ms is not None]
         generation = [rate for r in valid if (rate := r.generation_tokens_per_second) is not None]
         end_to_end = [rate for r in valid if (rate := _rate(r)) is not None]
         scored = [r for r in records if r.score is not None]
         parts.append(f'<tr><td>{_e(target)} / {_e(_condition_label(scenario, target=target, report=report, workload=records[0].workload))}</td><td>{len(records)}</td><td>{len(valid)}</td>'
-                     f'<td>{sum(r.status == "failed" for r in records)} / '
-                     f'{sum(r.status == "timeout" for r in records)}</td>'
-                     f'<td>{sum(r.status == "cancelled" for r in records)}</td>'
+                     f'<td>{outcomes["failed"] + outcomes["invalid"]} / '
+                     f'{outcomes["timeout"]}</td>'
+                     f'<td>{outcomes["cancelled"]}</td>'
                      f'<td>{_number(percentile(times, .5))} / {_number(percentile(times, .95))}</td>'
                      f'<td>{_number(percentile(first, .5))}</td>'
                      f'<td>{_number(percentile(generation, .5))} (n={len(generation)})</td>'

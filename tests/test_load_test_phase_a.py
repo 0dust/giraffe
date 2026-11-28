@@ -549,6 +549,104 @@ def group_fixture(c, records, arrival=False):
     return p, g
 
 
+@pytest.mark.parametrize("budget_status,budget_error", [
+    ("completed", "reasoning exhausted the output budget before an answer"),
+    ("failed", "response contained no useful answer output"),
+])
+def test_outcome_denominator_excludes_budget_and_client_stops(budget_status, budget_error):
+    c = config()
+    exhausted = record().model_copy(update={
+        "id": "budget", "valid": False, "score": None, "finish_reason": "length",
+        "reasoning": "still thinking", "output": "",
+        "status": budget_status, "error": budget_error,
+    })
+    invalid = record().model_copy(update={"id": "invalid", "valid": False, "score": None})
+    intentional = record().model_copy(update={"id": "intentional", "status": "timeout", "intentional": True})
+    cancelled = record().model_copy(update={"id": "cancelled", "status": "cancelled"})
+    records = [record(), exhausted, invalid, intentional, cancelled]
+    p, g = group_fixture(c, records)
+    assert g["error_denominator"] == 2
+    assert g["error_percent"] == 50
+    assert g["failed"] == 1 and g["timed_out"] == 0
+    assert g["reasoning_budget_exhausted"] == 1
+    assert g["intentional_stop"] == 1 and g["cancelled"] == 1
+    c.load_test.pass_criteria.max_error_percent = 100
+    assert score_group(c.load_test, p, g, records)["reason_code"] == "cancelled"
+
+
+def test_intentional_cancellation_still_makes_load_inconclusive():
+    c = config()
+    rows = [record(), record().model_copy(update={
+        "id": "client_cancel", "status": "cancelled", "intentional": True,
+    })]
+    p, g = group_fixture(c, rows)
+    assert g["error_denominator"] == 1 and g["error_percent"] == 0
+    assert g["outcome_counts"]["cancelled"] == 0 and g["intentional_stop"] == 1
+    assert score_group(c.load_test, p, g, rows)["reason_code"] == "cancelled"
+
+
+@pytest.mark.parametrize("server_failure", [False, True])
+def test_local_preparation_failure_prevents_group_and_point_pass(server_failure):
+    from giraffe.load_test import assess_point
+    from giraffe.request_outcome import preparation_failure_reason
+
+    c = config()
+    rows = [record(), record().model_copy(update={
+        "id": "local", "status": "failed", "valid": False, "score": None,
+        "not_dispatched": True, "dispatch_ms": None,
+    })]
+    if server_failure:
+        rows.append(record().model_copy(update={
+            "id": "invalid", "valid": False, "score": None,
+        }))
+    p, g = group_fixture(c, rows)
+    expected = "fail" if server_failure else "inconclusive"
+    assert score_group(c.load_test, p, g, rows)["status"] == expected
+    run = SimpleNamespace(config=c, records=rows, max_lag_ms=0)
+    assess_point(run, c.targets[0], c.load_test, p, rows)
+    assert p["status"] == expected
+    assert all(group["status"] != "pass" for group in p["groups"])
+    assert p["outcome_counts"]["not_dispatched"] == 1
+    if not server_failure:
+        assert p["reason"] == g["reason"] == preparation_failure_reason(rows)
+        assert g["error_denominator"] == 1 and g["error_percent"] == 0
+
+
+def test_invalid_completion_counts_as_origin_failure():
+    from giraffe.load_test import assess_point
+
+    c = config()
+    rows = [record().model_copy(update={
+        "id": origin, "valid": False, "score": None,
+        "load_point": {"shape": "short_short", "origin": origin, "burst_index": 0},
+    }) for origin in ("arrival", "burst")]
+    p, _ = group_fixture(c, rows)
+    run = SimpleNamespace(config=c, records=rows, max_lag_ms=0)
+    assess_point(run, c.targets[0], c.load_test, p, rows)
+    assert p["response_by_origin"]["arrival"]["failed"] == 1
+    assert p["response_by_origin"]["burst"]["failed"] == 1
+
+
+def test_legacy_concurrent_outcome_denominator_excludes_budget():
+    from giraffe.concurrent_load import measurements as concurrent_measurements
+    from giraffe.models import ConcurrentLoad
+
+    c = config()
+    settings = ConcurrentLoad()
+    rows = [record(), record().model_copy(update={"id": "invalid", "valid": False, "score": None}),
+        record().model_copy(update={
+            "id": "budget", "valid": False, "score": None, "finish_reason": "length",
+            "reasoning": "still thinking", "output": "",
+            "error": "reasoning exhausted the output budget before an answer",
+        })]
+    p, _ = group_fixture(c, rows)
+    p["shape"] = "short_short"
+    run = SimpleNamespace(config=c, records=rows, max_lag_ms=0)
+    concurrent_measurements(run, c.targets[0], settings, p, rows)
+    assert p["error_denominator"] == 2 and p["error_percent"] == 50
+    assert p["reasoning_budget_exhausted"] == 1 and p["failed"] == 1
+
+
 def test_per_response_not_p95_and_arrival_clock():
     c = config()
     c.load_test.pass_criteria.max_completion_ms = 100
@@ -1207,3 +1305,24 @@ async def test_extension_honors_existing_stops(stop, monkeypatch):
     assert point["cut_short"]
     assert point["window_extension"]["sending_seconds"] > .05
     assert f"It stopped early: {point['window_reason']}." in point["reason"]
+
+
+@pytest.mark.parametrize("field,code", [("blocked", "context_exceeded"),
+                                       ("execution_error", "internal_error")])
+def test_preparation_failure_preserves_blocked_load_group_and_point(field, code):
+    from giraffe.load_test import assess_point
+
+    c = config()
+    rows = [record(), record().model_copy(update={
+        "id": "local", "status": "failed", "valid": False, "score": None,
+        "not_dispatched": True, "dispatch_ms": None})]
+    p, group = group_fixture(c, rows)
+    p[field] = "Original blocking explanation."
+    score_group(c.load_test, p, group, rows)
+    assert group["status"] == "blocked"
+    assert group["reason_code"] == code
+    assert group["reason"] == p[field]
+    assess_point(SimpleNamespace(config=c, records=rows, max_lag_ms=0), c.targets[0], c.load_test, p, rows)
+    assert p["status"] == "blocked"
+    assert p["reason_code"] == code
+    assert p["reason"] == "Original blocking explanation."

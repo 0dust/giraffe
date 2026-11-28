@@ -16,6 +16,46 @@ def test_identical_runs_are_comparable():
     assert target["reasons"] == target["reason_details"] == []
 
 
+@pytest.mark.parametrize("previous_version", [None, 1, 2])
+def test_outcome_counting_version_requires_matching_baseline(previous_version):
+    current = make_report()
+    current.manifest["outcome_counting_version"] = 2
+    previous = current.model_copy(deep=True)
+    if previous_version is None:
+        del previous.manifest["outcome_counting_version"]
+    else:
+        previous.manifest["outcome_counting_version"] = previous_version
+    result = compare_baseline(current, previous)
+    target = result.baseline["targets"][0]
+    details = [detail for detail in target["reason_details"]
+               if detail["code"] == "outcome_counting_differs"]
+    if previous_version == 2:
+        assert details == []
+        assert result.baseline["comparability"] == target["comparability"] == "comparable"
+    else:
+        assert details == [{"code": "outcome_counting_differs",
+                            "text": "Request outcome counting rules differ; rerun the baseline."}]
+        assert result.baseline["comparability"] == target["comparability"] == "not_comparable"
+
+
+@pytest.mark.usefixtures("local_tokenizer")
+def test_access_only_comparison_retains_outcome_counting_reason():
+    from giraffe.models import CheckResult
+    from tests.test_gateway_access import config
+    from tests.test_web import report
+
+    current = report(config())
+    current.checks = [CheckResult(id="gateway_access", target="proxy", title="Access", status="pass", summary="Observed")]
+    current.manifest.update(gateway_access_workload_version=1, outcome_counting_version=2)
+    previous = current.model_copy(deep=True)
+    del previous.manifest["outcome_counting_version"]
+    result = compare_baseline(current, previous)
+    target = result.baseline["targets"][0]
+    assert target["reasons"] == ["Request outcome counting rules differ; rerun the baseline."]
+    assert target["reason_details"][0]["code"] == "outcome_counting_differs"
+    assert target["comparability"] == result.baseline["comparability"] == "not_comparable"
+
+
 @pytest.mark.parametrize("codes,expected", [
     ([], "comparable"), (["setting_missing"], "unknown"),
     (["setting_unknown", "comparison_unavailable"], "unknown"),

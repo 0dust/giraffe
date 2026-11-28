@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from .stats import median, percentile
 from .models import MAX_PLANNED_ARRIVALS, Limits, RequestRecord, RequestSpec, TrafficConfig
 from .timing import qualify, qualified_violations
+from .request_outcome import count_outcomes, preparation_failure_reason, request_outcome
 
 
 AUTHORITATIVE_TERMINATION_REASONS = {
@@ -128,17 +129,18 @@ def _timing(record: RequestRecord, limits: Limits) -> tuple[bool, bool]:
 
 
 def _record_stats(records: list[RequestRecord], limits: Limits) -> dict:
-    completed = [r for r in records if r.status == "completed" and r.valid]
+    outcomes = count_outcomes(records)
+    completed = [r for r in records if request_outcome(r) == "ok"]
     scored = [r for r in completed if r.score is not None]
     timings = [_timing(r, limits) for r in completed]
     good = sum(r.score is True and not bad and not missing
                for r, (bad, missing) in zip(completed, timings, strict=True))
     result = {
+        **outcomes,
+        "outcome_counts": outcomes,
         "completed": len(completed),
-        "failed": sum(r.status == "failed" or (r.status == "completed" and not r.valid)
-                      for r in records),
-        "timed_out": sum(r.status == "timeout" for r in records),
-        "cancelled": sum(r.status == "cancelled" for r in records),
+        "failed": outcomes["failed"] + outcomes["invalid"],
+        "timed_out": outcomes["timeout"],
         "scored": len(scored), "correct": sum(r.score is True for r in scored),
         "correctness": sum(r.score is True for r in scored) / len(scored) if scored else None,
         "good": good, "timing_violations": sum(bad for bad, _ in timings),
@@ -362,6 +364,7 @@ async def run_stage(
         record.arrival_first_output_ms = (lag_ms + record.first_output_ms
                                            if record.first_output_ms is not None else None)
         record.arrival_elapsed_ms = lag_ms + record.elapsed_ms
+        # Preserve transport cancellation provenance, including designed stops.
         if record.status == "cancelled" and record.load_point is not None:
             if record.termination_reason not in AUTHORITATIVE_TERMINATION_REASONS:
                 record.error = (
@@ -544,11 +547,16 @@ def finalize_stage(evidence: StageEvidence, limits: Limits) -> dict:
     started = counts["started"] + counts["cancelled"]
     not_offered = counts["not_offered"] + counts["dispatching"]
     stats = _record_stats([record for _, record in records], limits)
+    local_failure = preparation_failure_reason(record for _, record in records)
+    # outcome_counts partitions records; escaped execution errors have no record.
     stats["failed"] += evidence.execution_errors
+    stats["errors"] += evidence.execution_errors
+    stats["evaluated"] += evidence.execution_errors
     recorded_indices = {index for index, _ in records}
     stats["cancelled"] += sum(outcome == "cancelled" and index not in recorded_indices
                               for index, outcome in enumerate(outcomes))
-    error_rate = (stats["failed"] + stats["timed_out"]) / started if started else None
+    error_rate = stats["errors"] / stats["evaluated"] if stats["evaluated"] else None
+    stats["error_rate"] = error_rate
     generator_limited = bool(counts["dropped_local"] or counts["dropped_late"] or evidence.overflow)
     fully_offered = not (not_offered or generator_limited or evidence.interrupted)
     service_failure = error_rate is not None and error_rate > limits.max_error_rate
@@ -645,7 +653,9 @@ def finalize_stage(evidence: StageEvidence, limits: Limits) -> dict:
         if not all_cases_scored:
             reasons.append("An active unscored case prevents a full-pack correct-capacity claim.")
     failed = service_failure or answer_failure or timing_failure
-    passed = bool(not failed and fully_offered and enough_samples and latency_configured
+    if local_failure and not failed:
+        reasons.append(local_failure)
+    passed = bool(not failed and not local_failure and fully_offered and enough_samples and latency_configured
                     and not evidence.drain_expired and not stats["missing_timing"]
                     and not stats["unscored_completions"] and not stats["cancelled"]
                     and coverage_complete and all_cases_scored)
@@ -657,6 +667,13 @@ def finalize_stage(evidence: StageEvidence, limits: Limits) -> dict:
         window_records = [record for index, record in records if index in indices]
         window_counts = Counter(outcomes[index] for index in indices)
         window_stats = _record_stats(window_records, limits)
+        execution_errors = sum(outcomes[index] == "started" and index not in recorded_indices
+                               for index in indices)
+        window_stats["failed"] += execution_errors
+        window_stats["errors"] += execution_errors
+        window_stats["evaluated"] += execution_errors
+        window_stats["error_rate"] = (window_stats["errors"] / window_stats["evaluated"]
+                                      if window_stats["evaluated"] else None)
         window_stats["cancelled"] += sum(outcomes[index] == "cancelled" and index not in recorded_indices
                                           for index in indices)
         # Qualified request IDs belong to the stage; window counts remain raw.
@@ -670,8 +687,6 @@ def finalize_stage(evidence: StageEvidence, limits: Limits) -> dict:
             "pending_at_end": sum(begin <= upper < end for begin, end in evidence.lifetimes),
             "time_weighted_in_flight": sum(max(0, min(end, upper)-max(begin, lower))
                                            for begin, end in evidence.lifetimes) / (upper-lower),
-            "error_rate": ((window_stats["failed"] + window_stats["timed_out"]) / window_started
-                           if window_started else None),
             **window_stats,
         })
     # Theil-Sen on at most 64 evenly sampled requests bounds pairwise work.
@@ -684,7 +699,7 @@ def finalize_stage(evidence: StageEvidence, limits: Limits) -> dict:
     # At 10/20 s this rejects >=95% of overload seeds while flagging <=2% of
     # healthy seeds (see regression).
     latencies = sorted((schedule[index][0], record.arrival_elapsed_ms / 1000)
-                       for index, record in records if record.valid and record.status == "completed"
+                       for index, record in records if request_outcome(record) == "ok"
                        and record.arrival_elapsed_ms is not None)
     queue_growth = stability_unverified = False
     short_poisson = evidence.arrival == "poisson" and len(latencies) < 80

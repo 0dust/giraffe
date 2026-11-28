@@ -27,7 +27,8 @@ from giraffe.concurrent_load import (
     later_reservation,
     window_cause,
 )
-from giraffe.fixtures import deterministic_options, reasoning_budget
+from giraffe.fixtures import deterministic_options
+from giraffe.request_outcome import count_outcomes, preparation_failure_reason, request_outcome
 from giraffe.models import (
     CheckResult,
     MAX_PLANNED_ARRIVALS,
@@ -132,7 +133,7 @@ def _class_label(settings, size, *, floors=None):
 
 def input_qualification(settings, size, records, *, floors=None):
     # Selection estimates intentionally never enter this measurement evidence.
-    valid = [r for r in records if r.valid and r.status == "completed" and not reasoning_budget(r)]
+    valid = [r for r in records if request_outcome(r) == "ok"]
     known = [r.input_tokens for r in valid if r.input_tokens is not None]
     count = sum(_in_input_class(settings, size, n, floors=floors) for n in known)
     outside = len(known) - count
@@ -153,6 +154,7 @@ def input_qualification(settings, size, records, *, floors=None):
 
 
 def _source_tokens(source, records=()):
+    # Source sizing preserves saved-question selection; it does not count outcomes.
     measured = [r.input_tokens for r in records
                 if r.fixture_id == source.fixture_id and r.valid and r.input_tokens is not None]
     if measured:
@@ -966,6 +968,7 @@ async def concurrent_window(run, target, client, settings, point, calibration, *
         records = [record for record in run.records if record.target == target.name
                    and record.scenario == scenario]
     now = time.monotonic()
+    # Transport cancellation provenance includes designed stops as well as run stops.
     if any(r.status == "cancelled" for r in records) and reason in {
         None, "time limit reached", states.STOP_MAX_DURATION
     }:
@@ -1145,8 +1148,7 @@ def interference_measurements(records, windows, delay_windows=(), *, mode="long_
         r
         for r in records
         if r.load_point.get("role") == "short_stream"
-        and r.valid
-        and r.status == "completed"
+        and request_outcome(r) == "ok"
         and (reverse or r.answer_chunks >= 2)
     ]
     matched = {"baseline": [], "probe": []}
@@ -1155,7 +1157,7 @@ def interference_measurements(records, windows, delay_windows=(), *, mode="long_
         if reverse:
             window = answer_window(probe)
             if (not window or probe.stream is not True or probe.answer_chunks < 2
-                    or not probe.valid or probe.status != "completed"
+                    or request_outcome(probe) != "ok"
                     or probe.output_tokens is None or probe.output_tokens <= short_output_cap):
                 continue
             a, b = window
@@ -1194,7 +1196,7 @@ def interference_measurements(records, windows, delay_windows=(), *, mode="long_
         }
     a, b = result["baseline"]["completion_median_ms"], result["probe"]["completion_median_ms"]
     pauses = [result[k]["longest_stream_pause_ms"] for k in ("baseline", "probe")]
-    valid_shorts = [r for r in records if r.load_point.get("role") == "short_stream" and r.valid and r.status == "completed"]
+    valid_shorts = [r for r in records if r.load_point.get("role") == "short_stream" and request_outcome(r) == "ok"]
     buffered = sum(r.answer_chunks < 2 for r in valid_shorts)
     result.update(
         mode=mode,
@@ -1221,7 +1223,7 @@ def interference_measurements(records, windows, delay_windows=(), *, mode="long_
             "actual_output_tokens": _distribution([r.output_tokens for r in probes if r.output_tokens is not None]),
             "unknown_output_count": sum(r.output_tokens is None for r in probes),
             "background_request_count": len(probes),
-            "qualified_request_ids": [r.id for r in probes if r.stream is True and r.valid and r.status == "completed"
+            "qualified_request_ids": [r.id for r in probes if r.stream is True and request_outcome(r) == "ok"
                                       and r.answer_chunks >= 2 and answer_window(r) is not None
                                       and r.output_tokens is not None and r.output_tokens > short_output_cap],
         }
@@ -1235,15 +1237,17 @@ def measurements(run, target, settings, point, records, shape):
     criteria = settings.pass_criteria
     limits = criteria.timing_limits()
     rows = [r for r in records if r.load_point.get("shape") == shape]
-    valid = [r for r in rows if r.valid and r.status == "completed" and not reasoning_budget(r)]
+    outcomes = count_outcomes(rows)
+    valid = [r for r in rows if request_outcome(r) == "ok"]
+    # Completed throughput retains every completed transport, including excluded budgets.
     completed = [r for r in rows if r.status == "completed"]
     failed = [
         r
         for r in rows
-        if not reasoning_budget(r)
-        and (r.status == "failed" or r.status == "completed" and not r.valid)
+        if request_outcome(r) in {"failed", "invalid"}
     ]
-    timed_out = [r for r in rows if r.status == "timeout"]
+    timed_out = [r for r in rows if request_outcome(r) == "timeout"]
+    # Any cancellation makes load evidence inconclusive, including intentional stops.
     cancelled = [r for r in rows if r.status == "cancelled"]
     scored = [r for r in valid if r.score is not None]
     offers = [o for o in point.get("offers", []) if o["shape"] == shape]
@@ -1251,7 +1255,7 @@ def measurements(run, target, settings, point, records, shape):
     late = sum(o.get("outcome") == "dropped_late" for o in offers)
     not_offered = sum(o.get("outcome") in {"not_offered", "dispatching"} for o in offers)
     arrival = point["pattern"] not in {"concurrent", "interference"}
-    unfinished = [r for r in rows if r.status in {"timeout", "failed"}]
+    unfinished = [r for r in rows if request_outcome(r) in {"timeout", "failed"}]
     quality = run_quality(run, [*valid, *unfinished], target.name, configured_metrics(limits))
     qualified = qualified_violations(valid, limits, quality, arrival=arrival)
     raw = (
@@ -1319,7 +1323,7 @@ def measurements(run, target, settings, point, records, shape):
         "output_method": "endpoint-reported completion tokens; unknown when absent",
         "generation_speed_method": "client-observed estimate after first answer read; tokens apportioned by answer characters",
     }
-    denominator = len(rows) - len(cancelled)
+    denominator = outcomes["evaluated"]
     group = {
         k: point[k]
         for k in ("id", "type", "workload", "pattern", "level", "rate", "bursts", "source")
@@ -1349,13 +1353,16 @@ def measurements(run, target, settings, point, records, shape):
         not_offered=not_offered,
         completed=len(completed),
         valid=len(valid),
-        reasoning_budget_exhausted=sum(reasoning_budget(r) for r in rows),
+        reasoning_budget_exhausted=outcomes["budget_exhausted"],
+        intentional_stop=outcomes["intentional_stop"],
+        not_dispatched=outcomes["not_dispatched"],
+        outcome_counts=outcomes,
         failed=len(failed),
         timed_out=len(timed_out),
         cancelled=len(cancelled),
         error_denominator=denominator,
-        error_denominator_description="Dispatched responses excluding cancellations; local drops are not sent and are excluded.",
-        error_percent=(len(failed) + len(timed_out)) / denominator * 100 if denominator else 0,
+        error_denominator_description="OK responses plus invalid completions, failures and timeouts; intentional stops, cancellations, exhausted reasoning budgets, preparation failures and unsent offers are excluded.",
+        error_percent=outcomes["error_rate"] * 100 if outcomes["error_rate"] is not None else None,
         scored=len(scored),
         correct=sum(r.score is True for r in scored),
         refused=sum(r.score is False and r.refused for r in scored),
@@ -1448,8 +1455,12 @@ def measurements(run, target, settings, point, records, shape):
 
 def score_group(settings, point, group, records):
     c = settings.pass_criteria
+    rows = [r for r in records if r.load_point.get("shape") == group["shape"]]
+    local_failure = preparation_failure_reason(rows)
 
     def result(status, code, reason):
+        if local_failure and status == "pass":
+            status, code, reason = "inconclusive", "not_dispatched", local_failure
         group.update(status=status, reason_code=code, reason=reason)
         return group
 
@@ -1461,7 +1472,6 @@ def score_group(settings, point, group, records):
         return result("fail", "calibration_failed", point["calibration_failure"])
     if group["error_percent"] is not None and group["error_percent"] > c.max_error_percent:
         return result("fail", "error_rate", "Endpoint errors/timeouts exceed Errors allowed (%).")
-    rows = [r for r in records if r.load_point.get("shape") == group["shape"]]
     if any(
         r.completion_tokens is not None
         and r.requested_max_tokens
@@ -1618,11 +1628,14 @@ def assess_point(run, target, settings, point, records):
         "timed_out",
         "cancelled",
         "reasoning_budget_exhausted",
+        "intentional_stop",
+        "not_dispatched",
         "local_drops",
         "late_arrivals",
         "not_sent",
     ):
         point[field] = sum(g[field] for g in point["groups"])
+    point["outcome_counts"] = count_outcomes(records)
     status = aggregate([g["status"] for g in point["groups"]])
     reason = next((g["reason"] for g in point["groups"] if g["status"] == status), "No evidence.")
     if point["type"] == "interference":
@@ -1653,7 +1666,7 @@ def assess_point(run, target, settings, point, records):
                 for r in records
                 if r.load_point.get("phase") == window["phase"]
                 and r.load_point.get("role") == role
-                and (not serial_control or r.valid and r.status == "completed"
+                and (not serial_control or request_outcome(r) == "ok"
                      and r.dispatch_ms is not None and r.completed_ms is not None)
             ]
             average, client_peak = inflight(shorts, window["sending_start_ms"], window["sending_end_ms"])
@@ -1716,8 +1729,13 @@ def assess_point(run, target, settings, point, records):
                         "fail",
                         "Short-answer completion slowdown exceeded the workload limit.",
                     )
-    code = next((g["reason_code"] for g in point["groups"] if g["status"] == status), "comparison")
-    if point.get("window_extension_note"):
+    local_failure = preparation_failure_reason(records)
+    preparation_blocks_pass = bool(local_failure and status == "pass")
+    if preparation_blocks_pass:
+        status, reason = "inconclusive", local_failure
+    code = ("not_dispatched" if preparation_blocks_pass else
+            next((g["reason_code"] for g in point["groups"] if g["status"] == status), "comparison"))
+    if point.get("window_extension_note") and not preparation_blocks_pass:
         reason += " " + point["window_extension_note"]
     point.update(status=status, reason=reason, reason_code=code)
     bursts = {o["burst_index"]: [] for o in point.get("offers", []) if o.get("origin") == "burst"}
@@ -1750,7 +1768,7 @@ def assess_point(run, target, settings, point, records):
             "completion_p50_ms": percentile(
                 [r.arrival_elapsed_ms for r in rows if r.arrival_elapsed_ms is not None], 0.5
             ),
-            "failed": sum(r.status in {"failed", "timeout"} for r in rows),
+            "failed": count_outcomes(rows)["errors"],
         }
         for origin in ("arrival", "burst")
         if (rows := [r for r in records if r.load_point.get("origin") == origin])

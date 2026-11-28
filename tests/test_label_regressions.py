@@ -37,11 +37,13 @@ async def test_plain_requests_keep_empty_workloads_and_live_record_contract():
                 "read_output_tokens_source",
                 "max_stream_gap_ms", "input_tokens", "output_tokens",
                 "completion_tokens", "reasoning_tokens", "cached_prompt_tokens", "finish_reason",
-                "request_timeout_seconds", "termination_reason", "termination_limit_seconds"}
+                "request_timeout_seconds", "termination_reason", "termination_limit_seconds", "not_dispatched", "outcome"}
     for event in events:
         assert "workload" not in event
         if event["event"] == "request_completed":
             assert set(event["request"]) == expected
+            assert event["request"]["outcome"] == "ok"
+            assert event["request"]["not_dispatched"] is False
             assert not {"output", "reasoning", "tool_calls", "assistant_message", "evaluation",
                         "logprob_evidence", "content_reads", "reasoning_reads", "output_events"} & event["request"].keys()
             assert all(not isinstance(value, (dict, list)) for key, value in event["request"].items() if key != "check_ids")
