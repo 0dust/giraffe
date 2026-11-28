@@ -22,7 +22,9 @@ a:focus-visible,summary:focus-visible{outline:2px solid var(--accent);outline-of
 @media(max-width:800px){main{padding:14px}.html-throughput{grid-template-columns:1fr}.html-two{grid-template-columns:1fr}.html-section>header{display:block}.html-section header p{text-align:left}.html-cards{grid-template-columns:repeat(2,minmax(0,1fr))}}
 """
 
-CHART_STYLE = """.html-chart-frame{position:relative;margin:16px 0}.html-chart-frame svg{height:240px;width:100%}.html-axis-label,.html-stage-label{position:absolute;color:var(--text-2);font:11px/1.3 var(--mono);pointer-events:none}.html-axis-label.x-min{left:5.33%;bottom:8%}.html-axis-label.x-max{right:4%;bottom:8%}.html-axis-label.y-max{left:0;top:10%}.html-axis-label.y-min{left:0;bottom:20%}.html-axis-label.x-title{left:5.33%;right:4%;bottom:0;text-align:center}.html-axis-label.y-title{left:5.33%;top:0}.html-stage-label{top:8%;max-width:18%;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}.html-transition{stroke:var(--surface);stroke-width:1;vector-effect:non-scaling-stroke}@media(max-width:640px){.html-chart-frame svg{height:220px}}"""
+CHART_STYLE = """.html-chart-frame{position:relative;margin:16px 0}.html-chart-frame svg{height:240px;width:100%}.html-axis-label,.html-stage-label{position:absolute;color:var(--text-2);font:11px/1.3 var(--mono)}.html-axis-label{pointer-events:none}.html-axis-label.x-min{left:5.33%;bottom:8%}.html-axis-label.x-max{right:4%;bottom:8%}.html-axis-label.y-max{left:0;top:10%}.html-axis-label.y-min{left:0;bottom:20%}.html-axis-label.x-title{left:5.33%;right:4%;bottom:0;text-align:center}.html-axis-label.y-title{left:5.33%;top:0}
+.html-stage-labels{position:relative;height:15px;margin-top:12px}.html-stage-labels+.html-chart-frame{margin-top:6px}.html-stage-label{top:0;margin-right:4px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+.html-transition{stroke:var(--surface);stroke-width:1;vector-effect:non-scaling-stroke}@media(max-width:640px){.html-chart-frame svg{height:220px}}"""
 COLORS = ("#b5b2aa", "#9aa4ff", "#f5b544", "#3dd68c", "#63c8d2")
 COMMON_GUIDANCE = {"No eligible observations in this scope.", "Collect eligible observations for this scope."}
 
@@ -227,10 +229,10 @@ def decimate(points, buckets=120):
     return [points[index] for index in indices]
 
 
-def _chart_frame(svg, xmin, xmax, ymin, ymax, xlabel, ylabel, stage_labels=''):
+def _chart_frame(svg, xmin, xmax, ymin, ymax, xlabel, ylabel):
     # Text is HTML in CSS pixels, outside the scaled SVG coordinate system.
     # The portable report needs neither a script nor a fixed minimum width.
-    return ('<div class="html-chart-frame">' + svg + stage_labels
+    return ('<div class="html-chart-frame">' + svg
             + ''.join('<span class="html-axis-label ' + kind + '">' + _e(label) + '</span>'
                       for kind, label in (('x-min', _fmt(xmin)), ('x-max', _fmt(xmax)),
                                           ('y-min', _fmt(ymin)), ('y-max', _fmt(ymax)),
@@ -274,8 +276,12 @@ def _chart(title, series, *, xlabel="Request number · dispatch order", ylabel="
         left, right = max(xmin, band.get('elapsed_s', xmin)), min(xmax, band.get('end_elapsed_s', xmax))
         if right <= left:
             continue
-        body.append(f'<rect x="{x(left):.2f}" y="22" width="{x(right)-x(left):.2f}" height="198" fill="#f5b544" opacity=".04"/>')
-        stage_labels.append(f'<span class="html-stage-label" style="left:{x(left)/9:.2f}%">{_e(band.get("label", ""))}</span>')
+        start, end = x(left), x(right)
+        label = _e(band.get('label', ''))
+        level = band.get('intended_concurrency')
+        stage_text = f'{_fmt(level)} at once' if band.get('kind') == 'concurrency' and _number(level) else label
+        body.append(f'<rect x="{start:.2f}" y="22" width="{end-start:.2f}" height="198" fill="#f5b544" opacity=".04"><title>{label}</title></rect>')
+        stage_labels.append(f'<span class="html-stage-label" style="left:{start/9:.3f}%;right:{100-end/9:.3f}%" title="{label}">{stage_text}</span>')
     for index, (name, points) in enumerate(series):
         drawn = decimate(points)
         path = f'M{x(drawn[0][0]):.2f},{y(drawn[0][1]):.2f}'
@@ -290,7 +296,8 @@ def _chart(title, series, *, xlabel="Request number · dispatch order", ylabel="
             + '<path d="M48,24V220H864" fill="none" stroke="#555159"/>' + ''.join(body)
             + '</svg>')
     legend = '<div class="html-legend">' + ''.join(f'<span><i style="color:{COLORS[index % len(COLORS)]}"></i>{_e(name)}</span>' for index, (name, _) in enumerate(series)) + '</div>'
-    return (legend + _chart_frame(svg, xmin, xmax, ymin, ymax, xlabel, ylabel, ''.join(stage_labels))
+    stage_row = '<div class="html-stage-labels">' + ''.join(stage_labels) + '</div>' if stage_labels else ''
+    return (legend + stage_row + _chart_frame(svg, xmin, xmax, ymin, ymax, xlabel, ylabel)
             + '<p class="html-note">Min/max decimation for drawing; every request included in metrics.</p>')
 
 

@@ -96,6 +96,27 @@ def test_standalone_chart_decimation_preserves_extrema_and_bounds_geometry():
     assert '.html-throughput{grid-template-columns:1fr}' in html
 
 
+def test_standalone_concurrency_labels_fit_their_schedule_bands_above_the_plot():
+    from giraffe.performance_html import _chart
+
+    html = _chart('Actual and intended concurrency', [('Actual', [(0, 1), (90, 2), (180, 0)])],
+                  xlabel='Elapsed seconds', step=True, bands=[
+                      {'elapsed_s': 0, 'end_elapsed_s': 89, 'label': 'Short input',
+                       'kind': 'concurrency', 'intended_concurrency': 1},
+                      {'elapsed_s': 89, 'end_elapsed_s': 90, 'label': 'Drain'},
+                      {'elapsed_s': 90, 'end_elapsed_s': 180, 'label': 'Short input'},
+                  ])
+    row, plot = html.split('<div class="html-chart-frame">', 1)
+    assert '<div class="html-stage-labels">' in row
+    labels = re.findall(r'left:([\d.]+)%;right:([\d.]+)%" title="([^"]+)"', row)
+    assert [label for _, _, label in labels] == ['Short input', 'Drain', 'Short input']
+    assert 'title="Short input">1 at once</span>' in row
+    assert 0 < 100 - float(labels[1][0]) - float(labels[1][1]) < 1
+    for (_, right, _), (left, _, _) in zip(labels, labels[1:]):
+        assert abs(100 - float(right) - float(left)) < 0.001
+    assert '<title>Drain</title>' in plot
+
+
 def test_standalone_old_empty_reports_show_availability_without_empty_charts():
     report = RunReport(run_id='old', started_at='2026-01-01', finished_at='2026-01-01',
                        overall='inconclusive', manifest={'config': {'targets': [{'name': 'old'}]}})
