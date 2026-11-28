@@ -474,3 +474,178 @@ async def test_stress_phase_cancellation_only_aborts_when_run_stopped(run_stoppe
     await run.request(config.targets[0], Cancelled(status="cancelled"), spec)
     assert (run.reason is not None) is run_stopped
     assert ("recovery" in run.unfinished["t"]) is run_stopped
+
+
+async def test_serving_reports_rate_limits_separately_and_honors_retry_after(monkeypatch):
+    dispatch = []
+
+    def handler(request):
+        if request.method != "POST":
+            return httpx.Response(404)
+        dispatch.append(asyncio.get_running_loop().time())
+        if len(dispatch) in {1, 3}:
+            return httpx.Response(429, headers={"Retry-After": "0.05"})
+        return httpx.Response(200, json={"choices": [
+            {"message": {"content": "K7P4"}, "finish_reason": "stop"},
+        ]})
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _HTTPX_CLIENT(
+        transport=httpx.MockTransport(handler), **kw))
+    report = await runner.run_suite(cfg(stream=False, stop_after_errors=2))
+    serving = check(report, "serving")
+
+    assert report.abort_reason is None
+    assert len(dispatch) == len(report.requests) == 7
+    assert serving.status == "inconclusive"
+    assert serving.metrics["rate_limited"] == 2
+    assert serving.metrics["error_rate"] == 0
+    assert "HTTP 429" in serving.summary
+    for index in (0, 2):
+        assert dispatch[index + 1] - dispatch[index] >= .05
+    assert [r.retry_after_seconds for r in report.requests if r.http_status == 429] == [.05, .05]
+
+
+async def test_429_without_retry_after_uses_fallback_and_distinct_stop(monkeypatch):
+    dispatch = []
+
+    def handler(request):
+        if request.method != "POST":
+            return httpx.Response(404)
+        dispatch.append(asyncio.get_running_loop().time())
+        return httpx.Response(429, headers={"Retry-After": "invalid"} if len(dispatch) > 1 else {})
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _HTTPX_CLIENT(
+        transport=httpx.MockTransport(handler), **kw))
+    report = await runner.run_suite(cfg(stream=False, stop_after_errors=2))
+
+    assert report.abort_reason == "rate limit threshold reached"
+    assert len(dispatch) == 2
+    assert dispatch[1] - dispatch[0] >= 1
+    assert check(report, "serving").metrics["rate_limited"] == 2
+    assert check(report, "serving").metrics["error_rate"] is None
+
+
+@pytest.mark.parametrize("connections", [1, 2])
+async def test_429_headers_pause_dispatch_with_a_slow_body(monkeypatch, connections):
+    requested = asyncio.Event()
+    send_headers = asyncio.Event()
+    reading_body = asyncio.Event()
+    release_body = asyncio.Event()
+    dispatch = []
+
+    class SlowError(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            reading_body.set()
+            await release_body.wait()
+            yield b"rate limited"
+
+    async def handler(request):
+        dispatch.append(asyncio.get_running_loop().time())
+        if len(dispatch) == 1:
+            requested.set()
+            await send_headers.wait()
+            return httpx.Response(429, headers={"Retry-After": "0.1"}, stream=SlowError())
+        release_body.set()
+        return httpx.Response(200, json={"choices": [
+            {"message": {"content": "ok"}, "finish_reason": "stop"},
+        ]})
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _HTTPX_CLIENT(
+        transport=httpx.MockTransport(handler), **kw))
+    config = cfg(concurrency=2, stream=False)
+    target = config.targets[0]
+    run = runner._Run(config, None, None)
+    spec = RequestSpec(fixture_id="test", scenario="warm", check_ids=["serving"], messages=[])
+
+    async with LLMClient(target, config, max_connections=connections) as client:
+        async with asyncio.timeout(3), asyncio.TaskGroup() as tasks:
+            first = tasks.create_task(run.request(target, client, spec, slot_reserved=True))
+            await requested.wait()
+            if connections == 1:
+                # The request is waiting for the only transport lane when headers arrive.
+                second = tasks.create_task(run.request(target, client, spec, slot_reserved=True))
+                await asyncio.sleep(0)
+            send_headers.set()
+            await reading_body.wait()
+            headers_at = asyncio.get_running_loop().time()
+            if connections == 1:
+                release_body.set()
+            else:
+                second = tasks.create_task(run.request(target, client, spec, slot_reserved=True))
+
+    assert first.result().http_status == 429
+    assert second.result().valid
+    assert dispatch[1] - headers_at >= .09
+    assert second.result().elapsed_ms < 50
+
+
+async def test_load_cooldown_expiring_after_sending_window_does_not_dispatch(monkeypatch):
+    from giraffe import load_test
+    from tests.test_load_test_phase_a import config as load_config
+
+    attempts = []
+
+    def handler(request):
+        attempts.append(asyncio.get_running_loop().time())
+        return httpx.Response(429, headers={"Retry-After": "1"})
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _HTTPX_CLIENT(
+        transport=httpx.MockTransport(handler), **kw))
+    config = load_config()
+    config.load_test.schedule.duration_seconds = .05
+    run = runner._Run(config, None, None)
+    target = config.targets[0]
+    point, = load_test.test_points(config.load_test)
+    point.update(type="mixed", budget_start=0)
+    spec = RequestSpec(fixture_id="load", scenario=point["id"], check_ids=["load"], messages=[])
+    monkeypatch.setattr(load_test, "build_spec", lambda *args, **kwargs: spec)
+
+    async with LLMClient(target, config) as client:
+        records, _ = await load_test.concurrent_window(run, target, client, config.load_test, point, {})
+
+    assert len(attempts) == run.budget_used == run.attempted == len(records) == 1
+    assert records[0].http_status == 429
+
+
+async def test_cooling_target_skips_scheduled_offers_and_leaves_slot_for_peer(monkeypatch):
+    hosts = []
+
+    def handler(request):
+        hosts.append(request.url.host)
+        if request.url.host == "limited":
+            return httpx.Response(429, headers={"Retry-After": "10"})
+        return httpx.Response(200, json={"choices": [
+            {"message": {"content": "ok"}, "finish_reason": "stop"},
+        ]})
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _HTTPX_CLIENT(
+        transport=httpx.MockTransport(handler), **kw))
+    config = cfg(targets=[Target(name=name, model="m", url=f"http://{name}")
+                          for name in ("limited", "healthy")], stream=False, concurrency=1)
+    run = runner._Run(config, None, None)
+    limited, healthy = config.targets
+    spec = RequestSpec(fixture_id="test", scenario="warm", check_ids=["serving"], messages=[])
+
+    async with (LLMClient(limited, config) as limited_client,
+                LLMClient(healthy, config) as healthy_client):
+        assert (await run.request(limited, limited_client, spec)).http_status == 429
+        async with run.slot(False) as admitted:
+            assert admitted and run.reserve_offer(limited.name)
+            async with asyncio.timeout(.3):
+                skipped = await run.request(limited, limited_client, spec,
+                                            slot_reserved=True, budget_reserved=True)
+        assert skipped is None
+        assert limited.name not in run.unfinished or not run.unfinished[limited.name]
+
+        waiting = asyncio.create_task(run.request(limited, limited_client, spec))
+        try:
+            await asyncio.sleep(0)
+            async with asyncio.timeout(.3):
+                completed = await run.request(healthy, healthy_client, spec)
+            assert completed.valid
+        finally:
+            waiting.cancel()
+            await asyncio.gather(waiting, return_exceptions=True)
+
+    assert hosts == ["limited", "healthy"]
+    assert run.budget_used == 3 and run.attempted == 2

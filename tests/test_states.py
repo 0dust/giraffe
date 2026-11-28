@@ -116,7 +116,7 @@ def test_describe():
     }
     assert states.EXIT_CODE_BLOCKED == states.EXIT_CODES["blocked"] == 3
     assert states.STOP_REASONS == (states.STOP_CANCELLED_BY_USER, states.STOP_RUN_CANCELLED,
-        states.STOP_MAX_DURATION, states.STOP_REQUEST_BUDGET, states.STOP_ERROR_THRESHOLD)
+        states.STOP_MAX_DURATION, states.STOP_REQUEST_BUDGET, states.STOP_ERROR_THRESHOLD, states.STOP_RATE_LIMIT)
     assert capabilities()["states"] == description
 
 

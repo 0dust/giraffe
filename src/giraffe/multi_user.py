@@ -262,7 +262,7 @@ async def run_window(run, target, client, settings, load_settings, calibration, 
                 peers = []
                 trigger_expired = False
                 try:
-                    async with run.slot(False, cutoff) as admitted:
+                    async with run.slot(False, cutoff, target.name) as admitted:
                         if not admitted or closed or time.monotonic() >= cutoff:
                             return None
                         if not run.allowed(target.name):

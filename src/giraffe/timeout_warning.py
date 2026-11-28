@@ -46,8 +46,10 @@ class TimeoutWatch:
 
     def observe(self, record, elapsed_seconds: float, *, readiness=False, evidence_probe=False):
         reason = record.termination_reason or ""
-        if (reason in {"user_stop", "run_duration_limit", "memory_limit", "error_threshold",
-                       "endpoint_unresponsive", "workload_cancelled"} or reason.startswith("intentional_")
+        if (getattr(record, "http_status", None) == 429
+                or reason in {"user_stop", "run_duration_limit", "memory_limit", "error_threshold",
+                              "rate_limit_threshold", "endpoint_unresponsive", "workload_cancelled"}
+                or reason.startswith("intentional_")
                 or readiness or evidence_probe or record.intentional or record.scenario in {
                 "deadline_probe", "client_deadline", "client_cancel"}):
             return None

@@ -3162,7 +3162,7 @@ class RequestRecord(PersistedModel):
     @model_serializer(mode="wrap")
     def serialize_optional_evidence(self, handler):
         result = handler(self)
-        for name in ("identity", "gateway_evidence", "requested_stream_logprobs", "requested_stream_usage"):
+        for name in ("identity", "gateway_evidence", "retry_after_seconds", "requested_stream_logprobs", "requested_stream_usage"):
             if getattr(self, name) is None:
                 result.pop(name, None)
         return result
@@ -3185,6 +3185,7 @@ class RequestRecord(PersistedModel):
     started_at: str
     status: Literal["completed", "failed", "timeout", "cancelled"]
     http_status: int | None = None
+    retry_after_seconds: float | None = Field(default=None, ge=0)
     response_body_bytes: int = Field(default=0, ge=0)
     error: str | None = None
     request_timeout_seconds: float | None = None

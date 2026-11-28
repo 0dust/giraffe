@@ -29,6 +29,8 @@ def activate(watch, **updates):
     ({"termination_reason": "user_stop"}, {}),
     ({"termination_reason": "memory_limit"}, {}),
     ({"termination_reason": "error_threshold"}, {}),
+    ({"termination_reason": "rate_limit_threshold"}, {}),
+    ({"http_status": 429}, {}),
     ({"termination_reason": "endpoint_unresponsive"}, {}),
     ({}, {"readiness": True}), ({}, {"evidence_probe": True}),
 ])

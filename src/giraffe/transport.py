@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from contextlib import asynccontextmanager
-from typing import AsyncIterator, Callable
+from typing import AsyncIterator, Awaitable, Callable
 
 import httpx
 
@@ -73,7 +73,7 @@ class HTTPClientPool:
         return self._first.build_request(*args, **kwargs)
 
     async def send(self, request: httpx.Request, *, stream: bool = False,
-                   _before_send: Callable[[], None] | None = None) -> httpx.Response:
+                   _before_send: Callable[[], Awaitable[None]] | None = None) -> httpx.Response:
         if self._closed:
             raise RuntimeError("Cannot send a request after the client is closed")
         await self._slots.acquire()
@@ -87,7 +87,7 @@ class HTTPClientPool:
                 client = self._factory()
                 self._clients.append(client)
             if _before_send is not None:
-                _before_send()
+                await _before_send()
             response = await client.send(request, stream=stream)
         except BaseException as error:
             try:

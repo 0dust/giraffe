@@ -21,7 +21,7 @@ from .timing import qualify, qualified_violations
 
 
 AUTHORITATIVE_TERMINATION_REASONS = {
-    "endpoint_unresponsive", "user_stop", "memory_limit", "error_threshold", "run_duration_limit",
+    "endpoint_unresponsive", "user_stop", "memory_limit", "error_threshold", "rate_limit_threshold", "run_duration_limit",
 }
 
 

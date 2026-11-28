@@ -525,11 +525,14 @@ def request_status(record: Mapping[str, Any]) -> str:
 
 def request_result_text(record: Mapping[str, Any]) -> str:
     status = request_status(record)
+    if record.get("http_status") == 429 and status in {"failed", "timed_out"}:
+        return "HTTP 429 (rate limited)"
     reason = {"request_timeout": "Request timeout", "request_deadline": "Request timeout",
               "connect_timeout": "Connection timeout", "read_timeout": "Response read timeout",
               "write_timeout": "Request write timeout", "pool_timeout": "Connection pool timeout",
               "user_stop": "Stopped by user", "run_duration_limit": "Overall run time limit",
               "memory_limit": "Run memory limit", "error_threshold": "Run error threshold",
+              "rate_limit_threshold": "HTTP 429 rate limit threshold",
               "endpoint_unresponsive": "Endpoint unresponsive", "intentional_deadline": "Intentional test deadline",
               "intentional_cancellation": "Intentional test cancellation", "intentional_cancellation_deadline": "Intentional test cancellation",
               "generation_chunk_limit": "Intentional generated-chunk limit", "workload_cancelled": "Workload cancelled"}.get(record.get("termination_reason"))

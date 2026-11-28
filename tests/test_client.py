@@ -352,6 +352,27 @@ def setup_client(monkeypatch, chunks=None, *, body=None, timeout=1, stream=True,
     return LLMClient(target, config), transport_stream, calls
 
 
+@pytest.mark.parametrize(("header", "expected"), [
+    (" 2 ", 2), ("0", 0), ("0.25", .25),
+    ("Wed, 01 Jan 2025 00:00:07 GMT", 7),
+    ("Wed, 01 Jan 2025 00:00:00 GMT", 0),
+    ("Tuesday, 31-Dec-24 23:59:59 GMT", 0),
+    ("Wed Jan  1 00:00:07 2025", 7),
+    (None, None), ("-1", None), ("NaN", None), ("inf", None), ("bad", None),
+])
+def test_retry_after_parses_seconds_and_http_dates(monkeypatch, header, expected):
+    from datetime import datetime, timezone
+    from giraffe import client
+
+    class FrozenDate(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2025, 1, 1, tzinfo=timezone.utc)
+
+    monkeypatch.setattr(client, "datetime", FrozenDate)
+    assert client._retry_after_seconds(header) == expected
+
+
 def event(content=None, *, reasoning=None, finish=None, usage=None):
     delta = {}
     if content is not None:

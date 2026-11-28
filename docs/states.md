@@ -83,6 +83,7 @@ Repeated writes of the same run state are allowed.
 | `maximum run duration reached` | Run duration limit reached. | Yes |
 | `maximum request budget reached` | Request budget reached. | Yes |
 | `error threshold reached` | Error threshold reached. | Yes |
+| `rate limit threshold reached` | A target returned `stop_after_errors` consecutive HTTP 429 responses on ordinary requests. | Yes |
 
 Where you see it: `report.json` `abort_reason`.
 
