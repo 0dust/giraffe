@@ -1,6 +1,7 @@
 """Explain missing performance evidence using facts from one request window."""
 from __future__ import annotations
 
+
 from collections import Counter
 from dataclasses import dataclass, replace
 
@@ -64,6 +65,7 @@ class WindowFacts:
     dispatched: list | None = None
 
     def __post_init__(self):
+        from . import states
         from .models import CHECK_NAMES
         self.cohort = self.population if self.cohort is None else self.cohort
         self.dispatched = ([r for r in self.cohort if r.dispatch_ms is not None]
@@ -84,7 +86,7 @@ class WindowFacts:
         # Only this window's dispatches/completions can establish that it stopped.
         own = [*self.dispatched, *self.late, *self.in_flight, *self.population]
         interrupted = any(cancelled_by_stop(r) or (r.completed_ms is None and not r.intentional
-                          and r.status != "completed" and r.dispatch_ms is not None) for r in own)
+                          and r.status != states.REQUEST_COMPLETED and r.dispatch_ms is not None) for r in own)
         start = self.window.get("start_ms")
         stop_ms = request_phase_end_ms(self.report, target) if self.run_stop and not self.d else None
         # Missing interval bounds can hide dispatches from the numeric window
@@ -258,13 +260,14 @@ def applicability(rule, f):
 def failed_reply_summary(f):
     # Reuse the request-result vocabulary with safe structured fields only.
     # Neither response/error bodies nor endpoint URLs enter this explanation.
+    from . import states
     from .conditions import request_result_text
     from .reporting import connection_summary
     failures = Counter()
     for record in f.population:
-        if record.status == "completed" and record.valid:
+        if record.status == states.REQUEST_COMPLETED and record.valid:
             continue
-        label = ("Invalid completion" if record.status == "completed" and not record.valid else
+        label = ("Invalid completion" if record.status == states.REQUEST_COMPLETED and not record.valid else
                  request_result_text({name: getattr(record, name) for name in
                                       ("status", "valid", "http_status", "termination_reason", "termination_limit_seconds")}))
         if label == "Request failed":
@@ -339,6 +342,7 @@ USAGE_FIELDS = {
 
 
 def usage(key, row, f):
+    from . import states
     fields = USAGE_FIELDS.get(key, ("usage.completion_tokens",))
     missing = [name for name in fields if f.missing_usage.get(name)]
     # A total requires paired fields. Name the actual missing population, not
@@ -350,7 +354,7 @@ def usage(key, row, f):
             f"{f.reasoning_unseparated}/{f.n_good} replies include reasoning but no {field_name}, so answer tokens cannot be separated.",
             f"Use an endpoint that reports {field_name}.",
             f"{field_name} separates reasoning from answer tokens; completion throughput includes reasoning.")
-    elif f.token_evidence["usage"].get("rejected") and all(f.missing_usage.get(name) == f.n_good for name in (missing or fields)):
+    elif f.token_evidence["usage"].get(states.TOKEN_EVIDENCE_REJECTED) and all(f.missing_usage.get(name) == f.n_good for name in (missing or fields)):
         return Explanation("endpoint_unsupported", f"The endpoint rejected stream_options.include_usage and returned no {field_name}. Request throughput and latency are still measured.")
     else:
         count = max((f.missing_usage[name] for name in missing), default=f.missing_answer_usage)
@@ -367,13 +371,14 @@ def usage(key, row, f):
 
 
 def pace(key, row, f):
+    from . import states
     code, count = f.dominant(f.pace_reasons)
     m = f.n_good
     name = "generation pace" if key == "generation_pace" else "TPOT"
     if code == "not_streamed":
         return nonstreamed(f)
     if code == "no_usage":
-        unsupported = bool(f.token_evidence["usage"].get("rejected"))
+        unsupported = bool(f.token_evidence["usage"].get(states.TOKEN_EVIDENCE_REJECTED))
         return Explanation("endpoint_unsupported" if unsupported else "data_missing",
             f"The endpoint returned no token counts (usage.completion_tokens) on {count}/{m} streamed replies; {name} needs counts at the first and last streamed read.",
             None if unsupported else "Check that the endpoint returns usage.completion_tokens; Giraffe requests it via stream_options.include_usage.")
@@ -431,13 +436,14 @@ def client_ttft(key, row, f):
 
 
 def itl(key, row, f):
+    from . import states
     evidence = f.token_evidence["logprobs"]
-    if evidence.get("supported"):
-        return Explanation("data_missing", f"Streamed logprobs were requested but {evidence['supported']}/{f.n_good} replies lack separate single-token reads with matching answer usage.",
+    if evidence.get(states.TOKEN_EVIDENCE_SUPPORTED):
+        return Explanation("data_missing", f"Streamed logprobs were requested but {evidence[states.TOKEN_EVIDENCE_SUPPORTED]}/{f.n_good} replies lack separate single-token reads with matching answer usage.",
                            "The server or a proxy is batching tokens; test the endpoint directly. Mean TPOT is still reported when token counts are available.")
-    if evidence.get("rejected"):
+    if evidence.get(states.TOKEN_EVIDENCE_REJECTED):
         return Explanation("endpoint_unsupported", "The endpoint rejected logprobs, so chunk gaps cannot establish individual token arrival times.")
-    if evidence.get("not_returned"):
+    if evidence.get(states.TOKEN_EVIDENCE_NOT_RETURNED):
         return Explanation("endpoint_unsupported", "The endpoint accepted logprobs but returned no token boundaries in the stream.")
     if evidence.get("shape_unverified"):
         return Explanation("not_applicable", "Automatic logprobs are not added to tool-call or structured-output requests, so token boundaries are not recorded.",
@@ -599,15 +605,16 @@ def event_loop(key, row, f):
 
 def telemetry(key, row, f):
     # Telemetry owns its copy and normally supplies cause before this pass.
+    from . import states
     cause = {"not_collected": "collector_unavailable", "not_supported": "endpoint_unsupported",
              "not_observed": "not_observed", "not_applicable": "not_applicable",
              "insufficient_evidence": "too_few_samples"}.get(row["state"], "data_missing")
     status = row.get("details", {}).get("collection_status") or row["state"]
-    if status == "run_stopped" and f.stop_affected:
+    if status == states.TELEMETRY_RUN_STOPPED and f.stop_affected:
         return Explanation("collector_unavailable", f.run_stop[1], run_stop_action(f.run_stop[0]))
-    actions = {"authentication_denied": "Check the exporter credentials (metrics_api_key_env or metrics_headers_env).",
-               "endpoint_absent": "Set targets[].metrics_url to the existing exporter route.",
-               "response_limit": "Reduce the exporter's response size or expose a smaller metrics endpoint."}
+    actions = {states.TELEMETRY_AUTHENTICATION_DENIED: "Check the exporter credentials (metrics_api_key_env or metrics_headers_env).",
+               states.TELEMETRY_ENDPOINT_ABSENT: "Set targets[].metrics_url to the existing exporter route.",
+               states.TELEMETRY_RESPONSE_LIMIT: "Reduce the exporter's response size or expose a smaller metrics endpoint."}
     return Explanation(cause, row.get("reason") or f"The exporter returned no {row['label'].lower()} samples.",
                        row.get("action") or (None if cause in NO_ACTION_OK else actions.get(status,
                        "Check the recorded exporter collection status and required metric families.")))

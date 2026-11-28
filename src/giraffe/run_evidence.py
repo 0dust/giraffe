@@ -52,10 +52,11 @@ def stop_ends_phase(stop, phase):
 def cancelled_by_stop(record):
     # The runner's recorded flag is canonical, including imported probe records
     # whose termination reason was not retained. Traffic shares this vocabulary.
+    from . import states
     from .traffic import AUTHORITATIVE_TERMINATION_REASONS
     if record.intentional:
         return False
-    return (record.status in {"cancelled", "timeout"}
+    return (record.status in {states.REQUEST_CANCELLED, states.REQUEST_TIMEOUT}
             and record.termination_reason in AUTHORITATIVE_TERMINATION_REASONS)
 
 

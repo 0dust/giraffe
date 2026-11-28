@@ -984,10 +984,12 @@ def test_scoring_aggregation_cache_cannot_reintroduce_private_text():
     assert "SECRET-" not in str(summary(report([r]))["metrics"])
 
 
-def test_availability_modules_support_cold_import_order():
+@pytest.mark.parametrize('module', ['performance', 'availability', 'run_evidence', 'scoring_facts',
+                                    'telemetry', 'report_stream', 'states'])
+def test_availability_modules_support_cold_import_order(module):
     import subprocess
     import sys
-    result = subprocess.run([sys.executable, "-c", "import giraffe.performance; import giraffe.availability; import giraffe.scoring_facts"],
+    result = subprocess.run([sys.executable, "-c", f"import giraffe.{module}; import giraffe.performance; import giraffe.availability; import giraffe.scoring_facts"],
                             capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
 

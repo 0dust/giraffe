@@ -2070,16 +2070,16 @@ def _compare_gateway_attribution(report, baseline, target, compatible, current_t
         row = matching[0] if len(matching) == 1 else {}
         if (metrics.get("collection_version") != COLLECTION_VERSION
                 or metrics.get("collection_complete") is not True or metrics.get("evidence_changed") is not False):
-            return "unverified", 0, row
+            return states.GATEWAY_ATTRIBUTION_UNVERIFIED, 0, row
         matched, mismatched, unverified = (row.get(key) for key in
             ("matched_requests", "mismatched_requests", "unverified_requests"))
         counts = (matched, mismatched, unverified)
         if (not all(type(count) is int and 0 <= count <= settings.samples for count in counts)
                 or sum(counts) != row.get("observed_requests") or sum(counts) > settings.samples):
-            return "unverified", 0, row
+            return states.GATEWAY_ATTRIBUTION_UNVERIFIED, 0, row
         if mismatched:
-            return "mismatch", matched + mismatched, row
-        return ("verified" if matched == settings.samples else "unverified"), matched, row
+            return states.GATEWAY_ATTRIBUTION_MISMATCH, matched + mismatched, row
+        return (states.GATEWAY_ATTRIBUTION_VERIFIED if matched == settings.samples else states.GATEWAY_ATTRIBUTION_UNVERIFIED), matched, row
 
     current_check, baseline_check = check_for(report), check_for(baseline)
     if current_check is None:
@@ -2104,12 +2104,12 @@ def _compare_gateway_attribution(report, baseline, target, compatible, current_t
             reason = "Gateway test identity references differ or are missing."
         elif previous.get("collection_version") != COLLECTION_VERSION:
             reason = "Rerun the baseline with complete spend-log attribution evidence."
-        elif not baseline_check or baseline_check.status != "pass" or old != "verified":
+        elif not baseline_check or baseline_check.status != "pass" or old != states.GATEWAY_ATTRIBUTION_VERIFIED:
             reason = "The baseline lacks complete verified attribution for the selected identities."
-        elif current == "unverified":
+        elif current == states.GATEWAY_ATTRIBUTION_UNVERIFIED:
             reason = "Current attribution is incomplete for this identity."
         else:
-            status = "fail" if current == "mismatch" else "pass"
+            status = "fail" if current == states.GATEWAY_ATTRIBUTION_MISMATCH else "pass"
             reason = ("A previously verified identity now has a gateway identity or token mismatch."
                       if status == "fail" else "The identity and final token counts still match.")
         rows.append({"check": CHECK, "scenario": alias, "scenario_label": alias,
@@ -4387,7 +4387,7 @@ def _render(report: RunReport) -> str:
         probe = next((row for row in report.conditions if row.get("target") == name
                       and row.get("condition_id") == "performance_evidence_probe"), None)
         if probe:
-            passed = probe.get("status") == "passed"
+            passed = probe.get("status") == states.CONDITION_AGGREGATE_PASSED
             reason = probe.get("reason") or observation.get("token_evidence", {}).get("reason", "")
             parts.append(f'<p class="{"muted" if passed else "inconclusive"}">Streamed token and usage support: '
                          f'{"Passed" if passed else "Inconclusive"} — {_e(reason)}</p>')

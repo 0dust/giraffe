@@ -50,7 +50,8 @@ def scoring_facts(record) -> dict:
 
 
 def _cause(record, facts, config):
-    if record.status != "completed" or not record.valid:
+    from . import states
+    if record.status != states.REQUEST_COMPLETED or not record.valid:
         return "invalid_reply", None
     if facts["evaluation_error"]:
         return "evaluation_error", facts["evaluation_error"]

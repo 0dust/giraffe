@@ -101,3 +101,20 @@ def test_mapping_does_not_mutate_workload_metadata():
     original = workload.copy()
     condition_for("bucket_c32_short_long", workload)
     assert workload == original
+
+
+@pytest.mark.parametrize("started,expected", [(0, "skipped"), (1, "stopped")])
+@pytest.mark.parametrize("stop_reason", ["memory limit reached", "endpoint unresponsive"])
+def test_condition_cut_short_by_other_run_limits(started, expected, stop_reason):
+    from giraffe.conditions import condition_aggregate
+    from giraffe.models import RunConfig
+    from giraffe.runner import _Run
+
+    config = RunConfig(targets=[{"name": "t", "url": "http://localhost:1", "model": "m"}])
+    run = _Run(config, None, None)
+    run.reason = stop_reason
+    reason = run.condition_reason("t")
+    assert reason == "check stopped early"
+    result = condition_aggregate({"status": "finished", "planned": None,
+                                  "started": started, "completed": started, "reason": reason})
+    assert result["status"] == expected

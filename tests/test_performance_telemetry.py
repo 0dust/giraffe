@@ -172,6 +172,16 @@ def test_summarize_preserves_legacy_rows_and_adds_derived_contract():
     assert result["derived"]["server_ttft_mean_ms"]["value"] == 1000
 
 
+@pytest.mark.parametrize("status, failures", [
+    ("available", 0), ("stale_samples", 0), ("absent_families", 0),
+    ("connection_failure", 1),
+])
+def test_summarize_counts_only_unusable_snapshots_as_failures(status, failures):
+    row = {"status": status, "samples": [], "elapsed_seconds": 0, "phase": "load"}
+    result = telemetry.summarize({"snapshots": [row]}, .9)
+    assert result["failures"] == failures
+
+
 async def test_runner_collects_configured_runtime_and_host_independently_of_gpu_check(monkeypatch):
     from giraffe.runner import _Run, _metrics
 
