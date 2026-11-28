@@ -289,6 +289,49 @@ async def test_published_recovery_report_with_retained_journal_finishes_polling(
     assert (directory / "report.json").read_bytes() == published
 
 
+async def test_manual_recovery_after_server_exhausts_retries(tmp_path, monkeypatch, caplog):
+    import errno
+
+    from giraffe import states, web
+    from giraffe.cli import main
+    from giraffe.evidence import EvidenceWriter
+    from giraffe.storage import write_metadata
+
+    monkeypatch.setattr(states, "STRICT_TRANSITIONS", True)
+    directory = tmp_path / "given-up"
+    write_metadata(directory, {"id": directory.name, "state": "interrupted", "config": config(),
+                               "heartbeat_at": "2000-01-01T00:00:00Z", "recovery_attempts": 4})
+    writer = EvidenceWriter(directory, manifest={"config": config()})
+    writer.record_finished(report(RunConfig.model_validate(config())).requests[0])
+    writer.close()
+
+    def disk_full(*args, **kwargs):
+        raise OSError(errno.ENOSPC, "disk full")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(web, "write_report", disk_full)
+        async with browser(tmp_path):
+            given_up = json.loads((directory / ".web.json").read_text())
+            assert given_up["state"] == "error"
+            assert given_up["recovery_attempts"] == 5
+            assert given_up["recovery_retry_at"] > 0
+            assert given_up["error"] == (
+                f"Recovery failed: disk full (attempt 5/5). [error {given_up['error_id']}]")
+    assert (directory / "evidence.jsonl").is_file()
+    assert not (directory / "report.json").exists()
+
+    assert main(["report", str(directory), "--html"]) == 0
+
+    saved = json.loads((directory / "report.json").read_text())
+    assert saved["observations"]["interrupted"] is True
+    assert len(saved["requests"]) == 1
+    assert (directory / "report.html").is_file()
+    recovered = json.loads((directory / ".web.json").read_text())
+    assert recovered["state"] == "interrupted"
+    assert recovered["run_id"] == saved["run_id"]
+    assert "Undeclared run state transition" not in caplog.text
+
+
 async def test_interrupted_event_feed_tracks_recovery_report_publication(tmp_path, monkeypatch):
     from giraffe.evidence import recover_evidence
     from giraffe.reporting import write_report

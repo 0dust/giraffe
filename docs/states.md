@@ -68,9 +68,10 @@ CLI-owned runs write `running`, `completed`, `interrupted` or `error`. They neve
 | `stopping` | `completed`, `interrupted`, `error` |
 | `interrupted` | `completed`, `error` |
 | `completed` | `error` |
-| `error` | None |
+| `error` | `interrupted` |
 
 An interrupted run can recover on the next server start to `completed` or `error`.
+After the server gives up recovering a run, `giraffe report <run-dir> --html` can manually recover its retained evidence and move `error` to `interrupted`.
 The API reports `error` for a completed run whose saved report is unreadable. This does not rewrite `.web.json`.
 Repeated writes of the same run state are allowed.
 

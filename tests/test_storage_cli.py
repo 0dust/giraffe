@@ -163,11 +163,15 @@ def test_cli_marks_running_during_export_and_forwards_per_run_limit(tmp_path, mo
 
     directory = tmp_path / "run"
     original = giraffe.reporting.write_report
+    invocation_ids = []
 
     async def run(config, **kwargs):
         meta = json.loads((directory / ".web.json").read_text())
-        assert set(meta) == {"id", "state", "started_at", "owner_pid", "owner_host", "heartbeat_at"} and meta["state"] == "running"
+        assert set(meta) == {"id", "state", "started_at", "invocation_id", "owner_pid", "owner_host", "heartbeat_at"}
+        assert meta["state"] == "running"
         assert meta["owner_pid"] > 0
+        assert meta["invocation_id"]
+        invocation_ids.append(meta["invocation_id"])
         return RunReport(run_id="done", started_at="now", finished_at="now", overall="pass", manifest={})
 
     def export(report, path, **kwargs):
@@ -180,4 +184,6 @@ def test_cli_marks_running_during_export_and_forwards_per_run_limit(tmp_path, mo
     monkeypatch.setattr(giraffe.reporting, "write_report", export)
     assert main(["run", "--url", "http://localhost", "--model", "tiny", "--skip-preflight",
                  "--output", str(directory), "--min-free-disk", "0", "--max-run-storage", "7"]) == 0
-    assert json.loads((directory / ".web.json").read_text())["state"] == "completed"
+    meta = json.loads((directory / ".web.json").read_text())
+    assert meta["state"] == "completed"
+    assert meta["invocation_id"] == invocation_ids[0]

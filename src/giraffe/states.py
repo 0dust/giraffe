@@ -37,7 +37,7 @@ RUN_TRANSITIONS: Final = {
     RUN_STOPPING: frozenset({RUN_COMPLETED, RUN_INTERRUPTED, RUN_ERROR}),
     RUN_COMPLETED: frozenset({RUN_ERROR}),  # run_detail exposes unreadable saved reports as error.
     RUN_INTERRUPTED: frozenset({RUN_COMPLETED, RUN_ERROR}),
-    RUN_ERROR: frozenset(),
+    RUN_ERROR: frozenset({RUN_INTERRUPTED}),  # Manual evidence recovery of a given-up run only.
 }
 
 # Run stop reasons: RunState.reason and report.json abort_reason (fixed text only).

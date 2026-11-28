@@ -1138,11 +1138,12 @@ def _main(argv: list[str] | None = None) -> int:
         warnings = planning_warnings + warnings
         directory.mkdir(parents=True, exist_ok=True)
         started_at = datetime.now(timezone.utc).isoformat()
+        invocation_id = secrets.token_hex(16)
 
-        def save_state(state: str, **details) -> None:
+        def save_state(state: str, *, preserve_terminal: bool = False, **details) -> None:
             nonlocal last_saved_state
             from giraffe.reporting import _atomic_write
-            from giraffe.storage import metadata_lock
+            from giraffe.storage import metadata_lock, write_metadata_unless
 
             with metadata_lock:
                 try:
@@ -1150,12 +1151,20 @@ def _main(argv: list[str] | None = None) -> int:
                 except (OSError, ValueError):
                     saved = {}
                 states.check_run_transition(last_saved_state, state)
-                _atomic_write(directory / ".web.json", json.dumps(
+                contents = json.dumps(
                     {"id": directory.name, "state": state, "started_at": started_at,
+                     "invocation_id": invocation_id,
                      **({"latency_summary": saved["latency_summary"]} if "latency_summary" in saved else {}),
                      "owner_pid": os.getpid(), "owner_host": socket.gethostname(),
                      **({"heartbeat_at": datetime.now(timezone.utc).isoformat()}
-                        if state in states.RUN_OWNED_STATES else {}), **details}, allow_nan=False, separators=(",", ":")) + "\n")
+                        if state in states.RUN_OWNED_STATES else {}), **details}, allow_nan=False, separators=(",", ":")) + "\n"
+                if preserve_terminal and not write_metadata_unless(directory, json.loads(contents), lambda current: (
+                    current.get("invocation_id") == invocation_id
+                    and current.get("state") in states.RUN_TERMINAL_STATES
+                )):
+                    return
+                if not preserve_terminal:
+                    _atomic_write(directory / ".web.json", contents)
                 last_saved_state = state
 
         save_state(states.RUN_RUNNING)
@@ -1217,7 +1226,8 @@ def _main(argv: list[str] | None = None) -> int:
                     logger.exception("CLI run stopped", extra={"giraffe_file_only": True})
                     stop_heartbeat()
                     try:
-                        save_state(states.RUN_INTERRUPTED, finished_at=datetime.now(timezone.utc).isoformat(),
+                        save_state(states.RUN_INTERRUPTED, preserve_terminal=True,
+                                   finished_at=datetime.now(timezone.utc).isoformat(),
                                    abort_reason=states.STOP_RUN_CANCELLED)
                     except OSError:
                         pass
@@ -1338,7 +1348,8 @@ def _main(argv: list[str] | None = None) -> int:
     except (KeyboardInterrupt, asyncio.CancelledError):
         if save_state is not None and last_saved_state not in states.RUN_TERMINAL_STATES:
             try:
-                save_state(states.RUN_INTERRUPTED, finished_at=datetime.now(timezone.utc).isoformat(),
+                save_state(states.RUN_INTERRUPTED, preserve_terminal=True,
+                           finished_at=datetime.now(timezone.utc).isoformat(),
                            abort_reason=states.STOP_RUN_CANCELLED)
             except OSError:
                 pass

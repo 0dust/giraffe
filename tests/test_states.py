@@ -52,18 +52,17 @@ def test_run_transitions():
         "queued": {"running", "stopping", "completed", "interrupted", "error"},
         "running": {"stopping", "completed", "interrupted", "error"},
         "stopping": {"completed", "interrupted", "error"},
-        "interrupted": {"completed", "error"}, "completed": {"error"}, "error": set(),
+        "interrupted": {"completed", "error"}, "completed": {"error"}, "error": {"interrupted"},
     }
-    # Interrupted runs recover; completed runs can expose an unreadable report as error.
-    assert {state for state, successors in states.RUN_TRANSITIONS.items() if not successors} == (
-        states.RUN_TERMINAL_STATES - {"interrupted", "completed"})
+    # Terminal runs can still change state through recovery or an unreadable saved report.
+    assert all(states.RUN_TRANSITIONS.values())
 
 
 @pytest.mark.parametrize("current,new,allowed", [
     (None, "running", True), ("unknown", "running", True), (None, "unknown", True),
     ("running", "running", True), ("running", "stopping", True),
     ("interrupted", "completed", True), ("interrupted", "error", True),
-    ("completed", "error", True), ("error", "error", True),
+    ("completed", "error", True), ("error", "error", True), ("error", "interrupted", True),
     ("completed", "running", False), ("stopping", "running", False),
     ("error", "completed", False), ("running", "unknown", False),
 ])
