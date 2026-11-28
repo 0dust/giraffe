@@ -154,6 +154,9 @@ def test_describe():
                        "usage_error": states.EXIT_CODE_USAGE, "default": states.EXIT_CODE_DEFAULT},
         "request_statuses": list(states.REQUEST_STATUSES), "run_states": list(states.RUN_STATES),
         "judged_checks": sorted(states.JUDGED_CHECKS),
+        "baseline_comparability": list(states.BASELINE_COMPARABILITY),
+        "baseline_reason_codes": dict(states.BASELINE_REASON_CODES),
+        "load_acceptance_changes": list(states.LOAD_ACCEPTANCE_CHANGES),
         "server_activities": list(states.SERVER_ACTIVITIES),
         "admission": {operation: list(blockers) for operation, blockers in states.ADMISSION_BLOCKERS.items()},
         "run_in_progress_states": sorted(states.RUN_IN_PROGRESS_STATES),
@@ -351,3 +354,75 @@ def test_run_state_writes_use_declared_constants(filename):
     for value in writes:
         assert not any(isinstance(part, ast.Constant) and part.value in states.RUN_STATES
                        for part in ast.walk(value)), (filename, value.lineno)
+
+
+def test_baseline_vocabulary_and_documentation():
+    assert states.BASELINE_COMPARABILITY == ("comparable", "not_comparable", "unknown")
+    assert states.BASELINE_REASON_CODES["gateway_access_workload_version_differs"] == states.BASELINE_NOT_COMPARABLE
+    assert states.BASELINE_REASON_CODES["gateway_access_workload_version_unknown"] == states.BASELINE_UNKNOWN
+    assert not any(code.startswith("gateway_access_source_") for code in states.BASELINE_REASON_CODES)
+    assert set(states.BASELINE_REASON_CODES.values()) == {"not_comparable", "unknown"}
+    assert set(states.BASELINE_REASON_CODES.values()) <= set(states.BASELINE_COMPARABILITY)
+    assert len(states.LOAD_ACCEPTANCE_CHANGES) == len(set(states.LOAD_ACCEPTANCE_CHANGES)) == 11
+    section = (ROOT / "docs" / "states.md").read_text().split("## Baseline comparability\n", 1)[1].split("\n## ", 1)[0]
+    for code, verdict in states.BASELINE_REASON_CODES.items():
+        assert f"| `{code}` | `{verdict}` |" in section
+    for change in states.LOAD_ACCEPTANCE_CHANGES:
+        assert f"| `{change}` |" in section
+
+
+def test_reporting_reason_codes_are_declared():
+    tree = ast.parse((ROOT / "src" / "giraffe" / "reporting.py").read_text())
+    def code_literals(expression, bindings, resolving=frozenset()):
+        if isinstance(expression, ast.IfExp):
+            return code_literals(expression.body, bindings, resolving) | code_literals(expression.orelse, bindings, resolving)
+        if isinstance(expression, ast.Constant) and isinstance(expression.value, str):
+            return {expression.value}
+        if isinstance(expression, ast.Name) and expression.id not in resolving:
+            return set().union(*(code_literals(value, bindings, resolving | {expression.id})
+                                 for value in bindings.get(expression.id, [])))
+        return set()
+
+    codes = set()
+    for function in (node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)):
+        bindings = {}
+        for node in ast.walk(function):
+            if not isinstance(node, ast.Assign):
+                continue
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    bindings.setdefault(target.id, []).append(node.value)
+                elif isinstance(target, ast.Tuple) and isinstance(node.value, ast.Tuple):
+                    for name, value in zip(target.elts, node.value.elts):
+                        if isinstance(name, ast.Name):
+                            bindings.setdefault(name.id, []).append(value)
+        for node in ast.walk(function):
+            if function.name == "_comparison_reason_details" and isinstance(node, ast.Dict):
+                for key, value in zip(node.keys, node.values):
+                    if isinstance(key, ast.Constant) and key.value == "code":
+                        codes.update(code_literals(value, bindings))
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+                continue
+            if node.func.id not in {"setting_reason", "_comparison_reason"}:
+                continue
+            argument = 1 if node.func.id == "setting_reason" else 3
+            if len(node.args) > argument:
+                codes.update(code_literals(node.args[argument], bindings))
+    assert codes == set(states.BASELINE_REASON_CODES)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.keyword) and node.arg == "acceptance_change":
+            assert not any(isinstance(part, (ast.Constant, ast.JoinedStr)) and
+                           (not isinstance(part, ast.Constant) or part.value in states.LOAD_ACCEPTANCE_CHANGES)
+                           for part in ast.walk(node.value))
+
+
+def test_reason_code_guard(monkeypatch, caplog):
+    for code in states.BASELINE_REASON_CODES:
+        states.check_reason_code(code)
+    for code in (None, "undeclared"):
+        with pytest.raises(AssertionError, match="Undeclared baseline reason code"):
+            states.check_reason_code(code)
+    monkeypatch.setattr(states, "STRICT_TRANSITIONS", False)
+    with caplog.at_level("WARNING", logger="giraffe.states"):
+        states.check_reason_code("undeclared", text="New reason")
+    assert "undeclared" in caplog.text and "New reason" in caplog.text

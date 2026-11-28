@@ -273,18 +273,62 @@ def _is_workload_digest(value: Any) -> bool:
     return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
 
 
+def _comparison_reason(reasons, details, text, code, key=None, current=None, previous=None, *, side=None, index=None):
+    states.check_reason_code(code, text=text)
+    if index is None:
+        reasons.append(text)
+    else:
+        reasons.insert(index, text)
+    if details is not None:
+        detail = {"code": code}
+        if key is not None:
+            detail["key"] = key
+            if code == "target_differs":
+                detail.update(baseline=previous, current=current)
+            else:
+                detail.update(current=current, baseline=previous)
+        detail["text"] = text
+        if side is not None:
+            detail["side"] = side
+        if isinstance(details, list):
+            details.append(detail)
+        else:
+            details[text] = detail
+    return text
+
+
+def _missing_side(current_known, baseline_known):
+    if bool(current_known) != bool(baseline_known):
+        return "baseline" if current_known else "current"
+    return None
+
+
+def _comparison_reason_details(reasons, details, ordered_details=()):
+    occurrences = defaultdict(list)
+    for detail in ordered_details:
+        occurrences[detail["text"]].append(detail)
+    pending = {text: iter(entries) for text, entries in occurrences.items()}
+    result = []
+    for text in reasons:
+        # Dictionary-backed reasons with identical prose can borrow a coded
+        # detail and mask an uncoded occurrence from the strict fallback guard.
+        detail = next(pending[text], None) if text in pending else details.get(text)
+        if detail is None:
+            states.check_reason_code(None, text=text)
+            detail = {"code": "comparison_unavailable", "text": text}
+        result.append(detail)
+    return result
+
+
 def _settings_reasons(report: RunReport, baseline: RunReport, *, details: dict[str, dict[str, Any]] | None = None) -> list[str]:
     reasons = []
 
-    def setting_reason(text, code, key, current=None, previous=None):
-        reasons.append(text)
-        if details is not None:
-            details[text] = {"code": code, "key": key, "current": current,
-                             "baseline": previous, "text": text}
+    def setting_reason(text, code, key=None, current=None, previous=None, *, side=None):
+        _comparison_reason(reasons, details, text, code, key, current, previous, side=side)
     if not is_supported_schema(report.schema_version) or not is_supported_schema(baseline.schema_version):
-        reasons.append("Report schema versions differ.")
+        setting_reason("Report schema versions differ.", "schema_differs")
     if report.manifest.get("timing_measurement_version", 1) != baseline.manifest.get("timing_measurement_version", 1):
-        reasons.append("Client timing measurement methods differ; rerun the baseline.")
+        setting_reason("Client timing measurement methods differ; rerun the baseline.", "timing_method_differs")
     current_limits, baseline_limits = _limits_reached(report), _limits_reached(baseline)
 
     def shared_abort(run, limits):
@@ -302,12 +346,12 @@ def _settings_reasons(report: RunReport, baseline: RunReport, *, details: dict[s
             run.abort_reason and not (gateway_budget or gateway_deadline or gateway_user_stop))
 
     if shared_abort(report, current_limits):
-        reasons.append("Current run was aborted; incomplete traffic cannot establish a regression.")
+        setting_reason("Current run was aborted; incomplete traffic cannot establish a regression.", "run_aborted", side="current")
     if shared_abort(baseline, baseline_limits):
-        reasons.append("Baseline run was aborted; it cannot establish a complete reference.")
+        setting_reason("Baseline run was aborted; it cannot establish a complete reference.", "run_aborted", side="baseline")
     for label, run in (("Current", report), ("Baseline", baseline)):
         if any(record.evaluation_error for record in run.requests):
-            reasons.append(f"{label} answer evaluation failed; correctness and capacity cannot be compared.")
+            setting_reason(f"{label} answer evaluation failed; correctness and capacity cannot be compared.", "evaluation_failed", side=label.lower())
     manifests = []
     for label, run in (("Current", report), ("Baseline", baseline)):
         try:
@@ -317,12 +361,12 @@ def _settings_reasons(report: RunReport, baseline: RunReport, *, details: dict[s
             # Their unknown workload must not discard a completed current run.
             if any(item["loc"] and item["loc"][0] == "config_version"
                    for item in error.errors(include_input=False, include_url=False)):
-                reasons.append(f"{label} recorded configuration has an unsupported config_version; comparison requires "
+                setting_reason(f"{label} recorded configuration has an unsupported config_version; comparison requires "
                                "version 2 or an unversioned legacy configuration. "
-                               f"Rerun the {label.lower()} run with a supported configuration.")
+                               f"Rerun the {label.lower()} run with a supported configuration.", "config_unsupported", side=label.lower())
             else:
-                reasons.append(f"{label} recorded configuration is invalid; comparability is unknown. "
-                               f"Rerun the {label.lower()} run with a valid configuration.")
+                setting_reason(f"{label} recorded configuration is invalid; comparability is unknown. "
+                               f"Rerun the {label.lower()} run with a valid configuration.", "config_invalid", side=label.lower())
     if len(manifests) != 2:
         return reasons
     current_manifest, old_manifest = manifests
@@ -342,11 +386,11 @@ def _settings_reasons(report: RunReport, baseline: RunReport, *, details: dict[s
     if any(pack_modes):
         identities = [run.manifest.get("request_pack") for run in (report, baseline)]
         if not all(pack_modes):
-            reasons.append("The effective request source differs.")
+            setting_reason("The effective request source differs.", "request_source_differs")
         elif not all(isinstance(value, dict) and value.get("sha256") for value in identities):
-            reasons.append("Request pack identity is missing; comparability is unknown.")
+            setting_reason("Request pack identity is missing; comparability is unknown.", "request_pack_unknown", side=_missing_side(*[isinstance(value, dict) and value.get("sha256") for value in identities]))
         elif identities[0] != identities[1]:
-            reasons.append("Request pack identity differs.")
+            setting_reason("Request pack identity differs.", "request_pack_differs")
         for label, run, config, active in zip(
             ("Current", "Baseline"), (report, baseline), (current_config, old_config), pack_modes
         ):
@@ -357,8 +401,8 @@ def _settings_reasons(report: RunReport, baseline: RunReport, *, details: dict[s
                           if case.get("scorer") == "judge"}
             if any(record.fixture_id in judged_ids and record.status == "completed"
                    and record.valid and record.score is None for record in run.requests):
-                reasons.append(f"{label} AI judge results are incomplete; "
-                               "correctness and capacity cannot be compared.")
+                setting_reason(f"{label} AI judge results are incomplete; "
+                               "correctness and capacity cannot be compared.", "judge_incomplete", side=label.lower())
 
     def comparison_limits(limits):
         core = {"access", "serving", "correctness", "json", "first_output", "generation"}
@@ -426,7 +470,10 @@ def _settings_reasons(report: RunReport, baseline: RunReport, *, details: dict[s
                     for run in (report, baseline)]
         if (policies[0] != policies[1] or not policies[0]
                 or any(None in policy for policies_by_target in policies for policy in policies_by_target.values())):
-            reasons.append("Multi-user summary or window policy differs or is missing; rerun a matching baseline.")
+            known = [bool(values) and all(None not in policy for policy in values.values()) for values in policies]
+            setting_reason("Multi-user summary or window policy differs or is missing; rerun a matching baseline.",
+                           "multi_user_policy_differs" if all(known) else "multi_user_policy_unknown",
+                           side=_missing_side(*known))
     pack_only = all(pack_modes) and selected <= {"load", "capacity", "correctness"}
     inactive_pack_globals = {"context_limit", "samples", "sustained_seconds"} if pack_only else set()
     comparison_workloads = {**WORKLOAD_CHECKS, "concurrent_load": {"concurrency"},
@@ -439,7 +486,7 @@ def _settings_reasons(report: RunReport, baseline: RunReport, *, details: dict[s
             continue
         if key not in old_config or key not in current_config:
             setting_reason(f"Recorded {key} is missing; comparability is unknown.",
-                           "setting_missing", key)
+                           "setting_missing", key, side=_missing_side(key in current_config, key in old_config))
             continue
         current, old = current_config[key], old_config[key]
         if key == "limits":
@@ -456,7 +503,7 @@ def _settings_reasons(report: RunReport, baseline: RunReport, *, details: dict[s
                                  for check in item.checks if check.id == "cancellation"}
                                 for item in (report, baseline)]
         if cancellation_grading[0] != cancellation_grading[1]:
-            reasons.append("Cancellation verdict definitions differ; rerun the baseline with separate server-stop and answer grading.")
+            setting_reason("Cancellation verdict definitions differ; rerun the baseline with separate server-stop and answer grading.", "cancellation_grading_differs")
     traffic_selected = any("capacity" in config.get("checks", []) for config in (current_config, old_config))
     for key, effective in (("traffic", "effective_traffic"), ("test_options", "effective_checks")):
         if key == "traffic" and not traffic_selected:
@@ -466,7 +513,7 @@ def _settings_reasons(report: RunReport, baseline: RunReport, *, details: dict[s
         if key in current_config or key in old_config:
             if key not in current_config or key not in old_config:
                 setting_reason(f"Recorded {key} is missing; comparability is unknown.",
-                               "setting_missing", key)
+                               "setting_missing", key, side=_missing_side(key in current_config, key in old_config))
             elif current_config[key] != old_config[key]:
                 setting_reason(f"Run setting {key} differs.", "setting_differs", key,
                                current_config[key], old_config[key])
@@ -476,7 +523,7 @@ def _settings_reasons(report: RunReport, baseline: RunReport, *, details: dict[s
         if key == "effective_checks" and ((key in report.manifest) != (key in baseline.manifest)):
             missing = baseline.manifest if key in report.manifest else report.manifest
             if "config_version" in missing.get("config", {}):
-                setting_reason(f"Recorded {key} differs or is missing.", "setting_unknown", key)
+                setting_reason(f"Recorded {key} differs or is missing.", "setting_unknown", key, side=_missing_side(key in current_manifest, key in old_manifest))
                 continue
         if key == "effective_traffic" and not traffic_selected:
             continue
@@ -484,14 +531,14 @@ def _settings_reasons(report: RunReport, baseline: RunReport, *, details: dict[s
             current, old = effective_value(current_manifest, key), effective_value(old_manifest, key)
             if current != old:
                 if current is None or old is None:
-                    setting_reason(f"Recorded {key} is missing; comparability is unknown.", "setting_unknown", key)
+                    setting_reason(f"Recorded {key} is missing; comparability is unknown.", "setting_unknown", key, side=_missing_side(current is not None, old is not None))
                 else:
                     setting_reason(f"Recorded {key} differs.", "setting_differs", key, current, old)
     # Fixture-set identity is independent of the installed package version.
     current_pack = report.manifest.get("fixture_pack")
     old_pack = baseline.manifest.get("fixture_pack")
     if not isinstance(current_pack, dict) or not isinstance(old_pack, dict) or not current_pack or not old_pack:
-        reasons.append("Fixture pack identity is missing or unknown.")
+        setting_reason("Fixture pack identity is missing or unknown.", "fixture_pack_unknown", side=_missing_side(isinstance(current_pack, dict) and current_pack, isinstance(old_pack, dict) and old_pack))
     else:
         shared_key = "shared_workload_fixture_sha256"
         inactive = {"custom", shared_key}
@@ -528,17 +575,17 @@ def _settings_reasons(report: RunReport, baseline: RunReport, *, details: dict[s
             inactive.add("builtin_sha256")
         if (not has_identity or {key: value for key, value in current_pack.items() if key not in inactive}
                 != {key: value for key, value in old_pack.items() if key not in inactive}):
-            reasons.append("Fixture pack identity differs.")
+            setting_reason("Fixture pack identity differs.", "fixture_pack_differs")
     for label, config, pack in (("Current", current_config, current_pack),
                                 ("Baseline", old_config, old_pack)):
         if config.get("custom_fixtures") and "correctness" in config.get("checks", []):
             if not isinstance(pack, dict) or not any(
                 pack.get(key) for key in ("sha256", "custom_sha256", "hash", "content_hash")
             ):
-                reasons.append(f"{label} custom fixtures have no recorded content hash.")
+                setting_reason(f"{label} custom fixtures have no recorded content hash.", "custom_fixtures_unhashed", side=label.lower())
     for key in ("run_location", "load_shape"):
         if key not in report.manifest or key not in baseline.manifest:
-            setting_reason(f"Recorded {key} is missing; comparability is unknown.", "setting_missing", key)
+            setting_reason(f"Recorded {key} is missing; comparability is unknown.", "setting_missing", key, side=_missing_side(key in report.manifest, key in baseline.manifest))
         else:
             current, old = report.manifest[key], baseline.manifest[key]
             if key == "load_shape" and "max_requests" not in reached:
@@ -1081,17 +1128,17 @@ def _compare_load_tests(
 
     def acceptance(point):
         if not point:
-            return "not_established"
+            return states.LOAD_ACCEPTANCE_NOT_ESTABLISHED
         if point.get("status") == "fail":
             return "fail"
         if incomplete(point):
-            return "not_established"
+            return states.LOAD_ACCEPTANCE_NOT_ESTABLISHED
         if _server_limited_load(point):
             return "fail"
         if (point.get("status") == "pass" and point.get("groups")
                 and all(group.get("status") in {"pass", "fail"} for group in point["groups"])):
             return "pass"
-        return "not_established"
+        return states.LOAD_ACCEPTANCE_NOT_ESTABLISHED
 
     def records_for(run, point):
         ids = set(point.get("request_ids", []))
@@ -1151,13 +1198,14 @@ def _compare_load_tests(
         before, after = acceptance(previous), acceptance(point)
         row = {
             "current": snapshot(report, point), "baseline": snapshot(baseline, previous),
-            "status": "inconclusive", "acceptance_change": "not_established", "reason": "",
+            "status": "inconclusive", "acceptance_change": states.LOAD_ACCEPTANCE_NOT_ESTABLISHED, "reason": "",
             "baseline_acceptance": before, "current_acceptance": after,
             "evidence_ids": (point or {}).get("request_ids", []),
         }
         if point is None or previous is None:
             side = "current" if point is None else "baseline"
-            row.update(acceptance_change=f"not_tested_in_{side}", reason=f"This level was not tested in the {side}.")
+            row.update(acceptance_change=(states.LOAD_ACCEPTANCE_NOT_TESTED_IN_CURRENT if side == "current"
+                                          else states.LOAD_ACCEPTANCE_NOT_TESTED_IN_BASELINE), reason=f"This level was not tested in the {side}.")
         else:
             current_work, old_work = records_for(report, point), records_for(baseline, previous)
             work_reason, mix_changed = None, False
@@ -1170,54 +1218,54 @@ def _compare_load_tests(
             if current_shapes and old_shapes and current_shapes != old_shapes:
                 work_reason = "Result-group shapes differ."
             if work_reason:
-                row.update(acceptance_change="work_changed", reason=work_reason)
+                row.update(acceptance_change=states.LOAD_ACCEPTANCE_WORK_CHANGED, reason=work_reason)
             elif before == "pass" and after == "pass":
-                row.update(acceptance_change="unchanged_accepted", status="pass", reason="This tested load remains accepted.")
+                row.update(acceptance_change=states.LOAD_ACCEPTANCE_UNCHANGED_ACCEPTED, status="pass", reason="This tested load remains accepted.")
             elif before == "fail" and after == "fail":
-                row.update(acceptance_change="unchanged_not_accepted", reason="Still not accepted; baseline: " + explanation(previous, row["baseline"]) + "; current: " + explanation(point, row["current"]) + ".")
+                row.update(acceptance_change=states.LOAD_ACCEPTANCE_UNCHANGED_NOT_ACCEPTED, reason="Still not accepted; baseline: " + explanation(previous, row["baseline"]) + "; current: " + explanation(point, row["current"]) + ".")
             elif before == "pass" and after == "fail":
                 reason = ("No longer accepted: " + server_reason(point) + "." if point.get("status") != "fail" and _server_limited_load(point)
                           else "This previously acceptable tested load now fails; current: " + explanation(point, row["current"]) + ".")
-                row.update(acceptance_change="lost", status="fail", reason=reason)
+                row.update(acceptance_change=states.LOAD_ACCEPTANCE_LOST, status="fail", reason=reason)
             elif before == "fail" and after == "pass":
                 reason = ("Newly accepted: baseline " + server_reason(previous) + "."
                           if previous.get("status") != "fail" and _server_limited_load(previous) else "Newly accepted; baseline: " + explanation(previous, row["baseline"]) + ".")
-                row.update(acceptance_change="gained", status="pass", reason=reason)
+                row.update(acceptance_change=states.LOAD_ACCEPTANCE_GAINED, status="pass", reason=reason)
             elif after == "pass":
-                row.update(acceptance_change="accepted_baseline_not_established", reason="Accepted now; not established in baseline; baseline: " + explanation(previous, row["baseline"]) + ".")
+                row.update(acceptance_change=states.LOAD_ACCEPTANCE_ACCEPTED_BASELINE_NOT_ESTABLISHED, reason="Accepted now; not established in baseline; baseline: " + explanation(previous, row["baseline"]) + ".")
             elif before == "pass":
-                row.update(acceptance_change="not_established_in_current", reason="Preservation is unverified; current: " + explanation(point, row["current"]) + ".")
-            elif before == "not_established" and after == "fail":
-                row.update(acceptance_change="not_established_in_baseline", reason="No loss is established; baseline: " + explanation(previous, row["baseline"]) + "; current: " + explanation(point, row["current"]) + ".")
+                row.update(acceptance_change=states.LOAD_ACCEPTANCE_NOT_ESTABLISHED_IN_CURRENT, reason="Preservation is unverified; current: " + explanation(point, row["current"]) + ".")
+            elif before == states.LOAD_ACCEPTANCE_NOT_ESTABLISHED and after == "fail":
+                row.update(acceptance_change=states.LOAD_ACCEPTANCE_NOT_ESTABLISHED_IN_BASELINE, reason="No loss is established; baseline: " + explanation(previous, row["baseline"]) + "; current: " + explanation(point, row["current"]) + ".")
             else:
                 row["reason"] = "Acceptance is not established; baseline: " + explanation(previous, row["baseline"]) + "; current: " + explanation(point, row["current"]) + "."
-            if mix_changed and row["acceptance_change"] in {"gained", "lost"}:
-                row.update(acceptance_change="work_changed", status="inconclusive",
+            if mix_changed and row["acceptance_change"] in {states.LOAD_ACCEPTANCE_GAINED, states.LOAD_ACCEPTANCE_LOST}:
+                row.update(acceptance_change=states.LOAD_ACCEPTANCE_WORK_CHANGED, status="inconclusive",
                            reason="Request mix shifted by more than 10 percentage points; acceptance change is not attributable.")
         result["points"].append(row)
     counts = Counter(row["acceptance_change"] for row in result["points"])
-    result["summary_counts"] = {"gained": counts["gained"], "lost": counts["lost"], **counts}
+    result["summary_counts"] = {states.LOAD_ACCEPTANCE_GAINED: counts[states.LOAD_ACCEPTANCE_GAINED], states.LOAD_ACCEPTANCE_LOST: counts[states.LOAD_ACCEPTANCE_LOST], **counts}
     unverified = any(row["baseline_acceptance"] == "pass" and row["acceptance_change"] in {
-        "not_established_in_current", "not_tested_in_current", "work_changed"} for row in result["points"])
-    if counts["lost"]:
+        states.LOAD_ACCEPTANCE_NOT_ESTABLISHED_IN_CURRENT, states.LOAD_ACCEPTANCE_NOT_TESTED_IN_CURRENT, states.LOAD_ACCEPTANCE_WORK_CHANGED} for row in result["points"])
+    if counts[states.LOAD_ACCEPTANCE_LOST]:
         result["status"] = "fail"
     elif unverified:
         result["status"] = "inconclusive"
-    elif counts["unchanged_accepted"] or counts["gained"]:
+    elif counts[states.LOAD_ACCEPTANCE_UNCHANGED_ACCEPTED] or counts[states.LOAD_ACCEPTANCE_GAINED]:
         result["status"] = "pass"
     else:
         result["reason_code"] = "no_accepted_baseline"
-    labels = {"gained": "tested load(s) newly accepted", "lost": "lost",
-              "unchanged_accepted": "still accepted", "unchanged_not_accepted": "still not accepted",
-              "accepted_baseline_not_established": "accepted now (baseline not established)",
-              "not_established": "not established", "not_established_in_baseline": "not established in baseline",
-              "not_established_in_current": "not established in current", "not_tested_in_baseline": "not tested in baseline",
-              "not_tested_in_current": "not tested in current", "work_changed": "work changed"}
+    labels = {states.LOAD_ACCEPTANCE_GAINED: "tested load(s) newly accepted", states.LOAD_ACCEPTANCE_LOST: "lost",
+              states.LOAD_ACCEPTANCE_UNCHANGED_ACCEPTED: "still accepted", states.LOAD_ACCEPTANCE_UNCHANGED_NOT_ACCEPTED: "still not accepted",
+              states.LOAD_ACCEPTANCE_ACCEPTED_BASELINE_NOT_ESTABLISHED: "accepted now (baseline not established)",
+              states.LOAD_ACCEPTANCE_NOT_ESTABLISHED: "not established", states.LOAD_ACCEPTANCE_NOT_ESTABLISHED_IN_BASELINE: "not established in baseline",
+              states.LOAD_ACCEPTANCE_NOT_ESTABLISHED_IN_CURRENT: "not established in current", states.LOAD_ACCEPTANCE_NOT_TESTED_IN_BASELINE: "not tested in baseline",
+              states.LOAD_ACCEPTANCE_NOT_TESTED_IN_CURRENT: "not tested in current", states.LOAD_ACCEPTANCE_WORK_CHANGED: "work changed"}
     summary = []
     for change, label in labels.items():
-        if change in {"gained", "lost"} or counts[change]:
+        if change in {states.LOAD_ACCEPTANCE_GAINED, states.LOAD_ACCEPTANCE_LOST} or counts[change]:
             text = f"{counts[change]} {label}"
-            if change in {"gained", "lost"} and counts[change]:
+            if change in {states.LOAD_ACCEPTANCE_GAINED, states.LOAD_ACCEPTANCE_LOST} and counts[change]:
                 text += " (" + ", ".join(_comparison_load_label(row["current"] or row["baseline"])
                                          for row in result["points"] if row["acceptance_change"] == change) + ")"
             summary.append(text)
@@ -1503,41 +1551,64 @@ def _cancellation_evidence_ids(evidence: dict, records: dict[str, RequestRecord]
                               for rid in evidence.get(name, {}).get("request_ids", []) if rid in records))
 
 
-def _compare_interference_work(current, old, user_id, current_records, old_records, tolerance):
+def _compare_interference_work(current, old, user_id, current_records, old_records, tolerance, *, details=None):
     if current.get("user_id") != user_id or old.get("user_id") != user_id:
-        return [], "Matched short-user interference evidence is missing."
+        text = _comparison_reason([], details, "Matched short-user interference evidence is missing.",
+                                  "user_delivery_incomplete", side=_missing_side(
+                                      current.get("user_id") == user_id, old.get("user_id") == user_id))
+        return [], text
 
     retained_ids, reasons = [], []
     for role in ("control", "probe", "heavy"):
         field = f"{role}_request_ids"
         cohorts = []
-        complete = True
+        complete_sides = []
         for evidence, records in ((current, current_records), (old, old_records)):
             ids = evidence.get(field, [])
             cohort = [records[rid] for rid in ids if rid in records]
-            complete = complete and bool(ids) and len(cohort) == len(ids) == len(set(ids)) and all(
+            complete = bool(ids) and len(cohort) == len(ids) == len(set(ids)) and all(
                 record.status == "completed" and record.valid for record in cohort)
             if role != "heavy" and len(ids) != evidence.get("matched_samples"):
                 complete = False
+            complete_sides.append(complete)
             cohorts.append(cohort)
         retained_ids.extend(record.id for record in cohorts[0])
-        if not complete:
-            reasons.append(f"Matched {role} request evidence is incomplete.")
+        if not all(complete_sides):
+            _comparison_reason(reasons, details, f"Matched {role} request evidence is incomplete.",
+                               "user_delivery_incomplete", side=_missing_side(*complete_sides))
         elif _interference_role_work_changed(*cohorts, tolerance):
-            reasons.append(f"Matched {role} work differs or lacks observed token evidence.")
+            known, side = _user_work_evidence(*cohorts, tolerance)
+            _comparison_reason(reasons, details, f"Matched {role} work differs or lacks observed token evidence.",
+                               "user_delivery_differs" if known else "user_delivery_incomplete", side=side)
     if not reasons:
         links = [_interference_exposure(evidence) for evidence in (current, old)]
         if any(groups is None for groups in links):
-            reasons.append("Matched heavy exposure per probe is missing or incomplete.")
+            _comparison_reason(reasons, details, "Matched heavy exposure per probe is missing or incomplete.",
+                               "user_delivery_incomplete", side=_missing_side(*[groups is not None for groups in links]))
         else:
             exposure = [[[records[rid] for rid in group] for group in groups]
                         for groups, records in zip(links, (current_records, old_records))]
             if _heavy_work_per_probe_changed(exposure, tolerance):
-                reasons.append("Matched heavy exposure per matched probe differs between runs.")
+                _comparison_reason(reasons, details, "Matched heavy exposure per matched probe differs between runs.",
+                                   "user_delivery_differs")
             elif reason := _compare_interference_groups(
-                    (current, current_records, exposure[0]), (old, old_records, exposure[1]), tolerance):
+                    (current, current_records, exposure[0]), (old, old_records, exposure[1]), tolerance, details=details):
                 reasons.append(reason)
     return list(dict.fromkeys(retained_ids)), " ".join(reasons) or None
+
+
+def _user_work_evidence(current, old, tolerance):
+    if not current or not old:
+        return False, _missing_side(bool(current), bool(old))
+    if any(_load_work_comparison(current, old)):
+        return True, None
+    measures = _token_work_measures([record for cohort in (current, old) for record in cohort])
+    values = [[[measure(record) for record in cohort] for measure in measures] for cohort in (current, old)]
+    known = [all(None not in counts for counts in side) for side in values]
+    observed_difference = any(None not in latest and None not in previous
+                              and _work_samples_changed([latest, previous], tolerance)
+                              for latest, previous in zip(*values))
+    return all(known) or observed_difference, None if observed_difference else _missing_side(*known)
 
 
 def _interference_role_work_changed(current, old, tolerance):
@@ -1555,16 +1626,17 @@ def _interference_groups(evidence, records, exposure):
     return groups
 
 
-def _compare_interference_groups(current, old, tolerance):
+def _compare_interference_groups(current, old, tolerance, *, details=None):
     latest, previous = _interference_groups(*current), _interference_groups(*old)
     if latest is None or previous is None:
-        return "Matched logical short work evidence is missing or inconsistent."
+        return _comparison_reason([], details, "Matched logical short work evidence is missing or inconsistent.",
+                                  "user_delivery_incomplete", side=_missing_side(latest is not None, previous is not None))
     current_count = sum(len(pairs) for pairs in latest.values())
     old_count = sum(len(pairs) for pairs in previous.values())
     if latest.keys() != previous.keys() or any(
             abs(Fraction(len(pairs), current_count) - Fraction(len(previous[identity]), old_count)) > tolerance / 100
             for identity, pairs in latest.items()):
-        return "Matched logical short work or its proportions differ between runs."
+        return _comparison_reason([], details, "Matched logical short work or its proportions differ between runs.", "user_delivery_differs")
     if len(latest) == 1:
         return None  # The aggregate checks covered the only logical work group.
 
@@ -1573,11 +1645,13 @@ def _compare_interference_groups(current, old, tolerance):
         old_controls, old_probes, old_heavy = zip(*previous[identity])
         for role, cohorts in (("control", (current_controls, old_controls)), ("probe", (current_probes, old_probes))):
             if _interference_role_work_changed(*cohorts, tolerance):
-                return f"Matched {role} work differs for the same logical short work."
+                known, side = _user_work_evidence(*cohorts, tolerance)
+                return _comparison_reason([], details, f"Matched {role} work differs for the same logical short work.",
+                                          "user_delivery_differs" if known else "user_delivery_incomplete", side=side)
         heavy_cohorts = [[record for group in run for record in group] for run in (current_heavy, old_heavy)]
         if (_interference_role_work_changed(*heavy_cohorts, tolerance)
                 or _heavy_work_per_probe_changed((current_heavy, old_heavy), tolerance)):
-            return "Matched heavy exposure per matched probe differs for the same logical short work."
+            return _comparison_reason([], details, "Matched heavy exposure per matched probe differs for the same logical short work.", "user_delivery_differs")
     return None
 
 
@@ -1639,21 +1713,25 @@ def _heavy_interference_peers(evidence, request_ids):
     return peers
 
 
-def _compare_heavy_interference_work(current, old, current_records, old_records, tolerance):
+def _compare_heavy_interference_work(current, old, current_records, old_records, tolerance, *, details=None):
     if not current or current.keys() != old.keys():
-        return (), "Matched short-peer exposure for this heavy user is missing or differs between runs."
+        return (), _comparison_reason([], details, "Matched short-peer exposure for this heavy user is missing or differs between runs.",
+                                      "user_delivery_differs" if current and old else "user_delivery_incomplete",
+                                      side=_missing_side(bool(current), bool(old)))
     linked = [Counter(), Counter()]
     for peer_id, latest in current.items():
         previous = old[peer_id]
         if not latest or not previous:
-            return (), "Matched short-peer exposure for this heavy user is incomplete."
-        _, reason = _compare_interference_work(latest, previous, peer_id, current_records, old_records, tolerance)
+            return (), _comparison_reason([], details, "Matched short-peer exposure for this heavy user is incomplete.",
+                                          "user_delivery_incomplete", side=_missing_side(bool(latest), bool(previous)))
+        _, reason = _compare_interference_work(latest, previous, peer_id, current_records, old_records, tolerance, details=details)
         if reason:
             return (), reason
         for counts, peer in zip(linked, (latest, previous)):
             counts.update(rid for ids in peer["probe_heavy_request_ids"].values() for rid in ids)
     if _work_samples_changed([list(counts.values()) for counts in linked], tolerance):
-        return (), "Matched short-probe exposure per heavy request differs between runs."
+        return (), _comparison_reason([], details, "Matched short-probe exposure per heavy request differs between runs.",
+                                      "user_delivery_differs")
     return tuple({"probe_request_ids": counts.keys()} for counts in linked), None
 
 
@@ -1726,7 +1804,7 @@ def _recovery_timing_work_changed(current, previous, threshold, *, first_answer)
             or _matched_recovery_work_changed(*samples, threshold, compare_visible=not first_answer))
 
 
-def _compare_user_fairness(current, previous, current_records, old_records):
+def _compare_user_fairness(current, previous, current_records, old_records, *, details=None):
     """Compare a previously accepted fairness limit on the same observed work."""
     latest, old = current.get("fairness", {}), previous.get("fairness", {})
     limit = old.get("threshold")
@@ -1747,6 +1825,13 @@ def _compare_user_fairness(current, previous, current_records, old_records):
                   and old.get("ratio") is not None and latest.get("ratio") is not None
                   and len(compared) >= 2 and all(set(fairness.get(field, [])) == compared
                       for fairness in (latest, old) for field in ("compared_user_ids", "eligible_user_ids")))
+    code, side = "user_fairness_differs", None
+    known = [item.get("ratio") is not None and item.get("qualified") is True
+             and item.get("status") in {"pass", "fail"}
+             and all(field in item for field in ("compared_user_ids", "eligible_user_ids"))
+             for item in (latest, old)]
+    if not all(known) or len(compared) < 2:
+        code, side = "user_fairness_unknown", _missing_side(*known)
     evidence = []
     if comparable:
         latest_users, old_users = ({user["user_id"]: user for user in window["users"]}
@@ -1759,28 +1844,35 @@ def _compare_user_fairness(current, previous, current_records, old_records):
             if (not latest_exposure or not old_exposure
                     or abs(latest_exposure - old_exposure)*100 > min(latest_exposure, old_exposure)*tolerance):
                 comparable = False
+                if not latest_exposure or not old_exposure:
+                    code, side = "user_fairness_unknown", _missing_side(bool(latest_exposure), bool(old_exposure))
                 break
-            cohorts, delivery_cohorts = [], []
+            cohorts, delivery_cohorts, coverage = [], [], []
             for window, user, records, sample in (
                     (current, latest_users.get(user_id, {}), current_records, latest_sample),
                     (previous, old_users.get(user_id, {}), old_records, old_sample)):
                 requests = [records[rid] for rid in user.get("request_ids", []) if rid in records]
                 delivery = user_delivery_completions(requests, window, user_id)
                 if not delivery or len(delivery) != sample.get("valid_samples"):
-                    comparable = False
-                    break
+                    coverage.append(False)
+                    continue
                 cohort = user_delivery_completions(requests, window, user_id, include_drain=True) if scheduled else delivery
                 if scheduled and len(cohort) != sample.get("work_samples"):
-                    comparable = False
-                    break
+                    coverage.append(False)
+                    continue
+                coverage.append(True)
                 cohorts.append(cohort)
                 delivery_cohorts.append(delivery)
-            if not comparable:
+            if not all(coverage):
+                comparable = False
+                code, side = "user_fairness_unknown", _missing_side(*coverage)
                 break
             if (latest_users[user_id]["profile"] != old_users[user_id]["profile"]
                     or any(_load_work_comparison(*cohorts)) or _live_input_work_changed(*cohorts, tolerance)
                     or _user_token_work_changed(*cohorts, tolerance)):
                 comparable = False
+                known, side = _user_work_evidence(*cohorts, tolerance)
+                code = "user_fairness_differs" if known else "user_fairness_unknown"
                 break
             evidence.extend(record.id for record in delivery_cohorts[0])
 
@@ -1793,16 +1885,19 @@ def _compare_user_fairness(current, previous, current_records, old_records):
     reasons = {"pass": "Observed delivery fairness stayed within the previously accepted threshold.",
                "fail": "Observed delivery fairness exceeded the previously accepted threshold.",
                "inconclusive": "Observed fairness work or overlap differs or lacks evidence."}
+    text = f"Multi-user fairness at {population} users: {reasons[status]}"
+    if status == "inconclusive":
+        _comparison_reason([], details, text, code, side=side)
     return {"check": "multi_user", "scenario": label, "population": population, **role,
             "window_id": current["id"], "metric": "fairness_acceptance", "aggregation": "selected_criteria",
             "current": latest.get("ratio"), "baseline": old.get("ratio"), "threshold": limit,
             "current_samples": sum(item.get("valid_samples", 0) for item in latest.get("users", [])),
             "baseline_samples": sum(item.get("valid_samples", 0) for item in old.get("users", [])),
             "status": status, "worsening": {"pass": 0, "fail": 100}.get(status),
-            "reason": f"Multi-user fairness at {population} users: {reasons[status]}", "evidence_ids": evidence}
+            "reason": text, "evidence_ids": evidence}
 
 
-def _compare_user_delivery(report, baseline, target, reasons, threshold, slot_changes):
+def _compare_user_delivery(report, baseline, target, reasons, threshold, slot_changes, *, details=None):
     current, previous = _user_measurements(report, target), _user_measurements(baseline, target)
     rows, incomplete = [], []
     if reasons or not (current or previous):
@@ -1823,9 +1918,11 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold, slot_ch
         current_work = [current_records[rid] for rid in c.get("request_ids", []) if rid in current_records]
         old_work = [old_records[rid] for rid in b.get("request_ids", []) if rid in old_records]
         c_scenario, b_scenario = (_user_scenario_evidence(window, user_id) for window in (c_window, b_window))
+        scenario_known = [not item or item.get("qualified") and item.get("status") != "inconclusive"
+                          for item in (c_scenario, b_scenario)]
         scenario_reason = ("Scenario evidence is missing or unqualified in the current run or baseline."
-                           if any(item and (not item.get("qualified") or item.get("status") == "inconclusive")
-                                  for item in (c_scenario, b_scenario)) else None)
+                           if not all(scenario_known) else None)
+        scenario_side = _missing_side(*scenario_known)
         current_delivery = user_delivery_completions(current_work, c_window, user_id)
         old_delivery = user_delivery_completions(old_work, b_window, user_id)
         comparable_work = current_delivery, old_delivery
@@ -1865,18 +1962,24 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold, slot_ch
         short_probe = noisy_probe and any(evidence.get("user_id") == user_id
                                           for evidence in (c_scenario, b_scenario))
         interference_ids, interference_reason = ([], None)
+        interference_details = {}
         if short_probe:
             interference_ids, interference_reason = _compare_interference_work(
-                c_scenario, b_scenario, user_id, current_records, old_records, tolerance)
+                c_scenario, b_scenario, user_id, current_records, old_records, tolerance, details=interference_details)
         elif noisy_probe:
             peers = [_heavy_interference_peers(evidence, user.get("request_ids", []))
                      for evidence, user in ((c_scenario, c), (b_scenario, b))]
             overlap, interference_reason = _compare_heavy_interference_work(
-                *peers, current_records, old_records, tolerance)
+                *peers, current_records, old_records, tolerance, details=interference_details)
             # The window-level status combines every short user's evidence. This
             # heavy user's rows depend only on the qualified peers it overlapped.
             c_scenario, b_scenario = overlap or ({}, {})
             scenario_reason = None
+        interference_code = ("user_delivery_differs" if states.baseline_comparability([
+            detail["code"] for detail in interference_details.values()]) == states.BASELINE_NOT_COMPARABLE
+                             else "user_delivery_incomplete")
+        interference_sides = {detail.get("side") for detail in interference_details.values()}
+        interference_side = next(iter(interference_sides)) if len(interference_sides) == 1 else None
         delivery_reason = ("Shared-window delivery includes samples without qualified heavy overlap."
                            if noisy_probe and not (scenario_reason or interference_reason) and not all(
                                _probe_has_overlap(evidence, records)
@@ -1886,7 +1989,8 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold, slot_ch
         if scenario == "recovery" and scenario_reason:
             # Recovery compares work across three phases. A single window's
             # completed visible delivery has its own coverage and work checks.
-            incomplete.append(f"Multi-user {user_id} at {population} users: Recovery evidence is missing or unqualified.")
+            _comparison_reason(incomplete, details, f"Multi-user {user_id} at {population} users: Recovery evidence is missing or unqualified.",
+                               "user_delivery_incomplete", side=scenario_side)
             delivery_scenario_reason = None
         missing = (not complete
                    or c_rate is None or b_rate is None or work_reason or mix_changed
@@ -1914,10 +2018,27 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold, slot_ch
                       or "Missing or incomplete shared-window coverage.")
             message = f"Multi-user {user_id} at {population} users: {detail}"
             row["reason"] = message
-            incomplete.append(message)
+            side = None
+            if work_reason or mix_changed:
+                code = ("user_delivery_differs" if mix_changed or all(comparable_work) and not missing_drain_work
+                        else "user_delivery_incomplete")
+                side = _missing_side(bool(comparable_work[0]), bool(comparable_work[1]))
+            elif live_work_reason:
+                known, side = _user_work_evidence(*comparable_work, threshold)
+                code = "user_delivery_differs" if known else "user_delivery_incomplete"
+            elif delivery_scenario_reason:
+                code, side = "user_delivery_incomplete", scenario_side
+            elif interference_reason:
+                code, side = interference_code, interference_side
+            else:
+                code = "user_delivery_incomplete"
+                side = _missing_side(c_rate is not None and c.get("coverage", {}).get("status") == "complete",
+                                     b_rate is not None and b.get("coverage", {}).get("status") == "complete")
+            _comparison_reason(incomplete, details, message, code, side=side)
         elif b_rate == 0 and c_rate != 0:
             row["reason"] = "Zero baseline delivery does not support a relative rate comparison."
-            incomplete.append(f"Multi-user {user_id} has zero baseline delivery.")
+            _comparison_reason(incomplete, details, f"Multi-user {user_id} has zero baseline delivery.",
+                               "user_delivery_zero_baseline", side="baseline")
         else:
             worsening = (b_rate-c_rate)*100/b_rate if b_rate else 0
             row.update(worsening=worsening, observed_delta=c_rate-b_rate,
@@ -1932,7 +2053,8 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold, slot_ch
             if reason or observed not in {"pass", "fail"}:
                 status = "inconclusive"
                 reason = f"Multi-user {user_id} at {population} users: {reason or 'Interference evidence is unavailable.'}"
-                incomplete.append(reason)
+                _comparison_reason(incomplete, details, reason, interference_code if interference_reason and not scenario_reason else "user_delivery_incomplete",
+                                   side=scenario_side if scenario_reason else interference_side)
             else:
                 status = observed
                 reason = ("This user's previously accepted interference scenario now fails its selected criterion."
@@ -1945,7 +2067,7 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold, slot_ch
                          "observed_change": None, "observed_delta": None})
         elif short_probe and b_scenario.get("status") == "measured" and interference_reason:
             reason = f"Multi-user {user_id} at {population} users: {interference_reason}"
-            incomplete.append(reason)
+            _comparison_reason(incomplete, details, reason, interference_code, side=interference_side)
             rows.append({**identity,
                 "metric": "matched_interference_slowdown", "status": "inconclusive", "threshold": None,
                 "current": c_scenario.get("slowdown"), "baseline": b_scenario.get("slowdown"),
@@ -1959,7 +2081,7 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold, slot_ch
                 and c_scenario.get("status") in {"pass", "fail", "measured"}
                 and _recovery_work_changed(c_scenario, b_scenario, current_records, old_records, threshold)):
             recovery_reason = f"Multi-user {user_id} at {population} users: Matched work differs or lacks evidence across recovery runs."
-            incomplete.append(recovery_reason)
+            _comparison_reason(incomplete, details, recovery_reason, "user_delivery_differs")
         if (not noisy_probe and c_scenario.get("status") == "fail" and b_scenario.get("status") == "pass"
                 and not scenario_reason and not any(_load_work_comparison(current_work, old_work))):
             acceptance = {**row, "metric": "scenario_acceptance", "status": "fail",
@@ -2028,14 +2150,19 @@ def _compare_user_delivery(report, baseline, target, reasons, threshold, slot_ch
                           if timing_work_changed
                           else "Work behind the selected acceptance criteria differs or lacks evidence.")
                 reason = f"Multi-user {user_id} at {population} users: {detail}"
-                incomplete.append(reason)
+                if noisy_probe and failed_timing and (not timing_exposed or not observed_timing_failures):
+                    code = interference_code if interference_reason else "user_delivery_incomplete"
+                    side = interference_side if interference_reason else None
+                else:
+                    code, side = "user_delivery_differs", None
+                _comparison_reason(incomplete, details, reason, code, side=side)
                 acceptance.update(status="inconclusive", worsening=None, reason=reason)
             else:
                 acceptance.update(status="fail", worsening=100,
                                   reason="This previously accepted user now fails its selected criteria.")
             rows.append(acceptance)
     for c_window, b_window in window_pairs.values():
-        if row := _compare_user_fairness(c_window, b_window, current_records, old_records):
+        if row := _compare_user_fairness(c_window, b_window, current_records, old_records, details=details):
             rows.append(row)
             if row["status"] == "inconclusive":
                 incomplete.append(row["reason"])
@@ -2196,7 +2323,10 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
     current_load = [c for c in report.checks if c.id == "concurrency" and c.required]
     previous_load = [c for c in baseline.checks if c.id == "concurrency" and c.required]
     if any("load_types" in c.metrics for c in current_load) != any("load_types" in c.metrics for c in previous_load) and current_load and previous_load:
-        reasons.insert(0, "baseline uses the previous Concurrent workloads format")
+        _comparison_reason(reasons, reason_details, "baseline uses the previous Concurrent workloads format",
+                           "workload_format_changed", side=_missing_side(
+                               any("load_types" in c.metrics for c in current_load),
+                               any("load_types" in c.metrics for c in previous_load)), index=0)
     config = report.manifest.get("config", {})
     limits = config.get("limits", {})
     minimum = max(2, int(limits.get("min_samples", 5)))
@@ -2238,14 +2368,16 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
         identity_changes = {}
         identity_reasons = []
         if old_target is None:
-            identity_reasons.append("Target is absent from the baseline.")
+            _comparison_reason(identity_reasons, target_details, "Target is absent from the baseline.",
+                               "target_absent", side="baseline")
         else:
             for key in ("model", "url", "route", "parent"):
                 if key not in target or key not in old_target or target[key] != old_target[key]:
                     text = f"Target {key} differs or is unknown."
-                    identity_reasons.append(text)
-                    target_details[text] = {"code": "target_differs", "key": key,
-                                            "baseline": old_target.get(key), "current": target.get(key), "text": text}
+                    _comparison_reason(identity_reasons, target_details, text,
+                                       "target_unknown" if key not in target or key not in old_target else "target_differs", key,
+                                       target.get(key), old_target.get(key),
+                                       side=_missing_side(key in target, key in old_target))
             for key in set(target.get("identity", {})) | set(old_target.get("identity", {})):
                 previous, current = old_target.get("identity", {}).get(key), target.get("identity", {}).get(key)
                 if previous != current:
@@ -2283,27 +2415,38 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
             # Access sends its own fixed probes. Shared timing, fixture settings and
             # limits only matter to Access when they leave a case without evidence.
             if not all(is_supported_schema(run.schema_version) for run in (report, baseline)):
-                access_reasons.append("Report schema versions differ.")
+                _comparison_reason(access_reasons, target_details, "Report schema versions differ.",
+                                          "schema_differs")
             elif any(type(version) is not int or version != 2
                      for version in (config.get("config_version", 2), old_config.get("config_version", 2))):
-                access_reasons.append("Recorded configuration has an unsupported config_version.")
+                _comparison_reason(access_reasons, target_details, "Recorded configuration has an unsupported config_version.",
+                                          "config_unsupported", key="config_version", side=_missing_side(*[type(cfg.get("config_version", 2)) is int and cfg.get("config_version", 2) == 2
+                                                              for cfg in (config, old_config)]))
             elif not isinstance(old_checks := old_config.get("checks"), list) or "gateway_access" not in old_checks:
-                access_reasons.append("The baseline did not record a gateway access check.")
+                _comparison_reason(access_reasons, target_details, "The baseline did not record a gateway access check.",
+                                          "gateway_access_missing", side="baseline")
             elif (access_settings is None or old_access_settings is None
                   or access_settings.model_dump(exclude={"auth_header"}) != old_access_settings.model_dump(exclude={"auth_header"})
                   or (access_settings.auth_header or "").lower() != (old_access_settings.auth_header or "").lower()):
-                access_reasons.append("Gateway access settings differ or are missing.")
+                _comparison_reason(access_reasons, target_details, "Gateway access settings differ or are missing.",
+                                          "gateway_access_settings_unknown" if access_settings is None or old_access_settings is None else "gateway_access_settings_differs", key="gateway_access", side=_missing_side(access_settings is not None, old_access_settings is not None))
             elif not access_reasons:
                 uses_tls = any(isinstance(url, str) and url.lower().startswith("https://")
                                for url in (target["url"], config.get("proxy")))
                 if (config.get("proxy") != old_config.get("proxy")
                         or (uses_tls and config.get("ca_bundle") != old_config.get("ca_bundle"))):
-                    access_reasons.append("Gateway access transport settings differ.")
+                    _comparison_reason(access_reasons, target_details, "Gateway access transport settings differ.",
+                                          "gateway_access_transport_differs")
                 else:
                     version = report.manifest.get("gateway_access_workload_version")
                     old_version = baseline.manifest.get("gateway_access_workload_version")
                     if type(version) is not int or type(old_version) is not int or version != old_version:
-                        access_reasons.append("Gateway access workload version differs or is missing. Rerun the access check and baseline.")
+                        _comparison_reason(
+                            access_reasons, target_details,
+                            "Gateway access workload version differs or is missing. Rerun the access check and baseline.",
+                            "gateway_access_workload_version_differs" if type(version) is int and type(old_version) is int
+                            else "gateway_access_workload_version_unknown", "gateway_access_workload_version",
+                            version, old_version, side=_missing_side(type(version) is int, type(old_version) is int))
             if access_settings is not None:
                 rows.extend(_compare_gateway_access(current_access, old_access,
                                                     [case.model_dump() for case in access_settings.cases],
@@ -2356,7 +2499,9 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                           "Policy identities, outcomes, settings, source, summary version or qualified passing baseline do not match.",
                 "evidence_ids": [request_id for user in current_users for request_id in user["request_ids"]]})
         slot_changes = _scheduled_user_slot_changes(report, baseline, name)
-        user_rows, user_reasons = _compare_user_delivery(report, baseline, name, target_reasons, threshold, slot_changes)
+        user_details = []
+        user_rows, user_reasons = _compare_user_delivery(
+            report, baseline, name, target_reasons, threshold, slot_changes, details=user_details)
         rows.extend(user_rows)
         qualified_user_probes = {row["scenario"] for row in user_rows if row.get("timing_exposure_qualified")}
         # Optional observations and checks without inference/acceptance cohorts
@@ -2600,14 +2745,20 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                         row["timing_origin"] = "user_ready"
                     rows.append(row)
         target_reasons.extend(user_reasons)
-        target_reasons.extend(dict.fromkeys(slot_changes.values()))
+        for text in dict.fromkeys(slot_changes.values()):
+            _comparison_reason(target_reasons, target_details, text, "user_slots_differs")
         covered_load_points = {point["id"] for row in (load_tests or {}).get("points", [])
                                for side in ("current", "baseline") if (point := row.get(side))
                                and point.get("id") and point.get("pattern") != "interference"}
         for exclusion in load_exclusions:
             point = exclusion.get("load_point") or {}
             if point.get("pattern") == "interference" or point.get("point_id") not in covered_load_points:
-                target_reasons.append(f"load/{exclusion['scenario']}: {exclusion['reason']}")
+                _comparison_reason(target_reasons, target_details,
+                                   f"load/{exclusion['scenario']}: {exclusion['reason']}",
+                                   "load_samples_missing" if not current_groups.get(("load", exclusion["scenario"]))
+                                   or not old_groups.get(("load", exclusion["scenario"])) else "load_work_excluded",
+                                   side=_missing_side(bool(current_groups.get(("load", exclusion["scenario"]))),
+                                                      bool(old_groups.get(("load", exclusion["scenario"])))))
         assessed = [row for row in rows if "worsening" in row and row["status"] in {"pass", "fail"}]
         failures = [row for row in assessed if row["status"] == "fail"]
         # A sparse secondary metric cannot invalidate an otherwise measured check.
@@ -2647,7 +2798,8 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                           for row in (traffic or {}).get("stages", []) + (load_tests or {}).get("points", []))
         if any(check.id == "scale_down" and check.target == name and check.status != "skipped"
                for run in (report, baseline) for check in run.checks):
-            target_reasons.append("Automatic scale-down comparison is unsupported: separate external removals are not interchangeable traffic measurements.")
+            _comparison_reason(target_reasons, target_details, "Automatic scale-down comparison is unsupported: separate external removals are not interchangeable traffic measurements.",
+                               "scale_down_unsupported")
         verdict_reasons = access_reasons if access_only and current_access else target_reasons
         if failures or traffic_failures or load_failures:
             status = "fail"
@@ -2688,7 +2840,7 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
         excluded = len(rows) - len(assessed)
         if (load_tests and load_tests["reason"] not in summary
                 and (load_tests["status"] == "inconclusive"
-                     or any(load_tests.get("summary_counts", {}).get(change) for change in ("gained", "lost")))):
+                     or any(load_tests.get("summary_counts", {}).get(change) for change in (states.LOAD_ACCEPTANCE_GAINED, states.LOAD_ACCEPTANCE_LOST)))):
             summary += " " + load_tests["reason"]
         if excluded:
             summary += f" {excluded} metric(s) not comparable (low samples, undefined values or uncertain attribution); see comparison details."
@@ -2698,8 +2850,7 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
         entry = {"target": name, "status": status, "summary": summary, "reasons": verdict_reasons,
                  "load_exclusions": load_exclusions,
                  "observed_outputs": observed_outputs,
-                 "reason_details": [target_details.get(text, {"code": "comparison_unavailable", "text": text})
-                                    for text in verdict_reasons],
+                 "reason_details": _comparison_reason_details(verdict_reasons, target_details, user_details),
                  "client_delayed_runs": saturated_runs,
                  "generator_saturated_runs": saturated_runs,
                  "identity_changes": identity_changes, "configuration_diff": configuration_diff,
@@ -2707,6 +2858,7 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
                  "telemetry": {"current": report.observations.get("targets", {}).get(name, {}).get("serving_telemetry"),
                                "baseline": baseline.observations.get("targets", {}).get(name, {}).get("serving_telemetry")},
                  "comparisons": rows}
+        entry["comparability"] = states.baseline_comparability([detail["code"] for detail in entry["reason_details"]])
         if traffic is not None:
             entry["traffic_capacity"] = traffic
         if load_tests is not None:
@@ -2723,6 +2875,8 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
         ))
     baseline_checks = [check for check in result.checks if check.id == "baseline"]
     comparison["status"] = overall_status(baseline_checks)
+    comparison["comparability"] = states.worst_baseline_comparability([
+        entry["comparability"] for entry in comparison["targets"]])
     result.baseline = comparison
     interrupted = {(item["target"], item["id"]) for item in
                    result.observations.get("resources", {}).get("memory_interrupted_checks", [])}
@@ -3434,12 +3588,12 @@ def _comparison_load_label(point):
 
 
 def _load_baseline_html(target: dict[str, Any]) -> str:
-    changes = {"gained": "Newly accepted", "lost": "Lost", "unchanged_accepted": "Still accepted",
-               "accepted_baseline_not_established": "Accepted now; not established in baseline",
-               "unchanged_not_accepted": "Still not accepted", "not_established_in_baseline": "Not established in baseline",
-               "not_established_in_current": "Not established in current", "not_established": "Not established",
-               "not_tested_in_baseline": "Not tested in baseline", "not_tested_in_current": "Not tested in current",
-               "work_changed": "Requested work changed"}
+    changes = {states.LOAD_ACCEPTANCE_GAINED: "Newly accepted", states.LOAD_ACCEPTANCE_LOST: "Lost", states.LOAD_ACCEPTANCE_UNCHANGED_ACCEPTED: "Still accepted",
+               states.LOAD_ACCEPTANCE_ACCEPTED_BASELINE_NOT_ESTABLISHED: "Accepted now; not established in baseline",
+               states.LOAD_ACCEPTANCE_UNCHANGED_NOT_ACCEPTED: "Still not accepted", states.LOAD_ACCEPTANCE_NOT_ESTABLISHED_IN_BASELINE: "Not established in baseline",
+               states.LOAD_ACCEPTANCE_NOT_ESTABLISHED_IN_CURRENT: "Not established in current", states.LOAD_ACCEPTANCE_NOT_ESTABLISHED: "Not established",
+               states.LOAD_ACCEPTANCE_NOT_TESTED_IN_BASELINE: "Not tested in baseline", states.LOAD_ACCEPTANCE_NOT_TESTED_IN_CURRENT: "Not tested in current",
+               states.LOAD_ACCEPTANCE_WORK_CHANGED: "Requested work changed"}
     comparison = target.get("load_test", {"points": [], "status": "inconclusive", "reason": ""})
     def point_status(point):
         if point is None:
@@ -3570,7 +3724,7 @@ def _baseline_display_rows(target: dict[str, Any], *, target_index: int = 0) -> 
                              baseline_samples=before.get("dispatched"), current_samples=after.get("dispatched"),
                              sample_basis="dispatched",
                              scenario=point_label(after or before),
-                             acceptance_improved=(point.get("acceptance_change") == "gained"
+                             acceptance_improved=(point.get("acceptance_change") == states.LOAD_ACCEPTANCE_GAINED
                                  if "acceptance_change" in point else point.get("status") == "pass"
                                  and before.get("status") == "fail" and after.get("status") == "pass")))
         if not load.get("points"):

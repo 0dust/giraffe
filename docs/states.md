@@ -31,6 +31,96 @@ Where you see it: `report.json` `overall` and `checks[].status`, CLI JSON `outco
 | `blocked` | `error` |
 | `skipped`, `inconclusive` | `skipped` |
 
+## Baseline comparability
+
+`report.json` exposes `baseline.targets[].comparability` and the worst target verdict
+at `baseline.comparability`. These describe like-for-like evidence, independently
+of regression `status` or absolute acceptance.
+
+| Verdict | Meaning |
+| --- | --- |
+| `comparable` | No comparison reasons were recorded. |
+| `not_comparable` | At least one reason establishes incompatible work or evidence. |
+| `unknown` | Reasons only establish missing or unknown evidence. |
+
+A target is `not_comparable` if any `reason_details[].code` maps to that verdict;
+otherwise it is `unknown` if any code maps to unknown, and `comparable` with no
+reasons. The report uses the worst target verdict:
+`not_comparable` > `unknown` > `comparable` (empty targets are `comparable`).
+In gateway-access-only comparisons, `reasons` and `comparability` cover only
+access reasons, including target identity; unrelated shared-workload reasons do
+not participate. `comparable` can coexist with an `inconclusive` comparison
+`status`, for example when there are too few samples to conclude a regression.
+`reasons` prose stays for people; agents should read `comparability` and
+`reason_details[].code`. Details about one side include `side: "current"` or
+`side: "baseline"`; setting and field names use `key`.
+Unrecorded reasons retain the `comparison_unavailable` fallback and log a warning
+in production; strict test mode raises, so new reason paths must declare a code.
+`giraffe describe` exposes `baseline_comparability`, `baseline_reason_codes`, and
+`load_acceptance_changes` in its `states` block.
+
+| Code | Verdict | Meaning |
+| --- | --- | --- |
+| `setting_missing` | `unknown` | Recorded setting is missing. |
+| `setting_unknown` | `unknown` | Recorded setting cannot be established. |
+| `target_unknown` | `unknown` | Target identity key is missing from either run. |
+| `config_invalid` | `unknown` | Recorded configuration is invalid. |
+| `request_pack_unknown` | `unknown` | Request pack identity is missing. |
+| `multi_user_policy_unknown` | `unknown` | Multi-user summary or window policy is missing. |
+| `fixture_pack_unknown` | `unknown` | Fixture pack identity is missing or unknown. |
+| `custom_fixtures_unhashed` | `unknown` | Custom fixture content has no recorded hash. |
+| `gateway_access_missing` | `unknown` | Baseline gateway access check is missing. |
+| `gateway_access_settings_unknown` | `unknown` | Gateway access settings are missing or invalid. |
+| `gateway_access_workload_version_unknown` | `unknown` | Gateway access workload version is missing or invalid. |
+| `load_samples_missing` | `unknown` | Request samples are absent from one load run. |
+| `user_fairness_unknown` | `unknown` | Per-user fairness evidence is missing or unqualified. |
+| `user_delivery_incomplete` | `unknown` | Per-user delivery or scenario evidence is incomplete. |
+| `comparison_unavailable` | `unknown` | Unrecorded or undeclared comparison reason fallback. |
+| `setting_differs` | `not_comparable` | Recorded setting differs. |
+| `limit_constrained` | `not_comparable` | Changed run limit constrained executed work. |
+| `target_differs` | `not_comparable` | Recorded target identity values differ. |
+| `schema_differs` | `not_comparable` | Report schema is unsupported. |
+| `timing_method_differs` | `not_comparable` | Client timing measurement methods differ. |
+| `run_aborted` | `not_comparable` | Run was aborted. |
+| `evaluation_failed` | `not_comparable` | Answer evaluation failed. |
+| `config_unsupported` | `not_comparable` | Recorded configuration version is unsupported. |
+| `request_source_differs` | `not_comparable` | Effective request source differs. |
+| `request_pack_differs` | `not_comparable` | Request pack identity differs. |
+| `judge_incomplete` | `unknown` | Judge results are incomplete. |
+| `multi_user_policy_differs` | `not_comparable` | Multi-user summary or window policy differs. |
+| `cancellation_grading_differs` | `not_comparable` | Cancellation verdict definitions differ. |
+| `fixture_pack_differs` | `not_comparable` | Fixture pack identity differs. |
+| `workload_format_changed` | `not_comparable` | Concurrent workloads use different report formats. |
+| `target_absent` | `not_comparable` | Target is absent from the baseline. |
+| `gateway_access_settings_differs` | `not_comparable` | Gateway access settings differ. |
+| `gateway_access_transport_differs` | `not_comparable` | Gateway access transport settings differ. |
+| `gateway_access_workload_version_differs` | `not_comparable` | Gateway access workload versions differ. |
+| `user_delivery_differs` | `not_comparable` | Per-user work differs or cannot be matched. |
+| `user_delivery_zero_baseline` | `unknown` | Zero baseline delivery prevents relative comparison. |
+| `user_slots_differs` | `not_comparable` | Changed available slots constrained scheduled offers. |
+| `load_work_excluded` | `not_comparable` | Load work cannot be compared. |
+| `scale_down_unsupported` | `not_comparable` | Separate scale-down events cannot be compared. |
+| `user_fairness_differs` | `not_comparable` | Per-user fairness work or overlap differs or lacks evidence. |
+
+### Load acceptance changes
+
+Where you see it: `baseline.targets[].load_test.points[].acceptance_change`.
+These preserve the existing acceptance comparison independently of comparability.
+
+| Value | Meaning |
+| --- | --- |
+| `not_established` | Acceptance is not established. |
+| `not_tested_in_current` | Level was not tested in the current run. |
+| `not_tested_in_baseline` | Level was not tested in the baseline. |
+| `work_changed` | Work changed; acceptance change is not attributable. |
+| `unchanged_accepted` | Tested load remains accepted. |
+| `unchanged_not_accepted` | Tested load remains not accepted. |
+| `lost` | Previously accepted tested load now fails. |
+| `gained` | Previously failing tested load is now accepted. |
+| `accepted_baseline_not_established` | Accepted now; baseline acceptance was not established. |
+| `not_established_in_current` | Preservation is unverified in the current run. |
+| `not_established_in_baseline` | Baseline acceptance was not established. |
+
 ## Check phases
 
 | Phase | Meaning | Allowed next phases |
