@@ -352,7 +352,7 @@ def _request_series(records):
 
 
 def _window_summary(report, target, window, records, series, observation):
-    from .runner import _stats
+    from .runner import _ordinary_rate_limit_scope, _stats
     from .timing import qualify, threshold
 
     wid = window["id"]
@@ -461,13 +461,23 @@ def _window_summary(report, target, window, records, series, observation):
     if not event_records:
         for key in ("tpot_direct", "client_ttft", "answer_read_gap", "reasoning_read_gap"):
             metrics[key].update(value=None, state="not_collected", reason="No versioned timing evidence; old records remain unavailable.", action="Rerun with timing schema 1 instrumentation.")
-    stats = _stats(population)
-    for key, label in (("attempted", "Requests started"), ("completed", "Valid completions"),
+    outcome_records = [
+        r for r in population
+        if not (r.http_status == 429 and not r.intentional and not r.load_point and r.traffic_stage is None
+                and "load" not in r.check_ids and _ordinary_rate_limit_scope(r.scenario))
+    ]
+    stats = _stats(outcome_records)
+    put("attempted", n, "Requests started", "requests")
+    for key, label in (("completed", "Valid completions"),
                        ("failed", "Failed / invalid"), ("timed_out", "Timeouts"),
                        ("cancelled", "Cancelled"), ("reasoning_budget_exhausted", "Reasoning budget exhausted")):
         put(key, stats[key], label, "requests")
-    put("error_rate", stats["error_rate"], "Error rate", "ratio", "Existing outcome accounting; failures + timeouts / non-cancelled, non-reasoning-budget requests",
-        samples=n-stats["cancelled"]-stats["reasoning_budget_exhausted"], eligible=n-stats["cancelled"]-stats["reasoning_budget_exhausted"])
+    put("rate_limited", n - len(outcome_records), "Rate-limited ordinary requests", "requests",
+        "HTTP 429 responses during ordinary traffic")
+    error_eligible = len(outcome_records) - stats["cancelled"] - stats["reasoning_budget_exhausted"]
+    put("error_rate", stats["error_rate"], "Error rate", "ratio",
+        "Failures and timeouts divided by requests, excluding cancellations, reasoning-budget exhaustion, and ordinary HTTP 429s",
+        samples=error_eligible, eligible=error_eligible)
     scored = [r for r in population if r.score is not None]
     put("scored", len(scored), "Scored", "requests")
     put("unscored", n-len(scored), "Unscored", "requests")
@@ -567,7 +577,7 @@ def _window_summary(report, target, window, records, series, observation):
     _baseline_rows(report, target, window, population, put)
     sections = {
         "delivery": ("sampled_concurrency", "dispatch_rate", "max_event_loop_delay", "delayed_intervals", "timing_quality", "client_preparation", "client_wait", "offered_rate", "dispatch_delay", "arrival_first_output", "arrival_completion", "drops", "server_running", "server_queue"),
-        "outcomes": ("attempted", "completed", "failed", "timed_out", "cancelled", "error_rate", "reasoning_budget_exhausted", "partial_failed", "length_capped", "normal_finish", "scored", "unscored", "correctness", "structured_correctness", "tool_correctness", "latency_attainment"),
+        "outcomes": ("attempted", "completed", "failed", "timed_out", "cancelled", "rate_limited", "error_rate", "reasoning_budget_exhausted", "partial_failed", "length_capped", "normal_finish", "scored", "unscored", "correctness", "structured_correctness", "tool_correctness", "latency_attainment"),
         "token_accounting": ("input_tokens", "answer_tokens", "completion_tokens", "total_tokens", "cached_tokens", "cached_share", "reasoning_tokens", "missing_usage"),
         "throughput_capacity": ("input_throughput", "completion_throughput", "total_throughput", "output_rate", "output_per_in_flight", "total_per_in_flight", "goodput", "knee", "highest_acceptable_rate"),
         "conversations": ("turn_latency", "turn_generation", "conversation_completion", "user_fairness", "workload_occupancy", "decode_interference", "response_interference", "recovery_ratios", "cancel_followup"),

@@ -2187,6 +2187,43 @@ def endpoint_answer(request):
         "finish_reason": "stop"}], "usage": {"prompt_tokens": 8, "completion_tokens": 2}})
 
 
+def test_sustained_rate_limits_keep_cooldown_and_allow_recovery_probes(monkeypatch):
+    import httpx
+    from tests.virtual_clock import run_virtual
+
+    phase = None
+    sustained_dispatches = []
+
+    def progress(event):
+        nonlocal phase
+        if event["event"] == "scenario_started":
+            phase = event["scenario"]
+
+    async def handler(request):
+        if request.method != "POST":
+            return httpx.Response(404)
+        if phase == "sustained":
+            sustained_dispatches.append(asyncio.get_running_loop().time())
+            if len(sustained_dispatches) <= 2:
+                return httpx.Response(429, headers={"Retry-After": "0.01"})
+            await asyncio.sleep(.01)
+        return endpoint_answer(request)
+
+    mock_inference_transport(monkeypatch, handler)
+
+    async def scenario():
+        report = await runner.run_suite(config(checks=["recovery"], concurrency=1, stream=False,
+            sustained_seconds=.05, stop_after_errors=2), progress=progress)
+
+        assert report.abort_reason is None
+        assert [r.http_status for r in report.requests if r.scenario == "sustained"][:2] == [429, 429]
+        assert sustained_dispatches[1] - sustained_dispatches[0] == pytest.approx(.01)
+        assert sustained_dispatches[2] - sustained_dispatches[1] == pytest.approx(.01)
+        assert [r.status for r in report.requests if r.scenario == "recovery"] == ["completed", "completed"]
+
+    run_virtual(monkeypatch, scenario())
+
+
 @pytest.mark.parametrize("fault", ["refused", "reset", "silent"])
 async def test_endpoint_outage_through_transport_stops_and_saves_records(monkeypatch, tmp_path, fault):
     import httpx

@@ -213,6 +213,11 @@ def _stress(scenario):
                             "cancellation_probe", "cancellation_baseline"})
 
 
+def _ordinary_rate_limit_scope(scenario: str) -> bool:
+    return (not _stress(scenario) and not scenario.startswith(("scale_down_", "backend_cancel_"))
+            and scenario not in {"readiness", "performance_evidence_probe", "deadline_probe", "pack_loaded"})
+
+
 def _context_rejection(record):
     return record.http_status in {400, 413, 422} and any(word in (record.error or "").lower()
         for word in ("context length", "context_length", "maximum context", "too many tokens",
@@ -724,15 +729,18 @@ class _Run:
         health.update(last_response_seconds=time.monotonic() - self.start,
                       consecutive_failures=0, failure_request_ids=[])
 
-    def observe_http_status(self, target: str, status: int, retry_after: float | None) -> None:
+    def observe_http_status(self, target: str, status: int, retry_after: float | None, *, count_toward_stop: bool) -> None:
         if status != 429:
-            self.consecutive_rate_limits.pop(target, None)
+            if count_toward_stop:
+                self.consecutive_rate_limits.pop(target, None)
             return
 
         self.endpoint_response(target)
         delay = _RATE_LIMIT_FALLBACK_SECONDS if retry_after is None else retry_after
         self.rate_limit_until[target] = max(self.rate_limit_until.get(target, 0.0),
                                             time.monotonic() + delay)
+        if not count_toward_stop:
+            return
         self.consecutive_rate_limits[target] += 1
         if self.consecutive_rate_limits[target] >= self.config.stop_after_errors:
             self.rate_limit_threshold_reached = True
@@ -919,6 +927,10 @@ class _Run:
             slot_deadline = min(slot_deadline, admission_deadline)
         # Identity probes measure gateway policy using their own credentials.
         rate_limit_control = spec.identity is None
+        count_rate_limit_for_stop = (
+            not readiness and not budget_reserved and _ordinary_rate_limit_scope(spec.scenario)
+            and spec.cancel_after_ms is None and spec.cancel_after_chunks is None
+        )
         observes_headers = getattr(client, "_supports_rate_limit_control", False) is True
         guard_admission = admission_deadline is not None and (budget_reserved or prepared_admission)
         guard_transport = ((rate_limit_control and observes_headers) or
@@ -969,7 +981,7 @@ class _Run:
                     raise _DispatchRefused
 
             def observe_http_status(status, retry_after):
-                self.observe_http_status(target.name, status, retry_after)
+                self.observe_http_status(target.name, status, retry_after, count_toward_stop=count_rate_limit_for_stop)
 
             key = (target.name, spec.scenario)
             global_deadline = False

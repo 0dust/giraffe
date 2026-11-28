@@ -132,6 +132,30 @@ def test_outcomes_use_existing_reasoning_and_cancellation_accounting():
     assert metrics["partial_failed"]["value"] == 1
 
 
+@pytest.mark.parametrize(("scenarios", "rate_limited"), [
+    (("warm", "warm"), 2),
+    (("load_short_short_constant", "load_short_short_constant"), 0),
+    (("warm", "sustained"), 1),
+])
+def test_outcomes_classify_only_ordinary_429s_separately(scenarios, rate_limited):
+    records = [record(str(i), condition_id="shared").model_copy(update={"scenario": scenarios[0]})
+               for i in range(4)]
+    records.extend(record(f"limited-{i}", condition_id="shared").model_copy(update={
+        "scenario": scenario, "http_status": 429, "status": "failed", "valid": False,
+    }) for i, scenario in enumerate(scenarios))
+
+    result = summary(report(records))
+    metrics = result["metrics"]
+    eligible = 6 - rate_limited
+    assert metrics["attempted"]["value"] == 6
+    assert metrics["completed"]["value"] == 4
+    assert metrics["failed"]["value"] == 2 - rate_limited
+    assert metrics["rate_limited"]["value"] == rate_limited
+    assert metrics["error_rate"]["value"] == pytest.approx((2 - rate_limited) / eligible)
+    assert metrics["error_rate"]["counts"] == {"sample": eligible, "eligible": eligible, "missing": 0}
+    assert metrics["rate_limited"] in result["sections"]["outcomes"]
+
+
 def test_no_intended_history_invented_from_ceiling_and_zero_window():
     a=record(start=10,end=10)
     value=report([a])
