@@ -1,5 +1,12 @@
 """Availability is derived from recorded window evidence, without network I/O."""
 from dataclasses import replace
+import json
+from types import SimpleNamespace
+
+from giraffe import states
+from giraffe.fixtures import REASONING_WITHOUT_ANSWER, TRUNCATED_ANSWER
+from giraffe.models import EvaluationEvidence, JudgeVote, RequestJudgement
+from giraffe.scoring_facts import scoring_facts, scoring_gap
 import re
 
 import pytest
@@ -76,7 +83,7 @@ PACE_BASE = dict(stream=True, timing_schema=1, answer_reads=2, first_output_ms=1
     ("tpot", {"tool_calls": [{"id": "call_1", "function": {"name": "test", "arguments": "{}"}}]}, "not_applicable", "Tool-call"),
     ("first_reasoning", {"output": "answer"}, "not_applicable", "no reasoning content"),
     ("first_reasoning", {"reasoning": "private thought"}, "data_missing", "no timestamp"),
-    ("first_useful_output", {"first_output_ms": None, "first_reasoning_ms": 5}, "data_missing", "Output cap"),
+    ("first_useful_output", {"first_output_ms": None, "first_reasoning_ms": 5, "finish_reason": "length"}, "data_missing", "Output cap"),
     ("response_latency", {"valid": False, "status": "failed"}, "data_missing", "failed"),
     ("first_useful_output", {"first_output_ms": None, "valid": False, "status": "failed"}, "data_missing", "Fix the failing requests"),
     ("itl", {"workload": {"token_evidence": {"logprobs": "supported"}}}, "data_missing", "batching"),
@@ -329,7 +336,7 @@ def test_goodput_not_pooled_has_a_matching_next_step():
                  reason='Separate load-point rates are not pooled; select one load-point window.')
     # The pooling rule is about load-point scope, so supply a nonempty valid window.
     r = record(check_ids=['load'])
-    facts = replace(facts, population=[r], good=[r])
+    facts = replace(facts, population=[r], good=[r], cohort=[r], dispatched=[r])
     explain_window({'goodput': row}, {}, facts)
     assert row['cause'] == 'not_applicable'
     assert row['action'] == 'Choose a single load point in the Measurement menu.'
@@ -573,3 +580,602 @@ def test_total_usage_rejected_support_preserves_all_missing_fields():
         assert row['cause'] == 'endpoint_unsupported'
         assert 'usage.prompt_tokens' in row['reason'] and 'usage.completion_tokens' in row['reason']
         assert len(row['reason']) <= 200
+
+
+IDENTITY_OWNERS = {
+    'goodput': 'load', 'latency_attainment': 'load', 'offered_rate': 'load',
+    'drops': 'load', 'highest_acceptable_rate': 'load', 'correctness': 'correctness',
+    'structured_correctness': 'json', 'tool_correctness': 'tools',
+    'turn_latency': 'sessions', 'turn_generation': 'sessions',
+    'conversation_completion': 'sessions', 'user_fairness': 'sessions',
+}
+
+
+def identity_report(check='load', pattern='concurrent', completion='late'):
+    end = 1500 if completion == 'late' else 500
+    r = record(check_ids=[check], scenario=f'{check}_c1', stream=True, timing_schema=1,
+               end=end, first_output_ms=10, scheduled_ms=0 if pattern == 'constant' else None,
+               load_point=({'point_id': 'load_c1', 'source': 'primary', 'pattern': pattern}
+                           if check == 'load' else None),
+               workload={'pattern': pattern} if check == 'load' else {})
+    transitions = [dict(stage_id='send', kind='arrival_rate' if pattern == 'constant' else 'concurrency',
+                        start_ms=0, end_ms=1000, check_id=check,
+                        **({'intended_rate_rps': 1} if pattern == 'constant' else {'intended_concurrency': 1})),
+                   dict(stage_id='drain', kind='drain', start_ms=1000, end_ms=2000, check_id=check)]
+    value = report([r], config={'targets': [{'name': 't'}], 'checks': list(CHECK_NAMES)},
+                   observations={'targets': {'t': {'schedule_transitions': transitions}}})
+    value.manifest['effective_checks'] = {name: {} for name in CHECK_NAMES}
+    value.performance = build_performance(value)
+    return value
+
+
+def test_stage_dispatch_identity_survives_completion_in_drain():
+    value = identity_report()
+    windows = value.performance['targets'][0]['windows']
+    assert all(w['check_ids'] == ['load'] and w['cohort_check'] == 'load' for w in windows)
+    stage = next(w for w in windows if w['id'].startswith('stage:0:'))
+    assert (stage['dispatch_count'], stage['completion_count']) == (1, 0)
+    full = next(w for w in windows if w['kind'] == 'full')
+    assert (full['dispatch_count'], full['completion_count']) == (1, 1)
+    rows = summary(value, window=stage['id'])['metrics']
+    for key in ('goodput', 'latency_attainment', 'offered_rate', 'drops', 'highest_acceptable_rate'):
+        row = rows[key]
+        assert row['cause'] != 'not_applicable' or 'fixed concurrency' in row['reason']
+        assert 'not a' not in row['reason']
+    row = rows['goodput']
+    assert row['cause'] == 'too_few_samples'
+    assert 'dispatched 1 request' in row['reason']
+    assert 'finished after it ended (during drain)' in row['reason']
+    assert 'load_test.schedule.duration_seconds' in row['action']
+    assert len(row['reason']) <= 200 and len(row['action']) <= 170
+
+
+@pytest.mark.parametrize('check,pattern', [('load', 'concurrent'), ('load', 'constant'),
+                                         ('correctness', 'concurrent'), ('sessions', 'concurrent')])
+@pytest.mark.parametrize('completion', ['early', 'late'])
+def test_window_identity_is_cohort_scoped_and_never_vacuous(check, pattern, completion):
+    value = identity_report(check, pattern, completion)
+    for window in value.performance['targets'][0]['windows']:
+        records = value.requests
+        population = (records if window['kind'] == 'full' else
+                      [r for r in records if window['start_ms'] <= r.completed_ms <= window['end_ms']
+                       and (window.get('end_inclusive') or r.completed_ms < window['end_ms'])])
+        dispatched = [r for r in records if window['kind'] == 'full'
+                      or window['start_ms'] <= r.dispatch_ms < window['end_ms']]
+        facts = WindowFacts(value, window, population, population, population, [], window['duration_s'],
+                            population, cohort=records, dispatched=dispatched)
+        assert facts.owned_checks == frozenset({check})
+        assert facts.streamed and facts.timing_versioned
+        assert len(facts.nonstreaming_by_design) == len(records)
+        assert not any(facts.nonstreaming_by_design)
+        assert facts.scheduled == (pattern == 'constant')
+        rows = summary(value, window=window['id'])['metrics']
+        for key, owner_check in IDENTITY_OWNERS.items():
+            row = rows[key]
+            if row['value'] is None and owner_check != check:
+                assert row['cause'] == 'not_applicable'
+                assert 'which is not part of' in row['reason']
+            elif row['value'] is None:
+                assert 'which is not part of' not in row['reason']
+
+
+# Declarative contradiction predicates apply to every unavailable row, including
+# future owner metrics. Identity evidence never comes from interval completions.
+IDENTITY_CONTRADICTIONS = [
+    (lambda owner, window, selected: owner in window.get('check_ids', []),
+     r'which is not part of|not a .+ window'),
+    (lambda owner, window, selected: owner in window.get('check_ids', []) or owner in selected,
+     r'was not selected'),
+    (lambda owner, window, selected: True, r'not a Load test window'),
+]
+
+
+@pytest.mark.parametrize('check,pattern', [('load', 'constant'), ('load', 'concurrent'),
+                                         ('correctness', 'concurrent'), ('json', 'concurrent'),
+                                         ('tools', 'concurrent'), ('sessions', 'concurrent')])
+@pytest.mark.parametrize('completion', ['early', 'late'])
+def test_g1_explanations_never_contradict_window_identity(check, pattern, completion):
+    value = identity_report(check, pattern, completion)
+    target = value.performance['targets'][0]
+    windows = list(target['windows'])
+    empty = dict(windows[0], id='send-empty', kind='stage', start_ms=3000, end_ms=4000,
+                 includes_drain=False, dispatch_count=0, completion_count=0, request_count=0)
+    windows.append(empty)
+    selected = value.manifest['effective_checks']
+    owner_explanations = {}
+    for window in windows:
+        if window['id'] == 'send-empty':
+            from giraffe.performance import _cohort_label, _window_summary
+            window['workload_label'] = _cohort_label(value.requests, value.observations['targets']['t'])[1]
+            rows = _window_summary(value, 't', window, value.requests, target['request_series'],
+                                   value.observations['targets']['t'])['metrics']
+        else:
+            rows = summary(value, window=window['id'])['metrics']
+        for key, row in rows.items():
+            if row['value'] is not None:
+                continue
+            owner_check = IDENTITY_OWNERS.get(key)
+            if owner_check and owner_check != check:
+                text = (row['cause'], row['reason'], row['action'])
+                assert owner_explanations.setdefault(key, text) == text
+            for applies, forbidden in IDENTITY_CONTRADICTIONS:
+                if applies(owner_check, window, selected):
+                    assert not re.search(forbidden, row['reason'] or ''), (window['id'], key, row)
+    # Also cover a drain-only selected interval without any dispatch in it.
+    if completion == 'late':
+        drain = next(w for w in windows if w.get('includes_drain') and w['kind'] == 'stage')
+        assert drain['dispatch_count'] == 0 and drain['completion_count'] == 1
+
+
+
+def scoring_record(**updates):
+    values = dict(check_ids=["correctness"], score=None,
+                  evaluation=EvaluationEvidence(messages=[{"role": "user", "content": "SECRET-INPUT"}],
+                                                scorer="judge", expected="SECRET-EXPECTED", expected_provided=True),
+                  judgement=RequestJudgement(status="inconclusive", votes=[JudgeVote(
+                      judge="j", url="http://SECRET-URL", model="m", status="error", error_category="timeout",
+                      reason="SECRET-MODEL-OUTPUT")]), score_message="AI judge evaluation incomplete")
+    values.update(updates)
+    return record(**values)
+
+
+def scoring_context(records, config=None, stop=None):
+    return SimpleNamespace(good=records, config=config or {}, run_stop=stop,
+                           scoring=[scoring_facts(r) for r in records])
+
+
+def test_scoring_timeout_uses_recorded_outcome_before_absent_config():
+    row = scoring_gap(scoring_context([scoring_record(), scoring_record()]), "correctness")
+    assert row.cause == "data_missing"
+    assert "2/2" in row.reason and "timed out" in row.reason
+    assert "judging.request_timeout_seconds" in row.action
+    assert "attach" not in (row.reason + row.action).lower()
+
+
+@pytest.mark.parametrize("updates,config,cause,reason,action", [
+    ({"evaluation": None}, {}, "not_configured", "no expected", "--request-pack"),
+    ({"evaluation": EvaluationEvidence(messages=[], scorer="none")}, {}, "not_configured", "no expected", "--fixtures"),
+    ({"score_message": "AI judge panel tied", "judgement": RequestJudgement(status="inconclusive", votes=[
+        JudgeVote(judge="j", url="http://x", model="m", status="completed", verdict=True)])}, {}, "data_missing", "tied", "odd number"),
+    ({"judgement": None, "score_message": "AI judgment pending."}, {}, "data_missing", "pending or cancelled", "judging.max_duration_seconds"),
+    ({"score_message": TRUNCATED_ANSWER}, {}, "data_missing", "cut off", "--max-output-tokens"),
+    ({"score_message": REASONING_WITHOUT_ANSWER}, {}, "data_missing", "reasoning", "--max-output-tokens"),
+    ({"evaluation_error": "schema_recursion", "check_ids": ["json"]}, {}, "data_missing", "not a wrong answer", "JSON schema"),
+    ({}, {"judging": {"judges": []}}, "not_configured", "no judge endpoint", "judging.judges"),
+])
+def test_scoring_cause_matrix(updates, config, cause, reason, action):
+    records = [scoring_record(**updates), scoring_record(**updates)]
+    row = scoring_gap(scoring_context(records, config), "json" if "json" in records[0].check_ids else "correctness")
+    assert row.cause == cause
+    assert reason in row.reason and action in row.action
+    assert len(row.reason) <= 200 and len(row.action) <= 170
+
+
+@pytest.mark.parametrize("category,needle", [
+    ("timeout", "judging.request_timeout_seconds"), ("http_error", "judging.judges"),
+    ("request_failed", "judging.judges"), ("client_initialization", "judging.judges"),
+    ("truncated_response", "judging.max_output_tokens"), ("invalid_verdict", "verdict JSON"),
+    ("invalid_completion", "verdict JSON"), ("phase_deadline", "judging.max_duration_seconds"),
+    ("not_evaluated", "judging.max_duration_seconds"), ("cancelled", "judging.max_duration_seconds"),
+    ("SECRET-UNKNOWN", "judging.judges"),
+])
+def test_judge_error_categories_are_private_and_actionable(category, needle):
+    value = scoring_record(judgement=RequestJudgement(status="inconclusive", votes=[JudgeVote(
+        judge="SECRET-JUDGE", url="https://SECRET-USER:SECRET-PASSWORD@judge.test/v1?SECRET-TOKEN=1#SECRET-FRAGMENT", model="SECRET-MODEL", status="error",
+        error_category=category, reason="SECRET-MODEL-OUTPUT")]))
+    row = scoring_gap(scoring_context([value, value]), "correctness")
+    assert row.cause == "data_missing" and "2/2" in row.reason and needle in row.action
+    assert "SECRET-" not in str(row)
+    assert "SECRET-" not in json.dumps(scoring_facts(value))
+
+
+def test_scoring_facts_are_bounded_and_survive_evaluator_drop():
+    value = scoring_record()
+    facts = scoring_facts(value)
+    assert len(json.dumps(facts, separators=(",", ":"))) <= 300
+    dropped = value.model_copy(update={"evaluation": None, "judgement": None, "workload": {"_scoring": facts}})
+    direct = scoring_gap(scoring_context([value, value]), "correctness")
+    streamed = scoring_gap(SimpleNamespace(good=[dropped, dropped], config={}, run_stop=None), "correctness")
+    assert direct == streamed
+
+
+def test_scoring_dominance_counts_all_relevant_valid_replies():
+    records = [scoring_record(), scoring_record(), scoring_record(evaluation=None), scoring_record(score=True)]
+    row = scoring_gap(scoring_context(records), "correctness")
+    assert "2/4" in row.reason and "timed out" in row.reason
+
+
+@pytest.mark.parametrize("check,key", [("correctness", "correctness"), ("json", "structured_correctness"),
+                                       ("tools", "tool_correctness"), ("load", "goodput"),
+                                       ("load", "highest_acceptable_rate")])
+def test_scoring_sibling_rows_use_recorded_judge_errors(check, key):
+    from tests.test_performance import report, summary
+    values = dict(check_ids=[check], stream=True, timing_schema=1, output="answer", first_output_ms=10)
+    if check == "load":
+        values.update(load_point={"source": "primary", "pattern": "constant", "point_id": "p"}, scheduled_ms=0)
+    records = [scoring_record(identifier=str(i), start=i*1000, end=i*1000+100, **values) for i in range(2)]
+    config = {"targets": [{"name": "t"}], "checks": [check], "load_test": {"pass_criteria": {
+        "max_completion_ms": 1000}, "patterns": {"constant": {"enabled": True}}}}
+    row = summary(report(records, config=config))["metrics"][key]
+    assert row["cause"] == "data_missing"
+    assert "judge" in row["reason"] and "timed out" in row["reason"]
+    assert "2/2" in row["reason"] and "judging.request_timeout_seconds" in row["action"]
+    assert "expected answers" not in row["action"]
+
+
+def test_scoring_streamed_saved_export_keeps_explanations_and_original_requests(tmp_path):
+    from giraffe.cli import load_report
+    from giraffe.report_stream import expanded_report_chunks
+    from tests.test_performance import report
+    value = report([scoring_record(identifier=str(i), start=i*1000, end=i*1000+100,
+                                   stream=True, timing_schema=1, first_output_ms=10, output="SECRET-ANSWER")
+                    for i in range(2)], config={"targets": [{"name": "t"}], "checks": ["correctness"]})
+    raw = value.model_dump(mode="json")
+    raw.pop("performance")
+    raw.pop("conditions")
+    path = tmp_path / "report.json"
+    path.write_text(json.dumps(raw))
+    exported = json.loads("".join(expanded_report_chunks(path)))
+    assert exported["performance"] == load_report(path).performance
+    assert exported["requests"] == raw["requests"]
+    assert all("_scoring" not in r["workload"] for r in exported["requests"])
+    assert "SECRET-" not in json.dumps(exported["performance"])
+
+
+def test_scoring_dominance_groups_judge_failure_class_before_error_category():
+    records = [scoring_record(evaluation=None) for _ in range(3)]
+    for i, category in enumerate(["timeout", "http_error", "timeout", "invalid_verdict"]):
+        records.append(scoring_record(identifier=str(i), judgement=RequestJudgement(status="inconclusive", votes=[
+            JudgeVote(judge="j", url="http://x", model="m", status="error", error_category=category)])))
+    row = scoring_gap(scoring_context(records), "correctness")
+    assert row.cause == "data_missing" and "4/7" in row.reason and "timed out" in row.reason
+    assert "judging.request_timeout_seconds" in row.action
+
+
+@pytest.mark.parametrize("check", ["correctness", "json", "tools"])
+def test_recorded_scorer_limit_explains_relevant_check_without_model_text(check):
+    value = scoring_record(check_ids=[check], evaluation_error="tool_evaluation_budget")
+    row = scoring_gap(scoring_context([value, value]), check)
+    assert row.cause == "data_missing" and "2/2" in row.reason
+    assert "not a wrong answer" in row.reason and "tool expectation" in row.action
+    assert "SECRET-" not in str(row)
+
+
+def test_scoring_facts_reject_unbounded_unknown_strings():
+    value = scoring_record(evaluation=EvaluationEvidence(messages=[], scorer="SECRET-SCORER"),
+                           evaluation_error="SECRET-LIMIT", score_message="SECRET-OUTPUT")
+    facts = scoring_facts(value)
+    assert facts["scorer"] is None and facts["evaluation_error"] is None
+    assert facts["score_message_code"] is None and "SECRET-" not in json.dumps(facts)
+
+
+
+STOP_CASES = [
+    (states.STOP_MAX_DURATION, ['max_duration_seconds'], {}, 'maximum duration', '--max-duration'),
+    (states.STOP_CANCELLED_BY_USER, [], {}, 'stopped', 'Rerun'),
+    (states.STOP_REQUEST_BUDGET, ['max_requests'], {}, 'request budget', '--max-requests'),
+    (states.STOP_ERROR_THRESHOLD, [], {}, 'error threshold', '--stop-after-errors'),
+    (None, [], {'target_abort_reasons': {'t': 'SECRET-URL'}}, 'stopped responding', 'reachable'),
+    (None, [], {'resources': {'memory_limit_reached': True}}, 'memory limit', 'memory limit'),
+]
+
+
+@pytest.mark.parametrize('abort,limits,observations,reason,action', STOP_CASES)
+@pytest.mark.parametrize('empty', [True, False])
+def test_recorded_run_stop_explains_empty_and_cancelled_windows(abort, limits, observations, reason, action, empty):
+    records = [] if empty else [record(status='cancelled', valid=False, termination_reason='run_duration_limit')]
+    value = report(records, abort_reason=abort, limits_reached=limits, observations=observations)
+    rows = summary(value)['metrics']
+    for key in ('request_throughput',) if empty else ('response_latency', 'first_useful_output'):
+        row = rows[key]
+        assert reason in row['reason']
+        assert action in row['action']
+        assert 'Fix the failing requests first' not in row['action']
+        assert 'more requests' not in row['action']
+        assert len(row['reason']) <= 200 and len(row['action']) <= 170
+        assert 'SECRET-' not in str(row['reason'])
+
+
+# This table describes forbidden contradictions from recorded facts, not rule
+# implementations: every unavailable row participates as new rules are added.
+EVIDENCE_CONTRADICTIONS = [
+    ('expected answer recorded', lambda facts: facts['expected'], r'(?is)(?:attach.*expected answer|expected answer.*attach)'),
+    ('stop requires own-window evidence', lambda facts: not facts.get('stop_affected', False),
+     r'The run (?:was stopped|reached its (?:maximum duration|memory limit)|used its request budget|stopped after reaching its error threshold)|The endpoint stopped responding'),
+    ('unfinished stopped run', lambda facts: facts['stopped'], r'(?i)(?:rerun with more requests|Fix the failing requests first)'),
+    ('usage rejected', lambda facts: facts['rejected'], r'Check that the endpoint returns usage'),
+    ('response retention', lambda facts: facts['retained_none'], r'The model returned no reasoning content'),
+    ('private evidence', lambda facts: True, r'SECRET-'),
+    ('private URL components', lambda facts: True, r'https?://[^\s/]*@|https?://[^\s]*[?#]'),
+    *[(f'generic text {text}', lambda facts: True, re.escape(text)) for text in FORBIDDEN_TEXT],
+]
+
+
+@pytest.mark.parametrize('stop_case', [None, *STOP_CASES[:4]])
+@pytest.mark.parametrize('usage', ['not_recorded', 'rejected'])
+@pytest.mark.parametrize('scorer', ['none', 'exact', 'judge'])
+def test_recorded_evidence_contradiction_table(stop_case, usage, scorer):
+    from giraffe.models import EvaluationEvidence, JudgeVote, RequestJudgement
+    from giraffe.fixtures import TRUNCATED_ANSWER, REASONING_WITHOUT_ANSWER
+    variants = [(None, 'AI judgment pending.'), ('inconclusive', 'AI judge panel tied'),
+                ('inconclusive', TRUNCATED_ANSWER), ('inconclusive', REASONING_WITHOUT_ANSWER), ('pass', None)]
+    variants += [(category, 'AI judge evaluation incomplete') for category in (
+        'timeout', 'cancelled', 'http_error', 'request_failed', 'truncated_response', 'invalid_completion',
+        'invalid_verdict', 'phase_deadline', 'not_evaluated', 'client_initialization')]
+    for judgement, message in variants:
+        evaluation = EvaluationEvidence(messages=[], scorer=scorer, expected='SECRET-ANSWER', expected_provided=scorer != 'none')
+        judge = None if judgement is None else RequestJudgement(status='pass' if judgement == 'pass' else 'inconclusive', votes=[
+            JudgeVote(judge='j', url='https://SECRET-URL', model='m', status='error', error_category=judgement, reason='SECRET-OUTPUT')])
+        stopped = stop_case is not None
+        abort, limits, observations = stop_case[:3] if stopped else (None, [], {})
+        rows = [record(str(i), check_ids=['correctness'], timing_schema=1, stream=True,
+                       status='cancelled' if stopped else 'completed', valid=not stopped,
+                       termination_reason='run_duration_limit' if stopped else None, evaluation=evaluation,
+                       judgement=judge, score_message=message, output_chars=20,
+                       workload={'token_evidence': {'usage': usage}}) for i in range(2)]
+        value = report(rows, config={'targets': [{'name': 't'}], 'retention': 'none',
+                                    'checks': ['correctness'], 'judging': {'judges': [{'name': 'j'}]}},
+                       abort_reason=abort, limits_reached=limits, observations=observations)
+        facts = dict(expected=scorer != 'none', stopped=stopped, stop_affected=stopped,
+                     rejected=usage == 'rejected', retained_none=True)
+        for key, row in summary(value)['metrics'].items():
+            if row['value'] is not None:
+                continue
+            text = ' '.join(str(row.get(field) or '') for field in ('reason', 'action', 'detail'))
+            for label, predicate, forbidden in EVIDENCE_CONTRADICTIONS:
+                assert not predicate(facts) or not re.search(forbidden, text), (label, key, text)
+            assert len(row.get('reason') or '') <= 200
+            assert len(re.sub(r'--checks [a-z_,]+\.?', '', row.get('action') or '').strip()) <= 170
+
+
+@pytest.mark.parametrize('finish,cap', [('stop', False), ('length', True)])
+def test_output_cap_guidance_requires_recorded_length_finish(finish, cap):
+    value = report([record(first_reasoning_ms=1, first_output_ms=None, finish_reason=finish, stream=True, timing_schema=1)])
+    row = summary(value)['metrics']['first_useful_output']
+    assert ('--max-output-tokens' in row['action']) is cap
+
+
+def test_specific_timing_and_baseline_evidence_never_becomes_a_guessed_failure():
+    from giraffe.availability import WindowFacts, response_latency
+    r = record()
+    value = report([r], baseline={'status': 'inconclusive', 'targets': [
+        {'target': 't', 'reasons': ['Input workload differs.']}]})
+    f = WindowFacts(value, {'kind': 'full', 'target': 't'}, [r], [r], [r], [], 1, [r])
+    row = response_latency('response_latency', {}, f)
+    assert row.cause == 'unknown' and 'timestamps were recorded' in row.reason
+    baseline = summary(value)['metrics']['baseline_timing']
+    assert 'Input workload differs' in baseline['reason']
+    assert 'recorded' in baseline['action']
+
+
+def test_first_token_reason_is_bounded_to_recorded_vocabulary():
+    value = report([record(timing_schema=1, stream=True, first_token_reason='SECRET-MODEL https://credentials@host')])
+    row = summary(value)['metrics']['client_ttft']
+    assert 'SECRET-' not in row['reason'] and 'https://' not in row['reason']
+    assert 'failed' not in row['reason']
+
+
+def test_exporter_fallback_preserves_safe_route_and_uses_recorded_status():
+    from giraffe.availability import WindowFacts, explain_window
+    from giraffe.performance import metric
+    r = record()
+    value = report([r])
+    f = WindowFacts(value, {'kind': 'full', 'target': 't'}, [r], [r], [r], [], 1, [r])
+    for status, needle in [('authentication_denied', 'credentials'), ('endpoint_absent', 'metrics_url'),
+                           ('response_limit', 'response size')]:
+        rows = {'server_probe': metric(label='Probe', unit='', source='', target='t', window='full',
+                                      state='not_collected', details={'collection_status': status},
+                                      reason='Collection failed at https://host/metrics.')}
+        explain_window(rows, {}, f)
+        assert needle in rows['server_probe']['action']
+        assert rows['server_probe']['reason'] == 'Collection failed at https://host/metrics.'
+        assert 'secret' not in rows['server_probe']['reason']
+
+
+
+def test_scoring_aggregation_cache_cannot_reintroduce_private_text():
+    cached = dict(scorer="SECRET-SCORER", expected=True, judgement="SECRET-VERDICT",
+                  judge_errors=["SECRET-ERROR"], judge_votes=999999,
+                  score_message_code="SECRET-MESSAGE", evaluation_error="SECRET-OUTPUT")
+    r = record(workload={"_scoring": cached})
+    facts = scoring_facts(r)
+    assert "SECRET-" not in str(facts)
+    assert facts["judge_votes"] == 8 and facts["judge_errors"] == ["other"]
+    assert "SECRET-" not in str(summary(report([r]))["metrics"])
+
+
+def test_availability_modules_support_cold_import_order():
+    import subprocess
+    import sys
+    result = subprocess.run([sys.executable, "-c", "import giraffe.performance; import giraffe.availability; import giraffe.scoring_facts"],
+                            capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+
+
+
+def test_missing_saved_window_identity_keys_fall_back_to_cohort():
+    value = identity_report()
+    for window in value.performance['targets'][0]['windows']:
+        old_window = {key: item for key, item in window.items() if key not in {'check_ids', 'cohort_check', 'target'}}
+        f = WindowFacts(value, old_window, [], [], [], [], 1, [], cohort=value.requests, dispatched=[])
+        assert f.owns('load') and f.streamed and f.timing_versioned
+
+
+def test_stage_schedule_pattern_wins_over_other_patterns_in_the_cohort():
+    value = identity_report()
+    value.requests = [record('held', start=0, end=500, check_ids=['load'],
+                             load_point={'point_id': 'held', 'source': 'primary', 'pattern': 'concurrent'}),
+                      record('arrival', start=2000, end=2500, check_ids=['load'], scheduled_ms=2000,
+                             load_point={'point_id': 'arrival', 'source': 'primary', 'pattern': 'constant'})]
+    value.observations['targets']['t']['schedule_transitions'] = [
+        dict(stage_id='held', kind='concurrency', start_ms=0, end_ms=1000, check_id='load', intended_concurrency=1),
+        dict(stage_id='arrival', kind='arrival_rate', start_ms=2000, end_ms=3000, check_id='load', intended_rate_rps=1)]
+    value.performance = build_performance(value)
+    sending = next(w for w in value.performance['targets'][0]['windows'] if w['id'].startswith('stage:0:'))
+    rows = summary(value, window=sending['id'])['metrics']
+    for key in ('offered_rate', 'arrival_first_output', 'arrival_completion', 'drops'):
+        assert rows[key]['cause'] == 'not_applicable', rows[key]
+        assert 'fixed concurrency' in rows[key]['reason']
+
+
+@pytest.mark.parametrize('url,safe', [
+    ('http://localhost:11434/metrics', 'http://localhost:11434/metrics'),
+    ('https://user:pw@host:9400/metrics?token=abc#x', 'https://host:9400/metrics[redacted]'),
+])
+def test_exporter_route_survives_availability_and_privacy_guards(url, safe):
+    from giraffe.deployment import redact_url
+    expected = f'Metrics endpoint {redact_url(url)} returned HTTP 404; no runtime exporter was available at that route.'
+    value = report([record()], observations={'targets': {'t': {'serving_telemetry': {'snapshots': [
+        {'status': 'endpoint_absent', 'endpoint': url, 'reason': expected}]}}}})
+    row = summary(value)['metrics']['server_ttft']
+    assert row['reason'] == f'Metrics endpoint {safe} returned HTTP 404; no runtime exporter was available at that route.'
+    for label, _, forbidden in EVIDENCE_CONTRADICTIONS:
+        if label in {'private evidence', 'private URL components'}:
+            assert not re.search(forbidden, str((row['reason'], row['action'], row['detail'])))
+
+
+def stopped_stage_report():
+    rows = [record('clean', start=0, end=500, check_ids=['load'], scenario='load_c1',
+                   stream=True, timing_schema=1, first_output_ms=10, answer_reads=1,
+                   load_point={'point_id': 'load_c1', 'source': 'primary', 'pattern': 'concurrent'},
+                   workload={'pattern': 'concurrent'}),
+            record('stopped', start=1100, end=1500, check_ids=['load'], scenario='load_c1',
+                   status='cancelled', valid=False, termination_reason='run_duration_limit',
+                   load_point={'point_id': 'load_c1', 'source': 'primary', 'pattern': 'concurrent'})]
+    transitions = [dict(stage_id=f's{i}', label=f'C{i+1}', kind='concurrency',
+                        start_ms=i*1000, end_ms=(i+1)*1000, intended_concurrency=i+1) for i in range(2)]
+    return report(rows, config={'targets': [{'name': 't'}], 'checks': ['load']},
+                  observations={'targets': {'t': {'schedule_transitions': transitions}}},
+                  abort_reason=states.STOP_MAX_DURATION, limits_reached=['max_duration_seconds'])
+
+
+def test_stop_attribution_uses_selected_stage_requests_only():
+    value = stopped_stage_report()
+    clean = value.model_copy(update={'abort_reason': None, 'limits_reached': []})
+    for window in value.performance['targets'][0]['windows']:
+        if window['kind'] != 'stage':
+            continue
+        rows = summary(value, window=window['id'])['metrics']
+        for label, predicate, forbidden in EVIDENCE_CONTRADICTIONS:
+            if label == 'stop requires own-window evidence' and predicate({'stop_affected': window['stage_id'] != 's0'}):
+                for row in rows.values():
+                    assert not re.search(forbidden, str((row.get('reason'), row.get('action'))))
+        if window['stage_id'] == 's0':
+            expected = summary(clean, window=window['id'])['metrics']
+            for key, row in rows.items():
+                assert (row.get('cause'), row.get('reason'), row.get('action')) == (
+                    expected[key].get('cause'), expected[key].get('reason'), expected[key].get('action')), key
+        else:
+            assert 'maximum duration' in rows['response_latency']['reason']
+            assert '--max-duration' in rows['response_latency']['action']
+
+
+@pytest.mark.parametrize('termination', [None, 'external_cancellation', 'intentional_cancellation'])
+def test_intentional_cancellation_never_attributes_run_stop(termination):
+    from giraffe.run_evidence import cancelled_by_stop
+    r = record(check_ids=['cancellation'], scenario='client_cancel', status='cancelled', valid=False,
+               intentional=True, termination_reason=termination)
+    assert not cancelled_by_stop(r)
+    value = report([r], config={'targets': [{'name': 't'}], 'checks': ['cancellation']},
+                   abort_reason=states.STOP_REQUEST_BUDGET, limits_reached=['max_requests'])
+    for row in summary(value)['metrics'].values():
+        assert 'request budget' not in (row.get('reason') or '')
+
+
+@pytest.mark.parametrize('stop,limits,expected', [
+    (states.STOP_MAX_DURATION, ['max_duration_seconds'], False),
+    (states.STOP_REQUEST_BUDGET, ['max_requests'], False),
+    (states.STOP_ERROR_THRESHOLD, [], False),
+    (states.STOP_CANCELLED_BY_USER, [], True),
+])
+@pytest.mark.parametrize('mixed', [False, True])
+def test_judging_stop_attribution_respects_phase(stop, limits, expected, mixed):
+    r = scoring_record(judgement=None, score_message='AI judgment pending.')
+    rows = [r]
+    if mixed:
+        rows.append(record('cancelled', status='cancelled', valid=False, termination_reason='run_duration_limit',
+                           check_ids=['correctness']))
+    value = report(rows, config={'targets': [{'name': 't'}], 'checks': ['correctness']},
+                   abort_reason=stop, limits_reached=limits)
+    row = summary(value)['metrics']['correctness']
+    assert ('The run was stopped' in row['reason']) is expected
+    assert '--max-duration' not in row['action'] and '--max-requests' not in row['action']
+    if not expected:
+        assert 'judging.max_duration_seconds' in row['action']
+        assert 'judging was pending or cancelled' in row['reason']
+
+
+def test_target_abort_does_not_affect_other_target_windows():
+    value = report([record('a', target='A', status='cancelled', valid=False,
+                           termination_reason='endpoint_unresponsive'), record('b', target='B')],
+                   config={'targets': [{'name': 'A'}, {'name': 'B'}]},
+                   observations={'target_abort_reasons': {'A': 'private endpoint error'}})
+    for index, target in enumerate(value.performance['targets']):
+        rows = summary(value, target=index)['metrics']
+        if target['target'] == 'A':
+            assert 'stopped responding' in rows['response_latency']['reason']
+        else:
+            assert all('stopped responding' not in (row.get('reason') or '') for row in rows.values())
+
+
+@pytest.mark.parametrize('start,affected', [(0, False), (500, False), (2000, True), (None, True)])
+def test_empty_window_stop_requires_unreached_schedule(start, affected):
+    value = report([], abort_reason=states.STOP_MAX_DURATION, limits_reached=['max_duration_seconds'],
+                   observations={'inference_duration_seconds': 1})
+    f = WindowFacts(value, {'kind': 'stage', 'target': 't', 'start_ms': start, 'end_ms': 3000},
+                    [], [], [], [], 1, [], cohort=[], dispatched=[])
+    assert f.stop_affected is affected
+
+
+def test_recorded_judge_deadline_outweighs_inference_budget():
+    value = report([scoring_record(judgement=None, score_message='AI judgment pending.')],
+                   config={'targets': [{'name': 't'}], 'checks': ['correctness']},
+                   abort_reason=states.STOP_MAX_DURATION, limits_reached=['max_duration_seconds'],
+                   observations={'judging': {'stop_reason': 'phase_deadline'}})
+    row = summary(value)['metrics']['correctness']
+    assert 'judge phase reached its duration limit' in row['reason']
+    assert row['action'] == 'Raise judging.max_duration_seconds, then rerun.'
+
+
+def test_memory_stop_ends_judging_despite_completed_request_budget():
+    value = report([scoring_record(judgement=None, score_message='AI judgment pending.')],
+                   config={'targets': [{'name': 't'}], 'checks': ['correctness']},
+                   abort_reason=states.STOP_REQUEST_BUDGET, limits_reached=['max_requests'],
+                   observations={'resources': {'memory_limit_reached': True}})
+    row = summary(value)['metrics']['correctness']
+    assert 'memory limit' in row['reason'] and 'memory limit' in row['action']
+    assert '--max-requests' not in row['action']
+
+
+def test_completed_reply_without_completion_timestamp_is_not_stop_evidence():
+    r = record(completed_ms=None)
+    value = report([r], abort_reason=states.STOP_MAX_DURATION, limits_reached=['max_duration_seconds'])
+    f = WindowFacts(value, {'target': 't', 'kind': 'full'}, [r], [r], [], [], None, [], dispatched=[r])
+    assert not f.stop_affected
+    assert 'maximum duration' not in summary(value)['metrics']['client_ttft']['reason']
+
+
+def test_unreached_target_stage_uses_target_stop_time_not_other_targets_duration():
+    a = record('a', target='A', start=0, end=1000, status='cancelled', valid=False,
+               termination_reason='endpoint_unresponsive')
+    b = record('b', target='B', start=0, end=4000)
+    value = report([a, b], config={'targets': [{'name': 'A'}, {'name': 'B'}]},
+                   observations={'target_abort_reasons': {'A': 'private failure'}, 'inference_duration_seconds': 4})
+    f = WindowFacts(value, {'target': 'A', 'kind': 'stage', 'start_ms': 2000, 'end_ms': 3000},
+                    [], [], [], [], 1, [], cohort=[a], dispatched=[])
+    assert f.stop_affected
+    # A completed target is unaffected even when the run also has a duration flag.
+    value.limits_reached = ['max_duration_seconds']
+    f = WindowFacts(value, {'target': 'B', 'kind': 'full', 'start_ms': 0, 'end_ms': 4000},
+                    [b], [b], [b], [], 4, [b], cohort=[b], dispatched=[b])
+    assert not f.stop_affected
+
+
+@pytest.mark.parametrize('termination', [None, 'external_cancellation', 'workload_cancelled', 'unknown'])
+def test_unattributed_cancellation_does_not_prove_run_stop(termination):
+    from giraffe.run_evidence import cancelled_by_stop
+    r = record(status='cancelled', valid=False, termination_reason=termination)
+    assert not cancelled_by_stop(r)
+    value = report([r], abort_reason=states.STOP_REQUEST_BUDGET, limits_reached=['max_requests'])
+    row = summary(value)['metrics']['response_latency']
+    assert 'request budget' not in row['reason']

@@ -63,7 +63,7 @@ def test_distributions_timing_origins_dispatch_order_and_no_decimation():
 
 @pytest.mark.parametrize(("first_token_ms", "state", "sample_count", "reason"), [
     (0, "measured", 1, None),
-    (None, "insufficient_evidence", 0, "No streamed content event arrived on 1/1 requests (they failed, were cut off, or returned only non-content events)."),
+    (None, "insufficient_evidence", 0, "No timed streamed content event on 1/1 requests (legacy content-event evidence)."),
 ])
 def test_client_ttft_explains_missing_samples_only(first_token_ms, state, sample_count, reason):
     result = summary(report([record(timing_schema=1, first_token_ms=first_token_ms)]))
@@ -492,15 +492,15 @@ def test_goodput_requires_scoring_and_latency_limits_without_losing_measured_zer
     metric = data["summaries"][data["default_window"]]["metrics"]["goodput"]
     assert metric["value"] == expected
     assert metric["state"] == ("measured" if expected is not None else
-                               "not_collected" if limit in (None, "missing") else "insufficient_evidence")
+                               "not_collected" if not scored or limit in (None, "missing") else "insufficient_evidence")
     assert metric["sample_count"] == (0 if expected is None else 1)
     assert metric["eligible_count"] == 1
     assert metric["sample_unit"] == "load points"
     assert metric["request_coverage"] == {"sample": scored, "eligible": 16, "missing": 16-scored}
     assert f"{scored} / 16 scored valid requests" in metric["display_note"]
     if not scored:
-        assert "unscored" in metric["reason"].lower()
-    if limit in (None, "missing"):
+        assert "no expected answer or scorer" in metric["reason"].lower()
+    if scored and limit in (None, "missing"):
         assert "limit" in metric["reason"].lower()
     if 0 < scored < 16:
         assert metric["label"] == "Scored-subset correct goodput"
@@ -524,7 +524,7 @@ def test_historical_capacity_goodput_requires_scored_answers_and_saved_latency_l
     metric = data['summaries'][data['default_window']]['metrics']['goodput']
     assert metric['value'] == expected
     assert metric['state'] == ('measured' if expected is not None else
-                               'not_collected' if latency_limit is None else 'insufficient_evidence')
+                               'not_collected' if not scored or latency_limit is None else 'insufficient_evidence')
     assert value.checks[0].metrics['traffic_stages'][1]['goodput_rps'] == 0
 
 

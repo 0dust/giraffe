@@ -18,7 +18,7 @@ from .caps import (
     MAX_DEPLOYMENT_HISTORY, MAX_METRICS_BODY_BYTES, MAX_METRICS_LABELS,
     MAX_METRICS_LABEL_CHARS,
 )
-from giraffe.deployment import sanitize
+from giraffe.deployment import redact_url, sanitize
 from .models import MAX_SCALE_DOWN_SNAPSHOTS
 
 logger = logging.getLogger(__name__)
@@ -631,13 +631,13 @@ async def _scrape_runtime(run, target, phase, *, force=False):
                     if response.status_code in {401, 403}:
                         result.update({
                             "status": "authentication_denied",
-                            "reason": f"Metrics endpoint {url} denied access (HTTP {response.status_code}); inference credentials were not forwarded.",
+                            "reason": f"Metrics endpoint {redact_url(url)} denied access (HTTP {response.status_code}); inference credentials were not forwarded.",
                         })
                         return _remember_discovery(run, target, result)
                     if response.status_code == 404:
                         result.update({
                             "status": "endpoint_absent",
-                            "reason": f"Metrics endpoint {url} returned HTTP 404; no runtime exporter was available at that route.",
+                            "reason": f"Metrics endpoint {redact_url(url)} returned HTTP 404; no runtime exporter was available at that route.",
                         })
                         return _remember_discovery(run, target, result)
                     response.raise_for_status()
@@ -1248,7 +1248,7 @@ def derive_server_metrics(data, *, host_configured=False):
                 family = key.rsplit("_", 2)[0]
                 required = family + ("_bucket" if "_p95_" in key or "_p99_" in key else "_sum")
                 if required not in support:
-                    reason = (f"The metrics exporter at {snapshots[-1].get('endpoint') or 'the configured endpoint'} "
+                    reason = (f"The metrics exporter at {redact_url(snapshots[-1].get('endpoint') or 'the configured endpoint')} "
                               f"does not expose a TTFT histogram (profile {', '.join(sorted(profiles))})."
                               if family == "server_ttft" else
                               f"Runtime profile {', '.join(sorted(profiles))} exposes no documented {required} family in Giraffe's metric contract.")
@@ -1276,7 +1276,7 @@ def derive_server_metrics(data, *, host_configured=False):
             if required and required not in present and profiles:
                 latest = snapshots[-1]
                 if duration_family == "server_ttft":
-                    reason = (f"The metrics exporter at {latest.get('endpoint') or 'the configured endpoint'} "
+                    reason = (f"The metrics exporter at {redact_url(latest.get('endpoint') or 'the configured endpoint')} "
                               f"does not expose a TTFT histogram (profile {', '.join(sorted(profiles))}).")
                 else:
                     reason = f"The metrics exporter does not expose {required} (profile {', '.join(sorted(profiles))})."

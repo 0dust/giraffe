@@ -66,6 +66,10 @@ def test_main_schema_three_fixture_preserves_checks_outcome_and_conditions():
             # Availability states now follow the cause; measured states and all
             # numeric evidence remain part of this frozen comparison.
             omitted = {"reason", "action", "cause", "detail", "availability"}
+            if value.get("kind") in {"full", "stage"} and "cohort_id" in value:
+                omitted.update({"check_ids", "cohort_check", "target"})
+                if value["kind"] == "full":
+                    omitted.update({"dispatch_count", "completion_count"})
             if "value" in value and value["value"] is None:
                 omitted.add("state")
             return {key: strip_volatile(item) for key, item in value.items()

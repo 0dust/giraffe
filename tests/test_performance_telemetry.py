@@ -775,3 +775,37 @@ def test_partly_stale_duration_scrapes_still_check_exported_family():
     assert row["cause"] == "endpoint_unsupported"
     assert "does not expose a TTFT histogram" in row["reason"]
     assert row["action"] is None
+
+
+@pytest.mark.parametrize('url,safe', [
+    ('https://user:pw@host:9400/metrics?token=abc#x', 'https://host:9400/metrics[redacted]'),
+    ('http://localhost:11434/metrics', 'http://localhost:11434/metrics'),
+])
+@pytest.mark.parametrize('status', [404, 403])
+async def test_exporter_explanations_keep_route_without_url_secrets(monkeypatch, url, safe, status):
+    target, config = settings()
+    # Imported evidence can predate today's URL validation rules.
+    target = target.model_copy(update={'metrics_url': url})
+    actual = httpx.AsyncClient
+    monkeypatch.setattr(httpx, 'AsyncClient', lambda **kw: actual(
+        **kw, transport=httpx.MockTransport(lambda request: httpx.Response(status))))
+    run = SimpleNamespace(config=config, start=time.monotonic(), deadline=time.monotonic()+5,
+                          stop=asyncio.Event(), observations={target.name: {}})
+    result = await telemetry._scrape_runtime(run, target, 'load')
+    if status == 404:
+        expected = f'Metrics endpoint {safe} returned HTTP 404; no runtime exporter was available at that route.'
+    else:
+        expected = f'Metrics endpoint {safe} denied access (HTTP 403); inference credentials were not forwarded.'
+    assert result['reason'] == expected
+    row = telemetry.derive_server_metrics({'snapshots': [result]})['server_ttft_mean_ms']
+    assert row['reason'] == expected
+    assert all(secret not in row['reason'] for secret in ('user:', 'pw', 'token=abc', '#x'))
+
+
+@pytest.mark.parametrize('profile', ['sglang', 'vllm-v1'])
+def test_ttft_histogram_explanation_redacts_imported_exporter_url(profile):
+    snap = snapshot('', 0, profile=profile)
+    snap.update(status='available', endpoint='https://user:pw@host:9400/metrics?token=abc#x')
+    row = telemetry.derive_server_metrics({'snapshots': [snap]})['server_ttft_p95_ms']
+    assert 'https://host:9400/metrics[redacted]' in row['reason']
+    assert all(secret not in str((row['reason'], row['detail'])) for secret in ('user:', 'pw', 'token=abc', '#x'))

@@ -15,6 +15,7 @@ from collections import Counter, defaultdict
 import math
 import re
 
+from .availability import window_check_ids
 from .stats import PERCENTILES, distribution as sample_distribution, percentile as percentile
 
 PERFORMANCE_SCHEMA = 1
@@ -547,7 +548,8 @@ def _window_summary(report, target, window, records, series, observation):
         "baseline": ("baseline_throughput", "baseline_timing", "baseline_generation", "baseline_quality", "baseline_capacity"),
     }
     from .availability import WindowFacts, explain_window
-    facts = WindowFacts(report, window, population, good, rate_good, selected_series, duration, finished)
+    facts = WindowFacts(report, window, population, good, rate_good, selected_series, duration, finished,
+                        cohort=records, dispatched=dispatched)
     availability = explain_window(metrics, distributions, facts)
     return {"availability": availability, "metrics": metrics, "kpis": list(KPI_IDS), "distributions": distributions,
             "sections": {name: [metrics[key] for key in keys] for name, keys in sections.items()},
@@ -992,12 +994,14 @@ def build_performance(report, *, target=None, window=None):
             kinds = {row.get("kind") for row in sending}
             changes = (f"{count_words.get(len(sending), str(len(sending)))} changing " +
                        ("concurrency" if kinds == {"concurrency"} else "arrival-rate" if kinds == {"arrival_rate"} else "load") + " stages") if len(sending) > 1 else None
-            window = dict(id=f"full:{cohort}", kind="full", label="Full request window", cohort_id=cohort,
-                          workload_label=descriptor["label"], stage_count=len(sending),
+            window = dict(id=f"full:{cohort}", target=name, kind="full", label="Full request window", cohort_id=cohort,
+                          workload_label=descriptor["label"], cohort_check=descriptor["check"],
+                          check_ids=sorted(window_check_ids({}, group)), stage_count=len(sending),
                           stage_labels=[_stage_label(row) for row in sending], stages_description=changes,
                           schedule_indices=indices,
                           start_ms=start, end_ms=end, duration_s=(end-start)/1000 if start is not None and end is not None else None,
-                          request_count=len(group), includes_startup=True, includes_drain=True,
+                          request_count=len(group), dispatch_count=sum(r.dispatch_ms is not None for r in group),
+                          completion_count=sum(r.completed_ms is not None for r in group), includes_startup=True, includes_drain=True,
                           population="One comparable workload across its recorded load stages; preparation, shapes, sources and control/probe roles remain separate.")
             _window_labels(window, start)
             windows.append(window)
@@ -1015,8 +1019,9 @@ def build_performance(report, *, target=None, window=None):
                     continue
                 if drain and not completed and not any(row.dispatch_ms is not None and row.dispatch_ms < right and (row.completed_ms is None or row.completed_ms > left) for row in group):
                     continue
-                item = dict(id=f"stage:{index}:{cohort}", kind="stage", label=_stage_label(stage),
+                item = dict(id=f"stage:{index}:{cohort}", target=name, kind="stage", label=_stage_label(stage),
                     workload_label=descriptor["label"], cohort_id=cohort, stage_id=stage["stage_id"],
+                    cohort_check=descriptor["check"], check_ids=sorted(window_check_ids({}, group)),
                     schedule_indices=[index], start_ms=left, end_ms=right, end_inclusive=inclusive,
                     duration_s=(right-left)/1000, request_count=completed if drain else dispatched,
                     dispatch_count=dispatched, completion_count=completed, includes_startup=False,
@@ -1025,8 +1030,9 @@ def build_performance(report, *, target=None, window=None):
                 _window_labels(item, start)
                 windows.append(item)
         if not windows:
-            window = dict(id="full", kind="full", label="Full request window", cohort_id="empty", start_ms=None,
-                          end_ms=None, duration_s=None, request_count=0, includes_startup=True, includes_drain=True,
+            window = dict(id="full", target=name, kind="full", label="Full request window", cohort_id="empty", start_ms=None,
+                          end_ms=None, duration_s=None, request_count=0, dispatch_count=0, completion_count=0,
+                          check_ids=[], cohort_check=None, includes_startup=True, includes_drain=True,
                           population="No request lifetime evidence.", workload_label="No requests",
                           stage_count=0, stage_labels=[], schedule_indices=[])
             _window_labels(window, None)

@@ -10,6 +10,7 @@ import tempfile
 from .caps import MAX_REPORT_TOP_LEVEL_MEMBERS
 from .models import RequestRecord, RunReport
 from .report_inputs import verify_input
+from .scoring_facts import scoring_facts
 
 
 _STRING_SPECIAL = re.compile(r'["\\]')
@@ -204,9 +205,7 @@ def expanded_report_chunks(path: Path):
                     # Preserve availability facts before dropping large text and
                     # evaluator payloads from this aggregation-only copy. The
                     # second pass still emits the original saved request data.
-                    availability = {}
-                    if record.evaluation and record.evaluation.scorer != "none":
-                        availability["_answer_scoring_configured"] = True
+                    availability = {"_scoring": scoring_facts(record)}
                     measurements.append(record.model_copy(update={
                             "workload": {**record.workload, **availability},
                             # These fields feed presence predicates. Keep bounded
