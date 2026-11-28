@@ -127,6 +127,7 @@ LAUNCH_FLAGS = {
     "--tokenizer",
     "--tokenizer-revision",
     "--quantization",
+    "--dtype",
     "--max-model-len",
     "--max-num-seqs",
     "--max-num-batched-tokens",
@@ -145,34 +146,50 @@ LAUNCH_FLAGS = {
     "--port",
     "--config",
 }
+LAUNCH_DTYPES = {"auto", "bfloat16", "float", "float16", "float32", "half"}
 
 
 def safe_launch(command, *, structured=False):
+    return _safe_launch(command, structured=structured)[0]
+
+
+def _safe_launch(command, *, structured):
+    """Return safe launch evidence and whether it lost any information."""
     if isinstance(command, str) and launch_evidence_at_limit(command):
-        return [LAUNCH_SIZE_LIMIT]
+        return [LAUNCH_SIZE_LIMIT], True
     if structured and not isinstance(command, (str, list)):
-        return [REDACTED]
+        return [REDACTED], True
     try:
         args = shlex.split(command) if isinstance(command, str) else list(command)
     except ValueError:
         if structured:
-            return [REDACTED]
+            return [REDACTED], True
         raise
     if not structured and len(args) > MAX_LAUNCH_ARGUMENTS:
         raise ValueError("launch command exceeds 256 arguments")
     if launch_evidence_at_limit(args):
-        return [LAUNCH_SIZE_LIMIT]
+        return [LAUNCH_SIZE_LIMIT], args != [LAUNCH_SIZE_LIMIT]
     if structured and not all(isinstance(arg, str) for arg in args):
-        return [REDACTED]
+        return [REDACTED], True
     result, index = [], 0
+    masked = False
     while index < len(args):
+        start, output_start = index, len(result)
+        canonical_speculation = False
         arg = str(args[index])
         flag, equals, value = arg.partition("=")
-        if flag == "--speculative-config":
+        if flag in {"--speculative-config", "--dtype"}:
             if not equals and index + 1 < len(args) and not str(args[index + 1]).startswith("--"):
                 index += 1
                 value = str(args[index])
-            result.append(flag + "=" + safe_speculation(value))
+            if flag == "--speculative-config":
+                speculation = safe_speculation(value)
+                result.append(flag + "=" + speculation)
+                canonical_speculation = speculation != REDACTED
+            elif value in LAUNCH_DTYPES:
+                result.extend([arg] if equals else [arg, value])
+            else:
+                result.append(flag + "=" + REDACTED)
         elif flag in LAUNCH_FLAGS:
             result.append(sanitize(arg))
             if not equals and index + 1 < len(args) and not str(args[index + 1]).startswith("--"):
@@ -188,12 +205,13 @@ def safe_launch(command, *, structured=False):
             result.append(sanitize(arg))
         else:
             result.append(REDACTED)
+        masked |= not canonical_speculation and result[output_start:] != args[start:index + 1]
         index += 1
     if structured and isinstance(command, str):
         result = command if result == args else shlex.join(result)
     if launch_evidence_at_limit(result):
-        return [LAUNCH_SIZE_LIMIT]
-    return result
+        return [LAUNCH_SIZE_LIMIT], True
+    return result, masked
 
 
 def sanitize_serving(values):
@@ -864,9 +882,35 @@ def observed_signature(snapshot):
     }
 
 
+def _comparison_launch_facts(snapshot):
+    fields = snapshot.get("fields", {})
+    launch = fields.get(LAUNCH_FIELD)
+    if not isinstance(launch, dict):
+        return snapshot, set()
+    copied, masked = dict(launch), set()
+    for source, fact in launch.items():
+        if isinstance(fact, dict) and fact.get("value") is not None:
+            value, content_masked = _safe_launch(fact["value"], structured=True)
+            copied[source] = {**fact, "value": value}
+            if content_masked:
+                masked.add(source)
+    return {**snapshot, "fields": {**fields, LAUNCH_FIELD: copied}}, masked
+
+
 def deployment_diff(current, baseline):
     rows = []
     current, baseline = current or {}, baseline or {}
+    old_launch = baseline.get("fields", {}).get(LAUNCH_FIELD) or {}
+    new_launch = current.get("fields", {}).get(LAUNCH_FIELD) or {}
+    current, current_masked = _comparison_launch_facts(current)
+    baseline, baseline_masked = _comparison_launch_facts(baseline)
+    # Only supported speculation is normalized losslessly. Redaction can otherwise
+    # make distinct old arguments look identical, so it cannot establish equality.
+    masked_launch_change = any(
+        isinstance(old_launch.get(source), dict) and isinstance(new_launch.get(source), dict)
+        and old_launch[source].get("value") != new_launch[source].get("value")
+        for source in current_masked | baseline_masked
+    )
     fields, previous = current.get("fields", {}), baseline.get("fields", {})
     for key in sorted(set(fields) | set(previous)):
         c, b = fields.get(key), previous.get(key)
@@ -884,7 +928,7 @@ def deployment_diff(current, baseline):
             else "removed"
             if c is None
             else "changed"
-            if values(c) != values(b)
+            if values(c) != values(b) or (key == LAUNCH_FIELD and masked_launch_change)
             else "no_observed_change"
         )
         rows.append({"field": key, "change": change, "baseline": b, "current": c})
@@ -892,7 +936,7 @@ def deployment_diff(current, baseline):
     intended = current.get("intended_change")
     intended_fields = intended if isinstance(intended, list) else [intended]
     launch_comparison, covered, extra_settings = compare_launch_settings(
-        current, baseline, intended_fields, LAUNCH_FLAGS)
+        current, baseline, intended_fields, LAUNCH_FLAGS, masked_launch_change=masked_launch_change)
     return {
         "fields": rows,
         "unknown_baseline": not bool(baseline),

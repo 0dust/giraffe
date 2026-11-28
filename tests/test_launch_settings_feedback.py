@@ -9,9 +9,9 @@ import pytest
 
 from giraffe.caps import MAX_LAUNCH_ARGUMENTS, MAX_SANITIZE_STRING_CHARS
 from giraffe.deployment import deployment_diff, load_metadata, safe_launch, sanitize, snapshot
-from giraffe.launch_settings import LAUNCH_FIELD
-from giraffe.models import RunConfig
-from giraffe.reporting import write_report
+from giraffe.launch_settings import LAUNCH_FIELD, WHOLE_FIELD_WARNING
+from giraffe.models import RunConfig, RunReport
+from giraffe.reporting import compare_baseline, write_report
 from tests.fake_endpoint import FakeEndpoint
 from tests.test_reporting import make_report
 
@@ -182,3 +182,123 @@ def test_supported_structured_speculation_can_still_be_compared(tmp_path, as_str
     assert diff["confounded"]
     assert any(row["flag"] == "--max-num-seqs" and row["baseline"] == 16 and row["current"] == 128
                for row in diff["launch_comparison"]["settings"])
+
+
+@pytest.mark.parametrize("as_string", [False, True])
+@pytest.mark.parametrize("change", [None, "setting", "order", "scope"])
+def test_legacy_supported_structured_speculation_preserves_real_launch_changes(tmp_path, as_string, change):
+    # Before structured launch sanitization, metadata import kept the original argv spelling.
+    args = [*PREFIX, "--speculative-config", '{"num_speculative_tokens":2,"method":"ngram"}',
+            "--max-num-seqs", "16"]
+    old = sanitize(shlex.join(args) if as_string else args)
+    if change == "setting":
+        args[-1] = "32"
+    elif change == "order":
+        args[3:] = args[5:] + args[3:5]
+    path = tmp_path / "metadata.json"
+    path.write_text(json.dumps({"serving": {"launch_arguments": shlex.join(args) if as_string else args}}))
+    before = evidence(old, **{"extension.arm": "control"})
+    after = evidence(load_metadata(path)["serving"]["launch_arguments"], **{"extension.arm": "treatment"})
+    after["intended_change"] = "extension.arm"
+    for saved, scope in ((before, "deployment"), (after, "replica-B" if change == "scope" else "deployment")):
+        saved["fields"][LAUNCH_FIELD]["configured"].update(
+            provenance="user-supplied metadata file", scope=scope, status="unverified")
+
+    diff = deployment_diff(after, before)
+    row = next(row for row in diff["fields"] if row["field"] == LAUNCH_FIELD)
+    assert row["change"] == ("changed" if change else "no_observed_change")
+    assert diff["confounded"] is bool(change)
+    assert before["fields"][LAUNCH_FIELD]["configured"]["value"] == old
+
+
+@pytest.mark.parametrize("old_dtype,new_dtype,unknown,confounded,warned", [
+    ("float16", "bfloat16", False, True, None),
+    ("float16", "bfloat16", True, True, "--custom-option"),
+    ("unknown-type", "another-type", False, False, "--dtype"),
+    ("[redacted]", "float16", False, True, "--dtype"),
+])
+def test_declared_runtime_change_qualifies_the_launch_evidence(
+        tmp_path, old_dtype, new_dtype, unknown, confounded, warned):
+    def load(dtype, image):
+        args = [*PREFIX, "--dtype", dtype]
+        if unknown:
+            args += ["--custom-option", "placeholder"]
+        path = tmp_path / "metadata.json"
+        path.write_text(json.dumps({"serving": {"launch_arguments": args}}))
+        snapshot = evidence(load_metadata(path)["serving"]["launch_arguments"], **{"runtime.image": image})
+        snapshot["intended_change"] = "runtime.image"
+        return snapshot
+
+    diff = deployment_diff(load(new_dtype, "image-new"), load(old_dtype, "image-old"))
+    assert diff["confounded"] is confounded
+    warnings = diff["launch_comparison"]["warnings"]
+    assert warnings == ([f"The value of {warned} is redacted; equivalence is unverified."] if warned else [])
+    assert diff["launch_comparison"]["status"] == ("unverified" if warned else "not_requested")
+    assert "unknown-type" not in json.dumps(diff)
+    assert "another-type" not in json.dumps(diff)
+
+
+def test_legacy_positional_difference_remains_unverified_after_masking():
+    before, after = evidence([*PREFIX, "before-operand"]), evidence([*PREFIX, "after-operand"])
+    after["intended_change"] = "extension.arm"
+    diff = deployment_diff(after, before)
+    assert diff["confounded"] is True
+    row = diff["fields"][0]
+    assert row["change"] == "changed"
+    assert row["baseline"] == row["current"] == {"configured": {"value": [*PREFIX, "[redacted]"]}}
+    assert diff["launch_comparison"]["status"] == "unverified"
+
+
+@pytest.mark.parametrize("old,new,confounded,warning", [
+    (["[redacted]"], ["[redacted]"], False, "Launch evidence is redacted"),
+    ("'[redacted]'", PREFIX, True, "Launch evidence is redacted"),
+    (["vllm", "serve", "[redacted]"], PREFIX, True, "The launch model operand is redacted"),
+])
+def test_unrelated_experiment_qualifies_redacted_commands_and_model_operands(old, new, confounded, warning):
+    before, after = evidence(old), evidence(new)
+    after["intended_change"] = "runtime.image"
+    diff = deployment_diff(after, before)
+    assert diff["confounded"] is confounded
+    assert diff["launch_comparison"]["status"] == "unverified"
+    assert any(message.startswith(warning) for message in diff["launch_comparison"]["warnings"])
+
+
+def test_whole_field_only_does_not_check_redacted_options_individually():
+    before = evidence([*PREFIX, "--dtype=[redacted]"])
+    after = evidence([*PREFIX, "--dtype=float16"])
+    after["intended_change"] = LAUNCH_FIELD
+    diff = deployment_diff(after, before)
+    assert diff["confounded"] is False
+    assert diff["launch_comparison"] == {
+        "status": "whole_field", "settings": [], "warnings": [WHOLE_FIELD_WARNING],
+    }
+
+
+def test_legacy_launch_baseline_is_sanitized_in_new_json_and_html_exports(tmp_path):
+    marker = "harmless-legacy-launch-marker"
+    old_args = arguments(2)
+    old_args[-1] = json.dumps({"method": "ngram", "num_speculative_tokens": 2, "model": marker})
+    baseline, current = make_report("baseline"), make_report()
+    for report, argv in ((baseline, sanitize(old_args)), (current, safe_launch(arguments(3), structured=True))):
+        deployment = evidence(argv)
+        deployment["fields"][LAUNCH_FIELD]["configured"].update(
+            provenance="user-supplied metadata file", scope="deployment", status="unverified",
+            collected_at=report.started_at, freshness="collection time; underlying update time unknown")
+        report.observations = {"targets": {"local": {"deployment": deployment}}}
+    source = tmp_path / "saved-baseline.json"
+    original = baseline.model_dump_json().encode()
+    source.write_bytes(original)
+    baseline = RunReport.model_validate_json(source.read_bytes())
+
+    comparison = compare_baseline(current, baseline)
+    diff = comparison.baseline["targets"][0]["configuration_diff"]
+    assert diff["fields"][0]["baseline"]["configured"]["value"] == [*PREFIX, "--speculative-config=[redacted]"]
+    assert diff["launch_comparison"]["settings"][0]["baseline"] == "[redacted]"
+    json_path, html_path = write_report(comparison, tmp_path / "comparison", html=True)
+    for path in json_path, html_path:
+        rendered = path.read_text()
+        assert marker not in rendered
+        assert "--speculative-config" in rendered
+        assert "[redacted]" in rendered
+    assert source.read_bytes() == original
+    assert baseline.model_dump_json().encode() == original

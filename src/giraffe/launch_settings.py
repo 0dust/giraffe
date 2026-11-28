@@ -18,6 +18,9 @@ WHOLE_FIELD_WARNING = (
 )
 LAUNCH_SIZE_LIMIT = "[launch evidence exceeds size limit]"
 LAUNCH_SIZE_WARNING = "Launch evidence reached the size limit; equivalence is unverified."
+MASKED_CHANGE_WARNING = "Launch evidence differs and redaction prevents a full comparison."
+REDACTED_LAUNCH_WARNING = "Launch evidence is redacted; its equivalence is unverified."
+REDACTED_MODEL_WARNING = "The launch model operand is redacted; its equivalence is unverified."
 BOOLEAN_FLAGS = {"--enable-prefix-caching", "--no-enable-prefix-caching", "--enforce-eager"}
 SPECULATIVE_METHODS = {"eagle", "eagle3", "ngram", "mtp", "draft_model"}
 
@@ -100,13 +103,15 @@ def _parse(value, allowed_flags):
         args = None
     if launch_evidence_at_limit(args):
         return None, [], [LAUNCH_SIZE_WARNING]
+    if args == ["[redacted]"]:
+        return None, [], [REDACTED_LAUNCH_WARNING]
     if (not isinstance(args, list)
             or not all(isinstance(arg, str) for arg in args)
             or args[:2] != ["vllm", "serve"] or len(args) < 3 or args[2].startswith("--")):
         return None, [], ["Individual launch comparison requires a bounded vllm serve command with a model operand."]
     settings["model operand"] = [args[2]]
     if _redacted(args[2]):
-        warnings.append("The launch model operand is redacted; its equivalence is unverified.")
+        warnings.append(REDACTED_MODEL_WARNING)
     index = 3
     while index < len(args):
         flag, equals, value = args[index].partition("=")
@@ -173,6 +178,26 @@ def _same_context(before, after, *, allow_metadata_file_provenance=False):
         before.get(key) == after.get(key) for key in ("scope", "status"))
 
 
+def _comparable_redaction_warnings(before, after, allowed_flags):
+    flags, warnings = set(), set()
+    for source in before.keys() & after.keys():
+        old, new = before[source], after[source]
+        if not _same_context(old, new):
+            continue
+        left, _, old_warnings = _parse(old.get("value"), allowed_flags)
+        right, _, new_warnings = _parse(new.get("value"), allowed_flags)
+        if REDACTED_LAUNCH_WARNING in old_warnings or REDACTED_LAUNCH_WARNING in new_warnings:
+            warnings.add(REDACTED_LAUNCH_WARNING)
+        if left is None or right is None:
+            continue
+        if left["model operand"] != right["model operand"] and (
+                REDACTED_MODEL_WARNING in old_warnings or REDACTED_MODEL_WARNING in new_warnings):
+            warnings.add(REDACTED_MODEL_WARNING)
+        flags.update(flag for flag in left.keys() & right.keys()
+                     if flag.startswith("--") and (_redacted(left[flag]) or _redacted(right[flag])))
+    return sorted(warnings) + [f"The value of {flag} is redacted; equivalence is unverified." for flag in sorted(flags)]
+
+
 def _with_legacy_speculation_redacted(before, after):
     redacted = "--speculative-config=[redacted]"
     if not isinstance(before, list) or before.count(redacted) != 1 or not isinstance(after, list):
@@ -191,7 +216,7 @@ def _with_legacy_speculation_redacted(before, after):
     return restored
 
 
-def compare_launch_settings(current, baseline, intended, allowed_flags):
+def compare_launch_settings(current, baseline, intended, allowed_flags, *, masked_launch_change=False):
     """Return the comparison, covered whole fields, and observed additional settings."""
     declared = {flag for flag in SETTING_FIELDS if f"{LAUNCH_FIELD}.{flag}" in intended}
     whole_field = LAUNCH_FIELD in intended
@@ -204,15 +229,20 @@ def compare_launch_settings(current, baseline, intended, allowed_flags):
     if unsupported:
         result.update(status="unverified", warnings=result["warnings"] + [
             "Unsupported individual launch setting declaration; equivalence is unverified."])
+    if masked_launch_change and any(intended) and (not whole_field or declared or unsupported):
+        result["warnings"].append(MASKED_CHANGE_WARNING)
     before, after = _sources(baseline, LAUNCH_FIELD), _sources(current, LAUNCH_FIELD)
     legacy_redacted_args = {
         source: _with_legacy_speculation_redacted(before[source].get("value"), after[source].get("value"))
         for source in before.keys() & after.keys()
     } if not declared and not whole_field else {}
     if not declared and not any(value is not None for value in legacy_redacted_args.values()):
+        if not whole_field and any(intended):
+            result["warnings"].extend(_comparable_redaction_warnings(before, after, allowed_flags))
         if any(launch_evidence_at_limit(row.get("value")) for row in (*before.values(), *after.values())):
-            result["status"] = "unverified"
             result["warnings"].append(LAUNCH_SIZE_WARNING)
+        if result["warnings"] and result["warnings"] != [WHOLE_FIELD_WARNING]:
+            result["status"] = "unverified"
         return result, set(), False
     result["status"] = "checked"
     covered, parsed, extra = set(), {}, False
@@ -245,9 +275,10 @@ def compare_launch_settings(current, baseline, intended, allowed_flags):
                                        "intended": is_intended})
             extra |= not is_intended and change != "unverified"
     if comparable:
-        if declared or all(old.get("value") == after[source].get("value")
-                           or old.get("value") == legacy_redacted_args.get(source)
-                           for source, old in before.items()):
+        if declared or (not masked_launch_change and all(
+                old.get("value") == after[source].get("value")
+                or old.get("value") == legacy_redacted_args.get(source)
+                for source, old in before.items())):
             covered.add(LAUNCH_FIELD)
     else:
         result["warnings"].append("Launch evidence is missing or not comparable in both runs.")
