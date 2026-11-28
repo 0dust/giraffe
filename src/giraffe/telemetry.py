@@ -863,12 +863,16 @@ async def scrape(run, target, phase, *, force=False):
     return result
 
 
-def _derived(value, unit, source, *, reason=None, state=None, samples=0, eligible=0, **details):
+def _derived(value, unit, source, *, reason=None, state=None, action=None, samples=0, eligible=0, **details):
+    state = state or (states.METRIC_MEASURED if value is not None else states.METRIC_INSUFFICIENT_EVIDENCE)
+    states.check_metric_state(state, value)
     return {"value": value, "unit": unit, "source": source,
-            "state": state or ("measured" if value is not None else "insufficient_evidence"),
+            "state": state,
             "reason": reason or ("No fresh compatible observations or nonzero measurement population." if value is None else None),
-            "action": None if value is not None else "Collect at least two fresh compatible exporter samples during the workload.",
+            "action": action or (None if value is not None else
+                                 "Collect at least two fresh compatible exporter samples during the workload."),
             "sample_count": samples, "eligible_count": eligible, "scope": "server-wide",
+            "counts": {"sample": samples, "eligible": eligible, "missing": max(0, eligible - samples)},
             "details": details}
 
 
@@ -1027,7 +1031,7 @@ def _derive_spec_decode(snapshots):
                 "partial_coverage": bool(eligible - len(observed))}
 
     drafts, proposed, accepted = (totals[family] for family in families)
-    activity = "observed" if drafts else "not_observed" if windows else "unknown"
+    activity = "observed" if drafts else states.METRIC_NOT_OBSERVED if windows else "unknown"
     details = coverage(windows) | {
         "activity": activity,
         "attribution": "Server-wide counters may include unrelated shared traffic; not request-linked or evidence of speedup.",
@@ -1113,7 +1117,7 @@ def _histogram_percentiles(snapshots, family):
                 previous_bound, previous_count = bound, count
         output[f"p{int(quantile * 100)}"] = _derived(
             value, "ms", "Linear interpolation within classic histogram Δbucket counts; server-wide",
-            state="estimated" if value is not None else "insufficient_evidence", samples=population,
+            state=states.METRIC_ESTIMATED if value is not None else states.METRIC_INSUFFICIENT_EVIDENCE, samples=population,
             eligible=len(snapshots), reason=None if value is not None else
             "No complete compatible histogram increments, zero observations, or percentile falls in unbounded +Inf bucket.",
             bucket_bounds_seconds=bounds,
@@ -1216,30 +1220,31 @@ def derive_server_metrics(data, *, host_configured=False):
         row["details"].setdefault("partial_coverage", bool(row["details"].get("excluded_intervals")))
         if row["value"] is None and not key.startswith("host_"):
             if not snapshots or all(snap.get("status") == "not_enabled" for snap in snapshots):
-                row.update(state="not_collected", reason="This saved run has no runtime metrics discovery or collection evidence.",
+                row.update(state=states.METRIC_NOT_COLLECTED, reason="This saved run has no runtime metrics discovery or collection evidence.",
                            action="New runs discover same-origin /metrics automatically; set targets[].metrics_url only for a different exporter route.")
             elif not any(snap.get("status") in states.TELEMETRY_USABLE_STATUSES for snap in snapshots):
                 latest = snapshots[-1]
-                row.update(state="not_collected", reason=latest.get("reason", "Runtime metrics discovery did not return usable evidence."),
+                row.update(state=states.METRIC_NOT_COLLECTED, reason=latest.get("reason", "Runtime metrics discovery did not return usable evidence."),
                     action=("Supply targets[].metrics_url for an existing exporter at a different route." if latest.get("status") == states.TELEMETRY_ENDPOINT_ABSENT
                             else "Supply metrics_api_key_env or metrics_headers_env for the exporter." if latest.get("status") == states.TELEMETRY_AUTHENTICATION_DENIED
                             else "Check the recorded exporter discovery result; server-only evidence is unavailable from chat responses."))
                 row["details"].update(collection_status=latest.get("status"), endpoint=latest.get("endpoint"),
                                       endpoint_source=latest.get("endpoint_source"))
             elif profiles == {"mtplx"} and not key.startswith("mtplx_latest_"):
-                row.update(state="not_supported", reason="MTPLX completed-request JSON does not expose this live gauge or cumulative counter contract.",
+                row.update(state=states.METRIC_NOT_SUPPORTED, reason="MTPLX completed-request JSON does not expose this live gauge or cumulative counter contract.",
                            action=None)
             elif profiles and key.startswith("spec_decode_sglang_"):
                 if "sglang" not in profiles:
-                    row.update(state="not_supported", reason="SGLang scheduler gauges require the sglang metrics profile.", action=None)
+                    row.update(state=states.METRIC_NOT_SUPPORTED, reason="SGLang scheduler gauges require the sglang metrics profile.", action=None)
             elif profiles and key.startswith("spec_decode_") and "vllm-v1" not in profiles:
-                row.update(state="not_supported", reason="Optional speculative-decoding counters are documented only for the vllm-v1 profile.", action=None)
+                row.update(state=states.METRIC_NOT_SUPPORTED, reason="Optional speculative-decoding counters are documented only for the vllm-v1 profile.", action=None)
             elif profiles and key.startswith(("server_ttft_", "server_queue_", "server_inference_")):
                 family = key.rsplit("_", 2)[0]
                 required = family + ("_bucket" if "_p95_" in key or "_p99_" in key else "_sum")
                 if required not in support:
-                    row.update(state="not_supported", reason=f"Runtime profile {', '.join(sorted(profiles))} exposes no documented {required} family in Giraffe's metric contract.",
+                    row.update(state=states.METRIC_NOT_SUPPORTED, reason=f"Runtime profile {', '.join(sorted(profiles))} exposes no documented {required} family in Giraffe's metric contract.",
                                action=None)
+        states.check_metric_state(row["state"], row["value"])
     return metrics
 
 
@@ -1290,6 +1295,7 @@ def _derive_host(snapshots, configured):
             s["collection_period_seconds"] for s in snapshots if "collection_period_seconds" in s}),
             freshness="Exporter timestamp when supplied; otherwise scrape time only, source freshness unknown.")
         if not configured:
-            row.update(state="not_collected", reason="Server host exporter not configured.",
+            row.update(state=states.METRIC_NOT_COLLECTED, reason="Server host exporter not configured.",
                        action="Set targets[].host_metrics_url to an existing node_exporter Prometheus-text endpoint.")
+        states.check_metric_state(row["state"], row["value"])
     return rows

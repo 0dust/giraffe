@@ -9,7 +9,9 @@ from html import escape
 import math
 import re
 
+from . import states
 from .performance import KPI_IDS
+from .states import METRIC_STATE_LABELS
 
 
 STYLE = """
@@ -25,11 +27,6 @@ a:focus-visible,summary:focus-visible{outline:2px solid var(--accent);outline-of
 CHART_STYLE = """.html-chart-frame{position:relative;margin:16px 0}.html-chart-frame svg{height:240px;width:100%}.html-axis-label,.html-stage-label{position:absolute;color:var(--text-2);font:11px/1.3 var(--mono);pointer-events:none}.html-axis-label.x-min{left:5.33%;bottom:8%}.html-axis-label.x-max{right:4%;bottom:8%}.html-axis-label.y-max{left:0;top:10%}.html-axis-label.y-min{left:0;bottom:20%}.html-axis-label.x-title{left:5.33%;right:4%;bottom:0;text-align:center}.html-axis-label.y-title{left:5.33%;top:0}.html-stage-label{top:8%;max-width:18%;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}.html-transition{stroke:var(--surface);stroke-width:1;vector-effect:non-scaling-stroke}@media(max-width:640px){.html-chart-frame svg{height:220px}}"""
 COLORS = ("#b5b2aa", "#9aa4ff", "#f5b544", "#3dd68c", "#63c8d2")
 COMMON_GUIDANCE = {"No eligible observations in this scope.", "Collect eligible observations for this scope."}
-
-STATES = {"not_measured": "Not measured", "not_observed": "Not observed", "not_collected": "Not collected",
-          "not_applicable": "Not applicable", "insufficient_evidence": "Insufficient evidence",
-          "not_supported": "Not supported", "no_baseline": "No baseline"}
-
 
 def _e(value):
     return escape(str(value if value is not None else ""), quote=True)
@@ -145,8 +142,14 @@ def _value(row):
 def _availability(row):
     if row.get("value") is not None:
         return ""
-    state = STATES.get(row.get("state"), str(row.get("state", "Not measured")).replace("_", " ").capitalize())
+    state = METRIC_STATE_LABELS.get(row.get("state"), str(row.get("state", "Not measured")).replace("_", " ").capitalize())
     return f'<strong>{_e(state)}</strong>. ' + _e(" ".join(str(row.get(k) or "") for k in ("reason", "action") if row.get(k) not in COMMON_GUIDANCE).strip())
+
+
+def _missing_label(state):
+    if state in states.METRIC_VALUE_STATES:
+        state = states.METRIC_NOT_MEASURED
+    return METRIC_STATE_LABELS.get(state, "Not measured")
 
 
 def _card(row):
@@ -155,8 +158,8 @@ def _card(row):
             if row.get("distribution") and row.get("p95") is not None
             else f'{row.get("sample_count", 0)} / {row.get("eligible_count", 0)} eligible {_e(row.get("sample_unit", "samples"))}')
     note = _e(row['display_note']) if row.get('display_note') else note
-    estimate = ' <span class="html-estimate">ESTIMATE</span>' if row.get("state") == "estimated" else ''
-    missing = ('<strong>' + _e(STATES.get(row.get("state"), "Not measured")) + '</strong>. '
+    estimate = ' <span class="html-estimate">ESTIMATE</span>' if row.get("state") == states.METRIC_ESTIMATED else ''
+    missing = ('<strong>' + _e(_missing_label(row.get("state"))) + '</strong>. '
                + _e(row.get("reason", "") if row.get("reason") not in COMMON_GUIDANCE else "")) if row.get("value") is None else ''
     return ('<article class="html-kpi"><h3>' + _e(row.get("label", ""))
             + '<details class="html-info"><summary aria-label="Definition">i</summary><span>' + _e(info)
@@ -174,7 +177,7 @@ def _table(rows):
     # missing-collector guidance for every server metric.
     notes = [(_availability(row) or _e(row.get("source", "")))
              + (' · ' + _e(row["display_note"]) if row.get("display_note") else '')
-             + (' · ESTIMATE' if row.get("state") == "estimated" else '')
+             + (' · ESTIMATE' if row.get("state") == states.METRIC_ESTIMATED else '')
              + (' · Partial coverage' if row.get("partial") else '')
              + (' · Server-wide; separate telemetry collection interval' if row.get("scope") == "server-wide" else '')
              for row in rows]
@@ -198,7 +201,7 @@ def _distributions(rows, convention):
     for row in rows:
         parts.append('<tr><th scope="row">' + _e(row['label']) + ' · ' + _e(row.get('unit', '')))
         if row.get('value') is None:
-            parts.append('<td>' + str(row.get('sample_count', 0)) + '<td colspan="7">' + _e(STATES.get(row.get('state'), 'Not measured')))
+            parts.append('<td>' + str(row.get('sample_count', 0)) + '<td colspan="7">' + _e(_missing_label(row.get('state'))))
         else:
             parts.extend('<td>' + _fmt(row['value'].get(key)) for key in ('n', 'mean', 'min', 'median', 'p90', 'p95', 'p99', 'max'))
     parts.append('</table></div><p class="html-note">' + _e(convention) + '</p>')

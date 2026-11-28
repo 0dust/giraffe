@@ -43,16 +43,14 @@ def metric(value=None, *, label, unit, source, target, window, state=None, reaso
     """One envelope for scalar, structured and distribution-valued metrics."""
     if isinstance(value, float) and not math.isfinite(value):
         value = None
-    state = state or ("measured" if value is not None else "not_measured")
-    if value is None and state in {"measured", "estimated"}:
-        state = "insufficient_evidence"
+    state = state or (states.METRIC_MEASURED if value is not None else states.METRIC_NOT_MEASURED)
+    if value is None and state in states.METRIC_VALUE_STATES:
+        state = states.METRIC_INSUFFICIENT_EVIDENCE
+    states.check_metric_state(state, value)
     return dict(value=value, label=label, unit=unit, source=source, state=state,
                 reason=reason or (None if value is not None else "No eligible observations in this scope."),
-                action=action or (None if value is not None else {
-                    "no_baseline": "Attach a baseline with comparable workload and measurement coverage.",
-                    "not_applicable": "Select the corresponding workload or transport to collect this measure.",
-                    "not_collected": "Enable the corresponding collector and rerun the workload.",
-                }.get(state, "Collect eligible observations for this scope.")),
+                action=action or (None if value is not None else states.METRIC_STATE_ACTIONS.get(
+                    state, states.METRIC_STATE_ACTIONS[states.METRIC_NOT_MEASURED])),
                 sample_count=sample_count, eligible_count=eligible_count,
                 counts={"sample": sample_count, "eligible": eligible_count,
                         "missing": max(0, eligible_count - sample_count)},
@@ -424,35 +422,35 @@ def _window_summary(report, target, window, records, series, observation):
     legacy_source = "; from saved generation-rate estimate; older run" if any(rate is not None for rate in legacy_rates) else ""
     estimates = [1000 / rate if rate else None for rate in generation_rates]
     direct = [getattr(r, "tpot_direct_ms", None) for r in modern]
-    dist("tpot_estimate", estimates, "TPOT estimate", "ms/token", "1000 / generation_tokens_per_second" + legacy_source, state="estimated")
+    dist("tpot_estimate", estimates, "TPOT estimate", "ms/token", "1000 / generation_tokens_per_second" + legacy_source, state=states.METRIC_ESTIMATED)
     dist("tpot_direct", direct, "Direct TPOT", "ms/token", "(last answer receipt − first answer receipt) / (answer tokens − 1); proven first event token boundary")
     selected_tpot = metrics["tpot_direct"] if metrics["tpot_direct"]["value"] is not None else metrics["tpot_estimate"]
     metrics["tpot"] = {**selected_tpot, "id": "tpot", "label": "Time per output token (TPOT)"}
     metrics["tpot_direct"]["exclusion_reasons"] = dict(Counter(r.tpot_direct_reason for r in good if r.tpot_direct_reason))
     dist("generation_pace", generation_rates, "Generation pace", "tok/s",
-         "Client-observed pace from server token counts (cumulative usage or streamed logprobs) at first/last answer reads" + legacy_source, state="estimated")
+         "Client-observed pace from server token counts (cumulative usage or streamed logprobs) at first/last answer reads" + legacy_source, state=states.METRIC_ESTIMATED)
     itl = [gap for r in modern for gap in (getattr(r, "itl_ms", None) or [])]
     evidence_states = Counter(r.workload.get("token_evidence", {}).get("logprobs", "not_recorded") for r in good)
     if good and not any(r.stream for r in good):
-        itl_state, itl_reason = "not_applicable", "Non-streamed replies provide no individual token arrival timestamps."
+        itl_state, itl_reason = states.METRIC_NOT_APPLICABLE, "Non-streamed replies provide no individual token arrival timestamps."
     elif evidence_states.get(states.TOKEN_EVIDENCE_SUPPORTED):
-        itl_state, itl_reason = "insufficient_evidence", "Streamed logprobs were requested automatically, but these responses lack separate single-token reads with matching answer usage."
+        itl_state, itl_reason = states.METRIC_INSUFFICIENT_EVIDENCE, "Streamed logprobs were requested automatically, but these responses lack separate single-token reads with matching answer usage."
     elif evidence_states.get(states.TOKEN_EVIDENCE_REJECTED):
-        itl_state, itl_reason = "not_supported", "The endpoint rejected logprobs during the compatibility probe; chunk receipt gaps cannot establish individual token arrival times."
+        itl_state, itl_reason = states.METRIC_NOT_SUPPORTED, "The endpoint rejected logprobs during the compatibility probe; chunk receipt gaps cannot establish individual token arrival times."
     elif evidence_states.get(states.TOKEN_EVIDENCE_NOT_RETURNED):
-        itl_state, itl_reason = "insufficient_evidence", "The endpoint accepted the compatibility probe but did not return matching streamed logprob token boundaries."
+        itl_state, itl_reason = states.METRIC_INSUFFICIENT_EVIDENCE, "The endpoint accepted the compatibility probe but did not return matching streamed logprob token boundaries."
     elif evidence_states.get("shape_unverified"):
-        itl_state, itl_reason = "not_collected", "Plain-text probe did not establish logprobs compatibility with this tool or structured-output request shape; automatic fields were not added."
+        itl_state, itl_reason = states.METRIC_NOT_COLLECTED, "Plain-text probe did not establish logprobs compatibility with this tool or structured-output request shape; automatic fields were not added."
     elif evidence_states.get("disabled_by_request"):
-        itl_state, itl_reason = "not_collected", "Explicit request options disabled logprobs; automatic collection preserves those options."
+        itl_state, itl_reason = states.METRIC_NOT_COLLECTED, "Explicit request options disabled logprobs; automatic collection preserves those options."
     else:
-        itl_state, itl_reason = "not_collected", "No successful streamed token-evidence compatibility probe was recorded for these requests."
+        itl_state, itl_reason = states.METRIC_NOT_COLLECTED, "No successful streamed token-evidence compatibility probe was recorded for these requests."
     dist("itl", itl, "Inter-token latency (ITL)", "ms/token", "Proven single-token events in separate reads; usage reconciled",
-         state="measured" if itl else itl_state, reason=None if itl else itl_reason,
+         state=states.METRIC_MEASURED if itl else itl_state, reason=None if itl else itl_reason,
          action=None if itl or evidence_states.get(states.TOKEN_EVIDENCE_SUPPORTED) or evidence_states.get(states.TOKEN_EVIDENCE_REJECTED) else
                 "A new run probes token-evidence compatibility automatically; exact ITL still requires unbuffered single-token events and matching usage.")
     metrics["itl"]["capability_evidence"] = dict(evidence_states)
-    if itl or itl_state == "not_applicable" or any(evidence_states.get(state) for state in ("supported", "rejected", "shape_unverified", "disabled_by_request")):
+    if itl or itl_state == states.METRIC_NOT_APPLICABLE or any(evidence_states.get(state) for state in ("supported", "rejected", "shape_unverified", "disabled_by_request")):
         metrics["itl"]["action"] = distributions["itl"]["action"] = None
     metrics["itl"]["exclusion_reasons"] = dict(Counter(getattr(r, "itl_reason", "Missing timing evidence") for r in good if getattr(r, "itl_reason", None)))
     for key, prop in (("answer_read_gap", "read_gaps_ms"), ("reasoning_read_gap", "reasoning_read_gaps_ms"), ("itl", "itl_ms")):
@@ -464,7 +462,7 @@ def _window_summary(report, target, window, records, series, observation):
             row["sample_unit"] = "gaps"
     if not event_records:
         for key in ("tpot_direct", "client_ttft", "answer_read_gap", "reasoning_read_gap"):
-            metrics[key].update(value=None, state="not_collected", reason="No versioned timing evidence; old records remain unavailable.", action="Rerun with timing schema 1 instrumentation.")
+            metrics[key].update(value=None, state=states.METRIC_NOT_COLLECTED, reason="No versioned timing evidence; old records remain unavailable.", action="Rerun with timing schema 1 instrumentation.")
     stats = _stats(population)
     for key, label in (("attempted", "Requests started"), ("completed", "Valid completions"),
                        ("failed", "Failed / invalid"), ("timed_out", "Timeouts"),
@@ -487,7 +485,7 @@ def _window_summary(report, target, window, records, series, observation):
         values = [r for r in scored if check in r.check_ids]
         put(key, sum(r.score is True for r in values)/len(values) if values else None,
             label, "ratio", "Existing request scoring", samples=len(values),
-            state="measured" if values else "not_applicable", reason=None if values else "No scored requests for this check in the selected scope.")
+            state=states.METRIC_MEASURED if values else states.METRIC_NOT_APPLICABLE, reason=None if values else "No scored requests for this check in the selected scope.")
     judgements = [r.load_point.get("response_criteria") for r in population if r.load_point and r.load_point.get("response_criteria")]
     put("latency_attainment", judgements or None, "Latency-limit attainment", "responses",
         "Existing per-response load criteria; no new acceptance decision", samples=len(judgements))
@@ -546,7 +544,7 @@ def _window_summary(report, target, window, records, series, observation):
     pauses = [{**w, "elapsed_s": (w["end_ms"]-start)/1000} for w in health.get("windows", [])
               if start is not None and w.get("end_ms", -1) >= start and w.get("start_ms", math.inf) <= end]
     put("max_event_loop_delay", max((w["lag_ms"] for w in pauses), default=None), "Maximum event-loop delay", "ms", "Client scheduling health; cause not established", samples=len(pauses),
-        state="measured" if pauses else "not_observed", reason=None if pauses else "No delays above recording threshold in this window.")
+        state=states.METRIC_MEASURED if pauses else states.METRIC_NOT_OBSERVED, reason=None if pauses else "No delays above recording threshold in this window.")
     put("delayed_intervals", len(pauses) if health else None, "Delayed sampling intervals", "intervals", "Client scheduling health")
     dispatched = [r for r in records if start is not None and r.dispatch_ms is not None and start <= r.dispatch_ms <= end
                   and (window["kind"] == "full" or r.dispatch_ms < end)]
@@ -566,10 +564,12 @@ def _window_summary(report, target, window, records, series, observation):
     with_bursts = any(row.get("pattern") == "steady_with_bursts" for row in transitions)
     put("offered_rate", rates or None, "Scheduled steady arrival rate" if with_bursts else "Offered / scheduled arrival rate",
         "req/s", "Burst offers are counted separately in the Multi-user results" if with_bursts else
-        "Recorded arrival scheduler transitions; distinct from intended concurrency", state="measured" if rates else "not_applicable")
+        "Recorded arrival scheduler transitions; distinct from intended concurrency", state=states.METRIC_MEASURED if rates else states.METRIC_NOT_APPLICABLE)
     _bind_existing(report, target, window, population, observation, put)
     _server_rows(report, target, window, observation, put, metrics)
     _baseline_rows(report, target, window, population, put)
+    for row in (*metrics.values(), *distributions.values()):
+        states.check_metric_state(row["state"], row["value"])
     sections = {
         "delivery": ("sampled_concurrency", "dispatch_rate", "max_event_loop_delay", "delayed_intervals", "timing_quality", "client_preparation", "client_wait", "offered_rate", "dispatch_delay", "arrival_first_output", "arrival_completion", "drops", "server_running", "server_queue"),
         "outcomes": ("attempted", "completed", "failed", "timed_out", "cancelled", "error_rate", "reasoning_budget_exhausted", "partial_failed", "length_capped", "normal_finish", "scored", "unscored", "correctness", "structured_correctness", "tool_correctness", "latency_attainment"),
@@ -598,7 +598,7 @@ def _window_summary(report, target, window, records, series, observation):
             "intended_concurrency": [row for row in intended if row.get("intended_concurrency") is not None],
             "intended_arrival_rate": [row for row in intended if row.get("intended_rate_rps") is not None],
             "schedule_intervals": intended,
-            "intended_state": "measured" if any(row.get("intended_concurrency") is not None for row in intended) else "not_collected",
+            "intended_state": states.METRIC_MEASURED if any(row.get("intended_concurrency") is not None for row in intended) else states.METRIC_NOT_COLLECTED,
             "intended_reason": None if any(row.get("intended_concurrency") is not None for row in intended) else "No recorded intended-concurrency transitions; configured ceiling is not intended history.",
             "client_pauses": pauses, "client_pause_threshold_ms": health.get("delay_floor_ms"),
             "event_evidence": {"timing_schema": 1, "eligible_requests": n, "versioned_requests": len(event_records),
@@ -643,13 +643,13 @@ def _bind_existing(report, target, window, records, observation, put):
     else:
         delivery = None
     put("drops", delivery, "Local drops / late drops / not offered", "requests", "Existing scoped scheduler ledger; unsent work is not an endpoint error",
-        samples=len(delivery or ()), state="measured" if delivery else "not_applicable")
+        samples=len(delivery or ()), state=states.METRIC_MEASURED if delivery else states.METRIC_NOT_APPLICABLE)
     accepted = [p for p in points if p.get("status") == "pass"]
     rate_findings = [p.get("rate") for p in accepted if p.get("rate") is not None and p.get("pattern") in {"constant", "poisson"} and not p.get("bursts")]
     rate_findings += [s.get("rate_rps") for s in stages if s.get("accepted") and s.get("rate_rps") is not None]
     put("highest_acceptable_rate", max(rate_findings, default=None), "Highest acceptable arrival rate", "req/s",
         "Existing qualified acceptance at tested rates for this cohort; not maximum deployment capacity",
-        samples=len(rate_findings), state="measured" if rate_findings else "insufficient_evidence",
+        samples=len(rate_findings), state=states.METRIC_MEASURED if rate_findings else states.METRIC_INSUFFICIENT_EVIDENCE,
         reason=None if rate_findings else "No accepted arrival-rate evidence for this cohort.")
     goodput, legacy_coverage = [], []
     missing_goodput = set()
@@ -718,12 +718,12 @@ def _bind_existing(report, target, window, records, observation, put):
         "Valid, correct answers meeting configured latency limits per observation second; unscored answers are excluded",
         samples=len(goodput), eligible=len(points)+len(stages), sample_unit="load points", request_coverage=request_coverage,
         scored_subset=partial_scoring, display_note=coverage_note,
-        state="measured" if available_goodput else "insufficient_evidence",
+        state=states.METRIC_MEASURED if available_goodput else states.METRIC_INSUFFICIENT_EVIDENCE,
         reason=None if available_goodput else reason,
         action=("Set a first-answer or completion latency limit and configure answer scoring to measure correct goodput; throughput and latency remain available."
                 if not available_goodput else None))
     put("knee", None, "Knee / saturation concurrency", "requests", "No adaptive knee evidence in this revision",
-        state="insufficient_evidence", reason="Not established. Sampled concurrency and observed throughput do not establish saturation.",
+        state=states.METRIC_INSUFFICIENT_EVIDENCE, reason="Not established. Sampled concurrency and observed throughput do not establish saturation.",
         action="Run a supported capacity-discovery workload when available.")
     if point_groups:
         put("latency_attainment", [{k: g.get(k) for k in ("shape", "valid", "timing_violations", "unattributed_timing_violations", "missing_timing", "timing_quality", "status", "reason")} for g in point_groups],
@@ -737,23 +737,24 @@ def _bind_existing(report, target, window, records, observation, put):
             sessions = performance(session_observation, records, _stats)
     turns = sessions.get("turns", [])
     put("turn_latency", [{k: row.get(k) for k in ("task_type", "mode", "turn", "p50_ms", "p95_ms", "first_output_p50_ms", "first_output_p95_ms", "attempted")} for row in turns] or None,
-        "Per-turn latency / first output", "ms", "Existing session performance; turn and task populations retained", samples=len(turns), state="measured" if turns else "not_applicable")
+        "Per-turn latency / first output", "ms", "Existing session performance; turn and task populations retained", samples=len(turns), state=states.METRIC_MEASURED if turns else states.METRIC_NOT_APPLICABLE)
     put("turn_generation", [{k: row.get(k) for k in ("task_type", "mode", "turn", "generation_tokens_per_second_mean", "actual_input_tokens", "actual_output_tokens", "unmeasured_generation_requests")} for row in turns] or None,
-        "Per-turn generation pace / token growth", "tok/s, tokens", "Existing session performance; streaming estimates", samples=len(turns), state="estimated" if turns else "not_applicable")
+        "Per-turn generation pace / token growth", "tok/s, tokens", "Existing session performance; streaming estimates", samples=len(turns), state=states.METRIC_ESTIMATED if turns else states.METRIC_NOT_APPLICABLE)
     planned = sessions.get("planned_conversations")
     put("conversation_completion", sessions.get("completed_conversations", 0)/planned if planned else None,
-        "Conversation completion rate", "ratio", "Completed / planned conversations from session lifecycle", samples=sessions.get("started_conversations", 0), state="measured" if planned else "not_applicable")
+        "Conversation completion rate", "ratio", "Completed / planned conversations from session lifecycle", samples=sessions.get("started_conversations", 0), state=states.METRIC_MEASURED if planned else states.METRIC_NOT_APPLICABLE)
     put("user_fairness", sessions.get("users") or None, "Per-user generation pace / fairness", "tok/s", "Existing per-user estimates and equal-user weighting; missing coverage retained",
-        samples=sessions.get("users_with_measured_generation", 0), state="estimated" if sessions.get("users") else "not_applicable")
+        samples=sessions.get("users_with_measured_generation", 0), state=states.METRIC_ESTIMATED if sessions.get("users") else states.METRIC_NOT_APPLICABLE)
     if user_window:
         users = user_window.get("users", [])
         eligible = user_window.get("population", len(users))
         samples = sum(_number(user.get("output_tokens_per_second")) for user in users)
         complete = eligible > 0 and samples == eligible
-        put("persistent_user_delivery", users, "Persistent user delivery", "tok/s",
+        put("persistent_user_delivery", users if samples else None, "Persistent user delivery", "tok/s",
             "Completed valid output tokens inside the common user window / its actual duration; all planned users retained",
             samples=samples, eligible=eligible,
-            state="measured" if complete else "insufficient_evidence",
+            state=states.METRIC_MEASURED if samples else states.METRIC_INSUFFICIENT_EVIDENCE,
+            partial=bool(samples and not complete),
             reason=None if complete else "Not every planned user has a known shared-window output rate.",
             window_policy=user_summary.get("window_policy"))
     matched = [p for p in points if p.get("interference")]
@@ -772,16 +773,16 @@ def _bind_existing(report, target, window, records, observation, put):
             if value is not None:
                 values.append(value)
         put(key, values or None, label, "ratio", "Existing paired control/probe matched evidence; no pooled headline",
-            samples=len(values), state="measured" if values else "not_applicable")
+            samples=len(values), state=states.METRIC_MEASURED if values else states.METRIC_NOT_APPLICABLE)
     workload = [{"point_id": p.get("id"), "shape": g.get("shape"), **{k:g.get(k) for k in
         ("client_mean_inflight", "client_peak_inflight", "requested_share_percent", "observed_request_share_percent", "server_evidenced_concurrency")}}
         for p in points for g in p.get("groups", []) if not shapes or g.get("shape") in shapes]
-    put("workload_occupancy", workload or None, "Mixed-workload occupancy / shares", "requests, ratio", "Existing per-shape delivery/occupancy evidence", samples=len(workload), state="measured" if workload else "not_applicable")
+    put("workload_occupancy", workload or None, "Mixed-workload occupancy / shares", "requests, ratio", "Existing per-shape delivery/occupancy evidence", samples=len(workload), state=states.METRIC_MEASURED if workload else states.METRIC_NOT_APPLICABLE)
     recovery = by_id.get("recovery", {}) if cohort.startswith(("recovery", "sustained")) else {}
     ratios = {k: recovery[k] for k in ("latency_ratio", "first_output_ratio") if recovery.get(k) is not None}
-    put("recovery_ratios", ratios or None, "Recovery latency / first-output ratio", "ratio", "Existing recovery probe / baseline medians", samples=len(ratios), state="measured" if ratios else "not_applicable")
+    put("recovery_ratios", ratios or None, "Recovery latency / first-output ratio", "ratio", "Existing recovery probe / baseline medians", samples=len(ratios), state=states.METRIC_MEASURED if ratios else states.METRIC_NOT_APPLICABLE)
     followup = by_id.get("cancellation", {}).get("followup_delay") if any("cancellation" in r.check_ids for r in records) else None
-    put("cancel_followup", followup, "Post-cancellation follow-up delay", "ms", "Existing matched cancellation follow-up evidence", samples=1 if followup else 0, state="measured" if followup else "not_applicable")
+    put("cancel_followup", followup, "Post-cancellation follow-up delay", "ms", "Existing matched cancellation follow-up evidence", samples=1 if followup else 0, state=states.METRIC_MEASURED if followup else states.METRIC_NOT_APPLICABLE)
 
 
 def _spec_decode_coverage(details):
@@ -831,10 +832,10 @@ def _server_rows(report, target, window, observation, put, metrics):
     for key, derived_key, label, unit in mapping:
         row = derived.get(derived_key, {})
         if row.get("value") is None and key not in {"host_cpu", "host_ram"} and not key.startswith("spec_decode_") and not telemetry.get("snapshots"):
-            row = {**row, "state": "not_collected", "reason": "This saved run has no runtime telemetry collection evidence.",
+            row = {**row, "state": states.METRIC_NOT_COLLECTED, "reason": "This saved run has no runtime telemetry collection evidence.",
                    "action": "New runs discover same-origin /metrics automatically; an exporter at another route requires targets[].metrics_url."}
         put(key, row.get("value"), label, row.get("unit", unit), row.get("source", "Server telemetry"),
-            samples=row.get("sample_count", 0), state=row.get("state", "not_collected"),
+            samples=row.get("sample_count", 0), state=row.get("state", states.METRIC_NOT_COLLECTED),
             reason=row.get("reason"), action=row.get("action"), scope="server-wide",
             collection_window="telemetry sample interval; may extend beyond selected request window",
             details={**row.get("details", {}), "selected_window_attribution": "not established"})
@@ -864,7 +865,7 @@ def _server_rows(report, target, window, observation, put, metrics):
         mtplx = key.startswith("mtplx_latest_")
         label = row.get("label", key.replace('_', ' ').capitalize()) if mtplx else key.replace('_', ' ').capitalize()
         put(key, row.get("value"), label, row.get("unit", ""), row.get("source", "Server telemetry"),
-            samples=row.get("sample_count", 0), state=row.get("state", "not_collected"), reason=row.get("reason"), action=row.get("action"),
+            samples=row.get("sample_count", 0), state=row.get("state", states.METRIC_NOT_COLLECTED), reason=row.get("reason"), action=row.get("action"),
             scope=row.get("scope", "server-wide") if mtplx else "server-wide",
             collection_window="telemetry sample interval", details=row.get("details", {}),
             **({"eligible": row.get("eligible_count", 0)} if mtplx else {}))
@@ -881,7 +882,7 @@ def _server_rows(report, target, window, observation, put, metrics):
             partial=bool(coverage.get("partial_coverage")), sample_unit="telemetry intervals",
             display_note=_spec_decode_coverage(coverage),
             details={**coverage, "selected_window_attribution": "not established"})
-    put("websocket_rtt", None, "WebSocket round-trip time", "ms", "Inference transport: HTTP/SSE", state="not_applicable",
+    put("websocket_rtt", None, "WebSocket round-trip time", "ms", "Inference transport: HTTP/SSE", state=states.METRIC_NOT_APPLICABLE,
         reason="HTTP/SSE requests have no WebSocket round trip.", action="An actual WebSocket transport and request/response timing would be required.")
 
 
@@ -943,7 +944,7 @@ def _baseline_rows(report, target, window, records, put):
                          if key == "baseline_throughput" and window["kind"] == "full" and user_cohorts else
                          "Output-token rates in existing comparisons are per-request end-to-end rates; goodput deltas use requests/s. No aggregate throughput delta is invented.")
         put(key, qualified or None, label, "% change / percentage points", "Existing like-for-like qualified baseline comparisons; per-check/scenario",
-            samples=len(qualified), state="measured" if qualified else ("no_baseline" if baseline is None else "insufficient_evidence"),
+            samples=len(qualified), state=states.METRIC_MEASURED if qualified else (states.METRIC_NO_BASELINE if baseline is None else states.METRIC_INSUFFICIENT_EVIDENCE),
             reason=None if qualified else ("No baseline attached." if baseline is None else "No comparable qualified baseline population for this scope."),
             evidence=rows, comparable=bool(qualified), qualification=qualification)
     point_ids = {point.get("point_id") for point in load_points}
@@ -953,7 +954,7 @@ def _baseline_rows(report, target, window, records, put):
                      or ("acceptance_change" not in r and r.get("status") in {"pass", "fail"}))]
     capacity += traffic
     put("baseline_capacity", capacity or None, "Accepted capacity change", "tested load", "Existing qualified tested-load baseline; not inferred saturation",
-        samples=len(capacity), state="measured" if capacity else ("no_baseline" if baseline is None else "insufficient_evidence"))
+        samples=len(capacity), state=states.METRIC_MEASURED if capacity else (states.METRIC_NO_BASELINE if baseline is None else states.METRIC_INSUFFICIENT_EVIDENCE))
 
 
 def build_performance(report, *, target=None, window=None):
@@ -1103,9 +1104,11 @@ def cli_summary(report):
         for key in KPI_IDS:
             row = rows[key]
             if row["value"] is not None:
-                available.append(f"{row['label']}: {row['value']:.3g} {row['unit']}" + (" (estimate)" if row["state"] == "estimated" else ""))
+                suffix = f" ({states.METRIC_STATE_LABELS[states.METRIC_ESTIMATED].lower()})" if row["state"] == states.METRIC_ESTIMATED else ""
+                available.append(f"{row['label']}: {row['value']:.3g} {row['unit']}" + suffix)
             else:
-                unavailable.append(f"{row['label']}: {row['state'].replace('_', ' ')}")
+                label = states.METRIC_STATE_LABELS.get(row["state"], str(row["state"]).replace("_", " ")).lower()
+                unavailable.append(f"{row['label']}: {label}")
         lines.append(f"Performance · {target['target']} · {wid}")
         if available:
             lines.append("  " + " · ".join(available))
