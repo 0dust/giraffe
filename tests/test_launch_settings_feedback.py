@@ -253,6 +253,7 @@ def test_legacy_positional_difference_remains_unverified_after_masking():
     (["[redacted]"], ["[redacted]"], False, "Launch evidence is redacted"),
     ("'[redacted]'", PREFIX, True, "Launch evidence is redacted"),
     (["vllm", "serve", "[redacted]"], PREFIX, True, "The launch model operand is redacted"),
+    ([*PREFIX, "[redacted]"], [*PREFIX, "[redacted]"], False, "Additional launch arguments are redacted"),
 ])
 def test_unrelated_experiment_qualifies_redacted_commands_and_model_operands(old, new, confounded, warning):
     before, after = evidence(old), evidence(new)
@@ -302,3 +303,109 @@ def test_legacy_launch_baseline_is_sanitized_in_new_json_and_html_exports(tmp_pa
         assert "[redacted]" in rendered
     assert source.read_bytes() == original
     assert baseline.model_dump_json().encode() == original
+
+
+async def report_from_launch_metadata(tmp_path, name, command):
+    path = tmp_path / f"{name}-metadata.json"
+    path.write_text(json.dumps({
+        "scope": "deployment", "runtime": {"image": name},
+        "serving": {"launch_arguments": command},
+    }))
+    config = RunConfig(targets=[{"name": "local", "url": "http://localhost:1/v1", "model": "alias",
+        "deployment": {"metadata_file": str(path), "intended_change": "runtime.image"}}])
+    saved = await snapshot(config.targets[0], config, time.monotonic() + 5, asyncio.Event())
+    report = make_report(name)
+    report.manifest["config"] = config.model_dump(mode="json")
+    report.observations = {"targets": {"local": {"deployment": saved}}}
+    return report, saved["fields"][LAUNCH_FIELD]["configured"]
+
+
+@pytest.mark.parametrize("as_string", [False, True])
+@pytest.mark.parametrize("before,after,leading,legacy,counts,unverified", [
+    (["-tp", "2"], ["-tp", "4"], ["--enforce-eager"], False, ("2", "4"), False),
+    (["-tp=2"], ["--tensor-parallel-size", "002"], [], True, ("2", "2"), False),
+    (["--tensor-parallel-size=2"], ["-tp=4"], ["--custom-option"], False, ("2", "4"), True),
+    (["-tp", "-2"], ["--tensor-parallel-size=unsupported"], [], False, ("[redacted]", "[redacted]"), True),
+])
+async def test_tensor_parallel_alias_in_structured_metadata_and_saved_baselines(
+        tmp_path, as_string, before, after, leading, legacy, counts, unverified):
+    def command(flags):
+        args = [*PREFIX, *leading, *flags, "--max-num-seqs=16"]
+        return shlex.join(args) if as_string else args
+
+    baseline, old_launch = await report_from_launch_metadata(tmp_path, "baseline", command(before))
+    current, _ = await report_from_launch_metadata(tmp_path, "current", command(after))
+    if legacy:
+        old_launch["value"] = command(before)
+    original = baseline.model_dump_json()
+
+    comparison = compare_baseline(current, baseline)
+    diff = comparison.baseline["targets"][0]["configuration_diff"]
+    launch_row = next(row for row in diff["fields"] if row["field"] == LAUNCH_FIELD)
+    for side, count in zip(("baseline", "current"), counts, strict=True):
+        value = launch_row[side]["configured"]["value"]
+        argv = shlex.split(value) if as_string else value
+        assert argv[-2:] == [f"--tensor-parallel-size={count}", "--max-num-seqs=16"]
+    confounded = counts[0] != counts[1]
+    assert diff["confounded"] is confounded
+    assert (diff["launch_comparison"]["status"] == "unverified") is unverified
+    _, html_path = write_report(comparison, tmp_path / "comparison", html=True)
+    html = html_path.read_text()
+    assert ("Confounded: multiple unrelated changes." in html) is confounded
+    assert ("Launch setting comparison unverified." in html) is unverified
+    assert ("Deployment change: runtime.image (one intended change)" in html) is not (confounded or unverified)
+    assert baseline.model_dump_json() == original
+
+
+def test_tensor_parallel_alias_is_an_additional_individual_setting_change():
+    before = evidence(arguments(2, "--enforce-eager", "-tp", "2"))
+    after = evidence(arguments(3, "--enforce-eager", "--tensor-parallel-size=4"))
+    diff = deployment_diff(after, before)
+    assert diff["confounded"]
+    assert diff["launch_comparison"]["status"] == "checked"
+    assert {"flag": "--tensor-parallel-size", "source": "configured", "change": "changed",
+            "baseline": 2, "current": 4, "intended": False} in diff["launch_comparison"]["settings"]
+
+
+@pytest.mark.parametrize("malformed", [
+    " --harmless-marker=example",
+    "--harmless-marker =example",
+    '--example.{"field":"harmless-marker"}=example',
+])
+async def test_malformed_option_names_are_redacted_in_metadata_and_reports(tmp_path, malformed):
+    command = [*PREFIX, "--enforce-eager", malformed, "--max-num-seqs=16"]
+    baseline, old_launch = await report_from_launch_metadata(tmp_path, "baseline", command)
+    current, new_launch = await report_from_launch_metadata(tmp_path, "current", command)
+    safe_command = [*PREFIX, "--enforce-eager", "[redacted]", "--max-num-seqs=16"]
+    assert old_launch["value"] == new_launch["value"] == safe_command
+
+    # Exercise the report path with an older saved copy that retained the original argv.
+    old_launch["value"] = command
+    original = baseline.model_dump_json()
+    source = tmp_path / "saved-baseline.json"
+    source.write_text(original)
+    baseline = RunReport.model_validate_json(source.read_text())
+    comparison = compare_baseline(current, baseline)
+    diff = comparison.baseline["targets"][0]["configuration_diff"]
+    launch_row = next(row for row in diff["fields"] if row["field"] == LAUNCH_FIELD)
+    assert launch_row["baseline"]["configured"]["value"] == safe_command
+    assert launch_row["current"]["configured"]["value"] == safe_command
+    assert diff["launch_comparison"]["status"] == "unverified"
+    assert "Additional launch arguments are redacted; their equivalence is unverified." in (
+        diff["launch_comparison"]["warnings"])
+
+    for path in write_report(comparison, tmp_path / "comparison", html=True):
+        rendered = path.read_text()
+        assert "harmless-marker" not in rendered
+        assert "org/example-model" in rendered
+        assert "--max-num-seqs=16" in rendered
+        assert "[redacted]" in rendered
+    assert source.read_text() == original
+    assert baseline.model_dump_json() == original
+
+
+def test_well_formed_nested_option_name_is_retained_without_its_value():
+    args = arguments(2, "--custom-option.nested_key+", "harmless-value", "--enforce-eager")
+    saved = safe_launch(args, structured=True)
+    assert saved[-2:] == ["--custom-option.nested_key+=[redacted]", "--enforce-eager"]
+    assert "harmless-value" not in json.dumps(saved)

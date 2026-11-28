@@ -17,7 +17,9 @@ from urllib.parse import urlsplit, urlunsplit
 import httpx
 
 from .launch_settings import (
-    LAUNCH_FIELD, LAUNCH_SIZE_LIMIT, compare_launch_settings, launch_evidence_at_limit, safe_speculation,
+    LAUNCH_FIELD, LAUNCH_SIZE_LIMIT, TENSOR_PARALLEL_FLAG, compare_launch_settings,
+    launch_evidence_at_limit, launch_option_name, looks_like_launch_option, positive_launch_integer,
+    safe_speculation,
 )
 
 from .caps import (
@@ -134,7 +136,7 @@ LAUNCH_FLAGS = {
     "--gpu-memory-utilization",
     "--num-gpu-blocks-override",
     "--kv-cache-dtype",
-    "--tensor-parallel-size",
+    TENSOR_PARALLEL_FLAG,
     "--pipeline-parallel-size",
     "--attention-backend",
     "--scheduling-policy",
@@ -173,42 +175,55 @@ def _safe_launch(command, *, structured):
         return [REDACTED], True
     result, index = [], 0
     masked = False
+    vllm = args[:2] == ["vllm", "serve"]
+    normalized_tensor_parallel = False
     while index < len(args):
         start, output_start = index, len(result)
-        canonical_speculation = False
+        normalized = False
         arg = str(args[index])
-        flag, equals, value = arg.partition("=")
-        if flag in {"--speculative-config", "--dtype"}:
-            if not equals and index + 1 < len(args) and not str(args[index + 1]).startswith("--"):
+        name, equals, value = arg.partition("=")
+        flag = launch_option_name(name, vllm=vllm)
+        has_next_value = not equals and index + 1 < len(args) and not looks_like_launch_option(
+            str(args[index + 1]), vllm=vllm)
+        if flag in {"--speculative-config", "--dtype"} or (vllm and flag == TENSOR_PARALLEL_FLAG):
+            if has_next_value:
                 index += 1
                 value = str(args[index])
             if flag == "--speculative-config":
                 speculation = safe_speculation(value)
                 result.append(flag + "=" + speculation)
-                canonical_speculation = speculation != REDACTED
+                normalized = speculation != REDACTED
+            elif flag == TENSOR_PARALLEL_FLAG:
+                try:
+                    result.append(f"{flag}={positive_launch_integer(value)}")
+                    normalized_tensor_parallel = normalized = True
+                except ValueError:
+                    result.append(flag + "=" + REDACTED)
             elif value in LAUNCH_DTYPES:
                 result.extend([arg] if equals else [arg, value])
             else:
                 result.append(flag + "=" + REDACTED)
         elif flag in LAUNCH_FLAGS:
             result.append(sanitize(arg))
-            if not equals and index + 1 < len(args) and not str(args[index + 1]).startswith("--"):
+            if has_next_value:
                 index += 1
                 result.append(sanitize(str(args[index])))
-        elif flag.startswith("--"):
+        elif flag is not None:
             result.append(flag + "=" + REDACTED)
-            if not equals and index + 1 < len(args) and not str(args[index + 1]).startswith("--"):
+            if has_next_value:
                 index += 1
+        elif looks_like_launch_option(arg, vllm=vllm):
+            result.append(REDACTED)
         elif index < 3 and arg in {"vllm", "serve", "ollama", "run"}:
             result.append(arg)
         elif structured and index == 2 and args[:2] in (["vllm", "serve"], ["ollama", "run"]):
             result.append(sanitize(arg))
         else:
             result.append(REDACTED)
-        masked |= not canonical_speculation and result[output_start:] != args[start:index + 1]
+        masked |= not normalized and result[output_start:] != args[start:index + 1]
         index += 1
     if structured and isinstance(command, str):
-        result = command if result == args else shlex.join(result)
+        result = command if result == args and not normalized_tensor_parallel else shlex.join(result)
     if launch_evidence_at_limit(result):
         return [LAUNCH_SIZE_LIMIT], True
     return result, masked
@@ -904,8 +919,7 @@ def deployment_diff(current, baseline):
     new_launch = current.get("fields", {}).get(LAUNCH_FIELD) or {}
     current, current_masked = _comparison_launch_facts(current)
     baseline, baseline_masked = _comparison_launch_facts(baseline)
-    # Only supported speculation is normalized losslessly. Redaction can otherwise
-    # make distinct old arguments look identical, so it cannot establish equality.
+    # Redaction can make distinct old arguments look identical, so it cannot establish equality.
     masked_launch_change = any(
         isinstance(old_launch.get(source), dict) and isinstance(new_launch.get(source), dict)
         and old_launch[source].get("value") != new_launch[source].get("value")

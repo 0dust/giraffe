@@ -1,9 +1,10 @@
 """Compare bounded launch settings as data, without interpreting or executing shell code."""
 
 import json
+import re
 import shlex
 
-from .caps import MAX_LAUNCH_ARGUMENTS, MAX_SANITIZE_STRING_CHARS
+from .caps import MAX_LAUNCH_ARGUMENTS, MAX_SANITIZE_KEY_CHARS, MAX_SANITIZE_STRING_CHARS
 
 
 LAUNCH_FIELD = "serving.launch_arguments"
@@ -21,8 +22,37 @@ LAUNCH_SIZE_WARNING = "Launch evidence reached the size limit; equivalence is un
 MASKED_CHANGE_WARNING = "Launch evidence differs and redaction prevents a full comparison."
 REDACTED_LAUNCH_WARNING = "Launch evidence is redacted; its equivalence is unverified."
 REDACTED_MODEL_WARNING = "The launch model operand is redacted; its equivalence is unverified."
+REDACTED_POSITIONAL_WARNING = "Additional launch arguments are redacted; their equivalence is unverified."
+TENSOR_PARALLEL_FLAG = "--tensor-parallel-size"
+_TENSOR_PARALLEL_ALIAS = "-tp"
+_OPTION_NAME = re.compile(r"--[a-zA-Z0-9][a-zA-Z0-9_-]*(?:\.[a-zA-Z0-9][a-zA-Z0-9_-]*)*")
 BOOLEAN_FLAGS = {"--enable-prefix-caching", "--no-enable-prefix-caching", "--enforce-eager"}
 SPECULATIVE_METHODS = {"eagle", "eagle3", "ngram", "mtp", "draft_model"}
+
+
+def launch_option_name(name, *, vllm):
+    """Return a safe option name, allowing vLLM's documented nested JSON keys."""
+    if vllm and name == _TENSOR_PARALLEL_ALIAS:
+        return TENSOR_PARALLEL_FLAG
+    option = name.removesuffix("+") if vllm and "." in name else name
+    if len(name) <= MAX_SANITIZE_KEY_CHARS and _OPTION_NAME.fullmatch(option):
+        return name
+    return None
+
+
+def looks_like_launch_option(token, *, vllm):
+    # Keep malformed option-like arguments separate so they cannot become another flag's value.
+    return token.lstrip().startswith("--") or (
+        vllm and (token == _TENSOR_PARALLEL_ALIAS or token.startswith(_TENSOR_PARALLEL_ALIAS + "=")))
+
+
+def positive_launch_integer(value):
+    if not isinstance(value, str) or not value.isascii() or not value.isdigit():
+        raise ValueError("unsupported integer")
+    count = int(value)
+    if count <= 0:
+        raise ValueError("unsupported integer")
+    return count
 
 
 def _unique_keys(pairs):
@@ -107,21 +137,27 @@ def _parse(value, allowed_flags):
         return None, [], [REDACTED_LAUNCH_WARNING]
     if (not isinstance(args, list)
             or not all(isinstance(arg, str) for arg in args)
-            or args[:2] != ["vllm", "serve"] or len(args) < 3 or args[2].startswith("--")):
+            or args[:2] != ["vllm", "serve"] or len(args) < 3
+            or looks_like_launch_option(args[2], vllm=True)):
         return None, [], ["Individual launch comparison requires a bounded vllm serve command with a model operand."]
     settings["model operand"] = [args[2]]
     if _redacted(args[2]):
         warnings.append(REDACTED_MODEL_WARNING)
     index = 3
     while index < len(args):
-        flag, equals, value = args[index].partition("=")
-        if not flag.startswith("--"):
-            warnings.append("Additional positional launch arguments are unverified.")
+        name, equals, value = args[index].partition("=")
+        flag = launch_option_name(name, vllm=True)
+        if flag is None:
+            if _redacted(args[index]) or looks_like_launch_option(args[index], vllm=True):
+                warnings.append(REDACTED_POSITIONAL_WARNING)
+            else:
+                warnings.append("Additional positional launch arguments are unverified.")
             index += 1
             continue
         if not equals:
             value = True
-            if index + 1 < len(args) and not args[index + 1].startswith("--"):
+            if index + 1 < len(args) and not looks_like_launch_option(args[index + 1], vllm=True) and (
+                    flag not in BOOLEAN_FLAGS or args[index + 1] != "[redacted]"):
                 index += 1
                 value = args[index]
         if flag in settings:
@@ -142,12 +178,8 @@ def _parse(value, allowed_flags):
             try:
                 if flag == "--speculative-config":
                     value = _speculation(value)
-                elif flag in SETTING_FIELDS:
-                    if not isinstance(value, str) or not value.isascii() or not value.isdigit():
-                        raise ValueError("unsupported integer")
-                    value = int(value)
-                    if value <= 0:
-                        raise ValueError("unsupported integer")
+                elif flag in SETTING_FIELDS or flag == TENSOR_PARALLEL_FLAG:
+                    value = positive_launch_integer(value)
                 elif flag == "--gpu-memory-utilization":
                     if not isinstance(value, str):
                         raise ValueError("missing GPU memory utilization")
@@ -186,8 +218,11 @@ def _comparable_redaction_warnings(before, after, allowed_flags):
             continue
         left, _, old_warnings = _parse(old.get("value"), allowed_flags)
         right, _, new_warnings = _parse(new.get("value"), allowed_flags)
-        if REDACTED_LAUNCH_WARNING in old_warnings or REDACTED_LAUNCH_WARNING in new_warnings:
-            warnings.add(REDACTED_LAUNCH_WARNING)
+        for warning in (REDACTED_LAUNCH_WARNING, REDACTED_POSITIONAL_WARNING):
+            if warning in old_warnings or warning in new_warnings:
+                warnings.add(warning)
+        if any(_redacted(settings.get(TENSOR_PARALLEL_FLAG)) for settings in (left, right) if settings):
+            flags.add(TENSOR_PARALLEL_FLAG)
         if left is None or right is None:
             continue
         if left["model operand"] != right["model operand"] and (
