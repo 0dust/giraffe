@@ -11,7 +11,9 @@ import pytest
 from giraffe.capabilities import capabilities
 
 
-def run_render_checks(assertions: str, *, dom: bool = False, timeout_seconds: int = 60) -> None:
+def run_render_checks(
+    assertions: str, *, dom: bool = False, timeout_seconds: int = 60, strict: bool = False
+) -> None:
     node = shutil.which("node")
     if not node:
         pytest.skip("Node is needed to execute browser result rendering")
@@ -30,7 +32,7 @@ const context={assert,structuredClone,...formConfig,bootstrap,nodes,listeners,wa
 if(USE_DOM){context.document=browserDOM(listeners);context.location={hash:'#runs/live'};context.setTimeout=()=>{};context.clearTimeout=()=>{};context.window.innerWidth=1280;context.window.innerHeight=800;context.window.matchMedia=()=>({matches:false});nodes['#main']=context.document.querySelector('#main');}
 const source=fs.readFileSync(APP_PATH,'utf8')
   .replace(/^import .*?;\n/,'').replace(/\ninit\(\);\s*$/,'');
-vm.runInNewContext(source+`
+vm.runInNewContext((STRICT_MODE ? "'use strict';" : '')+source+`
 state.bootstrap=bootstrap;
 function check(id,status,extra={}) {
   return {id,target:'local',title:id+' check',status,required:true,
@@ -47,7 +49,7 @@ function detail(value,extra={}) {
   state.tab='checks';state.selectedCheck=null;renderDetail();return nodes['#main'].innerHTML;
 }
 `+ASSERTIONS,context);
-""".replace("DOM_PATH", json.dumps((Path(__file__).parent / "ui_dom.mjs").as_uri())).replace("USE_DOM", "true" if dom else "false").replace("APP_PATH", json.dumps(str(app))).replace(
+""".replace("DOM_PATH", json.dumps((Path(__file__).parent / "ui_dom.mjs").as_uri())).replace("USE_DOM", "true" if dom else "false").replace("STRICT_MODE", "true" if strict else "false").replace("APP_PATH", json.dumps(str(app))).replace(
         "ASSERTIONS", json.dumps(assertions)
     ).replace("BOOTSTRAP", json.dumps(capabilities())).replace("FORM_PATH", json.dumps(app.with_name("form-config.mjs").as_uri()))
     result = subprocess.run(
@@ -104,6 +106,7 @@ def test_saved_comparison_preserves_findings_and_grouped_comparison_results():
     overall:'fail',requests:[{id:'bad',target:'local',scenario:'question',status:'completed',valid:true,
       score:false,output:'Lyon',evaluation:{expected:'Paris',expected_provided:true}}]
   });
+  location.hash='#runs/saved-run';
   detail(failed);
   const heading=()=>document.querySelector('.page-heading');
   assert.equal(heading().querySelector('.button.primary').dataset.action,'show-failing');
@@ -220,7 +223,7 @@ def test_saved_comparison_failure_releases_pending_and_respects_navigation(phase
 
 
 @pytest.mark.parametrize("phase", ["post", "detail"])
-def test_saved_comparison_ignores_success_after_navigation(phase):
+def test_saved_comparison_only_finishes_started_read_after_navigation(phase):
     run_render_checks(r"""
 (async()=>{
   const phase=PHASE;
@@ -238,7 +241,9 @@ def test_saved_comparison_ignores_success_after_navigation(phase):
   const saving=compareSavedRun({preventDefault(){},target:dialog.querySelector('form')});
   await Promise.resolve();await Promise.resolve();
   state.routeVersion++;state.detail={...initial,id:'another-run'};
-  resolve({...initial,baseline_id:'reference'});await saving;
+  const finish=resolve;
+  if(phase==='post')api=async()=>{detailReads++;return {...initial,baseline_id:'reference'};};
+  finish({...initial,baseline_id:'reference'});await saving;
   assert.equal(state.detail.id,'another-run');
   assert.equal(detailReads,phase==='post'?0:1);
   dialog.close();state.routeVersion++;state.detail=initial;
@@ -803,6 +808,321 @@ def test_failed_checks_keep_applied_default_limits_and_qualified_evidence(check_
  assert.equal(JSON.stringify(value),original);
 })()
 """.replace('CHECK_ID', json.dumps(check_id)), dom=True)
+
+
+REPORT_REPLY_SETUP = r"""
+location.hash='#runs/saved-run';
+clearPoll=()=>{};schedulePoll=()=>{};updateNav=()=>{};
+const messages=[];toast=message=>messages.push(message);
+for(const id of ['baseline-dialog','comparison-dialog']){
+ const dialog=document.createElement('dialog');dialog.setAttribute('id',id);document.body.insertBefore(dialog,null);
+}
+globalThis.FormData=class{
+ constructor(form){this.form=form;}
+ get(name){return this.form.values?.[name]??'reference';}
+ has(name){return Boolean(this.form.values?.[name]);}
+};
+detail(report([check('serving','pass')]));
+const initial=structuredClone(state.detail);
+let reportRenders=0;const originalReportRender=renderDetail;renderDetail=(...args)=>{reportRenders++;return originalReportRender(...args);};
+function deferred(){let resolve,reject;const promise=new Promise((a,b)=>{resolve=a;reject=b;});return {promise,resolve,reject};}
+async function navigate(mode){
+ if(mode==='C')return;
+ location.hash=mode==='T'?'#runs/saved-run/performance':mode==='O'?'#runs/other':'#runs';
+ if(mode!=='P')await route();
+ if(mode==='L'){location.hash='#runs/saved-run';await route();}
+}
+function navigationReply(path){
+ if(path==='/api/runs')return {runs:[]};
+ if(path==='/api/storage')return {};
+ if(path==='/api/runs/other')return {...initial,id:'other'};
+ if(path==='/api/runs/saved-run')return structuredClone(initial);
+ throw Error(path);
+}
+"""
+
+
+@pytest.mark.parametrize('mode', ['C', 'T', 'P', 'R', 'O', 'L'])
+@pytest.mark.parametrize('action', ['new', 'replace', 'save-again'])
+def test_baseline_reply_respects_report_navigation(mode, action):
+    run_render_checks(REPORT_REPLY_SETUP + r"""
+(async()=>{
+ const mode=MODE,action=ACTION,pending=deferred();
+ if(action==='save-again')state.baselines=[{id:'old',run_id:'saved-run',name:'Old'}];
+ openBaselineDialog();const dialog=$('#baseline-dialog'),form=dialog.querySelector('form');
+ form.values={baseline_name:' Reference ',replace:action==='replace'};
+ api=async(path,options)=>{
+  if(path==='/api/baselines'){
+   if(options){assert.equal(JSON.parse(options.body).run_id,'saved-run');assert.equal(JSON.parse(options.body).replace,action==='replace');return pending.promise;}
+   return {baselines:[{id:'reference',run_id:'saved-run',name:'Reference'}]};
+  }
+  return navigationReply(path);
+ };
+ const saving=saveBaseline({preventDefault(){},target:form});
+ await navigate(mode);const before=$('#main').innerHTML,hash=location.hash;
+ pending.resolve({id:'reference',run_id:'saved-run',name:'Reference'});await saving;
+ assert(state.baselines.some(b=>b.id==='reference'));
+ assert.equal(location.hash,hash);
+ assert.equal(messages.length,['C','T'].includes(mode)?1:0);
+ if(['C','T','L'].includes(mode))assert.match($('#main').textContent,/Saved as baseline/);
+ else assert.equal($('#main').innerHTML,before);
+ assert.equal(dialog.open,mode==='P');
+ if(mode==='R')assert.equal(state.reportRouteActive,false);
+ if(mode==='O')assert.equal(state.detail.id,'other');
+ if(mode==='T')assert.equal(reportView.tab,'performance');
+})()
+""".replace('MODE', json.dumps(mode)).replace('ACTION', json.dumps(action)), dom=True)
+
+
+@pytest.mark.parametrize('mode', ['C', 'T', 'P', 'R', 'O', 'L'])
+@pytest.mark.parametrize('status', [409, 500])
+def test_baseline_error_only_reaches_own_visit(mode, status):
+    run_render_checks(REPORT_REPLY_SETUP + r"""
+(async()=>{
+ const pending=deferred();openBaselineDialog();
+ const form=$('#baseline-dialog').querySelector('form');form.values={baseline_name:'Reference'};
+ api=(path,options)=>options?pending.promise:Promise.resolve(navigationReply(path));
+ const saving=saveBaseline({preventDefault(){},target:form});await navigate(MODE);
+ const before=$('#main').innerHTML;
+ pending.reject(Object.assign(Error('Save failed'),{status:STATUS}));await saving;
+ const visible=['C','T'].includes(MODE);
+ assert.equal(form.querySelector('#baseline-error').hidden,!visible);
+ assert.equal(form.querySelector('#replace-row').hidden,!(visible&&STATUS===409));
+ assert.equal(messages.length,0);assert.equal($('#main').innerHTML,before);
+ assert.equal(form.querySelector('#save-baseline').disabled,false);
+})()
+""".replace('MODE', json.dumps(mode)).replace('STATUS', str(status)), dom=True)
+
+
+@pytest.mark.parametrize('outcome', ['success', '409', 'closed', 'refresh-fails'])
+def test_baseline_reply_owns_form_and_preserves_success(outcome):
+    run_render_checks(REPORT_REPLY_SETUP + r"""
+(async()=>{
+ const outcome=OUTCOME,pending=[deferred(),deferred()];let posts=0;
+ api=async(path,options)=>{
+  if(options)return pending[posts++].promise;
+  if(outcome==='refresh-fails')throw Error('Refresh failed');
+  return {baselines:[{id:'a',run_id:'saved-run',name:'A'}]};
+ };
+ openBaselineDialog();const dialog=$('#baseline-dialog'),a=dialog.querySelector('form');a.values={baseline_name:'A'};
+ const saving=saveBaseline({preventDefault(){},target:a});dialog.close();
+ if(['success','409'].includes(outcome)){
+  openBaselineDialog();const b=dialog.querySelector('form');b.values={baseline_name:'B'};
+  const second=saveBaseline({preventDefault(){},target:b});
+  if(outcome==='409')pending[0].reject(Object.assign(Error('Exists'),{status:409}));
+  else pending[0].resolve({id:'a',run_id:'saved-run',name:'A'});
+  await saving;assert(dialog.open);assert(b.querySelector('#replace-row').hidden);
+  assert(b.querySelector('#baseline-error').hidden);assert(b.querySelector('#save-baseline').disabled);
+  assert.match(messages[0],outcome==='409'?/Baseline “A” was not saved: Exists/:/Saved as baseline “A”/);
+  pending[1].resolve({id:'b',run_id:'saved-run',name:'B'});await second;
+ }else{
+  if(outcome==='closed')pending[0].reject(Error('Save failed'));
+  else pending[0].resolve({id:'a',run_id:'saved-run',name:'A'});
+  await saving;
+  assert.match(messages[0],outcome==='closed'?/Baseline “A” was not saved: Save failed/:/Saved as baseline “A”/);
+  if(outcome==='refresh-fails')assert(state.baselines.some(b=>b.id==='a'));
+ }
+})()
+""".replace('OUTCOME', json.dumps(outcome)), dom=True)
+
+
+@pytest.mark.parametrize('mode', ['C', 'T', 'P', 'R', 'O', 'L'])
+@pytest.mark.parametrize('fails', [False, True])
+def test_comparison_chooser_reply_respects_visit(mode, fails):
+    run_render_checks(REPORT_REPLY_SETUP + r"""
+(async()=>{
+ const pending=deferred();api=path=>path==='/api/baselines'?pending.promise:Promise.resolve(navigationReply(path));
+ const opening=openComparisonDialog();await navigate(MODE);
+ if(FAILS)pending.reject(Error('Choices failed'));else pending.resolve({baselines:[{id:'reference',name:'Reference'}]});
+ await opening;
+ assert.equal($('#comparison-dialog').open,!FAILS&&['C','T'].includes(MODE));
+ assert.equal(messages.length,FAILS&&['C','T'].includes(MODE)?1:0);
+ if(!FAILS)assert.equal(state.baselines[0].id,'reference');
+})()
+""".replace('MODE', json.dumps(mode)).replace('FAILS', json.dumps(fails)), dom=True)
+
+
+def test_comparison_chooser_and_baseline_cache_newest_request_wins():
+    run_render_checks(REPORT_REPLY_SETUP + r"""
+(async()=>{
+ const pending=[deferred(),deferred()];let reads=0;api=()=>pending[reads++].promise;
+ const a=openComparisonDialog(),b=openComparisonDialog();
+ pending[1].resolve({baselines:[{id:'b',name:'Newest choice'}]});await b;
+ const markup=$('#comparison-dialog').innerHTML;
+ pending[0].resolve({baselines:[{id:'a',name:'Old choice'}]});await a;
+ assert.equal($('#comparison-dialog').innerHTML,markup);assert.match(markup,/Newest choice/);
+ assert.equal(state.baselines[0].id,'b');
+ mergeBaseline({id:'b',name:'Updated'});mergeBaseline({id:'c'});mergeBaseline({});
+ assert.equal(state.baselines.length,2);assert.equal(state.baselines[0].name,'Updated');
+})()
+""", dom=True)
+
+
+@pytest.mark.parametrize('mode', ['C', 'T', 'P', 'R', 'O', 'L'])
+@pytest.mark.parametrize('phase', ['post', 'detail'])
+def test_saved_comparison_reply_respects_report_and_dialog(mode, phase):
+    run_render_checks(REPORT_REPLY_SETUP + r"""
+(async()=>{
+ const pending=deferred();let reading=false;
+ api=async(path,options)=>{
+  if(path==='/api/baselines')return {baselines:[{id:'reference',name:'Reference'}]};
+  if(path.endsWith('/compare')){reading=true;return PHASE==='post'?pending.promise:{};}
+  if(reading&&path==='/api/runs/saved-run'&&PHASE==='detail'){reading=false;return pending.promise;}
+  // A return GET issued after the POST confirmation reads the saved server state.
+  if(path==='/api/runs/saved-run'&&PHASE==='detail')return {...initial,baseline_id:'reference'};
+  return navigationReply(path);
+ };
+ await openComparisonDialog();const dialog=$('#comparison-dialog');
+ const saving=compareSavedRun({preventDefault(){},target:dialog.querySelector('form')});
+ await Promise.resolve();await Promise.resolve();
+ if(MODE==='T')dialog.close();
+ await navigate(MODE);const before=$('#main').innerHTML,hash=location.hash;
+ // The refetch after a successful POST returns the saved comparison.
+ if(PHASE==='post')api=async path=>path==='/api/runs/saved-run'?{...initial,baseline_id:'reference'}:navigationReply(path);
+ pending.resolve(PHASE==='post'?{}:{...initial,baseline_id:'reference'});await saving;
+ assert.equal(messages.length,['C','T'].includes(MODE)?1:0);
+ if(['C','T','L'].includes(MODE))assert.equal(state.detail.baseline_id,'reference');
+ else assert.equal($('#main').innerHTML,before);
+ if(MODE!=='C')assert.equal(location.hash,hash);
+ if(MODE==='T')assert.equal(reportView.tab,'performance');
+ if(MODE==='P')assert(dialog.open);
+})()
+""".replace('MODE', json.dumps(mode)).replace('PHASE', json.dumps(phase)), dom=True)
+
+
+@pytest.mark.parametrize('mode', ['C', 'T', 'P'])
+@pytest.mark.parametrize('flow', ['stop', 'poll', 'performance', 'evidence', 'plan'])
+def test_report_background_reply_cannot_repaint_after_hash_leave(mode, flow):
+    run_render_checks(REPORT_REPLY_SETUP + r"""
+(async()=>{
+ const mode=MODE,flow=FLOW,pending=deferred();let replaces=0;
+ globalThis.history={replaceState(_a,_b,hash){replaces++;location.hash=hash;}};
+ if(['stop','poll','plan'].includes(flow)){
+  state.detail={id:'saved-run',state:'running',config:{targets:[],checks:['access'],max_requests:10},seq:0};
+  reportView.id=null;renderDetail();
+ }
+ if(flow==='evidence'){
+  state.detail.report=report([check('correctness','fail',{evidence_ids:['bad']})],{overall:'fail',requests_compact:true,requests:[{id:'bad',target:'local',score:false,status:'completed'}]});
+ }
+ api=async path=>{
+  if(flow==='stop'&&path.endsWith('/cancel')||flow==='poll'&&path.includes('/events?')||flow==='performance'&&path.endsWith('/performance')||flow==='evidence'&&path.includes('/requests/')||flow==='plan'&&path==='/api/config/plan')return pending.promise;
+  return navigationReply(path);
+ };
+ if(['performance','evidence','plan'].includes(flow))globalThis.fetch=()=>{};
+ const saving=flow==='stop'?stopRun():flow==='poll'?pollDetail(state.routeVersion):flow==='performance'?loadPerformance({force:true}):flow==='evidence'?loadFindingEvidence():loadDetailPlan();
+ await navigate(mode);
+ const main=$('#main'),writes=reportRenders,hash=location.hash;replaces=0;
+ pending.resolve(flow==='stop'?{state:'stopping'}:flow==='poll'?{state:'completed',seq:1,reset:true}:flow==='plan'?{request_plan:{planned_total:12}}:flow==='evidence'?{id:'bad',output:'Answer'}:{targets:[],available_targets:[]});
+ await saving;for(let i=0;i<8;i++)await Promise.resolve();
+ if(mode==='P'){assert.equal(reportRenders,writes);assert.equal(replaces,0);assert.equal(location.hash,'#runs');}
+ else assert(reportRenders>writes,flow+' should render');
+ if(flow==='stop')assert.equal(state.stopPending,null);
+ if(flow==='performance')assert.equal(reportView.pending,false);
+ if(mode==='T')assert.equal(location.hash,hash);
+})()
+""".replace('MODE', json.dumps(mode)).replace('FLOW', json.dumps(flow)), dom=True)
+
+
+def test_replace_report_anchor_requires_current_run_route():
+    run_render_checks(REPORT_REPLY_SETUP + r"""
+let writes=0;globalThis.history={replaceState(){writes++;}};
+for(const hash of ['#runs','#runs/other','#new']){location.hash=hash;replaceReportAnchor();}
+assert.equal(writes,0);
+location.hash='#runs/saved-run/requests/one';replaceReportAnchor();assert.equal(writes,1);
+""", dom=True)
+
+
+@pytest.mark.parametrize('mode', ['closed', 'leave-return'])
+def test_comparison_refreshes_visible_performance_after_chooser_loses_ownership(mode):
+    from tests.test_ui_report_tabs import PERFORMANCE
+
+    run_render_checks(REPORT_REPLY_SETUP + PERFORMANCE + r"""
+(async()=>{
+ const post=deferred(),loads=[];
+ api=async(path,options)=>{
+  if(path==='/api/baselines')return {baselines:[{id:'reference',name:'Reference'}]};
+  if(path.endsWith('/compare'))return post.promise;
+  if(path.endsWith('/performance')){const p=deferred();loads.push(p);return p.promise;}
+  return navigationReply(path);
+ };
+ globalThis.fetch=()=>{};
+ if(MODE==='closed'){
+  location.hash='#runs/saved-run/performance';await route();
+  loads[0].resolve(performanceFixture());for(let i=0;i<12;i++)await Promise.resolve();
+  assert.match($('#report-performance').textContent,/12.5 tok\/s/);
+ }
+ await openComparisonDialog();const dialog=$('#comparison-dialog');
+ const saving=compareSavedRun({preventDefault(){},target:dialog.querySelector('form')});
+ dialog.close();
+ if(MODE==='leave-return'){
+  location.hash='#runs';await route();
+  location.hash='#runs/saved-run/performance';await route();
+ }
+ assert(loads.length);const hash=location.hash;
+ post.resolve({});await saving;
+ assert(loads.length>=2,'comparison must start a fresh performance load');
+ // The superseded performance request must not overwrite the refreshed selection.
+ loads.at(-1).resolve(performanceFixture());
+ for(let i=0;i<12;i++)await Promise.resolve();
+ loads[0].resolve({targets:[],available_targets:[]});
+ for(let i=0;i<12;i++)await Promise.resolve();
+ assert.equal(reportView.pending,false);assert.equal(reportView.tab,'performance');
+ assert.equal(location.hash,hash);assert.equal($('#report-performance').hidden,false);
+ assert.match($('#report-performance').textContent,/12.5 tok\/s/);
+ assert.equal(messages.length,MODE==='closed'?1:0);
+})()
+""".replace('MODE', json.dumps(mode)), dom=True)
+
+
+@pytest.mark.parametrize('noop', ['missing', 'active', 'pending'])
+def test_comparison_noop_open_does_not_cancel_legitimate_fetch(noop):
+    run_render_checks(REPORT_REPLY_SETUP + r"""
+(async()=>{
+ const pending=deferred();api=()=>pending.promise;
+ const opening=openComparisonDialog();
+ if(NOOP==='missing')state.detail=null;
+ else if(NOOP==='active')state.detail.state='running';
+ else pendingComparisons.add('saved-run');
+ await openComparisonDialog();state.detail=structuredClone(initial);pendingComparisons.clear();
+ pending.resolve({baselines:[{id:'reference',name:'Reference'}]});await opening;
+ assert($('#comparison-dialog').open);assert.match($('#comparison-dialog').textContent,/Reference/);
+})()
+""".replace('NOOP', json.dumps(noop)), dom=True)
+
+
+@pytest.mark.parametrize('refresh', [False, True])
+def test_comparison_chooser_includes_baseline_saved_during_fetch(refresh):
+    run_render_checks(REPORT_REPLY_SETUP + r"""
+(async()=>{
+ const old=deferred();let reads=0;
+ api=async()=>++reads===1?old.promise:{baselines:[{id:'new',name:'Saved during fetch'}]};
+ const opening=openComparisonDialog();mergeBaseline({id:'new',name:'Saved during fetch'});
+ if(REFRESH)await refreshBaselines();
+ old.resolve({baselines:[{id:'old',name:'Previous baseline'}]});await opening;
+ assert($('#comparison-dialog').open);
+ assert.match($('#comparison-dialog').textContent,/Saved during fetch/);
+ assert(state.baselines.some(b=>b.id==='new'));
+})()
+""".replace('REFRESH', json.dumps(refresh)), dom=True)
+
+
+@pytest.mark.parametrize('mode', ['R', 'O', 'L'])
+@pytest.mark.parametrize('fails', [False, True])
+def test_stop_reply_after_route_leave_drops_state_and_clears_pending(mode, fails):
+    run_render_checks(REPORT_REPLY_SETUP + r"""
+(async()=>{
+ state.detail={id:'saved-run',state:'running',config:{targets:[],checks:['access']}};renderDetail();
+ const post=deferred();api=async path=>path.endsWith('/cancel')?post.promise:path==='/api/runs/saved-run'?{id:'saved-run',state:'running',config:{targets:[],checks:['access']}}:navigationReply(path);
+ const stopping=stopRun();await navigate(MODE);
+ const before=$('#main').innerHTML,renders=reportRenders;
+ if(FAILS)post.reject(Error('Stop failed'));else post.resolve({state:'stopping'});
+ await stopping;
+ assert.equal(state.stopPending,null);assert.equal(reportRenders,renders);
+ assert.equal($('#main').innerHTML,before);assert.equal(messages.length,0);assert.equal(state.liveError,null);
+ if(MODE==='L')assert.equal(state.detail.state,'running');
+ if(MODE==='O')assert.equal(state.detail.id,'other');
+})()
+""".replace('MODE', json.dumps(mode)).replace('FAILS', json.dumps(fails)), dom=True)
 
 
 def test_live_timeout_warning_notice_and_event_updates():

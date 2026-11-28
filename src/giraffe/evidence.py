@@ -378,13 +378,13 @@ def _recovered_request_counts(records, preflight, snapshot):
         targets.setdefault(target, empty())
     for target, count in preflight.items():
         value = targets.setdefault(target, empty())
-        missing = max(0, count - value["budget_exempt_by_reason"].get("preflight", 0))
+        missing = max(0, count - value["budget_exempt_by_reason"].get(states.REQUEST_BUDGET_EXEMPTION_PREFLIGHT, 0))
         if missing:
             for row in (value, result):
                 row["sent"] += missing
                 row["budget_exempt"] += missing
                 reasons = row["budget_exempt_by_reason"]
-                reasons["preflight"] = reasons.get("preflight", 0) + missing
+                reasons[states.REQUEST_BUDGET_EXEMPTION_PREFLIGHT] = reasons.get(states.REQUEST_BUDGET_EXEMPTION_PREFLIGHT, 0) + missing
     for target, value in targets.items():
         value["saved_observations"] = saved[target]
     return result

@@ -4,7 +4,12 @@ import json
 
 import pytest
 
-from tests.test_reporting_merged_features import deployment_comparison, gpu_series_limited_report
+from tests.test_reporting_merged_features import (
+    LAUNCH_EVIDENCE_CASES,
+    deployment_comparison,
+    gpu_series_limited_report,
+    saved_launch_evidence_comparison,
+)
 from tests.test_spec_decode_reporting import saved_report
 from tests.test_ux_results import run_render_checks
 
@@ -27,6 +32,54 @@ if(confounded){
  assert.doesNotMatch(section.querySelector('.deployment-change').textContent,/Confounded/);
 }
 assert.match(section.textContent,/not evidence of causality/);
+''', dom=True)
+
+
+@pytest.mark.parametrize("mode", ["speculation", "batching", "whole", "legacy", "unverified", "mixed", "legacy_redaction"])
+def test_launch_setting_details_are_visible_beside_the_comparison(mode):
+    from tests.test_reporting_merged_features import launch_setting_comparison
+
+    value = launch_setting_comparison(mode).model_dump(mode="json")
+    run_render_checks("const value=" + json.dumps(value) + ";const mode=" + json.dumps(mode) + r''';
+detail(value);
+$('#report-baseline-reference').open=true;
+const section=$('#baseline-content .comparison-section');
+if(mode==='whole'||mode==='legacy'){
+ assert.match(section.textContent,/additional changes within that field are not checked separately/);
+}else if(['unverified','mixed','legacy_redaction'].includes(mode)){
+ assert.match(section.textContent,/Launch setting comparison unverified/);
+ if(mode==='mixed')assert.match(section.textContent,/additional changes within that field are not checked separately/);
+ assert.doesNotMatch(section.querySelector('.deployment-change').textContent,/one intended change/);
+}else{
+ assert.match(section.textContent,/--speculative-config/);
+ if(mode==='batching'){
+  assert.match(section.textContent,/--max-num-seqs/);
+  assert.match(section.textContent,/additional change/);
+  assert.match(section.textContent,/16.*32/);
+ }
+}
+''', dom=True)
+
+
+@pytest.mark.parametrize("mode", LAUNCH_EVIDENCE_CASES)
+async def test_saved_launch_evidence_controls_app_deployment_summary(tmp_path, mode):
+    redacted, confounded = LAUNCH_EVIDENCE_CASES[mode]
+    value = (await saved_launch_evidence_comparison(tmp_path, mode)).model_dump(mode="json")
+    run_render_checks(
+        "const value=" + json.dumps(value) + "; const redacted=" + json.dumps(redacted)
+        + "; const confounded=" + json.dumps(confounded) + r''';
+detail(value);
+$('#report-baseline-reference').open=true;
+const section=$('#baseline-content .comparison-section');
+const summary=section.querySelector('.deployment-change');
+assert.match(summary.textContent,/Deployment change: runtime.image/);
+assert.equal(/one intended change/.test(summary.textContent),!(redacted||confounded),summary.textContent);
+assert.equal(/Confounded: multiple unrelated changes/.test(section.textContent),confounded);
+assert.equal(/Launch setting comparison unverified/.test(section.textContent),redacted);
+if(redacted){
+ const {warnings}=value.baseline.targets[0].configuration_diff.launch_comparison;
+ assert(warnings.some(warning=>warning.includes('redacted')&&section.textContent.includes(warning)));
+}
 ''', dom=True)
 
 

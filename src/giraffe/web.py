@@ -812,7 +812,8 @@ def _merged_condition_rows(planned: list[dict], observed: list[dict], *, termina
                        reason=reason or "Work was not completed before the run ended.")
             # A stale running aggregate is never a terminal passing verdict.
             row.pop("aggregate_status", None)
-        verdict = {"passed": "pass", "failed": "fail"}.get(row.get("aggregate_status"), row.get("aggregate_status"))
+        verdict = {states.CONDITION_AGGREGATE_PASSED: "pass", states.CONDITION_AGGREGATE_FAILED: "fail"}.get(
+            row.get("aggregate_status"), row.get("aggregate_status"))
         result.append(condition_aggregate(row, verdict=verdict))
     return result
 
@@ -1254,7 +1255,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
             if not directory.is_dir() or directory.is_symlink() or directory.name.startswith("."):
                 continue
             meta = metadata(directory)
-            interrupted = meta.get("state") == "interrupted" and (directory / "evidence.jsonl").is_file()
+            interrupted = meta.get("state") == states.RUN_INTERRUPTED and (directory / "evidence.jsonl").is_file()
             if (meta.get("state") not in states.RUN_OWNED_STATES and not interrupted
                     or not is_giraffe_run(directory, meta) or directory.name == active_id):
                 continue
@@ -1269,7 +1270,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
             except HTTPException:
                 if (directory / "summary.json").is_file():
                     continue  # A final verdict summary owns this run's outcome.
-                meta.update(state="interrupted", finished_at=_now(),
+                meta.update(state=states.RUN_INTERRUPTED, finished_at=_now(),
                             error="The writer stopped before a complete report was saved.")
                 try:
                     recovered = recover_evidence(directory, meta, pause=recovery_pause)
@@ -1294,9 +1295,9 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                         recovery_retry_at=time.time() + _RECOVERY_SECONDS * 2 ** (attempts - 1),
                         error=f"Recovery failed: {reason} (attempt {attempts}/5). [error {error_id}]")
                     if terminal:
-                        meta["state"] = "error"
+                        meta["state"] = states.RUN_ERROR
             else:
-                state = "interrupted" if saved.observations.get("interrupted") else "completed"
+                state = states.RUN_INTERRUPTED if saved.observations.get("interrupted") else states.RUN_COMPLETED
                 meta.update(state=state, finished_at=saved.finished_at, run_id=saved.run_id)
                 meta.pop("error", None)
             try:
@@ -1319,13 +1320,13 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
         if "partial_report_deadline" not in job:
             count = max(job.get("live_request_count", 0), job.get("progress", {}).get("completed", 0))
             job["partial_report_deadline"] = time.monotonic() + _PARTIAL_REPORT_SECONDS + min(90, count / 1000)
-        job["state"] = job["meta"]["state"] = "stopping"
+        job["state"] = job["meta"]["state"] = states.RUN_STOPPING
         # Preserve run counters without replaying a stale request/condition event.
         job["progress"] = {key: value for key, value in job["progress"].items()
                            if key in {"completed", "attempted", "elapsed_seconds", "budget_used", "sent",
                                       "budget_exempt", "dropped_offers", "max_requests", "request_counts"}}
         job["progress"].update(event="saving_partial_report", phase="saving_partial_report",
-                               message="Saving partial report…", state="stopping")
+                               message="Saving partial report…", state=states.RUN_STOPPING)
         publish(job, job["progress"], None)
         job["meta"]["progress"] = job["progress"]
         return max(0, job["partial_report_deadline"] - time.monotonic())
@@ -1499,7 +1500,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
         journal_present = (directory / "evidence.jsonl").is_file()
         if (directory / "summary.json").is_file():
             return False  # Recovery leaves a final verdict summary in charge.
-        if state == "interrupted" and journal_present and report_available is None:
+        if state == states.RUN_INTERRUPTED and journal_present and report_available is None:
             # A listing summary does not validate the full report accepted by recovery.
             try:
                 _report(directory / "report.json")
@@ -1519,7 +1520,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
         if summary_path.is_file() and not summary_path.is_symlink():
             try:
                 summary = _read(summary_path)
-                meta = {**meta, "state": "error", "error": summary.get("error") or meta.get("error")
+                meta = {**meta, "state": states.RUN_ERROR, "error": summary.get("error") or meta.get("error")
                         or "The report could not be saved. Only check summaries are available."}
             except (OSError, ValueError):
                 pass
@@ -1535,10 +1536,10 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                 else:
                     persisted = dict(api_report(str(report_path), *_file_revision(report_path)))
             except (HTTPException, FileNotFoundError, NotADirectoryError):
-                meta = {**meta, "state": "error", "error": "Saved report is unreadable."}
+                meta = {**meta, "state": states.RUN_ERROR, "error": "Saved report is unreadable."}
         snapshot = snapshot or {}
         live = snapshot if snapshot.get("id") == identifier else {}
-        state = live.get("state", meta.get("state", "completed"))
+        state = live.get("state", meta.get("state", states.RUN_COMPLETED))
         control = live.get("scale_down_control", meta.get("scale_down_control"))
         if control is None and not live and not listing:
             from .scale_down_control import MAX_STATUS_BYTES, STATUS_FILE, _read as read_control
@@ -1713,13 +1714,13 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                 except Exception as error:
                     error_id = uuid.uuid4().hex[:8]
                     logger.exception("Run finalization failed [error %s]", error_id)
-                    job["meta"].update(state="error", finished_at=_now(), error_id=error_id,
+                    job["meta"].update(state=states.RUN_ERROR, finished_at=_now(), error_id=error_id,
                         error=f"Run finalization failed ({type(error).__name__}). [error {error_id}]")
         finally:
             # No await may separate terminal publication from releasing the run.
             # A second cancellation cannot strand the next POST behind a 409.
             if job["meta"].get("state") in states.RUN_OWNED_STATES:
-                job["meta"] = {**job["meta"], "state": "interrupted", "finished_at": _now()}
+                job["meta"] = {**job["meta"], "state": states.RUN_INTERRUPTED, "finished_at": _now()}
             job["state"] = job["meta"]["state"]
             try:
                 if job is active:
@@ -1789,14 +1790,14 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
             except OSError as error:
                 logger.exception("Report export failed [error %s]", export_error_id)
                 if getattr(error, "json_complete", False):
-                    result = dict(state="completed", finished_at=_now(), error=html_failure_warning(error))
+                    result = dict(state=states.RUN_COMPLETED, finished_at=_now(), error=html_failure_warning(error))
                 else:
                     message = save_failure_summary(report, job["directory"], error)
-                    result = dict(state="error", finished_at=_now(), error=message)
+                    result = dict(state=states.RUN_ERROR, finished_at=_now(), error=message)
                 result["error_id"] = export_error_id
                 result["error"] += f" [error {export_error_id}]"
             else:
-                result = dict(state="completed", finished_at=_now())
+                result = dict(state=states.RUN_COMPLETED, finished_at=_now())
             result.update(run_id=report.run_id, abort_reason=report.abort_reason, resources={
                 "sampled_peak_rss_bytes": dict(sampler.peaks),
                 "memory_measurement": "unavailable" if sampler.peaks.get("export") is None else "sampled process RSS",
@@ -1872,7 +1873,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                 stop_wait_attempted = True
                 worker.request_stop(cancel=True)
                 remaining = saving_partial(job)
-                meta.update(state="stopping", progress=job["progress"])
+                meta.update(state=states.RUN_STOPPING, progress=job["progress"])
                 await run_in_threadpool(save_metadata, job["directory"], meta)
                 # Validators may synchronously build a large partial report.
                 done, _ = await asyncio.wait({waiting}, timeout=remaining)
@@ -1898,12 +1899,12 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                         pass
                     except Exception:
                         logger.exception("Run failed while stopping %s", job["id"])
-            meta.update(state="interrupted", finished_at=_now(),
+            meta.update(state=states.RUN_INTERRUPTED, finished_at=_now(),
                         error="The local server stopped before a report was saved. Recorded evidence will be recovered on the next start.")
         except Exception as error:
             error_id = uuid.uuid4().hex[:8]
             logger.exception("Run could not finish [error %s]", error_id)
-            meta.update(state="error", finished_at=_now(), error_id=error_id,
+            meta.update(state=states.RUN_ERROR, finished_at=_now(), error_id=error_id,
                         error=f"Run could not finish ({type(error).__name__}). Review the configuration and retry. [error {error_id}]")
         finally:
             async def finalize():
@@ -2061,7 +2062,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
         connection_pending = True
         try:
             result = await check_connection(body)
-            if result.get("status") in {"connected", "unverified"}:
+            if result.get("status") in states.CONNECTION_USABLE_STATUSES:
                 from giraffe.client import models_url
                 try:
                     key = (models_url(body.url), result["model"], body.deployment.discovery)
@@ -2070,7 +2071,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                         context_window_cache[key] = (result["context_window"], time.time())
                         if len(context_window_cache) > 64:
                             context_window_cache.pop(next(iter(context_window_cache)))
-                    elif result.get("context_window_reason") == "no_window":
+                    elif result.get("context_window_reason") == states.CONNECTION_CONTEXT_NO_WINDOW:
                         context_window_cache.pop(key, None)
                 except httpx.InvalidURL:
                     pass
@@ -2253,14 +2254,14 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
             identifier = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8]
             directory = _directory(root, identifier)
             await run_in_threadpool(directory.mkdir, parents=True)
-            meta = {"id": identifier, "state": "running", "started_at": _now(), "heartbeat_at": _now(), "owner_pid": os.getpid(), "owner_host": socket.gethostname(),
+            meta = {"id": identifier, "state": states.RUN_RUNNING, "started_at": _now(), "heartbeat_at": _now(), "owner_pid": os.getpid(), "owner_host": socket.gethostname(),
                     "config": safe_config(config.model_dump(mode="json")), "baseline_id": body.baseline_id}
             await run_in_threadpool(save_metadata, directory, meta)
             waiting = planned_conditions(config)[:MAX_LIVE_CONDITIONS]
             condition_index = ConditionRequestIndex()
             for summary in waiting:
                 condition_index.summary(summary)
-            active = dict(id=identifier, state="running", directory=directory, meta=meta,
+            active = dict(id=identifier, state=states.RUN_RUNNING, directory=directory, meta=meta,
                           open_files=guard,
                           progress={}, events=[], requests=OrderedDict(), live_preparations=OrderedDict(),
                           live_timeout_warnings=OrderedDict(),
@@ -2275,7 +2276,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
             while len(feeds) > 4:
                 feeds.popitem(last=False)
             active["task"] = asyncio.create_task(execute(active, config, baseline))
-            return {"id": identifier, "state": "running", "terminal": False, "migration_notes": config._migration_notes, "migration_warnings": config._migration_warnings,
+            return {"id": identifier, "state": states.RUN_RUNNING, "terminal": False, "migration_notes": config._migration_notes, "migration_warnings": config._migration_warnings,
                     "live_conditions": waiting}
 
     @app.get("/api/runs/{identifier}")
@@ -2412,7 +2413,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
             if active:
                 raise HTTPException(409, "Wait for the active run to finish before comparing saved reports")
             detail = run_detail(identifier)
-            if detail["state"] != "completed" or detail["report"] is None:
+            if detail["state"] != states.RUN_COMPLETED or detail["report"] is None:
                 raise HTTPException(409, "Wait for a completed report before comparing")
             reference = next((item for item in saved_baselines() if item["id"] == body.baseline_id), None)
             if reference is None:
@@ -2507,16 +2508,16 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
     async def cancel_run(identifier: str):
         if active.get("id") == identifier:
             job = active
-            result = "already_stopping" if job["state"] == "stopping" else "stopping"
-            job["state"] = "stopping"
-            job["meta"]["state"] = "stopping"
+            result = "already_stopping" if job["state"] == states.RUN_STOPPING else "stopping"
+            job["state"] = states.RUN_STOPPING
+            job["meta"]["state"] = states.RUN_STOPPING
             job["worker"].request_stop()
-            publish(job, {"event": "run_stopping", "state": "stopping"}, None)
+            publish(job, {"event": "run_stopping", "state": states.RUN_STOPPING}, None)
             try:
                 await run_in_threadpool(save_metadata, job["directory"], dict(job["meta"]))
             except OSError:
                 pass  # Stopping traffic must not depend on available disk space.
-            return {"id": identifier, "state": "stopping", "terminal": False, "result": result}
+            return {"id": identifier, "state": states.RUN_STOPPING, "terminal": False, "result": result}
         detail = await run_in_threadpool(run_detail, identifier)
         return {"id": identifier, "state": detail["state"], "terminal": detail["terminal"],
                 "result": "already_finished" if detail["terminal"] else "not_owned"}
@@ -2553,7 +2554,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
         if not name:
             raise HTTPException(422, "Choose a baseline name")
         detail = run_detail(body.run_id, snapshot=snapshot)
-        if detail["state"] != "completed" or detail["report"] is None:
+        if detail["state"] != states.RUN_COMPLETED or detail["report"] is None:
             raise HTTPException(409, "Wait for the run report before saving a baseline")
         existing = next((item for item in saved_baselines() if item["name"] == name), None)
         if existing and not body.replace:

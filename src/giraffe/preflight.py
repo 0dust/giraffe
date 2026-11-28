@@ -12,6 +12,7 @@ from collections.abc import Callable
 import httpx
 from pydantic import Field, SecretStr, field_validator, model_validator
 
+from . import states
 from .caps import (
     MAX_PREFLIGHT_BODY_BYTES, MAX_PREFLIGHT_HEADER_CHARS,
 )
@@ -206,7 +207,7 @@ async def check_connection(body: ConnectionTest) -> dict:
                 discovered = await discover_models(body, allow_manual=True)
                 models = discovered["models"]
                 if len(models) != 1:
-                    return {"status": "needs_model", "models": models,
+                    return {"status": states.CONNECTION_NEEDS_MODEL, "models": models,
                             "message": "Choose a model, then test its connection."
                             if models else discovered["message"]}
                 model = models[0]
@@ -219,32 +220,32 @@ async def check_connection(body: ConnectionTest) -> dict:
                     raise
                 # Discovery succeeded, now or before a retry; an answerless test must not
                 # discard its result.
-                result = {"status": "unverified", "model": model, "models": [model],
+                result = {"status": states.CONNECTION_UNVERIFIED, "model": model, "models": [model],
                         "message": f'Found "{model}". The 32-token test ended before the model '
                                    "produced a visible answer. Choose checks to continue, "
                                    "or retry the connection test."}
             from giraffe.deployment import now, probe_context_window
             remaining = budget.when() - asyncio.get_running_loop().time()
             result["context_window"] = None
-            result["context_window_reason"] = "unavailable"
+            result["context_window_reason"] = states.CONNECTION_CONTEXT_UNAVAILABLE
             if discovered is not None:
                 value = discovered.get("context_windows", {}).get(model)
                 if value is not None:
                     result["context_window"] = {"value": value, "source": "/v1/models max_model_len", "collected_at": now()}
                     result["context_window_reason"] = None
                 else:
-                    result["context_window_reason"] = "no_window"
+                    result["context_window_reason"] = states.CONNECTION_CONTEXT_NO_WINDOW
             if (result["context_window"] is None and remaining > 0
                     and (discovered is None or config.targets[0].deployment.discovery
                          in {"ollama", "llamacpp", "tgi", "sglang"})):
-                result["context_window_reason"] = "unavailable"
+                result["context_window_reason"] = states.CONNECTION_CONTEXT_UNAVAILABLE
                 result["context_window"], result["context_window_reason"] = await probe_context_window(
                     config.targets[0], config, timeout=min(6, remaining), detail=True)
             return result
     except TimeoutError:
         if result is not None:
             result.setdefault("context_window", None)
-            result.setdefault("context_window_reason", "unavailable")
+            result.setdefault("context_window_reason", states.CONNECTION_CONTEXT_UNAVAILABLE)
             return result
         raise PreflightError("Connection test timed out after 15 seconds. "
                             "Check that the model is loaded, then try again.") from None
@@ -362,5 +363,5 @@ async def _check_target(target: Target, config: RunConfig, *,
         raise PreflightError(message, blocking=blocking,
                              no_answer=record.http_status is not None and 200 <= record.http_status < 300
                              and record.error in {REASONING_BUDGET_ERROR, NO_ANSWER_ERROR})
-    return {"status": "connected", "model": target.model, "latency_ms": round(record.elapsed_ms, 1),
+    return {"status": states.CONNECTION_CONNECTED, "model": target.model, "latency_ms": round(record.elapsed_ms, 1),
             "message": "The model returned an answer. Your endpoint is ready for checks."}

@@ -3,6 +3,7 @@ import asyncio
 import json
 import threading
 
+import httpx
 import pytest
 
 from giraffe.models import RunConfig
@@ -10,6 +11,86 @@ from giraffe.web import _RunThread
 from tests.test_web import browser, config, finished, report, start, successful_runner
 
 pytestmark = pytest.mark.usefixtures("local_tokenizer")
+
+
+@pytest.mark.parametrize("boundary,expected_requests", [("before_dispatch", 1), ("in_flight", 2)])
+async def test_cancelled_token_probe_download_is_unavailable(tmp_path, monkeypatch, boundary, expected_requests):
+    from giraffe import states
+    from giraffe.runner import _Run
+    from tests.test_automatic_performance_evidence import completion
+
+    reached = threading.Event()
+    sent = []
+
+    async def endpoint(request):
+        if request.method == "GET":
+            return httpx.Response(404)
+        body = json.loads(request.content)
+        if body.get("max_tokens") == 16:
+            sent.append(body)
+            if body.get("logprobs"):
+                return httpx.Response(400, json={"error": {"param": "logprobs"}})
+            reached.set()
+            await asyncio.Event().wait()
+        return completion()
+
+    actual_client = httpx.AsyncClient
+
+    def http_client(**kwargs):
+        kwargs.setdefault("transport", httpx.MockTransport(endpoint))
+        return actual_client(**kwargs)
+
+    original_request = _Run.request
+
+    async def request(run, target, client, spec, **kwargs):
+        if (boundary == "before_dispatch" and spec.scenario == "performance_evidence_probe"
+                and "logprobs" not in spec.options):
+            reached.set()
+            await run.stop.wait()
+        return await original_request(run, target, client, spec, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", http_client)
+    monkeypatch.setattr(_Run, "request", request)
+    values = config(checks=["serving"], samples=1, max_requests=100, metrics=False,
+                    request_timeout_seconds=10, max_duration_seconds=20)
+    async with browser(tmp_path) as client:
+        identifier = await start(client, values)
+        assert await asyncio.to_thread(reached.wait, 3)
+        response = await client.post(f"/api/runs/{identifier}/cancel", json={})
+        assert response.status_code == 200
+        detail = await finished(client, identifier)
+        assert detail["state"] == states.RUN_COMPLETED
+        downloaded = await client.get(f"/api/runs/{identifier}/report.json")
+        assert downloaded.status_code == 200
+        saved = downloaded.json()
+
+    assert saved["abort_reason"] == states.STOP_CANCELLED_BY_USER
+    probes = [row for row in saved["requests"] if row["scenario"] == "performance_evidence_probe"]
+    assert len(probes) == len(sent) == expected_requests
+    assert probes[0]["http_status"] == 400
+    assert probes[0]["workload"]["rejected_evidence_field"] == "logprobs"
+    if boundary == "in_flight":
+        assert probes[-1]["status"] == "cancelled"
+        assert probes[-1]["termination_reason"] == "user_stop"
+    observation = saved["observations"]["targets"]["local"]
+    evidence = observation["token_evidence"]
+    assert evidence["status"] == states.TOKEN_EVIDENCE_UNAVAILABLE
+    assert evidence["probe_requests"] == expected_requests
+    assert evidence["logprobs"] == states.TOKEN_EVIDENCE_REJECTED
+    assert evidence["usage"] == states.TOKEN_EVIDENCE_UNVERIFIED
+    assert "Endpoint rejected logprobs (HTTP 400)." in evidence["reason"]
+    assert states.STOP_CANCELLED_BY_USER in evidence["reason"]
+    assert "budget" not in evidence["reason"].lower()
+    preparation = observation["preparations"]["performance_evidence_probe"]
+    assert preparation["status"] == "unavailable"
+    assert preparation["reason"] == evidence["reason"]
+    condition = next(row for row in saved["conditions"] if row["condition_id"] == "performance_evidence_probe")
+    assert condition["status"] == states.CONDITION_AGGREGATE_INCONCLUSIVE
+    assert condition["reason"] == evidence["reason"]
+    assert condition["started"] == condition["completed"] == expected_requests
+    live = next(row for row in detail["report"]["conditions"] if row["condition_id"] == "performance_evidence_probe")
+    assert live["status"] == states.CONDITION_AGGREGATE_INCONCLUSIVE
+    assert live["reason"] == evidence["reason"]
 
 
 async def test_run_terminal_and_cancel_results(tmp_path, monkeypatch):
@@ -207,6 +288,59 @@ async def test_published_recovery_report_with_retained_journal_finishes_polling(
         assert (await client.post("/api/runs/recovered/cancel", json={})).json()["result"] == "already_finished"
     assert journal.read_bytes() == evidence
     assert (directory / "report.json").read_bytes() == published
+
+
+async def test_manual_recovery_after_server_exhausts_retries(tmp_path, monkeypatch, caplog):
+    import errno
+
+    from giraffe import states, web
+    from giraffe.cli import main
+    from giraffe.evidence import EvidenceWriter
+    from giraffe.storage import write_metadata
+
+    monkeypatch.setattr(states, "STRICT_TRANSITIONS", True)
+    directory = tmp_path / "given-up"
+    write_metadata(directory, {"id": directory.name, "state": "interrupted", "config": config(),
+                               "heartbeat_at": "2000-01-01T00:00:00Z", "recovery_attempts": 4})
+    writer = EvidenceWriter(directory, manifest={"config": config()})
+    writer.record_finished(report(RunConfig.model_validate(config())).requests[0])
+    writer.close()
+
+    def disk_full(*args, **kwargs):
+        raise OSError(errno.ENOSPC, "disk full")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(web, "write_report", disk_full)
+        async with browser(tmp_path):
+            given_up = json.loads((directory / ".web.json").read_text())
+            assert given_up["state"] == "error"
+            assert given_up["recovery_attempts"] == 5
+            assert given_up["recovery_retry_at"] > 0
+            assert given_up["error"] == (
+                f"Recovery failed: disk full (attempt 5/5). [error {given_up['error_id']}]")
+    assert (directory / "evidence.jsonl").is_file()
+    assert not (directory / "report.json").exists()
+
+    assert main(["report", str(directory), "--html"]) == 0
+
+    saved = json.loads((directory / "report.json").read_text())
+    assert saved["observations"]["interrupted"] is True
+    assert len(saved["requests"]) == 1
+    assert (directory / "report.html").is_file()
+    recovered = json.loads((directory / ".web.json").read_text())
+    assert recovered["state"] == "interrupted"
+    assert recovered["run_id"] == saved["run_id"]
+    for key in ("error", "error_id", "recovery_attempts", "recovery_retry_at"):
+        assert key not in recovered
+    async with browser(tmp_path) as client:
+        response = await client.get(f"/api/runs/{directory.name}")
+        assert response.status_code == 200
+        detail = response.json()
+        assert detail["state"] == "interrupted"
+        assert detail["recoverable"] is False
+        assert detail["error"] is None
+        assert detail["error_id"] is None
+    assert "Undeclared run state transition" not in caplog.text
 
 
 async def test_interrupted_event_feed_tracks_recovery_report_publication(tmp_path, monkeypatch):

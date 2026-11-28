@@ -28,6 +28,7 @@ from .caps import (MAX_HTML_PREVIEW_CHARS, MAX_HTML_JSON_PREVIEW_CHARS,
                    DEFAULT_HTML_REQUEST_DETAILS, MAX_FAILURE_SUMMARY_TITLE_CHARS,
                    MAX_FAILURE_SUMMARY_CHARS)
 from .deployment import deployment_diff, safe_config, sanitize
+from .launch_settings import comparison_warnings, setting_change_text
 from .report_inputs import input_ref as _input_ref
 from .multi_user_metrics import (_error as _user_error, _length_mix_differs, _total_generated_tokens,
                                  _uncached_input_tokens, _valid as _user_valid_completion,
@@ -2069,16 +2070,16 @@ def _compare_gateway_attribution(report, baseline, target, compatible, current_t
         row = matching[0] if len(matching) == 1 else {}
         if (metrics.get("collection_version") != COLLECTION_VERSION
                 or metrics.get("collection_complete") is not True or metrics.get("evidence_changed") is not False):
-            return "unverified", 0, row
+            return states.GATEWAY_ATTRIBUTION_UNVERIFIED, 0, row
         matched, mismatched, unverified = (row.get(key) for key in
             ("matched_requests", "mismatched_requests", "unverified_requests"))
         counts = (matched, mismatched, unverified)
         if (not all(type(count) is int and 0 <= count <= settings.samples for count in counts)
                 or sum(counts) != row.get("observed_requests") or sum(counts) > settings.samples):
-            return "unverified", 0, row
+            return states.GATEWAY_ATTRIBUTION_UNVERIFIED, 0, row
         if mismatched:
-            return "mismatch", matched + mismatched, row
-        return ("verified" if matched == settings.samples else "unverified"), matched, row
+            return states.GATEWAY_ATTRIBUTION_MISMATCH, matched + mismatched, row
+        return (states.GATEWAY_ATTRIBUTION_VERIFIED if matched == settings.samples else states.GATEWAY_ATTRIBUTION_UNVERIFIED), matched, row
 
     current_check, baseline_check = check_for(report), check_for(baseline)
     if current_check is None:
@@ -2103,12 +2104,12 @@ def _compare_gateway_attribution(report, baseline, target, compatible, current_t
             reason = "Gateway test identity references differ or are missing."
         elif previous.get("collection_version") != COLLECTION_VERSION:
             reason = "Rerun the baseline with complete spend-log attribution evidence."
-        elif not baseline_check or baseline_check.status != "pass" or old != "verified":
+        elif not baseline_check or baseline_check.status != "pass" or old != states.GATEWAY_ATTRIBUTION_VERIFIED:
             reason = "The baseline lacks complete verified attribution for the selected identities."
-        elif current == "unverified":
+        elif current == states.GATEWAY_ATTRIBUTION_UNVERIFIED:
             reason = "Current attribution is incomplete for this identity."
         else:
-            status = "fail" if current == "mismatch" else "pass"
+            status = "fail" if current == states.GATEWAY_ATTRIBUTION_MISMATCH else "pass"
             reason = ("A previously verified identity now has a gateway identity or token mismatch."
                       if status == "fail" else "The identity and final token counts still match.")
         rows.append({"check": CHECK, "scenario": alias, "scenario_label": alias,
@@ -3867,9 +3868,16 @@ def _deployment_change_html(diff: dict[str, Any]) -> str:
     intended = diff.get("intended_change")
     summary = ("Deployment change: " + ", ".join(changed) if changed
                else "No observed deployment changes.")
-    if changed and intended and not diff.get("confounded"):
+    launch = diff.get("launch_comparison") or {}
+    if changed and intended and not diff.get("confounded") and launch.get("status") != "unverified":
         summary += " (one intended change)"
     parts = [f'<p class="deployment-change">{_e(summary)}</p>']
+    if launch.get("status") == "unverified":
+        parts.append('<p><strong>Launch setting comparison unverified.</strong></p>')
+    parts.extend(f'<p class="muted">{_e(warning)}</p>' for warning in comparison_warnings(diff))
+    if launch.get("settings"):
+        parts.append('<ul>' + ''.join(f'<li>{_e(setting_change_text(row))}</li>'
+                                     for row in launch["settings"]) + '</ul>')
     if diff.get("confounded"):
         parts.append('<p><strong>Confounded: multiple unrelated changes.</strong></p>')
         if intended:
@@ -4194,7 +4202,7 @@ def request_count_lines(report: RunReport) -> list[str]:
     if counts.get("complete") is False:
         lines[0] += " (recovered; may be incomplete)"
     if counts["budget_exempt"]:
-        labels = {"preflight": "connection preflight", "restart_readiness": "restart readiness probe"}
+        labels = {states.REQUEST_BUDGET_EXEMPTION_PREFLIGHT: "connection preflight", states.REQUEST_BUDGET_EXEMPTION_RESTART_READINESS: "restart readiness probe"}
         reasons = [f"{count} {labels[reason]}{'s' if count != 1 else ''}"
                    for reason, count in counts["budget_exempt_by_reason"].items() if count]
         lines.append("Exempt: " + ", ".join(reasons))
@@ -4444,9 +4452,9 @@ def _render(report: RunReport) -> str:
                              f'{_e(row.get("scope", "unknown"))}</p>')
         parts.append(f'<h3>{_e(name)}</h3>')
         probe = next((row for row in report.conditions if row.get("target") == name
-                      and row.get("condition_id") == "performance_evidence_probe"), None)
+                      and row.get("condition_id") == states.SETUP_PROBE_PERFORMANCE_EVIDENCE), None)
         if probe:
-            passed = probe.get("status") == "passed"
+            passed = probe.get("status") == states.CONDITION_AGGREGATE_PASSED
             reason = probe.get("reason") or observation.get("token_evidence", {}).get("reason", "")
             parts.append(f'<p class="{"muted" if passed else "inconclusive"}">Streamed token and usage support: '
                          f'{"Passed" if passed else "Inconclusive"} — {_e(reason)}</p>')
@@ -4677,7 +4685,7 @@ def save_failure_summary(report: RunReport, directory: Path, error: OSError) -> 
         except OSError:
             pass
     message = prefix + "a summary was saved."
-    summary = {"run_id": report.run_id, "overall": report.overall, "state": "error",
+    summary = {"run_id": report.run_id, "overall": report.overall, "state": states.RUN_ERROR,
                "started_at": report.started_at, "finished_at": report.finished_at,
                "request_counts": report.observations.get("request_counts"), "summary_saved": True, "error": message,
                "checks": [{"id": check.id, "target": check.target, "title": check.title[:MAX_FAILURE_SUMMARY_TITLE_CHARS],

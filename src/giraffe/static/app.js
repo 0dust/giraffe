@@ -1,8 +1,20 @@
 import {configureGatewayAccess, configureGatewayPolicy, gatewayPolicySettings, positiveBoundErrors, inferSetupPreset, configureLoadTest, loadTestIssues, loadTestSettings, loadFieldName, convertExpectedAnswer, datasetCaseFromValues, changeDatasetScorer, configureJudging, configureSessions, configureMultiUser, multiUserSettings, configureProfiles, parseLogprobSettings, parseToolFixtures, effectiveProfileDefaults, configureTests, configureRunLimits, limitValue, optionDefault, optionValue, sameConfig} from './form-config.mjs?v=20261028-results-merge-ci';
 
 // Source: src/giraffe/states.py.
-const RUN_IN_PROGRESS_STATES = ['running','queued','stopping'];
-const RUN_TERMINAL_STATES = ['completed','interrupted','error'];
+const RUN={QUEUED:'queued',RUNNING:'running',STOPPING:'stopping',COMPLETED:'completed',INTERRUPTED:'interrupted',ERROR:'error'};
+const RUN_IN_PROGRESS_STATES = [RUN.RUNNING,RUN.QUEUED,RUN.STOPPING];
+const RUN_TERMINAL_STATES = [RUN.COMPLETED,RUN.INTERRUPTED,RUN.ERROR];
+
+// A live run never moves backwards: stopping does not return to running/queued, and a terminal run does not become active again.
+function nextLiveRunState(previous, incoming, {stopRequested=false}={}) {
+  if(RUN_TERMINAL_STATES.includes(previous)&&!RUN_TERMINAL_STATES.includes(incoming))return previous;
+  if((previous===RUN.STOPPING||stopRequested)&&[RUN.RUNNING,RUN.QUEUED].includes(incoming))return RUN.STOPPING;
+  return incoming;
+}
+
+// Connection-test values from src/giraffe/preflight.py, plus the local pending state.
+const DISCOVERY={PENDING:'pending',CONNECTED:'connected',UNVERIFIED:'unverified',NEEDS_MODEL:'needs_model',ERROR:'error'};
+const DISCOVERY_USABLE=[DISCOVERY.CONNECTED,DISCOVERY.UNVERIFIED];
 
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
@@ -28,8 +40,9 @@ function updateAPIKeySummary() {
   const key=apiKeyFor(form.elements.url.value),ref=form.elements.api_key_env?.value.trim();
   $('.row-value',summary).textContent=key?'Set for this tab':ref||'Not set';
 }
-const state = {bootstrap:null, runs:[], storage:null, storageUnavailable:false, cleanup:null, cleanupResult:null, baselines:[], detail:null, mosaicFollow:true, config:null, active:null, diskActive:null, routeVersion:0, setupNavigationSequence:0, poll:null, tab:'checks', selectedCheck:null, checkNavigatorOpen:false, filter:'all', historySearch:'', comparisonFilter:null, comparisonCheck:'all', submitting:false, openTest:null, configView:'form', jsonDraft:null, jsonBase:null, configRevision:0, configBusy:false, showAvailableTests:false, formMode:'normal', formRestartTarget:null, requestPreview:null, previewSequence:0, planTimer:null, setupPreset:null, catalogueFilter:'all', catalogueCategory:'all', catalogueSearch:'', setupStep:1, focusSetupOnEntry:false, returnToReview:false, modelDiscovery:null, modelDiscoverySequence:0, autoModel:null, datasetSelection:[], datasetImportSequence:0, judgeEditorOpen:null, datasetImport:null, datasetEditor:null, datasetTry:null, migrationNotes:[], migrationLimitNotes:[], migrationWarnings:[], dismissedMigrationNotes:[], loadPanels:{}, limitValues:{}, jsonValidation:null};
+const state = {bootstrap:null, runs:[], storage:null, storageUnavailable:false, cleanup:null, cleanupResult:null, baselines:[], detail:null, mosaicFollow:true, config:null, active:null, diskActive:null, routeVersion:0, setupNavigationSequence:0, poll:null, tab:'checks', selectedCheck:null, checkNavigatorOpen:false, filter:'all', historySearch:'', comparisonFilter:null, comparisonCheck:'all', submitting:false, openTest:null, configView:'form', jsonDraft:null, jsonBase:null, configRevision:0, configBusy:false, showAvailableTests:false, formMode:'normal', formRestartTarget:null, requestPreview:null, previewSequence:0, planTimer:null, setupPreset:null, catalogueFilter:'all', catalogueCategory:'all', catalogueSearch:'', setupStep:1, focusSetupOnEntry:false, returnToReview:false, modelDiscovery:null, modelDiscoverySequence:0, connectionTestsInFlight:0, autoModel:null, datasetSelection:[], datasetImportSequence:0, judgeEditorOpen:null, datasetImport:null, datasetEditor:null, datasetTry:null, migrationNotes:[], migrationLimitNotes:[], migrationWarnings:[], dismissedMigrationNotes:[], loadPanels:{}, limitValues:{}, jsonValidation:null};
 state.setupWorkspace=null;
+function resetJsonDraft(){state.jsonDraft=null;state.jsonBase=null;}
 const statusLabels = {not_applicable:'Not applicable',measured:'Measured',warmup:'Warmup',pass:'Passed',fail:'Failed',failed:'Failed',timeout:'Timed out',inconclusive:'Inconclusive',skipped:'Not run',idle:'Unused',blocked:'Blocked',running:'Running',queued:'Queued',reserved:'Reserved',stopping:'Stopping',error:'Runner error',completed:'Finished',stopped:'Stopped',cancelled:'Cancelled',interrupted:'Interrupted'};
 const statusIcons = {pass:'✓',fail:'×',failed:'×',timeout:'◷',inconclusive:'?',skipped:'–',idle:'○',blocked:'!',running:'·',queued:'○',reserved:'○',stopping:'·',error:'×',completed:'✓',stopped:'⊘',cancelled:'⊘',interrupted:'!'};
 const order = {fail:0,blocked:1,inconclusive:2,pass:3,skipped:4};
@@ -45,7 +58,8 @@ const duration = (run) => run.started_at && run.finished_at ? elapsed((new Date(
 const human = (name) => String(name).replaceAll('_',' ').replace(/\b\w/, c=>c.toUpperCase());
 const activeState = (run) => run && RUN_IN_PROGRESS_STATES.includes(run.state);
 function displayStatus(status,run=state.detail) {
-  if(run?.state&&!activeState(run)&&['running','queued','reserved','stopping'].includes(status))return status==='queued'?'skipped':['cancelled','interrupted'].includes(run.state)?'cancelled':'inconclusive';
+  // Legacy saved runs can still have the cancelled lifecycle state.
+  if(run?.state&&!activeState(run)&&[RUN.RUNNING,RUN.QUEUED,'reserved',RUN.STOPPING].includes(status))return status===RUN.QUEUED?'skipped':['cancelled',RUN.INTERRUPTED].includes(run.state)?'cancelled':'inconclusive';
   return status;
 }
 function probeCondition(record,report=state.detail?.report) {
@@ -64,7 +78,7 @@ function renderProbeReason(record) {
 }
 function requestStatus(record) {
   if(record.scenario==='performance_evidence_probe'&&record.status==='completed')return probePassed(record)?'pass':'inconclusive';
-  return ['running','queued','reserved','stopping','timeout','cancelled','skipped'].includes(record.status)?displayStatus(record.status):requestOutcome(record);
+  return [RUN.RUNNING,RUN.QUEUED,'reserved',RUN.STOPPING,'timeout','cancelled','skipped'].includes(record.status)?displayStatus(record.status):requestOutcome(record);
 }
 const runPath = (id) => `/api/runs/${encodeURIComponent(id)}`;
 const linkRun = (id) => `#runs/${encodeURIComponent(id)}`;
@@ -82,7 +96,7 @@ function requestOutcome(record) {
 }
 const landedItems=new Set(),landingAnimations=new Set(),terminalRequests=new Map();
 let landedRun=null;
-const inProgress=status=>['running','queued','reserved','stopping'].includes(status);
+const inProgress=status=>[RUN.RUNNING,RUN.QUEUED,'reserved',RUN.STOPPING].includes(status);
 function cancelLandings(root=null) {
   for(const animation of landingAnimations)if(!root||root.contains(animation.effect.target)){animation.cancel();landingAnimations.delete(animation);}
 }
@@ -255,7 +269,7 @@ function renderMosaic(records,{budget=records.length,live=false,budgetUsed=recor
   const bySlot=new Map(records.map((r,i)=>[liveBudget?r.slot:i,r]));
   // Request slots are compact dispatch IDs; unsent offers occupy the remaining budget.
   const sent=Math.max(attempted,live?records.reduce((count,r)=>Math.max(count,r.slot+1),0):records.length),droppedEnd=Math.min(budgetUsed,sent+droppedOffers);
-  const statuses=['pass','fail','timeout','cancelled','skipped','inconclusive',...(live?['running','queued',...(countOnly?[]:['reserved','idle'])]:[])];
+  const statuses=['pass','fail','timeout','cancelled','skipped','inconclusive',...(live?[RUN.RUNNING,RUN.QUEUED,...(countOnly?[]:['reserved','idle'])]:[])];
   return `<section class="request-viz"><div class="viz-heading"><h2>${liveBudget&&!countOnly?'Request budget':'Requests'}</h2><span class="mono hint">${countOnly?`${number(total)} started · ${number(records.length)} in live window`:`${number(records.length)} ${live?'started':'recorded'}`}${live&&droppedOffers?` · ${number(droppedOffers)} dropped before sending`:''}</span>${liveBudget&&pages>1?`<span class="mosaic-live-controls">${state.mosaicFollow!==false?'<span class="mosaic-following">Following live</span>':`<span class="hint">Live on requests ${liveOffset+1}–${Math.min(total,liveOffset+mosaicPageSize)}</span><button class="text-button mosaic-live" data-action="mosaic-live">Back to live</button>`}</span>`:''}</div><div class="mosaic-scroll"><svg class="request-mosaic${live?' is-live':''}${entrance?' is-entering':''}" viewBox="0 0 ${geometry.width} ${geometry.height}" style="--mosaic-w:${geometry.width}px;--spot-round:${geometry.round}" data-columns="${geometry.columns}" role="group" aria-label="${live?countOnly||filtered?'Live requests':'Live request budget':'Recorded requests'}. Arrow keys move between spots.">${geometry.cells.map((points,i)=>{
     const slot=offset+i,r=bySlot.get(slot);if(countOnly&&!r)return '';
     const dropped=!r&&slot>=sent&&slot<droppedEnd,status=r?requestStatus(r):dropped?'skipped':slot<sent?'inconclusive':slot<budgetUsed?displayStatus('reserved'):'idle',current=live&&status==='running'&&slot===frontier,label=r?requestLabel(r,records,undefined,positions):dropped?`Budget slot ${slot+1}: Not run · dropped before sending`:status!=='idle'?`Budget slot ${slot+1}: ${statusLabels[status]}, request evidence unavailable`:`Budget slot ${slot+1}: not used`;
@@ -293,7 +307,7 @@ function conditionStatus(summary,{live=false,failed=0,started=0,completed=0,pass
     else if(completed&&passed===completed)status='passed';
     else status=live&&!started?'waiting':'inconclusive';
   }
-  if(!live&&['running','waiting'].includes(status))status=state.detail?.state==='cancelled'?'cancelled':'inconclusive';
+  if(!live&&[RUN.RUNNING,'waiting'].includes(status))status=state.detail?.state==='cancelled'?'cancelled':'inconclusive';
   return aliases[status] || status;
 }
 function conditionProgress(view) {
@@ -771,7 +785,7 @@ function setActive(id) {
   state.active=id || null;
   updateTitle();
   const link=$('#active-run-link');link.hidden=!id;link.href=id?linkRun(id):'#runs';
-  const html=id?`${badge('running','Run in progress',{state:'running'})}<span aria-hidden="true"> →</span>`:'';if(link.innerHTML!==html)link.innerHTML=html;
+  const html=id?`${badge(RUN.RUNNING,'Run in progress',{state:RUN.RUNNING})}<span aria-hidden="true"> →</span>`:'';if(link.innerHTML!==html)link.innerHTML=html;
 }
 function updateNav(section, label) {
   renderRailRuns();
@@ -795,8 +809,76 @@ async function refreshStorage() {
   try{state.storage=await api('/api/storage');state.storageUnavailable=false;}
   catch{state.storage=null;state.storageUnavailable=true;}
 }
+// Reads and writes share a clock: arrival order alone cannot establish freshness.
+const runWrites=new Map(),runListReads=new Set(),runDetailReads=new WeakMap();
+let runWriteClock=0;
+function runWriteEntry(id){
+  if(!runWrites.has(id))runWrites.set(id,{sequence:0,pending:new Set(),readers:0,reads:new Set(),confirmed:0,comparison:0,keep:null,latestKeep:0,detail:null,detailStart:0,detailKept:false});
+  return runWrites.get(id);
+}
+function retireRunWrites(id,entry){
+  if(![...entry.reads].some(read=>read.start<entry.detailStart))entry.detail=null;
+  if(runWrites.get(id)===entry&&!entry.pending.size&&!entry.readers&&![...runListReads].some(start=>start<entry.confirmed))runWrites.delete(id);
+}
+function beginRunWrite(id,kind){
+  const entry=runWriteEntry(id),write={entry,kind,sequence:++entry.sequence};
+  entry.pending.add(write);
+  if(kind==='keep')entry.latestKeep=write.sequence;
+  return write;
+}
+function finishRunWrite(id,write){write.entry.pending.delete(write);retireRunWrites(id,write.entry);}
+function confirmRunWrite(id,write,value){
+  const entry=write.entry;
+  if(write.kind==='keep'&&entry.latestKeep!==write.sequence)return false;
+  entry.confirmed=++runWriteClock;
+  if(write.kind==='keep'){
+    entry.keep={at:entry.confirmed,value};
+    const row=state.runs.find(run=>run.id===id);if(row)row.kept=value;
+    if(state.detail?.id===id)state.detail.kept=value;
+    if(row&&typeof location!=='undefined'&&location.hash==='#runs'&&!state.reportRouteActive)renderRunsIfChanged();
+  }else entry.comparison=entry.confirmed;
+  return true;
+}
+function keepPending(id){return [...(runWrites.get(id)?.pending||[])].some(write=>write.kind==='keep');}
+// Only older readers need a private, immutable snapshot of a newer payload.
+async function fetchRunDetail(id,{handoff=false}={}){
+  const entry=runWriteEntry(id),start=++runWriteClock,read={id,entry,start,handoff:false};
+  entry.readers++;entry.reads.add(read);
+  try{
+    let detail=await api(runPath(id));
+    // A pre-comparison read cannot be final. Reuse the newer refetch, or fetch now.
+    if(entry.comparison>start&&entry.detailStart<entry.comparison)detail=await fetchRunDetail(id);
+    if(entry.detailStart>start)detail=JSON.parse(entry.detail);
+    else {
+      entry.detailStart=start;entry.detailKept=detail.kept;
+      entry.detail=[...entry.reads].some(reader=>reader.start<start)?JSON.stringify(detail):null;
+    }
+    if(entry.keep&&entry.keep.at>entry.detailStart)detail.kept=entry.keep.value;
+    read.start=entry.detailStart;read.handoff=handoff;runDetailReads.set(detail,read);
+    if(handoff)entry.readers++;
+    return detail;
+  }finally{if(!read.handoff)entry.reads.delete(read);entry.readers--;retireRunWrites(id,entry);}
+}
+// Report consumers hold their reader through the await handoff, then reconcile before assignment.
+function reconcileRunDetail(detail){
+  const read=runDetailReads.get(detail);if(!read)return detail;
+  runDetailReads.delete(detail);
+  const {id,entry,start,handoff}=read;
+  try{
+    if(entry.detailStart>start)detail=JSON.parse(entry.detail);
+    if(entry.keep&&entry.keep.at>entry.detailStart)detail.kept=entry.keep.value;
+    return detail;
+  }finally{if(handoff){entry.reads.delete(read);entry.readers--;retireRunWrites(id,entry);}}
+}
 async function refreshRuns() {
-  const [runs]=await Promise.allSettled([api('/api/runs'),refreshStorage()]);
+  const start=++runWriteClock;runListReads.add(start);
+  let runs;
+  try{[runs]=await Promise.allSettled([api('/api/runs'),refreshStorage()]);
+    if(runs.status==='fulfilled')for(const row of runs.value.runs||[]){
+      const entry=runWrites.get(row.id),keep=entry?.keep;
+      if(keep&&keep.at>start)row.kept=entry.detailStart>keep.at?entry.detailKept:keep.value;
+    }
+  }finally{runListReads.delete(start);for(const [id,entry] of runWrites)retireRunWrites(id,entry);}
   if(runs.status==='rejected')throw runs.reason;
   const data=runs.value;state.runs=data.runs || [];state.diskActive=data.disk_active_id || null;setActive(data.active_run_id);$('#run-count').textContent=state.runs.length || '';renderRailRuns();return data;
 }
@@ -860,7 +942,7 @@ let spotTipTarget=null,spotTipPosition=null;
 function showSpotTip(target,x,y) {
   const tip=$('#spot-tip'),label=target?.getAttribute('aria-label');if(!tip||!label)return;
   spotTipTarget=target;spotTipPosition={x,y};
-  const outcome=['pass','fail','timeout','cancelled','skipped','inconclusive','running','queued','reserved','stopping','idle'].find(name=>target.classList.contains(name)) || 'idle';
+  const outcome=['pass','fail','timeout','cancelled','skipped','inconclusive',RUN.RUNNING,RUN.QUEUED,'reserved',RUN.STOPPING,'idle'].find(name=>target.classList.contains(name)) || 'idle';
   const split=label.indexOf('. Request '),head=split<0?label:label.slice(0,split),rest=split<0?[]:[label.slice(split+2)];
   tip.innerHTML=`<span class="status-icon" aria-hidden="true">${statusIcons[outcome]}</span><span><strong>${escape(head.replace(/[.:]$/,''))}</strong>${rest.length?`<small>${escape(rest.join(' ').replace(/\.\s+/g,' · ').replace(/\.$/,''))}</small>`:''}</span>`;
   tip.hidden=false;
@@ -909,7 +991,7 @@ async function route() {
       const id=destination.id;updateNav('runs','Run detail');
       state.detail=null;
       $('#main').innerHTML='<div class="loading">Loading run…</div>';
-      const detail=await api(runPath(id));if(version!==state.routeVersion)return;
+      const detail=reconcileRunDetail(await fetchRunDetail(id,{handoff:true}));if(version!==state.routeVersion)return;
       state.detail=detail;state.failingRequestsOnly=false;state.mosaicPage=0;state.mosaicFollow=true;state.mosaicAutoFocus=null;state.selectedCheck=null;state.checkNavigatorOpen=false;state.tab='checks';state.comparisonFilter=null;state.comparisonCheck='all';reportView.id=null;renderDetail();enterRoute();if(destination?.section)revealReportSection(destination.section);
       if(reportView.tab==='performance'&&typeof fetch==='function')loadPerformance({force:true});
       if(destination?.requestId)await openRequest(destination.requestId);
@@ -931,20 +1013,20 @@ async function route() {
 }
 async function pollRuns(version) {
   try {
-    const previous=JSON.stringify([state.runs,state.storage,state.storageUnavailable]),active=state.active;
+    const active=state.active;
     if(state.active)await Promise.all([pollRunStatus(version,{schedule:false}),refreshStorage()]);else await refreshRuns();if(version!==state.routeVersion)return;
-    if(!active)connectionError();if(previous!==JSON.stringify([state.runs,state.storage,state.storageUnavailable])||active!==state.active)renderRuns();
+    if(!active)connectionError();renderRunsIfChanged();
   }catch(error){if(version===state.routeVersion)connectionError(error.message+' Your saved runs have not changed.');}
   if(version===state.routeVersion)schedulePoll(pollRuns,version,3000);
 }
 async function pollRunStatus(version,{schedule=true}={}) {
   const id=state.active;if(!id)return;let delay=300;
   try{
-    if(state.statusRun?.id!==id)state.statusRun={id,state:'running',seq:0};
+    if(state.statusRun?.id!==id)state.statusRun={id,state:RUN.RUNNING,seq:0};
     const delta=await runEvents(id,state.statusRun.seq);
     if(version!==state.routeVersion||state.active!==id)return;
     if(delta.reset||delta.idle)delay=1800;
-    if(delta.reset)state.statusRun=await api(runPath(id));else mergeRunEvents(state.statusRun,delta);
+    if(delta.reset)state.statusRun=reconcileRunDetail(await fetchRunDetail(id,{handoff:true}));else mergeRunEvents(state.statusRun,delta);
     if(version!==state.routeVersion||state.active!==id)return;
     const saved=state.runs.find(run=>run.id===id);if(saved)saved.state=state.statusRun.state;
     if(!activeState(state.statusRun)){setActive(null);await refreshRuns();}
@@ -962,21 +1044,21 @@ async function pollNew(version) {
 }
 let detailEpoch=0,detailSequence=0,lastDetailSequence=0;
 async function pollDetail(version) {
-  const id=state.detail.id,epoch=detailEpoch,sequence=++detailSequence;
+  const key=reportRouteKey(),id=state.detail.id,epoch=detailEpoch,sequence=++detailSequence;
   try {
-    const delta=await runEvents(id,state.detail.seq);if(version!==state.routeVersion || state.detail?.id!==id || sequence<lastDetailSequence)return;
+    const delta=await runEvents(id,state.detail.seq);if(version!==state.routeVersion || state.detail?.id!==id || sequence<lastDetailSequence||reportRouteKey()!==key)return;
     if(!activeState(state.detail)&&activeState({state:delta.state}))return;
-    const wasStopping=state.detail.state==='stopping';
-    let detail=delta.reset?await api(runPath(id)):mergeRunEvents(state.detail,delta);
-    if(version!==state.routeVersion || state.detail?.id!==id || sequence<lastDetailSequence)return;
+    const wasStopping=state.detail.state===RUN.STOPPING;
+    let detail=delta.reset?reconcileRunDetail(await fetchRunDetail(id,{handoff:true})):mergeRunEvents(state.detail,delta);
+    if(version!==state.routeVersion || state.detail?.id!==id || sequence<lastDetailSequence||reportRouteKey()!==key)return;
     const completed=!activeState(detail);
-    if(completed&&!delta.reset){detail=await api(runPath(id));if(version!==state.routeVersion||state.detail?.id!==id||sequence<lastDetailSequence)return;}
-    if(wasStopping&&activeState(detail))detail.state='stopping';
-    if(['running','queued'].includes(detail.state)&&(epoch!==detailEpoch||state.stopPending?.id===id)){
+    if(completed&&!delta.reset){detail=reconcileRunDetail(await fetchRunDetail(id,{handoff:true}));if(version!==state.routeVersion||state.detail?.id!==id||sequence<lastDetailSequence||reportRouteKey()!==key)return;}
+    detail.state=nextLiveRunState(wasStopping?RUN.STOPPING:null,detail.state);
+    if([RUN.RUNNING,RUN.QUEUED].includes(detail.state)&&(epoch!==detailEpoch||state.stopPending?.id===id)){
       schedulePoll(pollDetail,version,500);return;
     }
     if(!activeState(state.detail)&&activeState(detail))return;
-    if(state.detail.state==='stopping'&&['running','queued'].includes(detail.state))detail.state='stopping';
+    detail.state=nextLiveRunState(state.detail.state,detail.state);
     lastDetailSequence=sequence;
     if(state.liveError?.id===id&&sequence>state.liveError.sequence)state.liveError=null;
     const focused=document.activeElement,slot=focused?.dataset?.liveSlot,action=focused?.dataset?.action,autoFocused=slot!==undefined&&slot===state.mosaicAutoFocus,summaryFocus=focused?.tagName==='SUMMARY'&&Boolean(focused.closest?.('.all-requests'));
@@ -986,12 +1068,13 @@ async function pollDetail(version) {
     else if(summaryFocus){const disclosure=$('.all-requests');disclosure?.querySelector('summary')?.focus({preventScroll:true});}
     else if(action==='stop')$('[data-action="stop"]')?.focus({preventScroll:true});
     if(activeState(detail))schedulePoll(pollDetail,version,delta.reset||delta.idle?1800:300);else {if(state.active===id)setActive(null);await refreshRuns();if(version===state.routeVersion&&state.active)schedulePoll(pollRunStatus,version,3000);}
-  } catch(error) {if(error.name==='AbortError'||version!==state.routeVersion||state.detail?.id!==id||sequence<lastDetailSequence)return;if(epoch!==detailEpoch){schedulePoll(pollDetail,version,500);return;}connectionError(error.message+' Reconnecting; the suite may still be running.');schedulePoll(pollDetail,version,3000);}
+  } catch(error) {if(error.name==='AbortError'||version!==state.routeVersion||state.detail?.id!==id||sequence<lastDetailSequence||reportRouteKey()!==key)return;if(epoch!==detailEpoch){schedulePoll(pollDetail,version,500);return;}connectionError(error.message+' Reconnecting; the suite may still be running.');schedulePoll(pollDetail,version,3000);}
 }
 function suiteList() { return `<ol class="suite-list">${(state.bootstrap.checks || []).map((c,i)=>`<li><span class="index">${String(i+1).padStart(2,'0')}</span><span>${escape(c.title)}</span>${c.optional?'<small>OPT</small>':''}</li>`).join('')}</ol>`; }
 function runOutcome(run) {
-  if(run.state==='cancelled'||run.state==='completed'&&(run.abort_reason||run.report?.abort_reason||run.summary?.abort_reason))return 'stopped';
-  return activeState(run)||['error','failed','cancelled','interrupted'].includes(run.state)?run.state:run.overall || run.state;
+  // Legacy saved runs can still have cancelled or failed lifecycle states.
+  if(run.state==='cancelled'||run.state===RUN.COMPLETED&&(run.abort_reason||run.report?.abort_reason||run.summary?.abort_reason))return 'stopped';
+  return activeState(run)||[RUN.ERROR,'failed','cancelled',RUN.INTERRUPTED].includes(run.state)?run.state:run.overall || run.state;
 }
 function filteredRuns() {
   const query=state.historySearch.trim().toLowerCase();
@@ -1005,7 +1088,7 @@ function storageLine() {
   if(policy.max_total_bytes!=null)rules.push(`oldest first to ${diskSize(policy.max_total_bytes)}`);
   return `<div class="storage-line"><p>${s?`Saved runs on disk: ${diskSize(s.runs_bytes)}${s.limits?.max_total_storage?` of ${diskSize(s.limits.max_total_storage)} limit`:' · no total limit'} · Baselines ${diskSize(s.baselines_bytes)}${s.baselines_shared_bytes?` (${diskSize(s.baselines_shared_bytes)} shared with source run)`:''} · Automatic cleanup: ${rules.length?escape(rules.join(' or ')):'off'}${s.last_auto_cleanup?.deleted?.length?` · Automatically deleted: ${s.last_auto_cleanup.deleted.map(escape).join(', ')}`:''}${s.last_auto_cleanup?.error?` · Automatic cleanup failed: ${escape(s.last_auto_cleanup.error)}`:''} · Free disk ${diskSize(s.free_bytes)}`:state.storageUnavailable?'Storage information unavailable':'Saved runs on disk: loading…'}</p><button type="button" class="button small" data-action="storage-dialog">Clean up…</button></div>`;
 }
-function keepButton() {return `<button type="button" class="button small" data-action="keep-run" aria-pressed="${Boolean(state.detail.kept)}">${state.detail.kept?'Kept — protected from cleanup':'Keep run'}</button>`;}
+function keepButton() {return `<button type="button" class="button small" data-action="keep-run"${keepPending(state.detail.id)?' disabled aria-busy="true"':''} aria-pressed="${Boolean(state.detail.kept)}">${state.detail.kept?'Kept — protected from cleanup':'Keep run'}</button>`;}
 function openStorageDialog() {
   state.cleanup={revision:0,preview:null,busy:false};
   const dialog=$('#storage-dialog');
@@ -1039,21 +1122,24 @@ async function previewCleanup(event) {
   finally{if(state.cleanup===current)$('#cleanup-preview-button').disabled=false;}
 }
 async function confirmCleanup() {
-  const current=state.cleanup,preview=current?.preview,routeVersion=state.routeVersion;if(!preview||current.busy)return;
+  const current=state.cleanup,preview=current?.preview,routeVersion=state.routeVersion,key=reportRouteKey();if(!preview||current.busy)return;
   current.busy=true;$('#cleanup-confirm').disabled=true;$('#cleanup-preview-button').disabled=true;$('#cleanup-error').hidden=true;
   try {
     const result=await api('/api/storage/cleanup',{method:'POST',body:JSON.stringify({...preview.criteria,ids:preview.ids})});
     if(state.cleanup!==current)return;
-    current.preview=null;state.cleanupResult=result;$('#storage-dialog').close();renderRuns();
-    try{await refreshRuns();if(state.cleanup===current&&state.routeVersion===routeVersion)renderRuns();}
-    catch(error){toast('Cleanup finished, but run history could not be refreshed: '+error.message);}
+    current.preview=null;state.cleanupResult=result;$('#storage-dialog').close();if(state.routeVersion===routeVersion&&reportRouteKey()===key)renderRuns();
+    try{await refreshRuns();if(state.cleanup===current&&state.routeVersion===routeVersion&&reportRouteKey()===key)renderRuns();}
+    catch(error){if(state.routeVersion===routeVersion&&reportRouteKey()===key)toast('Cleanup finished, but run history could not be refreshed: '+error.message);}
   }catch(error){if(state.cleanup===current){current.preview=null;$('#cleanup-error').textContent=error.message+' Preview again before deleting.';$('#cleanup-error').hidden=false;}}
   finally{current.busy=false;if(state.cleanup===current)$('#cleanup-preview-button').disabled=false;}
 }
 async function toggleKept() {
-  const detail=state.detail,button=$('[data-action="keep-run"]');button.disabled=true;
-  try{const result=await api(`${runPath(detail.id)}/keep`,{method:'POST',body:JSON.stringify({keep:!detail.kept})});if(state.detail!==detail)return;detail.kept=result.kept;renderDetail();}
-  catch(error){toast(error.message);button.disabled=false;}
+  const detail=state.detail,id=detail.id;if(keepPending(id))return;
+  const t=reportToken(),write=beginRunWrite(id,'keep');
+  $('[data-action="keep-run"]').disabled=true;
+  try{const result=await api(`${runPath(id)}/keep`,{method:'POST',body:JSON.stringify({keep:!detail.kept})});confirmRunWrite(id,write,result.kept);}
+  catch(error){if(sameReportVisit(t)&&write.entry.latestKeep===write.sequence)toast(error.message);}
+  finally{finishRunWrite(id,write);if(reportStillShown(t))renderDetail();}
 }
 function cleanupResultNotice() {
   const result=state.cleanupResult;if(!result)return '';
@@ -1061,6 +1147,9 @@ function cleanupResultNotice() {
   const message=`Deleted ${count} ${count===1?'run':'runs'}, freed ${diskSize(result.bytes_freed)} on disk.${skipped.length?` Skipped ${skipped.length}: ${skipped.map(run=>`${run.id} — ${run.reason}`).join('; ')}.`:''}`;
   return `<div class="notice ${skipped.length?'warning':'info'}" role="status">${escape(message)}</div>`;
 }
+let runsRenderedSignature=null;
+function runsSignature(){return JSON.stringify([state.runs,state.storage,state.storageUnavailable,state.active,state.filter,state.historySearch,state.cleanupResult]);}
+function renderRunsIfChanged(){if(runsRenderedSignature!==runsSignature())renderRuns();}
 function renderRuns() {
   cancelStopConfirmationTimer({reset:true});
   const focused=document.activeElement,focusId=['run-search','run-filter'].includes(focused?.id)?focused.id:null;
@@ -1068,10 +1157,11 @@ function renderRuns() {
 
   if(!state.runs.length&&!state.active){
     $('#main').innerHTML=`<section class="first-run"><h1>Run history</h1><p>No runs yet.</p>${storageLine()}${cleanupResultNotice()}<a class="button primary" href="#new">${icon('plus')} New run</a></section>`;
+    runsRenderedSignature=runsSignature();
     return;
   }
   const runs=filteredRuns();
-  $('#main').innerHTML=`<div class="page-heading"><h1>Runs</h1><a class="button primary" href="#new">${icon('plus')} New run</a></div>${storageLine()}${cleanupResultNotice()}${renderOutcomeStrip()}<div class="history-chips" aria-label="Filter runs">${['all','pass','fail','inconclusive','blocked','skipped','active','stopped','interrupted','error'].filter(status=>status==='all'||status===state.filter||state.runs.some(r=>(activeState(r)?'active':runOutcome(r))===status)).map(status=>`<button class="filter-chip" data-run-filter="${status}" aria-pressed="${state.filter===status}">${status==='all'?'All runs':status==='active'?'Running':statusLabels[status]}</button>`).join('')}</div>
+  $('#main').innerHTML=`<div class="page-heading"><h1>Runs</h1><a class="button primary" href="#new">${icon('plus')} New run</a></div>${storageLine()}${cleanupResultNotice()}${renderOutcomeStrip()}<div class="history-chips" aria-label="Filter runs">${['all','pass','fail','inconclusive','blocked','skipped','active','stopped',RUN.INTERRUPTED,RUN.ERROR].filter(status=>status==='all'||status===state.filter||state.runs.some(r=>(activeState(r)?'active':runOutcome(r))===status)).map(status=>`<button class="filter-chip" data-run-filter="${status}" aria-pressed="${state.filter===status}">${status==='all'?'All runs':status==='active'?'Running':statusLabels[status]}</button>`).join('')}</div>
   <div class="history-layout history-focused"><section class="panel"><div class="section-heading"><div class="history-tools"><label class="history-search"><span class="sr-only">Search runs</span><input id="run-search" type="search" placeholder="Search runs" value="${escape(state.historySearch)}" autocomplete="off"></label><div class="filter-group"><label class="sr-only" for="run-filter">Filter run status</label><select id="run-filter" aria-label="Filter run status"><option value="all">All outcomes</option><option value="fail">Failed</option><option value="pass">Passed</option><option value="inconclusive">Inconclusive</option><option value="blocked">Blocked</option><option value="skipped">Not run</option><option value="active">Active</option><option value="stopped">Stopped</option><option value="interrupted">Interrupted</option><option value="error">Runner error</option></select></div></div></div>
   ${runs.length?`<div class="history-table"><table aria-label="Saved endpoint runs"><thead><tr><th>Model</th><th>Outcome</th><th>Started</th><th><span class="sr-only">Open run</span></th></tr></thead><tbody>${runs.map(r=>{
     const targets=r.targets || [],model=targets.map(t=>t.model).filter(Boolean).join(', ') || 'Unknown model';
@@ -1082,6 +1172,7 @@ function renderRuns() {
   `<div class="empty-state"><h2>No matching runs</h2><button class="button" data-action="clear-filter">Clear filters</button></div>`}</section></div>`;
   $('#run-filter').value=state.filter;
   if(focusId){const control=$('#'+focusId);control?.focus({preventScroll:true});if(selection&&selection[0]!=null)control?.setSelectionRange?.(...selection);}
+  runsRenderedSignature=runsSignature();
 }
 const numericFields=['context_limit','concurrency','max_requests','max_memory_mb','max_duration_seconds','request_timeout_seconds','max_output_tokens'].map(name=>[name]);
 const limitFields=[['first_output_ms','First output maximum','ms'],['latency_ms','Response time maximum','ms'],['stream_gap_ms','Stream pause maximum','ms'],['min_output_tokens_per_second','Minimum generation rate','tokens / second after first output; needs streamed token counts (logprobs or cumulative usage)'],['fairness_max_ratio','Mixed-load slowdown','ratio, greater than 1']];
@@ -1916,13 +2007,13 @@ function renderScaleDownControl(detail) {
   const control=detail.scale_down_control;if(!control)return '';
   const local=state.scaleDownSubmission?.id===detail.id?state.scaleDownSubmission:null,ack=control.acknowledgment?.accepted===true?control.acknowledgment:local?.ack||control.acknowledgment;
   const standalone=detail.stoppable===false&&activeState(detail);
-  const active=detail.stoppable!==false&&detail.state==='running'&&control.phase==='armed'&&!ack?.accepted;
+  const active=detail.stoppable!==false&&detail.state===RUN.RUNNING&&control.phase==='armed'&&!ack?.accepted;
   const message=control.phase==='finished'?'Finished. See the results below.':ack?.accepted?'Marker accepted. Remove the replica if you have not already; Giraffe is waiting for backend lifecycle evidence.':control.phase==='finalizing'?'Collecting final evidence.':control.phase==='armed'?'Armed: mark the removal, then remove the replica externally.':'Waiting for an active answer stream before arming.';
   return `<section class="panel" id="scale-down-control" data-live-key="scale-down-control"><h2>Scale-down continuity · ${escape(human(control.phase))}</h2><div class="field-label"><p>${escape(message)}</p>${infoHelp('scale_down_control_help','About scale-down marking','Only real answer streams arm this scenario. Remove the replica externally. A marker is not backend confirmation; final results require lifecycle evidence and sufficient overlap.')}</div>${standalone?'<p class="hint">This run is owned by a standalone CLI process. Mark the removal with <code>giraffe mark-scale-down &lt;run-directory&gt; --event-id &lt;unique-event-id&gt;</code>, using the active run directory and a unique event ID.</p>':''}${active?`<div class="fields">${field('scale_down_replica_marker','Intended replica incarnation (optional)',local?.marker?.replica_id||'',{})}${field('scale_down_marker_source','Operator source',local?.marker?.source||'browser',{})}</div><button type="button" class="button" data-action="mark-scale-down" ${local?.pending?'disabled':''}>${local?.pending?'Submitting…':'Mark removal'}</button>`:''}<p role="status" aria-live="polite">${ack?`${ack.accepted===true?'Accepted':'Rejected'}: ${escape(ack.reason||(ack.accepted===true?'Removal marker recorded.':'Marker was not accepted.'))}`:local?.error?escape(local.error):'No marker accepted.'}</p></section>`;
 }
 async function markScaleDown() {
   const detail=state.detail,control=detail?.scale_down_control,version=state.routeVersion;
-  if(detail?.stoppable===false||detail?.state!=='running'||control?.phase!=='armed'||(state.scaleDownSubmission?.id===detail.id&&state.scaleDownSubmission.pending))return;
+  if(detail?.stoppable===false||detail?.state!==RUN.RUNNING||control?.phase!=='armed'||(state.scaleDownSubmission?.id===detail.id&&state.scaleDownSubmission.pending))return;
   const previous=state.scaleDownSubmission?.id===detail.id?state.scaleDownSubmission:null;
   const marker=previous?.retrySameMarker&&previous.marker?.nonce===control.nonce?previous.marker:{event_id:globalThis.crypto?.randomUUID?.()||`browser-${Date.now()}-${Math.random().toString(16).slice(2)}`,nonce:control.nonce,target:control.target,replica_id:$('#field-scale_down_replica_marker')?.value?.trim()||null,source:$('#field-scale_down_marker_source')?.value?.trim()||'browser',operator_at:new Date().toISOString()};
   state.scaleDownSubmission={id:detail.id,pending:true,marker};renderLive();
@@ -1934,7 +2025,7 @@ async function markScaleDown() {
     const message=retrySameMarker?`Acknowledgment unavailable: ${error.message}. Retry to check the same marker.`:`Marker rejected: ${error.message}${error.status===422?'. Correct the fields and submit again.':''}`;
     if(state.scaleDownSubmission?.id===detail.id)state.scaleDownSubmission={id:detail.id,marker,retrySameMarker,error:message};
   }
-  if(state.reportRouteActive&&version===state.routeVersion&&reportRoute()?.id===detail.id&&state.detail?.id===detail.id&&state.detail.state==='running')renderLive();
+  if(state.reportRouteActive&&version===state.routeVersion&&reportRoute()?.id===detail.id&&state.detail?.id===detail.id&&state.detail.state===RUN.RUNNING)renderLive();
 }
 
 const loadSizes=['short','medium','long'];
@@ -2264,7 +2355,7 @@ function editUserRecall(action) {
   }
   else if(action==='user-remove-recall-turn'&&turns.length>bounds.minItems)turns.pop();
   else return;
-  configChanged();state.jsonDraft=null;state.jsonBase=null;renderNew();
+  configChanged();resetJsonDraft();renderNew();
   $(`#field-multi_user_conversation_turn_${turns.length-1}`)?.focus({preventScroll:true});
 }
 
@@ -2287,7 +2378,7 @@ function editUserConversation(action,index) {
     if(action==='user-remove-turn'&&task.turns.length>2)task.turns.pop();
     if(action==='user-remove-task')tasks.splice(position,1);
   }
-  configChanged();state.jsonDraft=null;state.jsonBase=null;renderNew();
+  configChanged();resetJsonDraft();renderNew();
 }
 
 function renderMultiUserResults(summary) {
@@ -2368,7 +2459,7 @@ function editSessionWorkload(action,index) {
     if(action==='add-session-turn'&&item.turns.length<state.bootstrap.limits['sessions.workloads[].turns'].maxItems)item.turns.push('Build on your previous answer and explain the next step in detail.');
     if(action==='remove-session-turn'&&item.turns.length>state.bootstrap.limits['sessions.workloads[].turns'].minItems)item.turns.pop();
   }
-  configChanged();state.jsonDraft=null;state.jsonBase=null;renderNew();
+  configChanged();resetJsonDraft();renderNew();
   state.openTest='sessions';syncTestControls();
   const advanced=$('#setup-advanced');if(advanced)advanced.open=true;
   const taskIndex=settings.workloads.findIndex(item=>item.name===taskName);
@@ -2623,7 +2714,7 @@ function saveEvaluator(event) {
     const judging=readEvaluatorDraft(false);
     const names=judging.judges.map(judge=>judge.name).filter(Boolean);
     if(new Set(names).size!==names.length)throw new Error('Evaluator names must be unique.');
-    state.config.judging=clone(judging);state.jsonDraft=null;state.jsonBase=null;
+    state.config.judging=clone(judging);resetJsonDraft();
     configChanged();refreshQuestionSetupSummary();finishEvaluator();
   }catch(error){evaluatorError(error.message);}
 }
@@ -2795,7 +2886,7 @@ async function applyDataset(pack,{guard=()=>true,clearSelection=false,validated=
     if(version!==state.routeVersion||revision!==state.configRevision)throw new Error('Configuration changed. Review the questions and try again.');
     assertAppliedConfig();state.config.request_source='request_pack';state.config.request_pack=normalized;
     state.datasetSelection=clearSelection?[]:state.datasetSelection.filter(id=>datasetCases().some(item=>item.fixture_id===id));
-    state.jsonDraft=null;state.jsonBase=null;configChanged();refreshQuestionSetupSummary();return true;
+    resetJsonDraft();configChanged();refreshQuestionSetupSummary();return true;
   }catch(error){if(questionDatasetOperation!==operation||!guard())return false;throw error;}
   finally{if(questionDatasetOperation===operation){questionDatasetOperation=null;state.configBusy=false;}}
 }
@@ -2956,7 +3047,8 @@ function currentRequestPlan() {
   return !hasJsonChanges()&&saved?.status==='current'&&saved.revision===state.configRevision&&saved.route===state.routeVersion?saved.plan:null;
 }
 function canStartRun() {
-  return Boolean(currentRequestPlan())&&!currentSettingErrors().length&&!currentResourceErrors().length&&!state.submitting&&!state.configBusy&&!state.active&&state.modelDiscovery?.status!=='pending'&&tokenizerSetupReady();
+  const pending=state.connectionTestsInFlight>0||(state.modelDiscovery?.status===DISCOVERY.PENDING&&currentDiscovery()===state.modelDiscovery);
+  return Boolean(currentRequestPlan())&&!currentSettingErrors().length&&!currentResourceErrors().length&&!state.submitting&&!state.configBusy&&!state.active&&!pending&&tokenizerSetupReady();
 }
 function renderReviewPassCriteria(config) {
   if(!config?.limits||!state.bootstrap?.checks)return '';
@@ -3106,7 +3198,7 @@ function changeRequestSource(source,{remove=false}={}) {
   try{
     assertAppliedConfig();
     captureFormDraft();state.config.request_source=source;if(remove)state.config.request_pack=null;
-    configChanged();state.jsonDraft=null;state.jsonBase=null;refreshQuestionSetupSummary();updateBounds();
+    configChanged();resetJsonDraft();refreshQuestionSetupSummary();updateBounds();
     $(`[name="request_source"][value="${source}"]`)?.focus({preventScroll:true});
   }catch(error){configError(error);}
 }
@@ -3312,19 +3404,23 @@ function modelDiscoveryKey() {
     deployment:{discovery:state.config?.targets?.[0]?.deployment?.discovery || 'none'},
     ca_bundle:state.config?.ca_bundle || null,proxy:state.config?.proxy || null,request_options:state.config?.request_options || {}});
 }
+function currentDiscovery(){
+  const d=state.modelDiscovery;
+  return d?.key===modelDiscoveryKey()&&(d.status!==DISCOVERY.PENDING||d.route===state.routeVersion)?d:null;
+}
 function invalidateModelDiscovery() {
   state.modelDiscoverySequence++;state.modelDiscovery=null;renderModelDiscovery();scheduleTokenizerSelection();
 }
 function renderModelDiscovery() {
   const status=$('#model-discovery-status'),button=$('[data-action="test-connection"]');
   if(!status||!button)return;
-  if(state.modelDiscovery?.status==='pending'&&state.modelDiscovery.route!==state.routeVersion)state.modelDiscovery=null;
-  const discovery=state.modelDiscovery?.key===modelDiscoveryKey()?state.modelDiscovery:null;
+  if(state.modelDiscovery?.status===DISCOVERY.PENDING&&state.modelDiscovery.route!==state.routeVersion)state.modelDiscovery=null;
+  const discovery=currentDiscovery();
   const model=$('#new-run-form')?.elements.model.value.trim();
-  button.disabled=discovery?.status==='pending'||hasJsonChanges();button.textContent=discovery?.status==='pending'?'Connecting…':discovery?.status==='connected'?'Reconnect':'Connect';button.classList.toggle('handshaking',discovery?.status==='pending');
+  button.disabled=discovery?.status===DISCOVERY.PENDING||hasJsonChanges();button.textContent=discovery?.status===DISCOVERY.PENDING?'Connecting…':discovery?.status===DISCOVERY.CONNECTED?'Reconnect':'Connect';button.classList.toggle('handshaking',discovery?.status===DISCOVERY.PENDING);
   button.classList.toggle('primary',!model);button.classList.toggle('small',Boolean(model));button.title='Sends one short request (32-token limit).';
   status.textContent=discovery?.message || '';
-  status.classList.toggle('error',discovery?.status==='error');status.classList.toggle('connected',discovery?.status==='connected');status.classList.toggle('unverified',discovery?.status==='unverified');
+  status.classList.toggle('error',discovery?.status===DISCOVERY.ERROR);status.classList.toggle('connected',discovery?.status===DISCOVERY.CONNECTED);status.classList.toggle('unverified',discovery?.status===DISCOVERY.UNVERIFIED);
   const choice=$('#connection-model-choice'),manual=$('#manual-model-field'),options=$('#model-options');
   const models=discovery?.models || [];
   if(choice){
@@ -3333,10 +3429,10 @@ function renderModelDiscovery() {
     choice.hidden=models.length<2;choice.previousElementSibling.hidden=models.length<2;
     manual.hidden=models.length>1&&value!=='__manual__'&&(!value||models.includes(value));
   }
-  if(discovery?.status==='needs_model'&&options)options.open=true;
-  const connectionOptions=$('#connection-options');if(connectionOptions&&['needs_model','error'].includes(discovery?.status))connectionOptions.open=true;
-  const label=$('#model-options-label');if(label)label.textContent=discovery?.status==='needs_model'?`Giraffe found ${models.length} models. Choose one.`:['connected','unverified'].includes(discovery?.status)?'Found on your server.':discovery?.status==='error'?'Type the exact model name to continue without a check.':discovery?.status==='pending'?'Looking for models…':model?'Typed by you. Connecting first is optional.':'Found when you connect, or type the exact name.';
-  const auth=$('#connection-auth');if(auth&&discovery?.status==='error'&&/key|401|403|unauthor/i.test(discovery.message || ''))auth.open=true;
+  if(discovery?.status===DISCOVERY.NEEDS_MODEL&&options)options.open=true;
+  const connectionOptions=$('#connection-options');if(connectionOptions&&[DISCOVERY.NEEDS_MODEL,DISCOVERY.ERROR].includes(discovery?.status))connectionOptions.open=true;
+  const label=$('#model-options-label');if(label)label.textContent=discovery?.status===DISCOVERY.NEEDS_MODEL?`Giraffe found ${models.length} models. Choose one.`:DISCOVERY_USABLE.includes(discovery?.status)?'Found on your server.':discovery?.status===DISCOVERY.ERROR?'Type the exact model name to continue without a check.':discovery?.status===DISCOVERY.PENDING?'Looking for models…':model?'Typed by you. Connecting first is optional.':'Found when you connect, or type the exact name.';
+  const auth=$('#connection-auth');if(auth&&discovery?.status===DISCOVERY.ERROR&&/key|401|403|unauthor/i.test(discovery.message || ''))auth.open=true;
   syncSetupStep();
 }
 async function testConnection() {
@@ -3345,24 +3441,27 @@ async function testConnection() {
   url?.setCustomValidity(url.value.trim()?'':'Enter an endpoint URL.');
   if(!url?.checkValidity()){url?.reportValidity();return;}
   const key=modelDiscoveryKey(),sequence=++state.modelDiscoverySequence,route=state.routeVersion;
-  state.modelDiscovery={key,route,status:'pending',models:[],message:'Checking your endpoint. A model may take a moment to load…'};renderModelDiscovery();
+  state.connectionTestsInFlight++;
+  state.modelDiscovery={key,route,status:DISCOVERY.PENDING,models:[],message:'Checking your endpoint. A model may take a moment to load…'};renderModelDiscovery();
   try{
     const api_key=apiKeyFor(url.value);
     const result=await api('/api/targets/test-connection',{method:'POST',body:JSON.stringify({...JSON.parse(key),...(state.autoModel&&state.autoModel===JSON.parse(key).model?{discovered:true}:{}),...(api_key?{api_key}:{})})});
     if(sequence!==state.modelDiscoverySequence||route!==state.routeVersion||key!==modelDiscoveryKey())return;
-    if(['connected','unverified'].includes(result.status)){
+    if(DISCOVERY_USABLE.includes(result.status)){
       if(!JSON.parse(key).model)state.autoModel=result.model;
       form.elements.model.value=result.model;form.elements.model.setCustomValidity('');
       state.config.targets[0].model=result.model;
       configChanged();updateBounds();
     }
-    state.modelDiscovery={key:modelDiscoveryKey(),route,status:result.status,models:result.models || [],message:result.status==='connected'?`Connected · ${result.model}${result.latency_ms==null?' · latency unavailable':` · ${ms(result.latency_ms)}`}`:result.message};
+    state.modelDiscovery={key:modelDiscoveryKey(),route,status:result.status,models:result.models || [],message:result.status===DISCOVERY.CONNECTED?`Connected · ${result.model}${result.latency_ms==null?' · latency unavailable':` · ${ms(result.latency_ms)}`}`:result.message};
     renderModelDiscovery();scheduleTokenizerSelection({immediate:true});
-    if(result.status==='connected')$('#model-options').open=false;
-    if(result.status==='needs_model')(result.models?.length>1?$('#connection-model-choice'):form.elements.model)?.focus();
+    if(result.status===DISCOVERY.CONNECTED)$('#model-options').open=false;
+    if(result.status===DISCOVERY.NEEDS_MODEL)(result.models?.length>1?$('#connection-model-choice'):form.elements.model)?.focus();
   }catch(error){
     if(sequence!==state.modelDiscoverySequence||route!==state.routeVersion||key!==modelDiscoveryKey())return;
-    state.modelDiscovery={key,route,status:'error',models:[],message:error.message};renderModelDiscovery();
+    state.modelDiscovery={key,route,status:DISCOVERY.ERROR,models:[],message:error.message};renderModelDiscovery();
+  }finally{
+    state.connectionTestsInFlight--;syncSetupStep();
   }
 }
 function renderPlanBounds(config,className='workload-bounds') {
@@ -3711,14 +3810,14 @@ function plannedRequests(detail=state.detail) {
   return detail?.progress?.planned_total ?? (conditions.length&&conditions.every(item=>Number.isFinite(item.planned))?conditions.reduce((sum,item)=>sum+item.planned,0):null);
 }
 async function loadDetailPlan() {
-  const detail=state.detail;
+  const detail=state.detail,t=reportToken();
   if(!activeState(detail)||plannedRequests(detail)!=null||typeof fetch!=='function'||!detail.config)return;
   if(detailPlan.id!==detail.id)detailPlan={id:detail.id,plan:null,pending:false,done:false};
   const current=detailPlan,version=state.routeVersion;if(current.pending||current.done)return;
   current.pending=true;
   try{const value=await api('/api/config/plan',{method:'POST',body:JSON.stringify(detail.config)});if(state.detail?.id===detail.id&&version===state.routeVersion)current.plan=value.request_plan || null;}
   catch{ /* The request count stays absent when planning is unavailable. */ }
-  finally{current.pending=false;current.done=true;if(current.plan&&state.detail?.id===detail.id&&version===state.routeVersion&&activeState(state.detail))renderDetail();}
+  finally{current.pending=false;current.done=true;if(current.plan&&state.detail?.id===detail.id&&version===state.routeVersion&&activeState(state.detail)&&reportStillShown(t))renderDetail();}
 }
 function countedRequests(report,detail=state.detail) {
   const counts=report?.observations?.request_counts ?? detail?.summary?.request_counts;
@@ -3765,6 +3864,10 @@ function reportRoute(hash=typeof location==='undefined'?'':location.hash) {
   if(section&&!(tab==='results'&&section==='baseline')&&!sections.some(([id])=>id===section))return null;
   try{return {id:decodeURIComponent(match[1]),tab,section};}catch{return null;}
 }
+function reportRouteKey(hash=typeof location==='undefined'?'':location.hash){const r=reportRoute(hash);return r?`run:${r.id}`:`hash:${hash}`;}
+function reportToken(){return {id:state.detail?.id??null,version:state.routeVersion,key:reportRouteKey()};}
+function reportStillShown(t){return Boolean(t.id)&&state.reportRouteActive&&state.detail?.id===t.id&&reportRouteKey()===t.key;}
+function sameReportVisit(t){return t.version===state.routeVersion&&reportStillShown(t);}
 function syncReportView() {
   const d=state.detail;if(!d)return;
   if(reportView.id!==d.id){
@@ -3789,6 +3892,7 @@ function announceRunComplete(detail) {
 }
 function replaceReportAnchor() {
   if(typeof location==='undefined')return;
+  if(reportRoute()?.id!==reportView.id)return;
   const hash=`${linkRun(reportView.id)}/${reportView.tab}`;
   // Replacing an automatic default must not add a browser-history entry or count as a user choice.
   if(typeof history!=='undefined'&&history.replaceState)history.replaceState(null,'',hash);
@@ -4148,8 +4252,9 @@ async function loadPerformance({force=false}={}) {
   if(!state.detail)return;
   if(reportView.pending){if(force)reportView.again=true;return;}
   const now=Date.now();if(!force&&(reportView.performance||reportView.lastFetch))return;
-  const id=state.detail.id,version=state.routeVersion,sequence=++reportView.sequence,target=reportView.target,window=reportView.window;
-  reportView.pending=true;reportView.lastFetch=now;
+  const t=reportToken(),id=state.detail.id,version=state.routeVersion,sequence=++reportView.sequence,target=reportView.target,window=reportView.window;
+  reportView.pending=true;reportView.error='';reportView.lastFetch=now;
+  if(state.reportRouteActive)renderDetail();
   const params=Object.entries({target,window}).filter(([,value])=>value!=null).map(([key,value])=>`${key}=${encodeURIComponent(value)}`).join('&');
   try{
     const value=await api(`${runPath(id)}/performance${params?'?'+params:''}`);
@@ -4157,7 +4262,7 @@ async function loadPerformance({force=false}={}) {
     if(target!==reportView.target||window!==reportView.window){reportView.again=true;return;}
     reportView.performance=value;reportView.error='';
   }catch(error){if(state.detail?.id===id&&version===state.routeVersion&&reportView.sequence===sequence)reportView.error=error.message;}
-  finally{if(state.detail?.id===id&&version===state.routeVersion&&reportView.sequence===sequence){reportView.pending=false;if(reportView.again){reportView.again=false;loadPerformance({force:true});}else if(state.reportRouteActive){renderDetail();finishPendingReportReveal();}}}
+  finally{if(state.detail?.id===id&&version===state.routeVersion&&reportView.sequence===sequence){reportView.pending=false;if(reportView.again){reportView.again=false;loadPerformance({force:true});}else if(reportStillShown(t)){renderDetail();finishPendingReportReveal();}}}
 }
 
 function resultActions(report,{completePass=false,savedBaseline=null}={}) {
@@ -4218,8 +4323,8 @@ function renderDetail() {
   state.reportRouteActive=true;
   const d=state.detail;
   syncReportView();
-  if(state.liveError&&(state.liveError.id!==d.id||d.state==='stopping'||!activeState(d)))state.liveError=null;
-  if(state.stopPending&&(state.stopPending.id!==d.id||d.state==='stopping'||!activeState(d)))state.stopPending=null;
+  if(state.liveError&&(state.liveError.id!==d.id||d.state===RUN.STOPPING||!activeState(d)))state.liveError=null;
+  if(state.stopPending&&(state.stopPending.id!==d.id||d.state===RUN.STOPPING||!activeState(d)))state.stopPending=null;
   if(!activeState(d)){
     cancelLandings();hideSpotTip();renderRailRuns();
     if(state.liveRendered===d.id){const dialog=$('#request-dialog');if(dialog?.open){dialog.close();dialog.innerHTML='';}state.liveRendered=null;}
@@ -4236,21 +4341,21 @@ function renderDetail() {
   const required=checks.filter(c=>c.required);
   const memoryInterrupted=report.observations?.resources?.memory_interrupted_checks || [];
   const requiredMemoryInterrupted=required.some(c=>memoryInterrupted.some(item=>item.target===c.target&&item.id===c.id));
-  const absolute=d.state==='error'?'error':checks.some(c=>c.status==='fail')?'fail':requiredMemoryInterrupted?'inconclusive':required.some(c=>c.status==='blocked')?'blocked':report.abort_reason||!required.length||required.some(c=>c.status==='inconclusive')||required.some(c=>c.status==='skipped'&&!unselectedCheck(c,report))?'inconclusive':required.every(c=>c.status==='skipped')?'skipped':'pass';
-  const completePass=d.state==='completed'&&!report.abort_reason&&report.overall==='pass'&&checks.some(c=>c.status==='pass')&&checks.every(c=>c.status==='pass'||c.required===false&&c.status==='inconclusive'||unselectedCheck(c,report));
+  const absolute=d.state===RUN.ERROR?'error':checks.some(c=>c.status==='fail')?'fail':requiredMemoryInterrupted?'inconclusive':required.some(c=>c.status==='blocked')?'blocked':report.abort_reason||!required.length||required.some(c=>c.status==='inconclusive')||required.some(c=>c.status==='skipped'&&!unselectedCheck(c,report))?'inconclusive':required.every(c=>c.status==='skipped')?'skipped':'pass';
+  const completePass=d.state===RUN.COMPLETED&&!report.abort_reason&&report.overall==='pass'&&checks.some(c=>c.status==='pass')&&checks.every(c=>c.status==='pass'||c.required===false&&c.status==='inconclusive'||unselectedCheck(c,report));
   const savedBaseline=(state.baselines || []).find(item=>item.run_id===d.id);
   const entering=state.enteredRun!==d.id;state.enteredRun=d.id;
-  const compareButton=d.state==='completed'?`<button class="button" data-action="compare-saved">${report.baseline?'Change baseline':'Compare with baseline'}</button>`:'';
+  const compareButton=d.state===RUN.COMPLETED?`<button class="button" data-action="compare-saved">${report.baseline?'Change baseline':'Compare with baseline'}</button>`:'';
   patchHTML($('#main'),`<div class="page-heading result-heading ${absolute}${entering?' is-entering':''}"><div><div class="eyebrow">Run <span class="mono">${escape(d.id)}</span></div><h1>${escape(absolute==='error'?'Run could not finish':mainFinding(report))}</h1>${renderGuidance(report,d)}<div class="run-meta"><span><strong>${escape((config.targets || []).map(t=>t.model).join(', '))}</strong></span><span>${date(report.started_at)}</span><span>${duration(report)}</span></div>${renderRequestCounts(report)}<p class="hint">${escape((config.targets || []).map(t=>t.url).filter(Boolean).join(' · '))}</p></div><div class="actions">${savedBaseline?`<p class="baseline-saved"><span aria-hidden="true">✓</span> Saved as baseline <strong>${escape(savedBaseline.name)}</strong></p>`:''}${resultActions(report,{completePass,savedBaseline})}<button class="button" data-action="rerun">${icon('repeat')} Run again</button>${compareButton}</div></div>
   ${renderBaselineSummary(report,absolute)}
-  ${d.error?notice(d.error,d.state==='error'?'error':'warning'):''}${storageOmission(report)}${d.auto_cleanup?.deleted?.length?notice(`Automatic cleanup deleted runs: ${d.auto_cleanup.deleted.map(escape).join(', ')}`):''}${renderReportToolbar()}${renderPerformance()}
+  ${d.error?notice(d.error,d.state===RUN.ERROR?'error':'warning'):''}${storageOmission(report)}${d.auto_cleanup?.deleted?.length?notice(`Automatic cleanup deleted runs: ${d.auto_cleanup.deleted.map(escape).join(', ')}`):''}${renderReportToolbar()}${renderPerformance()}
   <section id="report-results" role="tabpanel" aria-labelledby="tab-results" data-live-key="report-results" ${reportView.tab==='results'?'':'hidden'}>${renderResultsJump()}
   <section id="results-checks" class="report-result-section"><section id="result-content">${renderChecks(report)}</section></section>
   <details id="report-baseline-reference" class="report-reference report-result-section comparison-container" ${report.baseline||state.tab==='baseline'?'open':''}><summary><h2>Baseline comparison</h2></summary><div id="baseline-content" data-comparison-scope="results">${renderComparison(report)}</div></details>
   <section id="results-configuration" class="report-result-section"><details id="report-config-reference" class="report-reference" ${state.tab==='config'?'open':''}><summary><h2>Run configuration</h2></summary>${renderConfig(report)}</details></section>
   <details class="report-reference condition-reference"><summary>Test conditions</summary>${renderTests(report.requests,{report})}</details>
   <section id="results-requests" class="report-result-section">${renderAllRequests(orderedRequests(report))}</section><section id="results-resources" class="report-result-section">${renderDiagnostics(report,d)}</section></section>
-  <div class="actions" style="margin-top:24px">${keepButton()}<a class="button small" href="${runPath(d.id)}/report.html" download>Download HTML report</a><a class="button small" href="${runPath(d.id)}/report.json" download>Download JSON</a>${savedBaseline?`<button class="button small" data-action="compare-run">Compare a new run with this baseline</button><button class="button small" data-action="baseline-dialog">Save again under another name</button>`:!completePass&&d.state==='completed'?'<button class="button small" data-action="baseline-dialog">Save as reference baseline</button>':''}</div>`);
+  <div class="actions" style="margin-top:24px">${keepButton()}<a class="button small" href="${runPath(d.id)}/report.html" download>Download HTML report</a><a class="button small" href="${runPath(d.id)}/report.json" download>Download JSON</a>${savedBaseline?`<button class="button small" data-action="compare-run">Compare a new run with this baseline</button><button class="button small" data-action="baseline-dialog">Save again under another name</button>`:!completePass&&d.state===RUN.COMPLETED?'<button class="button small" data-action="baseline-dialog">Save as reference baseline</button>':''}</div>`);
   syncAllRequestsFilter();syncPerformanceSelection();syncComparisonFilters();refreshConditionDialog();loadFindingEvidence();
 }
 function renderDiagnostics(report,detail) {
@@ -4328,7 +4433,7 @@ function inlineAnswerRequests(check,report) {
   return findingRequests(check,report).filter(r=>r.score===false||r.evaluation||r.evaluation_error||['correctness','json','context','tools'].includes(check.id)).slice(0,3);
 }
 async function loadFindingEvidence() {
-  const detail=state.detail,report=detail?.report;
+  const t=reportToken(),detail=state.detail,report=detail?.report;
   if(!report?.requests_compact||reportView.tab!=='results'||typeof fetch!=='function')return;
   if(findingEvidence.id!==detail.id)findingEvidence={id:detail.id,records:new Map(),pending:new Set(),errors:new Map()};
   const evidence=findingEvidence,version=state.routeVersion,records=[...new Map(report.checks.flatMap(check=>inlineAnswerRequests(check,report)).map(r=>[r.id,r])).values()];
@@ -4340,7 +4445,7 @@ async function loadFindingEvidence() {
     catch(error){if(findingEvidence===evidence)evidence.errors.set(record.id,error.message);}
     finally{evidence.pending.delete(record.id);}
   }));
-  if(state.detail?.id===detail.id&&state.routeVersion===version&&findingEvidence===evidence)renderDetail();
+  if(state.detail?.id===detail.id&&state.routeVersion===version&&findingEvidence===evidence&&reportStillShown(t))renderDetail();
 }
 function requestWithEvidence(record) {return findingEvidence.id===state.detail?.id?findingEvidence.records.get(record.id)||record:record;}
 function requestQuestion(record,report) {
@@ -4396,7 +4501,7 @@ function renderChecks(report) {
   };
   const available=checkGroups.flatMap(group=>group.checks).filter(id=>!state.bootstrap?.checks||state.bootstrap.checks.some(check=>check.id===id));
   const configured=reportConfig(report).checks;
-  const chooseNext=state.detail?.state==='completed'&&state.detail.report&&(Array.isArray(configured)?available.some(id=>!configured.includes(id)):unselected.length>0);
+  const chooseNext=state.detail?.state===RUN.COMPLETED&&state.detail.report&&(Array.isArray(configured)?available.some(id=>!configured.includes(id)):unselected.length>0);
   const notSelected=unselected.length?`<details class="checks-not-selected"><summary>Not selected: ${unselected.map(c=>escape(checkGuide[c.id]?.name || c.title)).join(', ')}</summary><p>No traffic was sent for these checks.</p></details>`:'';
   const nextChecks=chooseNext?`<div class="checks-not-selected-row">${notSelected}<button type="button" class="button" data-action="choose-next-checks">Choose checks for next run</button></div>`:notSelected;
   return `<div class="findings" id="failing-requests" tabindex="-1"><p class="hint check-count">${number(selected.length)} checks · ${number(attention.length)} need attention · ${number(passed.length)} passed</p>${attention.map(item).join('')}${passed.length?`<details class="passed-checks" ${!attention.length||passed.some(c=>`${c.target}:${c.id}`===state.selectedCheck)?'open':''}><summary>Passed checks · ${passed.length}</summary>${passed.map(item).join('')}</details>`:''}${nextChecks}${!selected.length?'<p>No selected checks produced a result.</p>':''}</div>`;
@@ -4633,9 +4738,13 @@ function renderDeploymentChange(diff) {
   if(!diff)return '';
   const changed=(diff.fields||[]).filter(row=>row.change!=='no_observed_change').map(row=>row.field),intended=diff.intended_change;
   let summary=changed.length?`Deployment change: ${changed.join(', ')}`:'No observed deployment changes.';
-  if(changed.length&&intended&&!diff.confounded)summary+=' (one intended change)';
+  const launch=diff.launch_comparison||{},warnings=[...(launch.warnings||[])];
+  if(changed.length&&intended&&!diff.confounded&&launch.status!=='unverified')summary+=' (one intended change)';
   const fields=Array.isArray(intended)?intended:[intended];
-  return `<p class="deployment-change">${escape(summary)}</p>${diff.confounded?`<p><strong>Confounded: multiple unrelated changes.</strong></p>${intended?`<p class="hint">Intended change: ${escape(fields.join(', '))}</p>`:''}`:''}${diff.unknown_baseline?'<p class="hint">Baseline deployment configuration was not recorded.</p>':''}${diff.interpretation?`<p class="hint">${escape(diff.interpretation)}</p>`:''}`;
+  const wholeFieldWarning='The whole serving.launch_arguments field was declared intended; additional changes within that field are not checked separately.';
+  if(fields.includes('serving.launch_arguments')&&!warnings.includes(wholeFieldWarning))warnings.push(wholeFieldWarning);
+  const settings=(launch.settings||[]).map(row=>`<li>${escape(`${row.flag} (${row.source}): ${JSON.stringify(row.baseline)} → ${JSON.stringify(row.current)} (${row.change}; ${row.change==='unverified'?'equivalence unverified':row.intended?'intended':'additional change'})`)}</li>`).join('');
+  return `<p class="deployment-change">${escape(summary)}</p>${launch.status==='unverified'?'<p><strong>Launch setting comparison unverified.</strong></p>':''}${warnings.map(warning=>`<p class="hint">${escape(warning)}</p>`).join('')}${settings?`<ul>${settings}</ul>`:''}${diff.confounded?`<p><strong>Confounded: multiple unrelated changes.</strong></p>${intended?`<p class="hint">Intended change: ${escape(fields.join(', '))}</p>`:''}`:''}${diff.unknown_baseline?'<p class="hint">Baseline deployment configuration was not recorded.</p>':''}${diff.interpretation?`<p class="hint">${escape(diff.interpretation)}</p>`:''}`;
 }
 function renderComparisonDetails(targets) {
   if(!targets.length)return '';
@@ -4654,7 +4763,7 @@ function renderComparison(report,{scope='results'}={}) {
   const warningCount=allRows.filter(row=>comparisonWarnings(row).length).length,acceptance=b.acceptance||{};
   const acceptanceLabel=value=>value?escape(statusLabels[value]||value):'Not recorded';
   const filterRow=row=>(state.comparisonFilter==='all'||(state.comparisonFilter==='with_warnings'?comparisonWarnings(row).length>0:comparisonWarnings(row).length===0))&&(state.comparisonCheck==='all'||row.check===state.comparisonCheck);
-  return `<header id="${sectionPrefix}-comparison" class="comparison-conclusion"><div><p>${number(allRows.length)} measurements · ${number(warningCount)} with warnings</p></div><div class="baseline-reference"><span>Compared with</span>${baselineIdentity(b)}${state.detail?.state==='completed'?'<button class="button small" data-action="compare-saved">Change baseline</button>':''}</div></header><section id="${sectionPrefix}-acceptance" class="comparison-acceptance"><h3>Pass / fail</h3><div><span>Baseline: <strong>${acceptanceLabel(acceptance.baseline)}</strong></span><span>Current: <strong>${acceptanceLabel(acceptance.current)}</strong></span></div><p class="hint">Against each run’s requirements.</p></section>${(b.targets||[]).filter(target=>target.configuration_diff).map(target=>`<section class="comparison-section"><h3>${escape(target.target||target.name||'Target')} · Deployment</h3>${renderDeploymentChange(target.configuration_diff)}</section>`).join('')}${renderLoadAcceptance(b.targets||[],sectionPrefix)}<div class="comparison-filters">${allRows.length?`<div><label for="${filterPrefix}-outcome">Show</label><select id="${filterPrefix}-outcome" data-comparison-filter="outcome"><option value="all">All measurements</option><option value="with_warnings">With warnings</option><option value="without_warnings">Without warnings</option></select></div>${checkIds.length>1?`<div><label for="${filterPrefix}-check">Check</label><select id="${filterPrefix}-check" data-comparison-filter="check"><option value="all">All checks</option>${checkIds.map(id=>`<option value="${escape(id)}">${escape(catalogTitle(id))}</option>`).join('')}</select></div>`:''}`:''}<details class="comparison-support comparison-method"><summary>How comparison is done</summary><p>${escape(b.method||'Not recorded.')}</p></details></div>${(b.targets||[]).flatMap(t=>(t.reasons||[]).map(reason=>`<p class="notice warning">${escape(t.target||'Target')}: ${escape(reason)}</p>`)).join('')}${(b.targets||[]).map((t,targetIndex)=>t.traffic_capacity?`<section class="comparison-section" id="${sectionPrefix}-comparison-traffic-${targetIndex}" tabindex="-1"><h3>${escape(t.target||t.name||'Target')}</h3>${renderTrafficComparison(t.traffic_capacity)}</section>`:'').join('')}${comparisonSections.filter(([id])=>allRows.some(row=>comparisonCategory(row)===id)).map(([id,title])=>{
+  return `<header id="${sectionPrefix}-comparison" class="comparison-conclusion"><div><p>${number(allRows.length)} measurements · ${number(warningCount)} with warnings</p></div><div class="baseline-reference"><span>Compared with</span>${baselineIdentity(b)}${state.detail?.state===RUN.COMPLETED?'<button class="button small" data-action="compare-saved">Change baseline</button>':''}</div></header><section id="${sectionPrefix}-acceptance" class="comparison-acceptance"><h3>Pass / fail</h3><div><span>Baseline: <strong>${acceptanceLabel(acceptance.baseline)}</strong></span><span>Current: <strong>${acceptanceLabel(acceptance.current)}</strong></span></div><p class="hint">Against each run’s requirements.</p></section>${(b.targets||[]).filter(target=>target.configuration_diff).map(target=>`<section class="comparison-section"><h3>${escape(target.target||target.name||'Target')} · Deployment</h3>${renderDeploymentChange(target.configuration_diff)}</section>`).join('')}${renderLoadAcceptance(b.targets||[],sectionPrefix)}<div class="comparison-filters">${allRows.length?`<div><label for="${filterPrefix}-outcome">Show</label><select id="${filterPrefix}-outcome" data-comparison-filter="outcome"><option value="all">All measurements</option><option value="with_warnings">With warnings</option><option value="without_warnings">Without warnings</option></select></div>${checkIds.length>1?`<div><label for="${filterPrefix}-check">Check</label><select id="${filterPrefix}-check" data-comparison-filter="check"><option value="all">All checks</option>${checkIds.map(id=>`<option value="${escape(id)}">${escape(catalogTitle(id))}</option>`).join('')}</select></div>`:''}`:''}<details class="comparison-support comparison-method"><summary>How comparison is done</summary><p>${escape(b.method||'Not recorded.')}</p></details></div>${(b.targets||[]).flatMap(t=>(t.reasons||[]).map(reason=>`<p class="notice warning">${escape(t.target||'Target')}: ${escape(reason)}</p>`)).join('')}${(b.targets||[]).map((t,targetIndex)=>t.traffic_capacity?`<section class="comparison-section" id="${sectionPrefix}-comparison-traffic-${targetIndex}" tabindex="-1"><h3>${escape(t.target||t.name||'Target')}</h3>${renderTrafficComparison(t.traffic_capacity)}</section>`:'').join('')}${comparisonSections.filter(([id])=>allRows.some(row=>comparisonCategory(row)===id)).map(([id,title])=>{
     const rows=allRows.filter(row=>comparisonCategory(row)===id&&filterRow(row)),groups=new Map();
     for(const row of rows){const key=JSON.stringify([row.targetName,row.check,comparisonCohort(row)]);if(!groups.has(key))groups.set(key,[]);groups.get(key).push(row);}
     return `<section id="${sectionPrefix}-${id}" class="comparison-section"><h3>${escape(title)}</h3>${[...groups.values()].map(values=>comparisonGroup(values[0].check,values)).join('')}${!rows.length?'<p class="hint">No measurements match these filters.</p>':''}</section>`;
@@ -4730,12 +4839,12 @@ function renderLive() {
   state.liveRendered=state.detail.id;
   state.mosaicAnimated=state.detail.id;
   const d=state.detail,p=d.progress || {},c=d.config || reportConfig(d.report),events=(d.events || []).filter(e=>!String(e.event || '').startsWith('condition_')),last=events.at(-1) || {},progress={...last,...p};
-  const finished=progress.completed || 0,budgetStarted=(d.live_requests || []).reduce((total,record)=>Math.max(total,record.slot+1),0),secs=progress.elapsed_seconds || 0,stopping=d.state==='stopping',stopPending=state.stopPending?.id===d.id;
+  const finished=progress.completed || 0,budgetStarted=(d.live_requests || []).reduce((total,record)=>Math.max(total,record.slot+1),0),secs=progress.elapsed_seconds || 0,stopping=d.state===RUN.STOPPING,stopPending=state.stopPending?.id===d.id;
   const judging=progress.phase==='judging'||String(progress.event || '').startsWith('judging_');
   const judgeDone=progress.judge_calls_completed || 0,judgeTotal=progress.judge_calls_total || 0;
   const planned=plannedRequests(d),confirmation=state.stopConfirmation?.id===d.id&&Date.now()<state.stopConfirmation.until;
   const stopReasons=liveStopReasons(d),liveError=state.liveError?.id===d.id?state.liveError.message:'';
-  const title=d.stoppable===false?'Running from the CLI':judging?'Evaluating answers':d.state==='queued'?'Preparing run':'Running';
+  const title=d.stoppable===false?'Running from the CLI':judging?'Evaluating answers':d.state===RUN.QUEUED?'Preparing run':'Running';
   const description=judging?'Target traffic finished. Evaluating generated answers against golden answers; target measurements are frozen.':'One spot per test. Select a spot for its requests and results.';
   const bounds=judging?[['Evaluator concurrency',c.judging?.concurrency],['Evaluation duration',elapsed(c.judging?.max_duration_seconds)],['Judge deadline',elapsed(c.judging?.request_timeout_seconds)],['Judge output cap',`${c.judging?.max_output_tokens} tokens`]]:[['Simultaneous limit',c.concurrency??'Not set'],['Maximum requests',c.max_requests??'Not set'],['Maximum duration',c.max_duration_seconds==null?'Not set':elapsed(c.max_duration_seconds)],['Request timeout',elapsed(c.request_timeout_seconds)],['Maximum output tokens',`${c.max_output_tokens} tokens`]];
   patchHTML($('#main'),`<div class="page-heading"><div><div class="eyebrow">Live run <span class="mono">${escape(d.id)}</span></div><h1>${p.phase==='saving_partial_report'?'Saving partial report…':stopping?'Stopping your check':title}</h1><p>${stopping?'Stopping further work and saving the evidence collected so far.':description}</p><p class="live-progress">${judging?`Evaluation calls · ${number(judgeDone)} of ${number(judgeTotal)}`:`${planned==null?`${number(finished)} requests finished`:`${number(progress.budget_used || 0)} of ~${number(planned)} planned requests`} · ${elapsed(secs)} · limit ${c.max_requests==null?'not set':number(c.max_requests)}${progress.budget_exempt?` · ${number(progress.budget_exempt)} exempt`:''}`}</p></div>${d.stoppable===false?'':`<button class="button danger" data-action="stop" aria-label="${confirmation?'Confirm stop run':'Stop run'}" ${stopping||stopPending?'disabled':''}>${icon('stop')}${stopping||stopPending?'Stopping…':confirmation?'Confirm stop':'Stop run'}</button>`}</div>
@@ -4853,44 +4962,88 @@ function openBaselineDialog(){
   const report=state.detail.report,dialog=$('#baseline-dialog');dialog.className='baseline-form';dialog.innerHTML=`<form id="baseline-form"><div class="dialog-head"><div><div class="eyebrow">Explicit reference run</div><h2 id="baseline-title">Save baseline</h2></div><button type="button" class="button ghost" data-action="close-dialog" aria-label="Close save baseline">✕</button></div><div class="dialog-body"><p class="hint">Save this exact report for future comparisons. Its recorded outcome is ${escape(statusLabels[report.overall] || report.overall)}.</p><div class="fields">${field('baseline_name','Baseline name','',{required:true,full:true,placeholder:'e.g. before-runtime-upgrade'})}</div><p class="hint" style="margin-top:12px">Existing baselines are preserved unless you explicitly replace one.</p><div id="baseline-error" class="error-message" role="alert" hidden></div><label class="replace-row" id="replace-row" hidden><input name="replace" type="checkbox">Replace the existing baseline with this name</label></div><div class="dialog-footer"><button type="button" class="button" data-action="close-dialog">Cancel</button><button type="submit" class="button primary" id="save-baseline">Save baseline</button></div></form>`;dialog.showModal();}
 // Closing a chooser does not cancel a comparison already being saved.
 const pendingComparisons=new Set();
+let baselinesSequence=0,baselinesCacheSequence=0,baselineConfirmationClock=0,comparisonDialogSequence=0;
+const baselineConfirmations=new Map();
+function beginBaselineRead(){return {sequence:++baselinesSequence,confirmed:baselineConfirmationClock};}
+function reconcileBaselines(list,read){
+  // A newer completed list is authoritative, including entries it removed.
+  const merged=new Map((baselinesCacheSequence>read.sequence?state.baselines:list).map(item=>[item.id,item]));
+  for(const item of state.baselines)if(baselineConfirmations.get(item.id)>read.confirmed)merged.set(item.id,item);
+  return [...merged.values()];
+}
+async function refreshBaselines(read=beginBaselineRead()){
+  const r=await api('/api/baselines'),list=reconcileBaselines(r.baselines||[],read);
+  if(read.sequence===baselinesSequence){
+    state.baselines=list;baselinesCacheSequence=read.sequence;
+  }
+  return list;
+}
+function mergeBaseline(summary){if(!summary?.id)return;baselineConfirmations.set(summary.id,++baselineConfirmationClock);const index=state.baselines.findIndex(item=>item.id===summary.id);if(index<0)state.baselines.push(summary);else state.baselines[index]=summary;}
 async function openComparisonDialog() {
-  const id=state.detail?.id,version=state.routeVersion;
-  if(!id||state.detail.state!=='completed')return;
+  const t=reportToken(),id=t.id;
+  if(!id||state.detail.state!==RUN.COMPLETED)return;
   if(pendingComparisons.has(id)){toast('A comparison is still being saved for this run.');return;}
+  const s=++comparisonDialogSequence;
   try {
-    const result=await api('/api/baselines');
-    if(version!==state.routeVersion||state.detail?.id!==id||pendingComparisons.has(id))return;
-    state.baselines=result.baselines||[];
-    const choices=state.baselines.filter(item=>item.run_id!==id);
+    const read=beginBaselineRead(),list=await refreshBaselines(read);
+    if(s!==comparisonDialogSequence||!sameReportVisit(t)||pendingComparisons.has(id))return;
+    const choices=reconcileBaselines(list,read).filter(item=>item.run_id!==id);
     const dialog=$('#comparison-dialog');
     dialog.className='baseline-form';
     dialog.innerHTML=`<form id="comparison-form" data-run-id="${escape(id)}"><div class="dialog-head"><h2 id="comparison-title">Compare with saved baseline</h2><button type="button" class="button ghost" data-action="close-dialog" aria-label="Close comparison">✕</button></div><div class="dialog-body"><p>Compare the recorded results. No new requests will be sent to your endpoint.</p>${choices.length?`<label for="saved-baseline-choice">Saved baseline</label><select id="saved-baseline-choice" name="baseline_id" required>${choices.map(item=>`<option value="${escape(item.id)}"${item.id===state.detail.baseline_id?' selected':''}>${escape(item.name)} · ${escape(date(item.saved_at))}</option>`).join('')}</select>`:'<p>No other saved baselines yet. Open a different completed run and choose “Save as reference baseline”, then return here.</p>'}<div id="comparison-error" class="error-message" role="alert" hidden></div></div><div class="dialog-footer"><button type="button" class="button" data-action="close-dialog">Cancel</button><button type="submit" class="button primary"${choices.length?'':' disabled'}>Compare saved results</button></div></form>`;
     dialog.showModal();
-  }catch(error){if(version===state.routeVersion&&state.detail?.id===id)toast(error.message);}
+  }catch(error){if(s===comparisonDialogSequence&&sameReportVisit(t))toast(error.message);}
 }
 async function compareSavedRun(event) {
   event.preventDefault();
-  const form=event.target,id=form.dataset.runId,version=state.routeVersion;
+  const form=event.target,id=form.dataset.runId,t=reportToken(),dialog=$('#comparison-dialog');
+  const own=()=>sameReportVisit(t)&&form.isConnected&&dialog?.open;
   if(state.detail?.id!==id||pendingComparisons.has(id))return;
-  const button=form.querySelector('[type="submit"]'),error=$('#comparison-error');
+  const button=form.querySelector('[type="submit"]'),error=form.querySelector('#comparison-error');
   pendingComparisons.add(id);
+  const write=beginRunWrite(id,'compare');
   button.disabled=true;error.hidden=true;
   try {
     const result=await api(`${runPath(id)}/compare`,{method:'POST',body:JSON.stringify({baseline_id:new FormData(form).get('baseline_id')})});
-    if(version!==state.routeVersion||state.detail?.id!==id)return;
-    const detail=await api(runPath(id));
-    if(version!==state.routeVersion||state.detail?.id!==id)return;
+    confirmRunWrite(id,write);
+    if(!reportStillShown(t)&&!write.entry.readers)return;
+    const detail=reconcileRunDetail(await fetchRunDetail(id,{handoff:true}));
+    if(!reportStillShown(t))return;
     state.detail=detail;state.comparisonFilter=null;state.comparisonCheck='all';state.tab='baseline';
     reportView.performance=null;reportView.pending=false;reportView.lastFetch=0;reportView.sequence++;
-    $('#comparison-dialog').close();
-    chooseReportTab('results');renderDetail();
-    const section=$('#report-baseline-reference');
-    if(section){section.open=true;section.scrollIntoView?.({block:'start'});$('summary',section)?.focus({preventScroll:true});}
-    toast(result.warning||'Comparison saved. No new requests were sent.');
-  }catch(failure){if(version===state.routeVersion&&state.detail?.id===id){error.textContent=failure.message;error.hidden=false;}}
-  finally{pendingComparisons.delete(id);button.disabled=false;}
+    if(own()){
+      dialog.close();
+      chooseReportTab('results');renderDetail();
+      const section=$('#report-baseline-reference');
+      if(section){section.open=true;section.scrollIntoView?.({block:'start'});$('summary',section)?.focus({preventScroll:true});}
+    }else{
+      if(reportView.tab==='performance')loadPerformance({force:true});
+      renderDetail();
+    }
+    if(sameReportVisit(t))toast(result.warning||'Comparison saved. No new requests were sent.');
+  }catch(failure){if(sameReportVisit(t)){error.textContent=failure.message;error.hidden=false;}}
+  finally{pendingComparisons.delete(id);finishRunWrite(id,write);button.disabled=false;}
 }
-async function saveBaseline(event){event.preventDefault();const form=event.target,data=new FormData(form),button=$('#save-baseline'),error=$('#baseline-error');button.disabled=true;error.hidden=true;try{await api('/api/baselines',{method:'POST',body:JSON.stringify({run_id:state.detail.id,name:String(data.get('baseline_name')).trim(),replace:data.has('replace')})});const result=await api('/api/baselines');state.baselines=result.baselines || [];$('#baseline-dialog').close();renderDetail();toast(`Saved as baseline “${String(data.get('baseline_name')).trim()}”. Open another completed run and choose Compare with baseline, or select it before a new run.`);}catch(e){error.textContent=e.message;error.hidden=false;if(e.status===409)$('#replace-row').hidden=false;}finally{button.disabled=false;}}
+async function saveBaseline(event){
+  event.preventDefault();
+  const t=reportToken(),form=event.target,dialog=$('#baseline-dialog'),data=new FormData(form),name=String(data.get('baseline_name')).trim();
+  const button=form.querySelector('#save-baseline'),error=form.querySelector('#baseline-error'),replaceRow=form.querySelector('#replace-row');
+  const own=()=>sameReportVisit(t)&&form.isConnected&&dialog?.open;
+  button.disabled=true;error.hidden=true;
+  let result;
+  try{result=await api('/api/baselines',{method:'POST',body:JSON.stringify({run_id:t.id,name,replace:data.has('replace')})});}
+  catch(e){
+    if(own()){error.textContent=e.message;error.hidden=false;if(e.status===409)replaceRow.hidden=false;}
+    else if(sameReportVisit(t))toast(`Baseline “${name}” was not saved: ${e.message}`);
+    button.disabled=false;return;
+  }
+  mergeBaseline(result);
+  try{await refreshBaselines();}catch{}
+  if(own())dialog.close();
+  if(reportStillShown(t))renderDetail();
+  if(sameReportVisit(t))toast(`Saved as baseline “${name}”. Open another completed run and choose Compare with baseline, or select it before a new run.`);
+  button.disabled=false;
+}
 let stopConfirmationTimer=null,stopConfirmationEpoch=0;
 function cancelStopConfirmationTimer({reset=false}={}) {
   if(stopConfirmationTimer!=null&&typeof clearTimeout==='function')clearTimeout(stopConfirmationTimer);
@@ -4906,27 +5059,27 @@ function scheduleStopConfirmationReset() {
   },Math.max(0,confirmation.until-Date.now()));
 }
 async function confirmStop(){
-  const id=state.detail?.id;if(!activeState(state.detail)||state.detail.stoppable===false||state.detail.state==='stopping')return;
+  const id=state.detail?.id;if(!activeState(state.detail)||state.detail.stoppable===false||state.detail.state===RUN.STOPPING)return;
   const current=state.stopConfirmation,now=Date.now();
   if(current?.id===id&&now<current.until){if(now-current.armedAt<300)return;cancelStopConfirmationTimer({reset:true});await stopRun();return;}
   state.stopConfirmation={id,armedAt:now,until:now+4000};renderDetail();
 }
 
 async function stopRun(){
-  if(!activeState(state.detail)||state.detail.stoppable===false||state.detail.state==='stopping'||state.stopPending?.id===state.detail.id)return;
-  const button=$('[data-action="stop"]'),id=state.detail.id,version=state.routeVersion,epoch=++detailEpoch;
+  if(!activeState(state.detail)||state.detail.stoppable===false||state.detail.state===RUN.STOPPING||state.stopPending?.id===state.detail.id)return;
+  const t=reportToken(),button=$('[data-action="stop"]'),id=state.detail.id,version=state.routeVersion,epoch=++detailEpoch;
   state.liveError=null;state.stopPending={id};button.disabled=true;button.textContent='Stopping…';
   try{
     const result=await api(`${runPath(id)}/cancel`,{method:'POST',body:'{}'});
-    if(version!==state.routeVersion||state.detail?.id!==id||epoch!==detailEpoch)return;
+    if(!sameReportVisit(t)||epoch!==detailEpoch)return;
     state.stopPending=null;
     if(!activeState(state.detail))return;
-    if(state.detail.state!=='stopping')state.detail.state=result.state || 'stopping';
+    if(state.detail.state!==RUN.STOPPING)state.detail.state=result.state || RUN.STOPPING;
     renderDetail();schedulePoll(pollDetail,version,500);
   }catch(error){
-    if(version!==state.routeVersion||state.detail?.id!==id||epoch!==detailEpoch)return;
+    if(!sameReportVisit(t)||epoch!==detailEpoch)return;
     state.stopPending=null;
-    if(state.detail.state==='stopping'||!activeState(state.detail))return;
+    if(state.detail.state===RUN.STOPPING||!activeState(state.detail))return;
     state.liveError={id,message:error.message,sequence:detailSequence};
     renderDetail();
   }finally{
@@ -4970,7 +5123,7 @@ async function rerun({step=1,baseline,focusPath=null}={}){
   source=normalizeRateThreshold(source);
   replaceMigrationNotes(notes,warnings,limitNotes);state.config=clone(source);state.gatewayAccessDraft={};state.autoModel=null;state.setupStep=step===2&&source.targets?.length&&source.targets.every(t=>t.model?.trim())?2:1;state.focusSetupOnEntry=state.setupStep===2;
   if(step===2){state.returnToReview=false;state.catalogueFilter='all';state.catalogueCategory='all';state.catalogueSearch='';}
-  invalidateModelDiscovery();state.datasetSelection=[];state.config.restart_target=null;state.formMode='normal';state.formRestartTarget=null;state.jsonDraft=null;state.jsonBase=null;state.configView='form';configChanged();state.prefillBaseline=baseline ?? (detail.baseline_id || '');pendingTimeoutSetting=focusPath;location.hash='#new';
+  invalidateModelDiscovery();state.datasetSelection=[];state.config.restart_target=null;state.formMode='normal';state.formRestartTarget=null;resetJsonDraft();state.configView='form';configChanged();state.prefillBaseline=baseline ?? (detail.baseline_id || '');pendingTimeoutSetting=focusPath;location.hash='#new';
 }
 function portableConfig(payload) {return {...payload.config,restart_target:payload.mode==='cold-start'?payload.restart_target:null};}
 function hasJsonChanges() {return state.jsonDraft!==null&&state.jsonDraft!==state.jsonBase;}
@@ -5054,7 +5207,7 @@ async function applyConfig(text=state.jsonDraft,{importing=false,intent}={}) {
     // An explicit restart target in imported/edited JSON remains visible and intentional.
     state.formMode=result.config.restart_target?'cold-start':'normal';state.formRestartTarget=result.config.restart_target;
     state.config.restart_target=null;
-    state.jsonDraft=null;state.jsonBase=null;configChanged();
+    resetJsonDraft();configChanged();
     renderNew();toast(importing?'Configuration imported.':'Configuration applied.');
   }catch(error){if(!intent||intent.current()){configError(error);if(!importing&&text===state.jsonDraft){state.jsonValidation={draft:text,revision,route:version,errors:error.errors?.length?error.errors:[{fields:['config'],msg:error.message}]};renderRequestPreview();}}}
   finally{state.configBusy=false;}
@@ -5196,8 +5349,8 @@ document.addEventListener('click',async(event)=>{
   const resetSetting=event.target.closest('[data-reset-check-setting]');
   if(resetSetting){try{resetCheckSetting(resetSetting);}catch(error){configError(error);}return;}
   const reset=event.target.closest('[data-reset-test]')?.dataset.resetTest;
-  if(reset==='multi_user'){captureFormDraft();delete state.config.multi_user;delete state.config.test_options?.multi_user;state.jsonDraft=null;state.jsonBase=null;configChanged();renderNew();return;}
-  if(reset==='load'){captureFormDraft();replaceMigrationNotes();delete state.config.load_test;state.loadPanels={};delete state.config.test_options?.load;state.jsonDraft=null;state.jsonBase=null;configChanged();renderNew();return;}
+  if(reset==='multi_user'){captureFormDraft();delete state.config.multi_user;delete state.config.test_options?.multi_user;resetJsonDraft();configChanged();renderNew();return;}
+  if(reset==='load'){captureFormDraft();replaceMigrationNotes();delete state.config.load_test;state.loadPanels={};delete state.config.test_options?.load;resetJsonDraft();configChanged();renderNew();return;}
   if(reset){configChanged();if(state.config.test_options)delete state.config.test_options[reset];const form=$('#new-run-form');form.elements[`test_mode_${reset}`].value='default';refreshInheritedFields(reset);syncTestControls();updateBounds();return;}
   if(action==='use-check-concurrency'){
     try{
@@ -5210,7 +5363,7 @@ document.addEventListener('click',async(event)=>{
       const setting=check==='consistency'?profileDefaults('consistency',state.config).levels:check==='load'?loadSettings(state.config).patterns.concurrent.levels:value;
       for(const part of parts.slice(0,-1))target=target[part] ||= {};
       target[parts.at(-1)]=clone(setting);
-      state.jsonDraft=null;state.jsonBase=null;configChanged();renderNew();focusSetting(path);
+      resetJsonDraft();configChanged();renderNew();focusSetting(path);
     }catch(error){configError(error);}return;
   }
   if(action==='use-setting-correction'){
@@ -5225,7 +5378,7 @@ document.addEventListener('click',async(event)=>{
         const parts=field.split('.');let target=state.config;
         for(const part of parts.slice(0,-1))target=target[part] ||= {};
         target[parts.at(-1)]=value;
-        state.jsonDraft=null;state.jsonBase=null;configChanged();renderNew();focusSetting(field,{explicit:true});return;
+        resetJsonDraft();configChanged();renderNew();focusSetting(field,{explicit:true});return;
       }
 
       if(hasJsonChanges()){
@@ -5412,7 +5565,7 @@ document.addEventListener('change',event=>{
     input.value=value==='__manual__'?'':value;input.setCustomValidity('');state.autoModel=value==='__manual__'?null:value;
     // Keep the discovered choices while invalidating any earlier verification.
     const models=state.modelDiscovery?.models || [];
-    state.modelDiscoverySequence++;state.modelDiscovery={key:modelDiscoveryKey(),route:state.routeVersion,status:'needs_model',models,message:'Model selected. Test the connection, or continue to choose checks.'};
+    state.modelDiscoverySequence++;state.modelDiscovery={key:modelDiscoveryKey(),route:state.routeVersion,status:DISCOVERY.NEEDS_MODEL,models,message:'Model selected. Test the connection, or continue to choose checks.'};
     renderModelDiscovery();scheduleTokenizerSelection({immediate:true});if(value==='__manual__'){$('#manual-model-field').hidden=false;input.focus();}
     configChanged();updateBounds();return;
   }

@@ -16,6 +16,13 @@ from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
+from . import states
+from .launch_settings import (
+    LAUNCH_FIELD, LAUNCH_SIZE_LIMIT, TENSOR_PARALLEL_FLAG, compare_launch_settings,
+    launch_evidence_at_limit, launch_option_name, looks_like_launch_option, positive_launch_integer,
+    safe_speculation,
+)
+
 from .caps import (
     MAX_DEPLOYMENT_BODY_BYTES, MAX_DEPLOYMENT_SCOPE_CHARS, MAX_LAUNCH_ARGUMENTS,
     MAX_REPORT_SANITIZE_DEPTH, MAX_SANITIZE_DEPTH, MAX_SANITIZE_ITEMS,
@@ -123,13 +130,14 @@ LAUNCH_FLAGS = {
     "--tokenizer",
     "--tokenizer-revision",
     "--quantization",
+    "--dtype",
     "--max-model-len",
     "--max-num-seqs",
     "--max-num-batched-tokens",
     "--gpu-memory-utilization",
     "--num-gpu-blocks-override",
     "--kv-cache-dtype",
-    "--tensor-parallel-size",
+    TENSOR_PARALLEL_FLAG,
     "--pipeline-parallel-size",
     "--attention-backend",
     "--scheduling-policy",
@@ -141,31 +149,92 @@ LAUNCH_FLAGS = {
     "--port",
     "--config",
 }
+LAUNCH_DTYPES = {"auto", "bfloat16", "float", "float16", "float32", "half"}
 
 
-def safe_launch(command):
-    args = shlex.split(command) if isinstance(command, str) else list(command)
-    if len(args) > MAX_LAUNCH_ARGUMENTS:
+def safe_launch(command, *, structured=False):
+    return _safe_launch(command, structured=structured)[0]
+
+
+def _safe_launch(command, *, structured):
+    """Return safe launch evidence and whether it lost any information."""
+    if isinstance(command, str) and launch_evidence_at_limit(command):
+        return [LAUNCH_SIZE_LIMIT], True
+    if structured and not isinstance(command, (str, list)):
+        return [REDACTED], True
+    try:
+        args = shlex.split(command) if isinstance(command, str) else list(command)
+    except ValueError:
+        if structured:
+            return [REDACTED], True
+        raise
+    if not structured and len(args) > MAX_LAUNCH_ARGUMENTS:
         raise ValueError("launch command exceeds 256 arguments")
+    if launch_evidence_at_limit(args):
+        return [LAUNCH_SIZE_LIMIT], args != [LAUNCH_SIZE_LIMIT]
+    if structured and not all(isinstance(arg, str) for arg in args):
+        return [REDACTED], True
     result, index = [], 0
+    masked = False
+    vllm = args[:2] == ["vllm", "serve"]
+    normalized_tensor_parallel = False
     while index < len(args):
+        start, output_start = index, len(result)
+        normalized = False
         arg = str(args[index])
-        flag, equals, value = arg.partition("=")
-        if flag in LAUNCH_FLAGS:
+        name, equals, value = arg.partition("=")
+        flag = launch_option_name(name, vllm=vllm)
+        has_next_value = not equals and index + 1 < len(args) and not looks_like_launch_option(
+            str(args[index + 1]), vllm=vllm)
+        if flag in {"--speculative-config", "--dtype"} or (vllm and flag == TENSOR_PARALLEL_FLAG):
+            if has_next_value:
+                index += 1
+                value = str(args[index])
+            if flag == "--speculative-config":
+                speculation = safe_speculation(value)
+                result.append(flag + "=" + speculation)
+                normalized = speculation != REDACTED
+            elif flag == TENSOR_PARALLEL_FLAG:
+                try:
+                    result.append(f"{flag}={positive_launch_integer(value)}")
+                    normalized_tensor_parallel = normalized = True
+                except ValueError:
+                    result.append(flag + "=" + REDACTED)
+            elif value in LAUNCH_DTYPES:
+                result.extend([arg] if equals else [arg, value])
+            else:
+                result.append(flag + "=" + REDACTED)
+        elif flag in LAUNCH_FLAGS:
             result.append(sanitize(arg))
-            if not equals and index + 1 < len(args) and not str(args[index + 1]).startswith("--"):
+            if has_next_value:
                 index += 1
                 result.append(sanitize(str(args[index])))
-        elif flag.startswith("--"):
+        elif flag is not None:
             result.append(flag + "=" + REDACTED)
-            if not equals and index + 1 < len(args) and not str(args[index + 1]).startswith("--"):
+            if has_next_value:
                 index += 1
+        elif looks_like_launch_option(arg, vllm=vllm):
+            result.append(REDACTED)
         elif index < 3 and arg in {"vllm", "serve", "ollama", "run"}:
             result.append(arg)
+        elif structured and index == 2 and args[:2] in (["vllm", "serve"], ["ollama", "run"]):
+            result.append(sanitize(arg))
         else:
             result.append(REDACTED)
+        masked |= not normalized and result[output_start:] != args[start:index + 1]
         index += 1
-    return result
+    if structured and isinstance(command, str):
+        result = command if result == args and not normalized_tensor_parallel else shlex.join(result)
+    if launch_evidence_at_limit(result):
+        return [LAUNCH_SIZE_LIMIT], True
+    return result, masked
+
+
+def sanitize_serving(values):
+    """Apply the launch evidence policy before generic sanitization can slice its input."""
+    if values.get("launch_arguments") is not None:
+        values = {**values, "launch_arguments": safe_launch(values["launch_arguments"], structured=True)}
+    return sanitize(values)
 
 
 def safe_metadata(data):
@@ -175,7 +244,8 @@ def safe_metadata(data):
     for category, fields in CATEGORIES.items():
         source = data.get(category, {})
         if isinstance(source, dict):
-            result[category] = sanitize({k: v for k, v in source.items() if k in fields})
+            selected = {k: v for k, v in source.items() if k in fields}
+            result[category] = sanitize_serving(selected) if category == "serving" else sanitize(selected)
     aliases = {
         "model": ("model", "requested"),
         "revision": ("model", "revision"),
@@ -386,7 +456,7 @@ async def probe_context_window(target, config, timeout=6, *, detail=False):
     from giraffe.client import _headers, models_url
 
     errors = (httpx.HTTPError, httpx.InvalidURL, ValueError, TypeError, AttributeError, OSError, TimeoutError)
-    reason = "unavailable"
+    reason = states.CONNECTION_CONTEXT_UNAVAILABLE
     try:
         async with asyncio.timeout(timeout):
             client = await asyncio.to_thread(_discovery_client, config, timeout)
@@ -428,12 +498,12 @@ async def probe_context_window(target, config, timeout=6, *, detail=False):
                     info = await _read(client, models_url(target.url))
                     value = _models_context_limit(info, target.model)
                     source = "/v1/models max_model_len"
-                    reason = "no_window" if value is None else None
+                    reason = states.CONNECTION_CONTEXT_NO_WINDOW if value is None else None
                 if value is not None:
                     entry = {"value": value, "source": source, "collected_at": now()}
                     return (entry, None) if detail else entry
     except errors as exc:
-        reason = "unavailable"
+        reason = states.CONNECTION_CONTEXT_UNAVAILABLE
         logger.debug("Context window probe unavailable: %s", type(exc).__name__)
     return (None, reason) if detail else None
 
@@ -619,6 +689,7 @@ async def snapshot(target, config, deadline, stop, *, run_start=None):
         intended.setdefault("serving", {})["launch_arguments"] = safe_launch(
             deployment.launch_command
         )
+        imported_fields.discard(LAUNCH_FIELD)
     for category, values in intended.items():
         for key, value in values.items():
             path = f"{category}.{key}"
@@ -827,9 +898,34 @@ def observed_signature(snapshot):
     }
 
 
+def _comparison_launch_facts(snapshot):
+    fields = snapshot.get("fields", {})
+    launch = fields.get(LAUNCH_FIELD)
+    if not isinstance(launch, dict):
+        return snapshot, set()
+    copied, masked = dict(launch), set()
+    for source, fact in launch.items():
+        if isinstance(fact, dict) and fact.get("value") is not None:
+            value, content_masked = _safe_launch(fact["value"], structured=True)
+            copied[source] = {**fact, "value": value}
+            if content_masked:
+                masked.add(source)
+    return {**snapshot, "fields": {**fields, LAUNCH_FIELD: copied}}, masked
+
+
 def deployment_diff(current, baseline):
     rows = []
     current, baseline = current or {}, baseline or {}
+    old_launch = baseline.get("fields", {}).get(LAUNCH_FIELD) or {}
+    new_launch = current.get("fields", {}).get(LAUNCH_FIELD) or {}
+    current, current_masked = _comparison_launch_facts(current)
+    baseline, baseline_masked = _comparison_launch_facts(baseline)
+    # Redaction can make distinct old arguments look identical, so it cannot establish equality.
+    masked_launch_change = any(
+        isinstance(old_launch.get(source), dict) and isinstance(new_launch.get(source), dict)
+        and old_launch[source].get("value") != new_launch[source].get("value")
+        for source in current_masked | baseline_masked
+    )
     fields, previous = current.get("fields", {}), baseline.get("fields", {})
     for key in sorted(set(fields) | set(previous)):
         c, b = fields.get(key), previous.get(key)
@@ -847,13 +943,15 @@ def deployment_diff(current, baseline):
             else "removed"
             if c is None
             else "changed"
-            if values(c) != values(b)
+            if values(c) != values(b) or (key == LAUNCH_FIELD and masked_launch_change)
             else "no_observed_change"
         )
         rows.append({"field": key, "change": change, "baseline": b, "current": c})
     changed = [r["field"] for r in rows if r["change"] != "no_observed_change"]
     intended = current.get("intended_change")
     intended_fields = intended if isinstance(intended, list) else [intended]
+    launch_comparison, covered, extra_settings = compare_launch_settings(
+        current, baseline, intended_fields, LAUNCH_FLAGS, masked_launch_change=masked_launch_change)
     return {
         "fields": rows,
         "unknown_baseline": not bool(baseline),
@@ -865,7 +963,9 @@ def deployment_diff(current, baseline):
             "current": current.get("continuity", "unverified"),
         },
         "intended_change": intended,
-        "confounded": bool(intended and any(f not in intended_fields for f in changed)),
+        "confounded": bool(intended and (extra_settings or any(
+            f not in intended_fields and f not in covered for f in changed))),
+        "launch_comparison": launch_comparison,
         "interpretation": "Changes are investigation context, not evidence of causality. Missing/stale/unobserved fields cannot establish unchanged configuration.",
     }
 

@@ -397,7 +397,8 @@ def _report_for_render(path: Path) -> RunReport:
         if recovered is None:
             raise
         write_report(recovered, path, preserve_evidence=True)
-        update_metadata(path, {"state": "interrupted", "run_id": recovered.run_id})
+        update_metadata(path, {"state": states.RUN_INTERRUPTED, "run_id": recovered.run_id},
+                        remove=("recovery_attempts", "recovery_retry_at", "error", "error_id"))
         print(f"Recovered {len(recovered.requests)} recorded requests from an interrupted run; "
               "results are incomplete.", file=sys.stderr)
         return recovered
@@ -568,7 +569,7 @@ def _stage_name(scenario: str, config=None) -> str | None:
     for check, title in CATALOGUE_NAMES.items():
         if scenario == check or scenario.startswith(check + "_"):
             return title
-    if scenario in {"runtime_metrics_discovery", "performance_evidence_probe"}:
+    if scenario in {"runtime_metrics_discovery", states.SETUP_PROBE_PERFORMANCE_EVIDENCE}:
         return None
     from giraffe.conditions import condition_for
     label = condition_for(scenario, config=config)["label"]
@@ -779,6 +780,7 @@ def _main(argv: list[str] | None = None) -> int:
     validation_input = {}
     interrupted = None
     save_state = None
+    last_saved_state = None
 
     def emit(outcome: str, exit_code: int, **details) -> None:
         print(json.dumps({"kind": kind, "outcome": outcome, "exit_code": exit_code, **details},
@@ -1020,10 +1022,26 @@ def _main(argv: list[str] | None = None) -> int:
         if args.command in {"export", "inspect"}:
             from giraffe.reporting import reproduction_export, _retained
             report = _retained(load_report(args.report))
-            value = reproduction_export(report) if args.command == "export" else {
-                "run_id": report.run_id, "observations": report.observations, "baseline": report.baseline,
-                "performance": report.performance, "conditions": report.conditions,
-                "workload_selection": report.manifest.get("workload_selection", {})}
+            if args.command == "export":
+                value = reproduction_export(report)
+            else:
+                from giraffe.launch_settings import comparison_warnings
+
+                # Apply the display fallback to the retained copy of the comparison.
+                targets = (report.baseline or {}).get("targets")
+                if isinstance(targets, list):
+                    for target in targets:
+                        diff = target.get("configuration_diff") if isinstance(target, dict) else None
+                        if not isinstance(diff, dict) or "launch_comparison" in diff:
+                            continue
+                        warnings = comparison_warnings(diff)
+                        if warnings:
+                            diff["launch_comparison"] = {
+                                "status": "whole_field", "settings": [], "warnings": warnings}
+                value = {
+                    "run_id": report.run_id, "observations": report.observations, "baseline": report.baseline,
+                    "performance": report.performance, "conditions": report.conditions,
+                    "workload_selection": report.manifest.get("workload_selection", {})}
             print(json.dumps(value, indent=2, allow_nan=False))
             return 0
         if args.command == "baseline":
@@ -1140,24 +1158,36 @@ def _main(argv: list[str] | None = None) -> int:
         warnings = planning_warnings + warnings
         directory.mkdir(parents=True, exist_ok=True)
         started_at = datetime.now(timezone.utc).isoformat()
+        invocation_id = secrets.token_hex(16)
 
-        def save_state(state: str, **details) -> None:
+        def save_state(state: str, *, preserve_terminal: bool = False, **details) -> None:
+            nonlocal last_saved_state
             from giraffe.reporting import _atomic_write
-            from giraffe.storage import metadata_lock
+            from giraffe.storage import metadata_lock, write_metadata_unless
 
             with metadata_lock:
                 try:
                     saved = json.loads((directory / ".web.json").read_text())
                 except (OSError, ValueError):
                     saved = {}
-                _atomic_write(directory / ".web.json", json.dumps(
+                states.check_run_transition(last_saved_state, state)
+                contents = json.dumps(
                     {"id": directory.name, "state": state, "started_at": started_at,
+                     "invocation_id": invocation_id,
                      **({"latency_summary": saved["latency_summary"]} if "latency_summary" in saved else {}),
                      "owner_pid": os.getpid(), "owner_host": socket.gethostname(),
                      **({"heartbeat_at": datetime.now(timezone.utc).isoformat()}
-                        if state in {"running", "stopping"} else {}), **details}, allow_nan=False, separators=(",", ":")) + "\n")
+                        if state in states.RUN_OWNED_STATES else {}), **details}, allow_nan=False, separators=(",", ":")) + "\n"
+                if preserve_terminal and not write_metadata_unless(directory, json.loads(contents), lambda current: (
+                    current.get("invocation_id") == invocation_id
+                    and current.get("state") in states.RUN_TERMINAL_STATES
+                )):
+                    return
+                if not preserve_terminal:
+                    _atomic_write(directory / ".web.json", contents)
+                last_saved_state = state
 
-        save_state("running")
+        save_state(states.RUN_RUNNING)
         requests = f"{config.max_requests:,}" if config.max_requests is not None else "Not set"
         simultaneous = f"{config.concurrency:,}" if config.concurrency is not None else "Not set"
         duration = f"{config.max_duration_seconds:,g}s" if config.max_duration_seconds is not None else "Not set"
@@ -1218,7 +1248,8 @@ def _main(argv: list[str] | None = None) -> int:
                     logger.exception("CLI run stopped", extra={"giraffe_file_only": True})
                     stop_heartbeat()
                     try:
-                        save_state("interrupted", finished_at=datetime.now(timezone.utc).isoformat(),
+                        save_state(states.RUN_INTERRUPTED, preserve_terminal=True,
+                                   finished_at=datetime.now(timezone.utc).isoformat(),
                                    abort_reason=states.STOP_RUN_CANCELLED)
                     except OSError:
                         pass
@@ -1230,7 +1261,7 @@ def _main(argv: list[str] | None = None) -> int:
                     logger.exception("CLI run could not finish")
                     stop_heartbeat()
                     try:
-                        save_state("error", finished_at=datetime.now(timezone.utc).isoformat(),
+                        save_state(states.RUN_ERROR, finished_at=datetime.now(timezone.utc).isoformat(),
                                    error=f"Run could not finish ({type(error).__name__}).")
                     except OSError:
                         pass
@@ -1263,7 +1294,7 @@ def _main(argv: list[str] | None = None) -> int:
                         stop_heartbeat()
                         message = save_failure_summary(report, directory, error)
                         try:
-                            save_state("error", error=message, run_id=report.run_id, finished_at=report.finished_at,
+                            save_state(states.RUN_ERROR, error=message, run_id=report.run_id, finished_at=report.finished_at,
                                        progress={"completed": len(report.requests)}, resources=resources)
                         except OSError:
                             pass
@@ -1291,7 +1322,7 @@ def _main(argv: list[str] | None = None) -> int:
                     if not json_output and not getattr(args, "quiet", False):
                         print(f"Automatic cleanup deleted run: {identifier}")
             try:
-                save_state("completed", run_id=report.run_id, finished_at=report.finished_at, abort_reason=report.abort_reason,
+                save_state(states.RUN_COMPLETED, run_id=report.run_id, finished_at=report.finished_at, abort_reason=report.abort_reason,
                            **({"auto_cleanup": cleanup_result, "auto_cleanup_policy": policy} if policy else {}),
                            **({"error": warning} if warning else {}), resources={
                     "sampled_peak_rss_bytes": dict(sampler.peaks), "sampling": resources["sampling"],
@@ -1337,9 +1368,10 @@ def _main(argv: list[str] | None = None) -> int:
             sys.stdout.flush()
             return states.EXIT_CODE_CANCELLED if interrupted["requested"] else exit_code
     except (KeyboardInterrupt, asyncio.CancelledError):
-        if save_state is not None:
+        if save_state is not None and last_saved_state not in states.RUN_TERMINAL_STATES:
             try:
-                save_state("interrupted", finished_at=datetime.now(timezone.utc).isoformat(),
+                save_state(states.RUN_INTERRUPTED, preserve_terminal=True,
+                           finished_at=datetime.now(timezone.utc).isoformat(),
                            abort_reason=states.STOP_RUN_CANCELLED)
             except OSError:
                 pass
@@ -1444,9 +1476,9 @@ def _print_result(report: RunReport, json_path: Path, html_path: Path | None,
                 print(f"  {user['identity']}: {user['admitted']} admitted, {user['rejected']} rejected, "
                       f"{user['completed']} completed / {user['planned']} offered cap; declared {user['declared_rpm']} RPM")
             print("  " + policy["interpretation"])
-        if check.id == "gateway_attribution" and check.metrics.get("state") != "not_selected":
+        if check.id == "gateway_attribution" and check.metrics.get("state") != states.GATEWAY_ATTRIBUTION_NOT_SELECTED:
             data = check.metrics
-            print(f"Gateway attribution · {check.target} · {data.get('state', 'unverified')} · "
+            print(f"Gateway attribution · {check.target} · {data.get('state', states.GATEWAY_ATTRIBUTION_UNVERIFIED)} · "
                   f"{data.get('matched_requests', 0)} matched / {data.get('observed_requests', 0)} observed requests")
             for row in data.get("identities", []):
                 print(f"  {row['identity']} · {row['matched_requests']} matched · "
@@ -1551,19 +1583,29 @@ def _print_result(report: RunReport, json_path: Path, html_path: Path | None,
         print("Not selected: " + ", ".join(unselected))
     for name, observation in report.observations.get("targets", {}).items():
         probe = next((row for row in report.conditions if row.get("target") == name
-                      and row.get("condition_id") == "performance_evidence_probe"), None)
+                      and row.get("condition_id") == states.SETUP_PROBE_PERFORMANCE_EVIDENCE), None)
         if probe:
-            status = "passed" if probe.get("status") == "passed" else "inconclusive"
+            status = (states.CONDITION_AGGREGATE_PASSED if probe.get("status") == states.CONDITION_AGGREGATE_PASSED
+                      else states.CONDITION_AGGREGATE_INCONCLUSIVE)
             reason = probe.get("reason") or observation.get("token_evidence", {}).get("reason", "")
             print(f"  {name} / streamed token and usage support: {status} — {reason}")
         telemetry = observation.get("serving_telemetry", {})
-        states = sorted({s.get("status", "unknown") for s in telemetry.get("snapshots", [])})
-        print(f"  {name} / serving telemetry: {', '.join(states)}; source freshness and other traffic remain qualified in JSON.")
+        snapshot_statuses = sorted({s.get("status", "unknown") for s in telemetry.get("snapshots", [])})
+        print(f"  {name} / serving telemetry: {', '.join(snapshot_statuses)}; source freshness and other traffic remain qualified in JSON.")
     if report.baseline:
+        from .launch_settings import comparison_warnings, setting_change_text
+
         for target in report.baseline["targets"]:
             diff = target["configuration_diff"]
             changes = [row["field"] for row in diff["fields"] if row["change"] != "no_observed_change"]
             print(f"  {target['target']} / deployment changes: {', '.join(changes) or 'none observed; unknowns remain'}; confounded={diff['confounded']}; causality unverified")
+            launch = diff.get("launch_comparison") or {}
+            if launch.get("status") == "unverified":
+                print("    Launch setting comparison unverified.")
+            for warning in comparison_warnings(diff):
+                print(f"    {warning}")
+            for setting in launch.get("settings", []):
+                print(f"    {setting_change_text(setting)}")
         from .reporting import comparison_summary
 
         summary = comparison_summary(report)

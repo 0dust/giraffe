@@ -226,7 +226,7 @@ def _context_rejection(record):
 
 
 def _serving_failure(record, scenario):
-    if (record.identity is not None or scenario in {"sustained", "performance_evidence_probe"} or scenario.startswith("traffic_stage_") or record.status == "cancelled"
+    if (record.identity is not None or scenario in {"sustained", states.SETUP_PROBE_PERFORMANCE_EVIDENCE} or scenario.startswith("traffic_stage_") or record.status == "cancelled"
             or _reasoning_budget(record)):
         return False
     if (scenario.startswith("load_calibration_") and record.input_tokens is not None
@@ -256,7 +256,7 @@ def _spec(spec: RequestSpec, scenario: str, checks: list[str] = ()) -> RequestSp
 
 
 def _scenario_checks(spec):
-    if spec.scenario in {"initial", "readiness", "warm", "generation"}:
+    if spec.scenario in {"initial", states.SETUP_PROBE_READINESS, "warm", "generation"}:
         return spec.check_ids
     return [name for name in spec.check_ids if name not in {"access", "serving", "first_output", "generation"}]
 
@@ -534,13 +534,13 @@ class _Run:
                   **{key: aggregate[key] for key in ("condition_id", "check_id", "name", "concurrency_description", "not_started", "reasons")}},
                   **{k: v for k, v in row.items() if k not in {"target", "completed"}})
 
-    def condition_reason(self, target, fallback="check stopped early"):
+    def condition_reason(self, target, fallback=states.CONDITION_STOP_EARLY):
         if self.stop.is_set() or self.reason == states.STOP_CANCELLED_BY_USER:
-            return "run stopped"
+            return states.CONDITION_STOP_RUN
         if time.monotonic() >= self.deadline or self.reason == states.STOP_MAX_DURATION:
-            return "time limit reached"
+            return states.CONDITION_STOP_TIME_LIMIT
         if self.remaining(target) == 0 or self.reason == states.STOP_REQUEST_BUDGET:
-            return "request budget reached"
+            return states.CONDITION_STOP_REQUEST_BUDGET
         return fallback
 
     def finish_condition(self, target, scenario, workload=None, reason=None, load_point_result=None, *, verdict=None):
@@ -662,7 +662,7 @@ class _Run:
                 for (_, check), phase in self.pending_checks.items())
                 or any(checks - non_inference for checks in self.unfinished.values())
                 or any(target.get("client_error") for target in self.observations.values())
-                or (self.config.restart_target and (not restart or restart["status"] != "ready"))):
+                or (self.config.restart_target and (not restart or restart["status"] != states.RESTART_READY))):
             yield
             return
         # Attribute a deadline or user stop to the phase that owned it,
@@ -891,8 +891,8 @@ class _Run:
                     and self.config.effective_check(check)["request_timeout_seconds"] == timeout):
                 return "check", check, None
             return "run", None, None
-        if spec.scenario in {"initial", "readiness", "warm"}:
-            if spec.scenario in {"initial", "readiness"} and "access" in self.config.checks:
+        if spec.scenario in {"initial", states.SETUP_PROBE_READINESS, "warm"}:
+            if spec.scenario in {"initial", states.SETUP_PROBE_READINESS} and "access" in self.config.checks:
                 candidates = ["access"]
             else:
                 candidates = [name for name in ("serving", "first_output") if name in self.config.checks]
@@ -936,9 +936,9 @@ class _Run:
         spec = spec.model_copy(update={"check_ids": check_ids})
         gateway_probe = (spec.identity is not None and bool(check_ids)
                          and SHARED_BASELINE_EXCLUDED_WORKLOADS.issuperset(check_ids))
-        readiness = spec.scenario == "readiness" or (
+        readiness = spec.scenario == states.SETUP_PROBE_READINESS or (
             spec.scenario == "initial" and self.config.restart_target == target.name)
-        evidence_probe = spec.scenario == "performance_evidence_probe" or spec.identity is not None
+        evidence_probe = spec.scenario == states.SETUP_PROBE_PERFORMANCE_EVIDENCE or spec.identity is not None
         slot_deadline = min(self.deadline, deadline_override if deadline_override is not None else self.deadline)
         if admission_deadline is not None:
             slot_deadline = min(slot_deadline, admission_deadline)
@@ -1460,7 +1460,7 @@ class _Run:
 async def _restart(run: _Run, target: Target) -> bool:
     if run.config.restart_target != target.name:
         return True
-    observation = {"requested": True, "status": "blocked", "readiness_ms": None,
+    observation = {"requested": True, "status": states.RESTART_BLOCKED, "readiness_ms": None,
                    "coverage": "Only this configured hook; individual backend restart unverified"}
     run.observations[target.name]["restart"] = observation
     if not target.restart_command:
@@ -1482,7 +1482,7 @@ async def _restart(run: _Run, target: Target) -> bool:
         if process.returncode:
             observation["reason"] = f"Restart hook exited with status {process.returncode}"
             return False
-        observation["status"] = "hook_completed"
+        observation["status"] = states.RESTART_HOOK_COMPLETED
         observation["started_monotonic"] = started
         return True
     except (OSError, TimeoutError) as exc:
@@ -1700,7 +1700,7 @@ async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attributio
             data["host_configured"] = bool(target.host_metrics_url)
             run.preparation(target.name, "runtime_metrics_discovery", "Checking available runtime telemetry", "running")
             await _metrics(run, target, "start")
-            available = data["snapshots"] and data["snapshots"][-1]["status"] in {"available", "stale_samples"}
+            available = data["snapshots"] and data["snapshots"][-1]["status"] in states.TELEMETRY_DISCOVERY_REUSABLE_STATUSES
             discovery = run.observations[target.name].get("runtime_metrics_discovery", {})
             run.preparation(target.name, "runtime_metrics_discovery", "Runtime telemetry capability", "completed" if available else "unavailable", discovery.get("reason"))
             if available or target.metrics_url or config.metrics or target.host_metrics_url or target.deployment.collector_url:
@@ -1710,7 +1710,7 @@ async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attributio
             if enabled & {"access", "serving", "first_output", "generation"} or restart:
                 response_config = _response_config(config, initial=True)
                 initial_specs = builtin_fixtures(response_config)["short"]
-                if restart and restart["status"] == "hook_completed":
+                if restart and restart["status"] == states.RESTART_HOOK_COMPLETED:
                     ready_deadline = min(run.deadline, time.monotonic() + config.readiness_timeout_seconds)
                     backoff = .1
                     initial = []
@@ -1724,9 +1724,9 @@ async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attributio
                         restart["health_polls"].append({"elapsed_seconds": time.monotonic()-run.start,
                                                         "ready": ready})
                         if ready:
-                            probe = _spec(initial_specs[0], "readiness").model_copy(update={"check_ids": []})
+                            probe = _spec(initial_specs[0], states.SETUP_PROBE_READINESS).model_copy(update={"check_ids": []})
                             record = await run.request(target, client, probe, deadline_override=ready_deadline,
-                                                       budget_exemption="restart_readiness")
+                                                       budget_exemption=states.REQUEST_BUDGET_EXEMPTION_RESTART_READINESS)
                             if record and record.valid:
                                 record.check_ids = [name for name in ("access", "serving", "first_output")
                                                     if name in enabled]
@@ -1734,9 +1734,9 @@ async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attributio
                             break
                         await asyncio.sleep(min(backoff, max(0, ready_deadline-time.monotonic())))
                         backoff = min(5, backoff * 2)
-                    restart["status"] = "ready" if initial else "blocked"
+                    restart["status"] = states.RESTART_READY if initial else states.RESTART_BLOCKED
                     restart["readiness_ms"] = round((time.monotonic()-restart.pop("started_monotonic"))*1000, 3)
-                    if restart["status"] == "blocked":
+                    if restart["status"] == states.RESTART_BLOCKED:
                         restart["reason"] = "No successful inference within readiness budget"
                         run.stop_reason(target.name)
                         return
@@ -1747,31 +1747,57 @@ async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attributio
                 # A one-token inference can still have a slow first response.
                 # Share one configured timeout across compatibility retries.
                 probe_end = min(run.deadline, time.monotonic() + config.request_timeout_seconds)
-                run.preparation(target.name, "performance_evidence_probe", "Checking streamed token and usage support", "running")
+                run.preparation(target.name, states.SETUP_PROBE_PERFORMANCE_EVIDENCE, "Checking streamed token and usage support", "running")
                 client.on_response = None
                 probe_count = 0
                 planned_reserve = run.token_evidence_reserve(target)
-                while (run.allowed(target.name) and time.monotonic() < probe_end
-                       and (run.remaining(target.name) is None or run.remaining(target.name) > max(
-                           1, planned_reserve - (run.budget_counts[target.name] - probe_count)))):
-                    spec = client.token_evidence_probe()
-                    if spec is None:
-                        break
-                    spec = spec.model_copy(update={"request_timeout_seconds": min(spec.request_timeout_seconds, max(.001, probe_end - time.monotonic()))})
-                    record = await run.request(target, client, spec)
-                    if record is None:
-                        break
-                    probe_count += 1
-                    run.observations[target.name]["token_evidence"] = client.observe_token_evidence_probe(record)
-                client.on_response = lambda: run.endpoint_response(target.name)
-                evidence = run.observations[target.name].setdefault("token_evidence", {"status": "unavailable", "reason": "No request budget or preparation time remained for a token-evidence compatibility probe."})
-                complete_evidence = (evidence.get("status") == "observed"
-                                     and evidence.get("logprobs") == evidence.get("usage") == "supported"
-                                     and not evidence.get("missing_usage_fields"))
-                run.preparation(target.name, "performance_evidence_probe", "Streamed token and usage support",
-                                "completed" if complete_evidence else "unavailable", evidence.get("reason"))
-                run.finish_condition(target.name, "performance_evidence_probe", reason=evidence.get("reason"),
-                                     verdict="pass" if complete_evidence else "inconclusive")
+                probe_failure = None
+                try:
+                    while (run.allowed(target.name) and time.monotonic() < probe_end
+                           and (run.remaining(target.name) is None or run.remaining(target.name) > max(
+                               1, planned_reserve - (run.budget_counts[target.name] - probe_count)))):
+                        spec = client.token_evidence_probe()
+                        if spec is None:
+                            break
+                        spec = spec.model_copy(update={"request_timeout_seconds": min(spec.request_timeout_seconds, max(.001, probe_end - time.monotonic()))})
+                        record = await run.request(target, client, spec)
+                        if record is None:
+                            break
+                        probe_count += 1
+                        run.observations[target.name]["token_evidence"] = client.observe_token_evidence_probe(record)
+                except asyncio.CancelledError:
+                    probe_failure = states.STOP_RUN_CANCELLED
+                    raise
+                except Exception as exc:
+                    probe_failure = f"Compatibility probe did not complete ({type(exc).__name__})."
+                    raise
+                finally:
+                    # No awaits: request() persists cancellation before re-raising,
+                    # and both live and saved summaries must close before it escapes.
+                    client.on_response = lambda: run.endpoint_response(target.name)
+                    stop_reason = run.stop_reason(target.name)
+                    stopped = stop_reason is not None and stop_reason != states.STOP_REQUEST_BUDGET
+                    if stopped:
+                        reason = f"Token-evidence compatibility probe stopped: {stop_reason}."
+                    elif probe_failure:
+                        reason = probe_failure
+                    else:
+                        remaining = run.remaining(target.name)
+                        reserve = max(1, planned_reserve - (run.budget_counts[target.name] - probe_count))
+                        if time.monotonic() >= probe_end or remaining is not None and remaining <= reserve:
+                            phase = "retry" if probe_count else "probe"
+                            reason = f"No request budget or preparation time remained for a token-evidence compatibility {phase}."
+                        else:
+                            reason = "Token-evidence compatibility probe did not complete."
+                    evidence = client.finish_token_evidence_probe(reason, interrupted=stopped or probe_failure is not None)
+                    run.observations[target.name]["token_evidence"] = evidence
+                    complete_evidence = (evidence.get("status") == states.TOKEN_EVIDENCE_OBSERVED
+                                         and evidence.get("logprobs") == evidence.get("usage") == states.TOKEN_EVIDENCE_SUPPORTED
+                                         and not evidence.get("missing_usage_fields"))
+                    run.preparation(target.name, states.SETUP_PROBE_PERFORMANCE_EVIDENCE, "Streamed token and usage support",
+                                    "completed" if complete_evidence else "unavailable", evidence.get("reason"))
+                    run.finish_condition(target.name, states.SETUP_PROBE_PERFORMANCE_EVIDENCE, reason=evidence.get("reason"),
+                                         verdict="pass" if complete_evidence else "inconclusive")
             run.observations[target.name]["deployment"]["model_residency"]["after_preparation"] = (
                 await deployment.model_residency(target, config, deadline=run.deadline, stop=run.stop))
             if enabled & {"serving", "first_output"}:
@@ -2031,7 +2057,7 @@ async def _deferred_access(run, target):
         run.mark_unfinished(target.name, {check})
         return
     restart = observations["restart"]
-    if run.config.restart_target == target.name and (not restart or restart["status"] != "ready"):
+    if run.config.restart_target == target.name and (not restart or restart["status"] != states.RESTART_READY):
         run.finish_checks(target.name, {check})
         return
     run.emit("scenario_started", target.name, check)
@@ -2061,7 +2087,7 @@ async def _deferred_policy(run, target):
         run.mark_unfinished(target.name, {check})
         return
     restart = observations["restart"]
-    if run.config.restart_target == target.name and (not restart or restart["status"] != "ready"):
+    if run.config.restart_target == target.name and (not restart or restart["status"] != states.RESTART_READY):
         run.finish_checks(target.name, {check})
         return
     run.emit("scenario_started", target.name, check)
@@ -2089,8 +2115,8 @@ async def _deferred_attribution(run, target, *, deferred=True):
         run.mark_unfinished(target.name, {CHECK})
         return
     restart = observations["restart"]
-    if run.config.restart_target == target.name and (not restart or restart["status"] != "ready"):
-        observations[CHECK] = _state("unverified", "Gateway attribution did not run because restart readiness was not established.")
+    if run.config.restart_target == target.name and (not restart or restart["status"] != states.RESTART_READY):
+        observations[CHECK] = _state(states.GATEWAY_ATTRIBUTION_UNVERIFIED, "Gateway attribution did not run because restart readiness was not established.")
         run.finish_checks(target.name, {CHECK})
         return
     run.emit("scenario_started", target.name, CHECK)
@@ -2103,7 +2129,7 @@ async def _deferred_attribution(run, target, *, deferred=True):
     except Exception as exc:
         # Identity transport failures must not replace completed shared checks.
         logger.error("Internal gateway attribution error (%s)", type(exc).__name__)
-        observations[CHECK] = _state("unverified", "Gateway attribution could not complete.")
+        observations[CHECK] = _state(states.GATEWAY_ATTRIBUTION_UNVERIFIED, "Gateway attribution could not complete.")
     finally:
         run.finish_checks(target.name, {CHECK})
         run.emit("scenario_finished", target.name, CHECK)
@@ -2261,7 +2287,7 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
             metrics["timing_quality"] = quality
         if check_id not in config.checks:
             status, summary = "skipped", "Not selected for this run."
-        elif observations["restart"] and observations["restart"]["status"] == "blocked":
+        elif observations["restart"] and observations["restart"]["status"] == states.RESTART_BLOCKED:
             status, summary = "blocked", observations["restart"].get("reason", "Restart readiness unavailable")
         elif observations.get("client_error"):
             status, summary = "blocked", observations["client_error"]
@@ -2306,7 +2332,7 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
             else:
                 summary = "Valid non-empty responses and required stream termination observed."
         elif check_id in {"first_output", "generation"}:
-            metrics["initial"] = _stats([r for r in ordinary if r.scenario in {"initial", "readiness"}])
+            metrics["initial"] = _stats([r for r in ordinary if r.scenario in {"initial", states.SETUP_PROBE_READINESS}])
             thresholds = (limits.first_output_ms is not None if check_id == "first_output" else
                           any(v is not None for v in (limits.latency_ms, limits.stream_gap_ms,
                                                       limits.min_output_tokens_per_second)))
@@ -3250,7 +3276,7 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
     run = _Run(config, progress, stop_event)
     for target, count in (preflight_counts or {}).items():
         for _ in range(count):
-            run.note_sent(target, "preflight")
+            run.note_sent(target, states.REQUEST_BUDGET_EXEMPTION_PREFLIGHT)
     run.run_id = run_id
     sampler.run = run
     if "scale_down" in config.checks:
