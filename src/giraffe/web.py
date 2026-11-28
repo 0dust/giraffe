@@ -541,11 +541,17 @@ def _valid_budget_slot(slot, max_requests: int | None, *, source: str, run: dict
     if type(slot) is not int or slot < 0:
         return None
     if max_requests is not None and slot >= max_requests:
-        violations = run.setdefault("slot_invariant_sources", set())
-        if source not in violations:
-            violations.add(source)
-            logger.error("Request budget slot invariant violated (%s): slot %s exceeds limit %s",
-                         source, slot, max_requests)
+        # The app owns this registry; rebuilding or evicting a feed cannot
+        # reset a run's warning history. Standalone trackers have no registry.
+        violations, lock = run.get("slot_invariant_log", (OrderedDict(), threading.Lock()))
+        with lock:
+            key = (run.get("id"), source)
+            if key not in violations:
+                violations[key] = None
+                if len(violations) > 4096:
+                    violations.popitem(last=False)
+                logger.error("Request budget slot invariant violated (%s): slot %s exceeds limit %s",
+                             source, slot, max_requests)
         return None
     return slot
 
@@ -622,11 +628,25 @@ def _public_progress(event: dict) -> dict:
     return event
 
 
+def _remember_request_counts(job: dict, counts: dict | None) -> None:
+    """Keep the latest known snapshot independently of replaceable progress."""
+    if counts is not None and counts["available"] is True:
+        job["request_counts"] = counts
+
+
+def _progress_snapshot(job: dict) -> dict:
+    progress = dict(job.get("progress", {}))
+    if job.get("request_counts") is not None:
+        progress["request_counts"] = job["request_counts"]
+    return progress
+
+
 def _track_live_progress(job: dict, event: dict, max_requests: int | None) -> dict:
     """Bound live web metadata independently of the configured arrival count."""
     # Derived performance is requested separately, never copied into polling
     # progress/events (including events from third-party runner integrations).
     event = _public_progress(event)
+    _remember_request_counts(job, event.get("request_counts"))
     if event.get("event") == "timeout_warning" and isinstance(event.get("timeout_warning"), dict):
         warning = deepcopy(event["timeout_warning"])
         warnings = job.setdefault("live_timeout_warnings", OrderedDict())
@@ -648,7 +668,7 @@ def _track_live_progress(job: dict, event: dict, max_requests: int | None) -> di
         if not event["event"].startswith("check_") and event["event"] != "run_finished":
             if "partial_report_deadline" in job:
                 event.update(phase="saving_partial_report", message="Saving partial report…")
-            job["progress"] = event
+            job["progress"] = {key: value for key, value in event.items() if key != "request_counts"}
         job["events"].append({key: value for key, value in event.items() if key != "request_counts"})
         del job["events"][:-MAX_LIVE_EVENTS]
     index = job.get("condition_requests")
@@ -859,7 +879,7 @@ def _api_report(report: RunReport) -> dict:
               "started_at", "completed_at", "intentional", "http_status", "error", "score_message",
               "output_chars", "stream", "finish_reason", "input_tokens", "output_tokens", "evaluation_error",
               "requested_input_tokens", "requested_output_tokens", "input_chars", "requested_max_tokens",
-              "sent", "traffic_stage", "traffic_rate_rps", "traffic_class", "arrival_elapsed_ms", "arrival_first_output_ms", "load_point", "workload"}
+              "traffic_stage", "traffic_rate_rps", "traffic_class", "arrival_elapsed_ms", "arrival_first_output_ms", "load_point", "workload"}
     counts = (known_request_counts(report.observations.get("request_counts"))
               or unavailable_request_counts(report.observations.get("request_counts")))
     if counts is None:
@@ -868,9 +888,9 @@ def _api_report(report: RunReport) -> dict:
         result["observations"]["request_counts"] = counts
     result.update(request_counts=counts, requests_compact=True,
                   requests=[{**row.model_dump(mode="json", include=fields, exclude_defaults=True),
-                             "valid": row.valid, "sent": row.sent, "elapsed_ms": row.elapsed_ms, "output_chars": row.output_chars,
-                             **({"generation_tokens_per_second": row.generation_tokens_per_second}
-                                if row.generation_tokens_per_second is not None else {})}
+                             "valid": row.valid, **({"sent": False} if not row.sent else {}),
+                             "elapsed_ms": row.elapsed_ms, "output_chars": row.output_chars,
+                             "generation_tokens_per_second": row.generation_tokens_per_second}
                             for row in report.requests])
     return result
 
@@ -1023,6 +1043,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
     observation_cache: dict = {}
     live_journals: OrderedDict = OrderedDict()
     live_journal_lock = threading.Lock()
+    slot_invariant_log = (OrderedDict(), threading.Lock())
     # Microsecond epoch remains exact in JavaScript numbers. Allocate cursors
     # across journal generations so replacement/reopened files invalidate clients.
     journal_cursor = time_ns() // 1000
@@ -1040,7 +1061,8 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                 cached = live_journals.get(directory.name)
                 if cached is None or cached["identity"] != identity or stat.st_size < cached["offset"]:
                     journal_cursor += 1
-                    cached = {"identity": identity, "offset": 0, "warnings": OrderedDict(),
+                    cached = {"id": directory.name, "slot_invariant_log": slot_invariant_log,
+                              "identity": identity, "offset": 0, "warnings": OrderedDict(),
                               "seq": journal_cursor, "reset_after": journal_cursor,
                               "config": metadata(directory).get("config", {}),
                               "request_versions": OrderedDict(), "progress": {},
@@ -1109,8 +1131,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                             continue
                         if isinstance(value, dict) and value.get("type") == "request_counts":
                             counts = known_request_counts({key: child for key, child in value.items() if key != "type"})
-                            if counts is not None:
-                                cached["progress"]["request_counts"] = counts
+                            _remember_request_counts(cached, counts)
                             continue
                         event = value.get("progress", {}) if isinstance(value, dict) else {}
                         if not isinstance(event, dict):
@@ -1140,7 +1161,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                 return {"seq": cached["seq"], "reset": reset, "config": deepcopy(cached["config"]),
                         "idle": after == cached["seq"] and not reset,
                         "timeout_warnings": deepcopy(list(cached["warnings"].values())),
-                        "requests": deepcopy(requests), "progress": deepcopy(cached["progress"]),
+                        "requests": deepcopy(requests), "progress": deepcopy(_progress_snapshot(cached)),
                         "live_request_count": cached["live_request_count"],
                         "live_request_summary": deepcopy(cached["live_request_summary"])}
             except OSError:
@@ -1218,6 +1239,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
         value = _read(Path(path))
         if isinstance(value.get("progress"), dict):
             value["progress"] = _public_progress(value["progress"])
+            _remember_request_counts(value, value["progress"].get("request_counts"))
         if isinstance(value.get("events"), list):
             value["events"] = [{key: child for key, child in _public_progress(event).items()
                                 if key != "request_counts"} for event in value["events"]]
@@ -1373,7 +1395,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
         job["progress"].update(event="saving_partial_report", phase="saving_partial_report",
                                message="Saving partial report…", state=states.RUN_STOPPING)
         publish(job, job["progress"], None)
-        job["meta"]["progress"] = job["progress"]
+        job["meta"]["progress"] = _progress_snapshot(job)
         return max(0, job["partial_report_deadline"] - time.monotonic())
 
     @asynccontextmanager
@@ -1625,6 +1647,10 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
             journal = journal_live_state(directory, journal_after)
             timeout_warnings = journal.get("timeout_warnings") or timeout_warnings
         request_feed = live or journal
+        progress = _progress_snapshot(meta)
+        progress.update(_progress_snapshot(journal))
+        if live:
+            progress = _progress_snapshot(live)
         return {"id": identifier, "state": state,
                 **({"journal_reset": journal.get("reset", False), "journal_idle": journal.get("idle", True)}
                    if journal_after is not None else {}),
@@ -1632,7 +1658,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                 "abort_reason": (persisted or summary or {}).get("abort_reason") or meta.get("abort_reason"),
                 "error": meta.get("error"), "error_id": meta.get("error_id"),
                 "seq": request_feed.get("seq", meta.get("seq", 0)),
-                "progress": live.get("progress", {**meta.get("progress", {}), **journal.get("progress", {})}),
+                "progress": progress,
                 "scale_down_control": control,
                 "events": live.get("events", meta.get("events", [])),
                 "live_preparations": list(live["live_preparations"].values()) if "live_preparations" in live else meta.get("live_preparations", []),
@@ -1795,7 +1821,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                         del feeds[identifier]
                 feeds[job["id"]] = {key: job[key] for key in (
                     "id", "state", "meta", "seq", "deltas", "changed", "terminal", "checks",
-                    "progress", "phases", "live_preparations", "live_timeout_warnings", "live_request_count", "live_request_summary")}
+                    "progress", "request_counts", "slot_invariant_log", "phases", "live_preparations", "live_timeout_warnings", "live_request_count", "live_request_summary")}
             except Exception:
                 logger.exception("Could not retain terminal feed for %s", job["id"])
             finally:
@@ -1932,7 +1958,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                 stop_wait_attempted = True
                 worker.request_stop(cancel=True)
                 remaining = saving_partial(job)
-                meta.update(state=states.RUN_STOPPING, progress=job["progress"])
+                meta.update(state=states.RUN_STOPPING, progress=_progress_snapshot(job))
                 await run_in_threadpool(save_metadata, job["directory"], meta)
                 # Validators may synchronously build a large partial report.
                 done, _ = await asyncio.wait({waiting}, timeout=remaining)
@@ -1976,7 +2002,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                         logger.exception("Could not close evidence writer for %s", job["id"])
                 if writer is not None:
                     meta["evidence_dropped_count"] = writer.dropped_count
-                meta.update(progress=job["progress"], events=job["events"], phases=job["phases"],
+                meta.update(progress=_progress_snapshot(job), events=job["events"], phases=job["phases"],
                             live_preparations=list(job.get("live_preparations", {}).values()),
                             live_timeout_warnings=list(job.get("live_timeout_warnings", {}).values()),
                             conditions=list(job["conditions"].values()),
@@ -2322,7 +2348,8 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                 condition_index.summary(summary)
             active = dict(id=identifier, state=states.RUN_RUNNING, directory=directory, meta=meta,
                           open_files=guard,
-                          progress={}, events=[], requests=OrderedDict(), live_preparations=OrderedDict(),
+                          progress={}, request_counts=None, slot_invariant_log=slot_invariant_log,
+                          events=[], requests=OrderedDict(), live_preparations=OrderedDict(),
                           live_timeout_warnings=OrderedDict(),
                           conditions={(row["target"], row["condition_id"]): row for row in waiting},
                           condition_requests=condition_index,
@@ -2435,7 +2462,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                 "checks": list(checks.values()), "state": feed["state"],
                 "terminal": feed["state"] in states.RUN_TERMINAL_STATES,
                 "recoverable": recoverable,
-                "progress": feed["progress"], "live_request_count": feed["live_request_count"],
+                "progress": _progress_snapshot(feed), "live_request_count": feed["live_request_count"],
                 "scale_down_control": feed.get("scale_down_control", feed["meta"].get("scale_down_control")),
                 "live_request_summary": feed["live_request_summary"],
                 "live_preparations": list(feed["live_preparations"].values()),

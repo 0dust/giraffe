@@ -13,6 +13,7 @@ from tests.performance_fixture import synthetic_report_1000
 @pytest.mark.asyncio
 async def test_default_payload_and_selected_window_are_bounded(tmp_path):
     report = synthetic_report_1000()
+    report.requests[0].sent = False  # Unsent compact records still carry the marker.
     path, _ = write_report(report, tmp_path / 'saved')
     raw = json.loads(path.read_text())
     assert raw['performance']
@@ -42,9 +43,9 @@ async def test_default_payload_and_selected_window_are_bounded(tmp_path):
         assert evidence.status_code == 200
         assert evidence.json()['output_events']
         assert 'output_events' not in data['requests'][0]
-        # Compact rows omit absent derived metrics; explicit sent=false survives.
-        assert 'generation_tokens_per_second' not in data['requests'][0]
+        assert data['requests'][0]['generation_tokens_per_second'] is None
         assert data['requests'][0]['sent'] is False
+        assert 'sent' not in data['requests'][1]
         assert (await client.get('/api/runs/saved/performance', params={'window':'missing'})).status_code == 422
         assert (await client.get('/api/runs/saved/performance', params={'target':'missing'})).status_code == 422
 

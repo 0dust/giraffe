@@ -43,7 +43,7 @@ def synthetic_report_1000():
             records.append(RequestRecord(id=f"SYNTHETIC-{number:04d}", target="SYNTHETIC", fixture_id="SYNTHETIC",
                 scenario=condition, condition_id=condition, check_ids=["load"],
                 started_at=(epoch+timedelta(seconds=now)).isoformat(), completed_at=(epoch+timedelta(seconds=finish)).isoformat(),
-                status="completed", valid=True, score=None, timing_schema=1, first_token_reason=None,
+                status="completed", sent=True, valid=True, score=None, timing_schema=1, first_token_reason=None,
                 first_token_ms=first*1000, first_output_ms=first*1000, last_output_ms=(first+streaming)*1000,
                 stream_end_ms=elapsed*1000, dispatch_ms=now*1000, completed_ms=finish*1000,
                 timing_start_ms=now*1000+1, elapsed_ms=elapsed*1000, answer_reads=2, answer_chunks=2,

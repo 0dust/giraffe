@@ -504,8 +504,14 @@ async def test_replayed_slot_uses_saved_config_limit_and_logs_once(tmp_path, cap
         record._budget_request_slot = slot
         writer.record_finished(record)
     writer.close()
+    journal = directory / "evidence.jsonl"
+    original = journal.read_bytes()
     async with browser(tmp_path) as client:
         for _ in range(2):
             detail = (await client.get('/api/runs/cli')).json()
             assert detail["live_requests"] == []
+        journal.write_text("\n")  # Truncation rebuilds the replay cache entry.
+        await client.get('/api/runs/cli')
+        journal.write_bytes(original)
+        assert (await client.get('/api/runs/cli')).json()["live_requests"] == []
         assert sum("slot invariant violated (replay)" in record.message for record in caplog.records) == 1

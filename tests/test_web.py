@@ -1321,6 +1321,11 @@ async def test_web_counts_validate_once_at_ingest_and_not_on_polls(tmp_path, mon
 
     async def waiting(configuration, *, progress, stop_event):
         progress({"event": "request_started", "budget_request_slot": 0, "request_counts": counts})
+        progress({"event": "progress", "elapsed_seconds": 1})
+        progress({"event": "scenario_started", "scenario": "next"})
+        progress({"event": "progress", "request_counts": {"available": False}})
+        progress({"event": "progress", "request_counts": {
+            "available": False, "complete": False, "saved_observations": 0}})
         ready.set()
         await stop_event.wait()
         return report(configuration, cancelled=True)
@@ -1340,7 +1345,15 @@ async def test_web_counts_validate_once_at_ingest_and_not_on_polls(tmp_path, mon
         assert sum(value is counts for value in calls) == 1
         # The stored normalised copy is not validated again either.
         assert sum(value == counts for value in calls) == 1
+        from tests.test_ux_results import run_render_checks
+
+        detail["request_plan"] = {"planned_total": 2}
+        run_render_checks("state.detail=" + json.dumps(detail) + ";renderDetail();"
+                          "assert.match($('.live-progress').textContent,/1 of ~2 planned requests/);"
+                          "assert.doesNotMatch($('.live-progress').textContent,/counts unavailable/);", dom=True)
         await client.post(f"/api/runs/{identifier}/cancel", json={})
+        stopped = (await client.get(f"/api/runs/{identifier}/events?after=0")).json()
+        assert stopped["progress"]["request_counts"] == counts
 
 
 async def test_out_of_range_slot_is_rejected_and_logged_once_in_live_and_delta(tmp_path, monkeypatch, caplog):
