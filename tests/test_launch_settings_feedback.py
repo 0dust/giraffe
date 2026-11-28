@@ -264,6 +264,34 @@ def test_unrelated_experiment_qualifies_redacted_commands_and_model_operands(old
     assert any(message.startswith(warning) for message in diff["launch_comparison"]["warnings"])
 
 
+@pytest.mark.parametrize("command,warning", [
+    (["vllm", "serve", "[redacted]"], "The launch model operand is redacted"),
+    ("vllm serve '[re''dacted]' --max-num-seqs=16", "The launch model operand is redacted"),
+    (["[redacted]", "--mem-fraction-static=[redacted]"], "Launch evidence is redacted"),
+    ("'[redacted]' '--mem-fraction-static=[redacted]'", "Launch evidence is redacted"),
+    ("'[re''dacted]' --mem-fraction-static='[re''dacted]'", "Launch evidence is redacted"),
+])
+@pytest.mark.parametrize("context", ["same", "different_scope", "baseline_only", "current_only"])
+def test_redacted_evidence_qualifies_independently_of_other_launch_sources(command, warning, context):
+    before = evidence(command, **{"runtime.image": "image-old"})
+    after = evidence(command, **{"runtime.image": "image-new"})
+    after["intended_change"] = "runtime.image"
+    if context == "different_scope":
+        after["fields"][LAUNCH_FIELD]["configured"]["scope"] = "another replica"
+    elif context.endswith("_only"):
+        for side, snapshot in (("baseline", before), ("current", after)):
+            sources = {"configured": {"value": PREFIX}}
+            if context == f"{side}_only":
+                sources["reported"] = {"value": command}
+            snapshot["fields"][LAUNCH_FIELD] = sources
+
+    diff = deployment_diff(after, before)
+    assert diff["confounded"] is (context != "same")
+    assert diff["launch_comparison"]["status"] == "unverified"
+    [message] = diff["launch_comparison"]["warnings"]
+    assert message.startswith(warning)
+
+
 def test_whole_field_only_does_not_check_redacted_options_individually():
     before = evidence([*PREFIX, "--dtype=[redacted]"])
     after = evidence([*PREFIX, "--dtype=float16"])

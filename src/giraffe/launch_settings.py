@@ -124,31 +124,38 @@ def launch_evidence_at_limit(value):
 
 
 def _parse(value, allowed_flags):
-    warnings, settings, order = [], {}, []
+    """Return parsed settings, their order, parse warnings, and retained evidence warnings."""
+    warnings, redactions, settings, order = [], [], {}, []
     if launch_evidence_at_limit(value):
-        return None, [], [LAUNCH_SIZE_WARNING]
+        return None, [], [], [LAUNCH_SIZE_WARNING]
     try:
         args = shlex.split(value) if isinstance(value, str) else value
     except ValueError:
         args = None
     if launch_evidence_at_limit(args):
-        return None, [], [LAUNCH_SIZE_WARNING]
+        return None, [], [], [LAUNCH_SIZE_WARNING]
+    # Shell quoting can split a redaction marker across adjacent string fragments.
+    has_redaction = _redacted(value if args is None else args)
     if args == ["[redacted]"]:
-        return None, [], [REDACTED_LAUNCH_WARNING]
+        return None, [], [], [REDACTED_LAUNCH_WARNING]
     if (not isinstance(args, list)
             or not all(isinstance(arg, str) for arg in args)
             or args[:2] != ["vllm", "serve"] or len(args) < 3
             or looks_like_launch_option(args[2], vllm=True)):
-        return None, [], ["Individual launch comparison requires a bounded vllm serve command with a model operand."]
+        return None, [], [
+            "Individual launch comparison requires a bounded vllm serve command with a model operand."
+        ], [REDACTED_LAUNCH_WARNING] if has_redaction else []
     settings["model operand"] = [args[2]]
     if _redacted(args[2]):
-        warnings.append(REDACTED_MODEL_WARNING)
+        redactions.append(REDACTED_MODEL_WARNING)
     index = 3
     while index < len(args):
         name, equals, value = args[index].partition("=")
         flag = launch_option_name(name, vllm=True)
         if flag is None:
-            if _redacted(args[index]) or looks_like_launch_option(args[index], vllm=True):
+            if _redacted(args[index]):
+                redactions.append(REDACTED_POSITIONAL_WARNING)
+            elif looks_like_launch_option(args[index], vllm=True):
                 warnings.append(REDACTED_POSITIONAL_WARNING)
             else:
                 warnings.append("Additional positional launch arguments are unverified.")
@@ -163,6 +170,7 @@ def _parse(value, allowed_flags):
         if flag in settings:
             warnings.append(f"Duplicate launch flag {flag}; precedence is unverified.")
         order.append(flag)
+        retained_redaction = _redacted(value)
         if flag not in allowed_flags and flag != "--speculative-config":
             warnings.append(f"Unknown launch option {flag}; its value and effects are unverified.")
             value = "[redacted]"
@@ -173,7 +181,8 @@ def _parse(value, allowed_flags):
         elif flag not in BOOLEAN_FLAGS and value is True:
             warnings.append(f"Missing launch value for {flag}.")
         if _redacted(value):
-            warnings.append(f"The value of {flag} is redacted; equivalence is unverified.")
+            (redactions if retained_redaction else warnings).append(
+                f"The value of {flag} is redacted; equivalence is unverified.")
         else:
             try:
                 if flag == "--speculative-config":
@@ -193,7 +202,10 @@ def _parse(value, allowed_flags):
         index += 1
     if {"--enable-prefix-caching", "--no-enable-prefix-caching"} <= settings.keys():
         warnings.append("Competing prefix-caching flags; precedence is unverified.")
-    return {flag: values[0] if len(values) == 1 else values for flag, values in settings.items()}, order, warnings
+    if has_redaction and not redactions:
+        redactions.append(REDACTED_LAUNCH_WARNING)
+    parsed = {flag: values[0] if len(values) == 1 else values for flag, values in settings.items()}
+    return parsed, order, warnings, redactions
 
 
 def _sources(snapshot, field):
@@ -208,29 +220,6 @@ def _same_context(before, after, *, allow_metadata_file_provenance=False):
             or allow_metadata_file_provenance
             and all(value in user_declared_provenances for value in provenance)) and all(
         before.get(key) == after.get(key) for key in ("scope", "status"))
-
-
-def _comparable_redaction_warnings(before, after, allowed_flags):
-    flags, warnings = set(), set()
-    for source in before.keys() & after.keys():
-        old, new = before[source], after[source]
-        if not _same_context(old, new):
-            continue
-        left, _, old_warnings = _parse(old.get("value"), allowed_flags)
-        right, _, new_warnings = _parse(new.get("value"), allowed_flags)
-        for warning in (REDACTED_LAUNCH_WARNING, REDACTED_POSITIONAL_WARNING):
-            if warning in old_warnings or warning in new_warnings:
-                warnings.add(warning)
-        if any(_redacted(settings.get(TENSOR_PARALLEL_FLAG)) for settings in (left, right) if settings):
-            flags.add(TENSOR_PARALLEL_FLAG)
-        if left is None or right is None:
-            continue
-        if left["model operand"] != right["model operand"] and (
-                REDACTED_MODEL_WARNING in old_warnings or REDACTED_MODEL_WARNING in new_warnings):
-            warnings.add(REDACTED_MODEL_WARNING)
-        flags.update(flag for flag in left.keys() & right.keys()
-                     if flag.startswith("--") and (_redacted(left[flag]) or _redacted(right[flag])))
-    return sorted(warnings) + [f"The value of {flag} is redacted; equivalence is unverified." for flag in sorted(flags)]
 
 
 def _with_legacy_speculation_redacted(before, after):
@@ -272,10 +261,16 @@ def compare_launch_settings(current, baseline, intended, allowed_flags, *, maske
         for source in before.keys() & after.keys()
     } if not declared and not whole_field else {}
     if not declared and not any(value is not None for value in legacy_redacted_args.values()):
-        if not whole_field and any(intended):
-            result["warnings"].extend(_comparable_redaction_warnings(before, after, allowed_flags))
-        if any(launch_evidence_at_limit(row.get("value")) for row in (*before.values(), *after.values())):
-            result["warnings"].append(LAUNCH_SIZE_WARNING)
+        check_redaction = not whole_field and any(intended)
+        for row in (*before.values(), *after.values()):
+            value = row.get("value")
+            if check_redaction:
+                # Masked values cannot establish equivalence, even for identical retained commands.
+                _, _, _, evidence_warnings = _parse(value, allowed_flags)
+                result["warnings"].extend(evidence_warnings)
+            elif launch_evidence_at_limit(value):
+                result["warnings"].append(LAUNCH_SIZE_WARNING)
+        result["warnings"] = list(dict.fromkeys(result["warnings"]))
         if result["warnings"] and result["warnings"] != [WHOLE_FIELD_WARNING]:
             result["status"] = "unverified"
         return result, set(), False
@@ -284,9 +279,9 @@ def compare_launch_settings(current, baseline, intended, allowed_flags, *, maske
     comparable = bool(before and after and before.keys() == after.keys())
     for source in sorted(before.keys() | after.keys()):
         old, new = before.get(source, {}), after.get(source, {})
-        left, left_order, warnings = _parse(old.get("value"), allowed_flags)
-        right, right_order, more = _parse(new.get("value"), allowed_flags)
-        result["warnings"].extend(warnings + more)
+        left, left_order, old_warnings, old_evidence = _parse(old.get("value"), allowed_flags)
+        right, right_order, new_warnings, new_evidence = _parse(new.get("value"), allowed_flags)
+        result["warnings"].extend(old_warnings + old_evidence + new_warnings + new_evidence)
         parsed[source] = (left, right)
         if not _same_context(old, new):
             comparable = False
@@ -294,7 +289,7 @@ def compare_launch_settings(current, baseline, intended, allowed_flags, *, maske
         if left is None or right is None:
             comparable &= (
                 not declared and old.get("value") == new.get("value")
-                and LAUNCH_SIZE_WARNING not in warnings and LAUNCH_SIZE_WARNING not in more
+                and LAUNCH_SIZE_WARNING not in old_evidence and LAUNCH_SIZE_WARNING not in new_evidence
             )
             continue
         if [flag for flag in left_order if flag in right] != [flag for flag in right_order if flag in left]:

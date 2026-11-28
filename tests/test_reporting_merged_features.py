@@ -1,11 +1,17 @@
 """Merged deployment and telemetry features remain visible without embedded JSON."""
 
+import asyncio
 import json
+import shlex
+import time
 from html import unescape
 
 import pytest
 
 from giraffe.cli import load_report, main
+from giraffe.deployment import snapshot as deployment_snapshot
+from giraffe.launch_settings import LAUNCH_FIELD
+from giraffe.models import RunConfig
 from giraffe.reporting import compare_baseline, reproduction_export, write_report
 from tests.test_reporting import make_report
 
@@ -105,6 +111,79 @@ def test_launch_setting_results_survive_json_html_and_cli(mode, tmp_path, capsys
         else:
             assert "--speculative-config" in output and "intended" in output
     assert diff["confounded"] is (mode in {"batching", "unverified"})
+
+
+LAUNCH_EVIDENCE_CASES = {
+    "sglang-argv": (True, False),
+    "sglang-quoted": (True, False),
+    "vllm-redacted-model": (True, False),
+    "vllm-unchanged": (False, False),
+    "vllm-changed-tp": (False, True),
+    "vllm-redacted-model-and-changed-tp": (True, True),
+}
+
+
+async def saved_launch_evidence_comparison(tmp_path, mode):
+    redacted, confounded = LAUNCH_EVIDENCE_CASES[mode]
+    runs = []
+    for arm, fraction, count in (("baseline", "0.7", "2"), ("current", "0.8", "4")):
+        deployment = {"runtime": {"image": arm}, "intended_change": "runtime.image"}
+        if mode.startswith("sglang"):
+            prefix = "python -m sglang.launch_server --model-path example/model --mem-fraction-static"
+            command = f"{prefix} '{fraction}'" if mode == "sglang-quoted" else [*prefix.split(), fraction]
+            metadata = tmp_path / f"{arm}-metadata.json"
+            metadata.write_text(json.dumps({"serving": {"launch_arguments": command}}))
+            deployment["metadata_file"] = str(metadata)
+        else:
+            model = f"example/{arm}-model" if redacted else "example/model"
+            command = ["vllm", "serve", model, "-tp", count if confounded else "2"]
+            if redacted:
+                deployment["launch_command"] = command
+            else:
+                deployment["serving"] = {"launch_arguments": command}
+        config = RunConfig(targets=[{
+            "name": "local", "url": "http://localhost:1/v1", "model": "alias", "deployment": deployment,
+        }])
+        evidence = await deployment_snapshot(config.targets[0], config, time.monotonic() + 5, asyncio.Event())
+        report = make_report(arm)
+        report.manifest["config"] = config.model_dump(mode="json")
+        report.observations = {"targets": {"local": {"deployment": evidence}}}
+        runs.append(report)
+    baseline_path, _ = write_report(runs[0], tmp_path / "baseline")
+    return compare_baseline(runs[1], load_report(baseline_path))
+
+
+@pytest.mark.parametrize("mode", LAUNCH_EVIDENCE_CASES)
+async def test_saved_launch_evidence_controls_deployment_summary(tmp_path, mode):
+    redacted, confounded = LAUNCH_EVIDENCE_CASES[mode]
+    comparison = await saved_launch_evidence_comparison(tmp_path, mode)
+    json_path, html_path = write_report(comparison, tmp_path / "comparison", html=True)
+    diff = json.loads(json_path.read_text())["baseline"]["targets"][0]["configuration_diff"]
+    launch = next(row for row in diff["fields"] if row["field"] == LAUNCH_FIELD)
+    old, new = [launch[side]["configured"]["value"] for side in ("baseline", "current")]
+    assert (old != new) == confounded
+    for command in (old, new):
+        assert isinstance(command, str) == (mode == "sglang-quoted")
+        argv = shlex.split(command) if isinstance(command, str) else command
+        if mode.startswith("sglang"):
+            assert "--mem-fraction-static=[redacted]" in argv
+        else:
+            assert argv[2] == ("[redacted]" if redacted else "example/model")
+    expected_changes = {"runtime.image", LAUNCH_FIELD} if confounded else {"runtime.image"}
+    assert {row["field"] for row in diff["fields"] if row["change"] != "no_observed_change"} == expected_changes
+    assert diff["confounded"] is confounded
+    launch_comparison = diff["launch_comparison"]
+    assert launch_comparison["status"] == ("unverified" if redacted else "not_requested")
+    html = unescape(html_path.read_text())
+    section = html.split('<section id="baseline">', 1)[1].split('</section>', 1)[0]
+    assert ("Launch setting comparison unverified" in section) == redacted
+    assert ("(one intended change)" in section) == (not (redacted or confounded))
+    assert ("Confounded: multiple unrelated changes" in section) == confounded
+    warnings = launch_comparison["warnings"]
+    if redacted:
+        assert any("redacted" in warning and warning in section for warning in warnings)
+    else:
+        assert not warnings
 
 
 @pytest.mark.parametrize(("intended", "confounded"), [(FIELDS[-1], True), (FIELDS, False)])
