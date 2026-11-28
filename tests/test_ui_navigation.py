@@ -118,6 +118,7 @@ const page=browser();await page.run('init()');
 await page.run(`
 (async()=>{
 state.detail={id:'live',state:'running',config:state.config,
+ progress:{request_counts:{available:true,complete:true,sent:254,budget_counted:254,budget_counted_unsent:0,budget_exempt:0,saved_observations:250,budget_exempt_by_reason:{},targets:{}}},
  live_requests:Array.from({length:254},(_,slot)=>({slot,status:slot<250?'completed':'running'}))};
 state.detail.config.max_requests=600;renderDetail();assert.equal(state.mosaicPage,1);
 let focused=0;
@@ -153,6 +154,7 @@ const click=action=>listeners.click({target:{closest:q=>q==='[data-action]'?{dat
 for(const action of ['mosaic-live','mosaic-next','mosaic-prev']){
  document.activeElement=null;state.mosaicFollow=false;state.mosaicPage=action==='mosaic-prev'?2:0;
  state.detail={id:'live',state:'running',config:{...state.config,max_requests:960},
+  progress:{request_counts:{available:true,complete:true,sent:254,budget_counted:254,budget_counted_unsent:0,budget_exempt:0,saved_observations:250,budget_exempt_by_reason:{},targets:{}}},
   live_requests:Array.from({length:254},(_,slot)=>({slot,status:slot<250?'completed':'running'}))};
  renderDetail();await click(action);
  assert.equal(state.mosaicPage,1);assert.equal(state.mosaicFollow,true);assert.equal(document.activeElement,spots[240]);

@@ -3829,9 +3829,14 @@ function knownCounts(value) {
   const validTarget=value=>object(value)&&['sent','budget_counted','budget_counted_unsent','budget_exempt','saved_observations'].every(key=>count(value[key]))&&object(value.budget_exempt_by_reason)&&Object.entries(value.budget_exempt_by_reason).every(([reason,value])=>['preflight','restart_readiness'].includes(reason)&&count(value));
   return object(value)&&value.available===true&&typeof value.complete==='boolean'&&validTarget(value)&&object(value.targets)&&Object.values(value.targets).every(validTarget)?value:null;
 }
+function bestKnownCounts(report,detail=state.detail) {
+  for(const source of [report?.observations?.request_counts,detail?.summary?.request_counts,detail?.progress?.request_counts]){
+    const counts=knownCounts(source);if(counts)return counts;
+  }
+  return null;
+}
 function countedRequests(report,detail=state.detail) {
-  const counts=knownCounts(report?.observations?.request_counts ?? detail?.summary?.request_counts ?? detail?.progress?.request_counts);
-  return counts?.budget_counted ?? null;
+  return bestKnownCounts(report,detail)?.budget_counted ?? null;
 }
 
 function shortReason(reason) {
@@ -4318,8 +4323,8 @@ function showFailingRequests() {
   const table=$('.check-detail .evidence-table');table?.setAttribute('tabindex','-1');table?.scrollIntoView?.({block:'start'});table?.focus({preventScroll:true});
 }
 
-function renderRequestCounts(report) {
-  const counts=report.observations?.request_counts;
+function renderRequestCounts(report,detail=null) {
+  const counts=bestKnownCounts(report,detail) || report.observations?.request_counts || detail?.summary?.request_counts;
   if(!counts)return '<p class="hint">Requests: not recorded for this report</p>';
   const saved=`${number(counts.saved_observations)} saved ${counts.saved_observations===1?'observation':'observations'}`;
   if(counts.available===false&&counts.complete===false&&Number.isSafeInteger(counts.saved_observations)&&counts.saved_observations>=0)return `<p class="hint">Requests: counts unavailable for this recovered run · ${saved}</p>`;
@@ -4344,8 +4349,8 @@ function renderDetail() {
   const report=d.report;
   if(!report){
     const hadTestDialog=$('#test-dialog')?.open;if(hadTestDialog)closeConditionDialog({reveal:false});
-    const summary=d.summary,records=d.live_requests||[],partial=summaryReport(d);
-    patchHTML($('#main'),`<div class="page-heading"><div><div class="eyebrow">Run ${escape(d.id)}</div><h1>${userStopped(partial)?'Stopped by you':'Run could not finish'}</h1>${userStopped(partial)?renderGuidance(partial,d):`<p>${summary?'Only a summary was saved; request evidence may be unavailable.':'No report was saved. Review the error and settings before trying again.'}</p>`}</div></div>${notice(d.error || 'The runner did not produce a report.','error')}${renderReportToolbar()}${renderPerformance()}<section id="report-results" role="tabpanel" aria-labelledby="tab-results" data-live-key="report-results" ${reportView.tab==='results'?'':'hidden'}>${summary?`<section class="panel saved-summary"><h2>Saved summary</h2><p>Recorded overall: ${escape(statusLabels[summary.overall] || summary.overall)}${knownCounts(summary.request_counts)?` · ${counted(summary.request_counts.sent,'request')} sent`:""}</p>${renderRequestCounts({observations:{request_counts:summary.request_counts}})}<section id="result-content">${renderChecks(partial)}</section></section>`:'<section class="panel check-verdict-summary"><h2>Checks & evidence</h2><p>No final check verdicts were saved.</p></section>'}${renderTests(records,{conditions:d.live_conditions||[],live:false})}${renderLiveLoadResults(d)}${renderAllRequests(records)}${renderDiagnostics(null,d)}</section><div class="actions">${keepButton()}${summary?resultActions(partial):''}<button class="button" data-action="rerun">Run again</button><a class="button" href="#runs">Back to runs</a></div>`);syncAllRequestsFilter();syncPerformanceSelection();if(hadTestDialog)$(`#tab-${reportView.tab}`)?.focus({preventScroll:true});return;
+    const summary=d.summary,records=d.live_requests||[],partial=summaryReport(d),counts=bestKnownCounts(null,d);
+    patchHTML($('#main'),`<div class="page-heading"><div><div class="eyebrow">Run ${escape(d.id)}</div><h1>${userStopped(partial)?'Stopped by you':'Run could not finish'}</h1>${userStopped(partial)?renderGuidance(partial,d):`<p>${summary?'Only a summary was saved; request evidence may be unavailable.':'No report was saved. Review the error and settings before trying again.'}</p>`}</div></div>${notice(d.error || 'The runner did not produce a report.','error')}${renderReportToolbar()}${renderPerformance()}<section id="report-results" role="tabpanel" aria-labelledby="tab-results" data-live-key="report-results" ${reportView.tab==='results'?'':'hidden'}>${summary?`<section class="panel saved-summary"><h2>Saved summary</h2><p>Recorded overall: ${escape(statusLabels[summary.overall] || summary.overall)}${counts?` · ${counted(counts.sent,'request')} sent`:""}</p>${renderRequestCounts(partial,d)}<section id="result-content">${renderChecks(partial)}</section></section>`:'<section class="panel check-verdict-summary"><h2>Checks & evidence</h2><p>No final check verdicts were saved.</p></section>'}${renderTests(records,{conditions:d.live_conditions||[],live:false})}${renderLiveLoadResults(d)}${renderAllRequests(records)}${renderDiagnostics(null,d)}</section><div class="actions">${keepButton()}${summary?resultActions(partial):''}<button class="button" data-action="rerun">Run again</button><a class="button" href="#runs">Back to runs</a></div>`);syncAllRequestsFilter();syncPerformanceSelection();if(hadTestDialog)$(`#tab-${reportView.tab}`)?.focus({preventScroll:true});return;
   }
   const config=reportConfig(report),checks=report.checks.filter(c=>c.id!=='baseline');
   const required=checks.filter(c=>c.required);
@@ -4356,7 +4361,7 @@ function renderDetail() {
   const savedBaseline=(state.baselines || []).find(item=>item.run_id===d.id);
   const entering=state.enteredRun!==d.id;state.enteredRun=d.id;
   const compareButton=d.state===RUN.COMPLETED?`<button class="button" data-action="compare-saved">${report.baseline?'Change baseline':'Compare with baseline'}</button>`:'';
-  patchHTML($('#main'),`<div class="page-heading result-heading ${absolute}${entering?' is-entering':''}"><div><div class="eyebrow">Run <span class="mono">${escape(d.id)}</span></div><h1>${escape(absolute==='error'?'Run could not finish':mainFinding(report))}</h1>${renderGuidance(report,d)}<div class="run-meta"><span><strong>${escape((config.targets || []).map(t=>t.model).join(', '))}</strong></span><span>${date(report.started_at)}</span><span>${duration(report)}</span></div>${renderRequestCounts(report)}<p class="hint">${escape((config.targets || []).map(t=>t.url).filter(Boolean).join(' · '))}</p></div><div class="actions">${savedBaseline?`<p class="baseline-saved"><span aria-hidden="true">✓</span> Saved as baseline <strong>${escape(savedBaseline.name)}</strong></p>`:''}${resultActions(report,{completePass,savedBaseline})}<button class="button" data-action="rerun">${icon('repeat')} Run again</button>${compareButton}</div></div>
+  patchHTML($('#main'),`<div class="page-heading result-heading ${absolute}${entering?' is-entering':''}"><div><div class="eyebrow">Run <span class="mono">${escape(d.id)}</span></div><h1>${escape(absolute==='error'?'Run could not finish':mainFinding(report))}</h1>${renderGuidance(report,d)}<div class="run-meta"><span><strong>${escape((config.targets || []).map(t=>t.model).join(', '))}</strong></span><span>${date(report.started_at)}</span><span>${duration(report)}</span></div>${renderRequestCounts(report,d)}<p class="hint">${escape((config.targets || []).map(t=>t.url).filter(Boolean).join(' · '))}</p></div><div class="actions">${savedBaseline?`<p class="baseline-saved"><span aria-hidden="true">✓</span> Saved as baseline <strong>${escape(savedBaseline.name)}</strong></p>`:''}${resultActions(report,{completePass,savedBaseline})}<button class="button" data-action="rerun">${icon('repeat')} Run again</button>${compareButton}</div></div>
   ${renderBaselineSummary(report,absolute)}
   ${d.error?notice(d.error,d.state===RUN.ERROR?'error':'warning'):''}${storageOmission(report)}${d.auto_cleanup?.deleted?.length?notice(`Automatic cleanup deleted runs: ${d.auto_cleanup.deleted.map(escape).join(', ')}`):''}${renderReportToolbar()}${renderPerformance()}
   <section id="report-results" role="tabpanel" aria-labelledby="tab-results" data-live-key="report-results" ${reportView.tab==='results'?'':'hidden'}>${renderResultsJump()}
@@ -4849,7 +4854,7 @@ function renderLive() {
   state.liveRendered=state.detail.id;
   state.mosaicAnimated=state.detail.id;
   const d=state.detail,p=d.progress || {},c=d.config || reportConfig(d.report),events=(d.events || []).filter(e=>!String(e.event || '').startsWith('condition_')),last=events.at(-1) || {},progress={...last,...p};
-  const counts=knownCounts(progress.request_counts),secs=progress.elapsed_seconds || 0,stopping=d.state===RUN.STOPPING,stopPending=state.stopPending?.id===d.id;
+  const counts=bestKnownCounts(d.report,d),secs=progress.elapsed_seconds || 0,stopping=d.state===RUN.STOPPING,stopPending=state.stopPending?.id===d.id;
   const judging=progress.phase==='judging'||String(progress.event || '').startsWith('judging_');
   const judgeDone=progress.judge_calls_completed || 0,judgeTotal=progress.judge_calls_total || 0;
   const planned=plannedRequests(d),confirmation=state.stopConfirmation?.id===d.id&&Date.now()<state.stopConfirmation.until;

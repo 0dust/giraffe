@@ -111,6 +111,37 @@ def test_cli_forwards_real_preflight_count(tmp_path, monkeypatch, capsys):
     assert "request_count" not in result
 
 
+@pytest.mark.parametrize("counts", [{"available": False}, {"available": True, "sent": "invalid"}])
+@pytest.mark.parametrize("export_failure", [False, True])
+def test_cli_json_never_emits_invalid_request_counts(tmp_path, monkeypatch, capsys, counts, export_failure):
+    async def run(config, **options):
+        value = report()
+        value.observations["request_counts"] = counts
+        return value
+
+    monkeypatch.setattr("giraffe.cli._run", run)
+    if export_failure:
+        def fail(*args, **kwargs):
+            raise OSError("cannot write report")
+        monkeypatch.setattr("giraffe.reporting.write_report", fail)
+    result = main(["run", "--url", "http://server", "--model", "tiny", "--checks", "access",
+                   "--skip-preflight", "--output", str(tmp_path / "run"), "--json"])
+    assert result == (4 if export_failure else 0)
+    assert json.loads(capsys.readouterr().out)["request_counts"] is None
+
+
+async def test_cli_stream_normalises_invalid_counts(monkeypatch, capsys):
+    async def run(config, *, progress, **options):
+        progress({"event": "request_started", "request_counts": {"available": True, "sent": "invalid"}})
+        return report()
+
+    monkeypatch.setattr("giraffe.runner.run_suite", run)
+    config = RunConfig(targets=[Target(name="local", url="http://server", model="tiny")])
+    await _run(config, json_progress=True)
+    event = json.loads(capsys.readouterr().err)
+    assert event["request_counts"] is None
+
+
 def test_counted_unsent_and_recovered_suffix_on_text_and_html():
     value = report()
     counts = value.observations["request_counts"]

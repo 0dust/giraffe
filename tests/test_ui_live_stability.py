@@ -394,3 +394,31 @@ for(const raw of [undefined,null,{}, {available:true},requestCounts({sent:-1}),r
 }
 assert.equal(countedRequests({}, {progress:{request_counts:requestCounts({budget_counted:4})}}),4);
 """, dom=True)
+
+
+def test_best_known_counts_skips_unknown_sources_in_authority_order():
+    run_render_checks(r"""
+const live=requestCounts({sent:4,budget_counted:4});
+const saved=requestCounts({sent:3,budget_counted:3});
+const reportCounts=requestCounts({sent:2,budget_counted:2});
+const unavailable={available:false,complete:false,saved_observations:1};
+const currentReport={observations:{request_counts:unavailable},abort_reason:'cancelled by user',checks:[]};
+const currentDetail={report:currentReport,summary:{request_counts:{available:true}},progress:{request_counts:live},request_plan:{planned_total:5}};
+assert.equal(bestKnownCounts(currentReport,currentDetail).budget_counted,4);
+assert.equal(countedRequests(currentReport,currentDetail),4);
+assert.match(renderGuidance(currentReport,currentDetail),/4 of 5 planned requests counted/);
+assert.match(renderRequestCounts(currentReport,currentDetail),/4 sent · 4 counted/);
+assert.equal(bestKnownCounts(currentReport,{...currentDetail,summary:{request_counts:saved}}).budget_counted,3);
+assert.equal(bestKnownCounts({observations:{request_counts:reportCounts}},currentDetail).budget_counted,2);
+state.detail={...currentDetail,id:'best-counts',state:'running',config:{targets:[],max_requests:5},live_requests:[{slot:0,status:'running'}]};
+renderDetail();
+assert.match($('.live-progress').textContent,/4 of ~5 planned requests/);
+assert.equal($$('.request-mosaic .reserved').length,3);
+assert.equal($$('.request-mosaic .idle').length,1);
+state.detail.summary.request_counts=saved;renderDetail();
+assert.match($('.live-progress').textContent,/3 of ~5 planned requests/);
+assert.equal($$('.request-mosaic .reserved').length,2);
+state.detail.report.observations.request_counts=reportCounts;renderDetail();
+assert.match($('.live-progress').textContent,/2 of ~5 planned requests/);
+assert.equal($$('.request-mosaic .reserved').length,1);
+""", dom=True)

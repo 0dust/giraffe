@@ -490,3 +490,22 @@ def test_unsent_terminal_updates_retained_and_evicted_running_slots(monkeypatch,
     assert list(job["requests"]) == [1]
     _track_live_request(job, {"event": "request_started", "budget_request_slot": 2}, 2)
     assert "Request budget slot invariant violated" in caplog.text
+
+
+async def test_replayed_slot_uses_saved_config_limit_and_logs_once(tmp_path, caplog):
+    from giraffe.models import RequestRecord
+    directory = tmp_path / "cli"
+    write_metadata(directory, {"id": "cli", "state": "running", "heartbeat_at": _now(),
+        "owner_pid": os.getpid(), "owner_host": socket.gethostname(), "config": config(max_requests=1)})
+    writer = EvidenceWriter(directory, manifest={"config": config(max_requests=1)})
+    for slot in (1, 2):
+        record = RequestRecord(id=f"invalid-{slot}", target="local", fixture_id="short", scenario="warm",
+            check_ids=["serving"], started_at=_now(), status="failed", sent=False)
+        record._budget_request_slot = slot
+        writer.record_finished(record)
+    writer.close()
+    async with browser(tmp_path) as client:
+        for _ in range(2):
+            detail = (await client.get('/api/runs/cli')).json()
+            assert detail["live_requests"] == []
+        assert sum("slot invariant violated (replay)" in record.message for record in caplog.records) == 1

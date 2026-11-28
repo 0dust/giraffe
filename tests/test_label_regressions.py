@@ -37,7 +37,7 @@ async def test_plain_requests_keep_empty_workloads_and_live_record_contract():
                 "read_output_tokens_source",
                 "max_stream_gap_ms", "input_tokens", "output_tokens",
                 "completion_tokens", "reasoning_tokens", "cached_prompt_tokens", "finish_reason",
-                "request_timeout_seconds", "termination_reason", "termination_limit_seconds"}
+                "request_timeout_seconds", "termination_reason", "termination_limit_seconds", "sent"}
     for event in events:
         assert "workload" not in event
         if event["event"] == "request_completed":

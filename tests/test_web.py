@@ -1064,7 +1064,7 @@ async def test_dropped_offer_count_in_live_judging_and_reopened_payload(tmp_path
         assert detail["state"] == "running"
         assert detail["progress"]["phase"] == "judging"
         assert detail["progress"]["request_counts"] == counts
-        assert detail["events"][0]["request_counts"] == counts
+        assert all("request_counts" not in event for event in detail["events"])
         for value in [detail["progress"], *detail["events"]]:
             assert not {"budget_used", "sent", "budget_exempt", "attempted", "dropped_offers"} & value.keys()
         release.set()
@@ -1304,3 +1304,68 @@ def test_compact_api_report_keeps_explicit_unsent_record():
     saved = report(RunConfig.model_validate(config()))
     saved.requests[0].sent = False
     assert _api_report(saved)["requests"][0]["sent"] is False
+
+
+async def test_web_counts_validate_once_at_ingest_and_not_on_polls(tmp_path, monkeypatch):
+    from giraffe import web
+    ready = threading.Event()
+    calls = []
+    original = web.known_request_counts
+    target = {"sent": 1, "budget_counted": 1, "budget_counted_unsent": 0,
+              "budget_exempt": 0, "saved_observations": 0, "budget_exempt_by_reason": {}}
+    counts = {**target, "available": True, "complete": True, "targets": {"local": target}}
+
+    def counting(value):
+        calls.append(value)
+        return original(value)
+
+    async def waiting(configuration, *, progress, stop_event):
+        progress({"event": "request_started", "budget_request_slot": 0, "request_counts": counts})
+        ready.set()
+        await stop_event.wait()
+        return report(configuration, cancelled=True)
+
+    monkeypatch.setattr(web, "known_request_counts", counting)
+    monkeypatch.setattr(web, "run_suite", waiting)
+    async with browser(tmp_path) as client:
+        identifier = await start(client)
+        assert await asyncio.to_thread(ready.wait, 2)
+        for _ in range(3):
+            detail = (await client.get(f"/api/runs/{identifier}")).json()
+            assert detail["progress"]["request_counts"] == counts
+            assert all("request_counts" not in event for event in detail["events"])
+        delta = (await client.get(f"/api/runs/{identifier}/events?after=0")).json()
+        assert delta["progress"]["request_counts"] == counts
+        assert all("request_counts" not in event for event in delta["events"])
+        assert sum(value is counts for value in calls) == 1
+        # The stored normalised copy is not validated again either.
+        assert sum(value == counts for value in calls) == 1
+        await client.post(f"/api/runs/{identifier}/cancel", json={})
+
+
+async def test_out_of_range_slot_is_rejected_and_logged_once_in_live_and_delta(tmp_path, monkeypatch, caplog):
+    from giraffe import web
+    ready = threading.Event()
+
+    async def waiting(configuration, *, progress, stop_event):
+        for _ in range(2):
+            progress({"event": "request_completed", "budget_request_slot": 2,
+                      "request": {"id": "invalid", "status": "failed", "sent": False}})
+        ready.set()
+        await stop_event.wait()
+        return report(configuration, cancelled=True)
+
+    monkeypatch.setattr(web, "run_suite", waiting)
+    async with browser(tmp_path) as client:
+        response = await client.post('/api/runs', json={"config": config(max_requests=2)})
+        identifier = response.json()["id"]
+        assert await asyncio.to_thread(ready.wait, 2)
+        detail = (await client.get(f"/api/runs/{identifier}")).json()
+        assert detail["live_requests"] == []
+        for _ in range(2):
+            delta = (await client.get(f"/api/runs/{identifier}/events?after=0")).json()
+            assert delta["records"] == []
+        messages = [record.message for record in caplog.records if "slot invariant" in record.message]
+        assert sum("(live)" in message for message in messages) == 1
+        assert sum("(delta)" in message for message in messages) == 1
+        await client.post(f"/api/runs/{identifier}/cancel", json={})

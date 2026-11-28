@@ -536,7 +536,21 @@ ConfigDraftInput = Annotated[ConfigDraft, WrapValidator(_config_input)]
 
 
 
-def _track_live_request(job: dict, event: dict, max_requests: int | None) -> None:
+def _valid_budget_slot(slot, max_requests: int | None, *, source: str, run: dict) -> int | None:
+    """Apply the same slot invariant at every live evidence boundary."""
+    if type(slot) is not int or slot < 0:
+        return None
+    if max_requests is not None and slot >= max_requests:
+        violations = run.setdefault("slot_invariant_sources", set())
+        if source not in violations:
+            violations.add(source)
+            logger.error("Request budget slot invariant violated (%s): slot %s exceeds limit %s",
+                         source, slot, max_requests)
+        return None
+    return slot
+
+
+def _track_live_request(job: dict, event: dict, max_requests: int | None, *, source="live") -> None:
     """Keep a bounded slot window and count completed requests evicted while running."""
     kind = event["event"]
     if kind not in {"request_started", "request_completed"}:
@@ -547,10 +561,8 @@ def _track_live_request(job: dict, event: dict, max_requests: int | None) -> Non
         return
     if event.get("request_budget_exempt"):
         return
-    if type(slot) is not int or slot < 0:
-        return
-    if max_requests is not None and slot >= max_requests:
-        logger.error("Request budget slot invariant violated: slot %s exceeds limit %s", slot, max_requests)
+    slot = _valid_budget_slot(slot, max_requests, source=source, run=job)
+    if slot is None:
         return
     requests = job["requests"]
     summary = job["live_request_summary"]
@@ -610,7 +622,7 @@ def _public_progress(event: dict) -> dict:
     return event
 
 
-def _track_live_progress(job: dict, event: dict, max_requests: int | None) -> None:
+def _track_live_progress(job: dict, event: dict, max_requests: int | None) -> dict:
     """Bound live web metadata independently of the configured arrival count."""
     # Derived performance is requested separately, never copied into polling
     # progress/events (including events from third-party runner integrations).
@@ -637,7 +649,7 @@ def _track_live_progress(job: dict, event: dict, max_requests: int | None) -> No
             if "partial_report_deadline" in job:
                 event.update(phase="saving_partial_report", message="Saving partial report…")
             job["progress"] = event
-        job["events"].append(event)
+        job["events"].append({key: value for key, value in event.items() if key != "request_counts"})
         del job["events"][:-MAX_LIVE_EVENTS]
     index = job.get("condition_requests")
     if index is None:
@@ -668,6 +680,7 @@ def _track_live_progress(job: dict, event: dict, max_requests: int | None) -> No
         job["phases"].append({key: event.get(key) for key in
             ("event", "target", "scenario", "elapsed_seconds")})
         del job["phases"][:-MAX_LIVE_PHASES]
+    return event
 
 
 def _validated_plan(config: RunConfig | ConfigDraft, *, pack_details: dict | None = None) -> dict:
@@ -856,7 +869,8 @@ def _api_report(report: RunReport) -> dict:
     result.update(request_counts=counts, requests_compact=True,
                   requests=[{**row.model_dump(mode="json", include=fields, exclude_defaults=True),
                              "valid": row.valid, "sent": row.sent, "elapsed_ms": row.elapsed_ms, "output_chars": row.output_chars,
-                             "generation_tokens_per_second": row.generation_tokens_per_second}
+                             **({"generation_tokens_per_second": row.generation_tokens_per_second}
+                                if row.generation_tokens_per_second is not None else {})}
                             for row in report.requests])
     return result
 
@@ -1027,7 +1041,8 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                 if cached is None or cached["identity"] != identity or stat.st_size < cached["offset"]:
                     journal_cursor += 1
                     cached = {"identity": identity, "offset": 0, "warnings": OrderedDict(),
-                              "seq": journal_cursor, "reset_after": journal_cursor, "config": {},
+                              "seq": journal_cursor, "reset_after": journal_cursor,
+                              "config": metadata(directory).get("config", {}),
                               "request_versions": OrderedDict(), "progress": {},
                               "requests": OrderedDict(), "live_request_count": 0,
                               "live_request_summary": {"evicted": 0, "through_slot": None, "statuses": {}},
@@ -1083,7 +1098,8 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                                     "request": request,
                                     "intentional": record.get("intentional", False),
                                     **{key: record.get(key) for key in (
-                                        "input_chars", "requested_max_tokens", "requested_input_tokens")}}, None)
+                                        "input_chars", "requested_max_tokens", "requested_input_tokens")}},
+                                    cached["config"].get("max_requests"), source="replay")
                                 versions = cached["request_versions"]
                                 if not value.get("budget_exempt") and budget_slot in cached["requests"]:
                                     versions[budget_slot] = cached["seq"]
@@ -1145,12 +1161,11 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
         # Called exclusively on the server loop, including worker progress.
         if job is not active or job.get("terminal"):
             return
-        event = _public_progress(event)
-        _track_live_progress(job, event, max_requests)
+        event = _track_live_progress(job, event, max_requests)
         if "scale_down_control" in event:
             job["scale_down_control"] = deepcopy(event["scale_down_control"])
         job["seq"] += 1
-        event = {key: value for key, value in event.items() if key != "performance"}
+        event = {key: value for key, value in event.items() if key not in {"performance", "request_counts"}}
         event["seq"] = job["seq"]
         job["deltas"].append(event)
         del job["deltas"][:-_DELTA_WINDOW]
@@ -1198,12 +1213,23 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
             raise HTTPException(422, detail=plan["errors"])
         return plan
 
+    @lru_cache(maxsize=64)
+    def saved_metadata(path: str, modified: int, size: int, inode: int, changed: int) -> dict:
+        value = _read(Path(path))
+        if isinstance(value.get("progress"), dict):
+            value["progress"] = _public_progress(value["progress"])
+        if isinstance(value.get("events"), list):
+            value["events"] = [{key: child for key, child in _public_progress(event).items()
+                                if key != "request_counts"} for event in value["events"]]
+        return value
+
     def metadata(directory: Path) -> dict:
         with metadata_lock:
             if directory.name in unsaved_metadata:
                 return unsaved_metadata[directory.name]
             try:
-                return _read(directory / ".web.json")
+                path = directory / ".web.json"
+                return deepcopy(saved_metadata(str(path), *_file_revision(path)))
             except (OSError, ValueError):
                 return {}
 
@@ -1515,6 +1541,13 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
         except (OSError, ValueError, KeyError, TypeError):
             return None
 
+    @lru_cache(maxsize=64)
+    def saved_summary(path: str, modified: int, size: int, inode: int, changed: int) -> dict:
+        value = _read(Path(path))
+        value["request_counts"] = (known_request_counts(value.get("request_counts"))
+                                   or unavailable_request_counts(value.get("request_counts")))
+        return value
+
     def pending_recovery(directory: Path, *, report_available: bool | None = None) -> bool:
         state = metadata(directory).get("state")
         journal_present = (directory / "evidence.jsonl").is_file()
@@ -1539,7 +1572,7 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
         summary = None
         if summary_path.is_file() and not summary_path.is_symlink():
             try:
-                summary = _read(summary_path)
+                summary = deepcopy(saved_summary(str(summary_path), *_file_revision(summary_path)))
                 meta = {**meta, "state": states.RUN_ERROR, "error": summary.get("error") or meta.get("error")
                         or "The report could not be saved. Only check summaries are available."}
             except (OSError, ValueError):
@@ -1599,9 +1632,9 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                 "abort_reason": (persisted or summary or {}).get("abort_reason") or meta.get("abort_reason"),
                 "error": meta.get("error"), "error_id": meta.get("error_id"),
                 "seq": request_feed.get("seq", meta.get("seq", 0)),
-                "progress": _public_progress(live.get("progress", {**meta.get("progress", {}), **journal.get("progress", {})})),
+                "progress": live.get("progress", {**meta.get("progress", {}), **journal.get("progress", {})}),
                 "scale_down_control": control,
-                "events": [_public_progress(event) for event in live.get("events", meta.get("events", []))],
+                "events": live.get("events", meta.get("events", [])),
                 "live_preparations": list(live["live_preparations"].values()) if "live_preparations" in live else meta.get("live_preparations", []),
                 "live_requests": list(request_feed.get("requests", {}).values()),
                 "live_request_summary": request_feed.get("live_request_summary", meta.get("live_request_summary", {})),
@@ -1702,13 +1735,18 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
         counts = dict.fromkeys(states.CHECK_STATUSES, 0)
         for check in report.get("checks", []):
             counts[check["status"]] += 1
+        # These sources were normalised at report/summary/event ingestion.
+        sources = ((detail["report"] or {}).get("observations", {}).get("request_counts"),
+                   (detail["report"] or {}).get("request_counts"),
+                   (detail["summary"] or {}).get("request_counts"),
+                   detail["progress"].get("request_counts"))
+        request_counts = next((value for value in sources if value is not None and value["available"] is True),
+                              next((value for value in sources if value is not None), None))
         return {key: detail[key] for key in ("id", "state", "terminal", "recoverable", "error", "abort_reason", "progress", "baseline_id",
                                              "started_at", "finished_at", "bytes", "kept")} | {
             "run_id": report.get("run_id"), "overall": report.get("overall"),
             "targets": _targets(detail["config"]), "check_counts": counts,
-            "request_counts": next((counts for value in (report.get("request_counts"),
-                report.get("observations", {}).get("request_counts"), detail["progress"].get("request_counts"))
-                if (counts := known_request_counts(value) or unavailable_request_counts(value)) is not None), None)}
+            "request_counts": request_counts}
 
     def saved_baselines() -> list[dict]:
         if not baseline_root.exists():
@@ -2378,8 +2416,8 @@ def create_app(runs_dir: Path = Path("runs"), defaults: dict | None = None, *,
                 checks[("check", check.get("target"), check["id"])] = check
             slot = event.get("budget_request_slot")
             limit = feed.get("meta", {}).get("config", {}).get("max_requests")
-            if (not event.get("request_budget_exempt") and type(slot) is int and slot >= 0
-                    and (limit is None or slot < limit)):
+            slot = _valid_budget_slot(slot, limit, source="delta", run=feed)
+            if not event.get("request_budget_exempt") and slot is not None:
                 record = feed.get("requests", {}).get(slot)
                 if record is None and event.get("request"):
                     record = {**event["request"], "slot": slot}

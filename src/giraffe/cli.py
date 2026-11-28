@@ -43,7 +43,7 @@ if _required_modules_available():
     from giraffe.configuration_errors import configuration_errors
     from giraffe.diagnostics import configure_logging, run_logging
     from giraffe.models import (CATALOGUE_NAMES, CHECK_NAMES, ConfigDraft, RunConfig, RunReport, is_legacy_config,
-                               migrate_concurrent_load, migrate_load_test, migrate_run_limits, migration_limit_notes, merge_migration_warnings)
+                               known_request_counts, migrate_concurrent_load, migrate_load_test, migrate_run_limits, migration_limit_notes, merge_migration_warnings)
     from giraffe.storage import DEFAULT_LIMITS, Heartbeat, format_size as _disk_size, parse_size
     from giraffe.resources import PhaseSampler, SAMPLING
 else:
@@ -610,6 +610,9 @@ async def _run(config: RunConfig, *, json_progress: bool = False, verbose: bool 
 
     def progress(event: dict) -> None:
         nonlocal last, last_update
+        counts = known_request_counts(event.get("request_counts"))
+        if "request_counts" in event:
+            event = {**event, "request_counts": counts}
         if writer is not None:
             writer.progress(event)
         if quiet:
@@ -638,9 +641,6 @@ async def _run(config: RunConfig, *, json_progress: bool = False, verbose: bool 
         title = (current[1] if verbose else _stage_name(current[1], config)) if current[1] else None
         if title:
             parts = [f"  {current[0]}: {title}"]
-            from giraffe.models import known_request_counts
-
-            counts = known_request_counts(event.get("request_counts"))
             if counts is not None:
                 if config.max_requests is not None:
                     parts.append(f"{counts['budget_counted']} of {config.max_requests} counted requests")
@@ -672,8 +672,9 @@ async def _run(config: RunConfig, *, json_progress: bool = False, verbose: bool 
             report = await run_suite(config, progress=progress, stop_event=stop, **options)
         except asyncio.CancelledError as error:
             report = getattr(error, "giraffe_report", None)
-            if report is not None and (counts := report.observations.get("request_counts")) is not None:
+            if report is not None and (counts := known_request_counts(report.observations.get("request_counts"))) is not None:
                 counts["complete"] = False
+                report.observations["request_counts"] = counts
             raise
     finally:
         try:
@@ -787,6 +788,8 @@ def _main(argv: list[str] | None = None) -> int:
     last_saved_state = None
 
     def emit(outcome: str, exit_code: int, **details) -> None:
+        if "request_counts" in details:
+            details["request_counts"] = known_request_counts(details["request_counts"])
         print(json.dumps({"kind": kind, "outcome": outcome, "exit_code": exit_code, **details},
                          allow_nan=False))
 
@@ -1447,8 +1450,6 @@ def _print_result(report: RunReport, json_path: Path, html_path: Path | None,
 
     passed = sum(check.status == "pass" for check in report.checks)
     report_path = html_path or json_path
-    from giraffe.models import known_request_counts
-
     counts = known_request_counts(report.observations.get("request_counts"))
     requests = ""
     if counts is not None:

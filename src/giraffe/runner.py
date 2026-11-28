@@ -963,6 +963,7 @@ class _Run:
                 if admission_deadline is None or time.monotonic() >= self.deadline or reason:
                     self.mark_unfinished(target.name, _scenario_checks(spec))
                 return None
+            charged_offer_reserved = not budget_exempt and (budget_reserved or admission_deadline is None)
             if admission_deadline is None:
                 self.attempted += 1
             output_cap = spec.max_tokens if spec.max_tokens is not None else self.config.max_output_tokens
@@ -1016,7 +1017,7 @@ class _Run:
                     if self.stop.is_set() or time.monotonic() >= self.deadline:
                         self.mark_unfinished(target.name, _scenario_checks(spec))
                     return None
-                if budget_reserved and not budget_exempt:
+                if charged_offer_reserved:
                     self.refund_offer(target.name)
                 return RequestRecord(
                     id=uuid.uuid4().hex, target=target.name, fixture_id=spec.fixture_id,
@@ -1057,37 +1058,43 @@ class _Run:
 
             def begin_attempt():
                 nonlocal started, started_at, request_slot, budget_request_slot, token, pending_start
+                nonlocal charged_offer_reserved
                 if token is not None:
                     raise RuntimeError("begin_attempt cannot assign a request slot twice")
+                next_started = admission_clock() if admission_deadline is not None else time.monotonic()
                 if admission_deadline is not None:
-                    started = admission_clock()
-                    if (not budget_reserved and not budget_exempt
-                            and not self.reserve_offer(target.name, gateway_probe=gateway_probe)):
-                        self.mark_unfinished(target.name, _scenario_checks(spec))
-                        raise _DispatchRefused
+                    if not budget_reserved and not budget_exempt:
+                        if not self.reserve_offer(target.name, gateway_probe=gateway_probe):
+                            self.mark_unfinished(target.name, _scenario_checks(spec))
+                            raise _DispatchRefused
+                        charged_offer_reserved = True
+                if not budget_exempt and self.counted_attempted >= self.budget_used:
+                    raise RuntimeError("Request slot requires an unassigned charged offer")
+                next_started_at = _now()
+                if not readiness and not evidence_probe:
+                    self.endpoint_attempt(target.name)
+                if guard_transport:
+                    deadline.reschedule(min(self.deadline, task.get_loop().time() + request_budget()))
+                # Preparation and endpoint bookkeeping must succeed before this
+                # request owns a tile. No callback runs during the commit below.
+                next_token = self.inflight.start(target.name)
+                started, started_at, token = next_started, next_started_at, next_token
+                if admission_deadline is not None:
                     self.attempted += 1
+                request_slot = self.attempted - 1
+                if not budget_exempt:
+                    budget_request_slot = self.counted_attempted
+                    self.counted_attempted += 1
+                    _request_budget_slot.set((self, budget_request_slot))
                 if condition is not None:
                     condition["sent"] += 1
                     condition["started"] += 1
                     condition["running"] += 1
                     if condition["planned"] is not None:
                         condition["not_sent"] = max(0, condition["planned"] - condition["sent"])
-                request_slot = self.attempted - 1
-                if not budget_exempt:
-                    if self.counted_attempted >= self.budget_used:
-                        raise RuntimeError("Request slot requires an unassigned charged offer")
-                    budget_request_slot = self.counted_attempted
-                    self.counted_attempted += 1
-                    _request_budget_slot.set((self, budget_request_slot))
                 self.counts[target.name] += 1
-                if not readiness and not evidence_probe:
-                    self.endpoint_attempt(target.name)
                 self.active[key] += 1
                 self.peak[key] = max(self.peak[key], self.active[key])
-                if admission_deadline is None:
-                    started = time.monotonic()
-                started_at = _now()
-                token = self.inflight.start(target.name)
                 try:
                     if on_start:
                         on_start()
@@ -1099,8 +1106,6 @@ class _Run:
                         pending_start = task.get_loop().call_soon(emit_scheduled_start)
                     else:
                         emit_start()
-                if guard_transport:
-                    deadline.reschedule(min(self.deadline, task.get_loop().time() + request_budget()))
 
             def note_transport_sent():
                 nonlocal sent

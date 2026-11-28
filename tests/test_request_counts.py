@@ -485,3 +485,70 @@ async def test_dense_budget_slots_survive_exempt_refund_drop_and_unsent_attempt(
     assert starts == ends == [0, 1]
     assert run.counted_attempted <= run.budget_used <= config.max_requests
     assert max(starts) < config.max_requests
+
+
+@pytest.mark.parametrize("guarded", [False, True])
+async def test_endpoint_attempt_failure_refunds_without_committing_a_slot(inference_posts, monkeypatch, guarded):
+    config = configuration()
+    events = []
+    run = runner._Run(config, events.append, None)
+    target = config.targets[0]
+
+    def fail_endpoint_attempt(target_name):
+        raise ValueError("endpoint attempt failed")
+
+    monkeypatch.setattr(run, "endpoint_attempt", fail_endpoint_attempt)
+    options = {}
+    if guarded:
+        assert run.reserve_offer(target.name)
+        options = {"budget_reserved": True, "admission_deadline": time.monotonic() + 10}
+    async with LLMClient(target, config) as client:
+        record = await run.request(target, client, request_spec(), **options)
+    assert record.status == "failed"
+    assert record.error == "request could not be prepared (ValueError)"
+    assert record.sent is False and record._budget_request_slot is None
+    assert not [event for event in events if event["event"] == "request_started"]
+    assert run.counted_attempted == run.budget_used == len(run.inflight) == 0
+    assert run.counts[target.name] == run.active[(target.name, "initial")] == 0
+    condition = next(iter(run.conditions.values()))
+    assert condition["started"] == condition["running"] == 0
+    assert_reconciles(run, inference_posts)
+
+
+@pytest.mark.usefixtures("local_tokenizer")
+async def test_arrival_stop_observer_preserves_partial_accounting_without_flat_counters(inference_posts, monkeypatch):
+    from types import SimpleNamespace
+
+    from giraffe.models import TrafficConfig
+    from tests.test_arrival_end_to_end import capacity, traffic_config, traffic_records
+
+    stop = asyncio.Event()
+    started = 0
+
+    def progress(event):
+        nonlocal started
+        assert "attempted" not in event
+        if event["event"] == "request_started":
+            started += 1
+            if event["scenario"].startswith("load_primary_") and started >= 4:
+                stop.set()
+
+    handle = httpx.MockTransport.handle_async_request
+
+    async def slow_response(transport, request):
+        if request.method == "POST":
+            await asyncio.sleep(.3)
+        return await handle(transport, request)
+
+    monkeypatch.setattr(httpx.MockTransport, "handle_async_request", slow_response)
+    config = traffic_config(SimpleNamespace(url="http://local/v1"), traffic=TrafficConfig(
+        rates=[20], duration_seconds=2, max_in_flight=32,
+        mix={"short": 1, "long_input": 0, "long_output": 0}))
+    report = await asyncio.wait_for(runner.run_suite(config, progress=progress, stop_event=stop), 3)
+    point = capacity(report).metrics["points"][0]
+    assert report.abort_reason == "cancelled by user"
+    assert point["scheduled"] == point["dispatched"] + point["not_sent"]
+    assert point["not_sent"] > 0 and point["status"] == "inconclusive"
+    assert len(traffic_records(report)) == point["dispatched"] <= 3
+    counts = report.observations["request_counts"]
+    assert counts["sent"] == counts["budget_counted"] - counts["budget_counted_unsent"] + counts["budget_exempt"]
