@@ -329,6 +329,16 @@ async def test_manual_recovery_after_server_exhausts_retries(tmp_path, monkeypat
     recovered = json.loads((directory / ".web.json").read_text())
     assert recovered["state"] == "interrupted"
     assert recovered["run_id"] == saved["run_id"]
+    for key in ("error", "error_id", "recovery_attempts", "recovery_retry_at"):
+        assert key not in recovered
+    async with browser(tmp_path) as client:
+        response = await client.get(f"/api/runs/{directory.name}")
+        assert response.status_code == 200
+        detail = response.json()
+        assert detail["state"] == "interrupted"
+        assert detail["recoverable"] is False
+        assert detail["error"] is None
+        assert detail["error_id"] is None
     assert "Undeclared run state transition" not in caplog.text
 
 

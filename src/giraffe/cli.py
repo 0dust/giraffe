@@ -396,7 +396,8 @@ def _report_for_render(path: Path) -> RunReport:
         if recovered is None:
             raise
         write_report(recovered, path, preserve_evidence=True)
-        update_metadata(path, {"state": states.RUN_INTERRUPTED, "run_id": recovered.run_id})
+        update_metadata(path, {"state": states.RUN_INTERRUPTED, "run_id": recovered.run_id},
+                        remove=("recovery_attempts", "recovery_retry_at", "error", "error_id"))
         print(f"Recovered {len(recovered.requests)} recorded requests from an interrupted run; "
               "results are incomplete.", file=sys.stderr)
         return recovered

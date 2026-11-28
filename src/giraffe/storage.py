@@ -82,13 +82,15 @@ def write_metadata_unless(directory: Path | str, values: dict,
         return True
 
 
-def update_metadata(directory: Path | str, changes: dict) -> dict:
+def update_metadata(directory: Path | str, changes: dict, *, remove: tuple[str, ...] = ()) -> dict:
     with _metadata_lock:
         directory = Path(directory)
         values = _read(directory / ".web.json")
         if "state" in changes:
             states.check_run_transition(values.get("state"), changes["state"])
         values |= changes
+        for key in remove:
+            values.pop(key, None)
         _write_metadata(directory, values)
         return values
 
