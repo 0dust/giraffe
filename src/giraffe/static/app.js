@@ -4704,9 +4704,13 @@ function renderDeploymentChange(diff) {
   if(!diff)return '';
   const changed=(diff.fields||[]).filter(row=>row.change!=='no_observed_change').map(row=>row.field),intended=diff.intended_change;
   let summary=changed.length?`Deployment change: ${changed.join(', ')}`:'No observed deployment changes.';
-  if(changed.length&&intended&&!diff.confounded)summary+=' (one intended change)';
+  const launch=diff.launch_comparison||{},warnings=[...(launch.warnings||[])];
+  if(changed.length&&intended&&!diff.confounded&&launch.status!=='unverified')summary+=' (one intended change)';
   const fields=Array.isArray(intended)?intended:[intended];
-  return `<p class="deployment-change">${escape(summary)}</p>${diff.confounded?`<p><strong>Confounded: multiple unrelated changes.</strong></p>${intended?`<p class="hint">Intended change: ${escape(fields.join(', '))}</p>`:''}`:''}${diff.unknown_baseline?'<p class="hint">Baseline deployment configuration was not recorded.</p>':''}${diff.interpretation?`<p class="hint">${escape(diff.interpretation)}</p>`:''}`;
+  const wholeFieldWarning='The whole serving.launch_arguments field was declared intended; additional changes within that field are not checked separately.';
+  if(fields.includes('serving.launch_arguments')&&!warnings.includes(wholeFieldWarning))warnings.push(wholeFieldWarning);
+  const settings=(launch.settings||[]).map(row=>`<li>${escape(`${row.flag} (${row.source}): ${JSON.stringify(row.baseline)} → ${JSON.stringify(row.current)} (${row.change}; ${row.change==='unverified'?'equivalence unverified':row.intended?'intended':'additional change'})`)}</li>`).join('');
+  return `<p class="deployment-change">${escape(summary)}</p>${launch.status==='unverified'?'<p><strong>Launch setting comparison unverified.</strong></p>':''}${warnings.map(warning=>`<p class="hint">${escape(warning)}</p>`).join('')}${settings?`<ul>${settings}</ul>`:''}${diff.confounded?`<p><strong>Confounded: multiple unrelated changes.</strong></p>${intended?`<p class="hint">Intended change: ${escape(fields.join(', '))}</p>`:''}`:''}${diff.unknown_baseline?'<p class="hint">Baseline deployment configuration was not recorded.</p>':''}${diff.interpretation?`<p class="hint">${escape(diff.interpretation)}</p>`:''}`;
 }
 function renderComparisonDetails(targets) {
   if(!targets.length)return '';
