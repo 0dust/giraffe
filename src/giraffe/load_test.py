@@ -2016,7 +2016,7 @@ def _result_summary(run, target, points, status, settings, *, include_remedy=Tru
             remedy = f"Raise --max-requests (max_requests) to at least {minimum} or select fewer rates."
         else:
             explanation = ("Duration-based workloads send as many requests as the server can answer"
-                           if unknown == "duration_based" else "The selected workloads have no fixed request count")
+                           if unknown == "duration_based" else "The selected workloads have no known planned request count")
             remedy = (explanation + ", so bound this run with --max-duration (max_duration_seconds) and "
                       "--no-max-requests (max_requests: null), or select fewer rates.")
     elif code == "time_limited" and run.reason != states.STOP_CANCELLED_BY_USER:

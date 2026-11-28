@@ -8,7 +8,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from . import states
 from .deployment import REDACTED
-from .models import CHECK_NAMES, CheckResult, RunReport
+from .models import CHECK_NAMES, CheckResult, RunReport, known_request_counts, unavailable_request_counts
 
 
 _XML_CONTROL = re.compile(r"[^\x09\x0a\x0d\x20-\ud7ff\ue000-\ufffd\U00010000-\U0010ffff]")
@@ -99,6 +99,19 @@ def write_junit(report: RunReport, path: Path) -> None:
         for name, value in (("model", target.get("model") or ""),
                             ("url", _url(target.get("url") or "")), ("run_id", report.run_id)):
             ET.SubElement(properties, "property", name=name, value=_text(value))
+        request_counts = known_request_counts(report.observations.get("request_counts"))
+        target_counts = request_counts["targets"].get(target_name) if request_counts is not None else None
+        ET.SubElement(properties, "property", name="requests.available",
+                      value=str(target_counts is not None).lower())
+        if request_counts is not None:
+            ET.SubElement(properties, "property", name="requests.complete",
+                          value=str(request_counts["complete"]).lower())
+        elif unavailable_request_counts(report.observations.get("request_counts")) is not None:
+            ET.SubElement(properties, "property", name="requests.complete", value="false")
+        if target_counts is not None:
+            for name in ("sent", "budget_counted", "budget_exempt", "saved_observations"):
+                ET.SubElement(properties, "property", name=f"requests.{name}",
+                              value=_text(target_counts[name]))
         for check, status, reason in selected:
             case = ET.SubElement(suite, "testcase", name=_text(check.id), classname=_text(check.target))
             if status in {"fail", "blocked"}:
@@ -147,8 +160,12 @@ def _baseline_delta(report: RunReport) -> str:
 
 def write_summary_md(report: RunReport, path: Path, report_path: Path | None) -> None:
     """Write a concise summary suitable for GitHub step summaries and comments."""
-    lines = [f"## Giraffe: **{_md(report.overall.upper())}**", "", f"Run: {_md(report.run_id)}", "",
-             "| Target | Check | Verdict | Reason |", "| --- | --- | --- | --- |"]
+    from .reporting import request_count_lines
+
+    lines = [f"## Giraffe: **{_md(report.overall.upper())}**", "", f"Run: {_md(report.run_id)}", ""]
+    for line in request_count_lines(report):
+        lines.extend([_md(line), ""])
+    lines.extend(["| Target | Check | Verdict | Reason |", "| --- | --- | --- | --- |"])
     for check, status, reason in _rows(report):
         lines.append(f"| {_md(check.target, table_cell=True)} | {_md(check.id, table_cell=True)} | "
                      f"{_md(status, table_cell=True)} | {_md(reason, table_cell=True)} |")

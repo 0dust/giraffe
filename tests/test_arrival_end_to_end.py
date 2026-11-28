@@ -227,9 +227,13 @@ async def test_slower_upgrade_reduces_accepted_rate_as_http_queue_grows(monkeypa
 
 async def test_stop_during_http_arrivals_preserves_partial_accounting():
     stop=asyncio.Event()
+    started = 0
     def progress(event):
-        if event['event']=='request_started' and event['scenario'].startswith('load_primary_') and event['attempted']>=4:
-            stop.set()
+        nonlocal started
+        if event['event'] == 'request_started':
+            started += 1
+            if event['scenario'].startswith('load_primary_') and started >= 4:
+                stop.set()
     with FakeEndpoint(first_token_delay=.3,chunk_delay=0) as endpoint:
         cfg=traffic_config(endpoint,traffic=TrafficConfig(rates=[20],duration_seconds=2,max_in_flight=32,mix={'short':1,'long_input':0,'long_output':0}))
         report=await asyncio.wait_for(run_suite(cfg,progress=progress,stop_event=stop),3)
@@ -352,7 +356,7 @@ async def test_reference_judging_waits_for_all_http_answers_and_preserves_payloa
     correctness = next(check for check in report.checks if check.id == "correctness")
     assert correctness.metrics["request_pack"]["control_status"] == "pass"
     assert correctness.status == "fail"
-    assert report.abort_reason is None and report.observations["request_budget_used"] == 4
+    assert report.abort_reason is None and report.observations["request_counts"]["budget_counted"] == 4
     assert all(record.valid and record.judgement for record in report.requests)
 
 
@@ -426,5 +430,5 @@ def test_reference_judging_has_separate_budget_and_does_not_extend_arrival_measu
     assert next(c for c in report.checks if c.id == "correctness").metrics["request_pack"]["control_status"] == "pass"
     assert next(check for check in report.checks if check.id == "correctness").status == "fail"
     assert report.abort_reason is None
-    assert report.observations["request_budget_used"] == 4
+    assert report.observations["request_counts"]["budget_counted"] == 4
     assert all(record.valid and record.judgement for record in report.requests)

@@ -117,7 +117,7 @@ def test_disk_full_export_sets_error_and_saves_summary(tmp_path, monkeypatch, su
     else:
         summary = json.loads((tmp_path / identifier / "summary.json").read_text())
         assert summary["overall"] == "pass"  # Recorded result survives, run state stays error.
-        assert summary["request_count"] == 1
+        assert summary["request_counts"]["sent"] == 1
         (tmp_path / identifier / ".web.json").unlink()
         with TestClient(create_app(tmp_path), base_url="http://127.0.0.1:8787") as client:
             detail = client.get(f"/api/runs/{identifier}").json()

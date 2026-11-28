@@ -108,7 +108,7 @@ def test_import_stdout_cannot_corrupt_helper_protocol(tmp_path, monkeypatch):
     status, size = struct.unpack('!II', result.stdout[:8])
     assert status == 200
     assert len(result.stdout[8:]) == size
-    assert json.loads(result.stdout[8:])['report']['request_count'] == 1
+    assert json.loads(result.stdout[8:])['report']['request_counts']['sent'] == 1
     assert b'python import noise' in result.stderr and b'fd import noise' in result.stderr
 
 

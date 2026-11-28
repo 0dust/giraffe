@@ -106,7 +106,7 @@ async def test_progress_boundary_snapshots_nested_condition_state(tmp_path, monk
 
 async def test_check_updates_do_not_replace_progress_or_carry_request_payload(tmp_path, monkeypatch):
     async def measured(configuration, *, progress, stop_event):
-        progress({'event': 'request_completed', 'request_slot': 0,
+        progress({'event': 'request_completed', 'request_slot': 0, 'budget_request_slot': 0,
                   'request': {'id': 'last', 'status': 'completed'}, 'completed': 1})
         return report(configuration)
     monkeypatch.setattr(web, 'run_suite', measured)

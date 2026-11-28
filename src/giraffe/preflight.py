@@ -7,6 +7,7 @@ import logging
 import json
 import ssl
 from pathlib import Path
+from collections.abc import Callable
 
 import httpx
 from pydantic import Field, SecretStr, field_validator, model_validator
@@ -26,6 +27,7 @@ class PreflightError(Exception):
     def __init__(self, message: str, *, blocking: bool = True, no_answer: bool = False):
         super().__init__(message)
         self.blocking = blocking
+        self.inference_requests_sent = 0
         # The server completed a well-formed response, but it carried no visible answer.
         self.no_answer = no_answer
 
@@ -212,6 +214,7 @@ async def check_connection(body: ConnectionTest) -> dict:
             config = body.configuration(model, request_options=body.request_options)
             try:
                 result = await check_target(config.targets[0], config)
+                result.pop("inference_requests_sent", None)
             except PreflightError as error:
                 if not error.no_answer or (body.model and not body.discovered):
                     raise
@@ -256,6 +259,23 @@ async def check_connection(body: ConnectionTest) -> dict:
 
 
 async def check_target(target: Target, config: RunConfig) -> dict:
+    """Return connection evidence and the number of inference transport hand-offs."""
+    sent = 0
+
+    def note_sent():
+        nonlocal sent
+        sent += 1
+
+    try:
+        result = await _check_target(target, config, on_sent=note_sent)
+    except PreflightError as error:
+        error.inference_requests_sent = sent
+        raise
+    return {**result, "inference_requests_sent": sent}
+
+
+async def _check_target(target: Target, config: RunConfig, *,
+                       on_sent: Callable[[], None] | None = None) -> dict:
     """Send one bounded inference using the run's target and transport settings."""
     config = config.model_copy(update={"request_timeout_seconds": 15, "max_output_tokens": 32,
                                        "stream": False})
@@ -266,6 +286,7 @@ async def check_target(target: Target, config: RunConfig) -> dict:
             except ValueError as error:
                 raise PreflightError(str(error)) from None
             async with _PreflightClient(target, config) as client:
+                client.on_sent = on_sent
                 record = await client.execute(RequestSpec(
                     fixture_id="connection", scenario="connection", check_ids=["access"],
                     messages=[{"role": "user", "content": "Reply with OK."}],

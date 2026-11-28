@@ -44,7 +44,7 @@ def test_footprint_round_trip_preserves_models_api_and_failure_evidence(tmp_path
         new = client.get("/api/runs/saved").json()["report"]
         old = client.get("/api/runs/legacy").json()["report"]
         assert new == old
-        assert new["requests_compact"] and new["request_count"] == len(expected.requests)
+        assert new["requests_compact"] and new["request_counts"] == expected.observations.get("request_counts")
         assert new["comparison_summary"] == {
             "current_acceptance": expected.overall, "comparison_status": "absent", "reference": None,
             "reason": "No baseline selected.", "rows": [], "total_rows": 0, "omitted_rows": 0,
@@ -52,7 +52,7 @@ def test_footprint_round_trip_preserves_models_api_and_failure_evidence(tmp_path
         assert "comparison_summary" not in raw
         assert "comparison_summary" not in expected.model_dump(mode="json")
         assert {k: v for k, v in new.items()
-                if k not in {"requests", "request_count", "requests_compact", "comparison_summary"}} == expected.model_dump(mode="json", exclude={"requests"})
+                if k not in {"requests", "request_counts", "requests_compact", "comparison_summary"}} == expected.model_dump(mode="json", exclude={"requests"})
         for record in expected.requests:
             evidence = client.get(f"/api/runs/saved/requests/{record.id}")
             assert evidence.status_code == 200

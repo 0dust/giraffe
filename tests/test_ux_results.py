@@ -34,6 +34,10 @@ const source=fs.readFileSync(APP_PATH,'utf8')
   .replace(/^import .*?;\n/,'').replace(/\ninit\(\);\s*$/,'');
 vm.runInNewContext((STRICT_MODE ? "'use strict';" : '')+source+`
 state.bootstrap=bootstrap;
+function requestCounts(values={}) {
+  return {available:true,complete:true,sent:0,budget_counted:0,budget_counted_unsent:0,
+    budget_exempt:0,saved_observations:0,budget_exempt_by_reason:{},targets:{},...values};
+}
 function check(id,status,extra={}) {
   return {id,target:'local',title:id+' check',status,required:true,
     summary:'Recorded '+status+' reason',metrics:{},evidence_ids:[],...extra};
@@ -395,12 +399,12 @@ def test_live_counters_distinguish_started_requests_from_budget_and_completion()
     run_render_checks(r"""
 state.detail={id:'live',state:'running',config:{targets:[{name:'local',model:'test'}],
   max_requests:100,concurrency:4,max_duration_seconds:60,request_timeout_seconds:10,max_output_tokens:32},
-  progress:{attempted:12,completed:9,elapsed_seconds:5},events:[]};
+  progress:{attempted:12,completed:9,request_counts:requestCounts({sent:12,budget_counted:12}),elapsed_seconds:5},events:[]};
 renderLive();let html=nodes['#main'].innerHTML;
 assert.match(html,/<h1>Running<\/h1>/);
-assert.match(html,/9 requests finished · 5s · limit 100/);
+assert.match(html,/12 requests counted · 5s · limit 100/);
 assert.doesNotMatch(html,/Requests started ·|Active requests<\/dt>/);
-assert.match(html,/Scheduled requests can also use budget without reaching the server/);
+assert.match(html,/Scheduled requests can also use budget without being sent to the endpoint/);
 assert.doesNotMatch(html,/Request budget used/);
 state.detail.state='stopping';renderLive();html=nodes['#main'].innerHTML;
 assert.match(html,/data-action="stop"[^>]* disabled/);

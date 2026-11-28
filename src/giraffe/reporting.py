@@ -33,7 +33,7 @@ from .report_inputs import input_ref as _input_ref
 from .multi_user_metrics import (_error as _user_error, _length_mix_differs, _total_generated_tokens,
                                  _uncached_input_tokens, _valid as _user_valid_completion,
                                  fairness_applies, truncated_conversation_turn, user_delivery_completions, user_latency)
-from .models import (CHECK_NAMES, SHAPES, SHARED_BASELINE_EXCLUDED_WORKLOADS, CheckResult, GatewayAccess,
+from .models import (known_request_counts, unavailable_request_counts, CHECK_NAMES, SHAPES, SHARED_BASELINE_EXCLUDED_WORKLOADS, CheckResult, GatewayAccess,
                      GatewayAttribution, GatewayEvidence, GatewayPolicy, RequestRecord, RunConfig, RunReport,
                      TestIdentity, overall_status, load_shape_label,
                      migrate_concurrent_load, migrate_run_limits, is_supported_schema, CURRENT_SCHEMA)
@@ -2735,7 +2735,11 @@ def compare_baseline(report: RunReport, baseline: RunReport) -> RunReport:
 
 def _retained(report: RunReport) -> RunReport:
     from .invocation import safe_invocation
-    result = report.model_copy(update={"manifest": {**report.manifest,
+    from copy import deepcopy
+
+    result = report.model_copy(update={"observations": {**report.observations,
+        **({"request_counts": deepcopy(report.observations["request_counts"])}
+           if "request_counts" in report.observations else {})}, "manifest": {**report.manifest,
         **({"invocation": safe_invocation(report.manifest["invocation"])}
            if "invocation" in report.manifest else {}),
         "config": safe_config(report.manifest.get("config", {}))}})
@@ -4159,6 +4163,74 @@ def _scale_down_html(check, report, anchors):
     return "".join(parts)
 
 
+def refresh_saved_observations(report: RunReport) -> RunReport:
+    """Refresh measurement counts from the records actually retained in the report."""
+    raw_counts = report.observations.get("request_counts")
+    counts = known_request_counts(raw_counts)
+    if counts is None:
+        unavailable = unavailable_request_counts(raw_counts)
+        if unavailable is not None:
+            unavailable["saved_observations"] = sum(
+                record.scenario not in states.SETUP_PROBE_SCENARIOS for record in report.requests)
+            report.observations["request_counts"] = unavailable
+        return report
+    targets = counts["targets"]
+    for target_counts in targets.values():
+        target_counts["saved_observations"] = 0
+    saved = 0
+    for record in report.requests:
+        if record.scenario not in states.SETUP_PROBE_SCENARIOS:
+            saved += 1
+            if record.target in targets:
+                targets[record.target]["saved_observations"] += 1
+    counts["saved_observations"] = saved
+    report.observations["request_counts"] = counts
+    return report
+
+
+def request_count_lines(report: RunReport) -> list[str]:
+    """Format recorded inference accounting without inventing missing evidence."""
+    raw_counts = report.observations.get("request_counts")
+    counts = known_request_counts(raw_counts)
+    if counts is None:
+        unavailable = unavailable_request_counts(raw_counts)
+        if unavailable is None:
+            return ["Requests: not recorded for this report"]
+        saved = unavailable["saved_observations"]
+        noun = "saved observation" if saved == 1 else "saved observations"
+        return [f"Requests: counts unavailable for this recovered run · {saved} {noun}"]
+    saved = counts["saved_observations"]
+    saved_label = "saved observation" if saved == 1 else "saved observations"
+    lines = [f"Requests: {counts['sent']} sent · {counts['budget_counted']} counted toward the limit"
+             f" · {counts['budget_exempt']} exempt · {saved} {saved_label}"]
+    if counts.get("budget_counted_unsent", 0):
+        lines[0] += f" · {counts['budget_counted_unsent']} counted but not sent"
+    if counts.get("complete") is False:
+        lines[0] += " (recovered; may be incomplete)"
+    if counts["budget_exempt"]:
+        labels = {states.REQUEST_BUDGET_EXEMPTION_PREFLIGHT: "connection preflight", states.REQUEST_BUDGET_EXEMPTION_RESTART_READINESS: "restart readiness probe"}
+        reasons = [f"{count} {labels[reason]}{'s' if count != 1 else ''}"
+                   for reason, count in counts["budget_exempt_by_reason"].items() if count]
+        lines.append("Exempt: " + ", ".join(reasons))
+    return lines
+
+
+def _request_counts_html(report: RunReport) -> str:
+    lines = request_count_lines(report)
+    if not lines:
+        return ""
+    explanation = ("Sent counts inference requests sent to the endpoint (including attempts that failed to connect). Counted requests use the "
+                   "shared maximum request budget; scheduled requests may use budget without being sent. "
+                   "Connection preflight and readiness probes after a cold-start restart are exempt. Saved "
+                   "observations are measurement records in report.json requests, excluding readiness and performance-evidence probes. "
+                   "Evidence dropped counts refer to journal drops, not report.json records.")
+    if len(lines) > 1:
+        explanation += " " + lines[1] + "."
+    return ('<div class="muted">' + _e(lines[0])
+            + ' <details class="html-info"><summary aria-label="Request count definitions">i</summary><span>'
+            + _e(explanation) + '</span></details></div>')
+
+
 def _render(report: RunReport) -> str:
     from .performance import build_performance, refresh_performance
     from .performance_html import STYLE, render_performance
@@ -4185,6 +4257,7 @@ def _render(report: RunReport) -> str:
              f"<title>Giraffe — {_e(report.run_id)}</title>", '<style>' + STYLE + _COMPARISON_SUMMARY_STYLE + '.load-acceptance-export{max-width:100%;overflow-x:auto}.load-acceptance-export table{min-width:760px}.load-acceptance-export th:nth-child(2),.load-acceptance-export th:nth-child(3),.load-acceptance-export td:nth-child(2),.load-acceptance-export td:nth-child(3){white-space:nowrap;min-width:140px}.load-acceptance-export small{display:block;white-space:normal}' + '</style><main>',  f"<h1>{_e(verdict)}</h1>",
              f'<p class="muted">Run {_e(report.run_id)} · suite {_e(report.suite_version)}<br>'
              f'{_e(report.started_at)} → {_e(report.finished_at)}</p>']
+    parts.append(_request_counts_html(report))
     for warning in report.manifest.get("config_migration_warnings", []):
         parts.append(f'<p><strong>Warning:</strong> {_e(warning["msg"])}</p>')
     for summary in disconnected.values():
@@ -4385,7 +4458,7 @@ def _render(report: RunReport) -> str:
                              f'{_e(row.get("scope", "unknown"))}</p>')
         parts.append(f'<h3>{_e(name)}</h3>')
         probe = next((row for row in report.conditions if row.get("target") == name
-                      and row.get("condition_id") == "performance_evidence_probe"), None)
+                      and row.get("condition_id") == states.SETUP_PROBE_PERFORMANCE_EVIDENCE), None)
         if probe:
             passed = probe.get("status") == states.CONDITION_AGGREGATE_PASSED
             reason = probe.get("reason") or observation.get("token_evidence", {}).get("reason", "")
@@ -4554,7 +4627,13 @@ def write_report(report: RunReport, directory: Path, *, max_run_storage: int = D
         directory.mkdir(parents=True, exist_ok=True)
     except OSError as error:
         raise ReportWriteError(error, "report.json", json_complete=False) from error
-    retained = _retained(report)
+    retained = refresh_saved_observations(_retained(report))
+    # Retention owns a separate count object; explicitly publish its saved count
+    # to the caller so CLI summaries match the report written below.
+    if "request_counts" in retained.observations:
+        from copy import deepcopy
+
+        report.observations["request_counts"] = deepcopy(retained.observations["request_counts"])
     json_path, html_path = directory / "report.json", directory / "report.html"
     from .latency import latency_summary
 
@@ -4612,9 +4691,9 @@ def save_failure_summary(report: RunReport, directory: Path, error: OSError) -> 
         except OSError:
             pass
     message = prefix + "a summary was saved."
-    summary = {"run_id": report.run_id, "overall": report.overall, "state": "error",
+    summary = {"run_id": report.run_id, "overall": report.overall, "state": states.RUN_ERROR,
                "started_at": report.started_at, "finished_at": report.finished_at,
-               "request_count": len(report.requests), "summary_saved": True, "error": message,
+               "request_counts": report.observations.get("request_counts"), "summary_saved": True, "error": message,
                "checks": [{"id": check.id, "target": check.target, "title": check.title[:MAX_FAILURE_SUMMARY_TITLE_CHARS],
                            "status": check.status, "summary": (
                                text if len(text := _without_answer_excerpts(check.summary)) <= MAX_FAILURE_SUMMARY_CHARS

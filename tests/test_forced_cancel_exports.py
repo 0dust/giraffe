@@ -208,8 +208,12 @@ raise SystemExit(cli.main(["run", "--url", "http://server", "--model", "tiny",
 
 
 def partial_report(config, reason="cancelled by user"):
+    from giraffe.runner import _Run
+
+    counts = {**_Run(config, None, None).request_counts(), "complete": False}
     return RunReport(run_id="forced-stop", started_at="now", finished_at="later",
                      overall="inconclusive", abort_reason=reason,
+                     observations={"request_counts": counts},
                      manifest={"config": config.model_dump(mode="json")},
                      checks=[CheckResult(id="serving", target="local", title="Serving",
                                          status="inconclusive", summary="Stopped")])
@@ -322,6 +326,7 @@ async def test_real_web_run_journals_every_terminal_request(tmp_path, monkeypatc
         assert len(records) == len(report.requests) > 0
         assert [r["id"] for r in records] == [r.id for r in report.requests]
         if forced:
+            assert report.observations["request_counts"]["complete"] is False
             assert len(records) == 4
             assert all(r["status"] == "cancelled" for r in records)
         captured.append(records)
@@ -417,6 +422,7 @@ def test_cli_forced_cancel_without_signal_handlers_saves_partial_report(tmp_path
     assert len(signals) == 2
     saved = json.loads((directory / "report.json").read_text())
     assert saved["run_id"] == "forced-stop"
+    assert saved["observations"]["request_counts"]["complete"] is False
     assert saved["abort_reason"] == "run cancelled"
     assert saved["manifest"]["invocation"]["source"] == "cli"
     metadata = json.loads((directory / ".web.json").read_text())
@@ -433,7 +439,7 @@ def test_cli_forced_cancel_without_signal_handlers_saves_partial_report(tmp_path
         assert result["report_paths"] == {"json": str(directory / "report.json"), "html": None}
         assert result["auto_cleanup"] is None
     else:
-        assert f"INCONCLUSIVE  0 checks passed · 0 requests · report: {directory / 'report.json'}" in output.out
+        assert f"INCONCLUSIVE  0 checks passed · 0 requests sent · report: {directory / 'report.json'}" in output.out
         assert "Stopped: run cancelled" in output.out
         assert "Partial evidence saved." in output.out
 

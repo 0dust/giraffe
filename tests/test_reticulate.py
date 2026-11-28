@@ -46,7 +46,7 @@ def test_live_mosaic_tracks_start_slots_when_completion_order_changes():
 state.mosaicPage=0;
 const records=[{slot:2,id:'fast',status:'completed',score:true,valid:true},
  {slot:0,status:'running'},{slot:1,id:'slow',status:'completed',score:null,valid:true}];
-const html=renderMosaic(records,{budget:5,live:true,budgetUsed:4});
+const html=renderMosaic(records,{budget:5,live:true,requestCounts:requestCounts({budget_counted:4})});
 assert(html.indexOf('data-live-slot="0"')<html.indexOf('data-live-slot="1"'));
 assert(html.indexOf('data-live-slot="1"')<html.indexOf('data-live-slot="2"'));
 assert.equal((html.match(/class="request-spot /g)||[]).length,5);
@@ -61,32 +61,32 @@ def test_live_mosaic_follows_frontier_and_allows_manual_inspection():
     run_render_checks(r"""
 const records=Array.from({length:254},(_,slot)=>({slot,status:slot<250?'completed':'running'}));
 delete state.mosaicFollow;
-let html=renderMosaic(records,{budget:600,live:true});
+let html=renderMosaic(records,{budget:600,live:true,requestCounts:requestCounts({budget_counted:records.at(-1).slot+1})});
 assert.equal(state.mosaicPage,1);assert.equal(state.mosaicLivePage,1);
 assert.match(html,/data-live-slot="250"/);assert.doesNotMatch(html,/data-live-slot="0"/);
 assert.match(html,/<g class="request-spot running current"[^>]*data-live-slot="253"[^>]*aria-label="Requests\. Request 254 of 254/);
 assert.equal((html.match(/request-spot running current/g)||[]).length,1);
 assert.match(html,/Following live/);assert.doesNotMatch(html,/data-action="mosaic-live"/);
 state.mosaicFollow=false;state.mosaicPage=0;
-html=renderMosaic(records,{budget:600,live:true});
+html=renderMosaic(records,{budget:600,live:true,requestCounts:requestCounts({budget_counted:records.at(-1).slot+1})});
 assert.equal(state.mosaicPage,0);assert.equal(state.mosaicLivePage,1);
 assert.match(html,/data-live-slot="0"/);assert.doesNotMatch(html,/data-live-slot="250"/);
 assert.match(html,/data-action="mosaic-live">Back to live/);
 assert.match(html,/Live on requests 241–480/);assert.match(html,/live on another page/);
-records.push({slot:490,status:'running'});renderMosaic(records,{budget:600,live:true});
+records.push({slot:490,status:'running'});renderMosaic(records,{budget:600,live:true,requestCounts:requestCounts({budget_counted:records.at(-1).slot+1})});
 assert.equal(state.mosaicPage,0);assert.equal(state.mosaicLivePage,2);
 """)
 
 
 def test_live_mosaic_frontier_prefers_running_then_latest_record_then_budget():
     run_render_checks(r"""
-let html=renderMosaic([{slot:500,status:'completed'},{slot:250,status:'running'}],{budget:600,live:true});
+let html=renderMosaic([{slot:500,status:'completed'},{slot:250,status:'running'}],{budget:600,live:true,requestCounts:requestCounts({budget_counted:501})});
 assert.equal(state.mosaicLivePage,1);assert.match(html,/Requests\. Request 1 of 2/);
-html=renderMosaic([{slot:500,status:'completed'},{slot:250,status:'completed'}],{budget:600,live:true});
+html=renderMosaic([{slot:500,status:'completed'},{slot:250,status:'completed'}],{budget:600,live:true,requestCounts:requestCounts({budget_counted:501})});
 assert.equal(state.mosaicPage,2);assert.doesNotMatch(html,/request-spot \w+ current|Newest running request/);
-renderMosaic([],{budget:600,live:true,budgetUsed:481});assert.equal(state.mosaicPage,2);
-renderMosaic([],{budget:600,live:true,budgetUsed:0});assert.equal(state.mosaicPage,0);
-renderMosaic([],{budget:600,live:true,budgetUsed:999});assert.equal(state.mosaicPage,2);
+renderMosaic([],{budget:600,live:true,requestCounts:requestCounts({budget_counted:481})});assert.equal(state.mosaicPage,2);
+renderMosaic([],{budget:600,live:true,requestCounts:requestCounts({budget_counted:0})});assert.equal(state.mosaicPage,0);
+renderMosaic([],{budget:600,live:true,requestCounts:requestCounts({budget_counted:999})});assert.equal(state.mosaicPage,2);
 """)
 
 

@@ -196,6 +196,9 @@ def report(configuration, *, cancelled=False):
     return RunReport(run_id="suite-run-id", started_at="2026-10-04T10:00:00+00:00",
                      finished_at="2026-10-04T10:00:01+00:00",
                      overall="inconclusive" if cancelled else "pass",
+                     observations={"request_counts": {"sent": 1, "budget_counted": 1,
+                         "budget_counted_unsent": 0, "budget_exempt": 0, "saved_observations": 1,
+                         "budget_exempt_by_reason": {}, "available": True, "complete": True, "targets": {}}},
                      manifest={"config": configuration.model_dump(mode="json")},
                      abort_reason="cancelled by user" if cancelled else None,
                      checks=[CheckResult(id="serving", target="local", title="Serving success",
@@ -204,7 +207,7 @@ def report(configuration, *, cancelled=False):
                      requests=[RequestRecord(id="request-one", target="local", fixture_id="short",
                                              scenario="warm", check_ids=["serving"],
                                              started_at="2026-10-04T10:00:00+00:00",
-                                             status="completed", valid=True, score=True,
+                                             status="completed", valid=True, score=True, sent=True,
                                              output="private successful answer", output_chars=25)])
 
 
@@ -704,7 +707,7 @@ async def test_job_lifecycle_reads_retained_artifacts(tmp_path, fake_runner):
         assert listing["active_run_id"] is None
         assert listing["runs"][0]["id"] == identifier
         assert listing["runs"][0]["overall"] == "pass"
-        assert listing["runs"][0]["request_count"] == 1
+        assert listing["runs"][0]["request_counts"]["sent"] == 1
         assert listing["runs"][0]["check_counts"]["pass"] == 1
         saved = await client.get(f"/api/runs/{identifier}/report.json")
         assert saved.status_code == 200
@@ -712,7 +715,7 @@ async def test_job_lifecycle_reads_retained_artifacts(tmp_path, fake_runner):
         assert saved.json()["requests"][0] == evidence.json()
         assert {k: v for k, v in saved.json().items() if k != "requests"} == {
             k: v for k, v in detail["report"].items()
-            if k not in {"requests", "request_count", "requests_compact", "comparison_summary"}}
+            if k not in {"requests", "request_counts", "requests_compact", "comparison_summary"}}
         assert detail["report"]["comparison_summary"]["comparison_status"] == "absent"
         assert "comparison_summary" not in saved.json()
         html = await client.get(f"/api/runs/{identifier}/report.html")
@@ -983,10 +986,10 @@ async def test_live_requests_and_phases_survive_activity_feed_truncation(tmp_pat
         progress({"event": "scenario_started", "target": "local", "scenario": "warm",
                   "elapsed_seconds": 0})
         for slot in range(120):
-            progress({"event": "request_started", "request_slot": slot, "target": "local",
+            progress({"event": "request_started", "request_slot": slot, "budget_request_slot": slot, "target": "local",
                       "scenario": "warm", "fixture_id": f"fixture-{slot}"})
         for slot in reversed(range(120)):
-            progress({"event": "request_completed", "request_slot": slot,
+            progress({"event": "request_completed", "request_slot": slot, "budget_request_slot": slot,
                       "request": {"id": f"request-{slot}", "status": "completed", "score": None}})
         progress({"event": "scenario_finished", "target": "local", "scenario": "warm",
                   "elapsed_seconds": 12})
@@ -1041,12 +1044,15 @@ async def test_first_run_and_baseline_create_only_their_required_directories(tmp
 
 async def test_dropped_offer_count_in_live_judging_and_reopened_payload(tmp_path, monkeypatch):
     release = threading.Event()
+    target = {"sent": 2, "budget_counted": 4, "budget_counted_unsent": 2,
+              "budget_exempt": 0, "saved_observations": 2, "budget_exempt_by_reason": {}}
+    counts = {**target, "available": True, "complete": True, "targets": {"local": target}}
 
     async def waiting(configuration, *, progress, stop_event):
         progress({"event": "offer_dropped", "budget_used": 4, "attempted": 2,
-                  "completed": 2, "dropped_offers": 2})
+                  "completed": 2, "dropped_offers": 2, "request_counts": counts})
         progress({"event": "judging_started", "phase": "judging", "budget_used": 4,
-                  "attempted": 2, "completed": 2, "dropped_offers": 2})
+                  "attempted": 2, "completed": 2, "dropped_offers": 2, "request_counts": counts})
         await asyncio.to_thread(release.wait, 2)
         return report(configuration)
 
@@ -1057,15 +1063,17 @@ async def test_dropped_offer_count_in_live_judging_and_reopened_payload(tmp_path
                                   lambda value: value["progress"].get("phase") == "judging")
         assert detail["state"] == "running"
         assert detail["progress"]["phase"] == "judging"
-        assert detail["progress"]["dropped_offers"] == 2
-        assert detail["progress"]["budget_used"] > detail["progress"]["attempted"]
-        assert detail["events"][0]["dropped_offers"] == 2
+        assert detail["progress"]["request_counts"] == counts
+        assert all("request_counts" not in event for event in detail["events"])
+        for value in [detail["progress"], *detail["events"]]:
+            assert not {"budget_used", "sent", "budget_exempt", "attempted", "dropped_offers"} & value.keys()
         release.set()
         await finished(client, identifier)
     async with browser(tmp_path) as client:
         saved = (await client.get(f"/api/runs/{identifier}")).json()
         assert saved["state"] == "completed"
-        assert saved["progress"]["dropped_offers"] == 2
+        assert saved["progress"]["request_counts"] == counts
+        assert not {"budget_used", "sent", "budget_exempt", "attempted", "dropped_offers"} & saved["progress"].keys()
 
 
 def saved_comparison_fixture(root, name, *, latency=100):
@@ -1227,3 +1235,150 @@ async def test_legacy_ui_config_keeps_concurrency_intent(tmp_path, monkeypatch, 
         result = next(check for check in detail['report']['checks'] if check['id'] == 'correctness')
         assert result['status'] == ('inconclusive' if explicit else 'pass')
         assert result['metrics']['evidenced_overlap'] < 2
+
+
+def test_live_budget_slots_exclude_exempt_requests():
+    from collections import OrderedDict
+    from giraffe.web import _track_live_request
+
+    job = {"requests": OrderedDict(), "live_request_count": 0,
+           "live_request_summary": {"through_slot": None, "evicted": 0, "statuses": {}},
+           "evicted_running": set()}
+    _track_live_request(job, {"event": "request_started", "request_slot": 0, "budget_request_slot": 0,
+                             "request_budget_exempt": True, "scenario": "readiness"}, 2)
+    for slot in (1, 2):
+        _track_live_request(job, {"event": "request_started", "request_slot": slot, "budget_request_slot": slot - 1,
+                                 "request_budget_exempt": False, "budget_exempt": 1}, 2)
+    _track_live_request(job, {"event": "request_completed", "request_slot": 0, "budget_request_slot": 0,
+                             "request_budget_exempt": True,
+                             "request": {"id": "probe", "status": "completed"}}, 2)
+    for slot in (2, 1):
+        _track_live_request(job, {"event": "request_completed", "request_slot": slot, "budget_request_slot": slot - 1,
+                                 "request_budget_exempt": False, "budget_exempt": 1,
+                                 "request": {"id": str(slot), "status": "completed"}}, 2)
+    assert list(job["requests"]) == [0, 1]
+    assert [request["id"] for request in job["requests"].values()] == ["1", "2"]
+    assert job["live_request_count"] == 2
+
+
+def test_live_budget_slots_survive_out_of_order_exempt_journal_completion():
+    from collections import OrderedDict
+    from giraffe.web import _track_live_request
+
+    job = {"requests": OrderedDict(), "live_request_count": 0,
+           "live_request_summary": {"through_slot": None, "evicted": 0, "statuses": {}},
+           "evicted_running": set()}
+    for raw_slot, budget_slot, exempt in [(2, 1, False), (1, 0, False), (0, None, True)]:
+        _track_live_request(job, {"event": "request_completed", "request_slot": raw_slot,
+                                 "budget_request_slot": budget_slot,
+                                 "request_budget_exempt": exempt, "budget_exempt": 1,
+                                 "request": {"id": str(raw_slot), "status": "completed"}}, 2)
+    assert list(job["requests"]) == [0, 1]
+    assert [request["id"] for request in job["requests"].values()] == ["1", "2"]
+    assert job["live_request_count"] == 2
+
+
+def test_live_mosaic_requires_explicit_budget_slot():
+    from collections import OrderedDict
+    from giraffe.web import _track_live_request
+
+    job = {"requests": OrderedDict(), "live_request_count": 0,
+           "live_request_summary": {"through_slot": None, "evicted": 0, "statuses": {}},
+           "evicted_running": set()}
+    _track_live_request(job, {"event": "request_started", "request_slot": 0}, 1)
+    assert not job["requests"]
+    assert job["live_request_count"] == 0
+
+
+def test_web_progress_does_not_use_flat_or_unvalidated_request_counts():
+    from giraffe.web import _public_progress
+    event = {"event": "request_completed", "budget_used": 4, "sent": 3,
+             "budget_exempt": 1, "attempted": 4, "dropped_offers": 1,
+             "request_counts": {"sent": 3}, "request": {"sent": False, "status": "failed"}}
+    assert _public_progress(event) == {
+        "event": "request_completed", "request": {"sent": False, "status": "failed"}}
+
+
+def test_compact_api_report_keeps_explicit_unsent_record():
+    from giraffe.web import _api_report
+    saved = report(RunConfig.model_validate(config()))
+    saved.requests[0].sent = False
+    assert _api_report(saved)["requests"][0]["sent"] is False
+
+
+async def test_web_counts_validate_once_at_ingest_and_not_on_polls(tmp_path, monkeypatch):
+    from giraffe import web
+    ready = threading.Event()
+    calls = []
+    original = web.known_request_counts
+    target = {"sent": 1, "budget_counted": 1, "budget_counted_unsent": 0,
+              "budget_exempt": 0, "saved_observations": 0, "budget_exempt_by_reason": {}}
+    counts = {**target, "available": True, "complete": True, "targets": {"local": target}}
+
+    def counting(value):
+        calls.append(value)
+        return original(value)
+
+    async def waiting(configuration, *, progress, stop_event):
+        progress({"event": "request_started", "budget_request_slot": 0, "request_counts": counts})
+        progress({"event": "progress", "elapsed_seconds": 1})
+        progress({"event": "scenario_started", "scenario": "next"})
+        progress({"event": "progress", "request_counts": {"available": False}})
+        progress({"event": "progress", "request_counts": {
+            "available": False, "complete": False, "saved_observations": 0}})
+        ready.set()
+        await stop_event.wait()
+        return report(configuration, cancelled=True)
+
+    monkeypatch.setattr(web, "known_request_counts", counting)
+    monkeypatch.setattr(web, "run_suite", waiting)
+    async with browser(tmp_path) as client:
+        identifier = await start(client)
+        assert await asyncio.to_thread(ready.wait, 2)
+        for _ in range(3):
+            detail = (await client.get(f"/api/runs/{identifier}")).json()
+            assert detail["progress"]["request_counts"] == counts
+            assert all("request_counts" not in event for event in detail["events"])
+        delta = (await client.get(f"/api/runs/{identifier}/events?after=0")).json()
+        assert delta["progress"]["request_counts"] == counts
+        assert all("request_counts" not in event for event in delta["events"])
+        assert sum(value is counts for value in calls) == 1
+        # The stored normalised copy is not validated again either.
+        assert sum(value == counts for value in calls) == 1
+        from tests.test_ux_results import run_render_checks
+
+        detail["request_plan"] = {"planned_total": 2}
+        run_render_checks("state.detail=" + json.dumps(detail) + ";renderDetail();"
+                          "assert.match($('.live-progress').textContent,/1 of ~2 planned requests/);"
+                          "assert.doesNotMatch($('.live-progress').textContent,/counts unavailable/);", dom=True)
+        await client.post(f"/api/runs/{identifier}/cancel", json={})
+        stopped = (await client.get(f"/api/runs/{identifier}/events?after=0")).json()
+        assert stopped["progress"]["request_counts"] == counts
+
+
+async def test_out_of_range_slot_is_rejected_and_logged_once_in_live_and_delta(tmp_path, monkeypatch, caplog):
+    from giraffe import web
+    ready = threading.Event()
+
+    async def waiting(configuration, *, progress, stop_event):
+        for _ in range(2):
+            progress({"event": "request_completed", "budget_request_slot": 2,
+                      "request": {"id": "invalid", "status": "failed", "sent": False}})
+        ready.set()
+        await stop_event.wait()
+        return report(configuration, cancelled=True)
+
+    monkeypatch.setattr(web, "run_suite", waiting)
+    async with browser(tmp_path) as client:
+        response = await client.post('/api/runs', json={"config": config(max_requests=2)})
+        identifier = response.json()["id"]
+        assert await asyncio.to_thread(ready.wait, 2)
+        detail = (await client.get(f"/api/runs/{identifier}")).json()
+        assert detail["live_requests"] == []
+        for _ in range(2):
+            delta = (await client.get(f"/api/runs/{identifier}/events?after=0")).json()
+            assert delta["records"] == []
+        messages = [record.message for record in caplog.records if "slot invariant" in record.message]
+        assert sum("(live)" in message for message in messages) == 1
+        assert sum("(delta)" in message for message in messages) == 1
+        await client.post(f"/api/runs/{identifier}/cancel", json={})

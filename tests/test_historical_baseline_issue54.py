@@ -109,7 +109,7 @@ def test_cli_baseline_comparison_persists_completed_run(version, tmp_path, monke
     outcome = json.loads(captured.out)
     assert len(calls) == 1
     assert outcome["exit_code"] == expected
-    assert outcome["request_count"] == 8
+    assert outcome["request_counts"] is None
     assert outcome["report_paths"]["json"] == str((output / "report.json").resolve())
     persisted = RunReport.model_validate_json((output / "report.json").read_text())
     if expected:

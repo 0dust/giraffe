@@ -48,6 +48,17 @@ logger = logging.getLogger(__name__)
 # A context-local sink lets web runs persist evidence without changing request()
 # or sharing a writer between concurrent CLI invocations.
 record_sink = ContextVar("giraffe_record_sink", default=lambda record: None)
+request_counts_sink = ContextVar("giraffe_request_counts_sink", default=None)
+_transport_sent_callback = ContextVar("giraffe_transport_sent_callback", default=None)
+_request_budget_slot = ContextVar("giraffe_request_budget_slot", default=None)
+
+
+def _observe_transport_sent():
+    # A shared client can dispatch concurrent requests; the callback belongs to
+    # the request task's context, rather than mutable client request state.
+    callback = _transport_sent_callback.get()
+    if callback is not None:
+        callback()
 
 
 class _DispatchRefused(Exception):
@@ -216,7 +227,7 @@ def _context_rejection(record):
 
 
 def _serving_failure(record, scenario):
-    if (record.identity is not None or scenario in {"sustained", "performance_evidence_probe"} or scenario.startswith("traffic_stage_") or record.status == "cancelled"
+    if (record.identity is not None or scenario in {"sustained", states.SETUP_PROBE_PERFORMANCE_EVIDENCE} or scenario.startswith("traffic_stage_") or record.status == "cancelled"
             or _reasoning_budget(record)):
         return False
     if (scenario.startswith("load_calibration_") and record.input_tokens is not None
@@ -246,7 +257,7 @@ def _spec(spec: RequestSpec, scenario: str, checks: list[str] = ()) -> RequestSp
 
 
 def _scenario_checks(spec):
-    if spec.scenario in {"initial", "readiness", "warm", "generation"}:
+    if spec.scenario in {"initial", states.SETUP_PROBE_READINESS, "warm", "generation"}:
         return spec.check_ids
     return [name for name in spec.check_ids if name not in {"access", "serving", "first_output", "generation"}]
 
@@ -375,12 +386,19 @@ class _Run:
         self.records: list[RequestRecord] = []
         self.timeout_watch = TimeoutWatch()
         self.record_sink = record_sink.get()
+        self.request_counts_sink = request_counts_sink.get()
         from giraffe.logprobs import LogprobBudget
         self.logprob_budget = LogprobBudget()
         self.attempted = 0
+        self.counted_attempted = 0
         self.budget_used = 0
         self.dropped_offers = 0
         self.budget_counts = Counter()
+        self.budget_unsent_counts = Counter()
+        self.saved_counts = Counter()
+        self.sent_counts = Counter()
+        self.charged_sent_counts = Counter()
+        self.exempt_counts = defaultdict(Counter)
         self.errors = 0
         self.reason: str | None = None
         self.limits_reached = set()
@@ -433,6 +451,12 @@ class _Run:
                     "timeout_seconds": config.metrics_timeout_seconds,
                     "max_samples": config.metrics_max_samples,
                     "max_series": config.metrics_max_series, "collection_gaps_seconds": []})
+
+        self._publish_request_counts()
+
+    def _publish_request_counts(self):
+        if self.request_counts_sink is not None:
+            self.request_counts_sink(self.request_counts(saved_counts=self.saved_counts))
 
     def runtime_gateway_request_counts(self, target):
         from .gateway_access import eligible_probe_count
@@ -509,7 +533,7 @@ class _Run:
             event = "condition_scoring"
         self.emit(event, row["target"], scenario, condition_summary={**row, "aggregate_status": aggregate["status"],
                   **{key: aggregate[key] for key in ("condition_id", "check_id", "name", "concurrency_description", "not_started", "reasons")}},
-                  **{k: v for k, v in row.items() if k not in {"target", "completed"}})
+                  **{k: v for k, v in row.items() if k not in {"target", "completed", "sent"}})
 
     def condition_reason(self, target, fallback=states.CONDITION_STOP_EARLY):
         if self.stop.is_set() or self.reason == states.STOP_CANCELLED_BY_USER:
@@ -539,6 +563,41 @@ class _Run:
             row["condition_verdict"] = row.get("condition_verdict") or "pending"
         self.emit_condition("condition_finished", scenario, row)
 
+    def note_sent(self, target: str, exempt_reason: str | None = None) -> None:
+        """Count target inference only once local preparation reaches transport."""
+        if exempt_reason is not None and exempt_reason not in states.REQUEST_BUDGET_EXEMPTIONS:
+            raise ValueError(f"Unknown request budget exemption: {exempt_reason}")
+        self.sent_counts[target] += 1
+        if exempt_reason is None:
+            self.charged_sent_counts[target] += 1
+            self.budget_unsent_counts[target] -= 1
+        else:
+            self.exempt_counts[target][exempt_reason] += 1
+        self._publish_request_counts()
+
+    def request_counts(self, *, saved_counts=None) -> dict:
+        """Snapshot charged offers, actual dispatches, and retained measurements."""
+        saved = (Counter(record.target for record in self.records
+                         if record.scenario not in states.SETUP_PROBE_SCENARIOS)
+                 if saved_counts is None else saved_counts)
+        targets = {}
+        reasons = Counter()
+        for target in self.config.targets:
+            exempt = self.exempt_counts[target.name]
+            reasons.update(exempt)
+            targets[target.name] = {
+                "sent": self.sent_counts[target.name],
+                "budget_counted": self.budget_counts[target.name],
+                "budget_counted_unsent": self.budget_unsent_counts[target.name],
+                "budget_exempt": sum(exempt.values()),
+                "saved_observations": saved[target.name],
+                "budget_exempt_by_reason": dict(exempt),
+            }
+        return {"sent": sum(self.sent_counts.values()), "budget_counted": self.budget_used,
+                "budget_counted_unsent": sum(self.budget_unsent_counts.values()), "complete": True, "available": True,
+                "budget_exempt": sum(reasons.values()), "saved_observations": sum(saved.values()),
+                "budget_exempt_by_reason": dict(reasons), "targets": targets}
+
     def record_finished(self, record: RequestRecord) -> None:
         """Persist completed, pre-judging evidence through the installed sink."""
         self.record_sink(record)
@@ -551,9 +610,8 @@ class _Run:
                                    "elapsed_seconds": time.monotonic()-self.start})
         if self.progress:
             self.progress({"event": event, "target": target, "scenario": scenario,
-                           "completed": len(self.records), "attempted": self.attempted,
-                           "budget_used": self.budget_used,
-                           "dropped_offers": self.dropped_offers,
+                           "completed": len(self.records),
+                           "request_counts": self.request_counts(saved_counts=self.saved_counts),
                            "max_requests": self.config.max_requests,
                            "elapsed_seconds": round(time.monotonic() - self.start, 3), **extra})
 
@@ -746,7 +804,22 @@ class _Run:
             return False
         self.budget_used += 1
         self.budget_counts[target] += 1
+        # A charged offer is unsent until its transport hand-off or refund.
+        self.budget_unsent_counts[target] += 1
+        self._publish_request_counts()
         return True
+
+    def refund_offer(self, target: str) -> None:
+        """Refund only an offer that has not acquired a request tile."""
+        identity = _request_budget_slot.get()
+        if identity is not None and identity[0] is self and identity[1] is not None:
+            raise RuntimeError("Cannot refund a request after begin_attempt assigned its budget slot")
+        if self.budget_used <= self.counted_attempted:
+            raise RuntimeError("Cannot refund budget already assigned to request slots")
+        self.budget_used -= 1
+        self.budget_counts[target] -= 1
+        self.budget_unsent_counts[target] -= 1
+        self._publish_request_counts()
 
     def drop_offer(self, target: str, scenario: str):
         self.dropped_offers += 1
@@ -786,6 +859,14 @@ class _Run:
             if not reserved:
                 self.release_slot()
 
+    @asynccontextmanager
+    async def _request_identity(self):
+        identity = _request_budget_slot.set((self, None))
+        try:
+            yield
+        finally:
+            _request_budget_slot.reset(identity)
+
     def timeout_origin(self, spec):
         """Validate producer provenance against the request's actual deadline."""
         # These producers overwrite copied pack/fixture deadlines in build_spec.
@@ -820,8 +901,8 @@ class _Run:
                     and self.config.effective_check(check)["request_timeout_seconds"] == timeout):
                 return "check", check, None
             return "run", None, None
-        if spec.scenario in {"initial", "readiness", "warm"}:
-            if spec.scenario in {"initial", "readiness"} and "access" in self.config.checks:
+        if spec.scenario in {"initial", states.SETUP_PROBE_READINESS, "warm"}:
+            if spec.scenario in {"initial", states.SETUP_PROBE_READINESS} and "access" in self.config.checks:
                 candidates = ["access"]
             else:
                 candidates = [name for name in ("serving", "first_output") if name in self.config.checks]
@@ -840,7 +921,7 @@ class _Run:
     async def request(self, target, client, spec, event=None, on_start=None, timeout_override=None,
                       *, slot_reserved=False, budget_reserved=False, deadline_override=None,
                       admission_deadline=None, prepared_admission=False, admission_check=None,
-                      on_preparation_failure=None, budget_exempt=False, evaluate_record=None,
+                      on_preparation_failure=None, budget_exemption: str | None = None, evaluate_record=None,
                       finalize_record=None, request_parameters=None, lifecycle_observer=None):
         """Complete a request and persist its terminal evidence once.
 
@@ -852,6 +933,9 @@ class _Run:
         ``admission_check`` checks caller-owned eligibility before committing an attempt.
         ``on_preparation_failure`` can read a client diagnostic without recording an attempt.
         """
+        if budget_exemption is not None and budget_exemption not in states.REQUEST_BUDGET_EXEMPTIONS:
+            raise ValueError(f"Unknown request budget exemption: {budget_exemption}")
+        budget_exempt = budget_exemption is not None
         source, timeout_check, timeout_setting = self.timeout_origin(spec)
         spec = spec.model_copy(update={"deadline_source": source, "timeout_check": timeout_check,
                                        "timeout_setting": timeout_setting})
@@ -862,13 +946,13 @@ class _Run:
         spec = spec.model_copy(update={"check_ids": check_ids})
         gateway_probe = (spec.identity is not None and bool(check_ids)
                          and SHARED_BASELINE_EXCLUDED_WORKLOADS.issuperset(check_ids))
-        readiness = spec.scenario == "readiness" or (
+        readiness = spec.scenario == states.SETUP_PROBE_READINESS or (
             spec.scenario == "initial" and self.config.restart_target == target.name)
-        evidence_probe = spec.scenario == "performance_evidence_probe" or spec.identity is not None
+        evidence_probe = spec.scenario == states.SETUP_PROBE_PERFORMANCE_EVIDENCE or spec.identity is not None
         slot_deadline = min(self.deadline, deadline_override if deadline_override is not None else self.deadline)
         if admission_deadline is not None:
             slot_deadline = min(slot_deadline, admission_deadline)
-        async with self.slot(slot_reserved, slot_deadline, gateway_probe=gateway_probe) as admitted:
+        async with self.slot(slot_reserved, slot_deadline, gateway_probe=gateway_probe) as admitted, self._request_identity():
             # An offered arrival owns its budget even if a later arrival exhausts
             # the ceiling. Only a real stop condition can prevent its dispatch.
             reason = self.stop_reason(target.name)
@@ -879,6 +963,7 @@ class _Run:
                 if admission_deadline is None or time.monotonic() >= self.deadline or reason:
                     self.mark_unfinished(target.name, _scenario_checks(spec))
                 return None
+            charged_offer_reserved = not budget_exempt and (budget_reserved or admission_deadline is None)
             if admission_deadline is None:
                 self.attempted += 1
             output_cap = spec.max_tokens if spec.max_tokens is not None else self.config.max_output_tokens
@@ -910,6 +995,8 @@ class _Run:
             global_deadline = False
             deadline = None
             intentional_deadline_applies = False
+            sent = False
+            budget_request_slot = None
             request_slot = started = started_at = token = timeout = None
             failure = None
             task = asyncio.current_task()
@@ -930,9 +1017,8 @@ class _Run:
                     if self.stop.is_set() or time.monotonic() >= self.deadline:
                         self.mark_unfinished(target.name, _scenario_checks(spec))
                     return None
-                if budget_reserved and not budget_exempt:
-                    self.budget_used -= 1
-                    self.budget_counts[target.name] -= 1
+                if charged_offer_reserved:
+                    self.refund_offer(target.name)
                 return RequestRecord(
                     id=uuid.uuid4().hex, target=target.name, fixture_id=spec.fixture_id,
                     scenario=spec.scenario, check_ids=spec.check_ids, started_at=_now(),
@@ -942,7 +1028,8 @@ class _Run:
 
             def emit_start():
                 self.emit("request_started", target.name, spec.scenario,
-                          request_slot=request_slot, fixture_id=spec.fixture_id,
+                          request_slot=request_slot, budget_request_slot=budget_request_slot,
+                          request_budget_exempt=budget_exempt, fixture_id=spec.fixture_id,
                           **({"user": {key: spec.workload[key] for key in ("user_id", "population", "profile", "window_id", "phase", "request_sequence", "session_id", "turn_id", "conversation_sequence", "role", "matched_work_sequence", "trigger", "heavy_profile", "cancellation_role", "cohort", "origin", "work_sequence", "activation_seconds") if key in spec.workload}} if "multi_user" in spec.check_ids else {}),
                           input_chars=request_parameters["input_chars"], requested_max_tokens=output_cap,
                           requested_input_tokens=spec.requested_input_tokens,
@@ -970,42 +1057,65 @@ class _Run:
                 return timeout
 
             def begin_attempt():
-                nonlocal started, started_at, request_slot, token, pending_start
+                nonlocal started, started_at, request_slot, budget_request_slot, token, pending_start
+                nonlocal charged_offer_reserved
+                if token is not None:
+                    raise RuntimeError("begin_attempt cannot assign a request slot twice")
+                next_started = admission_clock() if admission_deadline is not None else time.monotonic()
                 if admission_deadline is not None:
-                    started = admission_clock()
-                    if (not budget_reserved and not budget_exempt
-                            and not self.reserve_offer(target.name, gateway_probe=gateway_probe)):
-                        self.mark_unfinished(target.name, _scenario_checks(spec))
-                        raise _DispatchRefused
+                    if not budget_reserved and not budget_exempt:
+                        if not self.reserve_offer(target.name, gateway_probe=gateway_probe):
+                            self.mark_unfinished(target.name, _scenario_checks(spec))
+                            raise _DispatchRefused
+                        charged_offer_reserved = True
+                if not budget_exempt and self.counted_attempted >= self.budget_used:
+                    raise RuntimeError("Request slot requires an unassigned charged offer")
+                next_started_at = _now()
+                if not readiness and not evidence_probe:
+                    self.endpoint_attempt(target.name)
+                if guard_transport:
+                    deadline.reschedule(min(self.deadline, task.get_loop().time() + request_budget()))
+                # Preparation and endpoint bookkeeping must succeed before this
+                # request owns a tile. No callback runs during the commit below.
+                next_token = self.inflight.start(target.name)
+                started, started_at, token = next_started, next_started_at, next_token
+                if admission_deadline is not None:
                     self.attempted += 1
+                request_slot = self.attempted - 1
+                if not budget_exempt:
+                    budget_request_slot = self.counted_attempted
+                    self.counted_attempted += 1
+                    _request_budget_slot.set((self, budget_request_slot))
                 if condition is not None:
                     condition["sent"] += 1
                     condition["started"] += 1
                     condition["running"] += 1
                     if condition["planned"] is not None:
                         condition["not_sent"] = max(0, condition["planned"] - condition["sent"])
-                request_slot = self.attempted - 1
                 self.counts[target.name] += 1
-                if not readiness and not evidence_probe:
-                    self.endpoint_attempt(target.name)
                 self.active[key] += 1
                 self.peak[key] = max(self.peak[key], self.active[key])
-                if admission_deadline is None:
-                    started = time.monotonic()
-                started_at = _now()
-                token = self.inflight.start(target.name)
-                if on_start:
-                    on_start()
-                if guard_admission and self.progress:
-                    # An admitted request enters transport before yielding to
-                    # public progress. A synchronous observer cannot hold it
-                    # past the checked admission boundary before dispatch.
-                    pending_start = task.get_loop().call_soon(emit_scheduled_start)
-                else:
-                    emit_start()
-                if guard_transport:
-                    deadline.reschedule(min(self.deadline, task.get_loop().time() + request_budget()))
+                try:
+                    if on_start:
+                        on_start()
+                finally:
+                    if guard_admission and self.progress:
+                        # An admitted request enters transport before yielding to
+                        # public progress. A synchronous observer cannot hold it
+                        # past the checked admission boundary before dispatch.
+                        pending_start = task.get_loop().call_soon(emit_scheduled_start)
+                    else:
+                        emit_start()
 
+            def note_transport_sent():
+                nonlocal sent
+                self.note_sent(target.name, budget_exemption)
+                sent = True
+
+            sent_observer = getattr(client, "_supports_sent_observer", False) is True
+            if sent_observer and client.on_sent is not _observe_transport_sent:
+                client.on_sent = _observe_transport_sent
+            sent_observer_token = _transport_sent_callback.set(note_transport_sent)
             try:
                 if guard_transport:
                     # Keep the run bound during preparation. The transport hook
@@ -1016,8 +1126,16 @@ class _Run:
                     begin_attempt()
                     deadline = asyncio.timeout(request_budget())
                 async with deadline:
+                    # Alternate clients without the transport observer expose execute
+                    # itself as their hand-off. The built-in client counts after preparation.
+                    if not sent_observer and not guard_transport:
+                        note_transport_sent()
                     if guard_transport:
-                        record = await client.execute(spec, first_output_event=event, _before_send=begin_attempt,
+                        def guarded_start():
+                            begin_attempt()
+                            if not sent_observer:
+                                note_transport_sent()
+                        record = await client.execute(spec, first_output_event=event, _before_send=guarded_start,
                             **({"lifecycle_observer": lifecycle_observer} if lifecycle_observer is not None else {}))
                     else:
                         record = await client.execute(spec, first_output_event=event,
@@ -1085,6 +1203,7 @@ class _Run:
                         input_chars=spec.input_chars, requested_max_tokens=output_cap,
                     )
             finally:
+                _transport_sent_callback.reset(sent_observer_token)
                 if token is not None:
                     self.active[key] -= 1
                     overlap = self.inflight.finish(target.name, token)
@@ -1112,6 +1231,10 @@ class _Run:
             record.timeout_check = spec.timeout_check
             record.timeout_setting = spec.timeout_setting
             record._request_slot = request_slot
+            record.sent = sent
+            record._budget_exempt = budget_exempt
+            record._budget_exemption = budget_exemption
+            record._budget_request_slot = budget_request_slot
             if (spec.deadline_source == "run" and spec.timeout_setting is not None
                     and spec.workload.get("request_source") == "custom_fixtures"
                     and spec._fixture_request_timeout_seconds == record.request_timeout_seconds):
@@ -1184,6 +1307,9 @@ class _Run:
                     failure = failure or exc
                 finally:
                     self.records.append(record)
+                    if record.scenario not in states.SETUP_PROBE_SCENARIOS:
+                        self.saved_counts[record.target] += 1
+                        self._publish_request_counts()
                 if isinstance(failure, asyncio.CancelledError):
                     # Scoring returns a copy; callers need this retained record.
                     failure.giraffe_record = record
@@ -1234,13 +1360,14 @@ class _Run:
                             item for item in self.timeout_watch.warnings if item["target"] == target.name][-16:]
                         self.emit("timeout_warning", target.name, spec.scenario, timeout_warning=warning)
                     self.emit("request_completed", target.name, spec.scenario, status=record.status,
+                              request_budget_exempt=budget_exempt, budget_request_slot=record._budget_request_slot,
                               condition_id=condition_id, condition_summary=dict(condition) if condition else None,
                               input_chars=request_parameters["input_chars"], requested_max_tokens=output_cap,
                               requested_input_tokens=spec.requested_input_tokens,
                               **({"user": {key: spec.workload[key] for key in ("user_id", "population", "profile", "window_id", "phase", "request_sequence", "session_id", "turn_id", "conversation_sequence", "role", "matched_work_sequence", "trigger", "heavy_profile", "cancellation_role", "cohort", "origin", "work_sequence", "activation_seconds") if key in spec.workload}} if "multi_user" in spec.check_ids else {}),
                               request_slot=request_slot, request=record.model_dump(mode="json", include={
                                   "id", "target", "fixture_id", "scenario", "condition_id", "intentional", "status", "valid", "score",
-                                  "elapsed_ms", "first_output_ms", "check_ids", "http_status",
+                                  "elapsed_ms", "first_output_ms", "check_ids", "http_status", "sent",
                                   "request_timeout_seconds", "termination_reason", "termination_limit_seconds",
                                   "started_at", "dispatch_ms", "completed_ms", "timing_start_ms",
                                   *({"request_body_sent_ms"} if record.request_body_sent_ms is not None else ()),
@@ -1619,9 +1746,9 @@ async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attributio
                         restart["health_polls"].append({"elapsed_seconds": time.monotonic()-run.start,
                                                         "ready": ready})
                         if ready:
-                            probe = _spec(initial_specs[0], "readiness").model_copy(update={"check_ids": []})
+                            probe = _spec(initial_specs[0], states.SETUP_PROBE_READINESS).model_copy(update={"check_ids": []})
                             record = await run.request(target, client, probe, deadline_override=ready_deadline,
-                                                       budget_exempt=True)
+                                                       budget_exemption=states.REQUEST_BUDGET_EXEMPTION_RESTART_READINESS)
                             if record and record.valid:
                                 record.check_ids = [name for name in ("access", "serving", "first_output")
                                                     if name in enabled]
@@ -1642,7 +1769,7 @@ async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attributio
                 # A one-token inference can still have a slow first response.
                 # Share one configured timeout across compatibility retries.
                 probe_end = min(run.deadline, time.monotonic() + config.request_timeout_seconds)
-                run.preparation(target.name, "performance_evidence_probe", "Checking streamed token and usage support", "running")
+                run.preparation(target.name, states.SETUP_PROBE_PERFORMANCE_EVIDENCE, "Checking streamed token and usage support", "running")
                 client.on_response = None
                 probe_count = 0
                 planned_reserve = run.token_evidence_reserve(target)
@@ -1689,9 +1816,9 @@ async def _target(run: _Run, target: Target, fixtures: dict, *, defer_attributio
                     complete_evidence = (evidence.get("status") == states.TOKEN_EVIDENCE_OBSERVED
                                          and evidence.get("logprobs") == evidence.get("usage") == states.TOKEN_EVIDENCE_SUPPORTED
                                          and not evidence.get("missing_usage_fields"))
-                    run.preparation(target.name, "performance_evidence_probe", "Streamed token and usage support",
+                    run.preparation(target.name, states.SETUP_PROBE_PERFORMANCE_EVIDENCE, "Streamed token and usage support",
                                     "completed" if complete_evidence else "unavailable", evidence.get("reason"))
-                    run.finish_condition(target.name, "performance_evidence_probe", reason=evidence.get("reason"),
+                    run.finish_condition(target.name, states.SETUP_PROBE_PERFORMANCE_EVIDENCE, reason=evidence.get("reason"),
                                          verdict="pass" if complete_evidence else "inconclusive")
             run.observations[target.name]["deployment"]["model_residency"]["after_preparation"] = (
                 await deployment.model_residency(target, config, deadline=run.deadline, stop=run.stop))
@@ -2227,7 +2354,7 @@ def _checks(run: _Run, target: Target) -> list[CheckResult]:
             else:
                 summary = "Valid non-empty responses and required stream termination observed."
         elif check_id in {"first_output", "generation"}:
-            metrics["initial"] = _stats([r for r in ordinary if r.scenario in {"initial", "readiness"}])
+            metrics["initial"] = _stats([r for r in ordinary if r.scenario in {"initial", states.SETUP_PROBE_READINESS}])
             thresholds = (limits.first_output_ms is not None if check_id == "first_output" else
                           any(v is not None for v in (limits.latency_ms, limits.stream_gap_ms,
                                                       limits.min_output_tokens_per_second)))
@@ -2799,7 +2926,7 @@ def _budget_guidance(config, check_id=None):
                               - plan["adaptive_estimates"].get("concurrency", 0)) * len(config.targets))
     amount = f"to at least {max(planned, config.max_requests + 1)}"
     return (f"Raise max_requests (or --max-requests) {amount}, "
-            f"or select fewer checks. The plan needs at least {plan['known_total']} fixed requests; adaptive traffic may need more.")
+            f"or select fewer checks. The plan has {plan['known_total']} known planned requests; adaptive traffic may need more.")
 
 
 def _output_budget_guidance(config, records, check_id):
@@ -3085,7 +3212,8 @@ def _verdict_summary(check, config, records, budget):
 
 async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | None = None,
                     stop_event: asyncio.Event | None = None,
-                    on_scale_down_control: Callable | None = None) -> RunReport:
+                    on_scale_down_control: Callable | None = None,
+                    preflight_counts: dict[str, int] | None = None) -> RunReport:
     from .local_tokenizer import ensure_tokenizers
     from .deployment import preparation_residency
     residency = config._preparation_residency
@@ -3096,7 +3224,8 @@ async def run_suite(config: RunConfig, *, progress: Callable[[dict], None] | Non
     with PhaseSampler("traffic") as sampler:
         try:
             return await _run_suite(config, progress=progress, stop_event=stop_event,
-                                    sampler=sampler, residency=residency, on_scale_down_control=on_scale_down_control)
+                                    sampler=sampler, residency=residency, on_scale_down_control=on_scale_down_control,
+                                    preflight_counts=preflight_counts)
         except Exception:
             logger.exception("Unexpected suite failure")
             raise
@@ -3135,7 +3264,7 @@ async def _stop_judging(evaluation, run):
             "duration_seconds": None, "stop_reason": "cancelled"}
 
 
-async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, residency, on_scale_down_control=None) -> RunReport:
+async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, residency, on_scale_down_control=None, preflight_counts=None) -> RunReport:
     """Run the built-in suite with one shared load budget and preserve partial evidence."""
     outer_cancellation = None
     suite_task = asyncio.current_task()
@@ -3167,6 +3296,9 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
                              "per-check request setting overrides are unsupported.")
     started_at, run_id = _now(), uuid.uuid4().hex
     run = _Run(config, progress, stop_event)
+    for target, count in (preflight_counts or {}).items():
+        for _ in range(count):
+            run.note_sent(target, states.REQUEST_BUDGET_EXEMPTION_PREFLIGHT)
     run.run_id = run_id
     sampler.run = run
     if "scale_down" in config.checks:
@@ -3433,7 +3565,7 @@ async def _run_suite(config: RunConfig, *, progress, stop_event, sampler, reside
                     "targets": run.observations, "generator_max_lag_ms": round(run.max_lag_ms, 3),
                     "target_abort_reasons": target_abort_reasons,
                     "client_timing_health": run.timing_health.snapshot(),
-                    "request_budget_used": run.budget_used,
+                    "request_counts": {**run.request_counts(), "complete": outer_cancellation is None},
                     "request_limit_scopes": sorted(run.request_limit_scopes),
                     "concurrency_limit_scopes": sorted(run.concurrency_limit_scopes),
                     **({"duration_limit_scope": run.duration_limit_scope} if run.duration_limit_scope else {}),

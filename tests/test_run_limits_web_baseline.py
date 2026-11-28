@@ -122,14 +122,14 @@ def live_job():
 def test_a25_backend_unlimited_slots_keep_recent_window_and_complete_evicted_summary():
     job = live_job()
     for slot in range(4100):
-        _track_live_request(job, {"event": "request_started", "request_slot": slot}, None)
+        _track_live_request(job, {"event": "request_started", "request_slot": slot, "budget_request_slot": slot}, None)
     assert len(job["requests"]) == 4096
     assert list(job["requests"])[0] == 4
     assert job["live_request_count"] == 4100
     assert job["live_request_summary"] == {"evicted": 4, "through_slot": 3,
                                              "statuses": {"running": 4}}
     for slot in range(4):
-        _track_live_request(job, {"event": "request_completed", "request_slot": slot,
+        _track_live_request(job, {"event": "request_completed", "request_slot": slot, "budget_request_slot": slot,
                                  "request": {"status": "completed"}}, None)
     assert len(job["requests"]) == 4096
     assert list(job["requests"])[0] == 4
@@ -140,8 +140,8 @@ def test_a25_backend_unlimited_slots_keep_recent_window_and_complete_evicted_sum
 def test_live_slots_respect_explicit_budget_and_do_not_reorder_on_completion():
     job = live_job()
     for slot in range(3):
-        _track_live_request(job, {"event": "request_started", "request_slot": slot}, 2)
-    _track_live_request(job, {"event": "request_completed", "request_slot": 0,
+        _track_live_request(job, {"event": "request_started", "request_slot": slot, "budget_request_slot": slot}, 2)
+    _track_live_request(job, {"event": "request_completed", "request_slot": 0, "budget_request_slot": 0,
                              "request": {"status": "completed"}}, 2)
     assert list(job["requests"]) == [0, 1]
     assert job["live_request_count"] == 2

@@ -654,7 +654,7 @@ async def test_load_local_drops_consume_budget_and_admitted_requests_drain(clien
                                                request_source="request_pack", request_pack={"version": 1, "cases": [
         {"fixture_id": "one", "messages": [{"role": "user", "content": "A"}], "scorer": "exact", "expected": "A"}]}))
     group = load_group(report)
-    assert report.observations["request_budget_used"] == 3
+    assert report.observations["request_counts"]["budget_counted"] == 3
     assert group["scheduled"] == 10 and group["dispatched"] == group["valid"] == 1
     assert group["local_drops"] == 2 and group["not_offered"] == 7
     assert group["status"] == "inconclusive"
@@ -741,7 +741,9 @@ async def test_shared_request_concurrency_budget_and_replica_separation(client):
     assert {r.target for r in report.requests} == {"service", "replica"}
     assert report.overall == "inconclusive" and "request budget" in report.abort_reason
     assert all(check(report, "serving", name).status == "inconclusive" for name in ("service", "replica"))
-    assert max(e["attempted"] for e in events) == 5
+    assert max(e["request_counts"]["budget_counted"] for e in events) == 5
+    assert events[-1]["request_counts"]["sent"] == 5
+    assert events[-1]["request_counts"]["budget_counted_unsent"] == 0
     assert len(report.checks) == 22
     assert all(row["other_replicas"] == "unverified" for row in report.observations["replica_coverage"])
 
@@ -1649,7 +1651,7 @@ async def test_legacy_capacity_and_arrivals_migrate_to_separate_load_points():
     assert len({point["source"] for point in points}) == 2
     assert {point["rate"] for point in points} == {20, 100}
     assert report.manifest["config"]["checks"] == ["load"]
-    assert report.observations["request_budget_used"] == len(report.requests)
+    assert report.observations["request_counts"]["budget_counted"] == len(report.requests)
 
 
 async def test_saved_inactive_drafts_do_not_change_load_fixture_identity():
@@ -1871,7 +1873,7 @@ async def test_judging_waits_for_every_target_telemetry_and_monitor(client, monk
     report = await runner.run_suite(judged_pack_config(targets=targets, concurrency=8, overlap_models=True),
                                     progress=events.append)
     assert snapshots == [(r.id, r.dispatch_ms, r.completed_ms, r.elapsed_ms) for r in report.requests]
-    assert len(report.requests) == report.observations["request_budget_used"] == 10
+    assert len(report.requests) == report.observations["request_counts"]["budget_counted"] == 10
     assert report.observations["judging"]["duration_seconds"] == .12
     assert report.observations["generator_max_lag_ms"] < 100
     for target in ("one", "two"):
@@ -2047,7 +2049,9 @@ async def test_live_request_events_keep_identity_and_exclude_response_bodies(cli
         record = event["request"]
         assert record["elapsed_ms"] == by_id[record["id"]].elapsed_ms
         assert record["score"] == by_id[record["id"]].score
-        assert set(record) == {"id", "target", "fixture_id", "scenario", "condition_id", "intentional", "status", "valid", "score",
+        assert record["sent"] is by_id[record["id"]].sent is True
+        assert not {"budget_used", "sent", "budget_exempt", "attempted", "dropped_offers"} & event.keys()
+        assert set(record) == {"id", "target", "fixture_id", "scenario", "condition_id", "intentional", "status", "valid", "score", "sent",
                 "request_timeout_seconds", "termination_reason", "termination_limit_seconds",
                 "elapsed_ms", "first_output_ms", "check_ids", "http_status", "started_at", "dispatch_ms",
                 "completed_ms", "timing_start_ms", "timing_schema", "first_token_ms", "first_reasoning_ms",
@@ -2061,7 +2065,10 @@ async def test_live_request_events_keep_identity_and_exclude_response_bodies(cli
         assert all(not isinstance(value, (dict, list)) for key, value in record.items() if key != "check_ids")
         for field in ["dispatch_ms", "completed_ms", "timing_schema", "output_tokens", "first_token_ms"]:
             assert record[field] == getattr(by_id[record["id"]], field)
-        assert event["budget_used"] >= event["attempted"]
+        assert event["request_counts"]["available"] is True
+        counts = event["request_counts"]
+        assert counts["budget_counted"] >= counts["sent"]
+        assert counts["sent"] == counts["budget_counted"] - counts["budget_counted_unsent"]
 
 
 
@@ -2721,7 +2728,8 @@ async def test_dropped_offer_progress_survives_traffic_into_judging(client, monk
     stage = load_group(result)
     assert stage["local_drops"] == 2
     dropped = [event for event in events if event["event"] == "offer_dropped"]
-    assert [event["dropped_offers"] for event in dropped] == [1, 2]
+    assert len(dropped) == 2
+    assert [event["request_counts"]["budget_counted_unsent"] for event in dropped] == [1, 2]
     assert all(event["target"] == "service" and event["scenario"] == load_point(result)["id"]
                for event in dropped)
     after_traffic = [event for event in events if event["event"] in {
@@ -2729,9 +2737,12 @@ async def test_dropped_offer_progress_survives_traffic_into_judging(client, monk
     }]
     assert len(after_traffic) == 3
     for event in after_traffic:
-        assert event["dropped_offers"] == 2
-        assert event["budget_used"] - event["attempted"] == 2
-        assert event["attempted"] == event["completed"] == len(result.requests)
+        counts = event["request_counts"]
+        assert counts["available"] is True
+        assert counts["budget_counted_unsent"] == 2
+        assert counts["budget_counted"] - counts["sent"] == 2
+        assert counts["sent"] == event["completed"] == len(result.requests)
+        assert not {"attempted", "dropped_offers"} & event.keys()
 
 
 @pytest.mark.parametrize('wrong_answer,expected', [(False, 'inconclusive'), (True, 'fail')])

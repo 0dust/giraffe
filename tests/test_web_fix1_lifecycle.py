@@ -278,7 +278,8 @@ async def test_published_recovery_report_with_retained_journal_finishes_polling(
                 break
         else:
             pytest.fail("Published recovery report still advertises pending recovery")
-        assert detail["state"] == "interrupted" and detail["report"]["request_count"] == 1
+        assert detail["state"] == "interrupted"
+        assert detail["report"]["request_counts"] == {"available": False, "complete": False, "saved_observations": 1}
         events = (await client.get("/api/runs/recovered/events")).json()
         assert events["terminal"] is True and events["recoverable"] is False
         row = next(row for row in (await client.get("/api/runs")).json()["runs"] if row["id"] == "recovered")
@@ -501,10 +502,15 @@ async def test_shutdown_shows_partial_save_and_waits_for_slow_builder(tmp_path, 
 
     started, building, release = threading.Event(), threading.Event(), threading.Event()
     identifiers = []
+    target_counts = {"sent": 2, "budget_counted": 1, "budget_counted_unsent": 0,
+                     "budget_exempt": 1, "saved_observations": 1,
+                     "budget_exempt_by_reason": {"preflight": 1}}
+    counts = {**target_counts, "available": True, "complete": True,
+              "targets": {"local": target_counts}}
 
     async def slow(configuration, *, progress, stop_event):
         progress({"event": "scenario_started", "target": "local", "scenario": "warm",
-                  "completed": 1, "attempted": 1})
+                  "completed": 1, "request_counts": counts, "max_requests": 2})
         started.set()
         try:
             await asyncio.Event().wait()
@@ -535,6 +541,9 @@ async def test_shutdown_shows_partial_save_and_waits_for_slow_builder(tmp_path, 
         assert meta["progress"]["message"] == "Saving partial report…"
         assert meta["progress"]["event"] == "saving_partial_report"
         assert meta["progress"]["completed"] == 1
+        assert meta["progress"]["request_counts"] == counts
+        assert meta["progress"]["max_requests"] == 2
+        assert not {"sent", "budget_used", "budget_exempt", "attempted", "dropped_offers"} & meta["progress"].keys()
         assert not task.done()
     finally:
         release.set()

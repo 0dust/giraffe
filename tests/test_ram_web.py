@@ -82,7 +82,7 @@ def test_runs_listing_caches_compact_report_summaries_and_refreshes_changed_repo
     with TestClient(create_app(tmp_path), base_url="http://127.0.0.1:8787") as client:
         for _ in range(3):
             rows = client.get("/api/runs").json()["runs"]
-            assert rows[0]["request_count"] == 1
+            assert rows[0]["request_counts"]["sent"] == 1
             assert rows[0]["check_counts"]["pass"] == 1
             assert rows[0]["overall"] == "pass"
             assert rows[0]["targets"][0]["model"] == "test-model"
@@ -92,7 +92,8 @@ def test_runs_listing_caches_compact_report_summaries_and_refreshes_changed_repo
         value.requests = []
         write_report(value, directory)
         rows = client.get("/api/runs").json()["runs"]
-        assert rows[0]["request_count"] == 0
+        assert rows[0]["request_counts"]["sent"] == 1
+        assert rows[0]["request_counts"]["saved_observations"] == 0
         assert rows[0]["check_counts"]["fail"] == 1
         assert rows[0]["overall"] == "fail"
         assert len(loads) == 2

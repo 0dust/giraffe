@@ -225,7 +225,7 @@ async def test_policy_admits_only_at_prepared_transport(monkeypatch, shared, sta
     policy_records = [record for record in report.requests if record.identity is not None]
     assert len(shared_wire) == (3 if shared else 0)
     assert len(policy_wire) == len(policy_records) == sum(observation["offered"].values())
-    assert run.attempted == report.observations["request_budget_used"] == len(wire)
+    assert run.attempted == report.observations["request_counts"]["budget_counted"] == len(wire)
     assert run.slots.qsize() == run.max_connections
     assert all((at - run.start)*1000 < observation["end_ms"] for at in policy_wire)
     starts = {slot: at for event, slot, at in events if event == "request_started"}

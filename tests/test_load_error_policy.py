@@ -133,7 +133,7 @@ def test_other_checks_keep_fixed_request_budget_guidance_with_concurrent_load_se
     guidance = runner._budget_guidance(settings)
     assert "Concurrent load" not in guidance
     assert "to at least" in guidance
-    assert f"at least {plan['known_total']} fixed requests" in guidance
+    assert f"{plan['known_total']} known planned requests" in guidance
     assert "sending windows" in runner._budget_guidance(settings, "load")
 
 

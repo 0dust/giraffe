@@ -36,7 +36,7 @@ assert.equal(landedItems.size,consumed);
 
 def test_reserved_budget_is_never_terminal_or_pulsing_before_dispatch():
     run_render_checks(r"""
-state.detail={id:'reserved',state:'running',config:{targets:[],max_requests:4},progress:{budget_used:3,attempted:0}};renderDetail();
+state.detail={id:'reserved',state:'running',config:{targets:[],max_requests:4},progress:{request_counts:requestCounts({budget_counted:3,budget_counted_unsent:3})}};renderDetail();
 const reserved=$('.request-mosaic [data-live-key="slot:0"]');assert(reserved.classList.contains('reserved'));assert.match(reserved.getAttribute('aria-label'),/Reserved/);assert.equal(reserved.animationCalls.length,0);assert.equal(landedItems.size,0);
 state.detail.live_requests=[{slot:0,id:'r',status:'running'}];renderDetail();assert.equal($('.request-mosaic [data-live-slot="0"]'),reserved);assert(reserved.classList.contains('running'));assert.equal(reserved.animationCalls.length,0);assert.equal(landedItems.size,0);
 state.detail.live_requests[0].status='completed';renderDetail();assert.equal(reserved.animationCalls.length,0,'closed disclosure consumes rather than animates');assert(landedItems.size>0);
@@ -209,18 +209,18 @@ details.open=true;listeners.toggle({target:details});renderDetail();assert.equal
 """, dom=True)
 
 
-def test_dropped_offers_are_not_pending_reservations_after_traffic_ends():
+def test_unsent_budget_slot_keeps_terminal_status_and_not_sent_tooltip():
     run_render_checks(r"""
-state.detail={id:'drops',state:'running',config:{targets:[],max_requests:8},progress:{budget_used:6,attempted:2,dropped_offers:3},live_requests:[{slot:0,id:'a',status:'completed'},{slot:1,id:'b',status:'completed'}]};renderDetail();
-assert.equal($$('.request-spot.skipped').length,3);assert.equal($$('.request-spot.reserved').length,1);
-for(const spot of $$('.request-spot.skipped')){assert.match(spot.getAttribute('aria-label'),/Not run.*dropped before sending/);assert.equal(spot.getAnimations().length,0);}
-// A new reservation must not turn an existing dropped marker back into Reserved.
-const dropped=$$('.request-spot.skipped');state.detail.progress.budget_used=7;renderDetail();
-assert(dropped.every(spot=>spot.classList.contains('skipped')));assert.equal($$('.request-spot.reserved').length,2);
-state.detail.progress={budget_used:7,attempted:4,dropped_offers:3,completed:4,phase:'judging',event:'judging_started'};state.detail.live_requests.push({slot:2,id:'c',status:'completed'},{slot:3,id:'d',status:'completed'});renderDetail();
-assert.equal($$('.request-spot.skipped').length,3);assert.equal($$('.request-spot.reserved').length,0);assert.match($('#main').textContent,/3 dropped before sending/);
-// Capped evidence for dispatched requests must not look like pending reservations.
-state.detail.live_requests=[{slot:3,id:'d',status:'completed'}];renderDetail();assert.equal($$('.request-mosaic .request-spot.reserved').length,0);assert.equal($$('.request-mosaic .request-spot.skipped').length,3);
+state.detail={id:'unsent',state:'running',config:{targets:[],max_requests:4},
+ progress:{request_counts:requestCounts({sent:1,budget_counted:2,budget_counted_unsent:1})},
+ live_requests:[{slot:0,id:'sent',sent:true,status:'completed'},{slot:1,id:'offer',sent:false,status:'failed'}]};
+renderDetail();
+const unsent=$('.request-mosaic [data-live-slot="1"]');
+assert(unsent.classList.contains('fail'));assert.match(unsent.getAttribute('aria-label'),/not sent/);
+assert.equal($$('.request-spot.reserved').length,0);
+state.detail.progress.request_counts.budget_counted=3;renderDetail();
+assert.equal($('.request-mosaic [data-live-slot="1"]'),unsent);
+assert.equal($$('.request-spot.reserved').length,1);
 """, dom=True)
 
 
@@ -326,7 +326,7 @@ const mosaic=$('.request-mosaic'),pending=$('[data-live-slot="501"]',mosaic);
 assert.equal($$('.request-spot',mosaic).length,3);assert.equal($('[tabindex="0"]',mosaic).dataset.liveSlot,'500');
 assert.equal($('[data-live-slot="500"]',mosaic).dataset.state,'timeout');assert.equal($('[data-live-slot="502"]',mosaic).dataset.state,'cancelled');
 assert.equal($('[data-live-slot="500"] .spot-glyph',mosaic).textContent,statusIcons.timeout);
-assert.match($('#main').textContent,/503 started · 3 in live window/);assert.match($('#main').textContent,/3 dropped before sending/);
+assert.match($('#main').textContent,/3 in live window/);assert.doesNotMatch($('#main').textContent,/dropped before sending/);
 assert.match($('#main').textContent,/500 earlier requests outside the live window/);assert.match($('#main').textContent,/limit not set/);
 assert.equal($('.budget-track'),null);assert.equal($('.request-spot.idle, .request-spot.reserved, .request-spot.skipped',mosaic),null);
 assert.doesNotMatch($('.mosaic-legend').textContent,/Unused|Reserved/);
@@ -335,4 +335,90 @@ assert.equal($('.request-mosaic'),mosaic);assert.equal($('[data-live-slot="501"]
 renderDetail();assert.equal(pending.animationCalls.length,1);assert(disclosure.open);
 state.mosaicFollow=false;state.mosaicPage=0;renderDetail();
 assert.match($('.all-requests').textContent,/Earlier request evidence was evicted from the live window/);assert.equal($('.request-mosaic'),null);
+""", dom=True)
+
+
+def test_live_budget_heading_and_mosaic_keep_exempt_requests_out_of_slots():
+    run_render_checks(r"""
+state.detail={id:'exempt',state:'running',config:{targets:[],max_requests:2},
+ request_plan:{planned_total:2},progress:{request_counts:requestCounts({sent:3,budget_counted:2,budget_exempt:1,budget_exempt_by_reason:{restart_readiness:1}})},
+ live_requests:[{slot:0,id:'first',status:'completed',valid:true,score:true},{slot:1,id:'last',status:'running'}]};
+renderDetail();
+assert.match($('.live-progress').textContent,/2 of ~2 planned requests/);
+assert.match($('.live-progress').textContent,/limit 2 · 1 exempt/);
+assert.equal($$('.request-mosaic .request-spot').length,2);
+assert.equal($('.request-mosaic [data-live-slot="1"]').dataset.state,'running');
+assert.equal($('.request-mosaic .request-spot.inconclusive'),null);
+const summary=renderRequestCounts({observations:{request_counts:requestCounts({sent:3,budget_counted:2,budget_exempt:1,saved_observations:1,budget_exempt_by_reason:{restart_readiness:1}})}});
+assert.match(summary,/Requests: 3 sent · 2 counted toward the limit · 1 exempt · 1 saved observation/);
+assert.match(summary,/class="field-info"/);
+assert.match(summary,/connection preflight/);
+assert.match(renderRequestCounts({observations:{}}),/Requests: not recorded for this report/);
+assert.equal(renderRequestCounts({observations:{request_counts:{available:false,complete:false,saved_observations:1}}}),'<p class="hint">Requests: counts unavailable for this recovered run · 1 saved observation</p>');
+assert.match(renderRequestCounts({observations:{request_counts:{available:false,complete:false,saved_observations:2}}}),/2 saved observations/);
+const recovered=renderRequestCounts({observations:{request_counts:requestCounts({sent:3,budget_counted:4,budget_counted_unsent:2,budget_exempt:1,saved_observations:1,complete:false})}});
+assert.match(recovered,/1 saved observation · 2 counted but not sent \(recovered; may be incomplete\)/);
+assert.match(recovered,/including attempts that failed to connect/);
+assert.doesNotMatch(summary,/counted but not sent|recovered;/);
+""", dom=True)
+
+
+def test_unavailable_recovered_counts_do_not_claim_stale_budget_progress():
+    run_render_checks(r"""
+const counts={available:false,complete:false,saved_observations:2};
+const recovered={abort_reason:'cancelled by user',observations:{request_counts:counts},checks:[]};
+const staleDetail={progress:{budget_used:99},request_plan:{planned_total:100}};
+assert.equal(countedRequests(recovered,staleDetail),null);
+assert.equal(countedRequests({}, {...staleDetail,summary:{request_counts:counts}}),null);
+const guidance=renderGuidance(recovered,staleDetail);
+assert.doesNotMatch(guidance,/requests counted|99|0 of/);
+assert.equal(guidance,'<p class="result-guidance">Partial results below.</p>');
+assert.match(renderRequestCounts(recovered),/Requests: counts unavailable for this recovered run · 2 saved observations/);
+""", dom=True)
+
+
+def test_unknown_counts_never_fall_back_to_flat_live_counters_or_show_budget_fillers():
+    run_render_checks(r"""
+for(const raw of [undefined,null,{}, {available:true},requestCounts({sent:-1}),requestCounts({budget_exempt_by_reason:[]}),requestCounts({targets:[]}),requestCounts({complete:'true'}),requestCounts({sent:'1'}),requestCounts({budget_exempt_by_reason:{other:1}}),requestCounts({targets:{local:{sent:1}}}),requestCounts({budget_counted_unsent:undefined})]){
+  assert.equal(knownCounts(raw),null);
+  const progress={budget_used:99,sent:100,budget_exempt:7,dropped_offers:20,request_counts:raw};
+  assert.equal(countedRequests({}, {progress}),null);
+  assert.match(renderRequestCounts({observations:{request_counts:raw}}),/Requests: not recorded for this report/);
+  state.detail={id:'unknown',state:'running',config:{targets:[],max_requests:10},request_plan:{planned_total:10},progress,
+    live_requests:[{slot:0,id:'first',status:'completed'},{slot:3,id:'last',status:'running'}]};
+  renderDetail();
+  assert.match($('.live-progress').textContent,/~10 planned requests · Request counts unavailable/);
+  assert.doesNotMatch($('.live-progress').textContent,/99|100|7 exempt|0 of/);
+  assert.equal($$('.request-mosaic .request-spot').length,2);
+  assert.equal($('.request-mosaic .reserved, .request-mosaic .idle, .request-mosaic .skipped'),null);
+}
+assert.equal(countedRequests({}, {progress:{request_counts:requestCounts({budget_counted:4})}}),4);
+""", dom=True)
+
+
+def test_best_known_counts_skips_unknown_sources_in_authority_order():
+    run_render_checks(r"""
+const live=requestCounts({sent:4,budget_counted:4});
+const saved=requestCounts({sent:3,budget_counted:3});
+const reportCounts=requestCounts({sent:2,budget_counted:2});
+const unavailable={available:false,complete:false,saved_observations:1};
+const currentReport={observations:{request_counts:unavailable},abort_reason:'cancelled by user',checks:[]};
+const currentDetail={report:currentReport,summary:{request_counts:{available:true}},progress:{request_counts:live},request_plan:{planned_total:5}};
+assert.equal(bestKnownCounts(currentReport,currentDetail).budget_counted,4);
+assert.equal(countedRequests(currentReport,currentDetail),4);
+assert.match(renderGuidance(currentReport,currentDetail),/4 of 5 planned requests counted/);
+assert.match(renderRequestCounts(currentReport,currentDetail),/4 sent · 4 counted/);
+assert.equal(bestKnownCounts(currentReport,{...currentDetail,summary:{request_counts:saved}}).budget_counted,3);
+assert.equal(bestKnownCounts({observations:{request_counts:reportCounts}},currentDetail).budget_counted,2);
+state.detail={...currentDetail,id:'best-counts',state:'running',config:{targets:[],max_requests:5},live_requests:[{slot:0,status:'running'}]};
+renderDetail();
+assert.match($('.live-progress').textContent,/4 of ~5 planned requests/);
+assert.equal($$('.request-mosaic .reserved').length,3);
+assert.equal($$('.request-mosaic .idle').length,1);
+state.detail.summary.request_counts=saved;renderDetail();
+assert.match($('.live-progress').textContent,/3 of ~5 planned requests/);
+assert.equal($$('.request-mosaic .reserved').length,2);
+state.detail.report.observations.request_counts=reportCounts;renderDetail();
+assert.match($('.live-progress').textContent,/2 of ~5 planned requests/);
+assert.equal($$('.request-mosaic .reserved').length,1);
 """, dom=True)

@@ -166,5 +166,5 @@ def test_try_example_cli_projects_configuration(tmp_path, monkeypatch, capsys):
                  "--output", str(tmp_path / "output"), "--output-format", "json"]) == 0
     assert len(captured) == 1 and captured[0].max_requests == 1
     assert captured[0].checks == ["correctness"] and len(captured[0].targets) == 1
-    assert json.loads(capsys.readouterr().out)["request_count"] == 1
+    assert json.loads(capsys.readouterr().out)["request_counts"]["sent"] == 1
     assert (tmp_path / "output" / "report.json").exists()

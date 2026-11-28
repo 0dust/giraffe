@@ -310,3 +310,13 @@ Start conflicts keep their HTTP 409 status and detail text. `X-Giraffe-Error-Cod
 `mark-scale-down` has its own outcomes and exit codes: `accepted` exits 0, `rejected` exits 1, and `submitted_without_acknowledgment` exits 2.
 
 Source of truth: `src/giraffe/states.py`.
+
+## Request accounting
+
+`REQUEST_BUDGET_EXEMPTIONS` declares `preflight` and `restart_readiness`: sent
+inference traffic that does not charge the request limit.
+`SETUP_PROBE_SCENARIOS` declares `readiness` and `performance_evidence_probe`:
+setup records excluded from saved measurement observations. Exemption follows the
+explicit `budget_exemption` argument, not its scenario name. Both declared
+vocabularies are included in the `states` block from `giraffe describe` and
+GET `/api/capabilities`.

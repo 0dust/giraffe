@@ -174,7 +174,7 @@ def test_live_user_identity_survives_started_and_completed_events():
                 'window_id': 'multi_user_20_measurement', 'phase': 'measurement', 'request_sequence': 2,
                 'activation_seconds': .5}
     for kind in ['request_started', 'request_completed']:
-        event = {'event': kind, 'request_slot': 0, 'target': 'local', 'scenario': 'multi_user_20_measurement',
+        event = {'event': kind, 'request_slot': 0, 'budget_request_slot': 0, 'target': 'local', 'scenario': 'multi_user_20_measurement',
                  'user': {**identity, 'prompt': 'must not reach live identity'}}
         if kind == 'request_completed':
             event['request'] = {'id': 'r', 'status': 'completed'}
@@ -196,7 +196,7 @@ def test_live_conversation_turn_identity_survives_long_target_names():
            'live_request_summary': {'evicted': 0, 'through_slot': None, 'statuses': {}}}
     rows = []
     for kind in ['request_started', 'request_completed']:
-        event = {'event': kind, 'request_slot': 0, 'target': target.name, 'scenario': window,
+        event = {'event': kind, 'request_slot': 0, 'budget_request_slot': 0, 'target': target.name, 'scenario': window,
                  'user': identity, 'request': {'id': 'r', 'status': 'completed'}}
         _track_live_request(job, event, 100)
         rows.append(job['requests'][0])

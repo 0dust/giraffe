@@ -188,20 +188,21 @@ const editor=renderLoadEditor(config);for(const label of ['Requests per burst','
 
 def test_a25_budget_free_mosaic_uses_slots_not_unused_budget_and_eviction_summary():
     browser_logic(r"""
+const counts={available:true,complete:true,sent:501,budget_counted:501,budget_counted_unsent:0,budget_exempt:0,saved_observations:500,budget_exempt_by_reason:{},targets:{}};
 const records=[{slot:500,status:'running',scenario:'warm',target:'local'}];
 state.detail={id:'live',live_request_summary:{evicted:500,statuses:{completed:499,running:1}}};
 state.mosaicPage=0;state.mosaicFollow=false;
-let markup=renderMosaic(records,{budget:null,live:true,budgetUsed:501});
+let markup=renderMosaic(records,{budget:null,live:true,requestCounts:counts});
 assert.match(markup,/Earlier request evidence was evicted/);assert.match(markup,/500 earlier requests/);
 assert.doesNotMatch(markup,/request-spot|Unused/);
-state.mosaicPage=2;markup=renderMosaic(records,{budget:null,live:true,budgetUsed:999});
-assert.match(markup,/501 started · 1 in live window/);
+state.mosaicPage=2;markup=renderMosaic(records,{budget:null,live:true,requestCounts:{...counts,budget_counted:999}});
+assert.match(markup,/1 in live window/);
 assert.equal((markup.match(/class="request-spot /g)||[]).length,1);
 assert.match(markup,/data-live-slot="500"[^>]*tabindex="0"/);
 assert.match(markup,/481–501 \/ 501/);assert.doesNotMatch(markup,/Unused|Budget slot|Request budget/);
-nodes['#main']={};state.detail={id:'live',state:'running',config,live_requests:records,progress:{attempted:501,completed:500},events:[],live_conditions:[],live_request_summary:{evicted:500,statuses:{completed:500}}};
+nodes['#main']={};state.detail={id:'live',state:'running',config,live_requests:records,progress:{request_counts:counts},events:[],live_conditions:[],live_request_summary:{evicted:500,statuses:{completed:500}}};
 renderTests=renderAllRequests=renderLiveLoadResults=renderPhases=()=>'';renderLive();
-assert.match(nodes['#main'].innerHTML,/500 requests finished · 0s · limit not set/);assert.match(nodes['#main'].innerHTML,/500 earlier requests outside the live window/);
+assert.match(nodes['#main'].innerHTML,/501 requests counted · 0s · limit not set/);assert.match(nodes['#main'].innerHTML,/500 earlier requests outside the live window/);
 assert.doesNotMatch(nodes['#main'].innerHTML,/budget-track|NaN|Infinity|undefined/);
 """)
 

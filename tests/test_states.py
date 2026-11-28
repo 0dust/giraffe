@@ -118,6 +118,8 @@ def test_describe():
         "exit_codes": {**states.EXIT_CODES, "cancelled": states.EXIT_CODE_CANCELLED,
                        "usage_error": states.EXIT_CODE_USAGE, "default": states.EXIT_CODE_DEFAULT},
         "request_statuses": list(states.REQUEST_STATUSES), "run_states": list(states.RUN_STATES),
+        "request_budget_exemptions": list(states.REQUEST_BUDGET_EXEMPTIONS),
+        "setup_probe_scenarios": list(states.SETUP_PROBE_SCENARIOS),
         "run_in_progress_states": sorted(states.RUN_IN_PROGRESS_STATES),
         "run_terminal_states": sorted(states.RUN_TERMINAL_STATES),
         "run_transitions": {state: sorted(successors) for state, successors in states.RUN_TRANSITIONS.items()},

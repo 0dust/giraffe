@@ -413,6 +413,7 @@ class _StreamGeneration:
 class LLMClient:
     reports_response_activity = True
     _supports_dispatch_guard = True
+    _supports_sent_observer = True
 
     def __init__(self, target: Target, config: RunConfig, *, max_connections: int | None = None,
                  _tls_context: ssl.SSLContext | None = None):
@@ -429,6 +430,7 @@ class LLMClient:
         self._tls_context = _tls_context
         self._stream_drains: set[asyncio.Task[None]] = set()
         self.on_response = None
+        self.on_sent: Callable[[], None] | None = None
         self._evidence_fields = {"logprobs", "stream_options"}
         self._evidence_probe_attempts = 0
         self._evidence_probe_finished = False
@@ -452,7 +454,7 @@ class LLMClient:
             options["stream_options"] = {"include_usage": True}
         # A single token can be a hidden reasoning delimiter. Give the bounded
         # probe room to observe visible output, without waiting for a full answer.
-        return RequestSpec(fixture_id="performance-evidence", scenario="performance_evidence_probe",
+        return RequestSpec(fixture_id="performance-evidence", scenario=states.SETUP_PROBE_PERFORMANCE_EVIDENCE,
             check_ids=[], messages=[{"role": "user", "content": "Reply with 1."}], max_tokens=16,
             request_timeout_seconds=self.config.request_timeout_seconds, options=options,
             workload={"performance_evidence_probe": True, "role": "setup", "phase": "preparation",
@@ -1207,6 +1209,9 @@ class LLMClient:
                     record.started_at = datetime.now(timezone.utc).isoformat()
                     record.client_preparation_ms = (start - preparation_start) * 1000
                     transport_started = True
+                    record.sent = True
+                    if self.on_sent is not None:
+                        self.on_sent()
                     if probing:
                         self._evidence_probe_attempts += 1
                         self.token_evidence["probe_requests"] = self._evidence_probe_attempts

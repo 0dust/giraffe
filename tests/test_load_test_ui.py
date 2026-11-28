@@ -230,7 +230,7 @@ def test_mixed_unknown_count_keeps_scheduled_requests_in_headline_and_footer(poi
     browser_logic('const plan='+json.dumps(plan)+',label='+json.dumps(label)+r''';
 nodes['#request-plan']={};nodes['#dock-summary']={};state.jsonDraft=state.jsonBase='synced';state.setupStep=2;
 state.requestPreview={status:'current',revision:state.configRevision,route:state.routeVersion,config,plan};renderRequestPlan();
-const headline=label.startsWith('Unknown + ≈')?'≈ 20 expected requests + adaptive checks':'20 known requests + adaptive checks';
+const headline=label.startsWith('Unknown + ≈')?'≈ 20 expected requests + adaptive checks':'20 known planned requests + adaptive checks';
 assert(nodes['#request-plan'].innerHTML.includes(headline));assert(nodes['#dock-summary'].innerHTML.includes(headline));
 ''',config)
 

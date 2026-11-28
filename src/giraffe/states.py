@@ -20,6 +20,16 @@ EXIT_CODE_USAGE: Final = 4
 # Request record: report.json requests[].status and evidence.jsonl (models.RequestRecord.status).
 REQUEST_STATUSES: Final = ("completed", "failed", "timeout", "cancelled")
 
+# Inference accounting: exemptions are independent of request scenario names.
+REQUEST_BUDGET_EXEMPTION_PREFLIGHT: Final = "preflight"
+REQUEST_BUDGET_EXEMPTION_RESTART_READINESS: Final = "restart_readiness"
+REQUEST_BUDGET_EXEMPTIONS: Final = (
+    REQUEST_BUDGET_EXEMPTION_PREFLIGHT, REQUEST_BUDGET_EXEMPTION_RESTART_READINESS,
+)
+SETUP_PROBE_READINESS: Final = "readiness"
+SETUP_PROBE_PERFORMANCE_EVIDENCE: Final = "performance_evidence_probe"
+SETUP_PROBE_SCENARIOS: Final = (SETUP_PROBE_READINESS, SETUP_PROBE_PERFORMANCE_EVIDENCE)
+
 # Run lifecycle: .web.json state and run API state.
 RUN_QUEUED: Final = "queued"
 RUN_RUNNING: Final = "running"
@@ -250,6 +260,8 @@ def describe() -> dict:
         "exit_codes": {**EXIT_CODES, "cancelled": EXIT_CODE_CANCELLED,
                        "usage_error": EXIT_CODE_USAGE, "default": EXIT_CODE_DEFAULT},
         "request_statuses": list(REQUEST_STATUSES), "run_states": list(RUN_STATES),
+        "request_budget_exemptions": list(REQUEST_BUDGET_EXEMPTIONS),
+        "setup_probe_scenarios": list(SETUP_PROBE_SCENARIOS),
         "run_in_progress_states": sorted(RUN_IN_PROGRESS_STATES),
         "run_terminal_states": sorted(RUN_TERMINAL_STATES),
         "run_transitions": {state: sorted(successors) for state, successors in RUN_TRANSITIONS.items()},

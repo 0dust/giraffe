@@ -90,6 +90,7 @@ def test_cli_observes_before_inference_preflight(tmp_path, monkeypatch):
         return {"state": "not_resident"}
     async def check(*args):
         events.append("inference")
+        return {"inference_requests_sent": 0}
     async def run(cfg, **kwargs):
         assert cfg._preparation_residency["local"]["state"] == "not_resident"
         return RunReport(run_id="r", started_at="now", finished_at="now", overall="pass", manifest={})

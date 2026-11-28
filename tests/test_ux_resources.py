@@ -63,7 +63,7 @@ assert.equal((html.match(/not measured on this platform/g)||[]).length,8);assert
 assert.match(html,/Memory guardrail inactive/);
 resources.memory_limit_bytes=0;html=renderResources({observations:{resources}});assert.match(html,/Memory guardrail disabled \(0 = off\)/);
 resources.memory_limit_reached=true;resources.memory_limit_stopped_run=true;html=renderResources({observations:{resources}});assert.match(html,/notice warning/);assert.match(html,/Memory limit exceeded; unfinished work stopped with partial results/);
-html=detail(null,{state:'error',error:'Export failed',resources:{sampled_peak_rss_bytes:{export:120*1024**2}},summary:{overall:'pass',request_count:1,checks:[]}});
+html=detail(null,{state:'error',error:'Export failed',resources:{sampled_peak_rss_bytes:{export:120*1024**2}},summary:{overall:'pass',request_counts:{sent:1,budget_counted:1,budget_exempt:0,saved_observations:1,complete:true},checks:[]}});
 assert.match(html,/Run could not finish/);assert.match(html,/Export failed/);assert.match(html,/<dt>Export<\/dt><dd>120 MiB/);assert.doesNotMatch(html,/Acceptance passed/);
 """)
 

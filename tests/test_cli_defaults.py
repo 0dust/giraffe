@@ -210,12 +210,13 @@ def test_final_block_starts_with_verdict_collapses_unselected_and_gates_ram(outc
     value.overall = outcome
     _print_result(value, Path("runs/run/report.json"), Path("runs/run/report.html"), Path("runs/run"), {}, verbose=verbose)
     output = capsys.readouterr().out
-    assert output.splitlines()[0] == f"{outcome.upper()}  1 checks passed · 0 requests · report: runs/run/report.html"
+    assert output.splitlines()[0] == f"{outcome.upper()}  1 checks passed · report: runs/run/report.html"
     assert output.count("Not selected: json, cancellation") == 1
     assert "skipped — Not selected" not in output
     assert ("Peak memory (RAM)" in output) == verbose
     if outcome != "pass":
-        assert output.splitlines()[1] == f"  local / first_output: {outcome} — First output exceeded its limit."
+        assert output.splitlines()[1] == "Requests: not recorded for this report"
+        assert output.splitlines()[2] == f"  local / first_output: {outcome} — First output exceeded its limit."
 
 
 @pytest.mark.parametrize("with_baseline", [False, True])
@@ -402,14 +403,23 @@ def test_sigkilled_cli_run_is_recovered_from_its_evidence_journal(tmp_path, caps
     directory, journal = tmp_path / "run", tmp_path / "run" / "evidence.jsonl"
     with FakeEndpoint(response_delay=delay) as fake:
         command = [sys.executable, "-c", "from giraffe.cli import main; raise SystemExit(main())",
-                   "run", "--url", fake.url, "--model", "fake-model", "--skip-preflight",
+                   "run", "--url", fake.url, "--model", "fake-model",
                    "--checks", "correctness", "--output", str(directory), "--quiet"]
         process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             deadline = time.monotonic() + 60
             while time.monotonic() < deadline and process.poll() is None:
-                if journal.is_file() and '"type":"record"' in journal.read_text(errors="replace").replace(" ", ""):
-                    break
+                if journal.is_file():
+                    rows = []
+                    for line in journal.read_text(errors="replace").splitlines():
+                        try:
+                            rows.append(json.loads(line))
+                        except ValueError:
+                            pass
+                    snapshots = [row for row in rows if row.get("type") == "request_counts"]
+                    finished = sum(row.get("type") == "record" for row in rows)
+                    if snapshots and finished and snapshots[-1]["sent"] > finished + 1:
+                        break
                 time.sleep(0.05)
             assert process.poll() is None, "run ended before it could be killed"
             assert journal.is_file(), "no evidence journal appeared"
@@ -422,8 +432,25 @@ def test_sigkilled_cli_run_is_recovered_from_its_evidence_journal(tmp_path, caps
     assert not (directory / "report.json").exists()
 
     assert main(["report", str(directory), "--html"]) == 0
-    recovered = int(re.search(r"Recovered (\d+) recorded requests", capsys.readouterr().err).group(1))
+    output = capsys.readouterr()
+    recovered = int(re.search(r"Recovered (\d+) recorded requests", output.err).group(1))
     assert recovered >= 1
     page = (directory / "report.html").read_text()
-    assert f"{recovered} requests recorded" in page
+    saved = json.loads((directory / "report.json").read_text())
+    counts = saved["observations"]["request_counts"]
+    assert counts["complete"] is False and counts["available"] is True
+    assert counts["sent"] > 1 + sum(record["sent"] for record in saved["requests"])
+    assert counts["budget_exempt"] == 1
+    assert counts["budget_exempt_by_reason"] == {"preflight": 1}
+    # A single snapshot preserves in-flight dispatches without mixing counter times.
+    assert counts["sent"] == counts["budget_counted"] - counts["budget_counted_unsent"] + counts["budget_exempt"]
+    for field in ("sent", "budget_counted", "budget_counted_unsent", "budget_exempt", "saved_observations"):
+        assert counts[field] == sum(row[field] for row in counts["targets"].values())
+    assert 0 <= counts["budget_counted_unsent"] <= counts["budget_counted"]
+    from giraffe.states import SETUP_PROBE_SCENARIOS
+    assert counts["saved_observations"] == sum(record["scenario"] not in SETUP_PROBE_SCENARIOS
+                                               for record in saved["requests"])
+    assert "Requests:" in output.out
+    assert " (recovered; may be incomplete)" in output.out
+    assert " (recovered; may be incomplete)" in page
     assert journal.is_file()

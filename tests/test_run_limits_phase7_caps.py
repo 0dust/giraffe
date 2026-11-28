@@ -176,7 +176,7 @@ def test_live_web_containers_stay_bounded_with_100000_conditions_and_requests():
     for slot in range(100000):
         summary = {"target": "local", "condition": {"id": str(slot)}, "completed": 1}
         _track_live_progress(job, {"event": "request_completed", "target": "local",
-            "request_slot": slot, "request": {"status": "completed"},
+            "request_slot": slot, "budget_request_slot": slot, "request": {"status": "completed"},
             "condition_summary": summary}, None)
         _track_live_progress(job, {"event": "scenario_finished", "target": "local",
                                   "scenario": str(slot), "elapsed_seconds": slot}, None)

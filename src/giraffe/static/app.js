@@ -245,8 +245,10 @@ function orderedRequests(report) {
     return (Date.parse(a.started_at)||0)-(Date.parse(b.started_at)||0);
   });
 }
-function renderMosaic(records,{budget=records.length,live=false,budgetUsed=records.length,attempted=records.length,droppedOffers=0,filtered=false,positions=requestPositions(records)}={}) {
-  const liveBudget=live&&!filtered,countOnly=liveBudget&&budget==null;
+function renderMosaic(records,{budget=records.length,live=false,requestCounts=null,filtered=false,positions=requestPositions(records)}={}) {
+  if(live)records=records.filter(record=>!record.request_budget_exempt&&Number.isInteger(record.slot)&&record.slot>=0);
+  const counts=knownCounts(requestCounts),budgetUsed=counts?.budget_counted;
+  const liveBudget=live&&!filtered,countOnly=liveBudget&&(!counts||budget==null);
   const total=countOnly?records.reduce((total,record)=>Math.max(total,record.slot+1),0):Math.max(records.length,budget || 0);
   if(!total)return '<section class="request-viz"><h2>Request mosaic</h2><p class="viz-empty">No requests recorded.</p></section>';
   const pages=Math.ceil(total/mosaicPageSize);
@@ -266,12 +268,11 @@ function renderMosaic(records,{budget=records.length,live=false,budgetUsed=recor
   const entrance=!live&&state.mosaicAnimated!==state.detail?.id;state.mosaicAnimated=state.detail?.id;
   const firstVisibleSlot=countOnly?records.reduce((slot,record)=>record.slot>=offset&&record.slot<offset+count?Math.min(slot,record.slot):slot,Infinity):offset;
   const bySlot=new Map(records.map((r,i)=>[liveBudget?r.slot:i,r]));
-  // Request slots are compact dispatch IDs; unsent offers occupy the remaining budget.
-  const sent=Math.max(attempted,live?records.reduce((count,r)=>Math.max(count,r.slot+1),0):records.length),droppedEnd=Math.min(budgetUsed,sent+droppedOffers);
+  const slotFrontier=live?records.reduce((count,r)=>Math.max(count,r.slot+1),0):records.length;
   const statuses=['pass','fail','timeout','cancelled','skipped','inconclusive',...(live?[RUN.RUNNING,RUN.QUEUED,...(countOnly?[]:['reserved','idle'])]:[])];
-  return `<section class="request-viz"><div class="viz-heading"><h2>${liveBudget&&!countOnly?'Request budget':'Requests'}</h2><span class="mono hint">${countOnly?`${number(total)} started · ${number(records.length)} in live window`:`${number(records.length)} ${live?'started':'recorded'}`}${live&&droppedOffers?` · ${number(droppedOffers)} dropped before sending`:''}</span>${liveBudget&&pages>1?`<span class="mosaic-live-controls">${state.mosaicFollow!==false?'<span class="mosaic-following">Following live</span>':`<span class="hint">Live on requests ${liveOffset+1}–${Math.min(total,liveOffset+mosaicPageSize)}</span><button class="text-button mosaic-live" data-action="mosaic-live">Back to live</button>`}</span>`:''}</div><div class="mosaic-scroll"><svg class="request-mosaic${live?' is-live':''}${entrance?' is-entering':''}" viewBox="0 0 ${geometry.width} ${geometry.height}" style="--mosaic-w:${geometry.width}px;--spot-round:${geometry.round}" data-columns="${geometry.columns}" role="group" aria-label="${live?countOnly||filtered?'Live requests':'Live request budget':'Recorded requests'}. Arrow keys move between spots.">${geometry.cells.map((points,i)=>{
+  return `<section class="request-viz"><div class="viz-heading"><h2>${liveBudget&&!countOnly?'Request budget':'Requests'}</h2><span class="mono hint">${live?`${number(records.length)} in live window`:`${number(records.length)} recorded`}</span>${liveBudget&&pages>1?`<span class="mosaic-live-controls">${state.mosaicFollow!==false?'<span class="mosaic-following">Following live</span>':`<span class="hint">Live on requests ${liveOffset+1}–${Math.min(total,liveOffset+mosaicPageSize)}</span><button class="text-button mosaic-live" data-action="mosaic-live">Back to live</button>`}</span>`:''}</div><div class="mosaic-scroll"><svg class="request-mosaic${live?' is-live':''}${entrance?' is-entering':''}" viewBox="0 0 ${geometry.width} ${geometry.height}" style="--mosaic-w:${geometry.width}px;--spot-round:${geometry.round}" data-columns="${geometry.columns}" role="group" aria-label="${live?countOnly||filtered?'Live requests':'Live request budget':'Recorded requests'}. Arrow keys move between spots.">${geometry.cells.map((points,i)=>{
     const slot=offset+i,r=bySlot.get(slot);if(countOnly&&!r)return '';
-    const dropped=!r&&slot>=sent&&slot<droppedEnd,status=r?requestStatus(r):dropped?'skipped':slot<sent?'inconclusive':slot<budgetUsed?displayStatus('reserved'):'idle',current=live&&status==='running'&&slot===frontier,label=r?requestLabel(r,records,undefined,positions):dropped?`Budget slot ${slot+1}: Not run · dropped before sending`:status!=='idle'?`Budget slot ${slot+1}: ${statusLabels[status]}, request evidence unavailable`:`Budget slot ${slot+1}: not used`;
+    const unsent=r?.sent===false&&!inProgress(r.status),status=r?requestStatus(r):slot<slotFrontier?'inconclusive':slot<budgetUsed?displayStatus('reserved'):'idle',current=live&&status==='running'&&slot===frontier,label=r?requestLabel(r,records,undefined,positions)+(unsent?' · not sent':''):status!=='idle'?`Budget slot ${slot+1}: ${statusLabels[status]}, request evidence unavailable`:`Budget slot ${slot+1}: not used`;
     const action=r?(live?`data-live-slot="${r.slot}"`:`data-request="${escape(r.id)}"`):'';
     return `<g class="request-spot ${status}${current?' current':''}" data-live-key="slot:${offset+i}" data-request-id="${escape(r?.id)}" data-state="${status}" style="--i:${i}" ${action} ${r?'role="button"':'role="img"'} tabindex="${offset+i===firstVisibleSlot?0:-1}" aria-label="${escape(label)}"><polygon points="${points}"/>${spotGlyph(points,status)}</g>`;
   }).join('')}</svg></div><div class="viz-footer"><div class="mosaic-legend">${statuses.map(status=>`<span><i class="legend-dot ${status}" aria-hidden="true"></i><span aria-hidden="true">${statusIcons[status]}</span>${statusLabels[status]}${live?'':`<b>${number(records.filter(r=>requestStatus(r)===status).length)}</b>`}</span>`).join('')}${infoHelp('mosaic','Request outcomes','Green means a scored, correct answer. Red means a failed or timed-out request, invalid completion or incorrect answer. Timed-out requests use a clock glyph; cancelled and not-run requests use neutral markers. Unscored completions stay inconclusive. Check verdicts also consider probe intent, timing and aggregate criteria.')}</div>${pages>1?`<div class="mosaic-pages"><button class="text-button" data-action="mosaic-prev" ${page===0?'disabled':''} aria-label="Previous requests">←</button><span class="mono">${offset+1}–${offset+count} / ${number(total)}${liveBudget&&page!==state.mosaicLivePage?' · live on another page':''}</span><button class="text-button" data-action="mosaic-next" ${page===pages-1?'disabled':''} aria-label="Next requests">→</button></div>`:''}</div></section>`;
@@ -537,7 +538,7 @@ function handleConditionKeydown(event) {
 }
 function renderAllRequests(records,options={}) {
   const filter=state.requestStatusFilter || 'all',filtered=filter!=='all',shown=filtered?records.filter(record=>requestFilterStatus(record)===filter):records;
-  const positions=requestPositions(records),mosaicOptions={...options,positions,filtered,...(filtered?{budget:shown.length,budgetUsed:shown.length,attempted:shown.length,droppedOffers:0}:{})};
+  const positions=requestPositions(records),mosaicOptions={...options,positions,filtered,...(filtered?{budget:shown.length}:{})};
   const controls=`<div class="request-tools"><label>Status <select id="all-requests-filter" aria-label="Request status">${requestFilterOptions(filter,records.map(requestFilterStatus))}</select></label></div>`;
   return `<details class="all-requests"${state.allRequestsOpen?' open':''}><summary>Individual requests · ${number(records.length)}</summary>${controls}${options.live?renderMosaic(shown,mosaicOptions):`<div class="evidence-band${shown.length<=72?' is-compact':''}">${renderMosaic(shown,mosaicOptions)}${renderBeeswarm(shown,{positions,width:shown.length<=72?500:960})}</div>`}</details>`;
 }
@@ -895,7 +896,11 @@ function mergeRunEvents(detail, delta) {
   detail.seq=delta.seq;
   detail.events=[...(detail.events || []),...events].slice(-100);
   const records=new Map((detail.live_requests || []).map(record=>[record.slot,record]));
-  for(const record of delta.records || [])records.set(record.slot,{...records.get(record.slot),...record});
+  for(const record of delta.records || []){
+    // Named completions without a budget slot are report evidence, not mosaic traffic.
+    if(!Number.isInteger(record.slot)||record.slot<0)continue;
+    records.set(record.slot,{...records.get(record.slot),...record});
+  }
   const through=detail.live_request_summary?.through_slot;
   detail.live_requests=[...records.values()].filter(record=>through==null||record.slot>through).sort((a,b)=>a.slot-b.slot).slice(-4096);
   const key=row=>JSON.stringify([row.target || '',row.condition?.id || row.condition_id || row.id || '']);
@@ -1183,7 +1188,7 @@ const fieldDescriptions={
   context_limit:{help:'The server’s configured limit for the question and answer together, measured in tokens. A token is a small piece of text. Use the context length configured on your server, which can be lower than the model’s advertised maximum.'},
   concurrency:{hint:'Requests running at the same time.',help:'The most requests Giraffe can run at the same time across all servers. You set this number; Giraffe does not detect your hardware limit. Individual tests can use fewer requests. Raising this does not change Maximum requests or Concurrency levels.'},
   max_memory_mb:{hint:'MiB of RAM growth since the run started; 0 = off. Exceeding the limit stops unfinished work with partial results; unfinished required checks make the verdict inconclusive unless a check failed. Completed checks keep their results. The requested workload stays unchanged.'},
-  max_requests:{help:'The most target requests Giraffe may use during the whole run, shared across all tests and endpoints. Some scheduled requests can use budget without reaching the server. The run can stop with fewer completed requests. AI evaluator calls have separate limits.'},
+  max_requests:{help:'Maximum inference requests charged across all targets. Not charged: the connection preflight and the readiness probe after a cold-start restart; the report lists them as exempt. Some scheduled requests can use budget without being sent to the endpoint. The run can stop with fewer completed requests. AI evaluator calls have separate limits.'},
   max_duration_seconds:{help:'Overall time limit for test traffic, including connection, readiness and warm-up requests. When reached, Giraffe stops sending new requests and cancels all requests still in progress. Completed results are kept; interrupted checks may be inconclusive. AI evaluation and report saving happen afterward.'},
   request_timeout_seconds:{help:'How long a single request may take before Giraffe times it out. This covers waiting for the answer and receiving it. A shorter test-specific or remaining run deadline can stop it sooner.'},
   max_output_tokens:{help:'The most tokens Giraffe asks the model to generate for one request. A token is a small piece of text. The model can stop before reaching this number; the cap does not guarantee a long answer. Reasoning models may need a larger cap; to limit reasoning, set reasoning_effort or chat_template_kwargs in YAML request_options and open the UI with --config.'},
@@ -1770,7 +1775,7 @@ function updateSharedSettingsSummaries(config) {
 function renderSharedRunSettings(config) {
   const rows=[
     ['max_duration_seconds','Maximum duration','When this time limit is reached, Giraffe stops sending new requests and cancels all requests still in progress. Tests can finish earlier. Completed results are kept; AI evaluation and report saving happen afterward. Server-side work may continue if the server does not honor cancellation.'],
-    ['max_requests','Maximum requests','Shared by all selected checks and split into per-endpoint quotas. Scheduled requests may use budget without reaching the server. AI evaluator calls have separate limits.'],
+    ['max_requests','Maximum requests','Maximum inference requests charged across all targets. Not charged: the connection preflight and the readiness probe after a cold-start restart; the report lists them as exempt. Shared by all selected checks and split into per-endpoint quotas. Scheduled requests may use budget without being sent to the endpoint. AI evaluator calls have separate limits.'],
     ['concurrency','Simultaneous limit','Ceiling on unfinished target requests across all endpoints. Each check keeps its own parallelism. An accepted value is not demonstrated delivery capacity.'],
   ];
   const row=(name,label,help)=>{
@@ -3123,8 +3128,8 @@ function renderRequestPlan(config=null) {
   const warnings=[...new Set([...(evaluator.readiness_errors || []),...(plan.warnings || [])])].filter(warning=>(!evaluator.active||warning!==evaluatorScope)&&!explained.has(warning));
   const filled=plan.request_limit==null?0:Math.min(100,(plan.planned_total ?? plan.known_total ?? 0)/plan.request_limit*100);
   const breakdown=plan.planned_target_counts?`Requests by endpoint: ${escape(planTargetCounts(plan.planned_target_counts))}`
-    :plan.known_target_counts?`Known requests by endpoint: ${escape(planTargetCounts(plan.known_target_counts))}, plus adaptive work`
-    :plan.planned_per_target==null?`${number(plan.known_per_target)} known requests per endpoint, plus adaptive work`
+    :plan.known_target_counts?`Known planned requests by endpoint: ${escape(planTargetCounts(plan.known_target_counts))}, plus adaptive work`
+    :plan.planned_per_target==null?`${number(plan.known_per_target)} known planned requests per endpoint, plus adaptive work`
     :`${plan.count_kind==='estimate'?'About ':''}${number(plan.planned_per_target)} requests per endpoint`;
   element.innerHTML=`<div class="plan-hero${raise?' is-over':''}">${heading}<p class="plan-total">${escape(count)}</p>${plan.request_limit==null?'':`<div class="plan-ceiling${plan.count_kind==='exact'||plan.count_kind==='estimate'?'':' adaptive'}" aria-hidden="true"><span style="width:${raise?100:filled.toFixed(1)}%"></span></div>`}${limits}${renderSettingIssues([...localSettingWarnings(),...(plan?.load_warnings||[])],'warning')}${renderMigrationWarnings()}${renderMigrationNotes()}${renderPlanTime(plan)}${renderSettingIssues()}${warnings.map(warning=>notice(warning,'warning')).join('')}</div><div class="plan-flight">${evaluator.active?`<div class="review-evaluator"><p>Up to ${number(evaluator.call_upper_bound)} evaluator calls after target traffic · ${number(evaluator.judge_count)} ${evaluator.judge_count===1?'evaluator':'evaluators'}.</p><p class="hint">Questions, expected answers and model answers go to every configured evaluator. These calls have separate limits.</p>${config?.judging?.judges?.length?`<ul class="review-evaluator-targets">${config.judging.judges.map(judge=>`<li><strong>${escape(judge.model || 'Model needed')}</strong> · ${escape(judge.url || 'Endpoint URL needed')}</li>`).join('')}</ul>`:''}</div>`:''}<details class="request-planning workload-breakdown"><summary>Request breakdown</summary><p class="hint">${breakdown}. Time and request limits can leave checks unfinished.</p>${Object.keys(plan.target_quotas || {}).length?`<h4>Endpoint request budgets</h4><ul class="review-quotas">${Object.entries(plan.target_quotas).map(([name,quota])=>`<li>${escape(name)}: up to ${number(quota)} requests</li>`).join('')}</ul>`:''}${renderCheckPlan(config,plan)}</details></div>${renderReviewPassCriteria(config)}`;
   const timingDetails=element.querySelector?.('.timing-warning-details');
@@ -3293,13 +3298,13 @@ function setupPlanCount(plan) {
   if(plan.request_count_label!=null){
     const label=plan.request_count_label;
     if(label==='Unknown')return 'Requests depend on response time';
-    if(plan.count_kind==='bounded'&&label!=='Unknown'){
+    if(plan.count_kind==='bounded'){
       const scheduled=label.replace(/^Unknown \+ /,'');
-      return `${scheduled} ${scheduled.startsWith('≈')?'expected':'known'} requests + adaptive checks`;
+      return `${scheduled} ${scheduled.startsWith('≈')?'expected requests':'known planned requests'} + adaptive checks`;
     }
     return `${label} ${plan.count_kind==='exact'&&plan.planned_total===1?'request':'requests'}${plan.count_kind==='exact'?' planned':''}`;
   }
-  return plan.count_kind==='exact'?`${number(plan.planned_total)} ${plan.planned_total===1?'request':'requests'} planned`:plan.count_kind==='estimate'?`About ${number(plan.planned_total)} requests`:`${number(plan.known_total)} known requests + adaptive checks`;
+  return plan.count_kind==='exact'?`${number(plan.planned_total)} ${plan.planned_total===1?'request':'requests'} planned`:plan.count_kind==='estimate'?`About ${number(plan.planned_total)} requests`:`${number(plan.known_total)} known planned requests + adaptive checks`;
 }
 function renderReviewScope(payload) {
   const config=payload.config,targets=config.targets || [],questionChecks=config.checks.filter(id=>['correctness','load'].includes(id)),usesQuestions=questionChecks.length>0;
@@ -3818,11 +3823,20 @@ async function loadDetailPlan() {
   catch{ /* The request count stays absent when planning is unavailable. */ }
   finally{current.pending=false;current.done=true;if(current.plan&&state.detail?.id===detail.id&&version===state.routeVersion&&activeState(state.detail)&&reportStillShown(t))renderDetail();}
 }
-function finishedRequests(report,detail=state.detail) {
-  const counts=[detail?.progress?.completed,detail?.summary?.request_count,report?.request_count];
-  if(report?.overall!=null&&!report.requests_compact)counts.push(report.requests?.length);
-  const known=counts.filter(Number.isFinite);
-  return known.length?Math.max(...known):report?.requests?.length || 0;
+function knownCounts(value) {
+  const object=value=>value!==null&&typeof value==='object'&&!Array.isArray(value);
+  const count=value=>Number.isSafeInteger(value)&&value>=0;
+  const validTarget=value=>object(value)&&['sent','budget_counted','budget_counted_unsent','budget_exempt','saved_observations'].every(key=>count(value[key]))&&object(value.budget_exempt_by_reason)&&Object.entries(value.budget_exempt_by_reason).every(([reason,value])=>['preflight','restart_readiness'].includes(reason)&&count(value));
+  return object(value)&&value.available===true&&typeof value.complete==='boolean'&&validTarget(value)&&object(value.targets)&&Object.values(value.targets).every(validTarget)?value:null;
+}
+function bestKnownCounts(report,detail=state.detail) {
+  for(const source of [report?.observations?.request_counts,detail?.summary?.request_counts,detail?.progress?.request_counts]){
+    const counts=knownCounts(source);if(counts)return counts;
+  }
+  return null;
+}
+function countedRequests(report,detail=state.detail) {
+  return bestKnownCounts(report,detail)?.budget_counted ?? null;
 }
 
 function shortReason(reason) {
@@ -3834,8 +3848,9 @@ function shortReason(reason) {
 }
 function renderGuidance(report,detail) {
   if(userStopped(report)){
-    const finished=finishedRequests(report,detail),planned=plannedRequests(detail);
-    return `<p class="result-guidance">${planned==null?`${number(finished)} requests finished`:`${number(finished)} of ${number(planned)} planned requests finished`}. Partial results below.</p>`;
+    const counted=countedRequests(report,detail),planned=plannedRequests(detail);
+    if(counted==null)return '<p class="result-guidance">Partial results below.</p>';
+    return `<p class="result-guidance">${planned==null?`${number(counted)} requests counted`:`${number(counted)} of ${number(planned)} planned requests counted`}. Partial results below.</p>`;
   }
   const reason=report.checks.find(c=>['fail','blocked','inconclusive'].includes(c.status));
   const raw=reportSummary(report) || report.abort_reason || reason?.summary || resultGuidance(report),text=shortReason(raw);
@@ -4308,6 +4323,16 @@ function showFailingRequests() {
   const table=$('.check-detail .evidence-table');table?.setAttribute('tabindex','-1');table?.scrollIntoView?.({block:'start'});table?.focus({preventScroll:true});
 }
 
+function renderRequestCounts(report,detail=null) {
+  const counts=bestKnownCounts(report,detail) || report.observations?.request_counts || detail?.summary?.request_counts;
+  if(!counts)return '<p class="hint">Requests: not recorded for this report</p>';
+  const saved=`${number(counts.saved_observations)} saved ${counts.saved_observations===1?'observation':'observations'}`;
+  if(counts.available===false&&counts.complete===false&&Number.isSafeInteger(counts.saved_observations)&&counts.saved_observations>=0)return `<p class="hint">Requests: counts unavailable for this recovered run · ${saved}</p>`;
+  if(!knownCounts(counts))return '<p class="hint">Requests: not recorded for this report</p>';
+  const help='Sent counts inference requests sent to the endpoint (including attempts that failed to connect). Counted requests use the shared request limit, including scheduled requests that can use budget without being sent to the endpoint. The connection preflight and readiness probe after a cold-start restart are exempt. Saved observations are measurement requests present in report.json, even if their evidence journal entry was dropped. Readiness and performance evidence setup probes are excluded.';
+  return `<p class="hint">Requests: ${number(counts.sent)} sent · ${number(counts.budget_counted)} counted toward the limit · ${number(counts.budget_exempt)} exempt · ${saved}${counts.budget_counted_unsent?` · ${number(counts.budget_counted_unsent)} counted but not sent`:""}${counts.complete===false?" (recovered; may be incomplete)":""} ${infoHelp('request_counts','Request counts',help)}</p>`;
+}
+
 function renderDetail() {
   cancelStopConfirmationTimer();
   state.reportRouteActive=true;
@@ -4324,8 +4349,8 @@ function renderDetail() {
   const report=d.report;
   if(!report){
     const hadTestDialog=$('#test-dialog')?.open;if(hadTestDialog)closeConditionDialog({reveal:false});
-    const summary=d.summary,records=d.live_requests||[],partial=summaryReport(d);
-    patchHTML($('#main'),`<div class="page-heading"><div><div class="eyebrow">Run ${escape(d.id)}</div><h1>${userStopped(partial)?'Stopped by you':'Run could not finish'}</h1>${userStopped(partial)?renderGuidance(partial,d):`<p>${summary?'Only a summary was saved; request evidence may be unavailable.':'No report was saved. Review the error and settings before trying again.'}</p>`}</div></div>${notice(d.error || 'The runner did not produce a report.','error')}${renderReportToolbar()}${renderPerformance()}<section id="report-results" role="tabpanel" aria-labelledby="tab-results" data-live-key="report-results" ${reportView.tab==='results'?'':'hidden'}>${summary?`<section class="panel saved-summary"><h2>Saved summary</h2><p>Recorded overall: ${escape(statusLabels[summary.overall] || summary.overall)} · ${number(summary.request_count)} requests</p><section id="result-content">${renderChecks(partial)}</section></section>`:'<section class="panel check-verdict-summary"><h2>Checks & evidence</h2><p>No final check verdicts were saved.</p></section>'}${renderTests(records,{conditions:d.live_conditions||[],live:false})}${renderLiveLoadResults(d)}${renderAllRequests(records)}${renderDiagnostics(null,d)}</section><div class="actions">${keepButton()}${summary?resultActions(partial):''}<button class="button" data-action="rerun">Run again</button><a class="button" href="#runs">Back to runs</a></div>`);syncAllRequestsFilter();syncPerformanceSelection();if(hadTestDialog)$(`#tab-${reportView.tab}`)?.focus({preventScroll:true});return;
+    const summary=d.summary,records=d.live_requests||[],partial=summaryReport(d),counts=bestKnownCounts(null,d);
+    patchHTML($('#main'),`<div class="page-heading"><div><div class="eyebrow">Run ${escape(d.id)}</div><h1>${userStopped(partial)?'Stopped by you':'Run could not finish'}</h1>${userStopped(partial)?renderGuidance(partial,d):`<p>${summary?'Only a summary was saved; request evidence may be unavailable.':'No report was saved. Review the error and settings before trying again.'}</p>`}</div></div>${notice(d.error || 'The runner did not produce a report.','error')}${renderReportToolbar()}${renderPerformance()}<section id="report-results" role="tabpanel" aria-labelledby="tab-results" data-live-key="report-results" ${reportView.tab==='results'?'':'hidden'}>${summary?`<section class="panel saved-summary"><h2>Saved summary</h2><p>Recorded overall: ${escape(statusLabels[summary.overall] || summary.overall)}${counts?` · ${counted(counts.sent,'request')} sent`:""}</p>${renderRequestCounts(partial,d)}<section id="result-content">${renderChecks(partial)}</section></section>`:'<section class="panel check-verdict-summary"><h2>Checks & evidence</h2><p>No final check verdicts were saved.</p></section>'}${renderTests(records,{conditions:d.live_conditions||[],live:false})}${renderLiveLoadResults(d)}${renderAllRequests(records)}${renderDiagnostics(null,d)}</section><div class="actions">${keepButton()}${summary?resultActions(partial):''}<button class="button" data-action="rerun">Run again</button><a class="button" href="#runs">Back to runs</a></div>`);syncAllRequestsFilter();syncPerformanceSelection();if(hadTestDialog)$(`#tab-${reportView.tab}`)?.focus({preventScroll:true});return;
   }
   const config=reportConfig(report),checks=report.checks.filter(c=>c.id!=='baseline');
   const required=checks.filter(c=>c.required);
@@ -4336,7 +4361,7 @@ function renderDetail() {
   const savedBaseline=(state.baselines || []).find(item=>item.run_id===d.id);
   const entering=state.enteredRun!==d.id;state.enteredRun=d.id;
   const compareButton=d.state===RUN.COMPLETED?`<button class="button" data-action="compare-saved">${report.baseline?'Change baseline':'Compare with baseline'}</button>`:'';
-  patchHTML($('#main'),`<div class="page-heading result-heading ${absolute}${entering?' is-entering':''}"><div><div class="eyebrow">Run <span class="mono">${escape(d.id)}</span></div><h1>${escape(absolute==='error'?'Run could not finish':mainFinding(report))}</h1>${renderGuidance(report,d)}<div class="run-meta"><span><strong>${escape((config.targets || []).map(t=>t.model).join(', '))}</strong></span><span>${date(report.started_at)}</span><span>${duration(report)}</span><span>${number(report.requests.length)} requests recorded</span></div><p class="hint">${escape((config.targets || []).map(t=>t.url).filter(Boolean).join(' · '))}</p></div><div class="actions">${savedBaseline?`<p class="baseline-saved"><span aria-hidden="true">✓</span> Saved as baseline <strong>${escape(savedBaseline.name)}</strong></p>`:''}${resultActions(report,{completePass,savedBaseline})}<button class="button" data-action="rerun">${icon('repeat')} Run again</button>${compareButton}</div></div>
+  patchHTML($('#main'),`<div class="page-heading result-heading ${absolute}${entering?' is-entering':''}"><div><div class="eyebrow">Run <span class="mono">${escape(d.id)}</span></div><h1>${escape(absolute==='error'?'Run could not finish':mainFinding(report))}</h1>${renderGuidance(report,d)}<div class="run-meta"><span><strong>${escape((config.targets || []).map(t=>t.model).join(', '))}</strong></span><span>${date(report.started_at)}</span><span>${duration(report)}</span></div>${renderRequestCounts(report,d)}<p class="hint">${escape((config.targets || []).map(t=>t.url).filter(Boolean).join(' · '))}</p></div><div class="actions">${savedBaseline?`<p class="baseline-saved"><span aria-hidden="true">✓</span> Saved as baseline <strong>${escape(savedBaseline.name)}</strong></p>`:''}${resultActions(report,{completePass,savedBaseline})}<button class="button" data-action="rerun">${icon('repeat')} Run again</button>${compareButton}</div></div>
   ${renderBaselineSummary(report,absolute)}
   ${d.error?notice(d.error,d.state===RUN.ERROR?'error':'warning'):''}${storageOmission(report)}${d.auto_cleanup?.deleted?.length?notice(`Automatic cleanup deleted runs: ${d.auto_cleanup.deleted.map(escape).join(', ')}`):''}${renderReportToolbar()}${renderPerformance()}
   <section id="report-results" role="tabpanel" aria-labelledby="tab-results" data-live-key="report-results" ${reportView.tab==='results'?'':'hidden'}>${renderResultsJump()}
@@ -4829,7 +4854,7 @@ function renderLive() {
   state.liveRendered=state.detail.id;
   state.mosaicAnimated=state.detail.id;
   const d=state.detail,p=d.progress || {},c=d.config || reportConfig(d.report),events=(d.events || []).filter(e=>!String(e.event || '').startsWith('condition_')),last=events.at(-1) || {},progress={...last,...p};
-  const finished=progress.completed || 0,started=progress.attempted || 0,secs=progress.elapsed_seconds || 0,stopping=d.state===RUN.STOPPING,stopPending=state.stopPending?.id===d.id;
+  const counts=bestKnownCounts(d.report,d),secs=progress.elapsed_seconds || 0,stopping=d.state===RUN.STOPPING,stopPending=state.stopPending?.id===d.id;
   const judging=progress.phase==='judging'||String(progress.event || '').startsWith('judging_');
   const judgeDone=progress.judge_calls_completed || 0,judgeTotal=progress.judge_calls_total || 0;
   const planned=plannedRequests(d),confirmation=state.stopConfirmation?.id===d.id&&Date.now()<state.stopConfirmation.until;
@@ -4837,12 +4862,12 @@ function renderLive() {
   const title=d.stoppable===false?'Running from the CLI':judging?'Evaluating answers':d.state===RUN.QUEUED?'Preparing run':'Running';
   const description=judging?'Target traffic finished. Evaluating generated answers against golden answers; target measurements are frozen.':'One spot per test. Select a spot for its requests and results.';
   const bounds=judging?[['Evaluator concurrency',c.judging?.concurrency],['Evaluation duration',elapsed(c.judging?.max_duration_seconds)],['Judge deadline',elapsed(c.judging?.request_timeout_seconds)],['Judge output cap',`${c.judging?.max_output_tokens} tokens`]]:[['Simultaneous limit',c.concurrency??'Not set'],['Maximum requests',c.max_requests??'Not set'],['Maximum duration',c.max_duration_seconds==null?'Not set':elapsed(c.max_duration_seconds)],['Request timeout',elapsed(c.request_timeout_seconds)],['Maximum output tokens',`${c.max_output_tokens} tokens`]];
-  patchHTML($('#main'),`<div class="page-heading"><div><div class="eyebrow">Live run <span class="mono">${escape(d.id)}</span></div><h1>${p.phase==='saving_partial_report'?'Saving partial report…':stopping?'Stopping your check':title}</h1><p>${stopping?'Stopping further work and saving the evidence collected so far.':description}</p><p class="live-progress">${judging?`Evaluation calls · ${number(judgeDone)} of ${number(judgeTotal)}`:`${planned==null?`${number(finished)} requests finished`:`${number(finished)} of ~${number(planned)} planned requests`} · ${elapsed(secs)} · limit ${c.max_requests==null?'not set':number(c.max_requests)}`}</p></div>${d.stoppable===false?'':`<button class="button danger" data-action="stop" aria-label="${confirmation?'Confirm stop run':'Stop run'}" ${stopping||stopPending?'disabled':''}>${icon('stop')}${stopping||stopPending?'Stopping…':confirmation?'Confirm stop':'Stop run'}</button>`}</div>
+  patchHTML($('#main'),`<div class="page-heading"><div><div class="eyebrow">Live run <span class="mono">${escape(d.id)}</span></div><h1>${p.phase==='saving_partial_report'?'Saving partial report…':stopping?'Stopping your check':title}</h1><p>${stopping?'Stopping further work and saving the evidence collected so far.':description}</p><p class="live-progress">${judging?`Evaluation calls · ${number(judgeDone)} of ${number(judgeTotal)}`:`${counts?(planned==null?`${number(counts.budget_counted)} requests counted`:`${number(counts.budget_counted)} of ~${number(planned)} planned requests`):`${planned==null?'':`~${number(planned)} planned requests · `}Request counts unavailable`} · ${elapsed(secs)} · limit ${c.max_requests==null?'not set':number(c.max_requests)}${counts?.budget_exempt?` · ${number(counts.budget_exempt)} exempt`:''}`}</p></div>${d.stoppable===false?'':`<button class="button danger" data-action="stop" aria-label="${confirmation?'Confirm stop run':'Stop run'}" ${stopping||stopPending?'disabled':''}>${icon('stop')}${stopping||stopPending?'Stopping…':confirmation?'Confirm stop':'Stop run'}</button>`}</div>
   ${renderReportToolbar()}${renderPerformance()}<section id="report-results" role="tabpanel" aria-labelledby="tab-results" data-live-key="report-results" ${reportView.tab==='results'?'':'hidden'}><section class="panel check-verdict-summary"><h2>Checks & evidence</h2><p>Checks are still running. Finished requests are not a passing check verdict.</p></section>
   ${d.live_request_summary?.evicted?`<p class="hint live-eviction-summary">${number(d.live_request_summary.evicted)} earlier requests outside the live window · ${Object.entries(d.live_request_summary.statuses||{}).map(([status,count])=>`${number(count)} ${escape(human(status))}`).join(' · ')}</p>`:''}${stopReasons.length?`<section class="notice warning live-stop-reason" role="status"><strong>Run stop reason</strong><ul>${stopReasons.map(reason=>`<li>${escape(reason)}</li>`).join('')}</ul></section>`:''}${renderScaleDownControl(d)}${renderTests(d.live_requests || [],{conditions:d.live_conditions || [],live:true})}${renderLiveLoadResults(d)}<div class="live-layout"><div><section class="panel live-state">${badge(d.state)}<h2>${judging?escape(testLabel({...progress,scenario:'judging'})):escape(progress.scenario?scenarioLabel(progress):human(progress.event || 'Preparing requests'))}</h2><p class="live-phase">${escape(progress.target || (c.targets || []).map(t=>t.name).join(', '))} · ${escape((c.targets || []).map(t=>t.model).join(', '))}</p>
 </section>
   <details class="panel live-activity"><summary>Activity · last 5 events</summary><div class="event-list">${[...events].reverse().slice(0,5).map(e=>`<div class="event-row"><span class="time">${elapsed(e.elapsed_seconds)}</span><span>${escape(({request_started:'Request sent',request_completed:'Response received',timeout_warning:'Requests timing out',run_started:'Run started',run_stopping:'Stopping run',run_completed:'Run complete',judging_started:'Answer evaluation started',judging_progress:'Evaluating answers'})[e.event] || human(e.event || 'Progress'))}${e.scenario?` · ${escape(scenarioLabel(e))}`:''}</span></div>`).join('')||'<p class="hint">Preparing the first requests…</p>'}</div></details></div>
-  <aside class="panel run-preview">${renderPhases(d.phases || events)}<h3>${judging?'Evaluation limits':'Limits'}</h3>${judging?'<p>Separate limits apply to the configured judges.</p>':''}<dl class="bound-list">${bounds.map(([k,v])=>`<div><dt>${escape(k)}</dt><dd>${escape(v)}</dd></div>`).join('')}</dl><hr><p class="hint">${judging?'Incomplete panels, evaluation failures and ties leave answers unscored.':'Finished requests include responses, failures, timeouts and cancellations. Scheduled requests can also use budget without reaching the server.'}</p></aside></div><div id="live-error" class="error-message" role="alert" ${liveError?'':'hidden'}>${escape(liveError)}</div>${renderAllRequests(d.live_requests || [],{budget:c.max_requests,live:true,budgetUsed:progress.budget_used ?? started,attempted:started,droppedOffers:progress.dropped_offers || 0})}${renderDiagnostics(d.report,d)}</section>`,{landing:true});
+  <aside class="panel run-preview">${renderPhases(d.phases || events)}<h3>${judging?'Evaluation limits':'Limits'}</h3>${judging?'<p>Separate limits apply to the configured judges.</p>':''}<dl class="bound-list">${bounds.map(([k,v])=>`<div><dt>${escape(k)}</dt><dd>${escape(v)}</dd></div>`).join('')}</dl><hr><p class="hint">${judging?'Incomplete panels, evaluation failures and ties leave answers unscored.':'Finished requests include responses, failures, timeouts and cancellations. Scheduled requests can also use budget without being sent to the endpoint.'}</p></aside></div><div id="live-error" class="error-message" role="alert" ${liveError?'':'hidden'}>${escape(liveError)}</div>${renderAllRequests(d.live_requests || [],{budget:c.max_requests,live:true,requestCounts:counts})}${renderDiagnostics(d.report,d)}</section>`,{landing:true});
   syncAllRequestsFilter();
   const dialog=$('#request-dialog'),status=dialog?.open?$('.live-request-status',dialog):null,record=status&&(d.live_requests || []).find(r=>String(r.slot)===status.dataset.statusSlot);
   if(record){if(status.getAttribute('data-request-id')!==String(record.id || '')){cancelLandings(status);status.setAttribute('data-request-id',record.id || '');}patchHTML(status,badge(requestStatus(record)),{landing:true});const identity=$('.request-identity',dialog);if(identity)patchHTML(identity,identity.getAttribute('data-condition-request-context')?conditionEvidenceIdentityText(JSON.parse(identity.getAttribute('data-condition-request-context'))):requestIdentityContent(record,d.live_requests));}

@@ -53,7 +53,7 @@ def test_preparation_failure_is_reported_once_per_user_without_dispatch(
         report = await runner.run_suite(cfg, progress=events.append)
         count = 1 if stop_after_errors == 1 else 2
         assert len(calls) == len(set(calls)) == len(report.requests) == count
-        assert report.observations["request_budget_used"] == 0
+        assert report.observations["request_counts"]["budget_counted"] == 0
         assert "secret-sk-123" not in report.model_dump_json()
         assert not any(event["event"] == "request_started" for event in events)
         for item in report.requests:
